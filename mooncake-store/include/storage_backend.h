@@ -95,6 +95,9 @@ struct FileStorageConfig {
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
+    // Use io_uring for file I/O instead of POSIX pread/pwrite
+    bool use_uring = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -125,7 +128,7 @@ class StorageBackendInterface {
             complete_handler) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) = 0;
+        std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
@@ -333,6 +336,7 @@ class StorageBackend {
     std::string fsdir_;
     bool enable_eviction_{
         true};  // User-configurable flag to enable/disable eviction
+    bool use_uring_{false};  // Use io_uring for file I/O
 
 #ifdef USE_3FS
     bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
@@ -509,7 +513,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
             complete_handler) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
@@ -569,6 +573,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
+    ~BucketStorageBackend();
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be
@@ -603,7 +609,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
@@ -709,7 +715,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoadBucket(
         int64_t bucket_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        std::unordered_map<std::string, Slice>& batched_slices);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -732,11 +738,37 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> HasNext();
 
+   public:
+    /**
+     * @brief Get a file instance for external buffer registration
+     * Opens a temporary file to get access to the UringFile instance
+     * @return Shared pointer to StorageFile or error
+     */
+    tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
+        const;
+
    private:
+    // Alignment helper functions for O_DIRECT I/O
+    static constexpr size_t kDirectIOAlignment = 4096;
+
+    static inline size_t align_up(size_t size, size_t alignment) {
+        return (size + alignment - 1) & ~(alignment - 1);
+    }
+
+    static inline int64_t align_down(int64_t offset, int64_t alignment) {
+        return offset & ~(alignment - 1);
+    }
+
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+
+    // Aligned buffer for O_DIRECT I/O operations
+    // We use a fixed-size buffer to avoid frequent allocations
+    static constexpr size_t kAlignedBufferSize = 16 * 1024 * 1024;  // 16MB
+    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
+                                                              [](void*) {}};
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
@@ -760,6 +792,18 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+
+    // File handle cache for UringFile to avoid repeated open/close overhead
+    mutable Mutex file_cache_mutex_;
+    mutable std::unordered_map<std::string, std::shared_ptr<StorageFile>>
+        file_cache_ GUARDED_BY(file_cache_mutex_);
+
+    // Get or open a file with caching support
+    tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetOrOpenFile(
+        const std::string& path, FileMode mode) const;
+
+    // Clear file cache (called on destruction or when needed)
+    void ClearFileCache();
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
@@ -796,7 +840,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Checks whether an object with the specified key exists in the
