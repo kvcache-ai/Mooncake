@@ -85,7 +85,7 @@ class ClientRequester {
 };
 
 // Python-specific wrapper class for client interface
-class PyClient {
+class PyClient : public std::enable_shared_from_this<PyClient> {
    public:
     virtual ~PyClient() = 0;
     virtual int setup_real(

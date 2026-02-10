@@ -2536,17 +2536,20 @@ void RealClient::try_cache_on_get(const std::string &key) {
 
     // Fire-and-forget: launch caching in background thread.
     // Caller proceeds with remote transfer at normal speed.
-    std::thread([this, key]() {
+    // Capture shared_ptr to prevent use-after-free if RealClient is destroyed
+    // while the background thread is still running.
+    auto self = std::static_pointer_cast<RealClient>(shared_from_this());
+    std::thread([self, key]() {
         auto result =
-            client_->TryCacheOnGet(key, client_->GetLocalHostname());
+            self->client_->TryCacheOnGet(key, self->client_->GetLocalHostname());
         if (!result.has_value()) {
             LOG(WARNING) << "try_cache_on_get failed for key=" << key
                          << ", error=" << toString(result.error());
         }
 
         // Remove from inflight set
-        std::unique_lock<std::shared_mutex> wlock(cache_inflight_mutex_);
-        cache_inflight_.erase(key);
+        std::unique_lock<std::shared_mutex> wlock(self->cache_inflight_mutex_);
+        self->cache_inflight_.erase(key);
     }).detach();
 }
 
