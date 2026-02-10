@@ -47,6 +47,16 @@ BENCH_DATA_SIZE = 1 * 1024 * 1024  # 1MB
 BENCH_ITERATIONS = 10
 BENCH_KEYS = [f"lc_bench_{i}" for i in range(8)]
 
+# Extended benchmark keys for get_into / batch_get_into
+BENCH_INTO_KEYS = [f"lc_bench_into_{i}" for i in range(8)]
+
+# Data size sweep
+BENCH_SIZES = [4 * 1024, 64 * 1024, 256 * 1024, 1 * 1024 * 1024, 4 * 1024 * 1024]
+BENCH_SIZE_KEYS = {sz: f"lc_bench_size_{sz}" for sz in BENCH_SIZES}
+
+# Higher iteration count for percentile accuracy
+PERF_ITERATIONS = 100
+
 
 # ==========================================
 #  Helpers
@@ -100,6 +110,20 @@ def make_data(prefix, size=3000):
     base = prefix.encode()
     repeats = (size // len(base)) + 1
     return (base * repeats)[:size]
+
+
+def format_size(n):
+    """Pretty-print byte sizes (e.g., '4 KB', '1 MB')."""
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.0f} MB"
+    elif n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+def percentile(data, p):
+    """Compute the p-th percentile of a list using numpy."""
+    return np.percentile(data, p)
 
 
 # ==========================================
@@ -169,6 +193,23 @@ def run_writer(store):
         assert rc == 0, f"put {key} failed: {rc}"
         all_keys.append(key)
     print(f"  Put {len(BENCH_KEYS)} bench keys ({BENCH_DATA_SIZE} bytes each)")
+
+    # Benchmark into keys (1MB each for get_into/batch_get_into benchmarks)
+    for key in BENCH_INTO_KEYS:
+        data = b"\xCD" * BENCH_DATA_SIZE
+        rc = store.put(key, data)
+        assert rc == 0, f"put {key} failed: {rc}"
+        all_keys.append(key)
+    print(f"  Put {len(BENCH_INTO_KEYS)} bench_into keys ({BENCH_DATA_SIZE} bytes each)")
+
+    # Data size sweep keys
+    for sz, key in BENCH_SIZE_KEYS.items():
+        data = b"\xEF" * sz
+        rc = store.put(key, data)
+        assert rc == 0, f"put {key} failed: {rc}"
+        all_keys.append(key)
+    print(f"  Put {len(BENCH_SIZE_KEYS)} size-sweep keys "
+          f"({', '.join(format_size(s) for s in BENCH_SIZES)})")
 
     # Signal reader that data is ready
     rc = store.put(BARRIER_KEY, b"ready")
@@ -439,6 +480,142 @@ def run_reader(store):
     bufs = store.batch_get_buffer(BENCH_KEYS, local_cache=True)
     t_batch_hit = time.perf_counter() - t0
     print(f"  Batch hit ({len(BENCH_KEYS)} keys): {t_batch_hit*1000:.3f} ms")
+
+    # ------------------------------------------
+    # Benchmark: get_into cache hit speedup
+    # ------------------------------------------
+    print("\n--- Benchmark: get_into cache hit speedup ---")
+    into_buf_size = 64 * 1024 * 1024
+    into_buf = (ctypes.c_ubyte * into_buf_size)()
+    into_buf_ptr = ctypes.addressof(into_buf)
+    res = store.register_buffer(into_buf_ptr, into_buf_size)
+    assert res == 0, f"register_buffer failed: {res}"
+
+    into_miss_times = []
+    for key in BENCH_INTO_KEYS:
+        t0 = time.perf_counter()
+        length = store.get_into(key, into_buf_ptr, into_buf_size, local_cache=True)
+        into_miss_times.append(time.perf_counter() - t0)
+        assert length > 0, f"get_into miss failed for {key}"
+
+    into_hit_times = []
+    for _ in range(BENCH_ITERATIONS):
+        for key in BENCH_INTO_KEYS:
+            t0 = time.perf_counter()
+            length = store.get_into(key, into_buf_ptr, into_buf_size, local_cache=True)
+            into_hit_times.append(time.perf_counter() - t0)
+
+    avg_into_miss = np.mean(into_miss_times)
+    avg_into_hit = np.mean(into_hit_times)
+    into_speedup = avg_into_miss / avg_into_hit if avg_into_hit > 0 else float('inf')
+    print(f"  Data size:  {BENCH_DATA_SIZE / 1024:.0f} KB x {len(BENCH_INTO_KEYS)} keys")
+    print(f"  Avg miss:   {avg_into_miss*1000:.3f} ms (remote transfer)")
+    print(f"  Avg hit:    {avg_into_hit*1000:.3f} ms (local cache)")
+    print(f"  Speedup:    {into_speedup:.1f}x")
+
+    store.unregister_buffer(into_buf_ptr)
+
+    # ------------------------------------------
+    # Benchmark: batch_get_into cache hit speedup
+    # ------------------------------------------
+    print("\n--- Benchmark: batch_get_into cache hit speedup ---")
+    num_bench_into = len(BENCH_INTO_KEYS)
+    bgi_each = 64 * 1024 * 1024
+    bgi_total = bgi_each * num_bench_into
+    bgi_buf = (ctypes.c_ubyte * bgi_total)()
+    bgi_buf_ptr = ctypes.addressof(bgi_buf)
+    res = store.register_buffer(bgi_buf_ptr, bgi_total)
+    assert res == 0, f"register_buffer failed: {res}"
+
+    bgi_ptrs = [bgi_buf_ptr + i * bgi_each for i in range(num_bench_into)]
+    bgi_sizes = [bgi_each] * num_bench_into
+
+    # Cache miss (already cached from get_into above, so this is a hit)
+    # Force a fresh miss by using a batch call — keys are already cached,
+    # so we just measure the batch hit directly.
+    bgi_hit_times = []
+    for _ in range(BENCH_ITERATIONS):
+        t0 = time.perf_counter()
+        lens = store.batch_get_into(BENCH_INTO_KEYS, bgi_ptrs, bgi_sizes,
+                                     local_cache=True)
+        bgi_hit_times.append(time.perf_counter() - t0)
+        for i, l in enumerate(lens):
+            assert l > 0, f"batch_get_into hit failed for key {i}"
+
+    avg_bgi_hit = np.mean(bgi_hit_times)
+    print(f"  Batch hit ({num_bench_into} keys x {BENCH_DATA_SIZE / 1024:.0f} KB): "
+          f"{avg_bgi_hit*1000:.3f} ms avg")
+
+    store.unregister_buffer(bgi_buf_ptr)
+
+    # ------------------------------------------
+    # Benchmark: Latency percentiles (get_buffer)
+    # ------------------------------------------
+    print("\n--- Benchmark: Latency percentiles (get_buffer cache hit) ---")
+    pct_times = []
+    for _ in range(PERF_ITERATIONS):
+        for key in BENCH_KEYS:
+            t0 = time.perf_counter()
+            buf = store.get_buffer(key, local_cache=True)
+            pct_times.append(time.perf_counter() - t0)
+
+    pct_times_ms = [t * 1000 for t in pct_times]
+    print(f"  Samples:  {len(pct_times_ms)}")
+    print(f"  Min:      {min(pct_times_ms):.3f} ms")
+    print(f"  p50:      {percentile(pct_times_ms, 50):.3f} ms")
+    print(f"  p95:      {percentile(pct_times_ms, 95):.3f} ms")
+    print(f"  p99:      {percentile(pct_times_ms, 99):.3f} ms")
+    print(f"  Max:      {max(pct_times_ms):.3f} ms")
+
+    # ------------------------------------------
+    # Benchmark: Data size sweep
+    # ------------------------------------------
+    print("\n--- Benchmark: Data size sweep (get_buffer) ---")
+    print(f"  {'Size':>8s} | {'Avg Miss':>10s} | {'Avg Hit':>10s} | "
+          f"{'Speedup':>8s} | {'Throughput':>12s}")
+    print(f"  {'-'*8}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*12}")
+
+    sweep_iters = BENCH_ITERATIONS
+    for sz in BENCH_SIZES:
+        key = BENCH_SIZE_KEYS[sz]
+
+        # Cache miss
+        t0 = time.perf_counter()
+        buf = store.get_buffer(key, local_cache=True)
+        t_sz_miss = time.perf_counter() - t0
+        assert buf is not None, f"size sweep miss failed for {key}"
+
+        # Cache hits
+        sz_hit_times = []
+        for _ in range(sweep_iters):
+            t0 = time.perf_counter()
+            buf = store.get_buffer(key, local_cache=True)
+            sz_hit_times.append(time.perf_counter() - t0)
+
+        avg_sz_hit = np.mean(sz_hit_times)
+        sz_speedup = t_sz_miss / avg_sz_hit if avg_sz_hit > 0 else float('inf')
+        throughput = sz / avg_sz_hit / (1024 ** 3) if avg_sz_hit > 0 else 0
+        print(f"  {format_size(sz):>8s} | {t_sz_miss*1000:>9.3f}ms | "
+              f"{avg_sz_hit*1000:>9.3f}ms | {sz_speedup:>7.1f}x | "
+              f"{throughput:>9.2f} GB/s")
+
+    # ------------------------------------------
+    # Benchmark: Throughput summary (batch_get_buffer)
+    # ------------------------------------------
+    print("\n--- Benchmark: Throughput summary (batch_get_buffer cache hit) ---")
+    total_data = BENCH_DATA_SIZE * len(BENCH_KEYS)
+    tp_times = []
+    for _ in range(BENCH_ITERATIONS):
+        t0 = time.perf_counter()
+        bufs = store.batch_get_buffer(BENCH_KEYS, local_cache=True)
+        tp_times.append(time.perf_counter() - t0)
+
+    avg_tp_time = np.mean(tp_times)
+    agg_throughput = total_data / avg_tp_time / (1024 ** 3) if avg_tp_time > 0 else 0
+    print(f"  Batch size:   {len(BENCH_KEYS)} keys x {format_size(BENCH_DATA_SIZE)} "
+          f"= {format_size(total_data)}")
+    print(f"  Avg latency:  {avg_tp_time*1000:.3f} ms")
+    print(f"  Throughput:   {agg_throughput:.2f} GB/s")
 
     # ------------------------------------------
     # Summary
