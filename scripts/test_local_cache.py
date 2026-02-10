@@ -618,6 +618,39 @@ def run_reader(store):
     print(f"  Throughput:   {agg_throughput:.2f} GB/s")
 
     # ------------------------------------------
+    # Benchmark: Throughput summary (batch_get_into)
+    # ------------------------------------------
+    print("\n--- Benchmark: Throughput summary (batch_get_into cache hit) ---")
+    total_into_data = BENCH_DATA_SIZE * len(BENCH_INTO_KEYS)
+    num_bi = len(BENCH_INTO_KEYS)
+    bi_each = 64 * 1024 * 1024
+    bi_total = bi_each * num_bi
+    bi_buf = (ctypes.c_ubyte * bi_total)()
+    bi_buf_ptr = ctypes.addressof(bi_buf)
+    res = store.register_buffer(bi_buf_ptr, bi_total)
+    assert res == 0, f"register_buffer failed: {res}"
+
+    bi_ptrs = [bi_buf_ptr + i * bi_each for i in range(num_bi)]
+    bi_sizes = [bi_each] * num_bi
+
+    tp_into_times = []
+    for _ in range(BENCH_ITERATIONS):
+        t0 = time.perf_counter()
+        lens = store.batch_get_into(BENCH_INTO_KEYS, bi_ptrs, bi_sizes,
+                                     local_cache=True)
+        tp_into_times.append(time.perf_counter() - t0)
+
+    store.unregister_buffer(bi_buf_ptr)
+
+    avg_tp_into = np.mean(tp_into_times)
+    into_throughput = (total_into_data / avg_tp_into / (1024 ** 3)
+                       if avg_tp_into > 0 else 0)
+    print(f"  Batch size:   {num_bi} keys x {format_size(BENCH_DATA_SIZE)} "
+          f"= {format_size(total_into_data)}")
+    print(f"  Avg latency:  {avg_tp_into*1000:.3f} ms")
+    print(f"  Throughput:   {into_throughput:.2f} GB/s")
+
+    # ------------------------------------------
     # Summary
     # ------------------------------------------
     print(f"\n{'='*50}")
