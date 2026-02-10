@@ -72,7 +72,12 @@ run_proxy()
     local model_name=$1
     local proxy_log_path="/test_run/run/logs/$test_case_name/$model_name/load_balancer.log"
 
-    launch_sglang_router "http://${LOCAL_IP}:30002" "http://${REMOTE_IP}:30003" "0.0.0.0" "8000" "$proxy_log_path"
+    if ! launch_sglang_router "http://${LOCAL_IP}:30002" "http://${REMOTE_IP}:30003" "0.0.0.0" "8000" "$proxy_log_path"; then
+        echo "ERROR: Failed to start SGLang Router"
+        return 1
+    fi
+    
+    return 0
 }
 
 run_request()
@@ -173,7 +178,12 @@ start_remote_decode()
     local model_name=$1
     local model_name_clean=$2
     
-    ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"
+    if ! ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"; then
+        echo "ERROR: Failed to start remote decode component"
+        return 1
+    fi
+    
+    return 0
 }
 
 run_single_model()

@@ -618,6 +618,7 @@ collect_remote_log_file() {
     fi
 }
 
+# Checks for API error responses containing "object":"error"
 validate_json_response_error() {
     local response=$1
     local model_name=${2:-"unknown"}
@@ -632,6 +633,7 @@ validate_json_response_error() {
     return 0
 }
 
+# Validates HTTP status codes (default expectation: 200)
 validate_http_status() {
     local status_code=$1
     local expected_code=${2:-200}
@@ -654,14 +656,19 @@ validate_http_status() {
     fi
 }
 
+# Extracts JSON values using jq paths and matches patterns
 validate_response_content() {
     local response=$1
-    local json_path=$2
+    local json_query=$2
     local expected_pattern=${3:-""}
+
+    if [ -z "$json_query" ]; then
+        return 0
+    fi
     
-    local content=$(echo "$response" | jq -r "$json_path" 2>/dev/null)
+    local content=$(echo "$response" | jq -r "$json_query" 2>/dev/null)
     if [ -z "$content" ] || [ "$content" = "null" ]; then
-        echo "ERROR: Failed to extract content from path: $json_path" >&2
+        echo "ERROR: Failed to extract content from JSON with query: $json_query" >&2
         return 1
     fi
     
@@ -684,7 +691,7 @@ validate_response_content() {
 validate_api_response() {
     local response_body=$1
     local status_code=$2
-    local json_path=${3:-""}
+    local json_query=${3:-""}
     local expected_pattern=${4:-""}
     
     if ! validate_http_status "$status_code" 200; then
@@ -695,8 +702,8 @@ validate_api_response() {
         return 1
     fi
     
-    if [ -n "$json_path" ]; then
-        if ! validate_response_content "$response_body" "$json_path" "$expected_pattern"; then
+    if [ -n "$json_query" ]; then
+        if ! validate_response_content "$response_body" "$json_query" "$expected_pattern"; then
             return 1
         fi
     else
