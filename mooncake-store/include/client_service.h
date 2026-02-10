@@ -412,6 +412,21 @@ class Client {
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
 
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+    /**
+     * @brief Try to cache an object locally on first get
+     * @param key Object key
+     * @param local_segment Local segment name
+     * @return true if cache was created or already exists, false on error
+     */
+    tl::expected<bool, ErrorCode> TryCacheOnGet(
+        const std::string& key, const std::string& local_segment);
+
+    [[nodiscard]] const std::string& GetLocalHostname() const {
+        return local_hostname_;
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -532,6 +547,18 @@ class Client {
         const std::vector<Replica::Descriptor>& targets);
 
     /**
+     * @brief Pull remote data to local replica via TransferRead
+     * @param key Object key
+     * @param source Remote source descriptor
+     * @param target Local target descriptor
+     * @return void on success, ErrorCode on failure
+     */
+    tl::expected<void, ErrorCode> CacheToLocal(
+        const std::string& key,
+        const Replica::Descriptor& source,
+        const Replica::Descriptor& target);
+
+    /**
      * @brief Copy an object's replica to target segments
      * @param key Object key
      * @param source Source segment
@@ -552,8 +579,6 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
                                        const std::string& target);
-
-    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

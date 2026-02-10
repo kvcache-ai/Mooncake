@@ -765,6 +765,22 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
         [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
 }
 
+tl::expected<CacheOnGetResponse, ErrorCode> WrappedMasterService::CacheOnGet(
+    const UUID& client_id, const std::string& key,
+    const std::string& local_segment) {
+    return execute_rpc(
+        "CacheOnGet",
+        [&] {
+            return master_service_.CacheOnGet(client_id, key, local_segment);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", local_segment=", local_segment);
+        },
+        [] { MasterMetricManager::instance().inc_copy_start_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+}
+
 tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
@@ -1009,6 +1025,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CacheOnGet>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
         &wrapped_master_service);

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <shared_mutex>
 #include <csignal>
 #include <memory>
 #include <string>
@@ -105,7 +106,8 @@ class RealClient : public PyClient {
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    int64_t get_into(const std::string &key, void *buffer, size_t size);
+    int64_t get_into(const std::string &key, void *buffer, size_t size,
+                     bool cache = false);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -120,7 +122,8 @@ class RealClient : public PyClient {
      */
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
-                                        const std::vector<size_t> &sizes);
+                                        const std::vector<size_t> &sizes,
+                                        bool cache = false);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -226,7 +229,8 @@ class RealClient : public PyClient {
      * @return std::shared_ptr<BufferHandle> Buffer containing the data, or
      * nullptr if error
      */
-    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key,
+                                             bool cache = false);
 
     /**
      * @brief Get buffer information (address and size) for a key
@@ -242,7 +246,7 @@ class RealClient : public PyClient {
      * data, or nullptr for each key if error
      */
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, bool cache = false);
 
     int remove(const std::string &key, bool force = false);
 
@@ -327,7 +331,7 @@ class RealClient : public PyClient {
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes,
-        const UUID &client_id);
+        const UUID &client_id, bool cache = false);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
@@ -382,11 +386,13 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
                                                        void *buffer,
-                                                       size_t size);
+                                                       size_t size,
+                                                       bool cache = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        bool cache = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -444,10 +450,11 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
-            nullptr);
+            nullptr,
+        bool cache = false);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, bool cache = false);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
@@ -554,6 +561,15 @@ class RealClient : public PyClient {
     int start_ipc_server();
     int stop_ipc_server();
     void ipc_server_func();
+
+    // Cache-on-get inflight deduplication
+    // Protected by shared_mutex: read lock to check, write lock to insert/erase
+    std::shared_mutex cache_inflight_mutex_;
+    std::unordered_set<std::string> cache_inflight_;
+    // Fire-and-forget: launches async caching in background thread.
+    // Caller always proceeds with remote transfer at normal speed.
+    // Future calls benefit from the cached local replica.
+    void try_cache_on_get(const std::string &key);
 };
 
 }  // namespace mooncake

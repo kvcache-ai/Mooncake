@@ -1057,6 +1057,100 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     return {};
 }
 
+tl::expected<CacheOnGetResponse, ErrorCode> MasterService::CacheOnGet(
+    const UUID& client_id, const std::string& key,
+    const std::string& local_segment) {
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& metadata = accessor.Get();
+
+    // Build replica list and grant lease (like GetReplicaList)
+    CacheOnGetResponse response;
+    std::vector<Replica::Descriptor> replica_list;
+    metadata.VisitReplicas(
+        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            replica_list.emplace_back(replica.get_descriptor());
+        });
+
+    if (replica_list.empty()) {
+        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    response.replica_list =
+        GetReplicaListResponse(std::move(replica_list), default_kv_lease_ttl_);
+
+    // Check if local replica already exists on local_segment
+    if (metadata.GetReplicaBySegmentName(local_segment) != nullptr) {
+        response.needs_transfer = false;
+        return response;
+    }
+
+    // Check if replication task already in progress (another client caching)
+    if (accessor.HasReplicationTask()) {
+        response.needs_transfer = false;
+        return response;
+    }
+
+    // Find first complete valid memory source replica
+    auto* source = metadata.GetFirstReplica([](const Replica& replica) {
+        return replica.is_memory_replica() && replica.is_completed() &&
+               !replica.has_invalid_mem_handle();
+    });
+    if (source == nullptr) {
+        LOG(WARNING) << "key=" << key
+                     << ", no valid memory source replica for cache";
+        response.needs_transfer = false;
+        return response;
+    }
+
+    // Allocate target replica on local_segment
+    std::vector<Replica> replicas;
+    {
+        ScopedAllocatorAccess allocator_access =
+            segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+        auto replica = allocation_strategy_->AllocateFrom(
+            allocator_manager, metadata.size, local_segment);
+        if (!replica.has_value()) {
+            LOG(WARNING) << "key=" << key
+                         << ", local_segment=" << local_segment
+                         << ", failed to allocate local replica for cache";
+            response.needs_transfer = false;
+            return response;
+        }
+        replicas.push_back(std::move(*replica));
+    }
+
+    // Create replication task for tracking
+    response.source = source->get_descriptor();
+    response.target = replicas[0].get_descriptor();
+    response.needs_transfer = true;
+
+    ReplicaID target_id = replicas[0].id();
+    auto& shard = accessor.GetShard();
+    shard->replication_tasks.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
+                              ReplicationTask::Type::COPY, source->id(),
+                              std::vector<ReplicaID>{target_id}));
+
+    // Increase source refcnt to protect it from eviction
+    source->inc_refcnt();
+
+    // Add target replica to the object
+    // DO NOT ACCESS source AFTER THIS !!!
+    metadata.AddReplicas(std::move(replicas));
+
+    return response;
+}
+
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {

@@ -173,6 +173,11 @@ struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::CacheOnGet> {
+    static constexpr const char* value = "CacheOnGet";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MoveStart> {
     static constexpr const char* value = "MoveStart";
 };
@@ -729,6 +734,18 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(const std::string& key) {
 
     auto result =
         invoke_rpc<&WrappedMasterService::CopyRevoke, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<CacheOnGetResponse, ErrorCode> MasterClient::CacheOnGet(
+    const std::string& key, const std::string& local_segment) {
+    ScopedVLogTimer timer(1, "MasterClient::CacheOnGet");
+    timer.LogRequest("key=", key, ", local_segment=", local_segment);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::CacheOnGet, CacheOnGetResponse>(
+            client_id_, key, local_segment);
     timer.LogResponseExpected(result);
     return result;
 }

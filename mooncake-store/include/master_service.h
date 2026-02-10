@@ -248,6 +248,23 @@ class MasterService {
                                              const std::string& key);
 
     /**
+     * @brief Cache-on-get: allocate a local replica and set up replication task
+     *
+     * If a local replica already exists or a replication task is in progress,
+     * returns needs_transfer=false. Otherwise allocates a target replica on
+     * local_segment, creates a replication task, and returns the source/target
+     * descriptors for the caller to perform TransferRead.
+     *
+     * @param client_id The client requesting the cache
+     * @param key Object key
+     * @param local_segment Segment name of the local node
+     * @return CacheOnGetResponse on success, ErrorCode on failure
+     */
+    tl::expected<CacheOnGetResponse, ErrorCode> CacheOnGet(
+        const UUID& client_id, const std::string& key,
+        const std::string& local_segment);
+
+    /**
      * @brief Start a move operation
      *
      * This will allocate replica buffer to move to

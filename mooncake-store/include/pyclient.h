@@ -114,12 +114,13 @@ class PyClient {
     virtual int unregister_buffer(void *buffer) = 0;
 
     virtual int64_t get_into(const std::string &key, void *buffer,
-                             size_t size) = 0;
+                             size_t size, bool cache = false) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,
-        const std::vector<size_t> &sizes) = 0;
+        const std::vector<size_t> &sizes,
+        bool cache = false) = 0;
 
     virtual std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
@@ -147,13 +148,13 @@ class PyClient {
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
     virtual std::shared_ptr<BufferHandle> get_buffer(
-        const std::string &key) = 0;
+        const std::string &key, bool cache = false) = 0;
 
     virtual std::tuple<uint64_t, size_t> get_buffer_info(
         const std::string &key) = 0;
 
     virtual std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
-        const std::vector<std::string> &keys) = 0;
+        const std::vector<std::string> &keys, bool cache = false) = 0;
 
     virtual int put_parts(
         const std::string &key, std::vector<std::span<const char>> values,

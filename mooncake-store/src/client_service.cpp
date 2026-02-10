@@ -2320,4 +2320,58 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     return local_hostname_ == replica_transfer_endpoint;
 }
 
+// CacheOnGet RPC already performs the equivalent of CopyStart (allocates target
+// replica, creates replication task, increments source refcount), so we only
+// need TransferRead + CopyEnd here.
+tl::expected<void, ErrorCode> Client::CacheToLocal(
+    const std::string& key,
+    const Replica::Descriptor& source,
+    const Replica::Descriptor& target) {
+    if (!source.is_memory_replica() || !target.is_memory_replica()) {
+        LOG(ERROR) << "CacheToLocal: source or target is not a memory replica";
+        master_client_.CopyRevoke(key);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto& target_desc = target.get_memory_descriptor().buffer_descriptor;
+    void* buffer = reinterpret_cast<void*>(target_desc.buffer_address_);
+    auto slices = split_into_slices(buffer, target_desc.size_);
+
+    auto transfer_err = TransferRead(source, slices);
+    if (transfer_err != ErrorCode::OK) {
+        LOG(ERROR) << "CacheToLocal: TransferRead failed for key=" << key;
+        master_client_.CopyRevoke(key);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+
+    auto end_result = master_client_.CopyEnd(key);
+    if (!end_result.has_value()) {
+        LOG(ERROR) << "CacheToLocal: CopyEnd failed for key=" << key;
+        master_client_.CopyRevoke(key);
+        return tl::make_unexpected(end_result.error());
+    }
+
+    return {};
+}
+
+tl::expected<bool, ErrorCode> Client::TryCacheOnGet(
+    const std::string& key, const std::string& local_segment) {
+    auto cache_result = master_client_.CacheOnGet(key, local_segment);
+    if (!cache_result.has_value()) {
+        return tl::make_unexpected(cache_result.error());
+    }
+
+    const auto& response = cache_result.value();
+    if (!response.needs_transfer) {
+        return true;
+    }
+
+    auto transfer_result = CacheToLocal(key, response.source, response.target);
+    if (!transfer_result.has_value()) {
+        return tl::make_unexpected(transfer_result.error());
+    }
+
+    return true;
+}
+
 }  // namespace mooncake
