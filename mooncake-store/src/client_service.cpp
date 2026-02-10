@@ -1531,6 +1531,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::CacheLocal(
         return tl::unexpected(end_result.error());
     }
 
+    // Update local descriptor to reflect the completed status set by master
+    target_desc.status = ReplicaStatus::COMPLETE;
     return target_desc;
 }
 

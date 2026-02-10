@@ -359,7 +359,8 @@ def run_reader(store):
         check("test_06_cache_data", bytes(buf) == expected, "data mismatch")
 
     # Reader removes the key (clears both remote and local cache)
-    rc = store.remove(REMOVE_KEY)
+    # Use force=True because the preceding get_buffer acquired a lease
+    rc = store.remove(REMOVE_KEY, force=True)
     check("test_06_remove", rc == 0, f"remove failed: {rc}")
 
     # After remove, get should fail
