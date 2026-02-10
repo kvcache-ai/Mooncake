@@ -78,6 +78,14 @@ class LocalHotCache {
     void ReleaseHotKey(const std::string& key);
 
     /**
+     * @brief Touch a key if it exists in the hot cache.
+     * Only touches the LRU, does not modify data or allocation.
+     * @param key Cache key.
+     * @return true if key exists and was touched, false otherwise.
+     */
+    bool TouchHotKey(const std::string& key);
+
+    /**
      * @brief Get the number of cache blocks available.
      * @return Number of blocks in LRU queue (cache size).
      */
@@ -143,7 +151,8 @@ class LocalHotCacheHandler {
      * (default: 2).
      */
     LocalHotCacheHandler(std::shared_ptr<LocalHotCache> hot_cache,
-                         size_t num_worker_threads = 2);
+                         size_t num_worker_threads = 2,
+                         size_t max_queue_capacity = 1024);
 
     ~LocalHotCacheHandler();
 
@@ -171,6 +180,7 @@ class LocalHotCacheHandler {
     std::shared_ptr<LocalHotCache> hot_cache_;
     std::vector<std::thread> workers_;
     std::queue<HotCachePutTask> task_queue_;
+    size_t max_queue_capacity_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     bool shutdown_;

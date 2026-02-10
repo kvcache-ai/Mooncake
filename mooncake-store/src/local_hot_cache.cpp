@@ -178,6 +178,16 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
     }
 }
 
+bool LocalHotCache::TouchHotKey(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    auto it = key_to_lru_it_.find(key);
+    if (it == key_to_lru_it_.end()) {
+        return false;
+    }
+    touchLRU(it);
+    return true;
+}
+
 void LocalHotCache::touchLRU(
     std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator
         it) {
@@ -195,8 +205,11 @@ size_t LocalHotCache::GetCacheSize() const {
 constexpr size_t kDefaultHotCacheWorkers = 2;
 
 LocalHotCacheHandler::LocalHotCacheHandler(
-    std::shared_ptr<LocalHotCache> hot_cache, size_t num_worker_threads)
-    : hot_cache_(hot_cache), shutdown_(false) {
+    std::shared_ptr<LocalHotCache> hot_cache, size_t num_worker_threads,
+    size_t max_queue_capacity)
+    : hot_cache_(hot_cache),
+      max_queue_capacity_(max_queue_capacity),
+      shutdown_(false) {
     size_t workers =
         (num_worker_threads > 0) ? num_worker_threads : kDefaultHotCacheWorkers;
 
@@ -229,6 +242,29 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
         return false;
     }
 
+    if (slice.ptr == nullptr || slice.size == 0) {
+        return false;
+    }
+
+    // Optimization: if key exists, just touch LRU to avoid data copy
+    if (hot_cache_->TouchHotKey(key)) {
+        return true;
+    }
+
+    // Check queue capacity before copy
+    if (max_queue_capacity_ > 0) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (task_queue_.size() >= max_queue_capacity_) {
+            LOG_EVERY_N(WARNING, 100) << "Hot cache task queue full ("
+                                      << task_queue_.size()
+                                      << "), dropping key: " << key;
+            return false;
+        }
+    }
+
+    // Copy data outside lock
+    HotCachePutTask task(key, slice, hot_cache_);
+
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (shutdown_) {
@@ -236,7 +272,7 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
                 << "Attempting to submit task to shutdown LocalHotCacheHandler";
             return false;
         }
-        task_queue_.emplace(key, slice, hot_cache_);
+        task_queue_.push(std::move(task));
     }
     queue_cv_.notify_one();
     return true;
@@ -282,5 +318,5 @@ void LocalHotCacheHandler::workerThread() {
 
     VLOG(2) << "LocalHotCacheHandler worker thread exiting";
 }
-
 }  // namespace mooncake
+
