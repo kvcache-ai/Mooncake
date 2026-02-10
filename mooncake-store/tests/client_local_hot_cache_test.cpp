@@ -247,8 +247,8 @@ TEST_F(LocalHotCacheTest, ZeroSizeCache) {
     EXPECT_EQ(cache.GetCacheSize(), 0);
 }
 
-// Test PutHotSlice basic functionality
-TEST_F(LocalHotCacheTest, PutHotSliceBasic) {
+// Test PutHotKey basic functionality
+TEST_F(LocalHotCacheTest, PutHotKeyBasic) {
     const size_t cache_size =
         32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
@@ -256,55 +256,55 @@ TEST_F(LocalHotCacheTest, PutHotSliceBasic) {
     const size_t slice_size = 1024;
     Slice slice = CreateSlice(slice_size, 'X');
 
-    EXPECT_TRUE(cache.PutHotSlice("test_key_0", slice));
-    EXPECT_TRUE(cache.HasHotSlice("test_key_0"));
+    EXPECT_TRUE(cache.PutHotKey("test_key_0", slice));
+    EXPECT_TRUE(cache.HasHotKey("test_key_0"));
 
-    HotMemBlock* block = cache.GetHotSlice("test_key_0");
+    HotMemBlock* block = cache.GetHotKey("test_key_0");
     VerifySliceData(block, slice_size, 'X');
 }
 
-// Test PutHotSlice with multiple keys
-TEST_F(LocalHotCacheTest, PutHotSliceMultipleKeys) {
+// Test PutHotKey with multiple keys
+TEST_F(LocalHotCacheTest, PutHotKeyMultipleKeys) {
     const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
     LocalHotCache cache(cache_size);
 
     // Put first key
     Slice slice1 = CreateSlice(1024, 'A');
-    EXPECT_TRUE(cache.PutHotSlice("key1", slice1));
+    EXPECT_TRUE(cache.PutHotKey("key1", slice1));
 
     // Put second key
     Slice slice2 = CreateSlice(2048, 'B');
-    EXPECT_TRUE(cache.PutHotSlice("key2", slice2));
+    EXPECT_TRUE(cache.PutHotKey("key2", slice2));
 
-    EXPECT_TRUE(cache.HasHotSlice("key1"));
-    EXPECT_TRUE(cache.HasHotSlice("key2"));
+    EXPECT_TRUE(cache.HasHotKey("key1"));
+    EXPECT_TRUE(cache.HasHotKey("key2"));
 
-    HotMemBlock* block1 = cache.GetHotSlice("key1");
+    HotMemBlock* block1 = cache.GetHotKey("key1");
     VerifySliceData(block1, 1024, 'A');
 
-    HotMemBlock* block2 = cache.GetHotSlice("key2");
+    HotMemBlock* block2 = cache.GetHotKey("key2");
     VerifySliceData(block2, 2048, 'B');
 }
 
-// Test PutHotSlice with existing key (touch LRU)
-TEST_F(LocalHotCacheTest, PutHotSliceTouchExisting) {
+// Test PutHotKey with existing key (touch LRU)
+TEST_F(LocalHotCacheTest, PutHotKeyTouchExisting) {
     const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
     LocalHotCache cache(cache_size);
 
     Slice slice = CreateSlice(1024, 'X');
-    EXPECT_TRUE(cache.PutHotSlice("test_key", slice));
+    EXPECT_TRUE(cache.PutHotKey("test_key", slice));
 
     // Put same key again (should just touch LRU, not copy data)
     Slice slice2 = CreateSlice(1024, 'Y');
-    EXPECT_TRUE(cache.PutHotSlice("test_key", slice2));
+    EXPECT_TRUE(cache.PutHotKey("test_key", slice2));
 
     // Data should still be 'X' (not updated)
-    HotMemBlock* block = cache.GetHotSlice("test_key");
+    HotMemBlock* block = cache.GetHotKey("test_key");
     VerifySliceData(block, 1024, 'X');
 }
 
-// Test PutHotSlice with invalid parameters
-TEST_F(LocalHotCacheTest, PutHotSliceInvalidParams) {
+// Test PutHotKey with invalid parameters
+TEST_F(LocalHotCacheTest, PutHotKeyInvalidParams) {
     const size_t cache_size =
         32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
@@ -313,13 +313,13 @@ TEST_F(LocalHotCacheTest, PutHotSliceInvalidParams) {
     Slice null_slice;
     null_slice.ptr = nullptr;
     null_slice.size = 1024;
-    EXPECT_FALSE(cache.PutHotSlice("key", null_slice));
+    EXPECT_FALSE(cache.PutHotKey("key", null_slice));
 
     // Test with zero size
     Slice zero_slice;
     zero_slice.ptr = malloc(1024);
     zero_slice.size = 0;
-    EXPECT_FALSE(cache.PutHotSlice("key", zero_slice));
+    EXPECT_FALSE(cache.PutHotKey("key", zero_slice));
     free(zero_slice.ptr);
 
     // Test with size larger than block size
@@ -327,12 +327,12 @@ TEST_F(LocalHotCacheTest, PutHotSliceInvalidParams) {
     large_slice.ptr =
         malloc(17 * 1024 * 1024);  // 17MB > 16MB (default block size)
     large_slice.size = 17 * 1024 * 1024;
-    EXPECT_FALSE(cache.PutHotSlice("key", large_slice));
+    EXPECT_FALSE(cache.PutHotKey("key", large_slice));
     free(large_slice.ptr);
 }
 
-// Test PutHotSlice with invalid parameters (custom block size)
-TEST_F(LocalHotCacheTest, PutHotSliceInvalidParamsWithCustomBlockSize) {
+// Test PutHotKey with invalid parameters (custom block size)
+TEST_F(LocalHotCacheTest, PutHotKeyInvalidParamsWithCustomBlockSize) {
     const size_t block_size = 4 * 1024 * 1024;  // 4MB
     const size_t cache_size = 8 * 1024 * 1024;  // 8MB = 2 blocks (4MB each)
     LocalHotCache cache(cache_size, block_size);
@@ -341,7 +341,7 @@ TEST_F(LocalHotCacheTest, PutHotSliceInvalidParamsWithCustomBlockSize) {
     Slice large_slice;
     large_slice.ptr = malloc(5 * 1024 * 1024);  // 5MB > 4MB (custom block size)
     large_slice.size = 5 * 1024 * 1024;
-    EXPECT_FALSE(cache.PutHotSlice("key", large_slice));
+    EXPECT_FALSE(cache.PutHotKey("key", large_slice));
     free(large_slice.ptr);
 }
 
@@ -353,91 +353,91 @@ TEST_F(LocalHotCacheTest, LRUEviction) {
 
     // Fill cache with 2 blocks
     Slice slice1 = CreateSlice(1024, 'A');
-    EXPECT_TRUE(cache.PutHotSlice("key1", slice1));
+    EXPECT_TRUE(cache.PutHotKey("key1", slice1));
 
     Slice slice2 = CreateSlice(1024, 'B');
-    EXPECT_TRUE(cache.PutHotSlice("key2", slice2));
+    EXPECT_TRUE(cache.PutHotKey("key2", slice2));
 
     // Add third key, should evict key1 (LRU)
     Slice slice3 = CreateSlice(1024, 'C');
-    EXPECT_TRUE(cache.PutHotSlice("key3", slice3));
+    EXPECT_TRUE(cache.PutHotKey("key3", slice3));
 
-    EXPECT_FALSE(cache.HasHotSlice("key1"));  // Should be evicted
-    EXPECT_TRUE(cache.HasHotSlice("key2"));
-    EXPECT_TRUE(cache.HasHotSlice("key3"));
+    EXPECT_FALSE(cache.HasHotKey("key1"));  // Should be evicted
+    EXPECT_TRUE(cache.HasHotKey("key2"));
+    EXPECT_TRUE(cache.HasHotKey("key3"));
 }
 
-// Test GetHotSlice updates LRU
-TEST_F(LocalHotCacheTest, GetHotSliceUpdatesLRU) {
+// Test GetHotKey updates LRU
+TEST_F(LocalHotCacheTest, GetHotKeyUpdatesLRU) {
     const size_t cache_size =
         32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
 
     Slice slice1 = CreateSlice(1024, 'A');
-    cache.PutHotSlice("key1", slice1);
+    cache.PutHotKey("key1", slice1);
 
     Slice slice2 = CreateSlice(1024, 'B');
-    cache.PutHotSlice("key2", slice2);
+    cache.PutHotKey("key2", slice2);
 
     // Access key1, should move it to front
-    HotMemBlock* block1 = cache.GetHotSlice("key1");
+    HotMemBlock* block1 = cache.GetHotKey("key1");
     ASSERT_NE(block1, nullptr);
 
     // Add third key, should evict key2 (not key1, since key1 was accessed)
     Slice slice3 = CreateSlice(1024, 'C');
-    cache.PutHotSlice("key3", slice3);
+    cache.PutHotKey("key3", slice3);
 
-    EXPECT_TRUE(cache.HasHotSlice("key1"));   // Should still be there
-    EXPECT_FALSE(cache.HasHotSlice("key2"));  // Should be evicted
-    EXPECT_TRUE(cache.HasHotSlice("key3"));
+    EXPECT_TRUE(cache.HasHotKey("key1"));   // Should still be there
+    EXPECT_FALSE(cache.HasHotKey("key2"));  // Should be evicted
+    EXPECT_TRUE(cache.HasHotKey("key3"));
 }
 
-// Test GetHotSlice with non-existent key
-TEST_F(LocalHotCacheTest, GetHotSliceMiss) {
+// Test GetHotKey with non-existent key
+TEST_F(LocalHotCacheTest, GetHotKeyMiss) {
     const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
     LocalHotCache cache(cache_size);
 
-    HotMemBlock* block = cache.GetHotSlice("non_existent_key");
+    HotMemBlock* block = cache.GetHotKey("non_existent_key");
     EXPECT_EQ(block, nullptr);
 }
 
-// Test that GetHotSlice marks block as in_use and prevents PutHotSlice from
+// Test that GetHotKey marks block as in_use and prevents PutHotKey from
 // reusing it
-TEST_F(LocalHotCacheTest, GetHotSliceProtectsBlockFromReuse) {
+TEST_F(LocalHotCacheTest, GetHotKeyProtectsBlockFromReuse) {
     // Create cache with only 1 block (16MB default block size)
     const size_t cache_size = 16 * 1024 * 1024;  // 16MB = 1 block
     LocalHotCache cache(cache_size);
 
     // Put first key
     Slice slice1 = CreateSlice(1024, 'A');
-    EXPECT_TRUE(cache.PutHotSlice("key1", slice1));
-    EXPECT_TRUE(cache.HasHotSlice("key1"));
+    EXPECT_TRUE(cache.PutHotKey("key1", slice1));
+    EXPECT_TRUE(cache.HasHotKey("key1"));
 
     // Get the block - this should mark it as in_use
-    HotMemBlock* block1 = cache.GetHotSlice("key1");
+    HotMemBlock* block1 = cache.GetHotKey("key1");
     ASSERT_NE(block1, nullptr);
     VerifySliceData(block1, 1024, 'A');
 
     // Try to put a second key - should fail because all blocks are in_use
     Slice slice2 = CreateSlice(1024, 'B');
-    EXPECT_FALSE(cache.PutHotSlice("key2", slice2))
-        << "PutHotSlice should fail when all blocks are in_use";
-    EXPECT_FALSE(cache.HasHotSlice("key2"));
+    EXPECT_FALSE(cache.PutHotKey("key2", slice2))
+        << "PutHotKey should fail when all blocks are in_use";
+    EXPECT_FALSE(cache.HasHotKey("key2"));
 
     // Release the block
-    cache.ReleaseHotSlice("key1");
+    cache.ReleaseHotKey("key1");
 
-    // Now PutHotSlice should succeed
-    EXPECT_TRUE(cache.PutHotSlice("key2", slice2));
-    EXPECT_TRUE(cache.HasHotSlice("key2"));
+    // Now PutHotKey should succeed
+    EXPECT_TRUE(cache.PutHotKey("key2", slice2));
+    EXPECT_TRUE(cache.HasHotKey("key2"));
 
     // Verify key2 data
-    HotMemBlock* block2 = cache.GetHotSlice("key2");
+    HotMemBlock* block2 = cache.GetHotKey("key2");
     ASSERT_NE(block2, nullptr);
     VerifySliceData(block2, 1024, 'B');
 
     // key1 should be evicted since we only have 1 block
-    EXPECT_FALSE(cache.HasHotSlice("key1"));
+    EXPECT_FALSE(cache.HasHotKey("key1"));
 }
 
 // Test LocalHotCacheHandler basic functionality
@@ -459,8 +459,8 @@ TEST_F(LocalHotCacheTest, LocalHotCacheHandlerBasic) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Verify data was cached
-    EXPECT_TRUE(cache->HasHotSlice("async_key"));
-    HotMemBlock* block = cache->GetHotSlice("async_key");
+    EXPECT_TRUE(cache->HasHotKey("async_key"));
+    HotMemBlock* block = cache->GetHotKey("async_key");
     VerifySliceData(block, slice_size, 'Z');
 }
 
@@ -501,11 +501,11 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
                 slice.size = 1024;
 
                 // Put the key
-                EXPECT_TRUE(cache.PutHotSlice(key, slice));
+                EXPECT_TRUE(cache.PutHotKey(key, slice));
                 successful_puts++;
 
                 // Get it back - should succeed since cache has enough capacity
-                HotMemBlock* block = cache.GetHotSlice(key);
+                HotMemBlock* block = cache.GetHotKey(key);
                 EXPECT_NE(block, nullptr) << "Block should not be nullptr with "
                                              "sufficient cache capacity";
                 successful_gets++;
@@ -698,13 +698,13 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
 }
 
 /**
- * Test updateReplicaDescriptorFromCache and ProcessSlicesAsync indirectly
+ * Test RedirectToHotCache and ProcessSlicesAsync indirectly
  * through Client::Get and Client::BatchGet
  *
  * IMPORTANT: With a single client, data is stored locally, so:
  * - ProcessSlicesAsync won't cache local transfers (transport_endpoint_ ==
  * local_hostname_)
- * - updateReplicaDescriptorFromCache won't find cached data (nothing was
+ * - RedirectToHotCache won't find cached data (nothing was
  * cached)
  * - we need multiple clients (one Put, another Get from non-local) to test
  * cache hit scenarios

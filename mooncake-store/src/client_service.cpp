@@ -662,11 +662,9 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     // Check local hot cache and update replica descriptor if cache hit
-    size_t cache_hits = 0;
     bool cache_used = false;
     if (hot_cache_ && replica.is_memory_replica()) {
-        cache_hits = updateReplicaDescriptorFromCache(object_key, replica);
-        cache_used = (cache_hits > 0);
+        cache_used = RedirectToHotCache(object_key, replica);
     }
 
     auto t0_get = std::chrono::steady_clock::now();
@@ -674,11 +672,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
-        hot_cache_->ReleaseHotSlice(object_key);
+        hot_cache_->ReleaseHotKey(object_key);
     }
 
     // Asynchronously update local hot cache with TE transfer slices
-    if (hot_cache_ && hot_cache_handler_) {
+    if (hot_cache_) {
         ProcessSlicesAsync(object_key, slices, replica);
     }
 
@@ -702,7 +700,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Log cache hit statistics
     if (hot_cache_ && replica.is_memory_replica()) {
         VLOG(1) << "Get completed: key=" << object_key
-                << " cache_hits=" << cache_hits;
+                << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
     return {};
@@ -750,8 +748,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         // Check local hot cache and update replica descriptor if cache hit
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
-            size_t cache_hits = updateReplicaDescriptorFromCache(key, replica);
-            cache_used = (cache_hits > 0);
+            cache_used = RedirectToHotCache(key, replica);
         }
 
         auto& memory_descriptor = replica.get_memory_descriptor();
@@ -793,7 +790,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 // Release cache block even on failure (memcpy may have started)
                 if (hot_cache_ && idx < op.cache_used.size() &&
                     op.cache_used[idx]) {
-                    hot_cache_->ReleaseHotSlice(object_keys[index]);
+                    hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
@@ -810,12 +807,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 // done)
                 if (hot_cache_ && idx < op.cache_used.size() &&
                     op.cache_used[idx]) {
-                    hot_cache_->ReleaseHotSlice(object_keys[index]);
+                    hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
 
                 // Asynchronously update local hot cache with TE transfer slices
-                if (hot_cache_ && hot_cache_handler_ &&
-                    idx < op.replicas.size() &&
+                if (hot_cache_ && idx < op.replicas.size() &&
                     idx < op.batched_slices.size()) {
                     ProcessSlicesAsync(object_keys[index],
                                        op.batched_slices[idx],
@@ -896,10 +892,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
-            size_t key_cache_hits =
-                updateReplicaDescriptorFromCache(key, replica);
-            total_cache_hits += key_cache_hits;
-            cache_used = (key_cache_hits > 0);
+            cache_used = RedirectToHotCache(key, replica);
+            if (cache_used) {
+                total_cache_hits++;
+            }
         }
 
         // Submit transfer operation asynchronously
@@ -908,7 +904,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
-                hot_cache_->ReleaseHotSlice(key);
+                hot_cache_->ReleaseHotKey(key);
             }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
@@ -930,7 +926,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
-            hot_cache_->ReleaseHotSlice(key);
+            hot_cache_->ReleaseHotKey(key);
         }
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
@@ -941,7 +937,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[index] = {};
 
             // asynchronously update local hot cache with TE transfer slices
-            if (hot_cache_ && hot_cache_handler_) {
+            if (hot_cache_) {
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end()) {
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
@@ -979,25 +975,27 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     return results;
 }
 
-size_t Client::updateReplicaDescriptorFromCache(const std::string& key,
-                                                Replica::Descriptor& replica) {
+bool Client::RedirectToHotCache(const std::string& key,
+                                Replica::Descriptor& replica) {
     if (!replica.is_memory_replica() || !hot_cache_) {
-        return 0;
+        return false;
     }
 
-    size_t cache_hits = 0;
     auto& mem_desc = replica.get_memory_descriptor();
-    HotMemBlock* blk = hot_cache_->GetHotSlice(key);
-    if (blk != nullptr) {
-        cache_hits++;
-        mem_desc.buffer_descriptor.transport_endpoint_ = local_hostname_;
-        mem_desc.buffer_descriptor.buffer_address_ =
-            reinterpret_cast<uintptr_t>(blk->addr);
-        if (mem_desc.buffer_descriptor.size_ != blk->size) {
-            LOG(WARNING) << "Cache hit but size mismatch for key: " << key;
-        }
+    HotMemBlock* blk = hot_cache_->GetHotKey(key);
+    if (blk == nullptr) {
+        return false;
     }
-    return cache_hits;
+
+    if (mem_desc.buffer_descriptor.size_ != blk->size) {
+        LOG(ERROR) << "Cache hit but size mismatch for key: " << key;
+        return false;
+    }
+
+    mem_desc.buffer_descriptor.transport_endpoint_ = local_hostname_;
+    mem_desc.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(blk->addr);
+    return true;
 }
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
@@ -2503,7 +2501,7 @@ ErrorCode Client::InitLocalHotCache() {
         // Environment variable not set or invalid, disable cache
         hot_cache_.reset();
         hot_cache_handler_.reset();
-        return ErrorCode::INVALID_PARAMS;
+        return ErrorCode::OK;
     }
 
     // Read LOCAL_HOT_BLOCK_SIZE from environment
@@ -2534,7 +2532,7 @@ ErrorCode Client::InitLocalHotCache() {
 void Client::ProcessSlicesAsync(const std::string& key,
                                 const std::vector<Slice>& slices,
                                 const Replica::Descriptor& replica) {
-    if (!(hot_cache_ && hot_cache_handler_ && replica.is_memory_replica())) {
+    if (!(hot_cache_ && replica.is_memory_replica())) {
         return;
     }
 
@@ -2547,7 +2545,11 @@ void Client::ProcessSlicesAsync(const std::string& key,
 
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
-        hot_cache_handler_->SubmitPutTask(key, slices[i]);
+        if (!hot_cache_handler_->SubmitPutTask(key, slices[i])) {
+            LOG(ERROR) << "Failed to submit hot cache put task for key=" << key
+                       << " slice_idx=" << i;
+            return;
+        }
     }
 }
 

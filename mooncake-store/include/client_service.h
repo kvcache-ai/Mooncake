@@ -488,13 +488,13 @@ class Client {
     size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
 
     /**
-     * @brief Update replica descriptor from local hot cache
+     * @brief Redirect replica descriptor to local hot cache if cache hit
      * @param key Object key
      * @param replica Replica descriptor
-     * @return The number of cache hits (blocks found in local hot cache)
+     * @return true if cache hit and replica descriptor was updated, false otherwise
      */
-    size_t updateReplicaDescriptorFromCache(const std::string& key,
-                                            Replica::Descriptor& replica);
+    bool RedirectToHotCache(const std::string& key,
+                            Replica::Descriptor& replica);
 
     /**
      * @brief Asynchronously process slices and update hot cache for TE

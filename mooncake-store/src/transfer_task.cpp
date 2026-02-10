@@ -707,10 +707,13 @@ std::string extractIpAddress(const std::string& endpoint) {
     // Handle IPv6 format: [ipv6]:port
     if (endpoint[0] == '[') {
         size_t closing_bracket = endpoint.find(']');
-        if (closing_bracket != std::string::npos) {
-            return endpoint.substr(
-                1, closing_bracket - 1);  // Extract IPv6 address
+        if (closing_bracket == std::string::npos) {
+            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
+            // Return empty to avoid mis-parsing and disable local memcpy optimization
+            return "";
         }
+        return endpoint.substr(
+            1, closing_bracket - 1);  // Extract IPv6 address
     }
 
     // Handle IPv4 or hostname:port format

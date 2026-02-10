@@ -36,6 +36,7 @@ LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
                 block->addr = base_ptr + i * block_size_;
                 block->size = block_size_;
                 block->in_use = false;
+                block->key_.clear();  // Initialize key as empty
                 lru_queue_.push_back(block.get());
                 blocks_.emplace_back(std::move(block));
             }
@@ -48,6 +49,7 @@ LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
                     block->addr = ptr;
                     block->size = block_size_;
                     block->in_use = false;
+                    block->key_.clear();  // Initialize key as empty
                     lru_queue_.push_back(block.get());
                     blocks_.emplace_back(std::move(block));
                 }
@@ -70,8 +72,10 @@ LocalHotCache::~LocalHotCache() {
     }
 }
 
-bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
+bool LocalHotCache::PutHotKey(const std::string& key, const Slice& src) {
     if (src.ptr == nullptr || src.size == 0) {
+        LOG(ERROR) << "Invalid slice parameters: ptr=" << src.ptr
+                   << ", size=" << src.size << " for key: " << key;
         return false;
     }
 
@@ -94,6 +98,7 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
     // use LRU tail block as victim for reuse
     // Skip blocks that are currently in use (being read from)
     if (lru_queue_.empty()) {
+        LOG(ERROR) << "Hot cache is empty, fail to put key: " << key;
         return false;
     }
 
@@ -117,13 +122,11 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
     auto it_front = lru_queue_.begin();
 
     // if victim is bound to old key, remove old mapping
-    auto old = block_to_key_map_.find(victim);
-    if (old != block_to_key_map_.end()) {
-        auto it_map = key_to_lru_it_.find(old->second);
+    if (!victim->key_.empty()) {
+        auto it_map = key_to_lru_it_.find(victim->key_);
         if (it_map != key_to_lru_it_.end()) {
             key_to_lru_it_.erase(it_map);
         }
-        block_to_key_map_.erase(old);
     }
 
     // copy data from src slice to victim block
@@ -132,17 +135,17 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
 
     // create new mapping
     key_to_lru_it_[key] = it_front;
-    block_to_key_map_[victim] = key;
+    victim->key_ = key;
 
     return true;
 }
 
-bool LocalHotCache::HasHotSlice(const std::string& key) const {
+bool LocalHotCache::HasHotKey(const std::string& key) const {
     std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     return key_to_lru_it_.find(key) != key_to_lru_it_.end();
 }
 
-HotMemBlock* LocalHotCache::GetHotSlice(const std::string& key) {
+HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
@@ -150,6 +153,7 @@ HotMemBlock* LocalHotCache::GetHotSlice(const std::string& key) {
     }
     HotMemBlock* blk = *(it->second);
     if (!blk) {
+        LOG(ERROR) << "Invalid block for key: " << key;
         return nullptr;
     }
 
@@ -157,14 +161,12 @@ HotMemBlock* LocalHotCache::GetHotSlice(const std::string& key) {
     blk->in_use = true;
 
     // update lru queue
-    lru_queue_.erase(it->second);
-    lru_queue_.push_front(blk);
-    it->second = lru_queue_.begin();
+    touchLRU(it);
 
     return blk;
 }
 
-void LocalHotCache::ReleaseHotSlice(const std::string& key) {
+void LocalHotCache::ReleaseHotKey(const std::string& key) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
@@ -209,7 +211,7 @@ LocalHotCacheHandler::~LocalHotCacheHandler() {
     // Signal shutdown
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        shutdown_.store(true);
+        shutdown_ = true;
     }
     queue_cv_.notify_all();
 
@@ -229,7 +231,7 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (shutdown_.load()) {
+        if (shutdown_) {
             LOG(WARNING)
                 << "Attempting to submit task to shutdown LocalHotCacheHandler";
             return false;
@@ -250,10 +252,10 @@ void LocalHotCacheHandler::workerThread() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cv_.wait(lock, [this] {
-                return shutdown_.load() || !task_queue_.empty();
+                return shutdown_ || !task_queue_.empty();
             });
 
-            if (shutdown_.load() && task_queue_.empty()) {
+            if (shutdown_ && task_queue_.empty()) {
                 break;
             }
 
@@ -269,7 +271,7 @@ void LocalHotCacheHandler::workerThread() {
                 Slice slice;
                 slice.ptr = task.data.data();
                 slice.size = task.size;
-                task.hot_cache->PutHotSlice(task.key, slice);
+                task.hot_cache->PutHotKey(task.key, slice);
                 VLOG(2) << "Hot cache put task completed for key: " << task.key;
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async hot cache put for key "

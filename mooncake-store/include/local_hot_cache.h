@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <list>
@@ -21,9 +20,10 @@ namespace mooncake {
  * @brief Memory block metadata for hot cache.
  */
 struct HotMemBlock {
-    void* addr;   // Memory address
-    size_t size;  // Block size in bytes
+    void* addr;   // Memory address (allocated block_size_ bytes)
+    size_t size;  // Actual cached data size in bytes (<= block_size_)
     bool in_use;  // Whether the block is currently in use
+    std::string key_;  // Cache key bound to this block (empty if not bound)
 };
 
 /**
@@ -49,33 +49,33 @@ class LocalHotCache {
      * If key already exists, it only moves the node to the LRU head (KV data is
      * assumed identical, no copy). Otherwise reuses the LRU tail block, binds
      * it to the key, and moves it to the head.
-     * @param key Cache key: {request key}_{slice index}
+     * @param key Cache key: {request key}
      * @param src Source slice to cache (size must be <= block size).
      * @return true on success, false on invalid params or no block available.
      */
-    bool PutHotSlice(const std::string& key, const Slice& src);
+    bool PutHotKey(const std::string& key, const Slice& src);
 
     /**
      * @brief Check if the key exists in cache.
-     * @param key Cache key: {request key}_{slice index}
+     * @param key Cache key: {request key}
      */
-    bool HasHotSlice(const std::string& key) const;
+    bool HasHotKey(const std::string& key) const;
 
     /**
      * @brief Get the underlying HotMemBlock pointer and touch LRU.
      * The block will be marked as in_use to prevent it from being reused
-     * until ReleaseHotSlice is called.
-     * @param key : {request key}_{slice index}
+     * until ReleaseHotKey is called.
+     * @param key : {request key}
      * @return HotMemBlock* on hit; nullptr on miss.
      */
-    HotMemBlock* GetHotSlice(const std::string& key);
+    HotMemBlock* GetHotKey(const std::string& key);
 
     /**
-     * @brief Release a hot slice block, marking it as no longer in use.
+     * @brief Release a hot key block, marking it as no longer in use.
      * This should be called after the block is no longer being read from.
-     * @param key : {request key}_{slice index}
+     * @param key : {request key}
      */
-    void ReleaseHotSlice(const std::string& key);
+    void ReleaseHotKey(const std::string& key);
 
     /**
      * @brief Get the number of cache blocks available.
@@ -104,12 +104,10 @@ class LocalHotCache {
     void* bulk_memory_standard_;
 
     mutable std::shared_mutex lru_mutex_;
-    std::list<HotMemBlock*> lru_queue_;  // prefilled LRU
+    std::list<HotMemBlock*> lru_queue_ GUARDED_BY(lru_mutex_);  // prefilled LRU
     // key -> iterator of lru_queue_
     std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>
-        key_to_lru_it_;
-    // block -> key, used to remove old mapping when reusing LRU tail block
-    std::unordered_map<HotMemBlock*, std::string> block_to_key_map_;
+        key_to_lru_it_ GUARDED_BY(lru_mutex_);
 };
 
 /**
@@ -133,7 +131,7 @@ struct HotCachePutTask {
 };
 
 /**
- * @brief Handler for asynchronously executing PutHotSlice operations.
+ * @brief Handler for asynchronously executing PutHotKey operations.
  */
 class LocalHotCacheHandler {
    public:
@@ -160,7 +158,7 @@ class LocalHotCacheHandler {
      *
      * The slice data will be deep copied, so the original slice data can be
      * safely freed after this function returns.
-     * @param key Cache key (composite key: {object key}_{slice index}).
+     * @param key Cache key: {object key}
      * @param slice Source slice to cache.
      * @return true if task was successfully submitted, false otherwise (e.g.,
      * hot_cache_ is null or handler is shutdown).
@@ -175,7 +173,7 @@ class LocalHotCacheHandler {
     std::queue<HotCachePutTask> task_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
-    std::atomic<bool> shutdown_;
+    bool shutdown_;
 };
 
 }  // namespace mooncake
