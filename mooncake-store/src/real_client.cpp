@@ -1461,8 +1461,7 @@ int64_t RealClient::get_into(const std::string &key, void *buffer, size_t size,
         }
         std::vector<mooncake::Slice> slices;
         allocateSlices(slices, replica, buffer);
-        QueryResult qr({replica},
-                       std::chrono::steady_clock::time_point::max());
+        QueryResult qr({replica}, std::chrono::steady_clock::time_point::max());
         auto get_result = client_->Get(key, qr, slices);
         if (get_result) {
             return static_cast<int64_t>(total_size);
@@ -1480,15 +1479,14 @@ int64_t RealClient::get_into(const std::string &key, void *buffer, size_t size,
 
     // Cache the data locally for future calls
     if (client_ && !local_cache_.Contains(key)) {
-        auto cache_result =
-            client_->CacheLocal(key, buffer, result.value());
+        auto cache_result = client_->CacheLocal(key, buffer, result.value());
         if (cache_result) {
             auto alloc_result =
                 client_buffer_allocator_->allocate(result.value());
             if (alloc_result) {
                 memcpy(alloc_result->ptr(), buffer, result.value());
-                auto handle = std::make_shared<BufferHandle>(
-                    std::move(*alloc_result));
+                auto handle =
+                    std::make_shared<BufferHandle>(std::move(*alloc_result));
                 local_cache_.Insert(key, handle, cache_result.value(),
                                     result.value());
             }
@@ -1726,14 +1724,14 @@ std::vector<int64_t> RealClient::batch_get_into(
             hit_qrs.push_back(std::move(hit.query_result));
             hit_slices[hit.key] = std::move(hit.slices);
         }
-        auto batch_results =
-            client_->BatchGet(hit_keys, hit_qrs, hit_slices);
+        auto batch_results = client_->BatchGet(hit_keys, hit_qrs, hit_slices);
         for (size_t j = 0; j < batch_results.size(); ++j) {
             if (!batch_results[j]) {
                 // Transfer failed, demote to miss
                 auto &hit = cache_hits[j];
-                LOG(WARNING) << "Local cache transfer failed for key: "
-                             << hit.key << ", falling back to remote";
+                LOG(WARNING)
+                    << "Local cache transfer failed for key: " << hit.key
+                    << ", falling back to remote";
                 results[hit.original_index] = -1;
                 miss_keys.push_back(keys[hit.original_index]);
                 miss_buffers.push_back(buffers[hit.original_index]);

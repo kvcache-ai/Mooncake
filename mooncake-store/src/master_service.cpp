@@ -1106,8 +1106,7 @@ tl::expected<Replica::Descriptor, ErrorCode> MasterService::CacheLocalStart(
 }
 
 tl::expected<void, ErrorCode> MasterService::CacheLocalEnd(
-    const UUID& client_id, const std::string& key,
-    ReplicaID replica_id) {
+    const UUID& client_id, const std::string& key, ReplicaID replica_id) {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1129,8 +1128,7 @@ tl::expected<void, ErrorCode> MasterService::CacheLocalEnd(
 }
 
 tl::expected<void, ErrorCode> MasterService::CacheLocalRevoke(
-    const UUID& client_id, const std::string& key,
-    ReplicaID replica_id) {
+    const UUID& client_id, const std::string& key, ReplicaID replica_id) {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";

@@ -754,8 +754,8 @@ tl::expected<Replica::Descriptor, ErrorCode> MasterClient::CacheLocalStart(
     timer.LogRequest("key=", key, ", tgt_segment=", tgt_segment);
 
     auto result =
-        invoke_rpc<&WrappedMasterService::CacheLocalStart,
-                    Replica::Descriptor>(client_id_, key, tgt_segment);
+        invoke_rpc<&WrappedMasterService::CacheLocalStart, Replica::Descriptor>(
+            client_id_, key, tgt_segment);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -45,8 +45,7 @@ class LocalCache {
      *         write lock (i.e., use under shared lock externally,
      *         or copy the entry).
      */
-    std::optional<CacheEntry> LookupEntry(
-        const std::string& key) const {
+    std::optional<CacheEntry> LookupEntry(const std::string& key) const {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         auto it = cache_.find(key);
         if (it != cache_.end()) {
@@ -58,8 +57,7 @@ class LocalCache {
     /**
      * @brief Insert a new cache entry. Overwrites if key exists.
      */
-    void Insert(const std::string& key,
-                std::shared_ptr<BufferHandle> handle,
+    void Insert(const std::string& key, std::shared_ptr<BufferHandle> handle,
                 const Replica::Descriptor& desc, uint64_t size) {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         cache_[key] = CacheEntry{std::move(handle), desc, size};

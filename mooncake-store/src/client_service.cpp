@@ -1494,8 +1494,7 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 tl::expected<Replica::Descriptor, ErrorCode> Client::CacheLocal(
     const std::string& key, const void* data_ptr, size_t data_size) {
     // Step 1: Ask master to allocate a replica on the local segment
-    auto start_result =
-        master_client_.CacheLocalStart(key, local_hostname_);
+    auto start_result = master_client_.CacheLocalStart(key, local_hostname_);
     if (!start_result) {
         if (start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "CacheLocal: key=" << key

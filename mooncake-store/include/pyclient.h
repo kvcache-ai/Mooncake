@@ -113,13 +113,12 @@ class PyClient {
 
     virtual int unregister_buffer(void *buffer) = 0;
 
-    virtual int64_t get_into(const std::string &key, void *buffer,
-                             size_t size, bool local_cache = false) = 0;
+    virtual int64_t get_into(const std::string &key, void *buffer, size_t size,
+                             bool local_cache = false) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers,
-        const std::vector<size_t> &sizes,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         bool local_cache = false) = 0;
 
     virtual std::vector<int> batch_get_into_multi_buffers(
