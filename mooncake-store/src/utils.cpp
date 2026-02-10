@@ -186,9 +186,15 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     // Traditional mmap allocation (fallback or arena disabled).
     // map_size is aligned to hugepage size only (not caller alignment), so that
     // free_buffer_mmap_memory() can compute the same size without the alignment param.
-    // mmap returns page-aligned pointers (4096), satisfying any alignment <= page size.
+    // mmap returns page-aligned pointers (4096), or hugepage-aligned when
+    // MAP_HUGETLB is set by get_hugepage_size_from_env().
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
     const size_t hugepage_size = get_hugepage_size_from_env(&flags);
+    const size_t guaranteed_alignment = hugepage_size > 0 ? hugepage_size : 4096;
+    LOG_IF(WARNING, alignment > guaranteed_alignment)
+        << "Fallback mmap cannot honor alignment=" << alignment
+        << " (guaranteed=" << guaranteed_alignment
+        << "); pointer may be under-aligned";
     const size_t map_size = align_up(total_size, hugepage_size);
 
     void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);

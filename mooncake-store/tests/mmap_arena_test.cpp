@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "mmap_arena.h"
+#include "utils.h"
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -715,6 +716,53 @@ TEST_F(MmapArenaTest, MadviseDontForkApplied) {
     // Either way, verify madvise succeeds on the pool region.
     int ret = madvise(base, pool_size, MADV_DONTFORK);
     EXPECT_EQ(ret, 0) << "madvise(MADV_DONTFORK) failed: " << strerror(errno);
+}
+
+// ===== FALLBACK MMAP ALIGNMENT TESTS =====
+
+TEST_F(MmapArenaTest, FallbackMmapHonorsPageAlignment) {
+    // With arena disabled (MC_DISABLE_MMAP_ARENA=1), the fallback mmap path
+    // should return pointers aligned to at least the system page size.
+    // This mirrors client_buffer.cpp which requests alignment=64.
+    setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
+
+    const size_t alloc_size = 64 * 1024;  // 64KB
+    constexpr size_t alignment = 64;      // Cache-line alignment
+
+    void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % alignment, 0u)
+        << "Fallback mmap pointer not aligned to " << alignment;
+
+    // Verify read/write works
+    memset(ptr, 0xAB, alloc_size);
+    EXPECT_EQ(static_cast<uint8_t*>(ptr)[0], 0xAB);
+    EXPECT_EQ(static_cast<uint8_t*>(ptr)[alloc_size - 1], 0xAB);
+
+    free_buffer_mmap_memory(ptr, alloc_size);
+    unsetenv("MC_DISABLE_MMAP_ARENA");
+}
+
+TEST_F(MmapArenaTest, FallbackMmapAllocateFreeCycle) {
+    // Verify multiple allocate/free cycles don't leak or crash.
+    // Exercises the fallback path's map_size computation consistency
+    // between allocate_buffer_mmap_memory and free_buffer_mmap_memory.
+    setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
+
+    constexpr int CYCLES = 8;
+    constexpr size_t alloc_size = 128 * 1024;  // 128KB
+    constexpr size_t alignment = 64;
+
+    for (int i = 0; i < CYCLES; ++i) {
+        void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
+        ASSERT_NE(ptr, nullptr) << "Allocation failed on cycle " << i;
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % alignment, 0u);
+        // Touch memory to ensure mapping is valid
+        memset(ptr, static_cast<uint8_t>(i), alloc_size);
+        free_buffer_mmap_memory(ptr, alloc_size);
+    }
+
+    unsetenv("MC_DISABLE_MMAP_ARENA");
 }
 
 } // namespace mooncake
