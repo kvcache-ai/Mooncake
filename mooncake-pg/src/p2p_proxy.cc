@@ -2,7 +2,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -224,7 +223,6 @@ void P2PProxy::Start() {
 void P2PProxy::Stop() {
     bool expected_send = true;
     if (send_worker_running_.compare_exchange_strong(expected_send, false)) {
-        send_queue_cv_.notify_all();
         if (send_worker_thread_.joinable()) {
             send_worker_thread_.join();
         }
@@ -232,7 +230,6 @@ void P2PProxy::Stop() {
 
     bool expected_recv = true;
     if (recv_worker_running_.compare_exchange_strong(expected_recv, false)) {
-        recv_queue_cv_.notify_all();
         if (recv_worker_thread_.joinable()) {
             recv_worker_thread_.join();
         }
@@ -248,7 +245,6 @@ void P2PProxy::EnqueueSend(SendOp op) {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
         send_queue_.emplace(std::move(op));
     }
-    send_queue_cv_.notify_one();
 }
 
 void P2PProxy::EnqueueRecv(RecvOp op) {
@@ -258,7 +254,6 @@ void P2PProxy::EnqueueRecv(RecvOp op) {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
         recv_queue_.push(std::move(op));
     }
-    recv_queue_cv_.notify_one();
 }
 
 P2PProxy::SendTransferTask::SendTransferTask(uint64_t chunk_offset_in,
@@ -330,28 +325,6 @@ uint64_t P2PProxy::GetRemoteCtrlRecvHeadOffset(int peer_rank) const {
 uint64_t P2PProxy::GetRemoteCtrlSendTailOffset(int peer_rank) const {
     return meta_->segmentInfos[peer_rank].p2p_ctrl_send +
            rank_ * sizeof(P2PControlSlot) + offsetof(P2PControlSlot, tail);
-}
-
-bool P2PProxy::HasLocalSendWork() const {
-    for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
-        const auto& lane = send_peer_lanes_[peer_rank];
-        if (!lane.pending_send_ops_.empty() ||
-            lane.active_send_op_.has_value()) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool P2PProxy::HasLocalRecvWork() const {
-    for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
-        const auto& lane = recv_peer_lanes_[peer_rank];
-        if (!lane.pending_recv_ops_.empty() ||
-            lane.active_recv_op_.has_value()) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool P2PProxy::TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity) {
@@ -729,12 +702,7 @@ void P2PProxy::SendWorkerThread() {
         bool did_work = false;
 
         {
-            std::unique_lock<std::mutex> lock(send_queue_mutex_);
-            while (send_queue_.empty() && send_worker_running_.load() &&
-                   !HasLocalSendWork()) {
-                send_queue_cv_.wait_for(lock, std::chrono::microseconds(50));
-            }
-
+            std::lock_guard<std::mutex> lock(send_queue_mutex_);
             while (!send_queue_.empty()) {
                 SendOpContext op_ctx = std::move(send_queue_.front());
                 send_queue_.pop();
@@ -829,13 +797,7 @@ void P2PProxy::RecvWorkerThread() {
         bool did_work = false;
 
         {
-            std::unique_lock<std::mutex> lock(recv_queue_mutex_);
-            while (recv_queue_.empty() &&
-                   recv_worker_running_.load(std::memory_order_acquire) &&
-                   !HasLocalRecvWork()) {
-                recv_queue_cv_.wait_for(lock, std::chrono::microseconds(50));
-            }
-
+            std::lock_guard<std::mutex> lock(recv_queue_mutex_);
             while (!recv_queue_.empty()) {
                 RecvOp op = std::move(recv_queue_.front());
                 recv_queue_.pop();

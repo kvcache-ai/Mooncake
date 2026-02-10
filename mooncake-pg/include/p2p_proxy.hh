@@ -5,7 +5,6 @@
 #include <torch/torch.h>
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -37,6 +36,20 @@ struct alignas(64) AtomicHeadTail {
     uint32_t value{0};
 };
 
+// Ring-control metadata for one peer lane.
+//
+//   slot index:   0 -> 1 -> 2 -> ... -> N-1 -> 0   (N = kP2PNumSlots)
+//                   ^h (producer publish cursor)
+//                   ^t (consumer reclaim cursor)
+//
+// State by (head, tail), modulo N:
+// - empty: head == tail
+// - full : (head + 1) % N == tail   (one slot reserved to distinguish full/empty)
+// - ready: head != tail
+//
+// Protocol:
+// - producer writes slot[head], then advances head (publish)
+// - consumer reads slot[tail], then advances tail (reclaim)
 struct P2PControlSlot {
     AtomicHeadTail head;
     AtomicHeadTail tail;
@@ -169,8 +182,6 @@ class P2PProxy {
         std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
     };
 
-    bool HasLocalSendWork() const;
-    bool HasLocalRecvWork() const;
     bool TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity);
     bool StepSendTransferTask(SendOpContext& op_ctx, SendTransferTask& task);
     bool StepSendDataCopy(SendTransferTask& task);
@@ -211,13 +222,11 @@ class P2PProxy {
 
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;
-    std::condition_variable send_queue_cv_;
     std::atomic<bool> send_worker_running_{false};
     std::thread send_worker_thread_;
 
     std::queue<RecvOp> recv_queue_;
     std::mutex recv_queue_mutex_;
-    std::condition_variable recv_queue_cv_;
     std::atomic<bool> recv_worker_running_{false};
     std::thread recv_worker_thread_;
 
