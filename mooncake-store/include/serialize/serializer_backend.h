@@ -165,13 +165,14 @@ class S3Backend : public SerializerBackend {
  * @brief Local file storage backend implementation
  *
  * Stores snapshot data to local file system
- * Storage path is configured via SNAPSHOT_LOCAL_PATH environment variable
+ * Storage path is configured via MOONCAKE_SNAPSHOT_LOCAL_PATH environment
+ * variable
  */
 class LocalFileBackend : public SerializerBackend {
    public:
     /**
      * @brief Default constructor
-     * Reads storage path from SNAPSHOT_LOCAL_PATH environment variable
+     * Reads storage path from MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable
      * If not set, uses default path /tmp/mooncake_snapshots
      */
     LocalFileBackend();

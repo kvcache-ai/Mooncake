@@ -96,7 +96,7 @@ std::string S3Backend::GetConnectionInfo() const {
 
 namespace {
 constexpr const char* kDefaultLocalPath = "/tmp/mooncake_snapshots";
-constexpr const char* kEnvLocalPath = "SNAPSHOT_LOCAL_PATH";
+constexpr const char* kEnvLocalPath = "MOONCAKE_SNAPSHOT_LOCAL_PATH";
 }  // namespace
 
 LocalFileBackend::LocalFileBackend() {
