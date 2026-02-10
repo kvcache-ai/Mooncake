@@ -44,7 +44,7 @@ jobs:
 
               if (runs.data.workflow_runs.length === 0) {
                 console.log(`No successful runs found for ${workflowFile}`);
-                return;
+                return 0;
               }
 
               const run = runs.data.workflow_runs[0];
@@ -56,6 +56,7 @@ jobs:
                 run_id: run.id,
               });
 
+              let count = 0;
               for (const artifact of artifacts.data.artifacts) {
                 if (!artifact.name.startsWith(artifactPrefix)) {
                   continue;
@@ -73,12 +74,19 @@ jobs:
                 const zipPath = path.join(artifactDir, `${artifact.name}.zip`);
                 fs.writeFileSync(zipPath, Buffer.from(download.data));
                 console.log(`Saved to ${zipPath}`);
+                count++;
               }
+              return count;
             }
 
             // Download from both CI workflows
-            await downloadLatestArtifacts('ci.yml', 'mooncake-wheel-ubuntu-py');
-            await downloadLatestArtifacts('ci_cu13.yml', 'mooncake-wheel-cu130-ubuntu-py');
+            let downloaded = 0;
+            downloaded += await downloadLatestArtifacts('ci.yml', 'mooncake-wheel-ubuntu-py');
+            downloaded += await downloadLatestArtifacts('ci_cu13.yml', 'mooncake-wheel-cu130-ubuntu-py');
+
+            if (downloaded === 0) {
+              core.setFailed('No artifacts were downloaded from any CI workflow');
+            }
 
       - name: Extract wheel files
         run: |
@@ -92,7 +100,7 @@ jobs:
 
       - name: Verify wheel files exist
         run: |
-          if [ ! -f nightly-release/*.whl ]; then
+          if [ -z "$(find nightly-release -name '*.whl' 2>/dev/null)" ]; then
             echo "ERROR: No wheel files found"
             exit 1
           fi
