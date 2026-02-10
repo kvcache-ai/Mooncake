@@ -128,13 +128,22 @@ int TEBenchRunner::allocateBuffers() {
         }
 #ifdef USE_CUDA
     } else if (XferBenchConfig::seg_type == "VRAM") {
-        int num_buffers = 0;
-        cudaGetDeviceCount(&num_buffers);
+        int gpu_count = 0;
+        cudaGetDeviceCount(&gpu_count);
+        int start_gpu = 0, num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_gpu = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_gpu < gpu_count)
+                << "local_gpu_id " << start_gpu << " exceeds device count "
+                << gpu_count;
+        }
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {
-            auto location = "cuda:" + std::to_string(i);
+            int gpu_id = start_gpu + i;
+            auto location = "cuda:" + std::to_string(gpu_id);
             pinned_buffer_list_[i] =
-                allocateMemoryPool(total_buffer_size, i, true);
+                allocateMemoryPool(total_buffer_size, gpu_id, true);
             engine_->registerLocalMemory(pinned_buffer_list_[i],
                                          total_buffer_size, location);
         }
