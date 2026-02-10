@@ -7,8 +7,8 @@ set(MOONCAKE_STORE_SOURCES
     client_service.cpp
     client_metric.cpp
     types.cpp
-    master_client.cpp
-    centralized_master_client.cpp
+    # master_client.cpp  # Temporarily excluded: yalantinglibs v0.5.6 incompatibility
+    # centralized_master_client.cpp  # Depends on master_client.h
     utils.cpp
     master_metric_manager.cpp
     storage_backend.cpp

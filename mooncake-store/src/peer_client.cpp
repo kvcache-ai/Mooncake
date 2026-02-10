@@ -1,47 +1,131 @@
 #include "peer_client.h"
 
+#include <cstdlib>
 #include <glog/logging.h>
+
+#include "client_rpc_service.h"
 #include "types.h"
 
 namespace mooncake {
 
-tl::expected<void, ErrorCode> PeerClient::Connect(const std::string& endpoint) {
+tl::expected<void, ErrorCode> PeerClient::Connect(
+    const std::string& endpoint) {
     endpoint_ = endpoint;
-    // TODO: Implement actual connection logic
-    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+
+    coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        pool_conf.client_config.socket_config =
+            coro_io::ib_socket_t::config_t{};
+    }
+
+    client_pools_ =
+        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+            pool_conf);
+    client_pool_ = client_pools_->at(endpoint);
+
+    return {};
+}
+
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+PeerClient::AsyncReadRemoteData(const RemoteReadRequest& request) {
+    if (!client_pool_) {
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto ret = co_await client_pool_->send_request(
+        [&](coro_io::client_reuse_hint,
+            coro_rpc::coro_rpc_client& client) {
+            return client.send_request<&ClientRpcService::ReadRemoteData>(
+                request);
+        });
+    if (!ret.has_value()) {
+        LOG(ERROR) << "AsyncReadRemoteData: client not available";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto result = co_await std::move(ret.value());
+    if (!result) {
+        LOG(ERROR) << "AsyncReadRemoteData: RPC call failed: "
+                   << result.error().msg;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    co_return result->result();
+}
+
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+PeerClient::AsyncWriteRemoteData(const RemoteWriteRequest& request) {
+    if (!client_pool_) {
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto ret = co_await client_pool_->send_request(
+        [&](coro_io::client_reuse_hint,
+            coro_rpc::coro_rpc_client& client) {
+            return client
+                .send_request<&ClientRpcService::WriteRemoteData>(
+                    request);
+        });
+    if (!ret.has_value()) {
+        LOG(ERROR) << "AsyncWriteRemoteData: client not available";
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    auto result = co_await std::move(ret.value());
+    if (!result) {
+        LOG(ERROR) << "AsyncWriteRemoteData: RPC call failed: "
+                   << result.error().msg;
+        co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
+    co_return result->result();
 }
 
 tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(
     const RemoteReadRequest& request) {
-    // TODO: Implement actual RPC call to remote client
-    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+    return async_simple::coro::syncAwait(AsyncReadRemoteData(request));
 }
 
 tl::expected<void, ErrorCode> PeerClient::WriteRemoteData(
     const RemoteWriteRequest& request) {
-    // TODO: Implement actual RPC call to remote client
-    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+    return async_simple::coro::syncAwait(AsyncWriteRemoteData(request));
 }
 
 std::vector<tl::expected<void, ErrorCode>> PeerClient::BatchReadRemoteData(
     const BatchRemoteReadRequest& request) {
-    // TODO: Implement actual batch RPC calls to remote client
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(request.keys.size());
+
     for (size_t i = 0; i < request.keys.size(); ++i) {
-        results.push_back(tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED));
+        RemoteReadRequest single_request;
+        single_request.key = request.keys[i];
+        if (i < request.dest_buffers_list.size()) {
+            single_request.dest_buffers = request.dest_buffers_list[i];
+        }
+        results.push_back(ReadRemoteData(single_request));
     }
+
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> PeerClient::BatchWriteRemoteData(
     const BatchRemoteWriteRequest& request) {
-    // TODO: Implement actual batch RPC calls to remote client
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(request.keys.size());
+
     for (size_t i = 0; i < request.keys.size(); ++i) {
-        results.push_back(tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED));
+        RemoteWriteRequest single_request;
+        single_request.key = request.keys[i];
+        if (i < request.src_buffers_list.size()) {
+            single_request.src_buffers = request.src_buffers_list[i];
+        }
+        if (i < request.target_tier_ids.size()) {
+            single_request.target_tier_id = request.target_tier_ids[i];
+        }
+        results.push_back(WriteRemoteData(single_request));
     }
+
     return results;
 }
 
