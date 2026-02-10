@@ -214,6 +214,11 @@ jobs:
         source ~/.bashrc
         make -j
         make install
+    - name: Run ZMQ Communicator Python test
+      run: |
+        pip install dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        python mooncake-transfer-engine/tests/zmq_communicator_example.py
       shell: bash
 
   test-wheel-ubuntu:
