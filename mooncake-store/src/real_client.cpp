@@ -778,6 +778,9 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Wait for any inflight cache-on-get for this key to complete,
+    // otherwise the PROCESSING cache replica blocks Remove.
+    wait_cache_inflight(key);
     auto remove_result = client_->Remove(key, force);
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
@@ -795,6 +798,8 @@ tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Wait for all inflight cache-on-get operations to complete.
+    wait_all_cache_inflight();
     return client_->RemoveByRegex(str, force);
 }
 
@@ -807,6 +812,8 @@ tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // Wait for all inflight cache-on-get operations to complete.
+    wait_all_cache_inflight();
     return client_->RemoveAll(force);
 }
 
@@ -2550,7 +2557,21 @@ void RealClient::try_cache_on_get(const std::string &key) {
         // Remove from inflight set
         std::unique_lock<std::shared_mutex> wlock(self->cache_inflight_mutex_);
         self->cache_inflight_.erase(key);
+        wlock.unlock();
+        self->cache_inflight_cv_.notify_all();
     }).detach();
+}
+
+void RealClient::wait_cache_inflight(const std::string &key) {
+    std::shared_lock<std::shared_mutex> rlock(cache_inflight_mutex_);
+    cache_inflight_cv_.wait(rlock,
+        [&]() { return cache_inflight_.count(key) == 0; });
+}
+
+void RealClient::wait_all_cache_inflight() {
+    std::shared_lock<std::shared_mutex> rlock(cache_inflight_mutex_);
+    cache_inflight_cv_.wait(rlock,
+        [&]() { return cache_inflight_.empty(); });
 }
 
 }  // namespace mooncake

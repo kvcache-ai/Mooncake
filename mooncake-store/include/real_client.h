@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <condition_variable>
 #include <shared_mutex>
 #include <csignal>
 #include <memory>
@@ -565,11 +566,14 @@ class RealClient : public PyClient {
     // Cache-on-get inflight deduplication
     // Protected by shared_mutex: read lock to check, write lock to insert/erase
     std::shared_mutex cache_inflight_mutex_;
+    std::condition_variable_any cache_inflight_cv_;
     std::unordered_set<std::string> cache_inflight_;
     // Fire-and-forget: launches async caching in background thread.
     // Caller always proceeds with remote transfer at normal speed.
     // Future calls benefit from the cached local replica.
     void try_cache_on_get(const std::string &key);
+    void wait_cache_inflight(const std::string &key);
+    void wait_all_cache_inflight();
 };
 
 }  // namespace mooncake
