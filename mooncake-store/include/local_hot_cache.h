@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <list>
@@ -21,10 +22,11 @@ namespace mooncake {
  * @brief Memory block metadata for hot cache.
  */
 struct HotMemBlock {
-    void* addr;        // Memory address (allocated block_size_ bytes)
-    size_t size;       // Actual cached data size in bytes (<= block_size_)
-    bool in_use;       // Whether the block is currently in use
-    std::string key_;  // Cache key bound to this block (empty if not bound)
+    void* addr;
+    size_t size;
+    std::atomic<int> ref_count;
+    std::string key_;
+    HotMemBlock() : addr(nullptr), size(0), ref_count(0) {}
 };
 
 /**

@@ -35,7 +35,7 @@ LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
                 auto block = std::make_unique<HotMemBlock>();
                 block->addr = base_ptr + i * block_size_;
                 block->size = block_size_;
-                block->in_use = false;
+                block->ref_count = 0;
                 block->key_.clear();  // Initialize key as empty
                 lru_queue_.push_back(block.get());
                 blocks_.emplace_back(std::move(block));
@@ -48,7 +48,7 @@ LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
                     auto block = std::make_unique<HotMemBlock>();
                     block->addr = ptr;
                     block->size = block_size_;
-                    block->in_use = false;
+                    block->ref_count = 0;
                     block->key_.clear();  // Initialize key as empty
                     lru_queue_.push_back(block.get());
                     blocks_.emplace_back(std::move(block));
@@ -79,7 +79,7 @@ bool LocalHotCache::PutHotKey(HotMemBlock* block) {
 
     // Handle return-to-lru tail case (empty key or cancelled task)
     if (block->key_.empty()) {
-        block->in_use = false;
+        block->ref_count = 0;
         lru_queue_.push_back(block);  // Add to tail as free block
         return false;
     }
@@ -91,13 +91,13 @@ bool LocalHotCache::PutHotKey(HotMemBlock* block) {
     if (key_to_lru_it_.find(key) != key_to_lru_it_.end()) {
         // Lost race -> Return to lru tail as free block
         block->key_.clear();
-        block->in_use = false;
+        block->ref_count = 0;
         lru_queue_.push_back(block);
         return false;
     }
 
     // Publish the new mapping
-    block->in_use = false;
+    block->ref_count = 0;
     lru_queue_.push_front(block);
     key_to_lru_it_[key] = lru_queue_.begin();
     return true;
@@ -121,7 +121,7 @@ HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
     }
 
     // Mark block as in use to prevent it from being reused during memcpy
-    blk->in_use = true;
+    blk->ref_count++;
 
     // update lru queue
     touchLRU(it);
@@ -135,9 +135,9 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
     if (it == key_to_lru_it_.end()) {
         return;
     }
-    HotMemBlock* blk = *(it->second);
-    if (blk) {
-        blk->in_use = false;
+    HotMemBlock* block = *(it->second);
+    if (block) {
+        block->ref_count--;
     }
 }
 
@@ -161,7 +161,7 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
     // Find the first block from the tail that is not in use
     auto victim_it = lru_queue_.end();
     for (auto it = lru_queue_.rbegin(); it != lru_queue_.rend(); ++it) {
-        if (!(*it)->in_use) {
+        if ((*it)->ref_count == 0) {
             // Convert reverse iterator to forward iterator
             victim_it = std::next(it).base();
             break;
@@ -189,7 +189,7 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
 
     // Now this block is exclusively owned by the caller.
     // It is detached from the cache structure.
-    victim->in_use = false;
+    victim->ref_count = 0;
 
     return victim;
 }
