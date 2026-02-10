@@ -109,8 +109,8 @@ class MasterMetricManager {
     void inc_unmount_segment_failures(int64_t val = 1);
     void inc_remount_segment_requests(int64_t val = 1);
     void inc_remount_segment_failures(int64_t val = 1);
-    void inc_ping_requests(int64_t val = 1);
-    void inc_ping_failures(int64_t val = 1);
+    void inc_heartbeat_requests(int64_t val = 1);
+    void inc_heartbeat_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
@@ -160,8 +160,8 @@ class MasterMetricManager {
     int64_t get_unmount_segment_failures();
     int64_t get_remount_segment_requests();
     int64_t get_remount_segment_failures();
-    int64_t get_ping_requests();
-    int64_t get_ping_failures();
+    int64_t get_heartbeat_requests();
+    int64_t get_heartbeat_failures();
 
     // Batch Operation Statistics Getters
     int64_t get_batch_exist_key_requests();
@@ -291,8 +291,8 @@ class MasterMetricManager {
     ylt::metric::counter_t unmount_segment_failures_;
     ylt::metric::counter_t remount_segment_requests_;
     ylt::metric::counter_t remount_segment_failures_;
-    ylt::metric::counter_t ping_requests_;
-    ylt::metric::counter_t ping_failures_;
+    ylt::metric::counter_t heartbeat_requests_;
+    ylt::metric::counter_t heartbeat_failures_;
 
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;

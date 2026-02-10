@@ -30,12 +30,13 @@ class AllocatedBuffer {
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    void* buffer_ptr, std::size_t size,
+                    void* buffer_ptr, std::size_t size, const UUID& segment_id,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
           buffer_ptr_(buffer_ptr),
           size_(size),
+          segment_id_(segment_id),
           offset_handle_(std::move(offset_handle)) {}
 
     ~AllocatedBuffer();
@@ -58,6 +59,8 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    [[nodiscard]] UUID getSegmentId() const noexcept { return segment_id_; }
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);
@@ -74,6 +77,7 @@ class AllocatedBuffer {
     std::weak_ptr<BufferAllocatorBase> allocator_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
+    UUID segment_id_;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
@@ -92,6 +96,7 @@ class BufferAllocatorBase {
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
+    virtual UUID getSegmentId() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
 
     /**
@@ -133,7 +138,8 @@ class CachelibBufferAllocator
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
-                            std::string transport_endpoint);
+                            std::string transport_endpoint,
+                            const UUID& segment_id);
 
     ~CachelibBufferAllocator() override;
 
@@ -144,6 +150,7 @@ class CachelibBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    UUID getSegmentId() const override { return segment_id_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
@@ -164,6 +171,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const UUID segment_id_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -184,7 +192,8 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
-                          std::string transport_endpoint);
+                          std::string transport_endpoint,
+                          const UUID& segment_id);
 
     ~OffsetBufferAllocator() override;
 
@@ -195,6 +204,7 @@ class OffsetBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    UUID getSegmentId() const override { return segment_id_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
@@ -211,6 +221,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const UUID segment_id_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

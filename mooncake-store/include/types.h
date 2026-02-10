@@ -3,9 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <optional>
 #include <string>
-#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -30,8 +28,9 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
-static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
-static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
+static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;       // in seconds
+static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;     // in seconds
+static constexpr int64_t DEFAULT_CLIENT_CRASHED_TTL_SEC = 30;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
@@ -102,6 +101,9 @@ enum class ErrorCode : int32_t {
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
     CLIENT_NOT_FOUND = -103,          ///< Client not found.
+    CLIENT_ALREADY_EXISTS = -104,     ///< Client already exists.
+    CLIENT_UNHEALTHY =
+        -105,  ///< Client is not in a healthy state for the operation.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
@@ -197,28 +199,49 @@ const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
 const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
 
+struct CentralizedSegmentExtraData {
+    uintptr_t base{0};
+    std::string te_endpoint;
+    YLT_REFL(CentralizedSegmentExtraData, base, te_endpoint);
+};
 /**
- * @brief Represents a contiguous memory region
+ * @brief Represents a contiguous storage region
  */
 struct Segment {
     UUID id{0, 0};
     std::string name{};  // Logical segment name used for preferred allocation
-    uintptr_t base{0};
     size_t size{0};
-    // TE p2p endpoint (ip:port) for transport-only addressing
-    std::string te_endpoint{};
-    Segment() = default;
+
+    // Polymorphic extra data
+    std::variant<CentralizedSegmentExtraData> extra;
+
+    // Helper to check type
+    bool IsCentralizedSegment() const {
+        return std::holds_alternative<CentralizedSegmentExtraData>(extra);
+    }
+
+    CentralizedSegmentExtraData& GetCentralizedExtra() {
+        if (!IsCentralizedSegment()) extra = CentralizedSegmentExtraData{};
+        return std::get<CentralizedSegmentExtraData>(extra);
+    }
+    const CentralizedSegmentExtraData& GetCentralizedExtra() const {
+        return std::get<CentralizedSegmentExtraData>(extra);
+    }
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint);
+YLT_REFL(Segment, id, name, size, extra);
 
 /**
- * @brief Client status from the master's perspective
+ * @brief Client status from the master's perspective.
+ *
+ * State machine: HEALTH -> DISCONNECTION (heartbeat timeout)
+ *                DISCONNECTION -> HEALTH (heartbeat recovered)
+ *                DISCONNECTION -> CRASHED (long-term timeout)
  */
 enum class ClientStatus {
-    UNDEFINED = 0,  // Uninitialized
-    OK,             // Client is alive, no need to remount for now
-    NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master,
-                    // so need to remount
+    UNDEFINED = 0,  // Client does not exist
+    HEALTH,         // Normal operation
+    DISCONNECTION,  // Heartbeat lost, waiting for recovery
+    CRASHED,        // Terminal state, all metadata will be cleaned up
 };
 
 /**
@@ -228,8 +251,9 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ClientStatus& status) noexcept {
     static const std::unordered_map<ClientStatus, std::string_view>
         status_strings{{ClientStatus::UNDEFINED, "UNDEFINED"},
-                       {ClientStatus::OK, "OK"},
-                       {ClientStatus::NEED_REMOUNT, "NEED_REMOUNT"}};
+                       {ClientStatus::HEALTH, "HEALTH"},
+                       {ClientStatus::DISCONNECTION, "DISCONNECTION"},
+                       {ClientStatus::CRASHED, "CRASHED"}};
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");
@@ -263,6 +287,34 @@ struct StorageObjectMetadata {
     YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
              transport_endpoint);
 };
+
+/**
+ * @brief object iteration strategy in for-each interface
+ */
+enum class ObjectIterateStrategy {
+    // Iterate over objects in order
+    ORDERED = 0,
+
+    // Choose a random object
+    RANDOM = 1,
+
+    // Choose a object with the most available capacity
+    CAPACITY_PRIORITY = 2,
+};
+
+inline std::ostream& operator<<(
+    std::ostream& os, const ObjectIterateStrategy& strategy) noexcept {
+    static const std::unordered_map<ObjectIterateStrategy, std::string_view>
+        strategy_strings{
+            {ObjectIterateStrategy::ORDERED, "ORDERED"},
+            {ObjectIterateStrategy::RANDOM, "RANDOM"},
+            {ObjectIterateStrategy::CAPACITY_PRIORITY, "CAPACITY_PRIORITY"},
+        };
+
+    os << (strategy_strings.count(strategy) ? strategy_strings.at(strategy)
+                                            : "UNKNOWN");
+    return os;
+}
 
 }  // namespace mooncake
 

@@ -59,7 +59,10 @@ void WrappedCentralizedMasterService::init_centralized_http_server() {
     http_server_.set_http_handler<GET>(
         "/query_key", [&](coro_http_request& req, coro_http_response& resp) {
             auto key = req.get_query_value("key");
-            auto get_result = master_service_.GetReplicaList(std::string(key));
+            auto get_result = master_service_.GetReplicaList(
+                std::string(key),
+                GetReplicaListRequestConfig(
+                    GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES));
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             if (get_result) {
                 std::string ss = "";
@@ -289,31 +292,43 @@ WrappedCentralizedMasterService::BatchPutRevoke(
     return results;
 }
 
-tl::expected<void, ErrorCode> WrappedCentralizedMasterService::MountSegment(
-    const Segment& segment, const UUID& client_id) {
-    return execute_rpc(
-        "MountSegment",
-        [&] { return master_service_.MountSegment(segment, client_id); },
-        [&](auto& timer) {
-            timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                             ", segment_name=", segment.name,
-                             ", id=", segment.id);
-        },
-        [] { MasterMetricManager::instance().inc_mount_segment_requests(); },
-        [] { MasterMetricManager::instance().inc_mount_segment_failures(); });
-}
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedCentralizedMasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "BatchReplicaClear");
+    const size_t total_keys = object_keys.size();
+    timer.LogRequest("object_keys_count=", total_keys,
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    MasterMetricManager::instance().inc_batch_replica_clear_requests(
+        total_keys);
 
-tl::expected<void, ErrorCode> WrappedCentralizedMasterService::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id) {
-    return execute_rpc(
-        "ReMountSegment",
-        [&] { return master_service_.ReMountSegment(segments, client_id); },
-        [&](auto& timer) {
-            timer.LogRequest("segments_count=", segments.size(),
-                             ", client_id=", client_id);
-        },
-        [] { MasterMetricManager::instance().inc_remount_segment_requests(); },
-        [] { MasterMetricManager::instance().inc_remount_segment_failures(); });
+    auto result =
+        master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_keys;
+        LOG(WARNING) << "BatchReplicaClear failed: "
+                     << toString(result.error());
+    } else {
+        const size_t cleared_count = result.value().size();
+        failure_count = total_keys - cleared_count;
+        timer.LogResponse("total=", total_keys, ", cleared=", cleared_count,
+                          ", failed=", failure_count);
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_replica_clear_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_replica_clear_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 tl::expected<std::string, ErrorCode>
@@ -376,67 +391,13 @@ WrappedCentralizedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
-tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedCentralizedMasterService::GetReplicaList(const std::string& key) {
-    return execute_rpc(
-        "GetReplicaList", [&] { return master_service_.GetReplicaList(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
-        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
-        [] {
-            MasterMetricManager::instance().inc_get_replica_list_failures();
-        });
-}
-
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedCentralizedMasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys) {
-    ScopedVLogTimer timer(1, "BatchGetReplicaList");
-    const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
-    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
-        total_keys);
-
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (const auto& key : keys) {
-        results.emplace_back(master_service_.GetReplicaList(key));
-    }
-
-    size_t failure_count = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].has_value()) {
-            failure_count++;
-            auto error = results[i].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::REPLICA_IS_NOT_READY) {
-                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
-            } else {
-                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
-                           << "] '" << keys[i] << "': " << toString(error);
-            }
-        }
-    }
-
-    if (failure_count == total_keys) {
-        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
-            failure_count);
-    } else if (failure_count != 0) {
-        MasterMetricManager::instance()
-            .inc_batch_get_replica_list_partial_success(failure_count);
-    }
-
-    timer.LogResponse("total=", results.size(),
-                      ", success=", results.size() - failure_count,
-                      ", failures=", failure_count);
-    return results;
-}
-
 void RegisterCentralizedRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedCentralizedMasterService& wrapped_master_service) {
     RegisterRpcService(server, wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::BatchReplicaClear>(
+        &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedCentralizedMasterService::PutStart>(
             &wrapped_master_service);
@@ -454,12 +415,7 @@ void RegisterCentralizedRpcService(
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::BatchPutRevoke>(
         &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedCentralizedMasterService::MountSegment>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedCentralizedMasterService::ReMountSegment>(
-        &wrapped_master_service);
+
     server
         .register_handler<&mooncake::WrappedCentralizedMasterService::GetFsdir>(
             &wrapped_master_service);
@@ -474,12 +430,6 @@ void RegisterCentralizedRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::NotifyOffloadSuccess>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedCentralizedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedCentralizedMasterService::BatchGetReplicaList>(
         &wrapped_master_service);
 }
 

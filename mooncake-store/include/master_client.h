@@ -14,10 +14,8 @@
 #include <ylt/coro_io/client_pool.hpp>
 
 #include "client_metric.h"
-#include "replica.h"
 #include "types.h"
 #include "rpc_types.h"
-#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -59,6 +57,24 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
+    /**
+     * @brief Gets replica list for an object
+     * @param object_key Key to query
+     * @param config Filter configuration for getting replica list
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaList(const std::string& key,
+                   const GetReplicaListRequestConfig& config =
+                       GetReplicaListRequestConfig());
+
+    /**
+     * @brief Batch query read routes
+     */
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        const GetReplicaListRequestConfig& config =
+                            GetReplicaListRequestConfig());
 
     /**
      * @brief Calculate cache hit rate metrics
@@ -78,20 +94,6 @@ class MasterClient {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids);
-
-    /**
-     * @brief Batch clear KV cache for specified object keys on a specific
-     * segment for a given client.
-     * @param object_keys Vector of object key strings to clear.
-     * @param client_id The UUID of the client that owns the object keys.
-     * @param segment_name The name of the segment (storage device) to clear
-     * from.
-     * @return An expected object containing a vector of successfully cleared
-     * object keys on success, or an ErrorCode on failure.
-     */
-    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
-    BatchReplicaClear(const std::vector<std::string>& object_keys,
-                      const UUID& client_id, const std::string& segment_name);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
@@ -136,11 +138,29 @@ class MasterClient {
         const UUID& segment_id);
 
     /**
-     * @brief Pings master to check its availability
-     * @return tl::expected<PingResponse, ErrorCode>
+     * @brief Sends heartbeat to master to maintain client liveness
+     * @return tl::expected<HeartbeatResponse, ErrorCode>
      * containing view version and client status
      */
-    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+    [[nodiscard]] tl::expected<HeartbeatResponse, ErrorCode> Heartbeat(
+        const HeartbeatRequest& req);
+
+    /**
+     * @brief Registers a segment to master for allocation
+     * @param segment Segment to register
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
+        const Segment& segment);
+
+    /**
+     * @brief Register client with the master on startup.
+     * Client calls this to register its UUID and local segments.
+     * @param segments Segments to register
+     * @return tl::expected<RegisterClientResponse, ErrorCode>
+     */
+    [[nodiscard]] tl::expected<RegisterClientResponse, ErrorCode>
+    RegisterClient(const std::vector<Segment>& segments);
 
    protected:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)

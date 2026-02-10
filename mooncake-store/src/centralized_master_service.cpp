@@ -21,7 +21,8 @@ CentralizedMasterService::CentralizedObjectMetadata::CentralizedObjectMetadata(
     const UUID& client_id,
     const std::chrono::steady_clock::time_point put_start_time,
     size_t value_length, std::vector<Replica>&& reps, bool enable_soft_pin)
-    : ObjectMetadata(client_id, value_length, std::move(reps)),
+    : ObjectMetadata(value_length, std::move(reps)),
+      owner_client_id_(client_id),
       put_start_time_(put_start_time),
       lease_timeout_(),
       soft_pin_timeout_(std::nullopt) {
@@ -155,7 +156,7 @@ tl::expected<void, ErrorCode>
 CentralizedMasterService::CentralizedObjectMetadata::IsReplicaRemovable(
     const Replica& replica) const {
     if (!IsLeaseExpired()) {
-        // TODO: wannyue-wy
+        // TODO: wanyue-wy
         // Discuss this condition with community:
         // Following old logic of main branch, in BatchReplicaClear(),
         // it clears a replica only when the object has no lease.
@@ -190,8 +191,8 @@ CentralizedMasterService::CentralizedMasterService(
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
-      client_manager_(config.client_live_ttl_sec, config.memory_allocator,
-                      [this] { this->ClearInvalidHandles(); }),
+      client_manager_(config.client_live_ttl_sec, config.client_crashed_ttl_sec,
+                      config.memory_allocator, view_version_),
       memory_allocator_type_(config.memory_allocator),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
@@ -229,6 +230,8 @@ CentralizedMasterService::CentralizedMasterService(
             global_file_segment_size_);
     }
 
+    InitializeClientManager();
+
     client_manager_.Start();
 }
 
@@ -240,76 +243,110 @@ CentralizedMasterService::~CentralizedMasterService() {
     }
 }
 
-auto CentralizedMasterService::MountSegment(const Segment& segment,
-                                            const UUID& client_id)
-    -> tl::expected<void, ErrorCode> {
-    auto result = client_manager_.MountSegment(segment, client_id);
-    if (!result) {
-        LOG(ERROR) << "fail to mount segment"
-                   << ", segment_name=" << segment.name
-                   << ", client_id=" << client_id << ", ret=" << result.error();
-        return result;
-    }
-    return {};
-}
+auto CentralizedMasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::vector<std::string> cleared_keys;
+    cleared_keys.reserve(object_keys.size());
+    const bool clear_all_segments = segment_name.empty();
 
-auto CentralizedMasterService::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id)
-    -> tl::expected<void, ErrorCode> {
-    auto result = client_manager_.ReMountSegment(segments, client_id);
-    if (!result) {
-        LOG(ERROR) << "fail to remount segment"
-                   << ", client_id=" << client_id << ", ret=" << result.error();
-        return result;
-    }
-    return {};
-}
+    for (const auto& key : object_keys) {
+        if (key.empty()) {
+            LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
+            continue;
+        }
+        CentralizedMetadataAccessor accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " not found, skipping";
+            continue;
+        }
 
-void CentralizedMasterService::ClearInvalidHandles() {
-    for (auto& shard : metadata_shards_) {
-        MutexLocker lock(&shard.mutex);
-        auto it = shard.metadata.begin();
-        while (it != shard.metadata.end()) {
-            if (CleanupStaleHandles(*it->second)) {
-                // If the object is empty, we need to erase the iterator
-                it = shard.metadata.erase(it);
-            } else {
-                ++it;
+        auto& metadata = accessor.Get();
+
+        // Security check: Ensure the requesting client owns the object.
+        if (metadata.owner_client_id_ != client_id) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " belongs to different owner_client_id="
+                         << metadata.owner_client_id_
+                         << ", expected=" << client_id << ", skipping";
+            continue;
+        }
+
+        if (clear_all_segments) {
+            if (auto res = metadata.IsObjectRemovable(); !res) {
+                LOG(WARNING) << "BatchReplicaClear: key=" << key
+                             << " cannot be removed, reason=" << res.error();
+                continue;
             }
-        }
-    }
-}
+            OnObjectRemoved(metadata);
 
-bool CentralizedMasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
-    // Iterate through replicas and remove those with invalid allocators
-    auto replica_it = metadata.replicas_.begin();
-    while (replica_it != metadata.replicas_.end()) {
-        // Use any_of algorithm to check if any handle has an invalid allocator
-        bool has_invalid_mem_handle = replica_it->has_invalid_mem_handle();
-
-        // Remove replicas with invalid handles using erase-remove idiom
-        if (has_invalid_mem_handle) {
-            // Update cache statistics before removing the replica
-            OnReplicaRemoved(*replica_it);
-            replica_it = metadata.replicas_.erase(replica_it);
+            // Erase the entire metadata (all replicas will be deallocated)
+            accessor.Erase();
+            cleared_keys.emplace_back(key);
+            VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
+                       "for key="
+                    << key << " for client_id=" << client_id;
         } else {
-            ++replica_it;
+            // Clear only replicas on the specified segment_name
+            bool has_replica_on_segment = false;
+            std::vector<size_t> replicas_to_remove;
+
+            for (size_t i = 0; i < metadata.replicas_.size(); ++i) {
+                const auto& replica = metadata.replicas_[i];
+                if (auto res = metadata.IsReplicaRemovable(replica); !res) {
+                    LOG(WARNING)
+                        << "BatchReplicaClear: key=" << key
+                        << " cannot be removed, reason=" << res.error();
+                    continue;
+                }
+                auto segment_names = replica.get_segment_names();
+                for (const auto& seg_name : segment_names) {
+                    if (seg_name.has_value() &&
+                        seg_name.value() == segment_name) {
+                        has_replica_on_segment = true;
+                        replicas_to_remove.emplace_back(i);
+                        break;
+                    }
+                }
+            }
+
+            if (!has_replica_on_segment) {
+                LOG(WARNING)
+                    << "BatchReplicaClear: key=" << key
+                    << " has no replica on segment_name=" << segment_name
+                    << ", skipping";
+                continue;
+            }
+
+            // Remove replicas in reverse order to keep indices valid
+            auto& shard = accessor.GetShard();
+            for (auto it = replicas_to_remove.rbegin();
+                 it != replicas_to_remove.rend(); ++it) {
+                auto& replica = metadata.replicas_[*it];
+                RemoveReplicaFromSegmentIndex(shard, key, replica);
+                OnReplicaRemoved(replica);
+                metadata.replicas_.erase(metadata.replicas_.begin() + *it);
+            }
+
+            if (metadata.replicas_.empty()) {
+                accessor.Erase();
+            }
+
+            cleared_keys.emplace_back(key);
+            VLOG(1) << "BatchReplicaClear: successfully cleared replicas on "
+                       "segment_name="
+                    << segment_name << " for key=" << key
+                    << " for client_id=" << client_id;
         }
     }
-
-    // Return true if no valid replicas remain after cleanup
-    return metadata.replicas_.empty();
+    return cleared_keys;
 }
 
 void CentralizedMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
     auto& c_metadata = static_cast<CentralizedObjectMetadata&>(metadata);
     c_metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-}
-
-void CentralizedMasterService::OnObjectRemoved(ObjectMetadata& metadata) {
-    for (auto& replica : metadata.replicas_) {
-        OnReplicaRemoved(replica);
-    }
 }
 
 void CentralizedMasterService::OnObjectHit(const ObjectMetadata& metadata) {
@@ -332,14 +369,67 @@ void CentralizedMasterService::OnReplicaRemoved(const Replica& replica) {
     }
 }
 
-auto CentralizedMasterService::GetReplicaList(std::string_view key)
-    -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    auto res = MasterService::GetReplicaList(key);
-    if (!res) {
-        return tl::make_unexpected(res.error());
+void CentralizedMasterService::OnReplicaAdded(const Replica& replica) {
+    if (replica.status() == ReplicaStatus::COMPLETE) {
+        if (replica.is_memory_replica()) {
+            MasterMetricManager::instance().inc_mem_cache_nums();
+        } else if (replica.is_disk_replica()) {
+            MasterMetricManager::instance().inc_file_cache_nums();
+        }
     }
-    return GetReplicaListResponse(std::move(res.value()),
-                                  default_kv_lease_ttl_);
+}
+
+auto CentralizedMasterService::GetReplicaList(
+    const std::string& key, const GetReplicaListRequestConfig& config)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    auto res = MasterService::GetReplicaList(key, config);
+    if (!res) {
+        LOG(ERROR) << "Failed to get replica list for key: " << key;
+        return res;
+    }
+
+    if (!res->centralized_extra) {
+        res->centralized_extra.emplace(default_kv_lease_ttl_);
+    } else {
+        res->centralized_extra->lease_ttl_ms = default_kv_lease_ttl_;
+    }
+    return res;
+}
+
+std::vector<Replica::Descriptor> CentralizedMasterService::FilterReplicas(
+    const GetReplicaListRequestConfig& config, const ObjectMetadata& metadata) {
+    // 1. fillter qualified replicas
+    std::vector<Replica::Descriptor> candidates;
+    candidates.reserve(metadata.replicas_.size());
+    for (const auto& replica : metadata.replicas_) {
+        if (metadata.IsReplicaAccessible(replica)) {
+            candidates.emplace_back(replica.get_descriptor());
+        }
+    }
+
+    if (config.max_candidates ==
+            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES ||
+        config.max_candidates >= candidates.size() || candidates.empty()) {
+        return candidates;
+    }
+
+    // 2. the number of qualified replicas is larger than limit,
+    // choose the best ones.
+    // Priority: Memory > LocalDisk > others
+    std::vector<Replica::Descriptor> sorted_candidates = std::move(candidates);
+    auto get_priority = [](ReplicaType type) {
+        if (type == ReplicaType::MEMORY) return 2;
+        if (type == ReplicaType::LOCAL_DISK) return 1;
+        return 0;
+    };
+
+    std::sort(sorted_candidates.begin(), sorted_candidates.end(),
+              [&](const auto& a, const auto& b) {
+                  return get_priority(a.type()) > get_priority(b.type());
+              });
+
+    sorted_candidates.resize(config.max_candidates);
+    return sorted_candidates;
 }
 
 auto CentralizedMasterService::PutStart(const UUID& client_id,
@@ -370,13 +460,13 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
-    size_t shard_idx = getShardIndex(key);
+    size_t shard_idx = GetShardIndex(key);
     auto& shard = GetCentralizedShard(shard_idx);
     MutexLocker lock(&shard.mutex);
 
     const auto now = std::chrono::steady_clock::now();
     auto it = shard.metadata.find(key);
-    if (it != shard.metadata.end() && !CleanupStaleHandles(*it->second)) {
+    if (it != shard.metadata.end()) {
         auto* metadata =
             static_cast<CentralizedObjectMetadata*>(it->second.get());
         // If the object's PutStart expired and has not completed any
@@ -462,15 +552,31 @@ auto CentralizedMasterService::PutEnd(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id_) {
+    if (client_id != metadata.owner_client_id_) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
-                   << ", was PutStart-ed by " << metadata.client_id_;
+                   << ", was PutStart-ed by " << metadata.owner_client_id_;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
     for (auto& replica : metadata.replicas_) {
-        if (replica.type() == replica_type) {
+        if (replica.type() == replica_type) {  // find the replica to complete
+            // Check that the segment of this replica is still valid.
+            if (replica.type() == ReplicaType::MEMORY) {
+                // Currently, PutEnd() uses replica_type to identify replica,
+                // which means each replica_type only has one replica.
+                // If there are multiple replicas with same type,
+                // here must be modified.
+                if (replica.has_invalid_mem_handle()) {
+                    LOG(ERROR) << "segment allocator expired"
+                               << ", the segment might be unmounted"
+                               << ", key=" << key << ", replica=" << replica;
+                    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+                }
+            }
             replica.mark_complete();
+            AddReplicaToSegmentIndex(accessor.GetShard(), accessor.GetKey(),
+                                     replica);
+            OnReplicaAdded(replica);
         }
         if (enable_offload_) {
             PushOffloadingQueue(key, replica);
@@ -482,11 +588,6 @@ auto CentralizedMasterService::PutEnd(const UUID& client_id,
         accessor.EraseFromProcessing();
     }
 
-    if (replica_type == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().inc_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().inc_file_cache_nums();
-    }
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
@@ -516,9 +617,10 @@ auto CentralizedMasterService::PutRevoke(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id_) {
+    if (client_id != metadata.owner_client_id_) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
-                   << key << ", was PutStart-ed by " << metadata.client_id_;
+                   << key << ", was PutStart-ed by "
+                   << metadata.owner_client_id_;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
@@ -571,6 +673,12 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
     bool update = false;
     for (size_t i = 0; i < metadata.replicas_.size(); ++i) {
         if (metadata.replicas_[i].type() == ReplicaType::LOCAL_DISK) {
+            // TODO: wanyue-wy
+            // The modification of `descriptor` could not take effect in the
+            // `metadata.replicas_`.
+            // The bug also exists in the main branch of Mooncake.
+            // When merge the P2P development branch to the main branch,
+            // we should check whether this bug is fixed.
             auto& descriptor = metadata.replicas_[i]
                                    .get_descriptor()
                                    .get_local_disk_descriptor();
@@ -928,6 +1036,8 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
                     // Evict this object
                     total_freed_size +=
                         metadata->size_ * metadata->GetMemReplicaCount();
+                    RemoveReplicaFromSegmentIndex(shard, it->first,
+                                                  metadata->replicas_);
                     metadata->EraseReplica(
                         ReplicaType::MEMORY);  // Erase memory replicas
                     if (metadata->IsValid() == false) {
@@ -994,6 +1104,8 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
                         // Evict this object
                         total_freed_size +=
                             metadata->size_ * metadata->GetMemReplicaCount();
+                        RemoveReplicaFromSegmentIndex(shard, it->first,
+                                                      metadata->replicas_);
                         metadata->EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
                         if (metadata->IsValid() == false) {
@@ -1049,6 +1161,8 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
                         metadata->lease_timeout_ <= soft_target_timeout) {
                         total_freed_size +=
                             metadata->size_ * metadata->GetMemReplicaCount();
+                        RemoveReplicaFromSegmentIndex(shard, it->first,
+                                                      metadata->replicas_);
                         metadata->EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
                         if (metadata->IsValid() == false) {
@@ -1091,6 +1205,48 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
     VLOG(1) << "action=evict_objects"
             << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
+}
+
+void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
+    // 1. Call base implementation to clean up metadata references
+    MasterService::OnSegmentRemoved(segment_id);
+
+    // 2. Clean up dangling processing keys
+    for (size_t i = 0; i < kNumShards; ++i) {
+        auto& shard = GetShard(i);
+        auto& c_shard = static_cast<CentralizedMetadataShard&>(shard);
+        MutexLocker lock(&shard.mutex);
+
+        auto it = c_shard.processing_keys.begin();
+        while (it != c_shard.processing_keys.end()) {
+            auto meta_it = shard.metadata.find(*it);
+            if (meta_it == shard.metadata.end()) {
+                // Key in processing set but not in metadata -> dangling
+                it = c_shard.processing_keys.erase(it);
+            } else {
+                // Check if this object has replicas on the removed segment
+                // Since this object is in processing_keys, it likely has
+                // PROCESSING replicas (which are not indexed)
+                auto& metadata = *meta_it->second;
+                auto& replicas = metadata.replicas_;
+                for (int k = replicas.size() - 1; k >= 0; --k) {
+                    auto id = replicas[k].get_segment_id();
+                    if (id.has_value() && id.value() == segment_id) {
+                        OnReplicaRemoved(replicas[k]);
+                        replicas.erase(replicas.begin() + k);
+                    }
+                }
+
+                if (replicas.empty()) {
+                    OnObjectRemoved(metadata);
+                    shard.metadata.erase(meta_it);
+                    it = c_shard.processing_keys.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
 }
 
 }  // namespace mooncake

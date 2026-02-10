@@ -5,16 +5,6 @@
 namespace mooncake {
 
 template <>
-struct RpcNameTraits<&WrappedCentralizedMasterService::GetReplicaList> {
-    static constexpr const char* value = "GetReplicaList";
-};
-
-template <>
-struct RpcNameTraits<&WrappedCentralizedMasterService::BatchGetReplicaList> {
-    static constexpr const char* value = "BatchGetReplicaList";
-};
-
-template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -43,22 +33,14 @@ template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::BatchPutRevoke> {
     static constexpr const char* value = "BatchPutRevoke";
 };
-
 template <>
-struct RpcNameTraits<&WrappedCentralizedMasterService::MountSegment> {
-    static constexpr const char* value = "MountSegment";
+struct RpcNameTraits<&WrappedCentralizedMasterService::BatchReplicaClear> {
+    static constexpr const char* value = "BatchReplicaClear";
 };
-
-template <>
-struct RpcNameTraits<&WrappedCentralizedMasterService::ReMountSegment> {
-    static constexpr const char* value = "ReMountSegment";
-};
-
 template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
-
 template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::GetStorageConfig> {
     static constexpr const char* value = "GetStorageConfig";
@@ -78,31 +60,6 @@ template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
 };
-
-tl::expected<GetReplicaListResponse, ErrorCode>
-CentralizedMasterClient::GetReplicaList(const std::string& object_key) {
-    ScopedVLogTimer timer(1, "CentralizedMasterClient::GetReplicaList");
-    timer.LogRequest("object_key=", object_key);
-
-    auto result = invoke_rpc<&WrappedCentralizedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-CentralizedMasterClient::BatchGetReplicaList(
-    const std::vector<std::string>& object_keys) {
-    ScopedVLogTimer timer(1, "CentralizedMasterClient::BatchGetReplicaList");
-    timer.LogRequest("keys_count=", object_keys.size());
-
-    auto result =
-        invoke_batch_rpc<&WrappedCentralizedMasterService::BatchGetReplicaList,
-                         GetReplicaListResponse>(object_keys.size(),
-                                                 object_keys);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
-}
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 CentralizedMasterClient::PutStart(const std::string& key,
@@ -195,29 +152,18 @@ CentralizedMasterClient::BatchPutRevoke(const std::vector<std::string>& keys) {
     return result;
 }
 
-tl::expected<void, ErrorCode> CentralizedMasterClient::MountSegment(
-    const Segment& segment) {
-    ScopedVLogTimer timer(1, "CentralizedMasterClient::MountSegment");
-    timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                     ", name=", segment.name, ", id=", segment.id,
-                     ", client_id=", client_id_);
-
+tl::expected<std::vector<std::string>, ErrorCode>
+CentralizedMasterClient::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::BatchReplicaClear");
+    timer.LogRequest("object_keys_count=", object_keys.size(),
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
     auto result =
-        invoke_rpc<&WrappedCentralizedMasterService::MountSegment, void>(
-            segment, client_id_);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<void, ErrorCode> CentralizedMasterClient::ReMountSegment(
-    const std::vector<Segment>& segments) {
-    ScopedVLogTimer timer(1, "CentralizedMasterClient::ReMountSegment");
-    timer.LogRequest("segments_num=", segments.size(),
-                     ", client_id=", client_id_);
-
-    auto result =
-        invoke_rpc<&WrappedCentralizedMasterService::ReMountSegment, void>(
-            segments, client_id_);
+        invoke_rpc<&WrappedCentralizedMasterService::BatchReplicaClear,
+                   std::vector<std::string>>(object_keys, client_id,
+                                             segment_name);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -17,24 +17,6 @@ class CentralizedMasterClient final : public MasterClient {
     CentralizedMasterClient& operator=(const CentralizedMasterClient&) = delete;
 
     /**
-     * @brief Gets object metadata without transferring data
-     * @param object_key Key to query
-     * @param object_key Key to query
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(const std::string& object_key);
-
-    /**
-     * @brief Gets object metadata without transferring data
-     * @param object_keys Keys to query
-     * @param object_keys Keys to query
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& object_keys);
-
-    /**
      * @brief Starts a put operation
      * @param key Object key
      * @param batch_slice_lengths Vector of slice lengths
@@ -97,23 +79,18 @@ class CentralizedMasterClient final : public MasterClient {
         const std::vector<std::string>& keys);
 
     /**
-     * @brief Registers a segment to master for allocation
-     * @param segment Segment to register
-     * @return tl::expected<void, ErrorCode> indicating success/failure
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
-        const Segment& segment);
-
-    /**
-     * @brief Re-mount segments, invoked when the client is the first time to
-     * connect to the master or the client Ping TTL is expired and need
-     * to remount. This function is idempotent. Client should retry if the
-     * return code is not ErrorCode::OK.
-     * @param segments Segments to remount
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
-    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments);
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    BatchReplicaClear(const std::vector<std::string>& object_keys,
+                      const UUID& client_id, const std::string& segment_name);
 
     /**
      * @brief Gets the cluster ID for the current client to use as subdirectory
