@@ -214,13 +214,42 @@ jobs:
         source ~/.bashrc
         make -j
         make install
+    - name: Upload wheel for ZMQ test job
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
+        path: dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+
+  zmq-communicator-test:
+    needs: build
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Generate Python version tag
+      id: tag
+      run: echo "tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+    - name: Download wheel from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: wheel-build-py${{ steps.tag.outputs.tag }}
+
     - name: Run ZMQ Communicator Python test
       run: |
-        WHEEL_DIR="dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}"
-        WHEEL_FILE=$(ls "$WHEEL_DIR"/*.whl 2>/dev/null | head -1)
+        WHEEL_FILE=$(find . -name '*.whl' -type f | head -1)
         if [ -z "$WHEEL_FILE" ]; then
-          echo "No wheel found in $WHEEL_DIR"
-          ls -la "$WHEEL_DIR" || true
+          echo "No wheel found"
+          ls -laR
           exit 1
         fi
         pip install "$WHEEL_FILE"
