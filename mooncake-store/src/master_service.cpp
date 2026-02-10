@@ -2346,6 +2346,14 @@ void MasterService::RestoreState() {
             return;
         }
 
+        // Validate snapshot ID format
+        static const std::regex snapshot_id_regex(R"(^\d{8}_\d{6}_\d{3}$)");
+        if (!std::regex_match(latest_content, snapshot_id_regex)) {
+            LOG(ERROR) << "[Restore] Invalid snapshot ID format: "
+                       << latest_content << ", starting fresh";
+            return;
+        }
+
         std::string state_id = latest_content;
         std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
 
