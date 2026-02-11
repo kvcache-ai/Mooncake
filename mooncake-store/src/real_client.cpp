@@ -17,6 +17,7 @@
 #include "real_client.h"
 #include "client_buffer.hpp"
 #include "config.h"
+#include "environ.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"

@@ -11,6 +11,7 @@
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
 #include "default_config.h"
+#include "environ.h"
 
 namespace mooncake {
 namespace py = pybind11;
@@ -50,8 +51,8 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
 
     // Initialize client pools with proper configuration
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    std::string rpc_protocol = Environ::Get().GetRpcProtocol();
+    if (rpc_protocol == "rdma") {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
