@@ -57,14 +57,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       snapshot_retention_count_(config.snapshot_retention_count),
-      snapshot_backend_(
-          SerializerBackend::Create(config.snapshot_backend_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
+    if (enable_snapshot_ || enable_snapshot_restore_) {
+        snapshot_backend_ =
+            SerializerBackend::Create(config.snapshot_backend_type);
+    }
+
     if (enable_snapshot_restore_) {
         RestoreState();
     }

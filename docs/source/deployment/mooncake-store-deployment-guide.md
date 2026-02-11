@@ -51,6 +51,7 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--snapshot_backend` (str, default `local`): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
   - `--snapshot_backup_dir` (str, default `.mooncake_snapshots`): Local directory for snapshot staging and fallback backups if uploading to the backend fails (not used for primary restore).
   - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
+  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_backend=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
 
 Example (enable embedded HTTP metadata and metrics):
 

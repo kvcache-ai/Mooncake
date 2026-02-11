@@ -95,7 +95,6 @@ std::string S3Backend::GetConnectionInfo() const {
 // ============================================================================
 
 namespace {
-constexpr const char* kDefaultLocalPath = "/tmp/mooncake_snapshots";
 constexpr const char* kEnvLocalPath = "MOONCAKE_SNAPSHOT_LOCAL_PATH";
 }  // namespace
 
@@ -104,7 +103,12 @@ LocalFileBackend::LocalFileBackend() {
     if (env_path && *env_path) {
         base_path_ = env_path;
     } else {
-        base_path_ = kDefaultLocalPath;
+        throw std::runtime_error(
+            "MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable is not set. "
+            "Please set it to a persistent directory path for snapshot "
+            "storage. "
+            "Example: export "
+            "MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots");
     }
     LOG(INFO) << "LocalFileBackend initialized with path: " << base_path_;
 }
@@ -112,7 +116,10 @@ LocalFileBackend::LocalFileBackend() {
 LocalFileBackend::LocalFileBackend(const std::string& base_path)
     : base_path_(base_path) {
     if (base_path_.empty()) {
-        base_path_ = kDefaultLocalPath;
+        throw std::runtime_error(
+            "LocalFileBackend base_path is empty. "
+            "Please provide a valid persistent directory path for snapshot "
+            "storage.");
     }
     LOG(INFO) << "LocalFileBackend initialized with path: " << base_path_;
 }

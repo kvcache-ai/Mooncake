@@ -165,21 +165,22 @@ class S3Backend : public SerializerBackend {
  * @brief Local file storage backend implementation
  *
  * Stores snapshot data to local file system
- * Storage path is configured via MOONCAKE_SNAPSHOT_LOCAL_PATH environment
- * variable
+ * Storage path MUST be configured via MOONCAKE_SNAPSHOT_LOCAL_PATH environment
+ * variable. No default path is provided — the environment variable is required.
  */
 class LocalFileBackend : public SerializerBackend {
    public:
     /**
      * @brief Default constructor
      * Reads storage path from MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable
-     * If not set, uses default path /tmp/mooncake_snapshots
+     * @throws std::runtime_error if environment variable is not set
      */
     LocalFileBackend();
 
     /**
      * @brief Constructor with specified path
-     * @param base_path Base storage path
+     * @param base_path Base storage path (must not be empty)
+     * @throws std::runtime_error if base_path is empty
      */
     explicit LocalFileBackend(const std::string& base_path);
 

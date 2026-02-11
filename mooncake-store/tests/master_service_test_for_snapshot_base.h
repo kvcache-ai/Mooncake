@@ -45,6 +45,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // eviction behavior inconsistency and snapshot comparison failures
         MasterMetricManager::instance().reset_allocated_mem_size();
         MasterMetricManager::instance().reset_total_mem_capacity();
+
+        // Set MOONCAKE_SNAPSHOT_LOCAL_PATH for LocalFileBackend
+        // Tests use a dedicated temporary directory to avoid conflicts
+        ::setenv(kEnvSnapshotLocalPath, kTestSnapshotPath, 1);
     }
 
     // ==================== Structures ====================
@@ -108,6 +112,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
+    static constexpr const char* kTestSnapshotPath =
+        "/tmp/mooncake_snapshots_test";
+    static constexpr const char* kEnvSnapshotLocalPath =
+        "MOONCAKE_SNAPSHOT_LOCAL_PATH";
 
     // ==================== Segment Helper Methods ====================
 
@@ -164,13 +172,14 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Get msgpack snapshot directory path
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
-        return "/tmp/mooncake_snapshots/master_snapshot/" + snapshot_id + "/";
+        return std::string(kTestSnapshotPath) + "/master_snapshot/" +
+               snapshot_id + "/";
     }
 
     // Get backup directory path
     std::string GetBackupDir(const std::string& snapshot_id) const {
-        return "/tmp/mooncake_snapshots/master_snapshot_backup/" + snapshot_id +
-               "/";
+        return std::string(kTestSnapshotPath) + "/master_snapshot_backup/" +
+               snapshot_id + "/";
     }
 
     // ==================== State Capture Methods ====================
