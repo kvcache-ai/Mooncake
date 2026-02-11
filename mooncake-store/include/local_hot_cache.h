@@ -121,6 +121,11 @@ class LocalHotCache {
     }
 
     /**
+     * @brief Whether this cache was allocated in shm mode (cross-process).
+     */
+    bool IsShm() const { return use_shm_; }
+
+    /**
      * @brief Compute offset of a block address relative to the bulk base.
      * Used by dummy clients to translate to their own mmap'd address.
      * @return offset in bytes, or SIZE_MAX if addr is not in the bulk region.

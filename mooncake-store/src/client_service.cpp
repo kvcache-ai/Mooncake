@@ -2539,8 +2539,10 @@ void Client::ProcessSlicesAsync(const std::string& key,
 
     const auto& mem_desc = replica.get_memory_descriptor();
 
-    // Only cache slices that came from TE transfer (non-local).
-    if (mem_desc.buffer_descriptor.transport_endpoint_ == local_hostname_) {
+    // Skip local data unless hot cache is in shm mode (shared with dummy
+    // clients who need local data cached for zero-copy access).
+    if (!hot_cache_->IsShm() &&
+        mem_desc.buffer_descriptor.transport_endpoint_ == local_hostname_) {
         return;
     }
 
