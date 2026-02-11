@@ -24,8 +24,7 @@ inline constexpr size_t kP2PTotalBufferSize = kP2PBufferSize * kMaxNumRanks;
 struct alignas(64) AtomicHeadTail {
     uint32_t load(
         std::memory_order order = std::memory_order_seq_cst) const noexcept {
-        uint32_t& mutable_value = const_cast<uint32_t&>(value);
-        return std::atomic_ref<uint32_t>(mutable_value).load(order);
+        return std::atomic_ref<uint32_t>(value).load(order);
     }
 
     void store(uint32_t new_value,
@@ -33,7 +32,7 @@ struct alignas(64) AtomicHeadTail {
         std::atomic_ref<uint32_t>(value).store(new_value, order);
     }
 
-    uint32_t value{0};
+    mutable uint32_t value{0};
 };
 
 // Ring-control metadata for one peer lane.
