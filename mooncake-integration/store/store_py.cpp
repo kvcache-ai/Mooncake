@@ -346,9 +346,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::object get_tensor(const std::string &key) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return pybind11::none();
         }
 
@@ -362,9 +361,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             py::list empty;
             for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
             return empty;
@@ -1134,11 +1132,6 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR) << "batch_get_buffer is not supported for dummy "
-                                  "client now";
-                    return std::vector<std::shared_ptr<BufferHandle>>{};
-                }
                 return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
