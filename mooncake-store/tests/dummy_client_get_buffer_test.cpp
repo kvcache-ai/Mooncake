@@ -53,16 +53,16 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
 
 static constexpr size_t kMB = 1024ULL * 1024;
 static constexpr size_t kGB = 1024ULL * kMB;
-static constexpr size_t kPayloadSize = 500 * kMB;  // single key: 500 MB
+static constexpr size_t kPayloadSize = 16 * kMB;  // single key: 16 MB
 static constexpr size_t kHotBlockSize =
-    512 * kMB;  // hot cache block: 512 MB (>= payload)
+    32 * kMB;  // hot cache block: 32 MB (>= payload)
 static constexpr size_t kSegmentSize =
-    8 * kGB;  // global segment: 8 GB (holds batch)
-static constexpr size_t kLocalBufSize = 8 * kGB;  // local transfer buffer: 8 GB
-static constexpr size_t kPoolSize = 8 * kGB;      // dummy mem pool: 8 GB
+    512 * kMB;  // global segment: 512 MB (holds batch)
+static constexpr size_t kLocalBufSize = 512 * kMB;  // local transfer buffer
+static constexpr size_t kPoolSize = 512 * kMB;      // dummy mem pool
 static constexpr size_t kHotCacheSize =
-    4 * kGB;  // hot cache: 4 GB (8 x 512 MB blocks)
-static constexpr size_t kBatchKeyCount = 14;  // 14 x 500 MB ~ 7 GB total
+    256 * kMB;  // hot cache: 256 MB (8 x 32 MB blocks)
+static constexpr size_t kBatchKeyCount = 14;  // 14 x 16 MB ~ 224 MB total
 static constexpr size_t kHotWarmCount = 4;    // keys to warm into hot cache
 
 class DummyClientGetBufferTest : public ::testing::Test {
