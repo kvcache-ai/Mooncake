@@ -59,12 +59,14 @@ if (WITH_TE)
         target_link_libraries(engine PUBLIC
             ascendcl
             transfer_engine
+            zmq_communicator_lib
             glog::glog
             gflags::gflags
         )
     else()
         target_link_libraries(engine PUBLIC
             transfer_engine
+            zmq_communicator_lib
             glog::glog
             gflags::gflags
         )
