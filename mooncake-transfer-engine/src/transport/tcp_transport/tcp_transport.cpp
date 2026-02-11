@@ -777,7 +777,6 @@ void TcpTransport::returnConnection(
         for (auto entry_it = it->second.begin(); entry_it != it->second.end();
              ++entry_it) {
             if ((*entry_it)->socket == socket) {
-                // Check if connection is still alive before returning to pool
                 if (socket->is_open()) {
                     (*entry_it)->in_use = false;
                     (*entry_it)->last_used = std::chrono::steady_clock::now();
