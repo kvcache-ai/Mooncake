@@ -375,6 +375,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.memory_allocator = FLAGS_memory_allocator;
     }
+    if ((google::GetCommandLineFlagInfo("allocation_strategy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
         !conf_set) {

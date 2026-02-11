@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <set>
@@ -373,7 +374,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
  * - Sampling 2N is O(N), sorting 2N is O(N log N) — both small since N
  *   (replica count) is typically 1–3.
  * - New empty segments naturally win the comparison, getting filled quickly.
- * - Stateless: no locks, no mutable state — fully thread-safe.
+ * - Thread-safe: uses thread_local state for sampling, no shared mutable data.
  */
 class P2CAllocationStrategy : public RandomAllocationStrategy {
    public:
@@ -422,36 +423,18 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
 
         const size_t remaining = replica_num - replicas.size();
 
-        // --- Build eligible segment list ---
-        std::vector<size_t> eligible;
-        eligible.reserve(names.size());
-        for (size_t i = 0; i < names.size(); ++i) {
-            if (excluded_segments.contains(names[i]) ||
-                used_segments.contains(names[i])) {
-                continue;
-            }
-            eligible.push_back(i);
-        }
-
-        if (eligible.empty()) {
-            if (replicas.empty()) {
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-            }
-            return replicas;
-        }
-
-        // --- P2C: sample candidates with min=6, max=min(2N, eligible_count)
-        // ---
+        // --- P2C: sample candidates from all segments, check eligibility when
+        // selecting ---
         const size_t min_candidate_size = 6;
-        size_t sample_count = std::min(2 * remaining, eligible.size());
-        // Ensure at least min_candidate_size candidates (if available)
-        sample_count = std::max(sample_count,
-                                std::min(min_candidate_size, eligible.size()));
+        size_t sample_count = std::max(2 * remaining, min_candidate_size);
+        sample_count = std::min(sample_count, names.size());
 
-        // Fisher-Yates partial shuffle to pick sample_count random elements
-        for (size_t i = 0; i < sample_count; ++i) {
-            std::uniform_int_distribution<size_t> dist(i, eligible.size() - 1);
-            std::swap(eligible[i], eligible[dist(generator)]);
+        // Thread-local indices for Fisher-Yates sampling (no shared mutable
+        // state, each thread has its own copy)
+        static thread_local std::vector<size_t> tl_indices;
+        if (tl_indices.size() != names.size()) {
+            tl_indices.resize(names.size());
+            std::iota(tl_indices.begin(), tl_indices.end(), 0);
         }
 
         // Compute free space ratio for sampled candidates
@@ -461,21 +444,38 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
         };
         std::vector<Candidate> candidates;
         candidates.reserve(sample_count);
+
+        // Fisher-Yates partial shuffle using thread-local indices
         for (size_t i = 0; i < sample_count; ++i) {
+            std::uniform_int_distribution<size_t> dist(i, names.size() - 1);
+            size_t j = dist(generator);
+            std::swap(tl_indices[i], tl_indices[j]);
+
             double free_ratio =
-                getSegmentFreeRatio(allocator_manager, names[eligible[i]]);
-            candidates.push_back({eligible[i], free_ratio});
+                getSegmentFreeRatio(allocator_manager, names[tl_indices[i]]);
+            candidates.push_back({tl_indices[i], free_ratio});
         }
 
-        // Sort by free space ratio descending, pick top-N
+        // Sort by free space ratio descending
         std::sort(candidates.begin(), candidates.end(),
                   [](const Candidate& a, const Candidate& b) {
                       return a.free_ratio > b.free_ratio;
                   });
 
-        const size_t top_n = std::min(remaining, candidates.size());
-        for (size_t i = 0; i < top_n; ++i) {
-            const auto& name = names[candidates[i].name_idx];
+        // Try to allocate from top candidates, skip excluded/used segments
+        for (const auto& candidate : candidates) {
+            if (replicas.size() >= replica_num) {
+                break;
+            }
+
+            const auto& name = names[candidate.name_idx];
+
+            // Skip excluded and used segments
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
+                continue;
+            }
+
             auto buffer = allocateSingle(allocator_manager, name, slice_length,
                                          generator);
             if (buffer) {
@@ -500,6 +500,7 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
             start_idx++;
             try_count++;
 
+            // Skip excluded and used segments
             if (excluded_segments.contains(names[index]) ||
                 used_segments.contains(names[index])) {
                 continue;
@@ -532,9 +533,9 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
         uint64_t total_free = 0;
         for (const auto& alloc : *allocators) {
             if (!alloc) continue;
-            total_capacity += static_cast<uint64_t>(alloc->capacity());
-            total_free +=
-                static_cast<uint64_t>(alloc->capacity() - alloc->size());
+            auto cap = static_cast<uint64_t>(alloc->capacity());
+            total_capacity += cap;
+            total_free += cap - static_cast<uint64_t>(alloc->size());
         }
 
         if (total_capacity == 0) return 0.0;
