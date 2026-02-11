@@ -766,7 +766,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Aligned buffer for O_DIRECT I/O operations
     // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 16 * 1024 * 1024;  // 16MB
+    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
     std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
                                                               [](void*) {}};
     /**

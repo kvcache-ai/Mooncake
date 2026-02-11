@@ -202,10 +202,11 @@ void MasterService::ClearInvalidHandles() {
         while (it != shard->metadata.end()) {
             if (CleanupStaleHandles(it->second)) {
                 // If the object is empty, we need to erase the iterator and
-                // also erase the key from processing_keys and
-                // replication_tasks.
+                // also erase the key from processing_keys,
+                // replication_tasks, and offloading_tasks.
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
+                shard->offloading_tasks.erase(it->first);
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -721,9 +722,20 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         [](Replica& replica) { replica.mark_complete(); });
 
     if (enable_offload_) {
+        auto& shard = accessor.GetShard();
         metadata.VisitReplicas(&Replica::fn_is_completed,
-                               [this, &key](const Replica& replica) {
-                                   PushOffloadingQueue(key, replica);
+                               [this, &key, &shard](Replica& replica) {
+                                   auto result =
+                                       PushOffloadingQueue(key, replica);
+                                   if (result) {
+                                       replica.inc_refcnt();
+                                       shard->offloading_tasks.emplace(
+                                           key,
+                                           OffloadingTask{
+                                               replica.id(),
+                                               std::chrono::steady_clock::
+                                                   now()});
+                                   }
                                });
     }
 
@@ -1519,6 +1531,26 @@ auto MasterService::NotifyOffloadSuccess(
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
         const auto& metadata = metadatas[i];
+
+        // Release refcnt and clear offloading task.
+        {
+            MetadataAccessorRW accessor(this, key);
+            if (accessor.Exists()) {
+                auto& obj_metadata = accessor.Get();
+                auto& shard = accessor.GetShard();
+                auto task_it = shard->offloading_tasks.find(key);
+                if (task_it != shard->offloading_tasks.end()) {
+                    auto source = obj_metadata.GetReplicaByID(
+                        task_it->second.source_id);
+                    if (source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                    shard->offloading_tasks.erase(task_it);
+                }
+            }
+        }
+
+        // Add LOCAL_DISK replica.
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, key, replica);
@@ -1532,7 +1564,7 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const std::string& key, const Replica& replica) {
+    const std::string& key, Replica& replica) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -1712,6 +1744,30 @@ void MasterService::DiscardExpiredProcessingReplicas(
         }
 
         task_it = shard->replication_tasks.erase(task_it);
+    }
+
+    // Part 3: Discard expired offloading operations.
+    for (auto task_it = shard->offloading_tasks.begin();
+         task_it != shard->offloading_tasks.end();) {
+        const auto ttl =
+            task_it->second.start_time + put_start_release_timeout_sec_;
+        if (ttl > now) {
+            task_it++;
+            continue;
+        }
+
+        auto metadata_it = shard->metadata.find(task_it->first);
+        if (metadata_it != shard->metadata.end()) {
+            auto source = metadata_it->second.GetReplicaByID(
+                task_it->second.source_id);
+            if (source != nullptr) {
+                source->dec_refcnt();
+            }
+        }
+
+        LOG(WARNING) << "Offloading task expired for key: "
+                     << task_it->first;
+        task_it = shard->offloading_tasks.erase(task_it);
     }
 
     if (!discarded_replicas.empty()) {
