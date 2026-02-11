@@ -3,6 +3,7 @@
 #include "master_service.h"
 #include "master_metric_manager.h"
 #include "segment.h"
+#include "serialize/serializer_backend.h"
 #include "task_manager.h"
 
 #include <glog/logging.h>
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -37,6 +39,10 @@ namespace mooncake::test {
  */
 class MasterServiceSnapshotTestBase : public ::testing::Test {
    protected:
+    // ==================== Temp Dir Accessor ====================
+
+    const std::string& tmp_dir() const { return tmp_dir_; }
+
     // ==================== SetUp ====================
 
     void SetUp() override {
@@ -46,9 +52,16 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         MasterMetricManager::instance().reset_allocated_mem_size();
         MasterMetricManager::instance().reset_total_mem_capacity();
 
+        // Create a unique temporary directory for this test
+        namespace fs = std::filesystem;
+        std::string tmpl =
+            (fs::temp_directory_path() / "mooncake_snap_test_XXXXXX").string();
+        char* dir = mkdtemp(tmpl.data());
+        ASSERT_NE(dir, nullptr) << "Failed to create temp directory";
+        tmp_dir_ = dir;
+
         // Set MOONCAKE_SNAPSHOT_LOCAL_PATH for LocalFileBackend
-        // Tests use a dedicated temporary directory to avoid conflicts
-        ::setenv(kEnvSnapshotLocalPath, kTestSnapshotPath, 1);
+        ::setenv(kEnvSnapshotLocalPath, tmp_dir().c_str(), 1);
     }
 
     // ==================== Structures ====================
@@ -112,8 +125,6 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
-    static constexpr const char* kTestSnapshotPath =
-        "/tmp/mooncake_snapshots_test";
     static constexpr const char* kEnvSnapshotLocalPath =
         "MOONCAKE_SNAPSHOT_LOCAL_PATH";
 
@@ -172,14 +183,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Get msgpack snapshot directory path
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
-        return std::string(kTestSnapshotPath) + "/master_snapshot/" +
-               snapshot_id + "/";
+        return tmp_dir() + "/master_snapshot/" + snapshot_id + "/";
     }
 
     // Get backup directory path
     std::string GetBackupDir(const std::string& snapshot_id) const {
-        return std::string(kTestSnapshotPath) + "/master_snapshot_backup/" +
-               snapshot_id + "/";
+        return tmp_dir() + "/master_snapshot_backup/" + snapshot_id + "/";
     }
 
     // ==================== State Capture Methods ====================
@@ -772,12 +781,31 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             << "Use 'service_.reset(new MasterService(...))' instead of "
                "'std::unique_ptr<MasterService> service_(...)'";
 
+        // Ensure snapshot_backend_ is initialized for PersistState
+        // Some test configs may not enable snapshot/restore, so the backend
+        // is not created in the constructor. We create it here for TearDown
+        // validation.
+        if (!service_->snapshot_backend_) {
+            service_->snapshot_backend_ =
+                SerializerBackend::Create(SnapshotBackendType::LOCAL_FILE);
+        }
+
         // Test snapshot and restore functionality for all test cases
         TestSnapshotAndRestore(service_);
         service_.reset();
+
+        // Clean up temporary directory
+        namespace fs = std::filesystem;
+        if (!tmp_dir().empty() && fs::exists(tmp_dir())) {
+            fs::remove_all(tmp_dir());
+        }
+        ::unsetenv(kEnvSnapshotLocalPath);
         // Note: Do not call ShutdownGoogleLogging() here - glog only allows
         // single init/shutdown cycle
     }
+
+   private:
+    std::string tmp_dir_;
 };
 
 }  // namespace mooncake::test
