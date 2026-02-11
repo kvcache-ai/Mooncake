@@ -352,7 +352,7 @@ bool HotStandbyService::IsReadyForPromotion() const {
 }
 
 ErrorCode HotStandbyService::Promote() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
 
     if (!IsReadyForPromotion()) {
         LOG(ERROR) << "Standby is not ready for promotion, state="
@@ -484,6 +484,7 @@ ErrorCode HotStandbyService::Promote() {
 
     // Stop replication (OpLogWatcher will stop watching).
     // Note: This will trigger STOP event, transitioning to STOPPED.
+    lock.unlock();
     Stop();
 
     // Design note: MasterService creation and initialization are handled by
