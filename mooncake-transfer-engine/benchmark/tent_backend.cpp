@@ -44,6 +44,27 @@ std::shared_ptr<Config> loadConfig() {
     config->set("local_segment_name", XferBenchConfig::seg_name);
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
+
+    // Configure transport types based on xport_type parameter
+    if (!XferBenchConfig::xport_type.empty()) {
+        // Map of transport names to their config keys (handle name mismatches)
+        std::unordered_map<std::string, std::string> transport_map = {
+            {"rdma", "rdma"},        {"tcp", "tcp"},    {"shm", "shm"},
+            {"iouring", "io_uring"},  // Note: iouring -> io_uring
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}};
+
+        // Disable all transports by default
+        for (const auto& entry : transport_map) {
+            config->set("transports/" + entry.second + "/enable", false);
+        }
+
+        // Enable only the specified transport
+        auto it = transport_map.find(XferBenchConfig::xport_type);
+        if (it != transport_map.end()) {
+            config->set("transports/" + it->second + "/enable", true);
+        }
+    }
+
     return config;
 }
 
