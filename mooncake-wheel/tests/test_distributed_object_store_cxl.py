@@ -19,7 +19,7 @@ def get_client(store, local_buffer_size_param=None):
     protocol = os.getenv("PROTOCOL", "cxl")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
-    metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
+    metadata_server = os.getenv("MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = (
         local_buffer_size_param if local_buffer_size_param is not None
@@ -228,14 +228,10 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         test_data = b"Hello, Zero-Copy World! " * 1000  # ~24KB test data
         key = "test_zero_copy_key"
 
-        # Allocate a buffer and register it
+        # Allocate a buffer
         buffer_size = len(test_data) + 1024  # Extra space for safety
         buffer = (ctypes.c_ubyte * buffer_size)()
         buffer_ptr = ctypes.addressof(buffer)
-
-        # Register the buffer for zero-copy operations
-        # result = self.store.register_buffer(buffer_ptr, buffer_size)
-        # self.assertEqual(result, 0, "Buffer registration should succeed")
 
         # Copy test data to buffer
         ctypes.memmove(buffer, test_data, len(test_data))
@@ -265,18 +261,12 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         small_buffer = (ctypes.c_ubyte * small_buffer_size)()
         small_buffer_ptr = ctypes.addressof(small_buffer)
 
-        # Register small buffer
-        # result = self.store.register_buffer(small_buffer_ptr, small_buffer_size)
-        # self.assertEqual(result, 0, "Small buffer registration should succeed")
-
         # get_into should fail with buffer too small
         bytes_read = self.store.get_into(key, small_buffer_ptr, small_buffer_size)
         self.assertLess(bytes_read, 0, "get_into should fail with small buffer")
 
         # Cleanup
         time.sleep(default_kv_lease_ttl / 1000)
-        # self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0, "Buffer unregistration should succeed")
-        # self.assertEqual(self.store.unregister_buffer(small_buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
 
     def test_batch_get_into_operations(self):
@@ -304,10 +294,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         total_buffer_size = buffer_spacing * batch_size
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-
-        # Register the entire large buffer once
-        # result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-        # self.assertEqual(result, 0, "Buffer registration should succeed")
 
         # Create individual buffer views within the large buffer with spacing
         buffers = []
@@ -351,7 +337,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
         # Cleanup
         time.sleep(default_kv_lease_ttl / 1000)
-        # self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 
@@ -375,9 +360,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         total_buffer_size = buffer_spacing * batch_size
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-        # Register the entire large buffer once
-        # result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-        # self.assertEqual(result, 0, "Buffer registration should succeed")
 
         # Create individual buffer views within the large buffer with spacing
         buffers = []
@@ -423,7 +405,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
         # Cleanup
         time.sleep(default_kv_lease_ttl / 1000)
-        # self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 

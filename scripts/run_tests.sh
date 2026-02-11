@@ -74,7 +74,7 @@ mooncake_master \
   &
 CXL_MASTER_PID=$!
 sleep 3
-MC_METADATA_SERVER=127.0.0.1:2379 DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
 kill $CXL_MASTER_PID || true
 sleep 2
 echo "CXL protocol test completed successfully!"

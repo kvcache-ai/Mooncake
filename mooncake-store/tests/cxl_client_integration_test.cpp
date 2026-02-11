@@ -411,9 +411,11 @@ TEST_F(ClientIntegrationTestCxl, EvictOperation) {
     const size_t test_total_size = 1000ULL * 1024 * 1024;
     std::vector<char> test_data(test_data_size, 'T');
     size_t test_put_size = 0;
+    std::vector<std::string> inserted_keys;
 
     for (uint64_t i = 0;; ++i) {
         std::string key = "evict_key_" + std::to_string(i);
+        inserted_keys.push_back(key);
         void* buffer = client_buffer_allocator_->allocate(test_data_size);
 
         // write
@@ -442,6 +444,23 @@ TEST_F(ClientIntegrationTestCxl, EvictOperation) {
         }
     }
     LOG(INFO) << "Test finished, put_data=" << test_put_size / 1048576 << "MB";
+
+    // Verify that some keys were actually evicted.
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    bool evict_worked = false;
+    for (const auto& key : inserted_keys) {
+        auto exist_result = test_client_->IsExist(key);
+        ASSERT_TRUE(exist_result.has_value());
+
+        if (!exist_result.value()) {
+            evict_worked = true;
+            LOG(INFO) << "Key " << key << " was evicted.";
+            break;
+        }
+    }
+
+    ASSERT_TRUE(evict_worked)
+        << "No keys were evicted, the eviction mechanism might not be working correctly.";
 }
 
 }  // namespace testing
