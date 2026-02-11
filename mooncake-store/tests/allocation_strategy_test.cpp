@@ -24,8 +24,8 @@ namespace mooncake {
 static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
-const auto kStrategyTypes = ::testing::Values(AllocationStrategyType::RANDOM,
-                                              AllocationStrategyType::BEST_OF_N);
+const auto kStrategyTypes = ::testing::Values(
+    AllocationStrategyType::RANDOM, AllocationStrategyType::BEST_OF_N);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -605,7 +605,8 @@ TEST_P(AllocationStrategyParameterizedTest, BestOfNLoadBalancingDistribution) {
     }
 
     // Calculate utilization ratio for each segment
-    std::cout << "\nBestOfN Load Balancing Results (Different Sized Segments):\n";
+    std::cout
+        << "\nBestOfN Load Balancing Results (Different Sized Segments):\n";
     std::cout << "Total allocations: " << kNumAllocations << " x "
               << (slice_length / 1024)
               << "KB = " << (kNumAllocations * slice_length / MiB) << "MB\n\n";
