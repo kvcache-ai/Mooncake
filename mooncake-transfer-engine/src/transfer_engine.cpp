@@ -310,6 +310,7 @@ std::string TransferEngine::showLinks(bool json) const {
 #else
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
+#include "environ.h"
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
 
@@ -362,7 +363,8 @@ void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
 }  // namespace
 
 TransferEngine::TransferEngine(bool auto_discover) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    auto& env = Environ::Get();
+    if (env.GetUseTent() || env.GetUseTev1()) {
         use_tent_ = true;
     }
     if (!use_tent_) {
@@ -372,7 +374,8 @@ TransferEngine::TransferEngine(bool auto_discover) {
 
 TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter) {
-    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+    auto& env = Environ::Get();
+    if (env.GetUseTent() || env.GetUseTev1()) {
         use_tent_ = true;
     }
     if (!use_tent_) {
