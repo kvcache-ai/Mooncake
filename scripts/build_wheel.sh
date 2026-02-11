@@ -91,8 +91,8 @@ if [ -f build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocato
     echo "Copying NPU ubshmem_fabric_allocator.so..."
     cp build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
     echo "Copying NPU allocator libraries..."
-    # Copy allocator_npu.py
-    cp mooncake-integration/allocator_npu.py mooncake-wheel/mooncake/allocator_npu.py
+    # Copy allocator_ascend_npu.py
+    cp mooncake-integration/allocator_ascend_npu.py mooncake-wheel/mooncake/allocator_ascend_npu.py
 else
     echo "Skipping ubshmem_fabric_allocator.so (not built - likely CUDA or non-NPU build)"
 fi

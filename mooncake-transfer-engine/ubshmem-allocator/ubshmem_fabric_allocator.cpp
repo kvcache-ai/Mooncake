@@ -3,15 +3,13 @@
 
 #include <iostream>
 
-enum class MemoryBackendType { use_aclmalloc, use_aclmallocphysical, unknown };
-
 extern "C" {
 
-MemoryBackendType mc_probe_ub_fabric_support(int device_id) {
+bool mc_probe_ub_fabric_support(int device_id) {
     aclError res = aclrtSetDevice(device_id);
     if (res != ACL_ERROR_NONE) {
         std::cerr << "Set device failed: " << device_id << ", result" << res;
-        return MemoryBackendType::unknown;
+        return false;
     }
     aclrtPhysicalMemProp prop = {};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
@@ -27,9 +25,9 @@ MemoryBackendType mc_probe_ub_fabric_support(int device_id) {
     res = aclrtMallocPhysical(&handle, size, &prop, 0);
     if (res == ACL_ERROR_NONE) {
         aclrtFreePhysical(handle);  // success → clean up
-        return MemoryBackendType::use_aclmallocphysical;
+        return true;
     } else {
-        return MemoryBackendType::use_aclmalloc;
+        return false;
     }
 }
 
@@ -38,6 +36,10 @@ void *mc_ub_fabric_malloc(ssize_t size, int device) {
     aclrtPhysicalMemProp prop = {};
     aclrtDrvMemHandle handle;
     void *ptr = nullptr;
+
+    // Align size to 2M
+    const size_t alignment = 2 * 1024 * 1024;
+    size = (size + alignment - 1) & ~(alignment - 1);
 
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;

@@ -129,9 +129,9 @@ if (USE_MNNVL)
 endif()
 
 if (USE_UBSHMEM)
-    message(STATUS "allocator_npu.py will be installed in the Python package")
+    message(STATUS "allocator_ascend_npu.py will be installed in the Python package")
     install(FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/allocator_npu.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/allocator_ascend_npu.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
 endif()

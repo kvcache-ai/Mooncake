@@ -3,8 +3,7 @@ import logging
 import os
 import threading
 from importlib import resources
-from typing import Dict, Final, Optional
-from enum import IntEnum
+from typing import Dict, Final
 import torch_npu
 
 from torch import device as torch_device
@@ -12,17 +11,11 @@ from torch_npu.npu.memory import NPUPluggableAllocator
 
 logger = logging.getLogger(__name__)
 
-class MemoryBackend(IntEnum):
-    USE_ACLMALLOC  = 0
-    USE_ACLMALLOCPHYSICAL = 1
-    UNKNOWN         = -1
-    UNSUPPORTED     = -2
-
 
 class UBShmemAllocator:
     _instances: Dict[torch_device, NPUPluggableAllocator] = {}
     _lock: Final = threading.Lock()
-    _supports_fabric: int = MemoryBackend.UNKNOWN
+    _supports_fabric: bool = False
     _probe_done: bool = False
 
     @classmethod
@@ -50,45 +43,42 @@ class UBShmemAllocator:
             )
 
     @classmethod
-    def _probe_fabric_memory_support(cls, so_path: str) -> MemoryBackend:
+    def _probe_fabric_memory_support(cls, so_path: str) -> bool:
         """
         Probe whether the system supports fabric memory by calling a C++ function
         that attempts aclrtMallocPhysical with fabric memory support.
         The shared library exports a symbol like:
-            extern "C" MemoryBackendType mc_probe_ub_fabric_support(int device_id);
+            extern "C" bool mc_probe_ub_fabric_support(int device_id);
         """
         try:
-
             lib = ctypes.CDLL(so_path)
 
             # Try to get the probe function
             probe_func = lib.mc_probe_ub_fabric_support
             probe_func.argtypes = [ctypes.c_int]
-            probe_func.restype = ctypes.c_int
+            probe_func.restype = ctypes.c_bool
 
             # Use device 0 for probing
             dev_id = 0
-            supported_type = probe_func(dev_id)
-            if supported_type == MemoryBackend.USE_ACLMALLOC:
-                logger.info(f"Use aclMalloc fallback")
-            elif supported_type == MemoryBackend.USE_ACLMALLOCPHYSICAL:
+            supported = probe_func(dev_id)
+            if supported:
                 logger.info(f"Supports Fabric Memory with aclMallocPhysical")
             else:
-                logger.info("Unknown Backend error")
-            return supported_type
+                logger.info("Fabric memory not supported")
+            return supported
 
         except AttributeError:
             logger.warning(
                 "Symbol 'mc_probe_ub_fabric_support' not found in ubshmem_fabric_allocator.so. "
                 "Assuming fabric memory is NOT supported (you may need to update the library)."
             )
-            return MemoryBackend.UNSUPPORTED
+            return False
         except Exception as e:
             logger.warning(f"Failed to probe fabric memory support: {e}")
-            return MemoryBackend.UNSUPPORTED
+            return False
 
     @classmethod
-    def detect_mem_backend(cls) -> MemoryBackend:
+    def detect_mem_backend(cls) -> bool:
         """Public API: check if fabric memory is supported."""
         if not cls._probe_done:
             with cls._lock:
@@ -101,7 +91,7 @@ class UBShmemAllocator:
                     cls._supports_fabric = cls._probe_fabric_memory_support(so_path)
                 except Exception as e:
                     logger.error(f"Critical error during fabric memory probe setup: {e}")
-                    cls._supports_fabric = MemoryBackend.UNSUPPORTED
+                    cls._supports_fabric = False
 
                 cls._probe_done = True
         return cls._supports_fabric

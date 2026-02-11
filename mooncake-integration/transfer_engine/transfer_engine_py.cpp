@@ -33,10 +33,6 @@
 #include <cuda_runtime.h>
 #endif
 
-#ifdef USE_UBSHMEM
-#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
-#endif
-
 static void *(*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void *) = nullptr;
 static std::string g_protocol;
@@ -73,18 +69,6 @@ void initMemoryAllocator(const char *protocol) {
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
-#endif
-    } else if (strcmp(protocol, "ubshmem") == 0) {
-#ifdef USE_UBSHMEM
-        allocateMemory = [](size_t s) -> void * {
-            return mooncake::UBShmemTransport::allocatePinnedLocalMemory(s);
-        };
-        freeMemory = [](void *p) {
-            mooncake::UBShmemTransport::freePinnedLocalMemory(p);
-        };
-        LOG(INFO) << "Selected ub_fabric memory allocator";
-#else
-        LOG(ERROR) << "Protocol 'ubshmem' requires -DUSE_UBSHMEM=ON";
 #endif
     } else {
         // default fallback
