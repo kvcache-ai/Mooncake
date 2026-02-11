@@ -252,7 +252,7 @@ YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
  */
 enum class AllocationStrategyType {
     RANDOM = 0,  // Pure random allocation
-    P2C,         // Power-of-Two-Choices allocation
+    BEST_OF_N,   // Best-of-N sampling allocation
     CXL,         // CXL-specific allocation
 };
 

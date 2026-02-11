@@ -270,8 +270,8 @@ class WrappedMasterServiceConfig {
         }
 
         // Convert string allocation_strategy to AllocationStrategyType enum
-        if (config.allocation_strategy == "p2c") {
-            allocation_strategy_type = AllocationStrategyType::P2C;
+        if (config.allocation_strategy == "best_of_n") {
+            allocation_strategy_type = AllocationStrategyType::BEST_OF_N;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
@@ -280,7 +280,7 @@ class WrappedMasterServiceConfig {
             LOG(WARNING)
                 << "Unrecognized allocation_strategy value: '"
                 << config.allocation_strategy << "'. Defaulting to 'random'. "
-                << "Valid options are: random, p2c, cxl (case-sensitive)";
+                << "Valid options are: random, best_of_n, cxl (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 

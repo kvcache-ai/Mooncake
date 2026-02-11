@@ -25,7 +25,7 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(AllocationStrategyType::RANDOM,
-                                              AllocationStrategyType::P2C);
+                                              AllocationStrategyType::BEST_OF_N);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -86,8 +86,8 @@ INSTANTIATE_TEST_SUITE_P(
             case AllocationStrategyType::RANDOM:
                 strategy_str = "Random";
                 break;
-            case AllocationStrategyType::P2C:
-                strategy_str = "P2C";
+            case AllocationStrategyType::BEST_OF_N:
+                strategy_str = "BestOfN";
                 break;
             default:
                 strategy_str = "Unknown";
@@ -557,11 +557,11 @@ TEST_P(AllocationStrategyParameterizedTest,
 }
 
 // Test the performance of AllocationStrategy.
-// Test P2C load balancing distribution with different sized segments
-TEST_P(AllocationStrategyParameterizedTest, P2CLoadBalancingDistribution) {
+// Test BestOfN load balancing distribution with different sized segments
+TEST_P(AllocationStrategyParameterizedTest, BestOfNLoadBalancingDistribution) {
     auto [strategy_type, allocator_type] = GetParam();
-    if (strategy_type != AllocationStrategyType::P2C) {
-        // This test is only for P2C strategy
+    if (strategy_type != AllocationStrategyType::BEST_OF_N) {
+        // This test is only for BestOfN strategy
         GTEST_SKIP();
     }
 
@@ -605,7 +605,7 @@ TEST_P(AllocationStrategyParameterizedTest, P2CLoadBalancingDistribution) {
     }
 
     // Calculate utilization ratio for each segment
-    std::cout << "\nP2C Load Balancing Results (Different Sized Segments):\n";
+    std::cout << "\nBestOfN Load Balancing Results (Different Sized Segments):\n";
     std::cout << "Total allocations: " << kNumAllocations << " x "
               << (slice_length / 1024)
               << "KB = " << (kNumAllocations * slice_length / MiB) << "MB\n\n";
@@ -626,7 +626,7 @@ TEST_P(AllocationStrategyParameterizedTest, P2CLoadBalancingDistribution) {
                   << "%\n\n";
     }
 
-    // P2C should balance utilization ratios across segments
+    // BestOfN should balance utilization ratios across segments
     // Even though segments have different capacities (32MB, 64MB, 128MB),
     // their utilization ratios should be similar (within 15% difference)
     double max_util =
@@ -640,7 +640,7 @@ TEST_P(AllocationStrategyParameterizedTest, P2CLoadBalancingDistribution) {
     std::cout << "Expected: < 15% for good load balancing\n\n";
 
     // Verify that utilization ratios are balanced (within 15%)
-    EXPECT_LT(util_diff, 15.0) << "P2C should balance utilization ratios";
+    EXPECT_LT(util_diff, 15.0) << "BestOfN should balance utilization ratios";
 }
 
 // Test the performance comparison between strategies
@@ -679,30 +679,31 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
 
     random_replicas.clear();
 
-    // Test P2C strategy
-    auto p2c_strategy = std::make_unique<P2CAllocationStrategy>();
-    std::vector<std::vector<Replica>> p2c_replicas;
-    p2c_replicas.reserve(kNumAllocations);
+    // Test BestOfN strategy
+    auto best_of_n_strategy = std::make_unique<BestOfNAllocationStrategy>();
+    std::vector<std::vector<Replica>> best_of_n_replicas;
+    best_of_n_replicas.reserve(kNumAllocations);
 
-    auto p2c_start = std::chrono::steady_clock::now();
+    auto best_of_n_start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < kNumAllocations; i++) {
         auto result =
-            p2c_strategy->Allocate(allocator_manager, kAllocationSize);
+            best_of_n_strategy->Allocate(allocator_manager, kAllocationSize);
         ASSERT_TRUE(result.has_value());
         ASSERT_EQ(result.value().size(), 1);
-        p2c_replicas.emplace_back(std::move(result.value()));
+        best_of_n_replicas.emplace_back(std::move(result.value()));
     }
-    auto p2c_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - p2c_start);
+    auto best_of_n_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - best_of_n_start);
 
     std::cout << "\nAllocation Strategy Performance Comparison:\n"
               << "Num segments: " << kNumSegments << "\n"
               << "Num allocations: " << kNumAllocations << "\n"
               << "Random strategy: " << random_elapsed_us.count() << " us\n"
-              << "P2C strategy: " << p2c_elapsed_us.count() << " us\n"
+              << "BestOfN strategy: " << best_of_n_elapsed_us.count() << " us\n"
               << "Speedup: " << std::fixed << std::setprecision(2)
               << (static_cast<double>(random_elapsed_us.count()) /
-                  p2c_elapsed_us.count())
+                  best_of_n_elapsed_us.count())
               << "x\n\n";
 }
 

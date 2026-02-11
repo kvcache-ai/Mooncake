@@ -23,7 +23,7 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
 - Allocation Strategy
   - `--allocation_strategy` (str, default `random`): Memory allocation strategy for replica placement. Available options:
     - `random`: Pure random selection across segments (baseline, fastest).
-    - `p2c`: Power-of-Two-Choices strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
+    - `best_of_n`: Best-of-N sampling strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
 
 - Eviction and TTLs
   - `--default_kv_lease_ttl` (uint64, default `5000` ms): Default lease TTL for KV objects.
@@ -54,11 +54,11 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
-Example (use P2C allocation strategy for better load balancing):
+Example (use Best-of-N allocation strategy for better load balancing):
 
 ```bash
 mooncake_master \
-  --allocation_strategy=p2c \
+  --allocation_strategy=best_of_n \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
 ```

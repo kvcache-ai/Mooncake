@@ -361,7 +361,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 };
 
 /**
- * @brief Power-of-Two-Choices (P2C) allocation strategy.
+ * @brief Best-of-N sampling allocation strategy.
  *
  * For each allocation of N replicas:
  * 1. Randomly sample min(2N, total) candidate segments from the eligible pool
@@ -376,9 +376,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
  * - New empty segments naturally win the comparison, getting filled quickly.
  * - Thread-safe: uses thread_local state for sampling, no shared mutable data.
  */
-class P2CAllocationStrategy : public RandomAllocationStrategy {
+class BestOfNAllocationStrategy : public RandomAllocationStrategy {
    public:
-    P2CAllocationStrategy() = default;
+    BestOfNAllocationStrategy() = default;
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
@@ -423,8 +423,8 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
 
         const size_t remaining = replica_num - replicas.size();
 
-        // --- P2C: sample candidates from all segments, check eligibility when
-        // selecting ---
+        // --- Best-of-N: sample candidates from all segments, check eligibility
+        // when selecting ---
         const size_t min_candidate_size = 6;
         size_t sample_count = std::max(2 * remaining, min_candidate_size);
         sample_count = std::min(sample_count, names.size());
@@ -611,8 +611,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
     switch (type) {
         case AllocationStrategyType::RANDOM:
             return std::make_shared<RandomAllocationStrategy>();
-        case AllocationStrategyType::P2C:
-            return std::make_shared<P2CAllocationStrategy>();
+        case AllocationStrategyType::BEST_OF_N:
+            return std::make_shared<BestOfNAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         default:
