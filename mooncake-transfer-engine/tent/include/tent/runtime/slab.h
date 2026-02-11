@@ -19,6 +19,8 @@
 #include <mutex>
 #include <array>
 #include <cstdlib>
+#include <atomic>
+#include <unordered_map>
 
 namespace mooncake {
 namespace tent {
@@ -28,6 +30,13 @@ class SlabBase {
     SlabBase(size_t block_size);
 
     ~SlabBase() {
+        // Mark as destroyed to prevent further allocations
+        destroyed_.store(true, std::memory_order_release);
+
+        // Collect and free all allocated slabs
+        // Note: thread_local caches may still hold pointers to this memory,
+        // but they will check destroyed_ flag before accessing
+        std::lock_guard<std::mutex> lock(mutex_);
         for (auto entry : alloc_list_) free(entry);
         alloc_list_.clear();
         free_list_.clear();
@@ -70,6 +79,7 @@ class SlabBase {
    private:
     const size_t block_size_;
     int slab_index_;
+    std::atomic<bool> destroyed_{false};
     std::mutex mutex_;
     std::list<void *> free_list_;
     std::list<void *> alloc_list_;
