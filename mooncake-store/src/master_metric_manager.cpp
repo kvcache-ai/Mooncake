@@ -303,7 +303,22 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+
+      segment_rebalance_tasks_total_(
+          "segment_rebalance_tasks_total",
+          "Total number of segment rebalance (move) tasks submitted"),
+      segment_rebalance_failed_total_(
+          "segment_rebalance_failed_total",
+          "Total number of failed segment rebalance tasks"),
+      segment_bytes_migrated_("segment_bytes_migrated_total",
+                              "Total bytes migrated by segment rebalance"),
+      segment_locality_improvement_score_(
+          "segment_locality_improvement_score",
+          "Last observed locality improvement score from rebalance"),
+      segment_utilization_skew_(
+          "segment_utilization_skew",
+          "Skew of segment utilization (e.g. max-min ratio)") {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
 }
@@ -360,6 +375,11 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     fetch_tasks_failures_.inc(0);
     mark_task_to_complete_requests_.inc(0);
     mark_task_to_complete_failures_.inc(0);
+    segment_rebalance_tasks_total_.inc(0);
+    segment_rebalance_failed_total_.inc(0);
+    segment_bytes_migrated_.inc(0);
+    segment_locality_improvement_score_.update(0);
+    segment_utilization_skew_.update(0);
 
     // Update CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // counters
@@ -1213,6 +1233,39 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+void MasterMetricManager::inc_segment_rebalance_tasks_total(int64_t val) {
+    segment_rebalance_tasks_total_.inc(val);
+}
+void MasterMetricManager::inc_segment_rebalance_failed_total(int64_t val) {
+    segment_rebalance_failed_total_.inc(val);
+}
+void MasterMetricManager::add_segment_bytes_migrated(int64_t bytes) {
+    segment_bytes_migrated_.inc(bytes);
+}
+void MasterMetricManager::observe_segment_locality_improvement_score(
+    double score) {
+    segment_locality_improvement_score_.update(
+        static_cast<int64_t>(score * 1000));
+}
+void MasterMetricManager::observe_segment_utilization_skew(double skew) {
+    segment_utilization_skew_.update(static_cast<int64_t>(skew * 1000));
+}
+int64_t MasterMetricManager::get_segment_rebalance_tasks_total() {
+    return segment_rebalance_tasks_total_.value();
+}
+int64_t MasterMetricManager::get_segment_rebalance_failed_total() {
+    return segment_rebalance_failed_total_.value();
+}
+int64_t MasterMetricManager::get_segment_bytes_migrated() {
+    return segment_bytes_migrated_.value();
+}
+double MasterMetricManager::get_segment_locality_improvement_score() {
+    return segment_locality_improvement_score_.value() / 1000.0;
+}
+double MasterMetricManager::get_segment_utilization_skew() {
+    return segment_utilization_skew_.value() / 1000.0;
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -1296,6 +1349,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(query_task_failures_);
     serialize_metric(fetch_tasks_requests_);
     serialize_metric(fetch_tasks_failures_);
+
+    serialize_metric(segment_rebalance_tasks_total_);
+    serialize_metric(segment_rebalance_failed_total_);
+    serialize_metric(segment_bytes_migrated_);
+    serialize_metric(segment_locality_improvement_score_);
+    serialize_metric(segment_utilization_skew_);
 
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
@@ -1613,15 +1672,12 @@ std::string MasterMetricManager::get_summary_string() {
               mark_task_to_complete_failures_.value()
        << "/" << mark_task_to_complete_requests_.value() << "), ";
     // Eviction summary
-    ss << " | Eviction: "
-       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
-       << ", "
-       << "keys=" << evicted_key_count << ", "
+    ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
+       << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
 
     // Discard summary
-    ss << " | Discard: "
-       << "Released/Total=" << put_start_release_cnt << "/"
+    ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
 

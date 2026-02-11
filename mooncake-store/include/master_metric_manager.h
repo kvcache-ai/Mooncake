@@ -274,6 +274,18 @@ class MasterMetricManager {
     int64_t get_update_task_requests();
     int64_t get_update_task_failures();
 
+    // Segment rebalance metrics (for automated migration)
+    void inc_segment_rebalance_tasks_total(int64_t val = 1);
+    void inc_segment_rebalance_failed_total(int64_t val = 1);
+    void add_segment_bytes_migrated(int64_t bytes);
+    void observe_segment_locality_improvement_score(double score);
+    void observe_segment_utilization_skew(double skew);
+    int64_t get_segment_rebalance_tasks_total();
+    int64_t get_segment_rebalance_failed_total();
+    int64_t get_segment_bytes_migrated();
+    double get_segment_locality_improvement_score();
+    double get_segment_utilization_skew();
+
     // --- Serialization ---
     /**
      * @brief Serializes all managed metrics into Prometheus text format.
@@ -441,6 +453,13 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    // Segment rebalance metrics
+    ylt::metric::counter_t segment_rebalance_tasks_total_;
+    ylt::metric::counter_t segment_rebalance_failed_total_;
+    ylt::metric::counter_t segment_bytes_migrated_;
+    ylt::metric::gauge_t segment_locality_improvement_score_;
+    ylt::metric::gauge_t segment_utilization_skew_;
 };
 
 }  // namespace mooncake

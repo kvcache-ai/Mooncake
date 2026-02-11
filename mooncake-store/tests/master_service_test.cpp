@@ -3836,6 +3836,17 @@ TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
 }
 
+TEST_F(MasterServiceTest, RebalanceThreadStartsAndStops) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_rebalance(true)
+                              .set_rebalance_interval_ms(100)
+                              .set_max_rebalance_moves_per_round(2)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    service_.reset();
+}
+
 TEST_F(MasterServiceTest, QueryTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();

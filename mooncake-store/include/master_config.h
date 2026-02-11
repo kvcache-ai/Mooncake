@@ -56,6 +56,10 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+
+    bool enable_rebalance = false;
+    uint64_t rebalance_interval_ms = 60000;
+    uint32_t max_rebalance_moves_per_round = 5;
 };
 
 class MasterServiceSupervisorConfig {
@@ -235,6 +239,9 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    bool enable_rebalance = false;
+    uint64_t rebalance_interval_ms = 60000;
+    uint32_t max_rebalance_moves_per_round = 5;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -280,6 +287,9 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_rebalance = config.enable_rebalance;
+        rebalance_interval_ms = config.rebalance_interval_ms;
+        max_rebalance_moves_per_round = config.max_rebalance_moves_per_round;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -358,6 +368,9 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+    bool enable_rebalance_ = false;
+    uint64_t rebalance_interval_ms_ = 60000;
+    uint32_t max_rebalance_moves_per_round_ = 5;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -492,6 +505,19 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_rebalance(bool enable) {
+        enable_rebalance_ = enable;
+        return *this;
+    }
+    MasterServiceConfigBuilder& set_rebalance_interval_ms(uint64_t ms) {
+        rebalance_interval_ms_ = ms;
+        return *this;
+    }
+    MasterServiceConfigBuilder& set_max_rebalance_moves_per_round(uint32_t n) {
+        max_rebalance_moves_per_round_ = n;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -539,6 +565,9 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    bool enable_rebalance = false;
+    uint64_t rebalance_interval_ms = 60000;
+    uint32_t max_rebalance_moves_per_round = 5;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -578,6 +607,9 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_rebalance = config.enable_rebalance;
+        rebalance_interval_ms = config.rebalance_interval_ms;
+        max_rebalance_moves_per_round = config.max_rebalance_moves_per_round;
     }
 
     // Static factory method to create a builder
@@ -618,6 +650,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.enable_rebalance = enable_rebalance_;
+    config.rebalance_interval_ms = rebalance_interval_ms_;
+    config.max_rebalance_moves_per_round = max_rebalance_moves_per_round_;
     return config;
 }
 

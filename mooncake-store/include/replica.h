@@ -48,6 +48,33 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 /**
+ * @brief Placement status for migration lifecycle (distinct from
+ * ReplicaStatus). Used for move-first rebalance: ACTIVE -> MOVING_OUT/MOVING_IN
+ * -> ACTIVE.
+ */
+enum class PlacementStatus {
+    ACTIVE = 0,  // Normal serving
+    MOVING_OUT,  // Replica is being migrated away from this segment
+    MOVING_IN,   // Replica is being migrated into this segment
+    FAILED,      // Migration failed, can be recovered or retried
+};
+
+/**
+ * @brief Stream operator for PlacementStatus
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const PlacementStatus& status) noexcept {
+    static const std::unordered_map<PlacementStatus, std::string_view>
+        status_strings{{PlacementStatus::ACTIVE, "ACTIVE"},
+                       {PlacementStatus::MOVING_OUT, "MOVING_OUT"},
+                       {PlacementStatus::MOVING_IN, "MOVING_IN"},
+                       {PlacementStatus::FAILED, "FAILED"}};
+    os << (status_strings.count(status) ? status_strings.at(status)
+                                        : "UNKNOWN");
+    return os;
+}
+
+/**
  * @brief Status of a replica in the system
  */
 enum class ReplicaStatus {
@@ -186,7 +213,8 @@ class Replica {
         : id_(src.id_),
           data_(std::move(src.data_)),
           status_(src.status_),
-          refcnt_(src.refcnt_.exchange(0)) {
+          refcnt_(src.refcnt_.exchange(0)),
+          placement_status_(src.placement_status_) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -209,6 +237,7 @@ class Replica {
         data_ = std::move(src.data_);
         status_ = src.status_;
         refcnt_.store(src.refcnt_.exchange(0));
+        placement_status_ = src.placement_status_;
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
 
@@ -301,6 +330,29 @@ class Replica {
     void dec_refcnt() { refcnt_.fetch_sub(1); }
 
     uint32_t get_refcnt() const { return refcnt_.load(); }
+
+    // --- Placement status for migration (move-first rebalance) ---
+    [[nodiscard]] PlacementStatus get_placement_status() const {
+        return placement_status_;
+    }
+
+    void set_placement_status(PlacementStatus s) { placement_status_ = s; }
+
+    void mark_placement_moving_out() {
+        placement_status_ = PlacementStatus::MOVING_OUT;
+    }
+
+    void mark_placement_moving_in() {
+        placement_status_ = PlacementStatus::MOVING_IN;
+    }
+
+    void mark_placement_active() {
+        placement_status_ = PlacementStatus::ACTIVE;
+    }
+
+    void mark_placement_failed() {
+        placement_status_ = PlacementStatus::FAILED;
+    }
 
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
@@ -405,6 +457,7 @@ class Replica {
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
     std::atomic<uint32_t> refcnt_{0};
+    PlacementStatus placement_status_{PlacementStatus::ACTIVE};
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {
@@ -459,7 +512,7 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
     os << "Replica: { id: " << replica.id_ << ", status: " << replica.status_
-       << ", ";
+       << ", placement_status: " << replica.placement_status_ << ", ";
 
     if (replica.is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);

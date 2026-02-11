@@ -268,4 +268,118 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
     EXPECT_EQ(second[0].status, TaskStatus::PROCESSING);
 }
 
+TEST_F(ClientTaskManagerTest, TaskHasAttemptsAndLastError) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    UUID client_id = generate_uuid();
+
+    auto task_id_exp =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, ReplicaMovePayload{
+                           .key = "k1", .source = "seg1", .target = "seg2"});
+    ASSERT_TRUE(task_id_exp.has_value());
+    UUID task_id = task_id_exp.value();
+
+    auto task_opt = manager.get_read_access().find_task_by_id(task_id);
+    ASSERT_TRUE(task_opt.has_value());
+    EXPECT_EQ(task_opt->attempts, 0u);
+    EXPECT_TRUE(task_opt->last_error.empty());
+
+    manager.get_write_access().pop_tasks(client_id, 1);
+    auto ec = manager.get_write_access().complete_task(
+        client_id, task_id, TaskStatus::FAILED, "transfer_failed");
+    EXPECT_EQ(ec, ErrorCode::OK);
+    task_opt = manager.get_read_access().find_task_by_id(task_id);
+    ASSERT_TRUE(task_opt.has_value());
+    EXPECT_EQ(task_opt->status, TaskStatus::FAILED);
+    EXPECT_EQ(task_opt->message, "transfer_failed");
+    EXPECT_EQ(task_opt->last_error, "transfer_failed");
+}
+
+TEST_F(ClientTaskManagerTest, HandleMigrationFailure) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    UUID client_id = generate_uuid();
+
+    auto task_id_exp =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, ReplicaMovePayload{
+                           .key = "k1", .source = "seg1", .target = "seg2"});
+    ASSERT_TRUE(task_id_exp.has_value());
+    UUID task_id = task_id_exp.value();
+
+    manager.get_write_access().pop_tasks(client_id, 1);
+    auto task_opt = manager.get_read_access().find_task_by_id(task_id);
+    ASSERT_TRUE(task_opt.has_value());
+    EXPECT_EQ(task_opt->status, TaskStatus::PROCESSING);
+
+    ErrorCode ec = manager.get_write_access().handle_migration_failure(
+        task_id, "replica_not_found");
+    EXPECT_EQ(ec, ErrorCode::OK);
+
+    task_opt = manager.get_read_access().find_task_by_id(task_id);
+    ASSERT_TRUE(task_opt.has_value());
+    EXPECT_EQ(task_opt->status, TaskStatus::FAILED);
+    EXPECT_EQ(task_opt->last_error, "replica_not_found");
+}
+
+TEST_F(ClientTaskManagerTest, ScheduleMigrationRetry) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    UUID client_id = generate_uuid();
+
+    auto task_id_exp =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, ReplicaMovePayload{
+                           .key = "k1", .source = "seg1", .target = "seg2"});
+    ASSERT_TRUE(task_id_exp.has_value());
+    UUID task_id = task_id_exp.value();
+
+    manager.get_write_access().pop_tasks(client_id, 1);
+    manager.get_write_access().complete_task(client_id, task_id,
+                                             TaskStatus::FAILED, "timeout");
+
+    auto retry_exp =
+        manager.get_write_access().schedule_migration_retry(task_id);
+    ASSERT_TRUE(retry_exp.has_value());
+
+    auto task_opt = manager.get_read_access().find_task_by_id(task_id);
+    ASSERT_TRUE(task_opt.has_value());
+    EXPECT_EQ(task_opt->status, TaskStatus::PENDING);
+    EXPECT_EQ(task_opt->attempts, 1u);
+
+    auto tasks = manager.get_write_access().pop_tasks(client_id, 10);
+    ASSERT_EQ(tasks.size(), 1u);
+    EXPECT_EQ(tasks[0].id, task_id);
+    EXPECT_EQ(tasks[0].attempts, 1u);
+}
+
+TEST_F(ClientTaskManagerTest,
+       ScheduleMigrationRetryFailsWhenMaxAttemptsReached) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 2});
+    UUID client_id = generate_uuid();
+
+    auto task_id_exp =
+        manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id, ReplicaMovePayload{
+                           .key = "k1", .source = "seg1", .target = "seg2"});
+    ASSERT_TRUE(task_id_exp.has_value());
+    UUID task_id = task_id_exp.value();
+
+    manager.get_write_access().pop_tasks(client_id, 1);
+    manager.get_write_access().complete_task(client_id, task_id,
+                                             TaskStatus::FAILED, "err1");
+    ASSERT_TRUE(manager.get_write_access().schedule_migration_retry(task_id));
+
+    manager.get_write_access().pop_tasks(client_id, 1);
+    manager.get_write_access().complete_task(client_id, task_id,
+                                             TaskStatus::FAILED, "err2");
+    ASSERT_TRUE(manager.get_write_access().schedule_migration_retry(task_id));
+
+    manager.get_write_access().pop_tasks(client_id, 1);
+    manager.get_write_access().complete_task(client_id, task_id,
+                                             TaskStatus::FAILED, "err3");
+    auto retry_exp =
+        manager.get_write_access().schedule_migration_retry(task_id);
+    EXPECT_FALSE(retry_exp.has_value());
+    EXPECT_EQ(retry_exp.error(), ErrorCode::INVALID_PARAMS);
+}
+
 }  // namespace mooncake

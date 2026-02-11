@@ -1,4 +1,6 @@
 #include "task_manager.h"
+
+#include <algorithm>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -32,8 +34,10 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .created_at = now,
                  .last_updated_at = now,
                  .message = "",
+                 .last_error = "",
                  .assigned_client = client_id,
-                 .max_retry_attempts = manager_->max_retry_attempts_};
+                 .max_retry_attempts = manager_->max_retry_attempts_,
+                 .attempts = 0};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
@@ -135,6 +139,86 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
     manager_->finished_task_history_.push_back(task_id);
 
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedTaskWriteAccess::handle_migration_failure(
+    const UUID& task_id, const std::string& error_message) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end()) {
+        LOG(ERROR) << "handle_migration_failure: task_id=" << task_id
+                   << " not found";
+        return ErrorCode::TASK_NOT_FOUND;
+    }
+
+    Task& task = it->second;
+    if (task.is_finished()) {
+        return ErrorCode::OK;
+    }
+
+    task.mark_complete(TaskStatus::FAILED, error_message);
+
+    const UUID& client_id = task.assigned_client;
+    auto ps_it = manager_->processing_tasks_.find(client_id);
+    if (ps_it != manager_->processing_tasks_.end()) {
+        auto& processing_set = ps_it->second;
+        const size_t erased = processing_set.erase(task_id);
+        if (erased == 1 && manager_->total_processing_tasks_ > 0) {
+            manager_->total_processing_tasks_--;
+        }
+    }
+
+    manager_->finished_task_history_.push_back(task_id);
+    return ErrorCode::OK;
+}
+
+tl::expected<void, ErrorCode> ScopedTaskWriteAccess::schedule_migration_retry(
+    const UUID& task_id) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end()) {
+        LOG(ERROR) << "schedule_migration_retry: task_id=" << task_id
+                   << " not found";
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+
+    Task& task = it->second;
+    if (!task.is_finished()) {
+        LOG(ERROR) << "schedule_migration_retry: task_id=" << task_id
+                   << " is not finished (status=" << task.status << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (task.status != TaskStatus::FAILED) {
+        LOG(ERROR) << "schedule_migration_retry: task_id=" << task_id
+                   << " is not FAILED";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (task.attempts >= task.max_retry_attempts) {
+        LOG(WARNING) << "schedule_migration_retry: task_id=" << task_id
+                     << " attempts " << task.attempts
+                     << " >= max_retry_attempts " << task.max_retry_attempts;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
+        return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    }
+
+    task.status = TaskStatus::PENDING;
+    task.attempts++;
+    task.last_updated_at = std::chrono::system_clock::now();
+    task.message.clear();
+    task.last_error.clear();
+
+    manager_->finished_task_history_.erase(
+        std::remove(manager_->finished_task_history_.begin(),
+                    manager_->finished_task_history_.end(), task_id),
+        manager_->finished_task_history_.end());
+
+    manager_->pending_tasks_[task.assigned_client].push(task_id);
+    manager_->total_pending_tasks_++;
+
+    return {};
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {

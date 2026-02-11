@@ -19,14 +19,14 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "master_config.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "segment.h"
-#include "types.h"
-#include "master_config.h"
-#include "rpc_types.h"
 #include "replica.h"
+#include "rpc_types.h"
+#include "segment.h"
 #include "task_manager.h"
+#include "types.h"
 
 namespace mooncake {
 // Forward declarations
@@ -55,8 +55,8 @@ class MasterService {
      *         be mounted temporarily,
      *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
-    auto MountSegment(const Segment& segment, const UUID& client_id)
-        -> tl::expected<void, ErrorCode>;
+    auto MountSegment(const Segment& segment,
+                      const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
@@ -78,8 +78,8 @@ class MasterService {
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
      */
-    auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
-        -> tl::expected<void, ErrorCode>;
+    auto UnmountSegment(const UUID& segment_id,
+                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Check if an object exists
@@ -130,9 +130,10 @@ class MasterService {
      * clients are omitted from the result map. Clients that exist but have no
      * IPs are included with empty vectors.
      */
-    auto BatchQueryIp(const std::vector<UUID>& client_ids) -> tl::expected<
-        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
-        ErrorCode>;
+    auto BatchQueryIp(const std::vector<UUID>& client_ids)
+        -> tl::expected<std::unordered_map<UUID, std::vector<std::string>,
+                                           boost::hash<UUID>>,
+                        ErrorCode>;
 
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
@@ -277,8 +278,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
-    auto Remove(const std::string& key, bool force = false)
-        -> tl::expected<void, ErrorCode>;
+    auto Remove(const std::string& key,
+                bool force = false) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
@@ -287,8 +288,8 @@ class MasterService {
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    auto RemoveByRegex(const std::string& str, bool force = false)
-        -> tl::expected<long, ErrorCode>;
+    auto RemoveByRegex(const std::string& str,
+                       bool force = false) -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
@@ -350,10 +351,10 @@ class MasterService {
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
-    auto NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas)
-        -> tl::expected<void, ErrorCode>;
+    auto NotifyOffloadSuccess(const UUID& client_id,
+                              const std::vector<std::string>& keys,
+                              const std::vector<StorageObjectMetadata>&
+                                  metadatas) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -413,6 +414,14 @@ class MasterService {
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
+
+    // Segment rebalance loop (move-first, locality-first)
+    void RebalanceThreadFunc();
+    void ObserveSegmentState(
+        std::vector<SegmentLocalityInfo>& segment_infos,
+        std::vector<std::pair<std::string, ReplicaPlacement>>&
+            replica_placements_with_key);
+    void FinalizeCompletedMigrations();
 
     // Internal data structures
     struct ObjectMetadata {
@@ -756,6 +765,13 @@ class MasterService {
     // Used to wake task cleanup thread immediately during shutdown.
     std::mutex task_cleanup_mutex_;
     std::condition_variable task_cleanup_cv_;
+
+    // Rebalance thread (segment migration, locality-first)
+    bool enable_rebalance_{false};
+    uint64_t rebalance_interval_ms_{60000};
+    uint32_t max_rebalance_moves_per_round_{5};
+    std::thread rebalance_thread_;
+    std::atomic<bool> rebalance_running_{false};
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {

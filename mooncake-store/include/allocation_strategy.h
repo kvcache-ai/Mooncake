@@ -418,4 +418,116 @@ class CxlAllocationStrategy : public AllocationStrategy {
     }
 };
 
+// =============================================================================
+// Locality scoring and rebalance planning (for segment migration)
+// =============================================================================
+
+/**
+ * @brief Segment info for locality scoring (node + utilization).
+ */
+struct SegmentLocalityInfo {
+    std::string segment_name;
+    UUID node_id;
+    double used_ratio{0.0};  // [0.0, 1.0]
+};
+
+/**
+ * @brief Current placement of a replica (segment + node) for rebalance input.
+ */
+struct ReplicaPlacement {
+    std::string segment_name;
+    UUID node_id;
+};
+
+/**
+ * @brief A suggested move: migrate replica from src_segment to target_segment.
+ */
+struct RebalanceMove {
+    std::string src_segment;
+    std::string target_segment;
+};
+
+/**
+ * @brief Score how good a candidate segment is for placing a replica.
+ * Higher is better. Same node > same rack > same region > lower utilization.
+ * @param replica_segment_name Current segment of the replica
+ * @param replica_node_id Node (client_id) of the current segment
+ * @param candidate Candidate segment info
+ * @return Score (higher = better locality / lower load)
+ */
+inline double ScoreSegmentLocality(const std::string& replica_segment_name,
+                                   const UUID& replica_node_id,
+                                   const SegmentLocalityInfo& candidate) {
+    if (candidate.segment_name == replica_segment_name) {
+        return -1e9;  // Exclude current segment
+    }
+    const double utilization_penalty = candidate.used_ratio * 10.0;
+    if (candidate.node_id == replica_node_id) {
+        return 1000.0 - utilization_penalty;  // Same node
+    }
+    return 100.0 - utilization_penalty;  // Different node; lower utilization
+                                         // still preferred
+}
+
+/**
+ * @brief Select the best target segment for a replica from candidates.
+ * @param replica_segment_name Current segment of the replica
+ * @param replica_node_id Node of the current segment
+ * @param candidates All candidate segment infos
+ * @param excluded_segments Segment names to exclude (e.g. full or unmounting)
+ * @return Best segment name, or std::nullopt if none
+ */
+inline std::optional<std::string> SelectBestTargetSegment(
+    const std::string& replica_segment_name, const UUID& replica_node_id,
+    const std::vector<SegmentLocalityInfo>& candidates,
+    const std::set<std::string>& excluded_segments = {}) {
+    std::optional<std::string> best;
+    double best_score = -1e18;
+
+    for (const auto& c : candidates) {
+        if (excluded_segments.count(c.segment_name)) {
+            continue;
+        }
+        double score =
+            ScoreSegmentLocality(replica_segment_name, replica_node_id, c);
+        if (score > best_score && score >= 0) {
+            best_score = score;
+            best = c.segment_name;
+        }
+    }
+    return best;
+}
+
+/**
+ * @brief Plan locality rebalance: suggest moves from current placements.
+ * For each replica placement, picks a better target by locality/utilisation if
+ * available; does not duplicate (src, target) pairs.
+ * @param replica_placements Current replica placements to consider
+ * @param segment_infos All segment infos (for scoring targets)
+ * @param excluded_segments Segment names to exclude as targets
+ * @return List of (src_segment, target_segment) moves
+ */
+inline std::vector<RebalanceMove> PlanLocalityRebalance(
+    const std::vector<ReplicaPlacement>& replica_placements,
+    const std::vector<SegmentLocalityInfo>& segment_infos,
+    const std::set<std::string>& excluded_segments = {}) {
+    std::vector<RebalanceMove> moves;
+    std::set<std::pair<std::string, std::string>> seen;
+
+    for (const auto& rp : replica_placements) {
+        auto target = SelectBestTargetSegment(rp.segment_name, rp.node_id,
+                                              segment_infos, excluded_segments);
+        if (!target.has_value() || *target == rp.segment_name) {
+            continue;
+        }
+        auto key = std::make_pair(rp.segment_name, *target);
+        if (seen.count(key)) {
+            continue;
+        }
+        seen.insert(key);
+        moves.push_back(RebalanceMove{rp.segment_name, *target});
+    }
+    return moves;
+}
+
 }  // namespace mooncake

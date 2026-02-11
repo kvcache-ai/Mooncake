@@ -2,9 +2,12 @@
 
 #include <cassert>
 #include <cstdint>
-#include <shared_mutex>
 #include <regex>
+#include <set>
+#include <shared_mutex>
+#include <thread>
 #include <unordered_set>
+#include <ylt/struct_json/json_reader.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
@@ -37,7 +40,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      enable_rebalance_(config.enable_rebalance),
+      rebalance_interval_ms_(config.rebalance_interval_ms),
+      max_rebalance_moves_per_round_(config.max_rebalance_moves_per_round) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -77,6 +83,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    if (enable_rebalance_) {
+        rebalance_running_ = true;
+        rebalance_thread_ =
+            std::thread(&MasterService::RebalanceThreadFunc, this);
+        VLOG(1) << "action=start_rebalance_thread";
+    }
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -96,6 +109,7 @@ MasterService::~MasterService() {
     eviction_running_ = false;
     client_monitor_running_ = false;
     task_cleanup_running_ = false;
+    rebalance_running_ = false;
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
@@ -108,6 +122,9 @@ MasterService::~MasterService() {
     }
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
+    }
+    if (rebalance_thread_.joinable()) {
+        rebalance_thread_.join();
     }
 }
 
@@ -1114,6 +1131,12 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         response.target = std::nullopt;
     }
 
+    // Placement state for move-first: source MOVING_OUT, target MOVING_IN
+    source->mark_placement_moving_out();
+    for (auto& r : replicas) {
+        r.mark_placement_moving_in();
+    }
+
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
     shard->replication_tasks.emplace(
@@ -1196,8 +1219,10 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
 
-        // Mark replica as complete
+        // Mark replica as complete and activate placement (target is now
+        // serving)
         replica->mark_complete();
+        replica->mark_placement_active();
     }
 
     // Remove the source replica and release its space later.
@@ -1250,7 +1275,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
         LOG(WARNING) << "key=" << key << ", source_id=" << source_id
                      << ", move source not found during revoke";
     } else {
-        // Decrement source reference count
+        source->mark_placement_active();
         source->dec_refcnt();
     }
 
@@ -1269,8 +1294,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key, bool force)
-    -> tl::expected<void, ErrorCode> {
+auto MasterService::Remove(const std::string& key,
+                           bool force) -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -1305,8 +1330,8 @@ auto MasterService::Remove(const std::string& key, bool force)
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
-    -> tl::expected<long, ErrorCode> {
+auto MasterService::RemoveByRegex(const std::string& regex_pattern,
+                                  bool force) -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
 
@@ -1984,8 +2009,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
@@ -2244,7 +2268,142 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
                    << ", error=complete_task_failed";
         return tl::make_unexpected(err);
     }
+
+    if (request.status == TaskStatus::FAILED) {
+        auto task_opt =
+            task_manager_.get_read_access().find_task_by_id(request.id);
+        if (task_opt.has_value() && task_opt->type == TaskType::REPLICA_MOVE) {
+            MasterMetricManager::instance().inc_segment_rebalance_failed_total(
+                1);
+            auto retry_exp = write_access.schedule_migration_retry(request.id);
+            if (!retry_exp.has_value()) {
+                VLOG(1) << "task_id=" << request.id
+                        << " migration_retry not scheduled: "
+                        << static_cast<int32_t>(retry_exp.error());
+            }
+        }
+    } else if (request.status == TaskStatus::SUCCESS) {
+        auto task_opt =
+            task_manager_.get_read_access().find_task_by_id(request.id);
+        if (task_opt.has_value() && task_opt->type == TaskType::REPLICA_MOVE) {
+            try {
+                ReplicaMovePayload payload;
+                struct_json::from_json(payload, task_opt->payload);
+                MetadataAccessorRO accessor(this, payload.key);
+                if (accessor.Exists()) {
+                    MasterMetricManager::instance().add_segment_bytes_migrated(
+                        static_cast<int64_t>(accessor.Get().size));
+                }
+            } catch (...) {
+                VLOG(1) << "task_id=" << request.id
+                        << " failed to parse move payload for bytes_migrated";
+            }
+        }
+    }
+
     return {};
+}
+
+void MasterService::ObserveSegmentState(
+    std::vector<SegmentLocalityInfo>& segment_infos,
+    std::vector<std::pair<std::string, ReplicaPlacement>>&
+        replica_placements_with_key) {
+    segment_infos.clear();
+    replica_placements_with_key.clear();
+
+    std::unordered_map<std::string, UUID> segment_to_node;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        std::vector<std::string> all_segments;
+        if (segment_access.GetAllSegments(all_segments) != ErrorCode::OK ||
+            all_segments.empty()) {
+            return;
+        }
+        for (const auto& name : all_segments) {
+            UUID node_id;
+            if (segment_access.GetClientIdBySegmentName(name, node_id) !=
+                ErrorCode::OK) {
+                continue;
+            }
+            segment_to_node[name] = node_id;
+            double used_ratio =
+                MasterMetricManager::instance().get_segment_mem_used_ratio(
+                    name);
+            segment_infos.push_back(
+                SegmentLocalityInfo{name, node_id, used_ratio});
+        }
+    }
+
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& [key, metadata] : shard->metadata) {
+            if (!metadata.IsValid()) {
+                continue;
+            }
+            if (shard->replication_tasks.count(key)) {
+                continue;
+            }
+            for (const std::string& seg_name :
+                 metadata.GetReplicaSegmentNames()) {
+                auto it = segment_to_node.find(seg_name);
+                if (it != segment_to_node.end()) {
+                    replica_placements_with_key.emplace_back(
+                        key, ReplicaPlacement{seg_name, it->second});
+                }
+            }
+        }
+    }
+}
+
+void MasterService::FinalizeCompletedMigrations() {
+    // Placement status is already cleared in MoveEnd (mark_placement_active).
+    // Optionally update locality/utilisation metrics here.
+    VLOG(2) << "action=finalize_completed_migrations";
+}
+
+void MasterService::RebalanceThreadFunc() {
+    VLOG(1) << "action=rebalance_thread_started";
+
+    while (rebalance_running_) {
+        std::vector<SegmentLocalityInfo> segment_infos;
+        std::vector<std::pair<std::string, ReplicaPlacement>>
+            replica_placements_with_key;
+        ObserveSegmentState(segment_infos, replica_placements_with_key);
+
+        if (segment_infos.empty()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(rebalance_interval_ms_));
+            continue;
+        }
+
+        std::set<std::string> excluded_segments;
+        uint32_t submitted = 0;
+        for (const auto& [key, placement] : replica_placements_with_key) {
+            if (submitted >= max_rebalance_moves_per_round_) {
+                break;
+            }
+            auto target = SelectBestTargetSegment(
+                placement.segment_name, placement.node_id, segment_infos,
+                excluded_segments);
+            if (!target.has_value() || *target == placement.segment_name) {
+                continue;
+            }
+            auto result = CreateMoveTask(key, placement.segment_name, *target);
+            if (result.has_value()) {
+                MasterMetricManager::instance()
+                    .inc_segment_rebalance_tasks_total(1);
+                submitted++;
+            }
+        }
+
+        FinalizeCompletedMigrations();
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(rebalance_interval_ms_));
+    }
+
+    VLOG(1) << "action=rebalance_thread_stopped";
 }
 
 }  // namespace mooncake

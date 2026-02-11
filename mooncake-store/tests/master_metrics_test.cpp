@@ -427,6 +427,35 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 3);
 }
 
+TEST_F(MasterMetricsTest, SegmentRebalanceMetricsTest) {
+    auto& metrics = MasterMetricManager::instance();
+
+    ASSERT_EQ(metrics.get_segment_rebalance_tasks_total(), 0);
+    ASSERT_EQ(metrics.get_segment_rebalance_failed_total(), 0);
+    ASSERT_EQ(metrics.get_segment_bytes_migrated(), 0);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_locality_improvement_score(), 0.0);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_utilization_skew(), 0.0);
+
+    metrics.inc_segment_rebalance_tasks_total(2);
+    metrics.inc_segment_rebalance_failed_total(1);
+    metrics.add_segment_bytes_migrated(4096);
+    metrics.observe_segment_locality_improvement_score(0.5);
+    metrics.observe_segment_utilization_skew(0.2);
+
+    ASSERT_EQ(metrics.get_segment_rebalance_tasks_total(), 2);
+    ASSERT_EQ(metrics.get_segment_rebalance_failed_total(), 1);
+    ASSERT_EQ(metrics.get_segment_bytes_migrated(), 4096);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_locality_improvement_score(), 0.5);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_utilization_skew(), 0.2);
+
+    std::string serialized = metrics.serialize_metrics();
+    ASSERT_TRUE(serialized.find("segment_rebalance_tasks_total") !=
+                std::string::npos);
+    ASSERT_TRUE(serialized.find("segment_rebalance_failed_total") !=
+                std::string::npos);
+    ASSERT_TRUE(serialized.find("segment_bytes_migrated") != std::string::npos);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

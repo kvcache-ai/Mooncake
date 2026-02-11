@@ -8,6 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ostream>
+
+#include <ylt/util/tl/expected.hpp>
+
 #include "types.h"
 #include "mutex.h"
 #include "master_config.h"
@@ -74,8 +77,10 @@ struct Task {
     std::chrono::system_clock::time_point last_updated_at;
 
     std::string message;
+    std::string last_error;  // Last error for migration failure reporting
     UUID assigned_client;
     uint32_t max_retry_attempts;
+    uint32_t attempts{0};  // Number of execution attempts (for retries)
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -87,6 +92,7 @@ struct Task {
     void mark_complete(TaskStatus final_status, const std::string& msg) {
         status = final_status;
         message = msg;
+        last_error = msg;
         last_updated_at = std::chrono::system_clock::now();
     }
 };
@@ -164,6 +170,20 @@ class ScopedTaskWriteAccess {
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
+
+    /**
+     * @brief Mark a migration task as failed and remove from processing.
+     * Used when client reports failure or migration cannot proceed.
+     */
+    ErrorCode handle_migration_failure(const UUID& task_id,
+                                       const std::string& error_message);
+
+    /**
+     * @brief Re-queue a failed migration task for retry (PENDING).
+     * Fails if attempts >= max_retry_attempts. Caller may apply backoff before
+     * next pop.
+     */
+    tl::expected<void, ErrorCode> schedule_migration_retry(const UUID& task_id);
 
     void prune_finished_tasks();
 
