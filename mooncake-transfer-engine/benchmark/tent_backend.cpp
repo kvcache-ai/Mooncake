@@ -108,7 +108,7 @@ int TENTBenchRunner::allocateBuffers() {
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
-        return 0;
+        return -1;
     }
 
     // Allocate
