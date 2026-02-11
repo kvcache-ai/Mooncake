@@ -37,6 +37,7 @@ class EvictionStrategy;
 // Forward declarations for test classes
 namespace test {
 class MasterServiceSnapshotTestBase;
+class SnapshotChildProcessTest;
 }  // namespace test
 
 /*
@@ -49,6 +50,7 @@ class MasterServiceSnapshotTestBase;
 class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
+    friend class test::SnapshotChildProcessTest;
 
    public:
     MasterService();
