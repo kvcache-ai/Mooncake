@@ -474,18 +474,18 @@ class Client {
     /**
      * @brief Initialize local hot cache
      * @return ErrorCode::OK if use local hot cache,
-     * ErrorCode::INVALID_PARAMS if invalid LOCAL_HOT_CACHE_SIZE config
+     * ErrorCode::INVALID_PARAMS if invalid MC_STORE_LOCAL_HOT_CACHE_SIZE config
      */
     ErrorCode InitLocalHotCache();
 
     /**
-     * @brief Read LOCAL_HOT_CACHE_SIZE from environment variable
+     * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
      * @return Cache size in bytes, or 0 if not set or invalid
      */
     size_t GetLocalHotCacheSizeFromEnv();
 
     /**
-     * @brief Read LOCAL_HOT_BLOCK_SIZE from environment variable
+     * @brief Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment variable
      * @param default_value Default block size to use if env var is not set or
      * invalid
      * @return Parsed block size from environment, or default_value if not

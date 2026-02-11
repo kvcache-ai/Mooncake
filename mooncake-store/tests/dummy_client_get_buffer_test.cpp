@@ -90,14 +90,22 @@ class DummyClientGetBufferTest : public ::testing::Test {
 
         // Restore env
         if (saved_hot_cache_env_.has_value()) {
-            setenv("LOCAL_HOT_CACHE_SIZE", saved_hot_cache_env_->c_str(), 1);
+            setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE",
+                   saved_hot_cache_env_->c_str(), 1);
         } else {
-            unsetenv("LOCAL_HOT_CACHE_SIZE");
+            unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         }
         if (saved_hot_block_env_.has_value()) {
-            setenv("LOCAL_HOT_BLOCK_SIZE", saved_hot_block_env_->c_str(), 1);
+            setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE",
+                   saved_hot_block_env_->c_str(), 1);
         } else {
-            unsetenv("LOCAL_HOT_BLOCK_SIZE");
+            unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
+        }
+        if (saved_hot_shm_env_.has_value()) {
+            setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM",
+                   saved_hot_shm_env_->c_str(), 1);
+        } else {
+            unsetenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
         }
     }
 
@@ -105,15 +113,20 @@ class DummyClientGetBufferTest : public ::testing::Test {
     // Returns true on success.
     bool SetupStack() {
         // Enable hot cache with production-scale block size
-        const char *prev = std::getenv("LOCAL_HOT_CACHE_SIZE");
+        const char *prev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         if (prev) saved_hot_cache_env_ = std::string(prev);
-        setenv("LOCAL_HOT_CACHE_SIZE", std::to_string(kHotCacheSize).c_str(),
-               1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE",
+               std::to_string(kHotCacheSize).c_str(), 1);
 
-        const char *prev_block = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+        const char *prev_block = std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
         if (prev_block) saved_hot_block_env_ = std::string(prev_block);
-        setenv("LOCAL_HOT_BLOCK_SIZE", std::to_string(kHotBlockSize).c_str(),
-               1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE",
+               std::to_string(kHotBlockSize).c_str(), 1);
+
+        // Enable shm mode so hot cache is shared with dummy client
+        const char *prev_shm = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
+        if (prev_shm) saved_hot_shm_env_ = std::string(prev_shm);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1", 1);
 
         // Start in-proc master
         if (!master_.Start(InProcMasterConfigBuilder().build())) return false;
@@ -175,6 +188,7 @@ class DummyClientGetBufferTest : public ::testing::Test {
     std::string ipc_path_;
     std::optional<std::string> saved_hot_cache_env_;
     std::optional<std::string> saved_hot_block_env_;
+    std::optional<std::string> saved_hot_shm_env_;
 };
 
 // ---- Test: get_buffer via allocator fallback (no hot cache hit) ----
