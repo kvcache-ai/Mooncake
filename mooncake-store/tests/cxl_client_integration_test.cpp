@@ -459,8 +459,8 @@ TEST_F(ClientIntegrationTestCxl, EvictOperation) {
         }
     }
 
-    ASSERT_TRUE(evict_worked)
-        << "No keys were evicted, the eviction mechanism might not be working correctly.";
+    ASSERT_TRUE(evict_worked) << "No keys were evicted, the eviction mechanism "
+                                 "might not be working correctly.";
 }
 
 }  // namespace testing
