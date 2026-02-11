@@ -419,6 +419,12 @@ class Client {
     bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
 
     /**
+     * @brief Get the local hot cache instance.
+     * @return shared_ptr to LocalHotCache, or nullptr if disabled.
+     */
+    std::shared_ptr<LocalHotCache> GetHotCache() const { return hot_cache_; }
+
+    /**
      * @brief Get the number of cache blocks in local hot cache
      * @return Number of cache blocks if hot cache is enabled, 0 otherwise
      */

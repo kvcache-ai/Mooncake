@@ -284,26 +284,15 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            if (use_dummy_client_) {
-                auto [buffer_base, buffer_size] = store_->get_buffer_info(key);
-                if (buffer_size == 0) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
+            auto buffer_handle = store_->get_buffer(key);
+            if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
-                                       buffer_size);
-            } else {
-                auto buffer_handle = store_->get_buffer(key);
-                if (!buffer_handle) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
-
-                py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes((char *)buffer_handle->ptr(),
-                                       buffer_handle->size());
+                return kNullString;
             }
+
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::bytes((char *)buffer_handle->ptr(),
+                                   buffer_handle->size());
         }
     }
 

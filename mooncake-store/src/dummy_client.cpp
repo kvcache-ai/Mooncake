@@ -19,156 +19,6 @@
 
 namespace mooncake {
 
-std::mutex ShmHelper::shm_mutex_;
-
-static int memfd_create_wrapper(const char* name, unsigned int flags) {
-#ifdef __NR_memfd_create
-    return syscall(__NR_memfd_create, name, flags);
-#else
-    return -1;  // Or appropriate fallback/error
-#endif
-}
-
-ShmHelper* ShmHelper::getInstance() {
-    static ShmHelper instance;
-    return &instance;
-}
-
-ShmHelper::ShmHelper() {
-    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
-}
-
-ShmHelper::~ShmHelper() { cleanup(); }
-
-bool ShmHelper::cleanup() {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-    bool ret = true;
-    for (auto& shm : shms_) {
-        if (shm->fd != -1) {
-            close(shm->fd);
-            shm->fd = -1;
-        }
-        if (shm->base_addr) {
-            if (munmap(shm->base_addr, shm->size) == -1) {
-                LOG(ERROR) << "Failed to unmap shared memory: "
-                           << strerror(errno);
-                ret = false;
-            }
-            shm->base_addr = nullptr;
-        }
-    }
-    shms_.clear();
-    return ret;
-}
-
-void* ShmHelper::allocate(size_t size) {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-
-    unsigned int flags = MFD_CLOEXEC;
-    if (use_hugepage_) {
-        bool use_memfd = true;
-        size = align_up(size, get_hugepage_size_from_env(&flags, use_memfd));
-        LOG(INFO) << "Using huge pages for shared memory, size: " << size;
-    }
-
-    // Create memfd
-    int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, flags);
-    if (fd == -1) {
-        std::string extra_msg =
-            use_hugepage_ ? " (Check /proc/sys/vm/nr_hugepages?)" : "";
-        throw std::runtime_error("Failed to create anonymous shared memory" +
-                                 extra_msg + ": " +
-                                 std::string(strerror(errno)));
-    }
-
-    // Set size
-    if (ftruncate(fd, size) == -1) {
-        close(fd);
-        throw std::runtime_error("Failed to set shared memory size: " +
-                                 std::string(strerror(errno)));
-    }
-
-    // Map memory
-    void* base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_POPULATE, fd, 0);
-    if (base_addr == MAP_FAILED) {
-        close(fd);
-        throw std::runtime_error("Failed to map shared memory: " +
-                                 std::string(strerror(errno)));
-    }
-
-    auto shm = std::make_shared<ShmSegment>();
-    shm->fd = fd;
-    shm->base_addr = base_addr;
-    shm->size = size;
-    shm->name = MOONCAKE_SHM_NAME;
-    shm->registered = false;
-    shms_.push_back(shm);
-
-    return base_addr;
-}
-
-std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-    for (auto& shm : shms_) {
-        if (addr >= shm->base_addr &&
-            reinterpret_cast<uint8_t*>(addr) <
-                reinterpret_cast<uint8_t*>(shm->base_addr) + shm->size) {
-            return shm;
-        }
-    }
-    return nullptr;
-}
-
-int ShmHelper::free(void* addr) {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-    for (auto it = shms_.begin(); it != shms_.end(); ++it) {
-        if ((*it)->base_addr == addr) {
-            if ((*it)->fd != -1) {
-                close((*it)->fd);
-            }
-            if ((*it)->base_addr &&
-                munmap((*it)->base_addr, (*it)->size) == -1) {
-                LOG(ERROR) << "Failed to unmap shared memory during free: "
-                           << strerror(errno);
-                return -1;
-            }
-            LOG(INFO) << "Freed shared memory at " << addr
-                      << ", size: " << (*it)->size;
-            shms_.erase(it);
-            return 0;
-        }
-    }
-    LOG(ERROR) << "Attempted to free unknown shared memory address: " << addr;
-    return -1;
-}
-
-static int send_fd(int socket, int fd, void* data, size_t data_len) {
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int))];
-    memset(buf, 0, sizeof(buf));
-
-    iov.iov_base = data;
-    iov.iov_len = data_len;
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-    return sendmsg(socket, &msg, 0);
-}
-
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -324,6 +174,14 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
         return -1;
     }
 
+    // Send request type first
+    IpcRequestType type = IPC_SHM_REGISTER;
+    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
+        LOG(ERROR) << "Failed to send IPC request type: " << strerror(errno);
+        close(sock_fd);
+        return -1;
+    }
+
     ShmRegisterRequest req;
     req.client_id_first = client_id_.first;
     req.client_id_second = client_id_.second;
@@ -331,7 +189,7 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
     req.shm_size = shm->size;
     req.is_local_buffer = is_local;
 
-    if (send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
+    if (ipc_send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
         close(sock_fd);
         return -1;
@@ -397,11 +255,28 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
 
+    // Best-effort: request hot cache shm from real client
+    if (request_hot_cache_fd() != 0) {
+        LOG(INFO)
+            << "Hot cache shm not available (real client may not have it)";
+    }
+
     return 0;
 }
 
 int DummyClient::tearDownAll() {
     unregister_shm();
+
+    // Cleanup hot cache shm mapping
+    if (hot_cache_base_) {
+        munmap(hot_cache_base_, hot_cache_size_);
+        hot_cache_base_ = nullptr;
+        hot_cache_size_ = 0;
+    }
+    if (hot_cache_fd_ >= 0) {
+        close(hot_cache_fd_);
+        hot_cache_fd_ = -1;
+    }
 
     if (ping_running_) {
         ping_running_ = false;
@@ -563,25 +438,98 @@ int64_t DummyClient::getSize(const std::string& key) {
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
-    // Dummy client does not use BufferHandle, so we return nullptr
-    return nullptr;
-}
+    // Try hot cache path if shm is mapped
+    if (hot_cache_base_) {
+        auto result = invoke_rpc<&RealClient::acquire_hot_cache,
+                                 std::tuple<uint64_t, size_t>>(key);
+        if (result.has_value()) {
+            auto [offset, size] = result.value();
+            void* local_ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
+            std::string key_copy = key;
+            auto release = [this, key_copy]() {
+                (void)invoke_rpc<&RealClient::release_hot_cache, void>(
+                    key_copy);
+            };
+            return std::make_shared<BufferHandle>(local_ptr, size,
+                                                  std::move(release));
+        }
+    }
 
-std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
-    const std::string& key) {
-    auto result = invoke_rpc<&RealClient::get_buffer_info_dummy_helper,
+    // Fallback: allocator-backed buffer via shm
+    auto result = invoke_rpc<&RealClient::acquire_buffer_dummy,
                              std::tuple<uint64_t, size_t>>(key, client_id_);
     if (!result.has_value()) {
-        LOG(ERROR) << "Get buffer failed: " << toString(result.error());
-        return std::make_tuple(0, 0);
+        return nullptr;
     }
-    return result.value();
+
+    auto [dummy_addr, size] = result.value();
+    void* local_ptr = reinterpret_cast<void*>(dummy_addr);
+    auto release = [this, dummy_addr]() {
+        (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(dummy_addr,
+                                                                  client_id_);
+    };
+    return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
 }
 
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     const std::vector<std::string>& keys) {
-    // TODO: implement this function
-    return std::vector<std::shared_ptr<BufferHandle>>();
+    std::vector<std::shared_ptr<BufferHandle>> results(keys.size(), nullptr);
+    if (keys.empty()) return results;
+
+    // Phase 1: batch hot cache acquire
+    std::vector<size_t> miss_indices;
+    if (hot_cache_base_) {
+        auto hot_results =
+            invoke_batch_rpc<&RealClient::batch_acquire_hot_cache,
+                             std::tuple<uint64_t, size_t>>(keys.size(), keys);
+        std::vector<std::string> hit_keys;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (hot_results[i].has_value()) {
+                auto [offset, size] = hot_results[i].value();
+                void* ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
+                hit_keys.push_back(keys[i]);
+                auto release = [this, hit_keys_ref = hit_keys,
+                                idx = hit_keys.size() - 1]() {
+                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(
+                        hit_keys_ref[idx]);
+                };
+                results[i] = std::make_shared<BufferHandle>(ptr, size,
+                                                            std::move(release));
+            } else {
+                miss_indices.push_back(i);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < keys.size(); ++i) miss_indices.push_back(i);
+    }
+
+    if (miss_indices.empty()) return results;
+
+    // Phase 2: batch allocator acquire for misses
+    std::vector<std::string> miss_keys;
+    miss_keys.reserve(miss_indices.size());
+    for (size_t idx : miss_indices) {
+        miss_keys.push_back(keys[idx]);
+    }
+
+    auto alloc_results =
+        invoke_batch_rpc<&RealClient::batch_acquire_buffer_dummy,
+                         std::tuple<uint64_t, size_t>>(miss_keys.size(),
+                                                       miss_keys, client_id_);
+
+    for (size_t i = 0; i < miss_indices.size(); ++i) {
+        if (!alloc_results[i].has_value()) continue;
+        auto [dummy_addr, size] = alloc_results[i].value();
+        void* ptr = reinterpret_cast<void*>(dummy_addr);
+        auto release = [this, dummy_addr]() {
+            (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(
+                dummy_addr, client_id_);
+        };
+        results[miss_indices[i]] =
+            std::make_shared<BufferHandle>(ptr, size, std::move(release));
+    }
+
+    return results;
 }
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
@@ -790,6 +738,72 @@ void DummyClient::ping_thread_main() {
                 std::chrono::milliseconds(fail_ping_interval_ms));
         }
     }
+}
+
+int DummyClient::request_hot_cache_fd() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, ipc_socket_path_.c_str(),
+            sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + ipc_socket_path_.length();
+
+    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
+        close(sock_fd);
+        return -1;
+    }
+
+    // Send request type
+    IpcRequestType type = IPC_SHM_FD_REQUEST;
+    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
+        LOG(ERROR) << "Failed to send IPC request type";
+        close(sock_fd);
+        return -1;
+    }
+
+    // Send payload
+    ShmFdRequest req;
+    req.client_id_first = client_id_.first;
+    req.client_id_second = client_id_.second;
+    req.segment_type = SHM_SEG_HOT_CACHE;
+    if (::send(sock_fd, &req, sizeof(req), 0) < 0) {
+        LOG(ERROR) << "Failed to send ShmFdRequest";
+        close(sock_fd);
+        return -1;
+    }
+
+    // Receive fd + response
+    ShmFdResponse resp;
+    int fd = ipc_recv_fd(sock_fd, &resp, sizeof(resp));
+    close(sock_fd);
+
+    if (fd < 0 || resp.status != 0) {
+        LOG(ERROR) << "Failed to receive hot cache fd, status=" << resp.status;
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+
+    // mmap the received fd
+    void* base = mmap(nullptr, resp.shm_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        LOG(ERROR) << "Failed to mmap hot cache shm: " << strerror(errno);
+        close(fd);
+        return -1;
+    }
+
+    hot_cache_fd_ = fd;
+    hot_cache_base_ = base;
+    hot_cache_size_ = resp.shm_size;
+    LOG(INFO) << "Hot cache shm mapped at " << base
+              << ", size=" << resp.shm_size;
+    return 0;
 }
 
 }  // namespace mooncake

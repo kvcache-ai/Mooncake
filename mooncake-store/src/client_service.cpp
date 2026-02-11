@@ -2509,7 +2509,8 @@ ErrorCode Client::InitLocalHotCache() {
 
     // Enable hot cache
     {
-        hot_cache_ = std::make_shared<LocalHotCache>(total_cache, block_size);
+        hot_cache_ = std::make_shared<LocalHotCache>(total_cache, block_size,
+                                                     /*use_shm=*/true);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
             LOG(ERROR)

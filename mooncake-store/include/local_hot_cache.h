@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "mutex.h"
+#include "shm_helper.h"
 #include "types.h"
 
 namespace mooncake {
@@ -38,8 +39,10 @@ class LocalHotCache {
      * @brief Construct a LocalHotCache.
      * @param total_size_bytes Desired total local hot cache size in bytes.
      * @param block_size_bytes Block size in bytes. If 0, uses default 16MB.
+     * @param use_shm If true, allocate via memfd for cross-process sharing.
      */
-    LocalHotCache(size_t total_size_bytes, size_t block_size_bytes = 0);
+    LocalHotCache(size_t total_size_bytes, size_t block_size_bytes = 0,
+                  bool use_shm = false);
 
     /**
      * @brief Destructor.
@@ -108,6 +111,22 @@ class LocalHotCache {
      */
     size_t GetBlockSize() const { return block_size_; }
 
+    /**
+     * @brief Get the shm segment backing this cache.
+     * Only valid when constructed with use_shm=true.
+     * @return shared_ptr to the ShmSegment, or nullptr if shm is disabled.
+     */
+    std::shared_ptr<ShmHelper::ShmSegment> GetShmSegment() const {
+        return shm_segment_;
+    }
+
+    /**
+     * @brief Compute offset of a block address relative to the bulk base.
+     * Used by dummy clients to translate to their own mmap'd address.
+     * @return offset in bytes, or SIZE_MAX if addr is not in the bulk region.
+     */
+    size_t GetBlockOffset(const void* addr) const;
+
    private:
     // Touch LRU using iterator (avoids duplicate lookup)
     void touchLRU(std::unordered_map<
@@ -118,9 +137,13 @@ class LocalHotCache {
     // All blocks owned by this cache (auto-cleaned on destruction)
     std::vector<std::unique_ptr<HotMemBlock>> blocks_;
 
-    // Bulk allocated memory pointer (nullptr if bulk allocation failed)
-    // Must save the original malloc pointer for correct free()
+    // Bulk allocated memory pointer (nullptr if allocation failed)
     void* bulk_memory_standard_;
+    size_t bulk_memory_size_ = 0;
+
+    // Shared memory segment (non-null only when use_shm=true)
+    std::shared_ptr<ShmHelper::ShmSegment> shm_segment_;
+    bool use_shm_ = false;
 
     mutable std::shared_mutex lru_mutex_;
     std::list<HotMemBlock*> lru_queue_ GUARDED_BY(lru_mutex_);  // prefilled LRU

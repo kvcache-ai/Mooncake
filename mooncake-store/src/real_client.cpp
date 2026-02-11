@@ -23,6 +23,7 @@
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "default_config.h"
+#include "shm_helper.h"
 
 namespace mooncake {
 
@@ -1123,25 +1124,43 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
     return get_buffer_internal(key, client_buffer_allocator_);
 }
 
-std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
-    const std::string &key) {
-    auto buffer_handle = get_buffer_internal(key, client_buffer_allocator_);
-    if (!buffer_handle) {
-        LOG(ERROR) << "Failed to get buffer for key: " << key;
-        return std::make_tuple(0, 0);
+tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+RealClient::acquire_hot_cache(const std::string &key) {
+    if (!client_ || !client_->IsHotCacheEnabled()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    uint64_t buffer_base = reinterpret_cast<uint64_t>(buffer_handle->ptr());
-    size_t buffer_size = buffer_handle->size();
-    return std::make_tuple(buffer_base, buffer_size);
+
+    auto hot_cache = client_->GetHotCache();
+    HotMemBlock *blk = hot_cache->GetHotKey(key);
+    if (!blk) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    size_t offset = hot_cache->GetBlockOffset(blk->addr);
+    if (offset == SIZE_MAX) {
+        hot_cache->ReleaseHotKey(key);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return std::make_tuple(static_cast<uint64_t>(offset), blk->size);
+}
+
+tl::expected<void, ErrorCode> RealClient::release_hot_cache(
+    const std::string &key) {
+    if (!client_ || !client_->IsHotCacheEnabled()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    client_->GetHotCache()->ReleaseHotKey(key);
+    return {};
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::get_buffer_info_dummy_helper(const std::string &key,
-                                         const UUID &client_id) {
-    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+RealClient::acquire_buffer_dummy(const std::string &key,
+                                 const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
@@ -1149,26 +1168,132 @@ RealClient::get_buffer_info_dummy_helper(const std::string &key,
     auto buffer_handle =
         get_buffer_internal(key, context.client_buffer_allocator);
     if (!buffer_handle) {
-        LOG(ERROR) << "Failed to get buffer for key: " << key;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
-    uint64_t buffer_base = reinterpret_cast<uint64_t>(buffer_handle->ptr());
-    size_t buffer_size = buffer_handle->size();
+
+    uint64_t real_addr = reinterpret_cast<uint64_t>(buffer_handle->ptr());
+    size_t buf_size = buffer_handle->size();
 
     for (const auto &shm : context.mapped_shms) {
         uint64_t shm_start = reinterpret_cast<uint64_t>(shm.shm_buffer);
         uint64_t shm_end = shm_start + shm.shm_size;
-
-        if (buffer_base >= shm_start && buffer_base < shm_end) {
-            // Convert real address to dummy address.
-            return std::make_tuple(buffer_base - shm.shm_addr_offset,
-                                   buffer_size);
+        if (real_addr >= shm_start && real_addr < shm_end) {
+            uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
+            context.active_handles[dummy_addr] = std::move(buffer_handle);
+            return std::make_tuple(dummy_addr, buf_size);
         }
     }
 
-    LOG(ERROR) << "Buffer allocated at " << buffer_base
-               << " not found in any shared memory for client " << client_id;
-    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<void, ErrorCode> RealClient::release_buffer_dummy(
+    uint64_t dummy_addr, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    it->second.active_handles.erase(dummy_addr);
+    return {};
+}
+
+std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+RealClient::batch_acquire_hot_cache(const std::vector<std::string> &keys) {
+    std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results;
+    results.reserve(keys.size());
+
+    if (!client_ || !client_->IsHotCacheEnabled()) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.push_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+
+    auto hot_cache = client_->GetHotCache();
+    for (const auto &key : keys) {
+        HotMemBlock *blk = hot_cache->GetHotKey(key);
+        if (!blk) {
+            results.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            continue;
+        }
+        size_t offset = hot_cache->GetBlockOffset(blk->addr);
+        if (offset == SIZE_MAX) {
+            hot_cache->ReleaseHotKey(key);
+            results.push_back(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            continue;
+        }
+        results.push_back(
+            std::make_tuple(static_cast<uint64_t>(offset), blk->size));
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> RealClient::batch_release_hot_cache(
+    const std::vector<std::string> &keys) {
+    if (!client_ || !client_->IsHotCacheEnabled()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto hot_cache = client_->GetHotCache();
+    for (const auto &key : keys) {
+        hot_cache->ReleaseHotKey(key);
+    }
+    return {};
+}
+
+std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
+                                       const UUID &client_id) {
+    std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results(
+        keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto ctx_it = shm_contexts_.find(client_id);
+    if (ctx_it == shm_contexts_.end()) {
+        for (auto &r : results)
+            r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return results;
+    }
+
+    // Use batch_get_buffer_internal (unlocked, it doesn't touch shm_contexts_)
+    lock.unlock();
+    auto handles = batch_get_buffer_internal(keys);
+    lock.lock();
+
+    // Re-validate context after re-lock
+    ctx_it = shm_contexts_.find(client_id);
+    if (ctx_it == shm_contexts_.end()) {
+        for (auto &r : results)
+            r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return results;
+    }
+    auto &ctx = ctx_it->second;
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!handles[i]) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+        uint64_t real_addr = reinterpret_cast<uint64_t>(handles[i]->ptr());
+        size_t buf_size = handles[i]->size();
+
+        bool found = false;
+        for (const auto &shm : ctx.mapped_shms) {
+            uint64_t start = reinterpret_cast<uint64_t>(shm.shm_buffer);
+            if (real_addr >= start && real_addr < start + shm.shm_size) {
+                uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
+                ctx.active_handles[dummy_addr] = std::move(handles[i]);
+                results[i] = std::make_tuple(dummy_addr, buf_size);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            results[i] = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    return results;
 }
 
 // Implementation of batch_get_buffer_internal method
@@ -2187,33 +2312,6 @@ int RealClient::stop_ipc_server() {
     return 0;
 }
 
-static int recv_fd(int socket, void *data, size_t data_len) {
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int))];
-    memset(buf, 0, sizeof(buf));
-
-    iov.iov_base = data;
-    iov.iov_len = data_len;
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    if (recvmsg(socket, &msg, 0) < 0) return -1;
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
-        cmsg->cmsg_type == SCM_RIGHTS) {
-        int fd;
-        memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-        return fd;
-    }
-    return -1;
-}
-
 void RealClient::ipc_server_func() {
     int server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (server_sock < 0) {
@@ -2257,32 +2355,84 @@ void RealClient::ipc_server_func() {
             break;
         }
 
-        ShmRegisterRequest req;
-        int fd = recv_fd(client_sock, &req, sizeof(req));
+        // Read request type discriminator
+        IpcRequestType req_type;
+        if (recv(client_sock, &req_type, sizeof(req_type), MSG_WAITALL) !=
+            sizeof(req_type)) {
+            LOG(ERROR) << "Failed to read IPC request type";
+            close(client_sock);
+            continue;
+        }
 
-        int status = 0;
-        if (fd < 0) {
-            LOG(ERROR) << "Failed to receive FD from client";
-            status = -1;
+        if (req_type == IPC_SHM_REGISTER) {
+            handle_ipc_shm_register(client_sock);
+        } else if (req_type == IPC_SHM_FD_REQUEST) {
+            handle_ipc_shm_fd_request(client_sock);
         } else {
-            UUID client_id = {req.client_id_first, req.client_id_second};
-            auto ret = map_shm_internal(fd, req.dummy_base_addr, req.shm_size,
-                                        req.is_local_buffer, client_id);
-            if (!ret) {
-                status = toInt(ret.error());
-                // FD is closed inside map_shm_internal
-            }
+            LOG(ERROR) << "Unknown IPC request type: " << req_type;
         }
 
-        // Send response
-        if (send(client_sock, &status, sizeof(status), 0) < 0) {
-            LOG(ERROR) << "Failed to send response to client";
-        }
         close(client_sock);
     }
 
     close(server_sock);
     LOG(INFO) << "IPC server stopped";
+}
+
+void RealClient::handle_ipc_shm_register(int client_sock) {
+    ShmRegisterRequest req;
+    int fd = ipc_recv_fd(client_sock, &req, sizeof(req));
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to receive fd for SHM_REGISTER";
+        return;
+    }
+
+    UUID client_id{req.client_id_first, req.client_id_second};
+    auto result = map_shm_internal(fd, req.dummy_base_addr, req.shm_size,
+                                   req.is_local_buffer, client_id);
+
+    int status = result.has_value() ? 0 : -1;
+    ::send(client_sock, &status, sizeof(status), 0);
+}
+
+void RealClient::handle_ipc_shm_fd_request(int client_sock) {
+    ShmFdRequest req;
+    if (recv(client_sock, &req, sizeof(req), MSG_WAITALL) != sizeof(req)) {
+        LOG(ERROR) << "Failed to read ShmFdRequest payload";
+        return;
+    }
+
+    ShmFdResponse resp{};
+    resp.status = -1;
+    resp.shm_size = 0;
+
+    // Currently only SHM_SEG_HOT_CACHE is supported
+    if (req.segment_type != SHM_SEG_HOT_CACHE) {
+        LOG(ERROR) << "Unknown segment_type: " << req.segment_type;
+        ::send(client_sock, &resp, sizeof(resp), 0);
+        return;
+    }
+
+    if (!client_ || !client_->IsHotCacheEnabled()) {
+        LOG(ERROR) << "Hot cache not available for fd request";
+        ::send(client_sock, &resp, sizeof(resp), 0);
+        return;
+    }
+
+    auto hot_cache = client_->GetHotCache();
+    auto seg = hot_cache->GetShmSegment();
+    if (!seg || seg->fd < 0) {
+        LOG(ERROR) << "Hot cache shm segment not available";
+        ::send(client_sock, &resp, sizeof(resp), 0);
+        return;
+    }
+
+    resp.status = 0;
+    resp.shm_size = seg->size;
+
+    if (ipc_send_fd(client_sock, seg->fd, &resp, sizeof(resp)) < 0) {
+        LOG(ERROR) << "Failed to send hot cache fd to dummy client";
+    }
 }
 
 std::vector<Replica::Descriptor> RealClient::get_replica_desc(
