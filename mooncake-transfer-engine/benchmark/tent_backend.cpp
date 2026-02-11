@@ -79,67 +79,64 @@ static TransportType getTransportType(const std::string& xport_type) {
 }
 
 int TENTBenchRunner::allocateBuffers() {
-    auto total_buffer_size = XferBenchConfig::total_buffer_size;
-    if (XferBenchConfig::seg_type == "DRAM") {
-        int num_buffers = numa_num_configured_nodes();
-        pinned_buffer_list_.resize(num_buffers, nullptr);
-        auto start_ts = getCurrentTimeInNano();
-        for (int i = 0; i < num_buffers; ++i) {
-            if (!XferBenchConfig::xport_type.empty()) {
-                MemoryOptions options;
-                options.type = getTransportType(XferBenchConfig::xport_type);
-                options.location = "cpu:" + std::to_string(i);
-                CHECK_FAIL(engine_->allocateLocalMemory(
-                    &pinned_buffer_list_[i], total_buffer_size, options));
-            } else {
-                auto location = "cpu:" + std::to_string(i);
-                CHECK_FAIL(engine_->allocateLocalMemory(
-                    &pinned_buffer_list_[i], total_buffer_size, location));
-            }
-        }
-        auto allocated_ts = getCurrentTimeInNano();
-        std::vector<size_t> buffers_size;
-        buffers_size.resize(pinned_buffer_list_.size(), total_buffer_size);
-        CHECK_FAIL(
-            engine_->registerLocalMemory(pinned_buffer_list_, buffers_size));
-        auto registered_ts = getCurrentTimeInNano();
-        LOG(INFO) << "Allocated " << total_buffer_size * num_buffers
-                  << " bytes DRAM buffers in "
-                  << (allocated_ts - start_ts) / 1e6 << " ms, registered in "
-                  << (registered_ts - allocated_ts) / 1e6 << " ms";
+    const auto total_buffer_size = XferBenchConfig::total_buffer_size;
+    const auto& seg_type = XferBenchConfig::seg_type;
+    const auto& xport_type = XferBenchConfig::xport_type;
+
+    // Resolve device prefix, start index, and buffer count per seg_type
+    std::string device_prefix;
+    int start_idx = 0, num_buffers = 0;
+
+    if (seg_type == "DRAM") {
+        device_prefix = "cpu";
+        num_buffers = numa_num_configured_nodes();
 #ifdef USE_CUDA
-    } else if (XferBenchConfig::seg_type == "VRAM") {
+    } else if (seg_type == "VRAM") {
+        device_prefix = "cuda";
         int gpu_count = 0;
         cudaGetDeviceCount(&gpu_count);
-        int start_gpu = 0, num_buffers = gpu_count;
+        start_idx = 0;
+        num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
-            start_gpu = XferBenchConfig::local_gpu_id;
+            start_idx = XferBenchConfig::local_gpu_id;
             num_buffers = 1;
-            LOG_ASSERT(start_gpu < gpu_count)
-                << "local_gpu_id " << start_gpu << " exceeds device count "
+            LOG_ASSERT(start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " exceeds device count "
                 << gpu_count;
-        }
-        pinned_buffer_list_.resize(num_buffers, nullptr);
-        for (int i = 0; i < num_buffers; ++i) {
-            int gpu_id = start_gpu + i;
-            if (!XferBenchConfig::xport_type.empty()) {
-                MemoryOptions options;
-                options.type = getTransportType(XferBenchConfig::xport_type);
-                options.location = "cuda:" + std::to_string(gpu_id);
-                CHECK_FAIL(engine_->allocateLocalMemory(
-                    &pinned_buffer_list_[i], total_buffer_size, options));
-            } else {
-                auto location = "cuda:" + std::to_string(gpu_id);
-                CHECK_FAIL(engine_->allocateLocalMemory(
-                    &pinned_buffer_list_[i], total_buffer_size, location));
-            }
-            CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                                    total_buffer_size));
         }
 #endif
     } else {
-        LOG(ERROR) << "Unknown seg_type: " << XferBenchConfig::seg_type;
+        LOG(ERROR) << "Unknown seg_type: " << seg_type;
+        return 0;
     }
+
+    // Allocate
+    pinned_buffer_list_.resize(num_buffers, nullptr);
+    auto start_ts = getCurrentTimeInNano();
+    for (int i = 0; i < num_buffers; ++i) {
+        auto location = device_prefix + ":" + std::to_string(start_idx + i);
+        if (!xport_type.empty()) {
+            MemoryOptions options;
+            options.type = getTransportType(xport_type);
+            options.location = std::move(location);
+            CHECK_FAIL(engine_->allocateLocalMemory(
+                &pinned_buffer_list_[i], total_buffer_size, options));
+        } else {
+            CHECK_FAIL(engine_->allocateLocalMemory(
+                &pinned_buffer_list_[i], total_buffer_size, location));
+        }
+    }
+
+    // Register
+    auto allocated_ts = getCurrentTimeInNano();
+    std::vector<size_t> buffers_size(num_buffers, total_buffer_size);
+    CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_, buffers_size));
+    auto registered_ts = getCurrentTimeInNano();
+
+    LOG(INFO) << "Allocated " << total_buffer_size * num_buffers << " bytes "
+              << seg_type << " buffers in " << (allocated_ts - start_ts) / 1e6
+              << " ms, registered in " << (registered_ts - allocated_ts) / 1e6
+              << " ms";
     return 0;
 }
 
