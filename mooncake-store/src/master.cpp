@@ -103,9 +103,9 @@ DEFINE_uint64(
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
 // Snapshot related configuration flags (migrated from global_flags)
-DEFINE_string(snapshot_backup_dir, mooncake::DEFAULT_SNAPSHOT_BACKUP_DIR,
-              "Local directory for snapshot staging and fallback backups (not "
-              "used for primary recovery)");
+DEFINE_string(snapshot_backup_dir, "",
+              "Optional local directory for snapshot and restore backup. "
+              "If empty, local backup is disabled");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
 DEFINE_uint64(snapshot_interval_seconds,

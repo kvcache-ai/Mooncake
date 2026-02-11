@@ -66,6 +66,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_snapshot_ || enable_snapshot_restore_) {
         snapshot_backend_ =
             SerializerBackend::Create(config.snapshot_backend_type);
+        if (!snapshot_backup_dir_.empty()) {
+            use_snapshot_backup_dir_ = true;
+        }
     }
 
     if (enable_snapshot_restore_) {
@@ -2172,15 +2175,18 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}",
                 snapshot_id, latest_path);
-            auto save_path =
-                fs::path(snapshot_backup_dir_) / "save" / SNAPSHOT_LATEST_FILE;
-            auto save_result =
-                FileUtil::SaveStringToFile(latest_content, save_path);
-            if (!save_result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] save latest to disk failed, snapshot_id={}, "
-                    "content={}, file={}",
-                    snapshot_id, latest_content, save_path.string());
+            if (use_snapshot_backup_dir_) {
+                auto save_path = fs::path(snapshot_backup_dir_) / "save" /
+                                 SNAPSHOT_LATEST_FILE;
+                auto save_result =
+                    FileUtil::SaveStringToFile(latest_content, save_path);
+                if (!save_result) {
+                    SNAP_LOG_ERROR(
+                        "[Snapshot] save latest to disk failed, "
+                        "snapshot_id={}, "
+                        "content={}, file={}",
+                        snapshot_id, latest_content, save_path.string());
+                }
             }
 
             return tl::make_unexpected(SerializationError(
@@ -2230,13 +2236,16 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
 
         // Upload failed, save locally for manual recovery in exception
         // scenarios
-        auto save_path =
-            fs::path(snapshot_backup_dir_) / "save" / local_filename;
-        auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
-        if (!save_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] save {} to disk failed, snapshot_id={}, file={}",
-                local_filename, snapshot_id, save_path.string());
+        if (use_snapshot_backup_dir_) {
+            auto save_path =
+                fs::path(snapshot_backup_dir_) / "save" / local_filename;
+            auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
+            if (!save_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] save {} to disk failed, snapshot_id={}, "
+                    "file={}",
+                    local_filename, snapshot_id, save_path.string());
+            }
         }
 
         error_msg.append(local_filename)
@@ -2370,12 +2379,14 @@ void MasterService::RestoreState() {
             return;
         }
 
-        auto save_result = FileUtil::SaveStringToFile(
-            manifest_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                  SNAPSHOT_MANIFEST_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save manifest to file: "
-                       << save_result.error();
+        if (use_snapshot_backup_dir_) {
+            auto save_result = FileUtil::SaveStringToFile(
+                manifest_content, fs::path(snapshot_backup_dir_) / "restore" /
+                                      SNAPSHOT_MANIFEST_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save manifest to file: "
+                           << save_result.error();
+            }
         }
 
         // Format: protocol_type|version|20230801_123456_000
@@ -2424,12 +2435,14 @@ void MasterService::RestoreState() {
             return;
         }
 
-        save_result = FileUtil::SaveBinaryToFile(
-            metadata_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                  SNAPSHOT_METADATA_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save metadata to file: "
-                       << save_result.error();
+        if (use_snapshot_backup_dir_) {
+            auto save_result = FileUtil::SaveBinaryToFile(
+                metadata_content, fs::path(snapshot_backup_dir_) / "restore" /
+                                      SNAPSHOT_METADATA_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save metadata to file: "
+                           << save_result.error();
+            }
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
@@ -2443,12 +2456,14 @@ void MasterService::RestoreState() {
                        << " error=" << download_result.error();
             return;
         }
-        save_result = FileUtil::SaveBinaryToFile(
-            segments_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                  SNAPSHOT_SEGMENTS_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save segments to file: "
-                       << save_result.error();
+        if (use_snapshot_backup_dir_) {
+            auto save_result = FileUtil::SaveBinaryToFile(
+                segments_content, fs::path(snapshot_backup_dir_) / "restore" /
+                                      SNAPSHOT_SEGMENTS_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save segments to file: "
+                           << save_result.error();
+            }
         }
         LOG(INFO) << "[Restore] Download segments file success";
 
@@ -2464,12 +2479,15 @@ void MasterService::RestoreState() {
                        << " error=" << download_result.error();
             return;
         }
-        save_result = FileUtil::SaveBinaryToFile(
-            task_manager_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                      SNAPSHOT_TASK_MANAGER_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save task manager to file: "
-                       << save_result.error();
+        if (use_snapshot_backup_dir_) {
+            auto save_result = FileUtil::SaveBinaryToFile(
+                task_manager_content, fs::path(snapshot_backup_dir_) /
+                                          "restore" /
+                                          SNAPSHOT_TASK_MANAGER_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save task manager to file: "
+                           << save_result.error();
+            }
         }
         LOG(INFO) << "[Restore] Download task manager file success";
 

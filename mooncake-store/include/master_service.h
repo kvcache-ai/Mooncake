@@ -1020,7 +1020,8 @@ class MasterService {
     bool enable_snapshot_restore_ = false;
 
     bool enable_snapshot_ = false;
-    std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    std::string snapshot_backup_dir_;
+    bool use_snapshot_backup_dir_{false};
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
