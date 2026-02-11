@@ -257,7 +257,8 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = env_auto_discover.value();
         } else {
             // Enable auto-discover for RDMA if no devices are specified
-            if ((protocol == "rdma" || protocol == "efa") && !device_names.has_value()) {
+            if ((protocol == "rdma" || protocol == "efa") &&
+                !device_names.has_value()) {
                 LOG(INFO)
                     << "Set auto discovery ON by default for RDMA protocol, "
                        "since no "
