@@ -2360,6 +2360,10 @@ void RealClient::ipc_server_func() {
             break;
         }
 
+        // Set recv timeout to prevent slow/malicious clients from blocking
+        struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
         // Read request type discriminator
         IpcRequestType req_type;
         if (recv(client_sock, &req_type, sizeof(req_type), MSG_WAITALL) !=
@@ -2410,6 +2414,18 @@ void RealClient::handle_ipc_shm_fd_request(int client_sock) {
     ShmFdResponse resp{};
     resp.status = -1;
     resp.shm_size = 0;
+
+    // Validate client_id against registered dummy clients
+    UUID client_id{req.client_id_first, req.client_id_second};
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "Unregistered client_id in fd request: "
+                       << client_id.first << ":" << client_id.second;
+            ::send(client_sock, &resp, sizeof(resp), 0);
+            return;
+        }
+    }
 
     // Currently only SHM_SEG_HOT_CACHE is supported
     if (req.segment_type != SHM_SEG_HOT_CACHE) {

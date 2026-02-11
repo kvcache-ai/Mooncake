@@ -444,6 +444,12 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
                                  std::tuple<uint64_t, size_t>>(key);
         if (result.has_value()) {
             auto [offset, size] = result.value();
+            if (offset + size > hot_cache_size_) {
+                LOG(ERROR) << "Hot cache offset out of bounds: offset="
+                           << offset << " size=" << size
+                           << " cache_size=" << hot_cache_size_;
+                return nullptr;
+            }
             void* local_ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
             std::string key_copy = key;
             auto release = [this, key_copy]() {
@@ -482,16 +488,20 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
         auto hot_results =
             invoke_batch_rpc<&RealClient::batch_acquire_hot_cache,
                              std::tuple<uint64_t, size_t>>(keys.size(), keys);
-        std::vector<std::string> hit_keys;
         for (size_t i = 0; i < keys.size(); ++i) {
             if (hot_results[i].has_value()) {
                 auto [offset, size] = hot_results[i].value();
+                if (offset + size > hot_cache_size_) {
+                    LOG(ERROR)
+                        << "Hot cache offset out of bounds: offset=" << offset
+                        << " size=" << size
+                        << " cache_size=" << hot_cache_size_;
+                    miss_indices.push_back(i);
+                    continue;
+                }
                 void* ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
-                hit_keys.push_back(keys[i]);
-                auto release = [this, hit_keys_ref = hit_keys,
-                                idx = hit_keys.size() - 1]() {
-                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(
-                        hit_keys_ref[idx]);
+                auto release = [this, key = keys[i]]() {
+                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(key);
                 };
                 results[i] = std::make_shared<BufferHandle>(ptr, size,
                                                             std::move(release));
