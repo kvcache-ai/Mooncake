@@ -20,7 +20,7 @@ echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT
 echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-asio:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -163,10 +163,10 @@ if [ "$CU13_BUILD" = "1" ]; then
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cu13"/' pyproject.toml
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda13"/' pyproject.toml
     sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cu13"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-cu13"
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cuda13"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-cuda13"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi

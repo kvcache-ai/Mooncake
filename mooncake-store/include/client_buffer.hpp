@@ -104,6 +104,14 @@ class BufferHandle {
 std::vector<Slice> split_into_slices(BufferHandle& handle);
 
 /**
+ * @brief Split a buffer into slices of maximum kMaxSliceSize
+ * @param buffer The buffer buffer to split
+ * @param length The length of the buffer to split
+ * @return Vector of slices covering the entire buffer
+ */
+std::vector<Slice> split_into_slices(void* buffer, size_t length);
+
+/**
  * @brief Calculate the total size of a replica descriptor
  * @param replica The replica descriptor to calculate size for
  * @return Total size in bytes
@@ -118,7 +126,6 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   void* buffer_ptr);
+                   const Replica::Descriptor& replica, void* buffer_ptr);
 
 }  // namespace mooncake

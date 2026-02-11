@@ -2148,21 +2148,21 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     // Randomly pick a segment from the source replicas
     static thread_local std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
-    size_t random_index = dis(gen);
-
+    std::string selected_source_segment = segment_names[dis(gen)];
     UUID select_client;
     ErrorCode error = segment_accessor.GetClientIdBySegmentName(
-        segment_names[random_index], select_client);
+        selected_source_segment, select_client);
     if (error != ErrorCode::OK) {
         LOG(ERROR) << "key=" << key
-                   << ", segment_name=" << segment_names[random_index]
+                   << ", segment_name=" << selected_source_segment
                    << ", error=client_id_not_found";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.key = key, .targets = targets});
+            select_client, {.key = key,
+                            .source = selected_source_segment,
+                            .targets = targets});
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(

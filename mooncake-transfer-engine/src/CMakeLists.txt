@@ -2,6 +2,8 @@ file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
+# EFA library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
+
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(USE_HIP)
@@ -104,4 +106,9 @@ endif()
 if(USE_INTRA_NODE_NVLINK)
   message(STATUS "Enabled USE_INTRA_NODE_NVLINK support")
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NODE_NVLINK)
+endif()
+
+if(USE_EFA)
+  message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
+  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
 endif()

@@ -97,12 +97,18 @@ size_t BufferHandle::size() const { return handle_.size(); }
 
 // Utility functions for buffer and slice management
 std::vector<Slice> split_into_slices(BufferHandle& handle) {
-    std::vector<Slice> slices;
     auto base = static_cast<uint8_t*>(handle.ptr());
+    auto length = handle.size();
+    return split_into_slices(base, length);
+}
+
+std::vector<Slice> split_into_slices(void* buffer, size_t length) {
+    std::vector<Slice> slices;
+    auto base = static_cast<uint8_t*>(buffer);
     size_t offset = 0;
 
-    while (offset < handle.size()) {
-        size_t chunk_size = std::min(handle.size() - offset, kMaxSliceSize);
+    while (offset < length) {
+        size_t chunk_size = std::min(length - offset, kMaxSliceSize);
         slices.push_back({base + offset, chunk_size});
         offset += chunk_size;
     }
