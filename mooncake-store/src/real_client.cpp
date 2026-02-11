@@ -249,7 +249,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // can create client buffer allocator on the shared memory later.
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage);
-    if (local_buffer_size > 0) {
+    if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(

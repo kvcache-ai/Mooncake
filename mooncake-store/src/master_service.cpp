@@ -1269,8 +1269,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key,
-                           bool force) -> tl::expected<void, ErrorCode> {
+auto MasterService::Remove(const std::string& key, bool force)
+    -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -1305,8 +1305,8 @@ auto MasterService::Remove(const std::string& key,
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern,
-                                  bool force) -> tl::expected<long, ErrorCode> {
+auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
+    -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
 
