@@ -134,9 +134,9 @@ int TEBenchRunner::allocateBuffers() {
         if (XferBenchConfig::local_gpu_id != -1) {
             start_gpu = XferBenchConfig::local_gpu_id;
             num_buffers = 1;
-            LOG_ASSERT(start_gpu < gpu_count)
-                << "local_gpu_id " << start_gpu << " exceeds device count "
-                << gpu_count;
+            LOG_ASSERT(start_gpu >= 0 && start_gpu < gpu_count)
+                << "local_gpu_id " << start_gpu << " out of range [0, "
+                << gpu_count << ")";
         }
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {

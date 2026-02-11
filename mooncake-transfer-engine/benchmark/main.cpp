@@ -41,12 +41,8 @@ int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
         runner.pinThread(thread_id);
         auto max_block_size = XferBenchConfig::max_block_size;
         auto max_batch_size = XferBenchConfig::max_batch_size;
-        auto local_gpu_offset = XferBenchConfig::local_gpu_id == -1
-                                    ? 0
-                                    : XferBenchConfig::local_gpu_id;
-        auto target_gpu_offset = XferBenchConfig::target_gpu_id == -1
-                                     ? 0
-                                     : XferBenchConfig::target_gpu_id;
+        auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
+        auto target_gpu_offset = std::max(0, XferBenchConfig::target_gpu_id);
         uint64_t local_addr = runner.getLocalBufferBase(
             local_gpu_offset + thread_id, max_block_size, max_batch_size);
         uint64_t target_addr = runner.getTargetBufferBase(

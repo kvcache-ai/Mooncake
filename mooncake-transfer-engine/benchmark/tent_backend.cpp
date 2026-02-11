@@ -101,9 +101,9 @@ int TENTBenchRunner::allocateBuffers() {
         if (XferBenchConfig::local_gpu_id != -1) {
             start_idx = XferBenchConfig::local_gpu_id;
             num_buffers = 1;
-            LOG_ASSERT(start_idx < gpu_count)
-                << "local_gpu_id " << start_idx << " exceeds device count "
-                << gpu_count;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
         }
 #endif
     } else {
