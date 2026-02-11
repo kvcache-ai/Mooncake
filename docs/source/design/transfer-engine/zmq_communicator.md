@@ -82,6 +82,17 @@ mooncake-transfer-engine/src/transport/zmq_communicator/
 
 ## Building and Testing
 
+### Build option: `MOONCAKE_BUILD_ZMQ_COMMUNICATOR`
+
+ZMQ Communicator is built by default. To exclude it from the build (for example when libzmq is not installed or ZMQ support is not required), set the environment variable **`MOONCAKE_BUILD_ZMQ_COMMUNICATOR`** to `0`, `OFF`, `NO`, or `FALSE` before running CMake:
+
+```bash
+MOONCAKE_BUILD_ZMQ_COMMUNICATOR=0 cmake -B build
+cmake --build build
+```
+
+When disabled, the ZMQ Communicator library, its unit test (`zmq_communicator_test`), and the ZMQ Python bindings in the `engine` module are not built. When enabled (default), all of them are included.
+
 ### Build
 
 ```bash

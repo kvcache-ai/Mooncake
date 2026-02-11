@@ -2,8 +2,11 @@ file(GLOB XPORT_SOURCES "*.cpp")
 
 add_subdirectory(rdma_transport)
 add_subdirectory(rpc_communicator)
-add_subdirectory(zmq_communicator)
-add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:rpc_communicator> $<TARGET_OBJECTS:zmq_communicator_lib>)
+add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:rpc_communicator>)
+if(BUILD_ZMQ_COMMUNICATOR)
+  add_subdirectory(zmq_communicator)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:zmq_communicator_lib>)
+endif()
 target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread)
 
 if (USE_TCP)
