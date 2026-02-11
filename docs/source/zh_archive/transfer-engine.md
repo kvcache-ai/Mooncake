@@ -416,7 +416,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` 启用设备亲和性以优化 RDMA 性能。启用后，Transfer Engine 将优先选择和本地网卡同名的远端网卡进行通信，以减少 QP 数量并改善 Rail-optimized 拓扑中的网络性能。默认值为 false
 - `MC_FORCE_HCA` 强制使用RDMA作为主要传输方式，如果没有探测到有效的RDMA网卡，返回失败
 - `MC_FORCE_MNNVL` 强制使用 Multi-Node NVLink 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
-- `MC_INTRANODE_NVLINK` 指定使用Intra-Node NVLink 作为主要传输方式，同时注意该设置不能与MC_FORCE_MNNVL一起使用
+- `MC_INTRA_NODE_NVLINK` 指定使用Intra-Node NVLink 作为主要传输方式，同时注意该设置不能与MC_FORCE_MNNVL一起使用
 - `MC_FORCE_TCP` 强制使用 TCP 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
 - `MC_MIN_PRC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_PRC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。
