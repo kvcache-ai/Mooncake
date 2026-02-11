@@ -50,8 +50,6 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(
         &real_client);
-    server.register_handler<&RealClient::batch_get_into_offload_object_internal>(
-        &real_client);
 }
 }  // namespace mooncake
 
