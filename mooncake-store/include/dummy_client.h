@@ -93,6 +93,14 @@ class DummyClient : public PyClient {
 
     [[nodiscard]] std::string get_hostname() const;
 
+    // Check if a pointer falls within the hot cache shm region
+    bool is_hot_cache_ptr(const void *ptr) const {
+        if (!hot_cache_base_) return false;
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        auto base = reinterpret_cast<uintptr_t>(hot_cache_base_);
+        return p >= base && p < base + hot_cache_size_;
+    }
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);

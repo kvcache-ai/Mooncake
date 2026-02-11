@@ -1256,9 +1256,10 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
         return results;
     }
 
-    // Use batch_get_buffer_internal (unlocked, it doesn't touch shm_contexts_)
+    // Use batch_get_buffer_internal with dummy's allocator
     lock.unlock();
-    auto handles = batch_get_buffer_internal(keys);
+    auto handles =
+        batch_get_buffer_internal(keys, ctx_it->second.client_buffer_allocator);
     lock.lock();
 
     // Re-validate context after re-lock
@@ -1298,7 +1299,9 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 
 // Implementation of batch_get_buffer_internal method
 std::vector<std::shared_ptr<BufferHandle>>
-RealClient::batch_get_buffer_internal(const std::vector<std::string> &keys) {
+RealClient::batch_get_buffer_internal(
+    const std::vector<std::string> &keys,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -1349,7 +1352,9 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string> &keys) {
             continue;
         }
 
-        auto alloc_result = client_buffer_allocator_->allocate(total_size);
+        auto &allocator = client_buffer_allocator ? client_buffer_allocator
+                                                  : client_buffer_allocator_;
+        auto alloc_result = allocator->allocate(total_size);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate buffer for key: " << key;
             continue;

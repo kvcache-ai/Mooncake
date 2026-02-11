@@ -468,7 +468,9 @@ class RealClient : public PyClient {
             nullptr);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys,
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
