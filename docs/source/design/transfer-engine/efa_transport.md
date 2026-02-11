@@ -68,13 +68,13 @@ mkdir build && cd build
 
 cmake .. \
     -DUSE_EFA=ON \
-    -DWITH_TE=ON \
-    -DWITH_STORE=ON \
-    -DBUILD_UNIT_TESTS=ON \
+    -DUSE_CUDA=ON \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 make -j$(nproc)
 ```
+
+> **Note:** `-DUSE_CUDA=ON` is required when transferring GPU memory (e.g., KV cache in vLLM). Without it, the TCP transport (used as fallback when `mooncake_protocol` is set to `"tcp"`) cannot detect GPU memory and will fail with "Bad address" (EFAULT) errors.
 
 ### 3. Install Python Package
 
