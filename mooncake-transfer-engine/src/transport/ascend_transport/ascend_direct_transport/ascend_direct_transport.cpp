@@ -203,7 +203,7 @@ int AscendDirectTransport::install(std::string &local_server_name,
 int AscendDirectTransport::InitAdxlEngine() {
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     std::string host_ip = local_segment_desc->rank_info.hostIp;
-    uint16_t host_port = local_segment_desc->rank_info.hostPort;
+    auto host_port = local_segment_desc->rank_info.hostPort;
     adxl_ = std::make_unique<adxl::AdxlEngine>();
     if (!adxl_) return ERR_MEMORY;
     std::map<adxl::AscendString, adxl::AscendString> options;
@@ -283,9 +283,7 @@ int AscendDirectTransport::InitAdxlEngine() {
         options["GlobalResourceConfig"] = global_resource_config;
         LOG(INFO) << "Set GlobalResourceConfig to:" << global_resource_config;
     }
-    std::string engine_name_str =
-        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
-        std::to_string(host_port);
+    std::string engine_name_str = GenAdxlEngineName(host_ip, host_port);
     auto adxl_engine_name = adxl::AscendString(engine_name_str.c_str());
     LOG(INFO) << "Set adxl engine name to " << adxl_engine_name.GetString();
     auto status = adxl_->Initialize(adxl_engine_name, options);
@@ -570,8 +568,7 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         return FAILED;
     }
     local_adxl_engine_name_ =
-        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
-        std::to_string(desc->rank_info.hostPort);
+        GenAdxlEngineName(host_ip, desc->rank_info.hostPort);
 
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
@@ -666,6 +663,14 @@ uint16_t AscendDirectTransport::findAdxlListenPort() {
     return 0;
 }
 
+std::string AscendDirectTransport::GenAdxlEngineName(const std::string &ip,
+                                                     const uint64_t port) {
+    if (globalConfig().use_ipv6) {
+        return ("[" + ip + "]") + ":" + std::to_string(port);
+    }
+    return ip + ":" + std::to_string(port);
+}
+
 void AscendDirectTransport::queryThread() {
 #ifdef EXIST_ADXL_ASYNC_METHOD
     LOG(INFO) << "AscendDirectTransport query thread started";
@@ -699,6 +704,15 @@ void AscendDirectTransport::queryThread() {
                 it = pending_batches.erase(it);
                 continue;
             }
+            auto target_segment_desc =
+                metadata_->getSegmentDescByID(slice_list[0]->target_id);
+            if (!target_segment_desc) {
+                it = pending_batches.erase(it);
+                continue;
+            }
+            auto target_adxl_engine_name =
+                GenAdxlEngineName(target_segment_desc->rank_info.hostIp,
+                                  target_segment_desc->rank_info.hostPort);
             auto handle = static_cast<adxl::TransferReq>(
                 slice_list[0]->ascend_direct.handle);
             adxl::TransferStatus task_status;
@@ -712,22 +726,12 @@ void AscendDirectTransport::queryThread() {
                     slice->markFailed();
                 }
                 it = pending_batches.erase(it);
+                disconnect(target_adxl_engine_name, connect_timeout_);
             } else if (task_status == adxl::TransferStatus::COMPLETED) {
                 auto now = getCurrentTimeInNano();
                 auto duration = now - slice_list[0]->ascend_direct.start_time;
-                auto target_segment_desc =
-                    metadata_->getSegmentDescByID(slice_list[0]->target_id);
-                if (target_segment_desc) {
-                    auto target_adxl_engine_name =
-                        (globalConfig().use_ipv6
-                             ? ("[" + target_segment_desc->rank_info.hostIp +
-                                "]")
-                             : target_segment_desc->rank_info.hostIp) +
-                        ":" +
-                        std::to_string(target_segment_desc->rank_info.hostPort);
-                    VLOG(1) << "Transfer to " << target_adxl_engine_name
-                            << " time: " << duration / 1000 << "us";
-                }
+                VLOG(1) << "Transfer to " << target_adxl_engine_name
+                        << " time: " << duration / 1000 << "us";
                 for (auto &slice : slice_list) {
                     slice->markSuccess();
                 }
@@ -744,6 +748,7 @@ void AscendDirectTransport::queryThread() {
                     for (auto &slice : slice_list) {
                         slice->markFailed();
                     }
+                    disconnect(target_adxl_engine_name, connect_timeout_);
                     it = pending_batches.erase(it);
                 } else {
                     task_finished = false;
@@ -788,10 +793,8 @@ void AscendDirectTransport::processSliceList(
         need_update_metadata_segs_.erase(it);
     }
     auto target_adxl_engine_name =
-        (globalConfig().use_ipv6
-             ? ("[" + target_segment_desc->rank_info.hostIp + "]")
-             : target_segment_desc->rank_info.hostIp) +
-        ":" + std::to_string(target_segment_desc->rank_info.hostPort);
+        GenAdxlEngineName(target_segment_desc->rank_info.hostIp,
+                          target_segment_desc->rank_info.hostPort);
     adxl::TransferOp operation;
     if (slice_list[0]->opcode == TransferRequest::WRITE) {
         operation = adxl::WRITE;

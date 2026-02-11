@@ -77,6 +77,9 @@ class AscendDirectTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
+    static std::string GenAdxlEngineName(const std::string &ip,
+                                         const uint64_t port);
+
     void queryThread();
 
     void processSliceList(const std::vector<Slice *> &slice_list);
@@ -104,7 +107,6 @@ class AscendDirectTransport : public Transport {
 
     uint16_t findAdxlListenPort();
 
-   private:
     int InitAdxlEngine();
 
     int checkAndConnect(const std::string &target_adxl_engine_name);
