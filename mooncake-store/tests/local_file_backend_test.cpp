@@ -23,9 +23,9 @@ class LocalFileBackendTest : public ::testing::Test {
         FLAGS_logtostderr = true;
 
         // Create a unique temporary directory
-        std::string tmpl = (fs::temp_directory_path() /
-                            "local_file_backend_test_XXXXXX")
-                               .string();
+        std::string tmpl =
+            (fs::temp_directory_path() / "local_file_backend_test_XXXXXX")
+                .string();
         char* dir = mkdtemp(tmpl.data());
         ASSERT_NE(dir, nullptr) << "Failed to create temp directory";
         tmp_dir_ = dir;

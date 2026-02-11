@@ -41,8 +41,7 @@ TEST_F(ZstdUtilTest, Roundtrip_RawPointer) {
     std::vector<uint8_t> input = {10, 20, 30, 40, 50};
     auto compressed = zstd_compress(input.data(), input.size());
     EXPECT_FALSE(compressed.empty());
-    auto decompressed =
-        zstd_decompress(compressed.data(), compressed.size());
+    auto decompressed = zstd_decompress(compressed.data(), compressed.size());
     EXPECT_EQ(decompressed, input);
 }
 
@@ -58,8 +57,7 @@ TEST_F(ZstdUtilTest, Roundtrip_WithMaxSize) {
     std::string input = "Max size decompression test.";
     auto compressed = zstd_compress(input);
     auto decompressed =
-        zstd_decompress(compressed.data(), compressed.size(),
-                        input.size() * 2);
+        zstd_decompress(compressed.data(), compressed.size(), input.size() * 2);
     std::string decompressed_str(decompressed.begin(), decompressed.end());
     EXPECT_EQ(decompressed_str, input);
 }

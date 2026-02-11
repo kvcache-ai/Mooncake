@@ -111,7 +111,6 @@ TEST_F(FileUtilTest, EnsureDirExists_AlreadyExists) {
     EXPECT_TRUE(result.has_value());
 }
 
-
 TEST_F(FileUtilTest, EnsureDirExists_PathIsFile_ReturnsError) {
     // Create a regular file, then try EnsureDirExists on it
     std::string file_path = tmp_dir() + "/a_file";

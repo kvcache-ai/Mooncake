@@ -61,18 +61,19 @@ class SnapshotChildProcessTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    // Create a default service with snapshot_restore enabled (backend initialized)
+    // Create a default service with snapshot_restore enabled (backend
+    // initialized)
     void CreateDefaultService() {
-        auto config = MasterServiceConfigBuilder()
-                          .set_enable_snapshot(false)
-                          .set_enable_snapshot_restore(true)
-                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
-                          .set_snapshot_interval_seconds(100)
-                          .set_snapshot_child_timeout_seconds(60)
-                          .set_snapshot_retention_count(3)
-                          .set_snapshot_backend_type(
-                              SnapshotBackendType::LOCAL_FILE)
-                          .build();
+        auto config =
+            MasterServiceConfigBuilder()
+                .set_enable_snapshot(false)
+                .set_enable_snapshot_restore(true)
+                .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                .set_snapshot_interval_seconds(100)
+                .set_snapshot_child_timeout_seconds(60)
+                .set_snapshot_retention_count(3)
+                .set_snapshot_backend_type(SnapshotBackendType::LOCAL_FILE)
+                .build();
         service_ = std::make_unique<MasterService>(config);
     }
 
@@ -87,8 +88,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         service_->HandleChildExit(pid, status, snapshot_id);
     }
 
-    void CallHandleChildTimeout(pid_t pid,
-                                const std::string& snapshot_id) {
+    void CallHandleChildTimeout(pid_t pid, const std::string& snapshot_id) {
         service_->HandleChildTimeout(pid, snapshot_id);
     }
 
@@ -99,8 +99,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     tl::expected<void, SerializationError> CallUploadSnapshotFile(
         const std::vector<uint8_t>& data, const std::string& path,
-        const std::string& local_filename,
-        const std::string& snapshot_id) {
+        const std::string& local_filename, const std::string& snapshot_id) {
         return service_->UploadSnapshotFile(data, path, local_filename,
                                             snapshot_id);
     }
@@ -253,8 +252,7 @@ TEST_F(SnapshotChildProcessTest, UploadSnapshotFile_Success) {
     CreateDefaultService();
     std::vector<uint8_t> data = {10, 20, 30, 40, 50};
     std::string path = "master_snapshot/test_upload/metadata";
-    auto result =
-        CallUploadSnapshotFile(data, path, "metadata", "test_upload");
+    auto result = CallUploadSnapshotFile(data, path, "metadata", "test_upload");
     ASSERT_TRUE(result.has_value())
         << "UploadSnapshotFile failed: " << result.error().message;
 
@@ -298,8 +296,7 @@ TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
 
 // ========== Snapshot Backup Dir ==========
 
-TEST_F(SnapshotChildProcessTest,
-       RestoreWithBackupDir_CreatesBackupFiles) {
+TEST_F(SnapshotChildProcessTest, RestoreWithBackupDir_CreatesBackupFiles) {
     // Step 1: Create a snapshot using a service
     CreateDefaultService();
     auto persist_result = CallPersistState("20240601_120000_000");
@@ -337,8 +334,7 @@ TEST_F(SnapshotChildProcessTest,
     restore_service.reset();
 }
 
-TEST_F(SnapshotChildProcessTest,
-       RestoreWithoutBackupDir_NoBackupFiles) {
+TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
     // Step 1: Create a snapshot using a service
     CreateDefaultService();
     auto persist_result = CallPersistState("20240601_120000_001");
@@ -412,25 +408,23 @@ TEST_F(SnapshotChildProcessTest, DisableSnapshotWithoutEnvVar_NoThrow) {
             .build();
 
     // With snapshot disabled, backend is never created, so no throw
-    EXPECT_NO_THROW({
-        MasterService service(config);
-    });
+    EXPECT_NO_THROW({ MasterService service(config); });
 }
 
 // ========== Restore Dirty Data Cleanup ==========
 
 TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
     // Step 1: Create service and add both clean and dirty data
-    auto config = MasterServiceConfigBuilder()
-                      .set_enable_snapshot(false)
-                      .set_enable_snapshot_restore(true)
-                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
-                      .set_snapshot_interval_seconds(100)
-                      .set_snapshot_child_timeout_seconds(60)
-                      .set_snapshot_retention_count(3)
-                      .set_snapshot_backend_type(
-                          SnapshotBackendType::LOCAL_FILE)
-                      .build();
+    auto config =
+        MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_backend_type(SnapshotBackendType::LOCAL_FILE)
+            .build();
     service_ = std::make_unique<MasterService>(config);
 
     // Mount a segment
@@ -446,8 +440,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
 
     // Add a complete object (clean data)
     std::string clean_key = "clean_object";
-    auto put_result = service_->PutStart(
-        client_id, clean_key, {1024}, {.replica_num = 1});
+    auto put_result =
+        service_->PutStart(client_id, clean_key, {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_result.has_value()) << "PutStart clean failed";
     auto put_end_result =
         service_->PutEnd(client_id, clean_key, ReplicaType::MEMORY);
@@ -455,8 +449,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
 
     // Add an incomplete object (PutStart without PutEnd -> non-COMPLETE)
     std::string dirty_key = "dirty_incomplete";
-    auto put_dirty_result = service_->PutStart(
-        client_id, dirty_key, {1024}, {.replica_num = 1});
+    auto put_dirty_result =
+        service_->PutStart(client_id, dirty_key, {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_dirty_result.has_value()) << "PutStart dirty failed";
     // Intentionally NO PutEnd -> replica stays in PENDING status
 
@@ -482,8 +476,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
             .set_snapshot_retention_count(3)
             .set_snapshot_backend_type(SnapshotBackendType::LOCAL_FILE)
             .build();
-    auto restored_service =
-        std::make_unique<MasterService>(restore_config);
+    auto restored_service = std::make_unique<MasterService>(restore_config);
 
     // Step 4: Verify non-COMPLETE replica was cleaned, complete one remains
     EXPECT_TRUE(restored_service->ExistKey(clean_key).value_or(false))
@@ -496,17 +489,17 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
 
 TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     // Step 1: Create service with long lease TTL
-    auto config = MasterServiceConfigBuilder()
-                      .set_enable_snapshot(false)
-                      .set_enable_snapshot_restore(true)
-                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
-                      .set_snapshot_interval_seconds(100)
-                      .set_snapshot_child_timeout_seconds(60)
-                      .set_snapshot_retention_count(3)
-                      .set_snapshot_backend_type(
-                          SnapshotBackendType::LOCAL_FILE)
-                      .set_default_kv_lease_ttl(600000)  // 10 min lease
-                      .build();
+    auto config =
+        MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_backend_type(SnapshotBackendType::LOCAL_FILE)
+            .set_default_kv_lease_ttl(600000)  // 10 min lease
+            .build();
     service_ = std::make_unique<MasterService>(config);
 
     // Mount a segment
@@ -523,21 +516,19 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     // Add two complete objects via PutStart + PutEnd
     // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
     std::string expired_key = "expired_lease_object";
-    auto put_exp = service_->PutStart(
-        client_id, expired_key, {1024}, {.replica_num = 1});
+    auto put_exp =
+        service_->PutStart(client_id, expired_key, {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_exp.has_value()) << "PutStart expired failed";
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, expired_key, ReplicaType::MEMORY)
-            .has_value())
+    ASSERT_TRUE(service_->PutEnd(client_id, expired_key, ReplicaType::MEMORY)
+                    .has_value())
         << "PutEnd expired failed";
 
     std::string normal_key = "normal_lease_object";
-    auto put_norm = service_->PutStart(
-        client_id, normal_key, {1024}, {.replica_num = 1});
+    auto put_norm =
+        service_->PutStart(client_id, normal_key, {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_norm.has_value()) << "PutStart normal failed";
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, normal_key, ReplicaType::MEMORY)
-            .has_value())
+    ASSERT_TRUE(service_->PutEnd(client_id, normal_key, ReplicaType::MEMORY)
+                    .has_value())
         << "PutEnd normal failed";
 
     // ExistKey grants a fresh lease (now + 600s) to normal_key
@@ -561,14 +552,12 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
             .set_snapshot_retention_count(3)
             .set_snapshot_backend_type(SnapshotBackendType::LOCAL_FILE)
             .build();
-    auto restored_service =
-        std::make_unique<MasterService>(restore_config);
+    auto restored_service = std::make_unique<MasterService>(restore_config);
 
     // Step 4: Verify normal data retained, expired-lease data cleaned
     EXPECT_TRUE(restored_service->ExistKey(normal_key).value_or(false))
         << "Normal object with valid lease should survive restore";
-    EXPECT_FALSE(
-        KeyExistsInMetadata(restored_service.get(), expired_key))
+    EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";
 
     restored_service.reset();
