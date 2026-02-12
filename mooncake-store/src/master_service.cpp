@@ -68,7 +68,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
             snapshot_backend_ =
                 SerializerBackend::Create(config.snapshot_backend_type);
         } catch (const std::exception& e) {
-            LOG(FATAL) << "Failed to create snapshot backend: " << e.what();
+            LOG(ERROR) << "Failed to create snapshot backend: " << e.what();
+            throw std::runtime_error(
+                fmt::format("Failed to create snapshot backend: {}", e.what()));
         }
         if (!snapshot_backup_dir_.empty()) {
             use_snapshot_backup_dir_ = true;
