@@ -68,6 +68,17 @@ struct CopyStartResponse {
 YLT_REFL(CopyStartResponse, source, targets);
 
 /**
+ * @brief Response structure for CacheOnGet operation
+ */
+struct CacheOnGetResponse {
+    bool needs_transfer = false;
+    GetReplicaListResponse replica_list;
+    Replica::Descriptor source;  // valid only when needs_transfer == true
+    Replica::Descriptor target;  // valid only when needs_transfer == true
+};
+YLT_REFL(CacheOnGetResponse, needs_transfer, replica_list, source, target);
+
+/**
  * @brief Response structure for MoveStart operation
  */
 struct MoveStartResponse {

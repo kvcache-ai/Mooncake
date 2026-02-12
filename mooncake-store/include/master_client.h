@@ -317,6 +317,15 @@ class MasterClient {
         const std::string& key);
 
     /**
+     * @brief Cache-on-get: allocate local replica and set up replication task
+     * @param key Object key
+     * @param local_segment Local segment name
+     * @return CacheOnGetResponse on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<CacheOnGetResponse, ErrorCode> CacheOnGet(
+        const std::string& key, const std::string& local_segment);
+
+    /**
      * @brief Start a move operation
      * @param key Object key
      * @param src_segment Source segment name
