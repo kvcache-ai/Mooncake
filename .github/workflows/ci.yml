@@ -179,11 +179,17 @@ jobs:
         echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
       shell: bash
 
+    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
     - name: Build Python wheel
       run: |
-        # build_wheel.sh: CI (or FREE_BUILD_DIR=1) removes build/ to save disk; set PYTHON_VERSION, OUTPUT_DIR; BUILD_WITH_EP only in build-flags.
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
+
+    - name: Upload wheel for ZMQ test job
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   build-musa:
     if: >-
@@ -491,9 +497,9 @@ jobs:
         echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
       shell: bash
 
+    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
     - name: Build Python wheel
       run: |
-        # build_wheel.sh: CI (or FREE_BUILD_DIR=1) removes build/ to save disk; set PYTHON_VERSION, OUTPUT_DIR; BUILD_WITH_EP only in build-flags.
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
