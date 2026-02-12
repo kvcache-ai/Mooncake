@@ -181,7 +181,7 @@ jobs:
 
     - name: Build Python wheel
       run: |
-        # Build wheel with specific Python version
+        # build_wheel.sh: CI (or FREE_BUILD_DIR=1) removes build/ to save disk; set PYTHON_VERSION, OUTPUT_DIR; BUILD_WITH_EP only in build-flags.
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
@@ -493,7 +493,7 @@ jobs:
 
     - name: Build Python wheel
       run: |
-        # Build wheel with specific Python version
+        # build_wheel.sh: CI (or FREE_BUILD_DIR=1) removes build/ to save disk; set PYTHON_VERSION, OUTPUT_DIR; BUILD_WITH_EP only in build-flags.
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
