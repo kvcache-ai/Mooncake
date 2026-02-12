@@ -41,7 +41,9 @@ DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",
               "List of metadata service URLs, comma-separated.");
-DEFINE_int32(rpc_server_port, 0, "RPC server port (0 = auto-select).");
+DEFINE_int32(
+    rpc_server_port, 0,
+    "RPC server port used for p2p metadata service (0 = auto-select).");
 DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
