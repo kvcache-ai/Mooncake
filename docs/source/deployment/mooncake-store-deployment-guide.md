@@ -23,7 +23,7 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
 - Allocation Strategy
   - `--allocation_strategy` (str, default `random`): Memory allocation strategy for replica placement. Available options:
     - `random`: Pure random selection across segments (baseline, fastest).
-    - `best_of_n`: Best-of-N sampling strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
+    - `free_ratio_first`: Free-ratio-first strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
 
 - Eviction and TTLs
   - `--default_kv_lease_ttl` (uint64, default `5000` ms): Default lease TTL for KV objects.
@@ -54,11 +54,11 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
-Example (use Best-of-N allocation strategy for better load balancing):
+Example (use free-ratio-first allocation strategy for better load balancing):
 
 ```bash
 mooncake_master \
-  --allocation_strategy=best_of_n \
+  --allocation_strategy=free_ratio_first \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
 ```

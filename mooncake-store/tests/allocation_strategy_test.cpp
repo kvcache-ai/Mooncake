@@ -25,7 +25,7 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::BEST_OF_N);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -86,8 +86,8 @@ INSTANTIATE_TEST_SUITE_P(
             case AllocationStrategyType::RANDOM:
                 strategy_str = "Random";
                 break;
-            case AllocationStrategyType::BEST_OF_N:
-                strategy_str = "BestOfN";
+            case AllocationStrategyType::FREE_RATIO_FIRST:
+                strategy_str = "FreeRatioFirst";
                 break;
             default:
                 strategy_str = "Unknown";
@@ -557,11 +557,11 @@ TEST_P(AllocationStrategyParameterizedTest,
 }
 
 // Test the performance of AllocationStrategy.
-// Test BestOfN load balancing distribution with different sized segments
-TEST_P(AllocationStrategyParameterizedTest, BestOfNLoadBalancingDistribution) {
+// Test FreeRatioFirst load balancing distribution with different sized segments
+TEST_P(AllocationStrategyParameterizedTest, FreeRatioFirstLoadBalancingDistribution) {
     auto [strategy_type, allocator_type] = GetParam();
-    if (strategy_type != AllocationStrategyType::BEST_OF_N) {
-        // This test is only for BestOfN strategy
+    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
+        // This test is only for FreeRatioFirst strategy
         GTEST_SKIP();
     }
 
@@ -606,7 +606,7 @@ TEST_P(AllocationStrategyParameterizedTest, BestOfNLoadBalancingDistribution) {
 
     // Calculate utilization ratio for each segment
     std::cout
-        << "\nBestOfN Load Balancing Results (Different Sized Segments):\n";
+        << "\nFreeRatioFirst Load Balancing Results (Different Sized Segments):\n";
     std::cout << "Total allocations: " << kNumAllocations << " x "
               << (slice_length / 1024)
               << "KB = " << (kNumAllocations * slice_length / MiB) << "MB\n\n";
@@ -627,7 +627,7 @@ TEST_P(AllocationStrategyParameterizedTest, BestOfNLoadBalancingDistribution) {
                   << "%\n\n";
     }
 
-    // BestOfN should balance utilization ratios across segments
+    // FreeRatioFirst should balance utilization ratios across segments
     // Even though segments have different capacities (32MB, 64MB, 128MB),
     // their utilization ratios should be similar (within 15% difference)
     double max_util =
@@ -641,7 +641,7 @@ TEST_P(AllocationStrategyParameterizedTest, BestOfNLoadBalancingDistribution) {
     std::cout << "Expected: < 15% for good load balancing\n\n";
 
     // Verify that utilization ratios are balanced (within 15%)
-    EXPECT_LT(util_diff, 15.0) << "BestOfN should balance utilization ratios";
+    EXPECT_LT(util_diff, 15.0) << "FreeRatioFirst should balance utilization ratios";
 }
 
 // Test the performance comparison between strategies
@@ -680,31 +680,31 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
 
     random_replicas.clear();
 
-    // Test BestOfN strategy
-    auto best_of_n_strategy = std::make_unique<BestOfNAllocationStrategy>();
-    std::vector<std::vector<Replica>> best_of_n_replicas;
-    best_of_n_replicas.reserve(kNumAllocations);
+    // Test FreeRatioFirst strategy
+    auto frf_strategy = std::make_unique<FreeRatioFirstAllocationStrategy>();
+    std::vector<std::vector<Replica>> frf_replicas;
+    frf_replicas.reserve(kNumAllocations);
 
-    auto best_of_n_start = std::chrono::steady_clock::now();
+    auto frf_start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < kNumAllocations; i++) {
         auto result =
-            best_of_n_strategy->Allocate(allocator_manager, kAllocationSize);
+            frf_strategy->Allocate(allocator_manager, kAllocationSize);
         ASSERT_TRUE(result.has_value());
         ASSERT_EQ(result.value().size(), 1);
-        best_of_n_replicas.emplace_back(std::move(result.value()));
+        frf_replicas.emplace_back(std::move(result.value()));
     }
-    auto best_of_n_elapsed_us =
+    auto frf_elapsed_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - best_of_n_start);
+            std::chrono::steady_clock::now() - frf_start);
 
     std::cout << "\nAllocation Strategy Performance Comparison:\n"
               << "Num segments: " << kNumSegments << "\n"
               << "Num allocations: " << kNumAllocations << "\n"
               << "Random strategy: " << random_elapsed_us.count() << " us\n"
-              << "BestOfN strategy: " << best_of_n_elapsed_us.count() << " us\n"
+              << "FreeRatioFirst strategy: " << frf_elapsed_us.count() << " us\n"
               << "Speedup: " << std::fixed << std::setprecision(2)
               << (static_cast<double>(random_elapsed_us.count()) /
-                  best_of_n_elapsed_us.count())
+                  frf_elapsed_us.count())
               << "x\n\n";
 }
 

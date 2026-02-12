@@ -270,8 +270,8 @@ class WrappedMasterServiceConfig {
         }
 
         // Convert string allocation_strategy to AllocationStrategyType enum
-        if (config.allocation_strategy == "best_of_n") {
-            allocation_strategy_type = AllocationStrategyType::BEST_OF_N;
+        if (config.allocation_strategy == "free_ratio_first") {
+            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
@@ -280,7 +280,7 @@ class WrappedMasterServiceConfig {
             LOG(WARNING)
                 << "Unrecognized allocation_strategy value: '"
                 << config.allocation_strategy << "'. Defaulting to 'random'. "
-                << "Valid options are: random, best_of_n, cxl (case-sensitive)";
+                << "Valid options are: random, free_ratio_first, cxl (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 

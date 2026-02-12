@@ -200,16 +200,16 @@ mooncake_master \
 ```
 This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
-Optional: Use the Best-of-N allocation strategy for better load balancing across segments with different sizes or utilization:
+Optional: Use the free-ratio-first allocation strategy for better load balancing across segments with different sizes or utilization:
 
 ```bash
 mooncake_master \
-  --allocation_strategy=best_of_n \
+  --allocation_strategy=free_ratio_first \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
 ```
 
-The Best-of-N strategy balances memory utilization ratio across segments by sampling multiple candidates and preferentially allocating to those with higher free space ratios, leading to more even utilization.
+The free-ratio-first strategy balances memory utilization ratio across segments by sampling multiple candidates and preferentially allocating to those with higher free space ratios, leading to more even utilization.
 
 ### Hello World Example
 

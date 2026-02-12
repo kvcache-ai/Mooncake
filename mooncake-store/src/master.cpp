@@ -82,7 +82,7 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 DEFINE_string(allocation_strategy, "random",
-              "Allocation strategy for segments, random | best_of_n | cxl");
+              "Allocation strategy for segments, random | free_ratio_first | cxl");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <memory>
-#include <numeric>
 #include <random>
 #include <string>
 #include <set>
@@ -361,7 +360,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 };
 
 /**
- * @brief Best-of-N sampling allocation strategy.
+ * @brief Free-ratio-first allocation strategy.
  *
  * For each allocation of N replicas:
  * 1. Randomly sample min(2N, total) candidate segments from the eligible pool
@@ -376,9 +375,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
  * - New empty segments naturally win the comparison, getting filled quickly.
  * - Thread-safe: uses thread_local state for sampling, no shared mutable data.
  */
-class BestOfNAllocationStrategy : public RandomAllocationStrategy {
+class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
    public:
-    BestOfNAllocationStrategy() = default;
+    FreeRatioFirstAllocationStrategy() = default;
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
@@ -423,21 +422,14 @@ class BestOfNAllocationStrategy : public RandomAllocationStrategy {
 
         const size_t remaining = replica_num - replicas.size();
 
-        // --- Best-of-N: sample candidates from all segments, check eligibility
-        // when selecting ---
-        const size_t min_candidate_size = 6;
-        size_t sample_count = std::max(2 * remaining, min_candidate_size);
-        sample_count = std::min(sample_count, names.size());
+        // --- Sample candidates: pick a random start, take 6*remaining
+        // consecutive segments, then sort by free space ---
+        size_t sample_count =
+            std::min(kCandidateMultiplier * remaining, names.size());
 
-        // Thread-local indices for Fisher-Yates sampling (no shared mutable
-        // state, each thread has its own copy)
-        static thread_local std::vector<size_t> tl_indices;
-        if (tl_indices.size() != names.size()) {
-            tl_indices.resize(names.size());
-            std::iota(tl_indices.begin(), tl_indices.end(), 0);
-        }
+        std::uniform_int_distribution<size_t> start_dist(0, names.size() - 1);
+        size_t start_idx = start_dist(generator);
 
-        // Compute free space ratio for sampled candidates
         struct Candidate {
             size_t name_idx;
             double free_ratio;  // free_bytes / capacity
@@ -445,15 +437,11 @@ class BestOfNAllocationStrategy : public RandomAllocationStrategy {
         std::vector<Candidate> candidates;
         candidates.reserve(sample_count);
 
-        // Fisher-Yates partial shuffle using thread-local indices
         for (size_t i = 0; i < sample_count; ++i) {
-            std::uniform_int_distribution<size_t> dist(i, names.size() - 1);
-            size_t j = dist(generator);
-            std::swap(tl_indices[i], tl_indices[j]);
-
+            size_t idx = (start_idx + i) % names.size();
             double free_ratio =
-                getSegmentFreeRatio(allocator_manager, names[tl_indices[i]]);
-            candidates.push_back({tl_indices[i], free_ratio});
+                getSegmentFreeRatio(allocator_manager, names[idx]);
+            candidates.push_back({idx, free_ratio});
         }
 
         // Sort by free space ratio descending
@@ -491,13 +479,13 @@ class BestOfNAllocationStrategy : public RandomAllocationStrategy {
 
         // --- Fallback: Random allocation for any remaining replicas ---
         std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
-        size_t start_idx = distribution(generator);
+        size_t fallback_idx = distribution(generator);
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
         size_t try_count = 0;
 
         while (replicas.size() < replica_num && try_count < max_retry) {
-            auto index = start_idx % names.size();
-            start_idx++;
+            auto index = fallback_idx % names.size();
+            fallback_idx++;
             try_count++;
 
             // Skip excluded and used segments
@@ -523,6 +511,7 @@ class BestOfNAllocationStrategy : public RandomAllocationStrategy {
 
    private:
     static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr size_t kCandidateMultiplier = 6;
 
     double getSegmentFreeRatio(const AllocatorManager& allocator_manager,
                                const std::string& name) {
@@ -611,8 +600,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
     switch (type) {
         case AllocationStrategyType::RANDOM:
             return std::make_shared<RandomAllocationStrategy>();
-        case AllocationStrategyType::BEST_OF_N:
-            return std::make_shared<BestOfNAllocationStrategy>();
+        case AllocationStrategyType::FREE_RATIO_FIRST:
+            return std::make_shared<FreeRatioFirstAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         default:
