@@ -362,7 +362,7 @@ int tent_register_memory_with_perm(tent_engine_t engine, void* addr,
                                    size_t size, int permission) {
     CHECK_POINTER(engine);
     CHECK_POINTER(addr);
-    auto perm = (mooncake::tent::Permission)permission;
+    auto perm = static_cast<mooncake::tent::Permission>(permission);
     auto status =
         CAST(engine)->registerLocalMemory({addr}, {size}, perm);
     if (!status.ok()) {
@@ -379,7 +379,7 @@ int tent_register_memory_batch(tent_engine_t engine, void** addrs,
     CHECK_POINTER(sizes);
     std::vector<void*> addr_list(addrs, addrs + count);
     std::vector<size_t> size_list(sizes, sizes + count);
-    auto perm = (mooncake::tent::Permission)permission;
+    auto perm = static_cast<mooncake::tent::Permission>(permission);
     auto status = CAST(engine)->registerLocalMemory(addr_list, size_list, perm);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_batch: " << status.ToString();
@@ -464,8 +464,7 @@ int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
         LOG(ERROR) << "tent_task_status_list: " << status.ToString();
         return -1;
     }
-    size_t to_copy =
-        status_list.size() < *count ? status_list.size() : *count;
+    size_t to_copy = std::min(status_list.size(), *count);
     for (size_t i = 0; i < to_copy; ++i) {
         statuses[i].status = (int)status_list[i].s;
         statuses[i].transferred_bytes = status_list[i].transferred_bytes;
