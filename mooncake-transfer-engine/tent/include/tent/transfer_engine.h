@@ -106,11 +106,11 @@ typedef struct tent_notifi_info tent_notifi_info;
 
 struct tent_memory_options {
     char location[64];
-    int permission;      /* PERM_LOCAL_READ_WRITE, etc. */
-    int transport_type;  /* TRANSPORT_RDMA, etc. */
+    int permission;     /* PERM_LOCAL_READ_WRITE, etc. */
+    int transport_type; /* TRANSPORT_RDMA, etc. */
     char shm_path[256];
     size_t shm_offset;
-    int internal;        /* 0 = false, nonzero = true */
+    int internal; /* 0 = false, nonzero = true */
 };
 
 typedef struct tent_memory_options tent_memory_options_t;

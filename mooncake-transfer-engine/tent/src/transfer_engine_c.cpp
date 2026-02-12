@@ -338,12 +338,14 @@ int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
 static mooncake::tent::MemoryOptions convert_options(
     const tent_memory_options_t* opts) {
     mooncake::tent::MemoryOptions options;
-    if (opts->location[0] != '\0')
+    if (opts->location[0] != '\0') {
         options.location = opts->location;
+    }
     options.perm = (mooncake::tent::Permission)opts->permission;
     options.type = (mooncake::tent::TransportType)opts->transport_type;
-    if (opts->shm_path[0] != '\0')
+    if (opts->shm_path[0] != '\0') {
         options.shm_path = opts->shm_path;
+    }
     options.shm_offset = opts->shm_offset;
     options.internal = opts->internal != 0;
     return options;
@@ -363,8 +365,7 @@ int tent_register_memory_with_perm(tent_engine_t engine, void* addr,
     CHECK_POINTER(engine);
     CHECK_POINTER(addr);
     auto perm = static_cast<mooncake::tent::Permission>(permission);
-    auto status =
-        CAST(engine)->registerLocalMemory({addr}, {size}, perm);
+    auto status = CAST(engine)->registerLocalMemory({addr}, {size}, perm);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_with_perm: " << status.ToString();
         return -1;
@@ -394,8 +395,9 @@ int tent_unregister_memory_batch(tent_engine_t engine, void** addrs,
     CHECK_POINTER(addrs);
     std::vector<void*> addr_list(addrs, addrs + count);
     std::vector<size_t> size_list;
-    if (sizes)
+    if (sizes) {
         size_list.assign(sizes, sizes + count);
+    }
     auto status = CAST(engine)->unregisterLocalMemory(addr_list, size_list);
     if (!status.ok()) {
         LOG(ERROR) << "tent_unregister_memory_batch: " << status.ToString();
@@ -424,8 +426,7 @@ int tent_register_memory_ex(tent_engine_t engine, void* addr, size_t size,
     CHECK_POINTER(addr);
     CHECK_POINTER(opts);
     auto options = convert_options(opts);
-    auto status =
-        CAST(engine)->registerLocalMemory({addr}, {size}, options);
+    auto status = CAST(engine)->registerLocalMemory({addr}, {size}, options);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_ex: " << status.ToString();
         return -1;
