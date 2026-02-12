@@ -45,8 +45,18 @@ std::unique_ptr<SerializerBackend> SerializerBackend::Create(
 
 class S3Backend::Impl {
    public:
-    Impl() : s3_helper_("", "", "") {}
+    Impl() : initialized_(InitializeOnce()), s3_helper_("", "", "") {}
 
+    ~Impl() { S3Helper::ShutdownAPI(); }
+
+   private:
+    static bool InitializeOnce() {
+        S3Helper::InitAPI();
+        return true;
+    }
+    bool initialized_;
+
+   public:
     S3Helper s3_helper_;
 };
 

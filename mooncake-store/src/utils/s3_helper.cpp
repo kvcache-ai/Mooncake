@@ -104,19 +104,19 @@ void S3Helper::InitAPI() {
 
     // Read environment variables once during initialization (fallback as needed
     // if not set)
-    AssignStringFromEnv("AWS_REGION", s3_env.region);
-    AssignStringFromEnv("AWS_S3_ENDPOINT", s3_env.endpoint);
-    AssignStringFromEnv("AWS_BUCKET_NAME", s3_env.bucket);
-    AssignStringFromEnv("AWS_ACCESS_KEY_ID", s3_env.access_key);
-    AssignStringFromEnv("AWS_SECRET_ACCESS_KEY", s3_env.secret_key);
+    AssignStringFromEnv("MOONCAKE_AWS_REGION", s3_env.region);
+    AssignStringFromEnv("MOONCAKE_AWS_S3_ENDPOINT", s3_env.endpoint);
+    AssignStringFromEnv("MOONCAKE_AWS_BUCKET_NAME", s3_env.bucket);
+    AssignStringFromEnv("MOONCAKE_AWS_ACCESS_KEY_ID", s3_env.access_key);
+    AssignStringFromEnv("MOONCAKE_AWS_SECRET_ACCESS_KEY", s3_env.secret_key);
 
-    AssignBoolFromEnv("AWS_USE_VIRTUAL_ADDRESSING",
+    AssignBoolFromEnv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING",
                       s3_env.use_virtual_addressing);
 
-    AssignTimeoutFromEnv("AWS_CONNECT_TIMEOUT_MS", kDefaultS3ConnectTimeoutMs,
-                         s3_env.connect_timeout_ms);
-    AssignTimeoutFromEnv("AWS_REQUEST_TIMEOUT_MS", kDefaultS3RequestTimeoutMs,
-                         s3_env.request_timeout_ms);
+    AssignTimeoutFromEnv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS",
+                         kDefaultS3ConnectTimeoutMs, s3_env.connect_timeout_ms);
+    AssignTimeoutFromEnv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS",
+                         kDefaultS3RequestTimeoutMs, s3_env.request_timeout_ms);
 }
 
 void S3Helper::ShutdownAPI() {
@@ -132,7 +132,7 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
 
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
     config.requestTimeoutMs = s3_env.request_timeout_ms;
-    config.scheme = Aws::Http::Scheme::HTTP;
+    config.scheme = Aws::Http::Scheme::HTTPS;
 
     if (!region.empty()) {
         config.region = region;
@@ -168,7 +168,7 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         config.endpointOverride.empty() ? "unset" : config.endpointOverride,
         bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs,
         config.requestTimeoutMs,
-        config.scheme == Aws::Http::Scheme::HTTP ? "HTTP" : "HTTPS",
+        config.scheme == Aws::Http::Scheme::HTTPS ? "HTTPS" : "HTTP",
         !s3_env.access_key.empty() ? "set" : "unset",
         !s3_env.secret_key.empty() ? "set" : "unset",
         s3_env.use_virtual_addressing ? "true" : "false");

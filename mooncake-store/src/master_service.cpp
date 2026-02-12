@@ -64,8 +64,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
-        snapshot_backend_ =
-            SerializerBackend::Create(config.snapshot_backend_type);
+        try {
+            snapshot_backend_ =
+                SerializerBackend::Create(config.snapshot_backend_type);
+        } catch (const std::exception& e) {
+            LOG(FATAL) << "Failed to create snapshot backend: " << e.what();
+        }
         if (!snapshot_backup_dir_.empty()) {
             use_snapshot_backup_dir_ = true;
         }
