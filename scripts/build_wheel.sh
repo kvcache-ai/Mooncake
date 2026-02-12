@@ -140,7 +140,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
 fi
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
-if [ -n "$CI" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf build/
 fi

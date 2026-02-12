@@ -19,6 +19,7 @@ jobs:
       matrix:
         python-version: ['3.10', '3.12']
     env:
+      CI: "true"
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -367,6 +368,7 @@ jobs:
       matrix:
         python-version: ['3.10', '3.12']
     env:
+      CI: "true"
       BUILD_WITH_EP: "1"
       EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
