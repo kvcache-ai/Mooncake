@@ -250,6 +250,16 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
+      // Snapshot Metrics
+      snapshot_duration_ms_(
+          "master_snapshot_duration_ms",
+          "Distribution of snapshot operation durations in milliseconds",
+          {0, 500, 1000, 5000, 10000, 30000, 60000, 120000, 180000, 240000,
+           300000}),
+      snapshot_success_("master_snapshot_success",
+                        "Total number of successful snapshot operations"),
+      snapshot_fail_("master_snapshot_fail",
+                     "Total number of failed snapshot operations"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -491,6 +501,16 @@ double MasterMetricManager::get_global_mem_used_ratio(void) {
 int64_t MasterMetricManager::get_segment_allocated_mem_size(
     const std::string& segment) {
     return mem_allocated_size_per_segment_.value({segment});
+}
+
+void MasterMetricManager::reset_segment_allocated_mem_size(
+    const std::string& segment) {
+    mem_allocated_size_per_segment_.update({segment}, 0);
+}
+
+void MasterMetricManager::reset_segment_total_mem_capacity(
+    const std::string& segment) {
+    mem_total_capacity_per_segment_.update({segment}, 0);
 }
 
 int64_t MasterMetricManager::get_segment_total_mem_capacity(
@@ -787,6 +807,14 @@ void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
     put_start_release_cnt_.inc(count);
     put_start_discarded_staging_size_.dec(size);
 }
+
+void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
+    snapshot_duration_ms_.observe(size);
+}
+
+void MasterMetricManager::inc_snapshot_success() { snapshot_success_.inc(); }
+
+void MasterMetricManager::inc_snapshot_fail() { snapshot_fail_.inc(); }
 
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
@@ -1324,6 +1352,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_release_cnt_);
     serialize_metric(put_start_discarded_staging_size_);
 
+    // Serialize Snapshot Metrics
+    serialize_metric(snapshot_duration_ms_);
+    serialize_metric(snapshot_success_);
+    serialize_metric(snapshot_fail_);
+
     return ss.str();
 }
 
@@ -1624,6 +1657,11 @@ std::string MasterMetricManager::get_summary_string() {
        << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
+
+    // Snapshot summary
+    ss << " | Snapshots: "
+       << "Success=" << snapshot_success_.value() << ", "
+       << "Fail=" << snapshot_fail_.value();
 
     return ss.str();
 }
