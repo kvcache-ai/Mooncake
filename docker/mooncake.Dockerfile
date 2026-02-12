@@ -45,6 +45,7 @@ WORKDIR /workspace
 COPY . /workspace
 
 # Ensure submodules are available when .git is present (skips quietly otherwise)
+RUN if [ -d .git ]; then git submodule update --init --recursive; fi
 
 # Install Mooncake dependencies (yalantinglibs, Go, etc.)
 RUN bash -x dependencies.sh -y
@@ -99,7 +100,6 @@ RUN apt-get update && \
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
-RUN pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
