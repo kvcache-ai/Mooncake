@@ -244,11 +244,11 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
-    int remove(const std::string &key);
+    int remove(const std::string &key, bool force = false);
 
-    long removeByRegex(const std::string &str);
+    long removeByRegex(const std::string &str, bool force = false);
 
-    long removeAll();
+    long removeAll(bool force = false);
 
     int tearDownAll();
 
@@ -362,6 +362,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_offload = false);
 
+    // Overload that accepts a configuration dictionary
+    tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
+
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
         size_t mount_segment_size = 1024 * 1024 * 16);
@@ -421,12 +424,13 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
 
-    tl::expected<void, ErrorCode> remove_internal(const std::string &key);
+    tl::expected<void, ErrorCode> remove_internal(const std::string &key,
+                                                  bool force = false);
 
-    tl::expected<long, ErrorCode> removeByRegex_internal(
-        const std::string &str);
+    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str,
+                                                         bool force = false);
 
-    tl::expected<int64_t, ErrorCode> removeAll_internal();
+    tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 

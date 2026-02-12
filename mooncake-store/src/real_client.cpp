@@ -267,47 +267,75 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
     // mapped_shms.
-    auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-    uint64_t total_glbseg_size = global_segment_size;  // For logging
-    uint64_t current_glbseg_size = 0;                  // For logging
-    while (global_segment_size > 0) {
-        size_t segment_size = std::min(global_segment_size, max_mr_size);
-        global_segment_size -= segment_size;
-        current_glbseg_size += segment_size;
-        LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                  << current_glbseg_size << " of " << total_glbseg_size;
-        size_t mapped_size = segment_size;
-        void *ptr = nullptr;
-        if (should_use_hugepage) {
-            mapped_size = align_up(segment_size, get_hugepage_size_from_env());
-            ptr = allocate_buffer_mmap_memory(mapped_size,
-                                              get_hugepage_size_from_env());
+    if (protocol == "cxl") {
+        size_t cxl_dev_size = 0;
+        const char *env = std::getenv("MC_CXL_DEV_SIZE");
+        if (env) {
+            char *end = nullptr;
+            unsigned long long val = strtoull(env, &end, 10);
+            if (end != env && *end == '\0')
+                cxl_dev_size = static_cast<size_t>(val);
         } else {
-            ptr =
-                allocate_buffer_allocator_memory(segment_size, this->protocol);
-        }
-
-        if (!ptr) {
-            LOG(ERROR) << "Failed to allocate segment memory";
+            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (this->protocol == "ascend") {
-            ascend_segment_ptrs_.emplace_back(ptr);
-        } else if (should_use_hugepage) {
-            hugepage_segment_ptrs_.emplace_back(
-                ptr, HugepageSegmentDeleter{mapped_size});
-        } else {
-            segment_ptrs_.emplace_back(ptr);
-        }
-        auto mount_result = client_->MountSegment(ptr, mapped_size);
+
+        void *ptr = client_->GetBaseAddr();
+        LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
+                  << ptr;
+        auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
-    }
-    if (total_glbseg_size == 0) {
-        LOG(INFO) << "Global segment size is 0, skip mounting segment";
+
+    } else {
+        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
+        uint64_t total_glbseg_size = global_segment_size;  // For logging
+        uint64_t current_glbseg_size = 0;                  // For logging
+        while (global_segment_size > 0) {
+            size_t segment_size = std::min(global_segment_size, max_mr_size);
+            global_segment_size -= segment_size;
+            current_glbseg_size += segment_size;
+            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
+                      << current_glbseg_size << " of " << total_glbseg_size;
+
+            size_t mapped_size = segment_size;
+            void *ptr = nullptr;
+            if (should_use_hugepage) {
+                mapped_size =
+                    align_up(segment_size, get_hugepage_size_from_env());
+                ptr = allocate_buffer_mmap_memory(mapped_size,
+                                                  get_hugepage_size_from_env());
+            } else {
+                ptr = allocate_buffer_allocator_memory(segment_size,
+                                                       this->protocol);
+            }
+
+            if (!ptr) {
+                LOG(ERROR) << "Failed to allocate segment memory";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (this->protocol == "ascend") {
+                ascend_segment_ptrs_.emplace_back(ptr);
+            } else if (should_use_hugepage) {
+                hugepage_segment_ptrs_.emplace_back(
+                    ptr, HugepageSegmentDeleter{mapped_size});
+            } else {
+                segment_ptrs_.emplace_back(ptr);
+            }
+            auto mount_result =
+                client_->MountSegment(ptr, mapped_size, protocol);
+            if (!mount_result.has_value()) {
+                LOG(ERROR) << "Failed to mount segment: "
+                           << toString(mount_result.error());
+                return tl::unexpected(mount_result.error());
+            }
+        }
+        if (total_glbseg_size == 0) {
+            LOG(INFO) << "Global segment size is 0, skip mounting segment";
+        }
     }
 
     // Start IPC server to accept FD from dummy clients
@@ -344,6 +372,99 @@ int RealClient::setup_real(
                                     global_segment_size, local_buffer_size,
                                     protocol, rdma_devices, master_server_addr,
                                     transfer_engine, ipc_socket_path));
+}
+
+namespace {
+// Helper to get value from config dict with default
+inline std::string get_config(const ConfigDict &config, const std::string &key,
+                              const std::string &default_value = "") {
+    auto it = config.find(key);
+    return (it != config.end()) ? it->second : default_value;
+}
+
+inline size_t get_config_size(const ConfigDict &config, const std::string &key,
+                              size_t default_value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        return default_value;
+    }
+    const std::string &value = it->second;
+    // Check for negative numbers (stoull incorrectly parses "-1" as large val)
+    if (!value.empty() && value[0] == '-') {
+        LOG(WARNING) << "Invalid negative value for config key '" << key
+                     << "': " << value << ", using default: " << default_value;
+        return default_value;
+    }
+    try {
+        return std::stoull(value);
+    } catch (const std::invalid_argument &e) {
+        LOG(WARNING) << "Invalid non-numeric value for config key '" << key
+                     << "': " << value << ", using default: " << default_value;
+        return default_value;
+    } catch (const std::out_of_range &e) {
+        LOG(WARNING) << "Value out of range for config key '" << key
+                     << "': " << value << ", using default: " << default_value;
+        return default_value;
+    }
+}
+}  // namespace
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const ConfigDict &config) {
+    // Extract required parameters (no defaults)
+    std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
+    std::string metadata_server =
+        get_config(config, CONFIG_KEY_METADATA_SERVER);
+
+    // Validate required parameters
+    if (local_hostname.empty()) {
+        LOG(ERROR) << "Missing required config: " << CONFIG_KEY_LOCAL_HOSTNAME;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (metadata_server.empty()) {
+        LOG(ERROR) << "Missing required config: " << CONFIG_KEY_METADATA_SERVER;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Extract optional parameters with defaults
+    size_t global_segment_size = get_config_size(
+        config, CONFIG_KEY_GLOBAL_SEGMENT_SIZE, DEFAULT_GLOBAL_SEGMENT_SIZE);
+    size_t local_buffer_size = get_config_size(
+        config, CONFIG_KEY_LOCAL_BUFFER_SIZE, DEFAULT_LOCAL_BUFFER_SIZE);
+    std::string protocol =
+        get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
+    std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
+    std::string master_server_addr = get_config(
+        config, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
+    std::string ipc_socket_path =
+        get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
+
+    // Validate size parameters are within acceptable ranges
+    if (global_segment_size < MIN_SEGMENT_SIZE ||
+        global_segment_size > MAX_SEGMENT_SIZE) {
+        LOG(ERROR) << "Invalid " << CONFIG_KEY_GLOBAL_SEGMENT_SIZE << ": "
+                   << global_segment_size << ", must be between "
+                   << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (local_buffer_size < MIN_SEGMENT_SIZE ||
+        local_buffer_size > MAX_SEGMENT_SIZE) {
+        LOG(ERROR) << "Invalid " << CONFIG_KEY_LOCAL_BUFFER_SIZE << ": "
+                   << local_buffer_size << ", must be between "
+                   << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Validate protocol is supported
+    if (protocol != "tcp" && protocol != "rdma") {
+        LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
+                   << ", must be 'tcp' or 'rdma'";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return setup_internal(local_hostname, metadata_server, global_segment_size,
+                          local_buffer_size, protocol, rdma_devices,
+                          master_server_addr, nullptr, ipc_socket_path);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -652,44 +773,46 @@ int RealClient::put_parts(const std::string &key,
 }
 
 tl::expected<void, ErrorCode> RealClient::remove_internal(
-    const std::string &key) {
+    const std::string &key, bool force) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto remove_result = client_->Remove(key);
+    auto remove_result = client_->Remove(key, force);
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
     return {};
 }
 
-int RealClient::remove(const std::string &key) {
-    return to_py_ret(remove_internal(key));
+int RealClient::remove(const std::string &key, bool force) {
+    return to_py_ret(remove_internal(key, force));
 }
 
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
-    const std::string &str) {
+    const std::string &str, bool force) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RemoveByRegex(str);
+    return client_->RemoveByRegex(str, force);
 }
 
-long RealClient::removeByRegex(const std::string &str) {
-    return to_py_ret(removeByRegex_internal(str));
+long RealClient::removeByRegex(const std::string &str, bool force) {
+    return to_py_ret(removeByRegex_internal(str, force));
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal() {
+tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RemoveAll();
+    return client_->RemoveAll(force);
 }
 
-long RealClient::removeAll() { return to_py_ret(removeAll_internal()); }
+long RealClient::removeAll(bool force) {
+    return to_py_ret(removeAll_internal(force));
+}
 
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string &key) {

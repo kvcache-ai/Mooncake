@@ -73,7 +73,9 @@ struct MooncakeEpBuffer {
     // IBGDA
     static constexpr size_t CTRL_BUF_SIZE = 1024 * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
-    ibv_mr* mr;
+    // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
+    // fails.
+    ibv_mr* mr = nullptr;
     std::vector<mlx5gda_qp*> qps;
     ibv_gid gid;
     void* raddrs = nullptr;
@@ -82,11 +84,13 @@ struct MooncakeEpBuffer {
     std::string device_name;
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
+    int gid_index_ = -1;  // Dynamically discovered GID index
 
     // NVLink P2P
     int32_t* nvlink_available = nullptr;
     void** ipc_peer_ptrs_host = nullptr;
     void** ipc_peer_ptrs = nullptr;
+    bool p2p_ipc_all_enabled_ = false;
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -125,6 +129,32 @@ struct MooncakeEpBuffer {
     bool ibgda_disabled() { return ibgda_disabled_; }
 
     bool is_roce() { return is_roce_; }
+
+    // Decide whether EP can safely run CUDA kernels (\"fast-path\").
+    //
+    // There are two independent ways EP kernels can work:
+    // - IBGDA RDMA path: requires successful IBGDA init (qps/mr/etc).
+    // - NVLink P2P+IPC path: requires full P2P+IPC across ranks on the same
+    // node.
+    //
+    // IMPORTANT INVARIANT:
+    // If `p2p_ipc_all_enabled_ == true`, `sync_nvlink_ipc_handles()` guarantees
+    // `nvlink_available[dst_rank] == 1` for every rank pair, so the CUDA
+    // kernels will never take the IBGDA branch and therefore do NOT require
+    // `qps`.
+    bool use_fast_path() {
+        if (!ibgda_disabled_) {
+            return true;  // IBGDA available
+        }
+        // IBGDA disabled: only allow fast-path if we can rely on NVLink
+        // P2P+IPC.
+        if (!p2p_ipc_all_enabled_) {
+            LOG(WARNING) << "Failed to initialize IBGDA. "
+                         << "Using fallback implementation. "
+                         << "Performance will be degraded.";
+        }
+        return p2p_ipc_all_enabled_;
+    }
 
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,

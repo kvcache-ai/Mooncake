@@ -9,6 +9,7 @@
 
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -220,8 +221,8 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         std::unique_lock<std::shared_mutex> lock(space_mutex_);
         RecalculateAvailableSpace();
 
-        LOG(INFO) << "Init: " << "Quota: " << total_space_
-                  << ", Used: " << used_space_
+        LOG(INFO) << "Init: "
+                  << "Quota: " << total_space_ << ", Used: " << used_space_
                   << ", Available: " << available_space_;
     }
 
@@ -1278,11 +1279,35 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             return tl::make_unexpected(error_code);
         }
     }
+
+    // Commit to metadata maps under exclusive lock
+    // Check for duplicate keys and rollback if any found
     SharedMutexLocker lock(&mutex_);
+
+    // Pre-check for duplicates before modifying any state
+    for (const auto& key : bucket->keys) {
+        if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
+            LOG(WARNING) << "Duplicate key detected in BatchOffload: " << key
+                         << ", bucket_id=" << bucket_id
+                         << ". Returning OBJECT_ALREADY_EXISTS.";
+            // Release lock and cleanup the orphaned bucket files
+            lock.unlock();
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+    }
+
+    // No duplicates found, safe to commit
     total_size_ += bucket->data_size + bucket->meta_size;
     object_bucket_map_.reserve(object_bucket_map_.size() + bucket->keys.size());
     for (size_t i = 0; i < bucket->keys.size(); ++i) {
-        object_bucket_map_.emplace(bucket->keys[i], std::move(metadatas[i]));
+        // Use insert instead of emplace to be explicit about not overwriting
+        auto [it, inserted] = object_bucket_map_.insert(
+            {bucket->keys[i], std::move(metadatas[i])});
+        if (!inserted) {
+            LOG(ERROR) << "Unexpected duplicate key after pre-check: "
+                       << bucket->keys[i] << ", bucket_id=" << bucket_id;
+        }
     }
     buckets_.emplace(bucket_id, std::move(bucket));
     return bucket_id;
@@ -1307,35 +1332,109 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     const std::unordered_map<std::string, Slice>& batch_object) {
-    std::unordered_map<int64_t, std::vector<std::string>> bucket_keys_map;
-    std::unordered_map<int64_t, std::vector<StorageObjectMetadata>>
-        bucket_key_metas_map;
+    // Step 1: Build read plan by copying metadata under lock
+    // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
+    // When the guard goes out of scope, it decrements the counter.
+    struct ReadPlan {
+        std::string key;
+        int64_t bucket_id;
+        int64_t offset;
+        int64_t key_size;
+        int64_t data_size;
+        Slice dest_slice;
+    };
+
+    // Group by bucket for efficient file access
+    // BucketReadGuard tracks inflight reads - one guard per bucket being read
+    std::unordered_map<int64_t, std::vector<ReadPlan>> bucket_read_plans;
+    std::vector<BucketReadGuard> bucket_guards;  // RAII guards for all buckets
+
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        for (const auto& key_it : batch_object) {
-            auto object_bucket_it = object_bucket_map_.find(key_it.first);
-            if (object_bucket_it == object_bucket_map_.end()) {
-                LOG(ERROR) << "key " << key_it.first << " does not exist";
+        for (const auto& [key, dest_slice] : batch_object) {
+            // Lookup key -> metadata
+            auto object_it = object_bucket_map_.find(key);
+            if (object_it == object_bucket_map_.end()) {
+                LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
-            auto [bucket_keys_it, create_keys_it] =
-                bucket_keys_map.try_emplace(object_bucket_it->second.bucket_id);
-            bucket_keys_it->second.emplace_back(key_it.first);
-            auto [bucket_key_metas_it, create_metas_it] =
-                bucket_key_metas_map.try_emplace(
-                    object_bucket_it->second.bucket_id);
-            bucket_key_metas_it->second.emplace_back(object_bucket_it->second);
+            const auto& metadata = object_it->second;
+
+            // Lookup bucket -> BucketMetadata
+            auto bucket_it = buckets_.find(metadata.bucket_id);
+            if (bucket_it == buckets_.end()) {
+                LOG(ERROR) << "Bucket not found for key: " << key
+                           << ", bucket_id=" << metadata.bucket_id;
+                return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+            }
+
+            // Validate size
+            if (metadata.data_size != static_cast<int64_t>(dest_slice.size)) {
+                LOG(ERROR) << "Size mismatch for key: " << key
+                           << ", expected: " << metadata.data_size
+                           << ", got: " << dest_slice.size;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            // Create guard for this bucket if not already guarded
+            // (one guard per bucket is sufficient - increments refcount once)
+            if (bucket_read_plans.find(metadata.bucket_id) ==
+                bucket_read_plans.end()) {
+                bucket_guards.emplace_back(bucket_it->second);
+            }
+
+            // Copy metadata into read plan
+            bucket_read_plans[metadata.bucket_id].push_back(
+                ReadPlan{key, metadata.bucket_id, metadata.offset,
+                         metadata.key_size, metadata.data_size, dest_slice});
         }
     }
-    for (const auto& bucket_keys_it : bucket_keys_map) {
-        auto result = BatchLoadBucket(
-            bucket_keys_it.first, bucket_keys_it.second,
-            bucket_key_metas_map.at(bucket_keys_it.first), batch_object);
-        if (!result) {
-            LOG(ERROR) << "Failed to load bucket " << bucket_keys_it.first;
-            return result;
+    // Lock released here - bucket files protected by BucketReadGuards
+    // which remain alive until this function returns (~line bucket_guards
+    // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
+
+    // Step 2: Perform IO without holding any locks
+    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+        // Open file for this bucket (cheap syscall, no lock needed)
+        auto filepath_res = GetBucketDataPath(bucket_id);
+        if (!filepath_res) {
+            LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                       << bucket_id;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+        if (!file_res) {
+            LOG(ERROR) << "Failed to open bucket file: "
+                       << filepath_res.value();
+            return tl::make_unexpected(file_res.error());
+        }
+        auto& file = file_res.value();
+
+        // Read each key's data
+        for (const auto& plan : read_plans) {
+            // Read value (skip key in file: offset + key_size)
+            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+            auto read_res =
+                file->vector_read(&iov, 1, plan.offset + plan.key_size);
+
+            if (!read_res) {
+                LOG(ERROR) << "vector_read failed for key: " << plan.key
+                           << ", bucket_id=" << plan.bucket_id
+                           << ", error: " << read_res.error();
+                return tl::make_unexpected(read_res.error());
+            }
+
+            if (read_res.value() != plan.dest_slice.size) {
+                LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                           << ", expected: " << plan.dest_slice.size
+                           << ", got: " << read_res.value();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
         }
     }
+
+    // bucket_guards go out of scope here, decrementing inflight_reads_
     return {};
 }
 
@@ -1493,7 +1592,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 orphaned_space_freed += file_size;
                 LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
                              << entry.path().string() << " (size: " << file_size
-                             << " bytes, " << "bucket_id: " << bucket_id << ")";
+                             << " bytes, "
+                             << "bucket_id: " << bucket_id << ")";
             } else if (cleanup_ec) {
                 LOG(ERROR) << "Failed to remove orphaned bucket file: "
                            << entry.path().string()
@@ -1585,8 +1685,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
         if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: " << "bucket_id="
-                       << bucket_it->first
+            LOG(ERROR) << "Bucket key count exceeds limit: "
+                       << "bucket_id=" << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
@@ -1809,6 +1909,133 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     return {};
 }
 
+void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    auto data_path_res = GetBucketDataPath(bucket_id);
+    if (data_path_res) {
+        if (fs::remove(data_path_res.value(), ec)) {
+            LOG(INFO) << "Cleaned up orphaned bucket data file: "
+                      << data_path_res.value();
+        } else if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "Failed to cleanup bucket data file: "
+                         << data_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+
+    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    if (meta_path_res) {
+        ec.clear();
+        if (fs::remove(meta_path_res.value(), ec)) {
+            LOG(INFO) << "Cleaned up orphaned bucket metadata file: "
+                      << meta_path_res.value();
+        } else if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "Failed to cleanup bucket metadata file: "
+                         << meta_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
+    int64_t bucket_id) {
+    namespace fs = std::filesystem;
+
+    std::shared_ptr<BucketMetadata> bucket_metadata;
+    std::vector<std::string> keys_to_remove;
+
+    // Step 1: Remove bucket from metadata maps under exclusive lock
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(WARNING) << "DeleteBucket: bucket not found, bucket_id="
+                         << bucket_id;
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+
+        // Move the shared_ptr out - we now own it
+        bucket_metadata = std::move(bucket_it->second);
+        buckets_.erase(bucket_it);
+
+        // Collect keys to remove (they reference this bucket)
+        keys_to_remove = bucket_metadata->keys;
+        for (const auto& key : keys_to_remove) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end() &&
+                obj_it->second.bucket_id == bucket_id) {
+                total_size_ -=
+                    obj_it->second.data_size + obj_it->second.key_size;
+                object_bucket_map_.erase(obj_it);
+            }
+        }
+
+        // Subtract metadata size
+        total_size_ -= bucket_metadata->meta_size;
+    }
+    // Lock released - new readers can't find this bucket anymore
+
+    // Step 2: Wait for in-flight reads to complete
+    // Readers that started before we removed from buckets_ still hold guards
+    constexpr int kMaxSpinIterations = 1000;
+    constexpr auto kSleepDuration = std::chrono::microseconds(100);
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+
+    int spin_count = 0;
+    auto wait_start = std::chrono::steady_clock::now();
+    while (bucket_metadata->inflight_reads_.load(std::memory_order_acquire) >
+           0) {
+        if (++spin_count > kMaxSpinIterations) {
+            // After spinning, sleep briefly and check timeout
+            std::this_thread::sleep_for(kSleepDuration);
+            spin_count = 0;  // Reset and continue waiting
+
+            auto elapsed = std::chrono::steady_clock::now() - wait_start;
+            if (elapsed > kMaxWaitTime) {
+                LOG(ERROR)
+                    << "DeleteBucket: timed out waiting for in-flight reads"
+                    << ", bucket_id=" << bucket_id << ", inflight_reads="
+                    << bucket_metadata->inflight_reads_.load(
+                           std::memory_order_relaxed);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } else {
+            PAUSE();
+        }
+    }
+
+    // Step 3: Safe to delete files now - no readers are using them
+    std::error_code ec;
+
+    auto data_path_res = GetBucketDataPath(bucket_id);
+    if (data_path_res) {
+        fs::remove(data_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "DeleteBucket: failed to remove data file: "
+                         << data_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+
+    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    if (meta_path_res) {
+        ec.clear();
+        fs::remove(meta_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
+                         << meta_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+
+    LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
+              << ", keys_removed=" << keys_to_remove.size();
+    return {};
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
     auto meta_path_res = GetBucketMetadataPath(id);
@@ -1878,54 +2105,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     } catch (...) {
         LOG(ERROR) << "Metadata parsing failed with unknown exception";
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    }
-    return {};
-}
-
-tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
-    int64_t bucket_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
-    SharedMutexLocker locker(&mutex_, shared_lock);
-    auto storage_filepath_res = GetBucketDataPath(bucket_id);
-    if (!storage_filepath_res) {
-        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    const auto& storage_filepath = storage_filepath_res.value();
-    auto open_file_result = OpenFile(storage_filepath, FileMode::Read);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for reading: " << storage_filepath;
-        return tl::make_unexpected(open_file_result.error());
-    }
-    auto file = std::move(open_file_result.value());
-    for (size_t i = 0; i < keys.size(); i++) {
-        const auto& key = keys[i];
-        int64_t offset;
-        const auto& slice = batched_slices.at(key);
-        const auto& object_metadata = metadatas[i];
-        if (object_metadata.data_size != static_cast<int64_t>(slice.size)) {
-            LOG(ERROR) << "Read size mismatch for: " << storage_filepath
-                       << ", expected: " << object_metadata.data_size
-                       << ", got: " << slice.size;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        offset = object_metadata.offset;
-        std::vector<iovec> iovs;
-        iovs.emplace_back(iovec{slice.ptr, slice.size});
-        auto read_result = file->vector_read(
-            iovs.data(), static_cast<int>(iovs.size()), offset + key.size());
-        if (!read_result) {
-            LOG(ERROR) << "vector_read failed for: " << storage_filepath
-                       << ", error: " << read_result.error();
-            return tl::make_unexpected(read_result.error());
-        }
-        if (read_result.value() != slice.size) {
-            LOG(ERROR) << "Read size mismatch for: " << storage_filepath
-                       << ", expected: " << slice.size
-                       << ", got: " << read_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
     }
     return {};
 }

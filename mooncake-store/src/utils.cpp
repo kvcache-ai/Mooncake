@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <random>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <sys/mman.h>
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl.h"
 #include "config.h"
+#include "common.h"
 #endif
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -73,6 +75,47 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
+#if defined(USE_ASCEND_DIRECT) && defined(ASCEND_SUPPORT_FABRIC_MEM)
+int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle) {
+    int32_t user_dev_id;
+    auto ret = aclrtGetDevice(&user_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get device: " << ret;
+        return -1;
+    }
+    int32_t physical_dev_id;
+    ret = aclrtGetPhyDevIdByLogicDevId(user_dev_id, &physical_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get physical dev id: " << ret;
+        return -1;
+    }
+    aclrtPhysicalMemProp prop = {};
+    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+    prop.memAttr = ACL_MEM_P2P_HUGE1G;
+    prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
+    // Only 0 2 4 6 is available for fabric mem, map 4 device to one numa.
+    const int32_t kDevicesPerChip = 4;
+    const int32_t kNumaNodeStep = 2;
+    prop.location.id = (physical_dev_id / kDevicesPerChip) * kNumaNodeStep;
+    prop.reserve = 0;
+    LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
+    ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(INFO) << "Malloc host memory for numa:" << prop.location.id
+                  << " failed, try common allocate instead.";
+        prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
+        prop.location.id = 0;
+        ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to allocate memory: " << ret;
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif
+
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
                                        size_t alignment) {
@@ -86,35 +129,12 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     if (protocol == "ascend" && total_size > 0) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
         if (globalConfig().ascend_use_fabric_mem) {
-            int32_t device_logic_id;
-            auto ret = aclrtGetDevice(&device_logic_id);
-            if (ret != ACL_ERROR_NONE) {
-                LOG(ERROR) << "Failed to get device: " << ret;
-                return nullptr;
-            }
             aclrtDrvMemHandle handle = nullptr;
-            aclrtPhysicalMemProp prop = {};
-            prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
-            prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-            prop.memAttr = ACL_MEM_P2P_HUGE1G;
-            prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
-            prop.location.id = static_cast<int32_t>(device_logic_id / 4) * 2;
-            prop.reserve = 0;
-            LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
-            ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-            if (ret != ACL_ERROR_NONE) {
-                LOG(ERROR) << "Failed to allocate specific numa memory: "
-                           << ret;
-                prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
-                prop.location.id = 0;
-                ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-                if (ret != ACL_ERROR_NONE) {
-                    LOG(ERROR) << "Failed to allocate memory: " << ret;
-                }
+            if (allocate_physical_memory(total_size, handle) != 0) {
                 return nullptr;
             }
             void *va;
-            ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
+            auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
             if (ret != ACL_ERROR_NONE) {
                 LOG(ERROR) << "Failed to reserve memory: " << ret;
                 return nullptr;

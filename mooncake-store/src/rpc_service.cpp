@@ -1,4 +1,5 @@
 #include "rpc_service.h"
+#include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -653,28 +654,31 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    const std::string& key) {
+    const std::string& key, bool force) {
     return execute_rpc(
-        "Remove", [&] { return master_service_.Remove(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "Remove", [&] { return master_service_.Remove(key, force); },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    const std::string& str) {
+    const std::string& str, bool force) {
     return execute_rpc(
-        "RemoveByRegex", [&] { return master_service_.RemoveByRegex(str); },
-        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        "RemoveByRegex",
+        [&] { return master_service_.RemoveByRegex(str, force); },
+        [&](auto& timer) {
+            timer.LogRequest("regex=", str, ", force=", force);
+        },
         [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll() {
+long WrappedMasterService::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = master_service_.RemoveAll();
+    long result = master_service_.RemoveAll(force);
     timer.LogResponse("items_removed=", result);
     return result;
 }

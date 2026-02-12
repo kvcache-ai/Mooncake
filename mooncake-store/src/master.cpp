@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 
 #include <chrono>  // For std::chrono
+#include <csignal>
 #include <memory>  // For std::unique_ptr
 #include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -112,10 +113,22 @@ DEFINE_uint64(pending_task_timeout_sec, 300,
               "Timeout in seconds for pending tasks (0 = no timeout)");
 DEFINE_uint64(processing_task_timeout_sec, 300,
               "Timeout in seconds for processing tasks (0 = no timeout)");
+DEFINE_uint32(max_retry_attempts, 10,
+              "Maximum number of retry attempts for failed tasks");
 
+DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
+              "DAX device path for CXL memory");
+DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
+DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
+    default_config.GetBool("enable_cxl", &master_config.enable_cxl,
+                           FLAGS_enable_cxl);
+    default_config.GetString("cxl_path", &master_config.cxl_path,
+                             FLAGS_cxl_path);
+    default_config.GetUInt64("cxl_size", &master_config.cxl_size,
+                             FLAGS_cxl_size);
     default_config.GetBool("enable_metric_reporting",
                            &master_config.enable_metric_reporting,
                            FLAGS_enable_metric_reporting);
@@ -202,6 +215,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("processing_task_timeout_sec",
                              &master_config.processing_task_timeout_sec,
                              FLAGS_processing_task_timeout_sec);
+    default_config.GetUInt32("max_retry_attempts",
+                             &master_config.max_retry_attempts,
+                             FLAGS_max_retry_attempts);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -251,6 +267,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 
     google::CommandLineFlagInfo info;
+    if ((google::GetCommandLineFlagInfo("enable_cxl", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_cxl = FLAGS_enable_cxl;
+    }
+    if ((google::GetCommandLineFlagInfo("cxl_path", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cxl_path = FLAGS_cxl_path;
+    }
+    if ((google::GetCommandLineFlagInfo("cxl_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cxl_size = FLAGS_cxl_size;
+    }
     if ((google::GetCommandLineFlagInfo("rpc_address", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -414,6 +445,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.processing_task_timeout_sec =
             FLAGS_processing_task_timeout_sec;
     }
+    if ((google::GetCommandLineFlagInfo("max_retry_attempts", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_retry_attempts = FLAGS_max_retry_attempts;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -532,7 +568,11 @@ int main(int argc, char* argv[]) {
         << ", pending_task_timeout_sec="
         << master_config.pending_task_timeout_sec
         << ", processing_task_timeout_sec="
-        << master_config.processing_task_timeout_sec;
+        << master_config.processing_task_timeout_sec
+        << ", max_retry_attempts=" << master_config.max_retry_attempts
+        << ", enable_cxl=" << master_config.enable_cxl
+        << ", cxl_path=" << master_config.cxl_path
+        << ", cxl_size=" << master_config.cxl_size;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

@@ -2,6 +2,8 @@ file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
+# EFA library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
+
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(USE_HIP)
@@ -52,6 +54,7 @@ target_link_libraries(
          pthread
          JsonCpp::JsonCpp
          numa
+         asio_shared
          yalantinglibs::yalantinglibs)
 
 if(USE_BAREX)
@@ -76,18 +79,20 @@ if(USE_HIP)
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
-if(USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
-                                               MPI::MPI)
+if (USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()
 
-if(USE_ASCEND_DIRECT)
+if (USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if(USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT
-       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if (USE_UBSHMEM)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
@@ -101,4 +106,9 @@ endif()
 if(USE_INTRA_NVLINK)
   message(STATUS "Enabled USE_INTRA_NVLINK support")
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
+endif()
+
+if(USE_EFA)
+  message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
+  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
 endif()

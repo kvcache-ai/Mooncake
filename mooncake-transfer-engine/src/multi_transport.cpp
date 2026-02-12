@@ -49,6 +49,12 @@
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
 #endif
+#ifdef USE_UBSHMEM
+#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
+#endif
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
 
 #include <cassert>
 
@@ -275,6 +281,16 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new CxlTransport();
     }
 #endif
+#ifdef USE_UBSHMEM
+    else if (std::string(proto) == "ubshmem") {
+        transport = new UBShmemTransport();
+    }
+#endif
+#ifdef USE_EFA
+    else if (std::string(proto) == "efa") {
+        transport = new EfaTransport();
+    }
+#endif
 
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
@@ -358,6 +374,17 @@ std::vector<Transport *> MultiTransport::listTransports() {
     for (auto &entry : transport_map_)
         transport_list.push_back(entry.second.get());
     return transport_list;
+}
+
+void *MultiTransport::getBaseAddr() {
+#ifdef USE_CXL
+    Transport *transport = getTransport("cxl");
+    if (transport) {
+        auto *cxl_transport = dynamic_cast<CxlTransport *>(transport);
+        return cxl_transport ? cxl_transport->getCxlBaseAddr() : 0;
+    }
+#endif
+    return 0;
 }
 
 }  // namespace mooncake

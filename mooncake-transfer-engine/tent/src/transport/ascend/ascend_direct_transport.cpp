@@ -208,6 +208,14 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl_env;
         }
     }
+    std::string auto_connect =
+        conf->get("transports/ascend_direct/auto_connect", "");
+    auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
+    if (auto_connect_opt.has_value()) {
+        auto_connect_ = (*auto_connect_opt == 1);
+        options["AutoConnect"] = auto_connect_ ? "1" : "0";
+        LOG(INFO) << "Set AutoConnect to: " << auto_connect;
+    }
     std::string buffer_pool =
         conf->get("transports/ascend_direct/buffer_pool", "");
     if (!buffer_pool.empty()) {
@@ -218,7 +226,8 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
     auto status =
         hixl_->Initialize(hixl::AscendString(hixl_name.c_str()), options);
     if (status != hixl::SUCCESS) {
-        LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
+        LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status
+                   << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("Initialize hixl failed.");
     }
     ret = aclrtCreateStreamWithConfig(
@@ -309,9 +318,17 @@ Status AscendDirectTransport::checkAndConnect(const std::string &remote_hixl) {
     } else {
         auto status = hixl_->Connect(
             remote_hixl.c_str(), static_cast<int32_t>(connect_timeout_ / 1000));
-        if (status != hixl::SUCCESS) {
+        if (status == hixl::TIMEOUT) {
+            LOG(ERROR) << "Connect timeout to: " << remote_hixl
+                       << ", you can increase the timeout duration to reduce "
+                          "the failure rate by configuring "
+                          "the ASCEND_CONNECT_TIMEOUT environment variable"
+                       << ", errmsg: " << aclGetRecentErrMsg();
+            return Status::InternalError("Connect to target timed out.");
+        } else if (status != hixl::SUCCESS) {
             LOG(ERROR) << "Failed to connect to target: " << remote_hixl
-                       << ", status: " << status;
+                       << ", status: " << status
+                       << ", errmsg: " << aclGetRecentErrMsg();
             return Status::InternalError("Connect to target failed.");
         }
         connected_segments_.emplace(remote_hixl);
@@ -349,9 +366,11 @@ void AscendDirectTransport::startTransfer(SegmentID target_id,
                   << " us.";
         return;
     } else {
-        auto ret = checkAndConnect(remote_hixl);
-        if (!ret.ok()) {
-            return;
+        if (!auto_connect_) {
+            auto ret = checkAndConnect(remote_hixl);
+            if (!ret.ok()) {
+                return;
+            }
         }
     }
     auto op = (opcode == Request::WRITE) ? hixl::WRITE : hixl::READ;
@@ -377,6 +396,9 @@ void AscendDirectTransport::startTransfer(SegmentID target_id,
                                  op_descs, hixl::TransferArgs(), req_handle);
     }
     if (hixl_ret != hixl::SUCCESS) {
+        LOG(ERROR) << "Failed to transfer to: " << remote_hixl
+                   << ", status: " << hixl_ret
+                   << ", errmsg: " << aclGetRecentErrMsg();
         // disconnect to remote when transfer fail
         disconnect(remote_hixl, 10);
         for (auto &task : tasks) {
@@ -442,6 +464,8 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (xfer_status == hixl::TransferStatus::FAILED) {
+            LOG(ERROR) << "Get transfer status failed, ret: " << xfer_status
+                       << ", errmsg: " << aclGetRecentErrMsg();
             disconnect(task.remote_hixl, 10);
             task.status_word = TransferStatusEnum::FAILED;
         }
@@ -453,6 +477,15 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 void AscendDirectTransport::disconnect(const std::string &remote_hixl,
                                        int32_t timeout_in_millis) {
+    if (auto_connect_) {
+        auto status = hixl_->Disconnect(remote_hixl.c_str(), timeout_in_millis);
+        if (status != hixl::SUCCESS) {
+            LOG(ERROR) << "Failed to disconnect to: " << remote_hixl
+                       << ", status: " << status
+                       << ", errmsg: " << aclGetRecentErrMsg();
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(remote_hixl);
     if (it == connected_segments_.end()) {
@@ -463,7 +496,8 @@ void AscendDirectTransport::disconnect(const std::string &remote_hixl,
         connected_segments_.erase(remote_hixl);
         if (status != hixl::SUCCESS) {
             LOG(ERROR) << "Failed to disconnect to: " << remote_hixl
-                       << ", status: " << status;
+                       << ", status: " << status
+                       << ", errmsg: " << aclGetRecentErrMsg();
         }
     }
 }
@@ -502,7 +536,8 @@ Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
     hixl::MemHandle mem_handle;
     auto hixl_ret = hixl_->RegisterMem(mem_desc, mem_type, mem_handle);
     if (hixl_ret != hixl::SUCCESS) {
-        LOG(ERROR) << "hixl_ret:" << hixl_ret << ".";
+        LOG(ERROR) << "hixl_ret:" << hixl_ret
+                   << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("Register failed for addr:" +
                                      std::to_string(desc.addr));
     }

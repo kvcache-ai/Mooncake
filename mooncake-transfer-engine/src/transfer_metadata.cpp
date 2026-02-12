@@ -62,6 +62,9 @@ struct TransferHandshakeUtil {
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
         root["reply_msg"] = desc.reply_msg;
+#ifdef USE_EFA
+        root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
+#endif
         return root;
     }
 
@@ -74,6 +77,9 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
+#ifdef USE_EFA
+        desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
+#endif
         return 0;
     }
 };
@@ -164,7 +170,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     if (segmentJSON["protocol"] == "rdma" ||
-        segmentJSON["protocol"] == "barex") {
+        segmentJSON["protocol"] == "barex" ||
+        segmentJSON["protocol"] == "efa") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -240,7 +247,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         segmentJSON["rank_info"] = rankInfoJSON;
     } else if (segmentJSON["protocol"] == "nvlink" ||
                segmentJSON["protocol"] == "nvlink_intra" ||
-               segmentJSON["protocol"] == "hip") {
+               segmentJSON["protocol"] == "hip" ||
+               segmentJSON["protocol"] == "ubshmem") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -324,7 +332,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
-    if (desc->protocol == "rdma" || desc->protocol == "barex") {
+    if (desc->protocol == "rdma" || desc->protocol == "barex" ||
+        desc->protocol == "efa") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
@@ -380,7 +389,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->buffers.push_back(buffer);
         }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip") {
+               desc->protocol == "hip" || desc->protocol == "ubshmem") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();

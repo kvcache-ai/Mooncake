@@ -14,6 +14,7 @@
 
 #include "tent_backend.h"
 #include "utils.h"
+#include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 
@@ -43,6 +44,27 @@ std::shared_ptr<Config> loadConfig() {
     config->set("local_segment_name", XferBenchConfig::seg_name);
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
+
+    // Configure transport types based on xport_type parameter
+    if (!XferBenchConfig::xport_type.empty()) {
+        // Map of transport names to their config keys (handle name mismatches)
+        std::unordered_map<std::string, std::string> transport_map = {
+            {"rdma", "rdma"},        {"tcp", "tcp"},    {"shm", "shm"},
+            {"iouring", "io_uring"},  // Note: iouring -> io_uring
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}};
+
+        // Disable all transports by default
+        for (const auto& entry : transport_map) {
+            config->set("transports/" + entry.second + "/enable", false);
+        }
+
+        // Enable only the specified transport
+        auto it = transport_map.find(XferBenchConfig::xport_type);
+        if (it != transport_map.end()) {
+            config->set("transports/" + it->second + "/enable", true);
+        }
+    }
+
     return config;
 }
 
@@ -252,7 +274,13 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;
-    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    if (XferBenchConfig::notifi) {
+        // Use target_addr as msg for verification by peer
+        Notification notifi{"benchmark", std::to_string(target_addr)};
+        CHECK_FAIL(engine_->submitTransfer(batch_id, requests, notifi));
+    } else {
+        CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    }
     while (true) {
         TransferStatus overall_status;
         CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));
