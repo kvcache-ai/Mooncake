@@ -69,7 +69,7 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
             config.thread_count, config.listen_address,
             std::chrono::seconds(config.timeout_seconds));
 
-        if (value && std::string_view(value) == "rdma") {
+        if (rpc_protocol == "rdma") {
             if (server_) {
                 try {
                     server_->init_ibv();
@@ -94,8 +94,8 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
                                   &RpcCommunicator::handleTensorTransfer>(this);
     }
     LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
-              << (value ? value : "not set");
-    if (value && std::string_view(value) == "rdma") {
+              << (rpc_protocol.empty() ? "not set" : rpc_protocol);
+    if (rpc_protocol == "rdma") {
         LOG(INFO) << "Using RDMA transport for RPC communication";
     } else {
         LOG(INFO) << "Using TCP transport for RPC communication";

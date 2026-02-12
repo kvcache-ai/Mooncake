@@ -40,8 +40,6 @@ uint64_t parseMetricsInterval() {
                   << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
     }
     return interval >= 0 ? static_cast<uint64_t>(interval) : 0;
-        return 0;
-    }
 }
 
 }  // anonymous namespace

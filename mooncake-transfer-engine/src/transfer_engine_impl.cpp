@@ -565,18 +565,7 @@ void TransferEngineImpl::InitializeMetricsConfig() {
     if (interval > 0) {
         metrics_interval_seconds_ = static_cast<uint64_t>(interval);
         LOG(INFO) << "Metrics reporting interval set to "
-                          << metrics_interval_seconds_ << " seconds";
-            } else {
-                LOG(WARNING)
-                    << "Invalid MC_TE_METRIC_INTERVAL_SECONDS value: "
-                    << interval_env << ", must be positive. Using default: "
-                    << metrics_interval_seconds_;
-            }
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse MC_TE_METRIC_INTERVAL_SECONDS: "
-                         << interval_env
-                         << ", using default: " << metrics_interval_seconds_;
-        }
+                  << metrics_interval_seconds_ << " seconds";
     }
 }
 

@@ -518,7 +518,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string rpc_protocol = Environ::Get().GetRpcProtocol();
+    std::string rpc_protocol = mooncake::Environ::Get().GetRpcProtocol();
     std::string protocol = "tcp";
     if (rpc_protocol == "rdma") {
         protocol = "rdma";
@@ -603,7 +603,7 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        std::string rpc_protocol = Environ::Get().GetRpcProtocol();
+        std::string rpc_protocol = mooncake::Environ::Get().GetRpcProtocol();
         if (rpc_protocol == "rdma") {
             server.init_ibv();
         }
