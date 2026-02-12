@@ -185,40 +185,11 @@ jobs:
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
-  build-musa:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
-    runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Mark repository as safe
-      run: git config --global --add safe.directory $GITHUB_WORKSPACE
-      shell: bash
-
-    - name: Configure project
-      run: |
-        apt update -y
-        bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        source ~/.bashrc
-        make -j
-        make install
     - name: Upload wheel for ZMQ test job
       uses: actions/upload-artifact@v4
       with:
         name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   zmq-communicator-test:
     needs: build
@@ -247,7 +218,7 @@ jobs:
     - name: Run ZMQ Communicator Python test
       continue-on-error: true
       run: |
-        WHEEL_DIR="dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}"
+        WHEEL_DIR="mooncake-wheel/dist-py${{ steps.tag.outputs.tag }}"
         WHEEL_FILE=$(find "$WHEEL_DIR" -name '*.whl' -type f 2>/dev/null | head -1)
         if [ -z "$WHEEL_FILE" ]; then
           echo "No wheel found in $WHEEL_DIR"
