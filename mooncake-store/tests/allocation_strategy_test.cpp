@@ -558,7 +558,8 @@ TEST_P(AllocationStrategyParameterizedTest,
 
 // Test the performance of AllocationStrategy.
 // Test FreeRatioFirst load balancing distribution with different sized segments
-TEST_P(AllocationStrategyParameterizedTest, FreeRatioFirstLoadBalancingDistribution) {
+TEST_P(AllocationStrategyParameterizedTest,
+       FreeRatioFirstLoadBalancingDistribution) {
     auto [strategy_type, allocator_type] = GetParam();
     if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
         // This test is only for FreeRatioFirst strategy
@@ -605,8 +606,8 @@ TEST_P(AllocationStrategyParameterizedTest, FreeRatioFirstLoadBalancingDistribut
     }
 
     // Calculate utilization ratio for each segment
-    std::cout
-        << "\nFreeRatioFirst Load Balancing Results (Different Sized Segments):\n";
+    std::cout << "\nFreeRatioFirst Load Balancing Results (Different Sized "
+                 "Segments):\n";
     std::cout << "Total allocations: " << kNumAllocations << " x "
               << (slice_length / 1024)
               << "KB = " << (kNumAllocations * slice_length / MiB) << "MB\n\n";
@@ -641,7 +642,8 @@ TEST_P(AllocationStrategyParameterizedTest, FreeRatioFirstLoadBalancingDistribut
     std::cout << "Expected: < 15% for good load balancing\n\n";
 
     // Verify that utilization ratios are balanced (within 15%)
-    EXPECT_LT(util_diff, 15.0) << "FreeRatioFirst should balance utilization ratios";
+    EXPECT_LT(util_diff, 15.0)
+        << "FreeRatioFirst should balance utilization ratios";
 }
 
 // Test the performance comparison between strategies
@@ -693,15 +695,15 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
         ASSERT_EQ(result.value().size(), 1);
         frf_replicas.emplace_back(std::move(result.value()));
     }
-    auto frf_elapsed_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - frf_start);
+    auto frf_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - frf_start);
 
     std::cout << "\nAllocation Strategy Performance Comparison:\n"
               << "Num segments: " << kNumSegments << "\n"
               << "Num allocations: " << kNumAllocations << "\n"
               << "Random strategy: " << random_elapsed_us.count() << " us\n"
-              << "FreeRatioFirst strategy: " << frf_elapsed_us.count() << " us\n"
+              << "FreeRatioFirst strategy: " << frf_elapsed_us.count()
+              << " us\n"
               << "Speedup: " << std::fixed << std::setprecision(2)
               << (static_cast<double>(random_elapsed_us.count()) /
                   frf_elapsed_us.count())

@@ -277,10 +277,11 @@ class WrappedMasterServiceConfig {
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         } else {
-            LOG(WARNING)
-                << "Unrecognized allocation_strategy value: '"
-                << config.allocation_strategy << "'. Defaulting to 'random'. "
-                << "Valid options are: random, free_ratio_first, cxl (case-sensitive)";
+            LOG(WARNING) << "Unrecognized allocation_strategy value: '"
+                         << config.allocation_strategy
+                         << "'. Defaulting to 'random'. "
+                         << "Valid options are: random, free_ratio_first, cxl "
+                            "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 

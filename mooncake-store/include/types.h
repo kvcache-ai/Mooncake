@@ -251,9 +251,9 @@ YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
  * @brief Allocation strategy type for segment allocation
  */
 enum class AllocationStrategyType {
-    RANDOM = 0,  // Pure random allocation
+    RANDOM = 0,        // Pure random allocation
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
-    CXL,         // CXL-specific allocation
+    CXL,               // CXL-specific allocation
 };
 
 /**
