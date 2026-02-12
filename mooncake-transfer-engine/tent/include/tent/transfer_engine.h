@@ -81,10 +81,39 @@ struct tent_notifi_record {
     char msg[4096];
 };
 
+typedef struct tent_notifi_record tent_notifi_record_t;
+
 struct tent_notifi_info {
     int num_records;
     struct tent_notifi_record* records;
 };
+
+typedef struct tent_notifi_info tent_notifi_info;
+
+#define PERM_LOCAL_READ_WRITE (0)
+#define PERM_GLOBAL_READ_ONLY (1)
+#define PERM_GLOBAL_READ_WRITE (2)
+
+#define TRANSPORT_RDMA (0)
+#define TRANSPORT_MNNVL (1)
+#define TRANSPORT_SHM (2)
+#define TRANSPORT_NVLINK (3)
+#define TRANSPORT_GDS (4)
+#define TRANSPORT_IOURING (5)
+#define TRANSPORT_TCP (6)
+#define TRANSPORT_ASCEND_DIRECT (7)
+#define TRANSPORT_UNSPEC (8)
+
+struct tent_memory_options {
+    char location[64];
+    int permission;      /* PERM_LOCAL_READ_WRITE, etc. */
+    int transport_type;  /* TRANSPORT_RDMA, etc. */
+    char shm_path[256];
+    size_t shm_offset;
+    int internal;        /* 0 = false, nonzero = true */
+};
+
+typedef struct tent_memory_options tent_memory_options_t;
 
 void tent_load_config_from_file(const char* path);
 
@@ -141,6 +170,30 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
 
 int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
                         tent_status_t* status);
+
+int tent_available(tent_engine_t engine);
+
+int tent_register_memory_with_perm(tent_engine_t engine, void* addr,
+                                   size_t size, int permission);
+
+int tent_register_memory_batch(tent_engine_t engine, void** addrs,
+                               size_t* sizes, size_t count, int permission);
+
+int tent_unregister_memory_batch(tent_engine_t engine, void** addrs,
+                                 size_t* sizes, size_t count);
+
+int tent_allocate_memory_ex(tent_engine_t engine, void** addr, size_t size,
+                            tent_memory_options_t* opts);
+
+int tent_register_memory_ex(tent_engine_t engine, void* addr, size_t size,
+                            tent_memory_options_t* opts);
+
+int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
+                                  size_t* sizes, size_t count,
+                                  tent_memory_options_t* opts);
+
+int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
+                          tent_status_t* statuses, size_t* count);
 
 #ifdef __cplusplus
 }

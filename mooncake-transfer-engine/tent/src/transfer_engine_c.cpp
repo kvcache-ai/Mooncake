@@ -330,3 +330,146 @@ int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
     xfer_status->transferred_bytes = internal_status.transferred_bytes;
     return 0;
 }
+
+// =========================================================================
+// Helper: convert C tent_memory_options_t to C++ MemoryOptions
+// =========================================================================
+
+static mooncake::tent::MemoryOptions convert_options(
+    const tent_memory_options_t* opts) {
+    mooncake::tent::MemoryOptions options;
+    if (opts->location[0] != '\0')
+        options.location = opts->location;
+    options.perm = (mooncake::tent::Permission)opts->permission;
+    options.type = (mooncake::tent::TransportType)opts->transport_type;
+    if (opts->shm_path[0] != '\0')
+        options.shm_path = opts->shm_path;
+    options.shm_offset = opts->shm_offset;
+    options.internal = opts->internal != 0;
+    return options;
+}
+
+// =========================================================================
+// New C API functions for Python parity
+// =========================================================================
+
+int tent_available(tent_engine_t engine) {
+    if (!engine) return 0;
+    return CAST(engine)->available() ? 1 : 0;
+}
+
+int tent_register_memory_with_perm(tent_engine_t engine, void* addr,
+                                   size_t size, int permission) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(addr);
+    auto perm = (mooncake::tent::Permission)permission;
+    auto status =
+        CAST(engine)->registerLocalMemory({addr}, {size}, perm);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_register_memory_with_perm: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int tent_register_memory_batch(tent_engine_t engine, void** addrs,
+                               size_t* sizes, size_t count, int permission) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(addrs);
+    CHECK_POINTER(sizes);
+    std::vector<void*> addr_list(addrs, addrs + count);
+    std::vector<size_t> size_list(sizes, sizes + count);
+    auto perm = (mooncake::tent::Permission)permission;
+    auto status = CAST(engine)->registerLocalMemory(addr_list, size_list, perm);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_register_memory_batch: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int tent_unregister_memory_batch(tent_engine_t engine, void** addrs,
+                                 size_t* sizes, size_t count) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(addrs);
+    std::vector<void*> addr_list(addrs, addrs + count);
+    std::vector<size_t> size_list;
+    if (sizes)
+        size_list.assign(sizes, sizes + count);
+    auto status = CAST(engine)->unregisterLocalMemory(addr_list, size_list);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_unregister_memory_batch: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int tent_allocate_memory_ex(tent_engine_t engine, void** addr, size_t size,
+                            tent_memory_options_t* opts) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(addr);
+    CHECK_POINTER(opts);
+    auto options = convert_options(opts);
+    auto status = CAST(engine)->allocateLocalMemory(addr, size, options);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_allocate_memory_ex: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int tent_register_memory_ex(tent_engine_t engine, void* addr, size_t size,
+                            tent_memory_options_t* opts) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(addr);
+    CHECK_POINTER(opts);
+    auto options = convert_options(opts);
+    auto status =
+        CAST(engine)->registerLocalMemory({addr}, {size}, options);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_register_memory_ex: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
+                                  size_t* sizes, size_t count,
+                                  tent_memory_options_t* opts) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(addrs);
+    CHECK_POINTER(sizes);
+    CHECK_POINTER(opts);
+    std::vector<void*> addr_list(addrs, addrs + count);
+    std::vector<size_t> size_list(sizes, sizes + count);
+    auto options = convert_options(opts);
+    auto status =
+        CAST(engine)->registerLocalMemory(addr_list, size_list, options);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_register_memory_batch_ex: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
+int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
+                          tent_status_t* statuses, size_t* count) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(batch_id);
+    CHECK_POINTER(statuses);
+    CHECK_POINTER(count);
+    std::vector<mooncake::tent::TransferStatus> status_list;
+    auto status = CAST(engine)->getTransferStatus(batch_id, status_list);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_task_status_list: " << status.ToString();
+        return -1;
+    }
+    size_t to_copy =
+        status_list.size() < *count ? status_list.size() : *count;
+    for (size_t i = 0; i < to_copy; ++i) {
+        statuses[i].status = (int)status_list[i].s;
+        statuses[i].transferred_bytes = status_list[i].transferred_bytes;
+    }
+    *count = status_list.size();
+    return 0;
+}
