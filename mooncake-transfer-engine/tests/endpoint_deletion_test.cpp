@@ -393,7 +393,7 @@ TransferMetadata::DeleteEndpointDesc transmitOverNetwork(
 class EndpointDeletionFlowTest : public ::testing::Test {};
 
 // ---------------------------------------------------------------------------
-// 11. Endpoint ID generator produces monotonically increasing IDs
+// Endpoint ID generator produces monotonically increasing IDs
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, IdGeneratorMonotonic) {
@@ -413,7 +413,7 @@ TEST_F(EndpointDeletionFlowTest, IdGeneratorStartsAtZero) {
 }
 
 // ---------------------------------------------------------------------------
-// 12. SimEndpoint::deconstruct invokes callback exactly once
+// SimEndpoint::deconstruct invokes callback exactly once
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, DeconstructCallbackInvokedOnce) {
@@ -443,7 +443,7 @@ TEST_F(EndpointDeletionFlowTest, DeconstructWithNullCallbackIsNoOp) {
 }
 
 // ---------------------------------------------------------------------------
-// 13. SimEndpointStore: basic insert / get / delete
+// SimEndpointStore: basic insert / get / delete
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, StoreInsertAndGet) {
@@ -465,7 +465,7 @@ TEST_F(EndpointDeletionFlowTest, StoreGetNonexistent) {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Store unconditional deleteEndpoint(path) – always removes
+// Store unconditional deleteEndpoint(path) – always removes
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, StoreUnconditionalDelete) {
@@ -486,7 +486,7 @@ TEST_F(EndpointDeletionFlowTest, StoreUnconditionalDeleteNonexistent) {
 }
 
 // ---------------------------------------------------------------------------
-// 15. Store conditional deleteEndpoint(path, peer_endpoint_id)
+// Store conditional deleteEndpoint(path, peer_endpoint_id)
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, StoreConditionalDeleteMatch) {
@@ -517,9 +517,7 @@ TEST_F(EndpointDeletionFlowTest, StoreConditionalDeleteNotFound) {
 }
 
 // ---------------------------------------------------------------------------
-// 16. Callback → DeleteEndpointDesc → encode/decode full chain
-//     Verify that the on_delete_callback correctly produces a
-//     DeleteEndpointDesc that round-trips through JSON.
+// Callback → DeleteEndpointDesc → encode/decode full chain
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, CallbackToDeleteDescPipeline) {
@@ -547,7 +545,7 @@ TEST_F(EndpointDeletionFlowTest, CallbackToDeleteDescPipeline) {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Two-node handshake correctly exchanges endpoint_ids
+// Two-node handshake correctly exchanges endpoint_ids
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, HandshakeExchangesIds) {
@@ -563,8 +561,7 @@ TEST_F(EndpointDeletionFlowTest, HandshakeExchangesIds) {
 }
 
 // ---------------------------------------------------------------------------
-// 18. End-to-end: normal deletion flow
-//     NodeA EP evicted → notification → NodeB correctly deletes its EP
+// End-to-end: normal deletion flow
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, E2ENormalDeletionFlow) {
@@ -591,10 +588,7 @@ TEST_F(EndpointDeletionFlowTest, E2ENormalDeletionFlow) {
 }
 
 // ---------------------------------------------------------------------------
-// 19. End-to-end: stale deletion notification is rejected
-//     NodeA creates EP v1, evicts it, creates EP v2 (same nic_path).
-//     NodeB receives the stale v1 delete notification but now holds v2 →
-//     reject.
+// End-to-end: stale deletion notification is rejected
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, E2EStaleDeletionRejected) {
@@ -625,9 +619,7 @@ TEST_F(EndpointDeletionFlowTest, E2EStaleDeletionRejected) {
 }
 
 // ---------------------------------------------------------------------------
-// 20. End-to-end: delete notification for already-gone endpoint
-//     NodeA sends delete, but NodeB has already removed the EP for other
-//     reasons (e.g., its own eviction).
+// End-to-end: delete notification for already-gone endpoint
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, E2EDeleteAlreadyGoneEndpoint) {
@@ -649,9 +641,7 @@ TEST_F(EndpointDeletionFlowTest, E2EDeleteAlreadyGoneEndpoint) {
 }
 
 // ---------------------------------------------------------------------------
-// 21. End-to-end: bidirectional deletion
-//     Both nodes independently evict their endpoints.
-//     Each should receive the peer's notification and successfully delete.
+// End-to-end: bidirectional deletion
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, E2EBidirectionalDeletion) {
@@ -679,9 +669,7 @@ TEST_F(EndpointDeletionFlowTest, E2EBidirectionalDeletion) {
 }
 
 // ---------------------------------------------------------------------------
-// 22. End-to-end: multiple independent connections on the same node
-//     NodeA has endpoints to NodeB and NodeC.  Evicting one must not
-//     affect the other.
+// End-to-end: multiple independent connections on the same node
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, E2EMultiplePeersIndependent) {
@@ -711,9 +699,7 @@ TEST_F(EndpointDeletionFlowTest, E2EMultiplePeersIndependent) {
 }
 
 // ---------------------------------------------------------------------------
-// 23. End-to-end: rapid create-delete cycles
-//     Stress-test: repeatedly create and evict endpoints for the same peer,
-//     verifying that only the current-generation notification succeeds.
+// End-to-end: rapid create-delete cycles
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, E2ERapidCreateDeleteCycles) {
@@ -748,9 +734,7 @@ TEST_F(EndpointDeletionFlowTest, E2ERapidCreateDeleteCycles) {
 }
 
 // ---------------------------------------------------------------------------
-// 24. Notification carries correct NIC paths through the full chain
-//     Verifies that deleted_nic_path and target_nic_path are correctly
-//     propagated from callback → DeleteEndpointDesc → JSON → receiver.
+// Notification carries correct NIC paths through the full chain
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, NotificationNicPathsCorrect) {
@@ -777,9 +761,7 @@ TEST_F(EndpointDeletionFlowTest, NotificationNicPathsCorrect) {
 }
 
 // ---------------------------------------------------------------------------
-// 25. Handshake roundtrip preserves all fields through JSON
-//     Full HandShakeDesc encode → JSON string → decode pipeline, verifying
-//     endpoint_id alongside all other fields.
+// Handshake roundtrip preserves all fields through JSON
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, HandshakeFullFieldRoundTrip) {
@@ -811,9 +793,7 @@ TEST_F(EndpointDeletionFlowTest, HandshakeFullFieldRoundTrip) {
 }
 
 // ---------------------------------------------------------------------------
-// 26. Endpoint replacement: inserting a new EP for the same peer_nic_path
-//     should update the store entry, and the old EP remains accessible via
-//     the deleted list.
+// Endpoint replacement in store
 // ---------------------------------------------------------------------------
 
 TEST_F(EndpointDeletionFlowTest, StoreReplacementUpdatesEntry) {
