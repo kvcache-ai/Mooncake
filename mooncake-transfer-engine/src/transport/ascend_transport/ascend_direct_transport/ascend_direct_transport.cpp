@@ -470,7 +470,8 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
     LOG(INFO) << "AscendDirectTransport register mem addr:" << addr
               << ", length:" << length << ", location:" << location
-              << ", mem type:" << mem_type;
+              << ", mem type:"
+              << (mem_type == adxl::MEM_HOST ? "host" : "device");
     ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
         LOG(ERROR) << "HcclTransport: addLocalMemoryBuffer failed, ret: "
