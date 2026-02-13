@@ -3,9 +3,10 @@ import os
 import time
 import threading
 import random
+import tempfile
 from mooncake.store import MooncakeDistributedStore
 
-CXL_SIM_FILE = "tmp_dax_sim"
+CXL_SIM_FILE = os.path.join(tempfile.gettempdir(), "tmp_dax_sim")
 CXL_SIM_SIZE = 8 * 1024 * 1024 * 1024
 
 # The lease time of the kv object, should be set equal to

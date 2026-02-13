@@ -689,6 +689,10 @@ class InProcMasterConfigBuilder {
     }
 
     InProcMasterConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "eviction_high_watermark_ratio must be between 0.0 and 1.0");
+        }
         eviction_high_watermark_ratio_ = ratio;
         return *this;
     }
