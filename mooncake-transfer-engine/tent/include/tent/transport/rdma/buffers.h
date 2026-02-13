@@ -119,6 +119,28 @@ class LocalBufferManager {
     std::shared_ptr<Topology> topology_;
 };
 
+// MR warm-up utilities: split a buffer into chunks and do parallel temp
+// ibv_reg_mr/dereg to pre-pin pages in the RDMA driver path.
+// These are shared between LocalBufferManager and RdmaTransport.
+
+// Minimum buffer size to justify warm-up overhead.
+constexpr size_t kMrWarmupMinBytes = 4ull * 1024 * 1024 * 1024;
+
+// Pick thread count for parallel MR warm-up based on hardware concurrency.
+inline unsigned pickMrWarmupThreads(unsigned hwc) {
+    constexpr unsigned kMrWarmupMaxThreads = 8;
+    constexpr unsigned kMrWarmupMaxThreadsHighCore = 16;
+    constexpr unsigned kHighCoreCountThreshold = 64;
+    if (hwc == 0) hwc = 1;
+    if (hwc > kHighCoreCountThreshold) return kMrWarmupMaxThreadsHighCore;
+    return std::min(hwc, kMrWarmupMaxThreads);
+}
+
+// Parallel MR warm-up: split buffer into chunks, temp register/deregister
+// each chunk to trigger RDMA driver page pinning.
+int warmupMrRegistrationParallel(RdmaContext *context, void *addr,
+                                 size_t length);
+
 }  // namespace tent
 }  // namespace mooncake
 

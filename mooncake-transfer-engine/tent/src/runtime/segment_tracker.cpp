@@ -87,7 +87,8 @@ Status SegmentTracker::add(uint64_t base, size_t length,
 
 Status SegmentTracker::addInBatch(
     std::vector<void*> base_list, std::vector<size_t> length_list,
-    std::function<Status(std::vector<BufferDesc>&)> callback) {
+    std::function<Status(std::vector<BufferDesc>&)> callback,
+    std::function<bool(void* addr, size_t length)> pre_callback) {
     assert(base_list.size() == length_list.size());
     std::vector<BufferDesc> new_desc_list;
     for (size_t i = 0; i < base_list.size(); ++i) {
@@ -110,7 +111,12 @@ Status SegmentTracker::addInBatch(
         BufferDesc new_desc;
         new_desc.addr = base;
         new_desc.length = length;
-        auto entries = Platform::getLoader().getLocation((void*)base, length);
+        bool skip_prefault = false;
+        if (pre_callback) {
+            skip_prefault = pre_callback((void*)base, length);
+        }
+        auto entries =
+            Platform::getLoader().getLocation((void*)base, length, skip_prefault);
         if (entries.size() == 1)
             new_desc.location = entries[0].location;
         else {
