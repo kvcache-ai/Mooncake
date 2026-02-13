@@ -65,6 +65,18 @@ static bool parseJsonString(const std::string &json_str, Json::Value &value,
 }
 
 namespace mooncake {
+
+bool MetadataStoragePlugin::get(const std::string &key, Json::Value &value,
+                                bool silent) {
+    std::string error_msg;
+    if (tryGet(key, value, &error_msg)) {
+        return true;
+    }
+    if (!silent && !error_msg.empty()) {
+        LOG(ERROR) << error_msg;
+    }
+    return false;
+}
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
     RedisStoragePlugin(const std::string &metadata_uri)
@@ -129,20 +141,25 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) override {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
         if (!resp) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
+            if (error_msg) {
+                *error_msg = "RedisStoragePlugin: unable to get " + key +
+                             " from " + metadata_uri_;
+            }
             return false;
         }
         if (!resp->str) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
+            if (error_msg) {
+                *error_msg = "RedisStoragePlugin: unable to get " + key +
+                             " from " + metadata_uri_;
+            }
             freeReplyObject(resp);
             return false;
         }
@@ -152,7 +169,9 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
         std::string errs;
         if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "RedisStoragePlugin: JSON parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -252,7 +271,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
     static inline bool is_200(long code) { return code == 200; }
 
-    bool get(const std::string &key, Json::Value &value) override {
+    bool tryGet(const std::string &key, Json::Value &value,
+                std::string *error_msg = nullptr) override {
         CURL *h = tl_easy();
         curl_easy_reset(h);
 
@@ -271,16 +291,20 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
         CURLcode rc = curl_easy_perform(h);
         if (rc != CURLE_OK) {
-            LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
-                       << " err: " << errbuf;
+            if (error_msg) {
+                *error_msg = "GET " + url + " curl: " + curl_easy_strerror(rc) +
+                             " err: " + errbuf;
+            }
             return false;
         }
 
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
         if (!is_200(code)) {
-            LOG(ERROR) << "GET " << url << " http=" << code
-                       << " body: " << readBody;
+            if (error_msg) {
+                *error_msg = "GET " + url + " http=" + std::to_string(code) +
+                             " body: " + readBody;
+            }
             return false;
         }
 
@@ -289,7 +313,9 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         std::unique_ptr<Json::CharReader> r(b.newCharReader());
         if (!r->parse(readBody.data(), readBody.data() + readBody.size(),
                       &value, &errs)) {
-            LOG(ERROR) << "GET " << url << " json parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "GET " + url + " json parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -392,18 +418,24 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
     virtual ~EtcdStoragePlugin() {}
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) override {
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
-            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
-                       << metadata_uri_ << ": " << resp.error_message();
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: unable to get " + key +
+                             " from " + metadata_uri_ + ": " +
+                             resp.error_message();
+            }
             return false;
         }
         auto json_file = resp.value().as_string();
 
         std::string errs;
         if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: JSON parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -451,12 +483,16 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
     virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) override {
         char *json_data = nullptr;
         auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
         if (ret) {
-            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
-                       << metadata_uri_ << ": " << err_msg_;
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: unable to get " + key +
+                             " in " + metadata_uri_ + ": " +
+                             std::string(err_msg_ ? err_msg_ : "");
+            }
             // free the memory for storing error message
             free(err_msg_);
             err_msg_ = nullptr;
@@ -471,7 +507,9 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
         std::string errs;
         if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: JSON parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -636,6 +674,10 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         on_notify_callback_ = callback;
     }
 
+    virtual void registerOnDeleteEndpointCallBack(OnReceiveCallBack callback) {
+        on_delete_endpoint_callback_ = callback;
+    }
+
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
         if (listener_running_) {
             // LOG(INFO) << "SocketHandShakePlugin: listener already running";
@@ -767,6 +809,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                         on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
                     if (on_notify_callback_) on_notify_callback_(peer, local);
+                } else if (type == HandShakeRequestType::DeleteEndpoint) {
+                    if (on_delete_endpoint_callback_)
+                        on_delete_endpoint_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
@@ -812,76 +857,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
-                           const Json::Value &local, Json::Value &peer) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendNotify(rp, local, peer);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
-                     const Json::Value &local, Json::Value &peer) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSend(rp, local, peer);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
     int doConnect(struct addrinfo *addr, int &conn_fd) {
         int on = 1;
         conn_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
@@ -915,48 +890,54 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    int doSend(struct addrinfo *addr, const Json::Value &local,
-               Json::Value &peer) {
+    // Unified helper
+    int doSendRequest(struct addrinfo *addr, HandShakeRequestType type,
+                      const Json::Value &local, Json::Value *peer) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
             return ret;
         }
 
-        ret = writeString(conn_fd, HandShakeRequestType::Connection,
-                          Json::FastWriter{}.write(local));
+        ret = writeString(conn_fd, type, Json::FastWriter{}.write(local));
         if (ret) {
             LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send handshake message: "
-                   "malformed json format, check tcp connection";
+                << "SocketHandShakePlugin: failed to send "
+                << handshakeRequestTypeName(type)
+                << " message: malformed json format, check tcp connection";
             close(conn_fd);
             return ret;
         }
 
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Connection) {
+        auto [resp_type, json_str] = readString(conn_fd);
+        if (resp_type != type) {
             LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
+                << "SocketHandShakePlugin: unexpected handshake message type"
+                   " (expected "
+                << handshakeRequestTypeName(type) << ", got "
+                << handshakeRequestTypeName(resp_type) << ")";
             close(conn_fd);
             return ERR_SOCKET;
         }
 
-        std::string errs;
-        if (!parseJsonString(json_str, peer, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive handshake "
-                          "message: malformed json format: "
-                       << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
+        if (peer) {
+            std::string errs;
+            if (!parseJsonString(json_str, *peer, &errs)) {
+                LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
+                           << handshakeRequestTypeName(type)
+                           << " message, malformed json format: " << errs;
+                close(conn_fd);
+                return ERR_MALFORMED_JSON;
+            }
         }
 
         close(conn_fd);
         return 0;
     }
 
-    virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
-                                 const Json::Value &local_metadata,
-                                 Json::Value &peer_metadata) {
+    // Unified helper
+    int resolveAndTryEach(const std::string &ip_or_host_name, uint16_t rpc_port,
+                          std::function<int(struct addrinfo *)> action) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -976,13 +957,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         int ret = 0;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendMetadata(rp, local_metadata, peer_metadata);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
+            ret = action(rp);
+            if (ret == 0 || ret == ERR_MALFORMED_JSON) {
+                break;
             }
         }
 
@@ -990,88 +967,42 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doSendNotify(struct addrinfo *addr, const Json::Value &local_notify,
-                     Json::Value &peer_notify) {
-        int conn_fd = -1;
-        int ret = doConnect(addr, conn_fd);
-        if (ret) {
-            return ret;
-        }
-
-        ret = writeString(conn_fd, HandShakeRequestType::Notify,
-                          Json::FastWriter{}.write(local_notify));
-        if (ret) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send metadata message: "
-                   "malformed json format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
-
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Notify) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
-        //           << json_str;
-
-        std::string errs;
-        if (!parseJsonString(json_str, peer_notify, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
-                          "message, malformed json format: "
-                       << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
-        }
-
-        close(conn_fd);
-        return 0;
+    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
+                           const Json::Value &local, Json::Value &peer) {
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::Notify, local,
+                                     &peer);
+            });
     }
 
-    int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
-                       Json::Value &peer_metadata) {
-        int conn_fd = -1;
-        int ret = doConnect(addr, conn_fd);
-        if (ret) {
-            return ret;
-        }
+    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
+                     const Json::Value &local, Json::Value &peer) {
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::Connection,
+                                     local, &peer);
+            });
+    }
 
-        ret = writeString(conn_fd, HandShakeRequestType::Metadata,
-                          Json::FastWriter{}.write(local_metadata));
-        if (ret) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send metadata message: "
-                   "malformed json format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
+    virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
+                                 const Json::Value &local_metadata,
+                                 Json::Value &peer_metadata) {
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::Metadata,
+                                     local_metadata, &peer_metadata);
+            });
+    }
 
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Metadata) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
-        //           << json_str;
-
-        std::string errs;
-        if (!parseJsonString(json_str, peer_metadata, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
-                          "message, malformed json format: "
-                       << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
-        }
-
-        close(conn_fd);
-        return 0;
+    virtual int sendDeleteEndpoint(std::string ip_or_host_name,
+                                   uint16_t rpc_port,
+                                   const Json::Value &local) {
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::DeleteEndpoint,
+                                     local, nullptr);
+            });
     }
 
     std::atomic<bool> listener_running_;
@@ -1082,6 +1013,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
     OnReceiveCallBack on_notify_callback_;
+    OnReceiveCallBack on_delete_endpoint_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(

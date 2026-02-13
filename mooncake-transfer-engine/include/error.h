@@ -30,6 +30,8 @@
 #define ERR_METADATA (-200)
 #define ERR_ENDPOINT (-201)
 #define ERR_CONTEXT (-202)
+#define ERR_ENDPOINT_NOT_FOUND (-203)
+#define ERR_ENDPOINT_ID_MISMATCH (-204)
 
 #define ERR_NUMA (-300)
 #define ERR_CLOCK (-301)

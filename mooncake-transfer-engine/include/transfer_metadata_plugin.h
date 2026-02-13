@@ -25,7 +25,9 @@ struct MetadataStoragePlugin {
     MetadataStoragePlugin() {}
     virtual ~MetadataStoragePlugin() {}
 
-    virtual bool get(const std::string &key, Json::Value &value) = 0;
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) = 0;
+    bool get(const std::string &key, Json::Value &value, bool silent = false);
     virtual bool set(const std::string &key, const Json::Value &value) = 0;
     virtual bool remove(const std::string &key) = 0;
 };
@@ -65,6 +67,15 @@ struct HandShakePlugin {
 
     // Register callback function for receiving metadata exchange request.
     virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) = 0;
+
+    // Register callback function for receiving delete endpoint request.
+    virtual void registerOnDeleteEndpointCallBack(
+        OnReceiveCallBack callback) = 0;
+
+    // Send delete endpoint notification to peer endpoint.
+    virtual int sendDeleteEndpoint(std::string ip_or_host_name,
+                                   uint16_t rpc_port,
+                                   const Json::Value &local) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();
