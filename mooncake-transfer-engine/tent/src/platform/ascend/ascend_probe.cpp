@@ -14,6 +14,7 @@
 
 #include "tent/platform/ascend.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
 
 #include <acl/acl.h>
@@ -200,6 +201,21 @@ const std::vector<RangeLocation> AscendPlatform::getLocation(void* start,
 
     for (int i = 0; i < n; i++) {
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+    }
+
+    // Prefault pages to reduce page-fault overhead during numa_move_pages.
+    const PrefaultResult prefault_result =
+        prefaultPages(pages, n, aligned_start, PrefaultOptions{});
+    if (prefault_result.err != 0) {
+        LOG(WARNING) << "[AscendPlatform] Prefault " << prefault_result.method
+                     << " failed with errno=" << prefault_result.err
+                     << ", continuing with unprefaulted pages";
+    } else {
+        VLOG(1) << "[AscendPlatform] Prefault succeeded: method="
+                << prefault_result.method
+                << " duration_ms=" << prefault_result.duration_ms
+                << " threads=" << prefault_result.threads
+                << " chunk_bytes=" << prefault_result.chunk_bytes;
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
