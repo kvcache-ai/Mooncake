@@ -33,6 +33,8 @@ DEFINE_uint64(cxl_device_size, 1073741824, "Device Size for cxl");
 DEFINE_bool(auto_disc, false, "Auto discover tcp devices");
 DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
               "Metadata connection string for transfer engine");
+DEFINE_double(eviction_high_watermark_ratio, 0.1,
+              "Ratio of high watermark trigger eviction");
 
 namespace mooncake {
 namespace testing {
@@ -135,6 +137,8 @@ class ClientIntegrationTestCxl : public ::testing::Test {
                                         .set_enable_cxl(true)
                                         .set_cxl_path(FLAGS_cxl_device_name)
                                         .set_cxl_size(FLAGS_cxl_device_size)
+                                        .set_eviction_high_watermark_ratio(
+                                            FLAGS_eviction_high_watermark_ratio)
                                         .build();
 
         ASSERT_TRUE(master_.Start(config)) << "Failed to start InProcMaster!";
@@ -239,8 +243,6 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     // application, user should manage the memory allocation and deallocation
     // themselves.
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
-    static void* segment_ptr_;
-    static size_t ram_buffer_size_;
     static void* test_client_segment_ptr_;
     static size_t test_client_ram_buffer_size_;
     static uint64_t default_kv_lease_ttl_;
@@ -254,11 +256,9 @@ class ClientIntegrationTestCxl : public ::testing::Test {
 
 // Static members initialization
 std::shared_ptr<Client> ClientIntegrationTestCxl::test_client_ = nullptr;
-void* ClientIntegrationTestCxl::segment_ptr_ = nullptr;
 void* ClientIntegrationTestCxl::test_client_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTestCxl::client_buffer_allocator_ = nullptr;
-size_t ClientIntegrationTestCxl::ram_buffer_size_ = 0;
 size_t ClientIntegrationTestCxl::test_client_ram_buffer_size_ = 0;
 uint64_t ClientIntegrationTestCxl::default_kv_lease_ttl_ = 0;
 InProcMaster ClientIntegrationTestCxl::master_;
@@ -402,6 +402,46 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
         client_buffer_allocator_->deallocate(
             target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
     }
+}
+
+// Test Evict operation through the client
+TEST_F(ClientIntegrationTestCxl, EvictOperation) {
+    // Test data
+    const size_t test_data_size = 1ULL * 1024 * 1024;
+    const size_t test_total_size = 1000ULL * 1024 * 1024;
+    std::vector<char> test_data(test_data_size, 'T');
+    size_t test_put_size = 0;
+
+    for (uint64_t i = 0;; ++i) {
+        std::string key = "evict_key_" + std::to_string(i);
+        void* buffer = client_buffer_allocator_->allocate(test_data_size);
+
+        // write
+        memcpy(buffer, test_data.data(), test_data_size);
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buffer, test_data_size});
+
+        // Test Put operation
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_result = test_client_->Put(key, slices, config);
+        ASSERT_TRUE(put_result.has_value())
+            << "Put failed at i=" << i << " " << toString(put_result.error());
+
+        client_buffer_allocator_->deallocate(buffer, test_data_size);
+        test_put_size += test_data_size;
+
+        if (i % 100 == 0) {
+            LOG(INFO) << "put count=" << i + 1
+                      << ", total_put_size=" << test_put_size / 1048576 << "MB";
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (test_put_size >= test_total_size) {
+            LOG(INFO) << "stop";
+            break;
+        }
+    }
+    LOG(INFO) << "Test finished, put_data=" << test_put_size / 1048576 << "MB";
 }
 
 }  // namespace testing
