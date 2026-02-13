@@ -187,26 +187,25 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
 }
 
 tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(
-    const std::vector<RemoteBufferDesc>& buffers,
-    const std::string& function_name) {
+    const std::vector<RemoteBufferDesc>& buffers) {
     if (buffers.empty()) {
-        LOG(ERROR) << function_name << ": Empty buffers";
+        LOG(ERROR) << "Empty buffers";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     for (const auto& buffer : buffers) {
         if (buffer.segment_name.empty()) {
-            LOG(ERROR) << function_name << ": Empty segment name in buffers";
+            LOG(ERROR) << "Empty segment name in buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.addr == 0) {
-            LOG(ERROR) << function_name
-                       << ": Invalid buffer address (null) in buffers";
+            LOG(ERROR) << "Invalid buffer address "
+                          "(null) in buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.size == 0) {
-            LOG(ERROR) << function_name
-                       << ": Invalid buffer size (zero) in buffers";
+            LOG(ERROR) << "Invalid buffer size (zero) "
+                          "in buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -358,16 +357,16 @@ tl::expected<BatchID, ErrorCode> DataManager::SubmitTransferRequests(
 }
 
 tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
-    const std::vector<std::tuple<BatchID, size_t, std::string>>& batches,
-    const std::string& function_name) {
+    const std::vector<std::tuple<BatchID, size_t, std::string>>& batches) {
     for (size_t i = 0; i < batches.size(); ++i) {
         const auto& [batch_id, num_tasks, segment_name] = batches[i];
-        auto wait_result =
-            WaitTransferBatch(batch_id, num_tasks, segment_name, function_name);
+        auto wait_result = WaitTransferBatch(batch_id, num_tasks, segment_name);
         if (!wait_result.has_value()) {
-            LOG(ERROR) << function_name << ": Transfer failed for segment '"
-                       << segment_name
-                       << "', error: " << toString(wait_result.error());
+            LOG(ERROR) << "Transfer failed for segment '" << segment_name << "'"
+                       << ", error: " << toString(wait_result.error())
+                       << ", batch_id: " << batch_id << ", index: " << i
+                       << ", total_batches: " << batches.size()
+                       << ", num_tasks: " << num_tasks;
 
             // Free remaining batch IDs that haven't been processed yet
             // Note: WaitTransferBatch already freed the failed batch ID
@@ -392,9 +391,10 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     }
 
     // Validate buffers
-    auto validate_result =
-        ValidateRemoteBuffers(dest_buffers, "TransferDataToRemote");
+    auto validate_result = ValidateRemoteBuffers(dest_buffers);
     if (!validate_result.has_value()) {
+        LOG(ERROR) << "TransferDataToRemote: Buffer validation failed, error: "
+                   << toString(validate_result.error());
         return validate_result;
     }
 
@@ -473,12 +473,22 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             size_t offset_in_source = buffer_offsets[idx];
 
             if (offset_in_source >= total_data_size) {
+                LOG(WARNING)
+                    << "TransferDataToRemote: Skipping buffer at idx " << idx
+                    << " because offset_in_source (" << offset_in_source
+                    << ") >= total_data_size (" << total_data_size << ")";
                 continue;
             }
 
             size_t length =
                 std::min(buffer.size, total_data_size - offset_in_source);
             if (length == 0) {
+                LOG(WARNING)
+                    << "TransferDataToRemote: Skipping buffer at idx " << idx
+                    << " because computed length is zero (buffer.size="
+                    << buffer.size
+                    << ", remaining=" << (total_data_size - offset_in_source)
+                    << ")";
                 continue;
             }
 
@@ -493,6 +503,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         }
 
         if (requests.empty()) {
+            LOG(WARNING) << "TransferDataToRemote: No transfer requests "
+                            "created for segment '"
+                         << segment_name << "', skipping.";
             continue;
         }
 
@@ -513,9 +526,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
     // Phase 2: Wait for all batches to complete
     if (!submitted_batches.empty()) {
-        auto wait_result =
-            WaitAllTransferBatches(submitted_batches, "TransferDataToRemote");
+        auto wait_result = WaitAllTransferBatches(submitted_batches);
         if (!wait_result.has_value()) {
+            LOG(ERROR)
+                << "TransferDataToRemote: WaitAllTransferBatches failed: "
+                << toString(wait_result.error());
             return wait_result;
         }
     }
@@ -532,10 +547,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     }
 
     // Validate buffers
-    auto validate_result =
-        ValidateRemoteBuffers(src_buffers, "TransferDataFromRemote");
+    auto validate_result = ValidateRemoteBuffers(src_buffers);
     if (!validate_result.has_value()) {
-        return tl::make_unexpected(validate_result.error());
+        LOG(ERROR)
+            << "TransferDataFromRemote: Buffer validation failed, error: "
+            << toString(validate_result.error());
+        return validate_result;
     }
 
     // Get destination handle info
@@ -573,6 +590,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     auto buffer_result =
         PrepareDRAMReceiveBuffer(dest_ptr, dest_type, total_data_size);
     if (!buffer_result.has_value()) {
+        LOG(ERROR) << "TransferDataFromRemote: PrepareDRAMReceiveBuffer failed "
+                      "with error code "
+                   << static_cast<int>(buffer_result.error());
         return tl::make_unexpected(buffer_result.error());
     }
     auto [transfer_dest, temp_buffer] = std::move(buffer_result.value());
@@ -614,12 +634,22 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             size_t offset_in_dest = buffer_offsets[idx];
 
             if (offset_in_dest >= total_data_size) {
+                LOG(WARNING)
+                    << "TransferDataFromRemote: Skipping buffer at idx " << idx
+                    << " because offset_in_dest (" << offset_in_dest
+                    << ") >= total_data_size (" << total_data_size << ")";
                 continue;
             }
 
             size_t length =
                 std::min(buffer.size, total_data_size - offset_in_dest);
             if (length == 0) {
+                LOG(WARNING)
+                    << "TransferDataFromRemote: Skipping buffer at idx " << idx
+                    << " because computed length is zero (buffer.size="
+                    << buffer.size
+                    << ", remaining=" << (total_data_size - offset_in_dest)
+                    << ")";
                 continue;
             }
 
@@ -633,6 +663,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         }
 
         if (requests.empty()) {
+            LOG(WARNING) << "TransferDataFromRemote: No transfer requests "
+                            "created for segment '"
+                         << segment_name << "', skipping.";
             continue;
         }
 
@@ -657,8 +690,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
-    auto wait_result =
-        WaitAllTransferBatches(submitted_batches, "TransferDataFromRemote");
+    auto wait_result = WaitAllTransferBatches(submitted_batches);
     if (!wait_result.has_value()) {
         LOG(ERROR) << "TransferDataFromRemote: Transfer failed, error: "
                    << toString(wait_result.error());
@@ -681,8 +713,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 }
 
 tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
-    BatchID batch_id, size_t num_tasks, const std::string& segment_name,
-    const std::string& function_name) {
+    BatchID batch_id, size_t num_tasks, const std::string& segment_name) {
     // Poll for completion
     constexpr int64_t timeout_seconds = 10;
     auto start_time = std::chrono::steady_clock::now();
@@ -694,8 +725,9 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
             std::chrono::duration_cast<std::chrono::seconds>(now - start_time)
                 .count();
         if (elapsed >= timeout_seconds) {
-            LOG(ERROR) << function_name << ": Timeout after " << elapsed
-                       << " seconds";
+            LOG(ERROR) << "WaitTransferBatch: Timeout after " << elapsed
+                       << " seconds for batch " << batch_id << " for segment '"
+                       << segment_name << "'";
             transfer_engine_->freeBatchID(batch_id);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -708,9 +740,10 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
             TransferStatus status;
             Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
             if (!s.ok()) {
-                LOG(ERROR) << function_name << ": Failed to get "
-                           << "transfer status for task " << i
-                           << ", error: " << s.message();
+                LOG(ERROR) << "Failed to get "
+                           << "transfer status for task " << i << " for batch "
+                           << batch_id << " for segment '" << segment_name
+                           << "', error: " << s.message();
                 has_failure = true;
                 break;
             }
@@ -721,7 +754,8 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
                        status.s == TransferStatusEnum::CANCELED ||
                        status.s == TransferStatusEnum::INVALID ||
                        status.s == TransferStatusEnum::TIMEOUT) {
-                LOG(ERROR) << function_name << ": Transfer task " << i
+                LOG(ERROR) << "Transfer task " << i << " for batch " << batch_id
+                           << " for segment '" << segment_name
                            << " failed with status "
                            << static_cast<int>(status.s);
                 has_failure = true;
@@ -733,14 +767,14 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
         }
 
         if (has_failure) {
+            LOG(ERROR) << "Transfer failed in batch_id " << batch_id;
             transfer_engine_->freeBatchID(batch_id);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
         if (all_completed) {
-            VLOG(1) << function_name
-                    << ": All transfers completed for segment '" << segment_name
-                    << "'";
+            VLOG(1) << "All transfers completed for batch " << batch_id
+                    << " for segment '" << segment_name << "'";
             break;
         }
 

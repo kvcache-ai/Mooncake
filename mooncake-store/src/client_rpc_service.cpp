@@ -94,100 +94,10 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRemoteData(
     return {};
 }
 
-std::vector<tl::expected<void, ErrorCode>>
-ClientRpcService::BatchReadRemoteData(const BatchRemoteReadRequest& request) {
-    ScopedVLogTimer timer(1, "ClientRpcService::BatchReadRemoteData");
-    timer.LogRequest("key_count=", request.keys.size());
-
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(request.keys.size());
-
-    if (request.keys.size() != request.dest_buffers_list.size()) {
-        LOG(ERROR) << "BatchReadRemoteData: key count (" << request.keys.size()
-                   << ") != buffer list count ("
-                   << request.dest_buffers_list.size() << ")";
-        for (size_t i = 0; i < request.keys.size(); ++i) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
-    }
-
-    // Process each key sequentially
-    for (size_t i = 0; i < request.keys.size(); ++i) {
-        RemoteReadRequest single_request;
-        single_request.key = request.keys[i];
-        single_request.dest_buffers = request.dest_buffers_list[i];
-
-        auto result = ReadRemoteData(single_request);
-        if (!result.has_value()) {
-            LOG(ERROR) << "BatchReadRemoteData failed for key: "
-                       << single_request.key
-                       << ", error: " << toString(result.error());
-        }
-        results.push_back(result);
-    }
-
-    timer.LogResponse("processed_count=", request.keys.size());
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>>
-ClientRpcService::BatchWriteRemoteData(const BatchRemoteWriteRequest& request) {
-    ScopedVLogTimer timer(1, "ClientRpcService::BatchWriteRemoteData");
-    timer.LogRequest("key_count=", request.keys.size());
-
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(request.keys.size());
-
-    if (request.keys.size() != request.src_buffers_list.size()) {
-        LOG(ERROR) << "BatchWriteRemoteData: key count (" << request.keys.size()
-                   << ") != buffer list count ("
-                   << request.src_buffers_list.size() << ")";
-        for (size_t i = 0; i < request.keys.size(); ++i) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
-    }
-
-    if (request.keys.size() != request.target_tier_ids.size()) {
-        LOG(ERROR) << "BatchWriteRemoteData: key count (" << request.keys.size()
-                   << ") != tier_id count (" << request.target_tier_ids.size()
-                   << ")";
-        for (size_t i = 0; i < request.keys.size(); ++i) {
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
-    }
-
-    // Process each key sequentially
-    for (size_t i = 0; i < request.keys.size(); ++i) {
-        RemoteWriteRequest single_request;
-        single_request.key = request.keys[i];
-        single_request.src_buffers = request.src_buffers_list[i];
-        single_request.target_tier_id = request.target_tier_ids[i];
-
-        auto result = WriteRemoteData(single_request);
-        if (!result.has_value()) {
-            LOG(ERROR) << "BatchWriteRemoteData failed for key: "
-                       << single_request.key
-                       << ", error: " << toString(result.error());
-        }
-        results.push_back(result);
-    }
-
-    timer.LogResponse("processed_count=", request.keys.size());
-    return results;
-}
-
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
                               ClientRpcService& service) {
     server.register_handler<&ClientRpcService::ReadRemoteData>(&service);
     server.register_handler<&ClientRpcService::WriteRemoteData>(&service);
-    server.register_handler<&ClientRpcService::BatchReadRemoteData>(&service);
-    server.register_handler<&ClientRpcService::BatchWriteRemoteData>(&service);
 }
 
 }  // namespace mooncake

@@ -104,11 +104,9 @@ class PeerClientTest : public ::testing::Test {
 
         // Create and connect PeerClient
         peer_client_ = std::make_unique<PeerClient>();
-        std::string endpoint =
-            "127.0.0.1:" + std::to_string(kTestPort);
+        std::string endpoint = "127.0.0.1:" + std::to_string(kTestPort);
         auto connect_result = peer_client_->Connect(endpoint);
-        ASSERT_TRUE(connect_result.has_value())
-            << "PeerClient::Connect failed";
+        ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
     }
 
     void TearDown() override {
@@ -441,128 +439,6 @@ TEST_F(PeerClientTest, SyncWriteRemoteDataValidRequest) {
     auto result = peer_client_->WriteRemoteData(request);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
-}
-
-// ============================================================================
-// BatchReadRemoteData Tests
-// ============================================================================
-
-TEST_F(PeerClientTest, BatchReadRemoteDataKeysNotFound) {
-    BatchRemoteReadRequest request;
-    request.keys.push_back("batch_key1");
-    request.keys.push_back("batch_key2");
-    request.dest_buffers_list.push_back(
-        {CreateBufferDesc("segment1", 0x1000, 100)});
-    request.dest_buffers_list.push_back(
-        {CreateBufferDesc("segment2", 0x2000, 100)});
-
-    auto results = peer_client_->BatchReadRemoteData(request);
-    ASSERT_EQ(results.size(), 2);
-
-    // Both should fail (keys don't exist)
-    ASSERT_FALSE(results[0].has_value());
-    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_KEY);
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_KEY);
-}
-
-TEST_F(PeerClientTest, BatchReadRemoteDataWithExistingKeys) {
-    // Put test data
-    const std::string key1 = "batch_read_key1";
-    const std::string key2 = "batch_read_key2";
-    const std::string test_data = "batch_data";
-
-    auto buffer1 = StringToBuffer(test_data);
-    auto put_result1 =
-        data_manager_->Put(key1, std::move(buffer1), test_data.size());
-    ASSERT_TRUE(put_result1.has_value());
-
-    auto buffer2 = StringToBuffer(test_data);
-    auto put_result2 =
-        data_manager_->Put(key2, std::move(buffer2), test_data.size());
-    ASSERT_TRUE(put_result2.has_value());
-
-    BatchRemoteReadRequest request;
-    request.keys.push_back(key1);
-    request.keys.push_back(key2);
-    request.dest_buffers_list.push_back(
-        {CreateBufferDesc("segment1", 0x1000, test_data.size())});
-    request.dest_buffers_list.push_back(
-        {CreateBufferDesc("segment2", 0x2000, test_data.size())});
-
-    auto results = peer_client_->BatchReadRemoteData(request);
-    ASSERT_EQ(results.size(), 2);
-
-    // Both should fail with INTERNAL_ERROR (TransferEngine not initialized)
-    ASSERT_FALSE(results[0].has_value());
-    EXPECT_EQ(results[0].error(), ErrorCode::INTERNAL_ERROR);
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::INTERNAL_ERROR);
-}
-
-TEST_F(PeerClientTest, BatchReadRemoteDataEmptyRequest) {
-    BatchRemoteReadRequest request;
-    // Empty keys and buffers
-
-    auto results = peer_client_->BatchReadRemoteData(request);
-    ASSERT_EQ(results.size(), 0);
-}
-
-// ============================================================================
-// BatchWriteRemoteData Tests
-// ============================================================================
-
-TEST_F(PeerClientTest, BatchWriteRemoteDataValidRequests) {
-    BatchRemoteWriteRequest request;
-    request.keys.push_back("batch_write_key1");
-    request.keys.push_back("batch_write_key2");
-    request.src_buffers_list.push_back(
-        {CreateBufferDesc("segment1", 0x1000, 100)});
-    request.src_buffers_list.push_back(
-        {CreateBufferDesc("segment2", 0x2000, 100)});
-    request.target_tier_ids.push_back(std::nullopt);
-    request.target_tier_ids.push_back(std::nullopt);
-
-    auto results = peer_client_->BatchWriteRemoteData(request);
-    ASSERT_EQ(results.size(), 2);
-
-    // Both should fail with INTERNAL_ERROR (TransferEngine not initialized)
-    ASSERT_FALSE(results[0].has_value());
-    EXPECT_EQ(results[0].error(), ErrorCode::INTERNAL_ERROR);
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::INTERNAL_ERROR);
-}
-
-TEST_F(PeerClientTest, BatchWriteRemoteDataWithTierIds) {
-    auto tier_id = GetTierId();
-    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
-
-    BatchRemoteWriteRequest request;
-    request.keys.push_back("batch_write_tier_key1");
-    request.keys.push_back("batch_write_tier_key2");
-    request.src_buffers_list.push_back(
-        {CreateBufferDesc("segment1", 0x1000, 100)});
-    request.src_buffers_list.push_back(
-        {CreateBufferDesc("segment2", 0x2000, 100)});
-    request.target_tier_ids.push_back(tier_id);
-    request.target_tier_ids.push_back(tier_id);
-
-    auto results = peer_client_->BatchWriteRemoteData(request);
-    ASSERT_EQ(results.size(), 2);
-
-    // Both should fail with INTERNAL_ERROR (TransferEngine not initialized)
-    ASSERT_FALSE(results[0].has_value());
-    EXPECT_EQ(results[0].error(), ErrorCode::INTERNAL_ERROR);
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::INTERNAL_ERROR);
-}
-
-TEST_F(PeerClientTest, BatchWriteRemoteDataEmptyRequest) {
-    BatchRemoteWriteRequest request;
-    // Empty keys, buffers, and tier_ids
-
-    auto results = peer_client_->BatchWriteRemoteData(request);
-    ASSERT_EQ(results.size(), 0);
 }
 
 // ============================================================================

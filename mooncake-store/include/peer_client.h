@@ -17,8 +17,8 @@ class PeerClient {
     tl::expected<void, ErrorCode> Connect(const std::string& endpoint);
 
     // --- Async single-key interfaces ---
-    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-    AsyncReadRemoteData(const RemoteReadRequest& request);
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncReadRemoteData(
+        const RemoteReadRequest& request);
 
     async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
     AsyncWriteRemoteData(const RemoteWriteRequest& request);
@@ -28,12 +28,6 @@ class PeerClient {
         const RemoteReadRequest& request);
     tl::expected<void, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
-
-    // --- Sync batch interfaces ---
-    std::vector<tl::expected<void, ErrorCode>> BatchReadRemoteData(
-        const BatchRemoteReadRequest& request);
-    std::vector<tl::expected<void, ErrorCode>> BatchWriteRemoteData(
-        const BatchRemoteWriteRequest& request);
 
    private:
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>

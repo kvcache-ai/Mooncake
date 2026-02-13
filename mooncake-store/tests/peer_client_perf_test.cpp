@@ -100,11 +100,9 @@ class PeerClientPerfTest : public ::testing::Test {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         peer_client_ = std::make_unique<PeerClient>();
-        std::string endpoint =
-            "127.0.0.1:" + std::to_string(kTestPort);
+        std::string endpoint = "127.0.0.1:" + std::to_string(kTestPort);
         auto connect_result = peer_client_->Connect(endpoint);
-        ASSERT_TRUE(connect_result.has_value())
-            << "PeerClient::Connect failed";
+        ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
     }
 
     void TearDown() override {
@@ -150,7 +148,7 @@ class PeerClientPerfTest : public ::testing::Test {
         size_t num_requests;
         double sync_total_ms;
         double async_total_ms;
-        double sync_rps;     // requests per second
+        double sync_rps;  // requests per second
         double async_rps;
         double speedup;
     };
@@ -171,8 +169,7 @@ class PeerClientPerfTest : public ::testing::Test {
     double RunAsyncReads(size_t n) {
         auto start = std::chrono::steady_clock::now();
 
-        auto coro = [this, n]()
-            -> async_simple::coro::Lazy<void> {
+        auto coro = [this, n]() -> async_simple::coro::Lazy<void> {
             // Requests must outlive all coroutines since
             // AsyncReadRemoteData takes const& references.
             std::vector<RemoteReadRequest> requests;
@@ -181,13 +178,11 @@ class PeerClientPerfTest : public ::testing::Test {
                 requests.push_back(MakeReadRequest(i));
             }
 
-            std::vector<
-                async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
                 tasks;
             tasks.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                tasks.push_back(
-                    peer_client_->AsyncReadRemoteData(requests[i]));
+                tasks.push_back(peer_client_->AsyncReadRemoteData(requests[i]));
             }
             auto results =
                 co_await async_simple::coro::collectAllPara(std::move(tasks));
@@ -217,16 +212,14 @@ class PeerClientPerfTest : public ::testing::Test {
     double RunAsyncWrites(size_t n) {
         auto start = std::chrono::steady_clock::now();
 
-        auto coro = [this, n]()
-            -> async_simple::coro::Lazy<void> {
+        auto coro = [this, n]() -> async_simple::coro::Lazy<void> {
             std::vector<RemoteWriteRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
                 requests.push_back(MakeWriteRequest(i));
             }
 
-            std::vector<
-                async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
                 tasks;
             tasks.reserve(n);
             for (size_t i = 0; i < n; ++i) {
@@ -266,10 +259,10 @@ class PeerClientPerfTest : public ::testing::Test {
     void PrintResult(const char* label, const BenchResult& r) {
         std::cout << std::fixed << std::setprecision(2);
         std::cout << label << " (N=" << r.num_requests << "):\n"
-                  << "  Sync:  " << r.sync_total_ms << " ms, "
-                  << r.sync_rps << " req/s\n"
-                  << "  Async: " << r.async_total_ms << " ms, "
-                  << r.async_rps << " req/s\n"
+                  << "  Sync:  " << r.sync_total_ms << " ms, " << r.sync_rps
+                  << " req/s\n"
+                  << "  Async: " << r.async_total_ms << " ms, " << r.async_rps
+                  << " req/s\n"
                   << "  Speedup: " << r.speedup << "x\n\n";
     }
 
@@ -307,10 +300,9 @@ TEST_F(PeerClientPerfTest, ReadConcurrencyComparison) {
               << "+---------+------------+------------+----------+---------+\n";
     for (auto& r : results) {
         std::cout << "| " << std::setw(7) << r.num_requests << " | "
-                  << std::setw(10) << r.sync_total_ms << " | "
-                  << std::setw(10) << r.async_total_ms << " | "
-                  << std::setw(8) << r.async_rps << " | "
-                  << std::setw(6) << r.speedup << "x |\n";
+                  << std::setw(10) << r.sync_total_ms << " | " << std::setw(10)
+                  << r.async_total_ms << " | " << std::setw(8) << r.async_rps
+                  << " | " << std::setw(6) << r.speedup << "x |\n";
     }
     std::cout << "+---------+------------+------------+----------+---------+\n";
 }
@@ -355,10 +347,10 @@ TEST_F(PeerClientPerfTest, WriteConcurrencyComparison) {
 
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "Write (N=" << n << "):\n"
-                  << "  Sync:  " << sync_ms << " ms, "
-                  << r.sync_rps << " req/s\n"
-                  << "  Async: " << async_ms << " ms, "
-                  << r.async_rps << " req/s\n"
+                  << "  Sync:  " << sync_ms << " ms, " << r.sync_rps
+                  << " req/s\n"
+                  << "  Async: " << async_ms << " ms, " << r.async_rps
+                  << " req/s\n"
                   << "  Speedup: " << r.speedup << "x\n\n";
     }
 
@@ -368,11 +360,10 @@ TEST_F(PeerClientPerfTest, WriteConcurrencyComparison) {
               << "|    N    | Sync(ms)   | Async(ms)  | Async RPS| Speedup |\n"
               << "+---------+------------+------------+----------+---------+\n";
     for (auto& r : results) {
-        std::cout << "| " << std::setw(7) << r.n << " | "
-                  << std::setw(10) << r.sync_ms << " | "
-                  << std::setw(10) << r.async_ms << " | "
-                  << std::setw(8) << r.async_rps << " | "
-                  << std::setw(6) << r.speedup << "x |\n";
+        std::cout << "| " << std::setw(7) << r.n << " | " << std::setw(10)
+                  << r.sync_ms << " | " << std::setw(10) << r.async_ms << " | "
+                  << std::setw(8) << r.async_rps << " | " << std::setw(6)
+                  << r.speedup << "x |\n";
     }
     std::cout << "+---------+------------+------------+----------+---------+\n";
 }
@@ -394,8 +385,8 @@ TEST_F(PeerClientPerfTest, WindowedAsyncConcurrency) {
     double sync_ms = RunSyncReads(total);
     double sync_rps = (total / sync_ms) * 1000.0;
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Baseline (sync sequential): "
-              << sync_ms << " ms, " << sync_rps << " req/s\n\n";
+    std::cout << "Baseline (sync sequential): " << sync_ms << " ms, "
+              << sync_rps << " req/s\n\n";
 
     struct WindowResult {
         size_t window;
@@ -408,21 +399,18 @@ TEST_F(PeerClientPerfTest, WindowedAsyncConcurrency) {
     for (size_t w : windows) {
         auto start = std::chrono::steady_clock::now();
 
-        auto coro = [this, total, w]()
-            -> async_simple::coro::Lazy<void> {
+        auto coro = [this, total, w]() -> async_simple::coro::Lazy<void> {
             std::vector<RemoteReadRequest> requests;
             requests.reserve(total);
             for (size_t i = 0; i < total; ++i) {
                 requests.push_back(MakeReadRequest(i));
             }
 
-            std::vector<
-                async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
                 tasks;
             tasks.reserve(total);
             for (size_t i = 0; i < total; ++i) {
-                tasks.push_back(
-                    peer_client_->AsyncReadRemoteData(requests[i]));
+                tasks.push_back(peer_client_->AsyncReadRemoteData(requests[i]));
             }
             auto results = co_await async_simple::coro::collectAllWindowedPara(
                 w, /*yield=*/false, std::move(tasks));
@@ -440,9 +428,8 @@ TEST_F(PeerClientPerfTest, WindowedAsyncConcurrency) {
 
         results.push_back({w, ms, rps, speedup});
 
-        std::cout << "Window=" << std::setw(3) << w
-                  << ": " << std::setw(8) << ms << " ms, "
-                  << std::setw(8) << rps << " req/s, "
+        std::cout << "Window=" << std::setw(3) << w << ": " << std::setw(8)
+                  << ms << " ms, " << std::setw(8) << rps << " req/s, "
                   << speedup << "x vs sync\n";
     }
 
@@ -450,9 +437,8 @@ TEST_F(PeerClientPerfTest, WindowedAsyncConcurrency) {
               << "| Window | Time(ms) |  Req/s   | Speedup |\n"
               << "+--------+----------+----------+---------+\n";
     for (auto& r : results) {
-        std::cout << "| " << std::setw(6) << r.window << " | "
-                  << std::setw(8) << r.ms << " | "
-                  << std::setw(8) << r.rps << " | "
+        std::cout << "| " << std::setw(6) << r.window << " | " << std::setw(8)
+                  << r.ms << " | " << std::setw(8) << r.rps << " | "
                   << std::setw(6) << r.speedup << "x |\n";
     }
     std::cout << "+--------+----------+----------+---------+\n";
@@ -482,8 +468,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         const char* local_hostname = std::getenv("MC_LOCAL_HOSTNAME");
 
         if (!metadata_addr || !local_hostname) {
-            skip_reason_ =
-                "MC_METADATA_ADDR and MC_LOCAL_HOSTNAME not set";
+            skip_reason_ = "MC_METADATA_ADDR and MC_LOCAL_HOSTNAME not set";
             return;
         }
 
@@ -497,15 +482,12 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         if (rdma_dev) {
             nic_filter.push_back(std::string(rdma_dev));
         }
-        transfer_engine_ =
-            std::make_shared<TransferEngine>(true, nic_filter);
-        int init_rc = transfer_engine_->init(metadata_addr,
-                                             local_hostname_, "",
+        transfer_engine_ = std::make_shared<TransferEngine>(true, nic_filter);
+        int init_rc = transfer_engine_->init(metadata_addr, local_hostname_, "",
                                              kRpcPort);
         if (init_rc != 0) {
-            skip_reason_ =
-                "TransferEngine init failed (error " +
-                std::to_string(init_rc) + ")";
+            skip_reason_ = "TransferEngine init failed (error " +
+                           std::to_string(init_rc) + ")";
             transfer_engine_.reset();
             return;
         }
@@ -542,16 +524,15 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto backend_rc = tiered_backend_->Init(
-            config, transfer_engine_.get(), nullptr);
+        auto backend_rc =
+            tiered_backend_->Init(config, transfer_engine_.get(), nullptr);
         ASSERT_TRUE(backend_rc.has_value())
             << "Failed to initialize TieredBackend";
 
         data_manager_ = std::make_unique<DataManager>(
             std::move(tiered_backend_), transfer_engine_);
 
-        rpc_service_ =
-            std::make_unique<ClientRpcService>(*data_manager_);
+        rpc_service_ = std::make_unique<ClientRpcService>(*data_manager_);
 
         server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             /*thread_num=*/4, kTestPort);
@@ -560,19 +541,16 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         server_thread_ = std::thread([this]() {
             auto ec = server_->start();
             if (ec) {
-                LOG(ERROR) << "RDMA server start failed: "
-                           << ec.message();
+                LOG(ERROR) << "RDMA server start failed: " << ec.message();
             }
         });
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         peer_client_ = std::make_unique<PeerClient>();
-        std::string endpoint =
-            "127.0.0.1:" + std::to_string(kTestPort);
+        std::string endpoint = "127.0.0.1:" + std::to_string(kTestPort);
         auto connect_result = peer_client_->Connect(endpoint);
-        ASSERT_TRUE(connect_result.has_value())
-            << "PeerClient::Connect failed";
+        ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
 
         rdma_available_ = true;
     }
@@ -614,15 +592,12 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         auto data = std::make_unique<char[]>(data_size);
         std::memset(data.get(), 'A', data_size);
         auto rc = data_manager_->Put(key, std::move(data), data_size);
-        ASSERT_TRUE(rc.has_value())
-            << "PopulateKey failed for " << key;
+        ASSERT_TRUE(rc.has_value()) << "PopulateKey failed for " << key;
     }
 
-    RemoteReadRequest MakeRdmaReadRequest(size_t index,
-                                          size_t data_size) {
+    RemoteReadRequest MakeRdmaReadRequest(size_t index, size_t data_size) {
         RemoteReadRequest request;
-        request.key =
-            "rdma_perf_key_" + std::to_string(index);
+        request.key = "rdma_perf_key_" + std::to_string(index);
         RemoteBufferDesc desc;
         desc.segment_name = local_hostname_;
         desc.addr = reinterpret_cast<uintptr_t>(
@@ -632,14 +607,11 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         return request;
     }
 
-    RemoteWriteRequest MakeRdmaWriteRequest(size_t index,
-                                            size_t data_size) {
+    RemoteWriteRequest MakeRdmaWriteRequest(size_t index, size_t data_size) {
         RemoteWriteRequest request;
-        request.key =
-            "rdma_perf_write_key_" + std::to_string(index);
+        request.key = "rdma_perf_write_key_" + std::to_string(index);
         // Pre-fill source region with data
-        char* src = static_cast<char*>(rdma_buffer_) +
-                    index * data_size;
+        char* src = static_cast<char*>(rdma_buffer_) + index * data_size;
         std::memset(src, 'B', data_size);
 
         RemoteBufferDesc desc;
@@ -670,32 +642,27 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
             (void)result;
         }
         auto end = std::chrono::steady_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start)
-            .count();
+        return std::chrono::duration<double, std::milli>(end - start).count();
     }
 
     // Run N async reads with RDMA-backed requests.
     // window=0 means unlimited (collectAllPara).
-    double RunRdmaAsyncReads(size_t n, size_t data_size,
-                             size_t window = 0) {
+    double RunRdmaAsyncReads(size_t n, size_t data_size, size_t window = 0) {
         auto start = std::chrono::steady_clock::now();
 
-        auto coro = [this, n, data_size, window]()
-            -> async_simple::coro::Lazy<void> {
+        auto coro = [this, n, data_size,
+                     window]() -> async_simple::coro::Lazy<void> {
             std::vector<RemoteReadRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                requests.push_back(
-                    MakeRdmaReadRequest(i, data_size));
+                requests.push_back(MakeRdmaReadRequest(i, data_size));
             }
 
-            std::vector<async_simple::coro::Lazy<
-                tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
                 tasks;
             tasks.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                tasks.push_back(
-                    peer_client_->AsyncReadRemoteData(requests[i]));
+                tasks.push_back(peer_client_->AsyncReadRemoteData(requests[i]));
             }
             if (window > 0) {
                 auto results =
@@ -703,9 +670,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
                         window, /*yield=*/false, std::move(tasks));
                 (void)results;
             } else {
-                auto results =
-                    co_await async_simple::coro::collectAllPara(
-                        std::move(tasks));
+                auto results = co_await async_simple::coro::collectAllPara(
+                    std::move(tasks));
                 (void)results;
             }
             co_return;
@@ -714,8 +680,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         async_simple::coro::syncAwait(coro());
 
         auto end = std::chrono::steady_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start)
-            .count();
+        return std::chrono::duration<double, std::milli>(end - start).count();
     }
 
     // Run N sync writes with RDMA-backed requests
@@ -727,27 +692,23 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
             (void)result;
         }
         auto end = std::chrono::steady_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start)
-            .count();
+        return std::chrono::duration<double, std::milli>(end - start).count();
     }
 
     // Run N async writes with RDMA-backed requests.
     // window=0 means unlimited (collectAllPara).
-    double RunRdmaAsyncWrites(size_t n, size_t data_size,
-                              size_t window = 0) {
+    double RunRdmaAsyncWrites(size_t n, size_t data_size, size_t window = 0) {
         auto start = std::chrono::steady_clock::now();
 
-        auto coro = [this, n, data_size, window]()
-            -> async_simple::coro::Lazy<void> {
+        auto coro = [this, n, data_size,
+                     window]() -> async_simple::coro::Lazy<void> {
             std::vector<RemoteWriteRequest> requests;
             requests.reserve(n);
             for (size_t i = 0; i < n; ++i) {
-                requests.push_back(
-                    MakeRdmaWriteRequest(i, data_size));
+                requests.push_back(MakeRdmaWriteRequest(i, data_size));
             }
 
-            std::vector<async_simple::coro::Lazy<
-                tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
                 tasks;
             tasks.reserve(n);
             for (size_t i = 0; i < n; ++i) {
@@ -760,9 +721,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
                         window, /*yield=*/false, std::move(tasks));
                 (void)results;
             } else {
-                auto results =
-                    co_await async_simple::coro::collectAllPara(
-                        std::move(tasks));
+                auto results = co_await async_simple::coro::collectAllPara(
+                    std::move(tasks));
                 (void)results;
             }
             co_return;
@@ -771,12 +731,10 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         async_simple::coro::syncAwait(coro());
 
         auto end = std::chrono::steady_clock::now();
-        return std::chrono::duration<double, std::milli>(end - start)
-            .count();
+        return std::chrono::duration<double, std::milli>(end - start).count();
     }
 
-    static double ThroughputMBps(size_t n, size_t data_size,
-                                 double ms) {
+    static double ThroughputMBps(size_t n, size_t data_size, double ms) {
         double total_bytes = static_cast<double>(n) * data_size;
         double seconds = ms / 1000.0;
         return (total_bytes / (1024.0 * 1024.0)) / seconds;
@@ -794,73 +752,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         }
         std::sort(samples.begin(), samples.end());
         size_t n = samples.size();
-        return (n % 2 == 0)
-            ? (samples[n / 2 - 1] + samples[n / 2]) / 2.0
-            : samples[n / 2];
-    }
-
-    // Build a BatchRemoteReadRequest for N keys with RDMA buffers
-    BatchRemoteReadRequest MakeBatchRdmaReadRequest(size_t n,
-                                                     size_t data_size) {
-        BatchRemoteReadRequest batch;
-        batch.keys.reserve(n);
-        batch.dest_buffers_list.reserve(n);
-        for (size_t i = 0; i < n; ++i) {
-            batch.keys.push_back(
-                "rdma_perf_key_" + std::to_string(i));
-            RemoteBufferDesc desc;
-            desc.segment_name = local_hostname_;
-            desc.addr = reinterpret_cast<uintptr_t>(
-                static_cast<char*>(rdma_buffer_) + i * data_size);
-            desc.size = data_size;
-            batch.dest_buffers_list.push_back({desc});
-        }
-        return batch;
-    }
-
-    // Build a BatchRemoteWriteRequest for N keys with RDMA buffers
-    BatchRemoteWriteRequest MakeBatchRdmaWriteRequest(size_t n,
-                                                       size_t data_size) {
-        BatchRemoteWriteRequest batch;
-        batch.keys.reserve(n);
-        batch.src_buffers_list.reserve(n);
-        batch.target_tier_ids.reserve(n);
-        for (size_t i = 0; i < n; ++i) {
-            batch.keys.push_back(
-                "rdma_perf_write_key_" + std::to_string(i));
-            char* src = static_cast<char*>(rdma_buffer_) +
-                        i * data_size;
-            std::memset(src, 'B', data_size);
-            RemoteBufferDesc desc;
-            desc.segment_name = local_hostname_;
-            desc.addr = reinterpret_cast<uintptr_t>(src);
-            desc.size = data_size;
-            batch.src_buffers_list.push_back({desc});
-            batch.target_tier_ids.push_back(std::nullopt);
-        }
-        return batch;
-    }
-
-    // Run batch read RPC (single RPC, N keys)
-    double RunRdmaBatchReads(size_t n, size_t data_size) {
-        auto batch = MakeBatchRdmaReadRequest(n, data_size);
-        auto start = std::chrono::steady_clock::now();
-        auto results = peer_client_->BatchReadRemoteData(batch);
-        auto end = std::chrono::steady_clock::now();
-        (void)results;
-        return std::chrono::duration<double, std::milli>(end - start)
-            .count();
-    }
-
-    // Run batch write RPC (single RPC, N keys)
-    double RunRdmaBatchWrites(size_t n, size_t data_size) {
-        auto batch = MakeBatchRdmaWriteRequest(n, data_size);
-        auto start = std::chrono::steady_clock::now();
-        auto results = peer_client_->BatchWriteRemoteData(batch);
-        auto end = std::chrono::steady_clock::now();
-        (void)results;
-        return std::chrono::duration<double, std::milli>(end - start)
-            .count();
+        return (n % 2 == 0) ? (samples[n / 2 - 1] + samples[n / 2]) / 2.0
+                            : samples[n / 2];
     }
 
     std::string local_hostname_;
@@ -886,7 +779,8 @@ TEST_F(PeerClientRdmaPerfTest, RdmaReadConcurrencyBySizeComparison) {
     std::cout
         << "\n============================================================\n"
         << "  RDMA Read: Async vs Sync (real data transfer)\n"
-        << "  (median of " << kBenchIterations << " iterations per data point)\n"
+        << "  (median of " << kBenchIterations
+        << " iterations per data point)\n"
         << "============================================================\n\n";
 
     std::vector<size_t> data_sizes = {
@@ -903,16 +797,14 @@ TEST_F(PeerClientRdmaPerfTest, RdmaReadConcurrencyBySizeComparison) {
         for (size_t n : concurrency_levels) {
             // Ensure we don't exceed RDMA buffer: n * data_size <= 128MB
             if (n * data_size > kRdmaBufSize) {
-                std::cout << "  [SKIP] size="
-                          << (data_size / 1024) << "KB, N=" << n
-                          << " exceeds 128MB RDMA buffer\n";
+                std::cout << "  [SKIP] size=" << (data_size / 1024)
+                          << "KB, N=" << n << " exceeds 128MB RDMA buffer\n";
                 continue;
             }
 
             // Pre-populate keys in DataManager
             for (size_t i = 0; i < n; ++i) {
-                std::string key =
-                    "rdma_perf_key_" + std::to_string(i);
+                std::string key = "rdma_perf_key_" + std::to_string(i);
                 PopulateKey(key, data_size);
             }
 
@@ -948,22 +840,18 @@ TEST_F(PeerClientRdmaPerfTest, RdmaReadConcurrencyBySizeComparison) {
             double async_tp = ThroughputMBps(n, data_size, async_ms);
             double speedup = sync_ms / async_ms;
 
-            RdmaBenchResult r{data_size, n, sync_ms, async_ms,
-                              sync_tp, async_tp, speedup};
+            RdmaBenchResult r{data_size, n,        sync_ms, async_ms,
+                              sync_tp,   async_tp, speedup};
             all_results.push_back(r);
 
             std::cout << std::fixed << std::setprecision(2);
-            std::cout << "  size=" << std::setw(7)
-                      << (data_size / 1024) << "KB, N="
-                      << std::setw(3) << n
-                      << " | Sync: " << std::setw(9) << sync_ms
-                      << " ms (" << std::setw(9) << sync_tp
-                      << " MB/s)"
-                      << " | Async: " << std::setw(9) << async_ms
-                      << " ms (" << std::setw(9) << async_tp
-                      << " MB/s)"
-                      << " | Speedup: " << std::setw(5) << speedup
-                      << "x";
+            std::cout << "  size=" << std::setw(7) << (data_size / 1024)
+                      << "KB, N=" << std::setw(3) << n
+                      << " | Sync: " << std::setw(9) << sync_ms << " ms ("
+                      << std::setw(9) << sync_tp << " MB/s)"
+                      << " | Async: " << std::setw(9) << async_ms << " ms ("
+                      << std::setw(9) << async_tp << " MB/s)"
+                      << " | Speedup: " << std::setw(5) << speedup << "x";
             if (!first_correct) {
                 std::cout << " [DATA MISMATCH]";
             }
@@ -971,34 +859,30 @@ TEST_F(PeerClientRdmaPerfTest, RdmaReadConcurrencyBySizeComparison) {
 
             // Clean up keys for next iteration
             for (size_t i = 0; i < n; ++i) {
-                std::string key =
-                    "rdma_perf_key_" + std::to_string(i);
+                std::string key = "rdma_perf_key_" + std::to_string(i);
                 data_manager_->Delete(key);
             }
         }
     }
 
     // Summary table
-    std::cout
-        << "\n+---------+-----+------------+------------+-----------"
-           "+-----------+---------+\n"
-        << "|  Size   |  N  | Sync(ms)   | Async(ms)  | Sync MB/s "
-           "| Async MB/s| Speedup |\n"
-        << "+---------+-----+------------+------------+-----------"
-           "+-----------+---------+\n";
+    std::cout << "\n+---------+-----+------------+------------+-----------"
+                 "+-----------+---------+\n"
+              << "|  Size   |  N  | Sync(ms)   | Async(ms)  | Sync MB/s "
+                 "| Async MB/s| Speedup |\n"
+              << "+---------+-----+------------+------------+-----------"
+                 "+-----------+---------+\n";
     for (auto& r : all_results) {
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "| " << std::setw(5) << (r.data_size / 1024)
-                  << "KB | " << std::setw(3) << r.concurrency
-                  << " | " << std::setw(10) << r.sync_ms << " | "
-                  << std::setw(10) << r.async_ms << " | "
+        std::cout << "| " << std::setw(5) << (r.data_size / 1024) << "KB | "
+                  << std::setw(3) << r.concurrency << " | " << std::setw(10)
+                  << r.sync_ms << " | " << std::setw(10) << r.async_ms << " | "
                   << std::setw(9) << r.sync_throughput_mbps << " | "
                   << std::setw(9) << r.async_throughput_mbps << " | "
                   << std::setw(6) << r.speedup << "x |\n";
     }
-    std::cout
-        << "+---------+-----+------------+------------+-----------"
-           "+-----------+---------+\n";
+    std::cout << "+---------+-----+------------+------------+-----------"
+                 "+-----------+---------+\n";
 }
 
 // ============================================================================
@@ -1011,7 +895,8 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
     std::cout
         << "\n============================================================\n"
         << "  RDMA Write: Async vs Sync (real data transfer)\n"
-        << "  (median of " << kBenchIterations << " iterations per data point)\n"
+        << "  (median of " << kBenchIterations
+        << " iterations per data point)\n"
         << "============================================================\n\n";
 
     std::vector<size_t> data_sizes = {
@@ -1027,9 +912,8 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
     for (size_t data_size : data_sizes) {
         for (size_t n : concurrency_levels) {
             if (n * data_size > kRdmaBufSize) {
-                std::cout << "  [SKIP] size="
-                          << (data_size / 1024) << "KB, N=" << n
-                          << " exceeds 128MB RDMA buffer\n";
+                std::cout << "  [SKIP] size=" << (data_size / 1024)
+                          << "KB, N=" << n << " exceeds 128MB RDMA buffer\n";
                 continue;
             }
 
@@ -1037,21 +921,21 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
             // RDMA paths, QP connections, and caches
             RunRdmaSyncWrites(n, data_size);
             for (size_t i = 0; i < n; ++i) {
-                data_manager_->Delete(
-                    "rdma_perf_write_key_" + std::to_string(i));
+                data_manager_->Delete("rdma_perf_write_key_" +
+                                      std::to_string(i));
             }
             RunRdmaAsyncWrites(n, data_size);
             for (size_t i = 0; i < n; ++i) {
-                data_manager_->Delete(
-                    "rdma_perf_write_key_" + std::to_string(i));
+                data_manager_->Delete("rdma_perf_write_key_" +
+                                      std::to_string(i));
             }
 
             // Multiple iterations with median for stability
             double sync_ms = MedianOf(kBenchIterations, [&]() {
                 double ms = RunRdmaSyncWrites(n, data_size);
                 for (size_t i = 0; i < n; ++i) {
-                    data_manager_->Delete(
-                        "rdma_perf_write_key_" + std::to_string(i));
+                    data_manager_->Delete("rdma_perf_write_key_" +
+                                          std::to_string(i));
                 }
                 return ms;
             });
@@ -1059,8 +943,8 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
             double async_ms = MedianOf(kBenchIterations, [&]() {
                 double ms = RunRdmaAsyncWrites(n, data_size);
                 for (size_t i = 0; i < n; ++i) {
-                    data_manager_->Delete(
-                        "rdma_perf_write_key_" + std::to_string(i));
+                    data_manager_->Delete("rdma_perf_write_key_" +
+                                          std::to_string(i));
                 }
                 return ms;
             });
@@ -1076,22 +960,18 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
             double async_tp = ThroughputMBps(n, data_size, async_ms);
             double speedup = sync_ms / async_ms;
 
-            RdmaBenchResult r{data_size, n, sync_ms, async_ms,
-                              sync_tp, async_tp, speedup};
+            RdmaBenchResult r{data_size, n,        sync_ms, async_ms,
+                              sync_tp,   async_tp, speedup};
             all_results.push_back(r);
 
             std::cout << std::fixed << std::setprecision(2);
-            std::cout << "  size=" << std::setw(7)
-                      << (data_size / 1024) << "KB, N="
-                      << std::setw(3) << n
-                      << " | Sync: " << std::setw(9) << sync_ms
-                      << " ms (" << std::setw(9) << sync_tp
-                      << " MB/s)"
-                      << " | Async: " << std::setw(9) << async_ms
-                      << " ms (" << std::setw(9) << async_tp
-                      << " MB/s)"
-                      << " | Speedup: " << std::setw(5) << speedup
-                      << "x";
+            std::cout << "  size=" << std::setw(7) << (data_size / 1024)
+                      << "KB, N=" << std::setw(3) << n
+                      << " | Sync: " << std::setw(9) << sync_ms << " ms ("
+                      << std::setw(9) << sync_tp << " MB/s)"
+                      << " | Async: " << std::setw(9) << async_ms << " ms ("
+                      << std::setw(9) << async_tp << " MB/s)"
+                      << " | Speedup: " << std::setw(5) << speedup << "x";
             if (!write_ok) {
                 std::cout << " [WRITE VERIFY FAILED]";
             }
@@ -1099,34 +979,30 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
 
             // Clean up keys for next iteration
             for (size_t i = 0; i < n; ++i) {
-                std::string key =
-                    "rdma_perf_write_key_" + std::to_string(i);
+                std::string key = "rdma_perf_write_key_" + std::to_string(i);
                 data_manager_->Delete(key);
             }
         }
     }
 
     // Summary table
-    std::cout
-        << "\n+---------+-----+------------+------------+-----------"
-           "+-----------+---------+\n"
-        << "|  Size   |  N  | Sync(ms)   | Async(ms)  | Sync MB/s "
-           "| Async MB/s| Speedup |\n"
-        << "+---------+-----+------------+------------+-----------"
-           "+-----------+---------+\n";
+    std::cout << "\n+---------+-----+------------+------------+-----------"
+                 "+-----------+---------+\n"
+              << "|  Size   |  N  | Sync(ms)   | Async(ms)  | Sync MB/s "
+                 "| Async MB/s| Speedup |\n"
+              << "+---------+-----+------------+------------+-----------"
+                 "+-----------+---------+\n";
     for (auto& r : all_results) {
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "| " << std::setw(5) << (r.data_size / 1024)
-                  << "KB | " << std::setw(3) << r.concurrency
-                  << " | " << std::setw(10) << r.sync_ms << " | "
-                  << std::setw(10) << r.async_ms << " | "
+        std::cout << "| " << std::setw(5) << (r.data_size / 1024) << "KB | "
+                  << std::setw(3) << r.concurrency << " | " << std::setw(10)
+                  << r.sync_ms << " | " << std::setw(10) << r.async_ms << " | "
                   << std::setw(9) << r.sync_throughput_mbps << " | "
                   << std::setw(9) << r.async_throughput_mbps << " | "
                   << std::setw(6) << r.speedup << "x |\n";
     }
-    std::cout
-        << "+---------+-----+------------+------------+-----------"
-           "+-----------+---------+\n";
+    std::cout << "+---------+-----+------------+------------+-----------"
+                 "+-----------+---------+\n";
 }
 
 // ============================================================================
@@ -1139,7 +1015,8 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWindowedConcurrency) {
     std::cout
         << "\n============================================================\n"
         << "  RDMA Windowed Async: Finding optimal concurrency window\n"
-        << "  (N=100 total requests, median of " << kBenchIterations << " iterations)\n"
+        << "  (N=100 total requests, median of " << kBenchIterations
+        << " iterations)\n"
         << "============================================================\n\n";
 
     const size_t N = 100;
@@ -1167,8 +1044,7 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWindowedConcurrency) {
 
         // Pre-populate keys
         for (size_t i = 0; i < N; ++i) {
-            PopulateKey("rdma_perf_key_" + std::to_string(i),
-                        data_size);
+            PopulateKey("rdma_perf_key_" + std::to_string(i), data_size);
         }
 
         // Warmup: prime RDMA paths with one sync + async round
@@ -1186,8 +1062,8 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWindowedConcurrency) {
 
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "  size=" << (data_size / 1024)
-                  << "KB: Sync baseline: " << sync_ms
-                  << " ms (" << sync_tp << " MB/s)\n";
+                  << "KB: Sync baseline: " << sync_ms << " ms (" << sync_tp
+                  << " MB/s)\n";
 
         for (size_t w : windows) {
             double async_ms = MedianOf(kBenchIterations, [&]() {
@@ -1197,172 +1073,44 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWindowedConcurrency) {
             double async_tp = ThroughputMBps(N, data_size, async_ms);
             double speedup = sync_ms / async_ms;
 
-            std::string wlabel = (w == 0) ? "  ALL" :
-                std::string(5 - std::to_string(w).size(), ' ') +
-                std::to_string(w);
-            std::cout << "    Window=" << wlabel
-                      << ": " << std::setw(9) << async_ms
-                      << " ms (" << std::setw(9) << async_tp
-                      << " MB/s), " << std::setw(5) << speedup
-                      << "x vs sync\n";
+            std::string wlabel =
+                (w == 0) ? "  ALL"
+                         : std::string(5 - std::to_string(w).size(), ' ') +
+                               std::to_string(w);
+            std::cout << "    Window=" << wlabel << ": " << std::setw(9)
+                      << async_ms << " ms (" << std::setw(9) << async_tp
+                      << " MB/s), " << std::setw(5) << speedup << "x vs sync\n";
 
             all_results.push_back(
-                {data_size, w, sync_ms, async_ms,
-                 sync_tp, async_tp, speedup});
+                {data_size, w, sync_ms, async_ms, sync_tp, async_tp, speedup});
         }
 
         // Clean up
         for (size_t i = 0; i < N; ++i) {
-            data_manager_->Delete(
-                "rdma_perf_key_" + std::to_string(i));
+            data_manager_->Delete("rdma_perf_key_" + std::to_string(i));
         }
         std::cout << "\n";
     }
 
     // Summary table
-    std::cout
-        << "+---------+--------+----------+----------+-----------"
-           "+-----------+---------+\n"
-        << "|  Size   | Window | Sync(ms) |Async(ms) | Sync MB/s "
-           "|Async MB/s | Speedup |\n"
-        << "+---------+--------+----------+----------+-----------"
-           "+-----------+---------+\n";
+    std::cout << "+---------+--------+----------+----------+-----------"
+                 "+-----------+---------+\n"
+              << "|  Size   | Window | Sync(ms) |Async(ms) | Sync MB/s "
+                 "|Async MB/s | Speedup |\n"
+              << "+---------+--------+----------+----------+-----------"
+                 "+-----------+---------+\n";
     for (auto& r : all_results) {
         std::cout << std::fixed << std::setprecision(2);
-        std::string wlabel = (r.window == 0) ? "ALL" :
-            std::to_string(r.window);
-        std::cout << "| " << std::setw(5) << (r.data_size / 1024)
-                  << "KB | " << std::setw(6) << wlabel << " | "
-                  << std::setw(8) << r.sync_ms << " | "
-                  << std::setw(8) << r.async_ms << " | "
-                  << std::setw(9) << r.sync_tp << " | "
-                  << std::setw(9) << r.async_tp << " | "
-                  << std::setw(6) << r.speedup << "x |\n";
+        std::string wlabel = (r.window == 0) ? "ALL" : std::to_string(r.window);
+        std::cout << "| " << std::setw(5) << (r.data_size / 1024) << "KB | "
+                  << std::setw(6) << wlabel << " | " << std::setw(8)
+                  << r.sync_ms << " | " << std::setw(8) << r.async_ms << " | "
+                  << std::setw(9) << r.sync_tp << " | " << std::setw(9)
+                  << r.async_tp << " | " << std::setw(6) << r.speedup
+                  << "x |\n";
     }
-    std::cout
-        << "+---------+--------+----------+----------+-----------"
-           "+-----------+---------+\n";
-}
-
-// ============================================================================
-// RDMA: Sync vs Async vs Batch comparison (especially for small packets)
-// ============================================================================
-
-TEST_F(PeerClientRdmaPerfTest, RdmaSyncAsyncBatchComparison) {
-    if (ShouldSkip()) return;
-
-    std::cout
-        << "\n============================================================\n"
-        << "  RDMA: Sync vs Async vs Batch RPC Comparison\n"
-        << "  (median of " << kBenchIterations << " iterations per data point)\n"
-        << "============================================================\n\n";
-
-    std::vector<size_t> data_sizes = {
-        32 * 1024,       // 32KB
-        64 * 1024,       // 64KB
-        256 * 1024,      // 256KB
-        1 * 1024 * 1024  // 1MB
-    };
-    std::vector<size_t> concurrency_levels = {1, 10, 50, 100};
-
-    struct TriResult {
-        size_t data_size;
-        size_t n;
-        double sync_ms;
-        double async_ms;
-        double batch_ms;
-        double sync_tp;
-        double async_tp;
-        double batch_tp;
-    };
-    std::vector<TriResult> all_results;
-
-    for (size_t data_size : data_sizes) {
-        for (size_t n : concurrency_levels) {
-            if (n * data_size > kRdmaBufSize) continue;
-
-            // Pre-populate keys for read
-            for (size_t i = 0; i < n; ++i) {
-                PopulateKey("rdma_perf_key_" + std::to_string(i),
-                            data_size);
-            }
-
-            // Warmup all three paths
-            std::memset(rdma_buffer_, 0, n * data_size);
-            RunRdmaSyncReads(n, data_size);
-            std::memset(rdma_buffer_, 0, n * data_size);
-            RunRdmaAsyncReads(n, data_size);
-            std::memset(rdma_buffer_, 0, n * data_size);
-            RunRdmaBatchReads(n, data_size);
-
-            // Multiple iterations with median for stability
-            double sync_ms = MedianOf(kBenchIterations, [&]() {
-                std::memset(rdma_buffer_, 0, n * data_size);
-                return RunRdmaSyncReads(n, data_size);
-            });
-
-            double async_ms = MedianOf(kBenchIterations, [&]() {
-                std::memset(rdma_buffer_, 0, n * data_size);
-                return RunRdmaAsyncReads(n, data_size);
-            });
-
-            double batch_ms = MedianOf(kBenchIterations, [&]() {
-                std::memset(rdma_buffer_, 0, n * data_size);
-                return RunRdmaBatchReads(n, data_size);
-            });
-
-            double sync_tp = ThroughputMBps(n, data_size, sync_ms);
-            double async_tp = ThroughputMBps(n, data_size, async_ms);
-            double batch_tp = ThroughputMBps(n, data_size, batch_ms);
-
-            all_results.push_back({data_size, n, sync_ms, async_ms,
-                                   batch_ms, sync_tp, async_tp,
-                                   batch_tp});
-
-            std::cout << std::fixed << std::setprecision(2);
-            std::cout << "  size=" << std::setw(5)
-                      << (data_size / 1024) << "KB, N="
-                      << std::setw(3) << n
-                      << " | Sync: " << std::setw(8) << sync_ms
-                      << " ms (" << std::setw(8) << sync_tp
-                      << " MB/s)"
-                      << " | Async: " << std::setw(8) << async_ms
-                      << " ms (" << std::setw(8) << async_tp
-                      << " MB/s)"
-                      << " | Batch: " << std::setw(8) << batch_ms
-                      << " ms (" << std::setw(8) << batch_tp
-                      << " MB/s)\n";
-
-            // Clean up
-            for (size_t i = 0; i < n; ++i) {
-                data_manager_->Delete(
-                    "rdma_perf_key_" + std::to_string(i));
-            }
-        }
-    }
-
-    // Summary table
-    std::cout
-        << "\n+---------+-----+----------+----------+----------+"
-           "----------+----------+----------+\n"
-        << "|  Size   |  N  | Sync(ms) |Async(ms) |Batch(ms) |"
-           " Sync MB/s|Async MB/s|Batch MB/s|\n"
-        << "+---------+-----+----------+----------+----------+"
-           "----------+----------+----------+\n";
-    for (auto& r : all_results) {
-        std::cout << std::fixed << std::setprecision(2);
-        std::cout << "| " << std::setw(5) << (r.data_size / 1024)
-                  << "KB | " << std::setw(3) << r.n << " | "
-                  << std::setw(8) << r.sync_ms << " | "
-                  << std::setw(8) << r.async_ms << " | "
-                  << std::setw(8) << r.batch_ms << " | "
-                  << std::setw(8) << r.sync_tp << " | "
-                  << std::setw(8) << r.async_tp << " | "
-                  << std::setw(8) << r.batch_tp << " |\n";
-    }
-    std::cout
-        << "+---------+-----+----------+----------+----------+"
-           "----------+----------+----------+\n";
+    std::cout << "+---------+--------+----------+----------+-----------"
+                 "+-----------+---------+\n";
 }
 
 }  // namespace mooncake

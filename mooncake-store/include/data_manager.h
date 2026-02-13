@@ -132,8 +132,7 @@ class DataManager {
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> WaitTransferBatch(
-        BatchID batch_id, size_t num_tasks, const std::string& segment_name,
-        const std::string& function_name);
+        BatchID batch_id, size_t num_tasks, const std::string& segment_name);
 
     /**
      * @brief Validate remote buffer descriptors
@@ -142,8 +141,7 @@ class DataManager {
      * @return ErrorCode if validation fails, otherwise OK
      */
     tl::expected<void, ErrorCode> ValidateRemoteBuffers(
-        const std::vector<RemoteBufferDesc>& buffers,
-        const std::string& function_name);
+        const std::vector<RemoteBufferDesc>& buffers);
 
     /**
      * @brief Prepare DRAM buffer for transfer from non-DRAM source
@@ -206,8 +204,7 @@ class DataManager {
      *         remaining batch IDs are freed and error is returned immediately.
      */
     tl::expected<void, ErrorCode> WaitAllTransferBatches(
-        const std::vector<std::tuple<BatchID, size_t, std::string>>& batches,
-        const std::string& function_name);
+        const std::vector<std::tuple<BatchID, size_t, std::string>>& batches);
 
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client

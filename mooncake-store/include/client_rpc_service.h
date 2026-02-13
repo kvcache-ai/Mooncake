@@ -52,24 +52,6 @@ class ClientRpcService {
     tl::expected<void, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
 
-    /**
-     * @brief Batch read remote data for multiple keys
-     * @param request BatchRemoteReadRequest containing multiple keys and their
-     * destination buffers
-     * @return Vector of expected results for each key
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchReadRemoteData(
-        const BatchRemoteReadRequest& request);
-
-    /**
-     * @brief Batch write remote data for multiple keys
-     * @param request BatchRemoteWriteRequest containing multiple keys, source
-     * buffers, and tier_ids
-     * @return Vector of expected results for each key
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchWriteRemoteData(
-        const BatchRemoteWriteRequest& request);
-
    private:
     DataManager& data_manager_;  // Reference: owned by Client, same lifetime
 };

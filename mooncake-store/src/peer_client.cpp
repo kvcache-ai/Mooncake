@@ -8,8 +8,7 @@
 
 namespace mooncake {
 
-tl::expected<void, ErrorCode> PeerClient::Connect(
-    const std::string& endpoint) {
+tl::expected<void, ErrorCode> PeerClient::Connect(const std::string& endpoint) {
     endpoint_ = endpoint;
 
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
@@ -34,8 +33,7 @@ PeerClient::AsyncReadRemoteData(const RemoteReadRequest& request) {
     }
 
     auto ret = co_await client_pool_->send_request(
-        [&](coro_io::client_reuse_hint,
-            coro_rpc::coro_rpc_client& client) {
+        [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
             return client.send_request<&ClientRpcService::ReadRemoteData>(
                 request);
         });
@@ -61,11 +59,9 @@ PeerClient::AsyncWriteRemoteData(const RemoteWriteRequest& request) {
     }
 
     auto ret = co_await client_pool_->send_request(
-        [&](coro_io::client_reuse_hint,
-            coro_rpc::coro_rpc_client& client) {
-            return client
-                .send_request<&ClientRpcService::WriteRemoteData>(
-                    request);
+        [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+            return client.send_request<&ClientRpcService::WriteRemoteData>(
+                request);
         });
     if (!ret.has_value()) {
         LOG(ERROR) << "AsyncWriteRemoteData: client not available";
@@ -90,43 +86,6 @@ tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(
 tl::expected<void, ErrorCode> PeerClient::WriteRemoteData(
     const RemoteWriteRequest& request) {
     return async_simple::coro::syncAwait(AsyncWriteRemoteData(request));
-}
-
-std::vector<tl::expected<void, ErrorCode>> PeerClient::BatchReadRemoteData(
-    const BatchRemoteReadRequest& request) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(request.keys.size());
-
-    for (size_t i = 0; i < request.keys.size(); ++i) {
-        RemoteReadRequest single_request;
-        single_request.key = request.keys[i];
-        if (i < request.dest_buffers_list.size()) {
-            single_request.dest_buffers = request.dest_buffers_list[i];
-        }
-        results.push_back(ReadRemoteData(single_request));
-    }
-
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> PeerClient::BatchWriteRemoteData(
-    const BatchRemoteWriteRequest& request) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(request.keys.size());
-
-    for (size_t i = 0; i < request.keys.size(); ++i) {
-        RemoteWriteRequest single_request;
-        single_request.key = request.keys[i];
-        if (i < request.src_buffers_list.size()) {
-            single_request.src_buffers = request.src_buffers_list[i];
-        }
-        if (i < request.target_tier_ids.size()) {
-            single_request.target_tier_id = request.target_tier_ids[i];
-        }
-        results.push_back(WriteRemoteData(single_request));
-    }
-
-    return results;
 }
 
 }  // namespace mooncake
