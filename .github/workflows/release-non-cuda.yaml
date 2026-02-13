@@ -7,6 +7,7 @@ on:
 
 env:
   SCCACHE_GHA_ENABLED: "true"
+  CI: "true"
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -53,7 +54,7 @@ jobs:
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=OFF -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       - name: Build project
