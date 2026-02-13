@@ -50,7 +50,7 @@
 #include "gpu_vendor/mnnvl.h"
 #endif
 
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 
@@ -144,12 +144,12 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
             return nullptr;
 #endif
         } else if (FLAGS_protocol == "nvlink_intra") {
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
             d_buf = allocateFabricMemory_intra(size);
             LOG(INFO) << "Using intra-NVLink memory allocation";
 #else
             LOG(ERROR)
-                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON";
+                << "--protocol=nvlink_intra requires USE_INTRA_NODE_NVLINK=ON";
             return nullptr;
 #endif
         } else if (FLAGS_protocol == "ubshmem") {
@@ -198,7 +198,7 @@ static void freeMemoryPool(void *addr, size_t size) {
         }
 #endif  // USE_MNNVL
     } else if (FLAGS_protocol == "nvlink_intra") {
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
         if (FLAGS_use_vram) {
             freeFabricMemory_intra(addr);
             return;
