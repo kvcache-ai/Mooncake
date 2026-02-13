@@ -90,6 +90,10 @@ class LocalBufferManager {
         context_list_.resize(topology->getNicCount(), nullptr);
     }
 
+    void setRelaxedOrderingEnabled(bool enabled) {
+        relaxed_ordering_enabled_ = enabled;
+    }
+
     Status addBuffer(BufferDesc &desc, const MemoryOptions &options);
 
     Status addBuffer(std::vector<BufferDesc> &desc_list,
@@ -114,6 +118,7 @@ class LocalBufferManager {
     std::vector<RdmaContext *> context_list_;
     std::map<AddressRange, BufferEntryForRdma> buffer_list_;
     std::shared_ptr<Topology> topology_;
+    bool relaxed_ordering_enabled_ = false;
 };
 
 }  // namespace tent
