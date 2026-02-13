@@ -543,7 +543,8 @@ Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
     }
     LOG(INFO) << "AscendDirectTransport register mem addr:" << desc.addr
               << ", length:" << desc.length << ", location:" << desc.location
-              << ", mem type:" << mem_type;
+              << ", mem type:"
+              << (mem_type == hixl::MEM_HOST ? "host" : "device");
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     addr_to_mem_handle_[desc.addr] = mem_handle;
     return Status::OK();
