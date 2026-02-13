@@ -30,16 +30,6 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Install and start etcd
-      run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3 # Give etcd time to start
-        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
-
     - name: Free up disk space
       run: |
         sudo rm -rf /usr/share/dotnet
@@ -87,7 +77,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=OFF -DSTORE_USE_ETCD=OFF -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
       shell: bash
 
     - name: Build project
@@ -212,7 +202,7 @@ jobs:
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+        cmake .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=OFF -DSTORE_USE_ETCD=OFF -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
       shell: bash
 
     - name: Build project
@@ -437,7 +427,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 

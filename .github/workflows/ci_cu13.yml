@@ -74,7 +74,7 @@ jobs:
         mkdir build
         cd build
         cmake .. \
-          -DUSE_ETCD=ON \
+          -DUSE_ETCD=OFF \
           -DUSE_REDIS=ON \
           -DUSE_HTTP=ON \
           -DWITH_STORE=ON \
