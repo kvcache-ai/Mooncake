@@ -42,6 +42,9 @@ if(USE_ASCEND_CACHE_TIER)
 endif()
 add_store_test(data_manager_test data_manager_test.cpp)
 add_store_test(client_rpc_service_test client_rpc_service_test.cpp)
+add_store_test(peer_client_test peer_client_test.cpp)
+add_store_test(peer_client_perf_test peer_client_perf_test.cpp)
+
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
