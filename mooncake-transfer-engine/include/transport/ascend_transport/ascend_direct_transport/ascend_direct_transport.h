@@ -142,7 +142,6 @@ class AscendDirectTransport : public Transport {
     bool use_buffer_pool_{false};
     bool auto_connect_{false};
     int32_t base_port_ = 20000;
-    std::unordered_set<SegmentID> need_update_metadata_segs_;
     bool use_short_connection_{false};
 
     // add for async transfer

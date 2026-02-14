@@ -308,7 +308,8 @@ void AscendDirectTransport::enqueue(F &&f, Args &&...args) {
     {
         std::unique_lock<std::mutex> lock(thread_pool_queue_mutex_);
         if (!running_) {
-            throw std::runtime_error("enqueue on stopped ThreadPool");
+            LOG(WARNING) << "thread pool is stopped";
+            return;
         }
         tasks_.emplace([task] { (*task)(); });
     }
@@ -779,9 +780,8 @@ void AscendDirectTransport::processSliceList(
     if (slice_list.empty()) {
         return;
     }
-    auto it = need_update_metadata_segs_.find(slice_list[0]->target_id);
-    auto target_segment_desc = metadata_->getSegmentDescByID(
-        slice_list[0]->target_id, (it != need_update_metadata_segs_.end()));
+    auto target_segment_desc =
+        metadata_->getSegmentDescByID(slice_list[0]->target_id);
     if (!target_segment_desc) {
         LOG(ERROR) << "Cannot find segment descriptor for target_id: "
                    << slice_list[0]->target_id;
@@ -789,9 +789,6 @@ void AscendDirectTransport::processSliceList(
             slice->markFailed();
         }
         return;
-    }
-    if (it != need_update_metadata_segs_.end()) {
-        need_update_metadata_segs_.erase(it);
     }
     auto target_adxl_engine_name =
         GenAdxlEngineName(target_segment_desc->rank_info.hostIp,
@@ -881,7 +878,6 @@ void AscendDirectTransport::connectAndTransfer(
         LOG(INFO) << "transfer failed and disconnect to:"
                   << target_adxl_engine_name;
         disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
-        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 }
 
@@ -938,7 +934,6 @@ void AscendDirectTransport::TransferWithAsync(
         // the connection is probably broken.
         // set small timeout to just release local res.
         disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
-        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 #endif
 }
@@ -956,6 +951,7 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
+        return;
     }
     aclrtPtrAttributes dst_attributes;
     ret = aclrtPointerGetAttributes(remote_ptr, &dst_attributes);
@@ -964,6 +960,7 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
+        return;
     }
     if (attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
         attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
@@ -971,6 +968,7 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
+        return;
     }
     if (dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
         dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
@@ -978,6 +976,7 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
+        return;
     }
     if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
         dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
@@ -1054,11 +1053,12 @@ aclError AscendDirectTransport::copyWithBatch(
     if (ret != ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
         if (ret == ACL_ERROR_NONE) {
             VLOG(1) << "Copy with aclrtMemcpyBatch suc.";
-            for (size_t i = 0; i < 0 + batch_num; i++) {
+            for (size_t i = 0; i < batch_num; i++) {
                 auto &slice = slice_list[slice_index + i];
                 slice->markSuccess();
             }
         } else {
+            LOG(ERROR) << "aclrtMemcpyBatch failed, ret:" << ret;
             for (size_t i = 0; i < batch_num; i++) {
                 auto &slice = slice_list[slice_index + i];
                 slice->markFailed();
@@ -1193,11 +1193,11 @@ int AscendDirectTransport::disconnect(
             LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
-            connected_segments_.erase(target_adxl_engine_name);
+            connected_segments_.erase(it);
             return -1;
         }
     }
-    connected_segments_.erase(target_adxl_engine_name);
+    connected_segments_.erase(it);
     return 0;
 }
 }  // namespace mooncake
