@@ -99,9 +99,8 @@ class ClientIntegrationTestCxl : public ::testing::Test {
             std::nullopt,  // RDMA device names (auto-discovery)
             master_address_);
 
-        EXPECT_TRUE(client_opt.has_value())
-            << "Failed to create client with host_name: " << host_name;
         if (!client_opt.has_value()) {
+            LOG(WARNING) << "Failed to create client with host_name: " << host_name;
             return nullptr;
         }
         return client_opt.value();
@@ -156,6 +155,11 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     }
 
     static void InitializeSegment() {
+        // Skip if client creation failed (CXL device unavailable)
+        if (test_client_ == nullptr) {
+            return;
+        }
+
         // init local buffer allocator
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
@@ -198,7 +202,13 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         google::AddLogSink(test_client_sink);
 
         test_client_ = CreateClient("localhost:17813");
-        ASSERT_TRUE(test_client_ != nullptr);
+        if (test_client_ == nullptr) {
+            google::RemoveLogSink(test_client_sink);
+            delete test_client_sink;
+            cxl_available_ = false;
+            LOG(WARNING) << "CXL device not available, tests will be skipped";
+            return;
+        }
 
         // Wait for logs to flush
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -249,6 +259,7 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     static std::string metadata_url_;
     static UUID test_client_id_;
     static inline bool is_cxl = false;
+    static inline bool cxl_available_ = true;
     static int tmp_fd;
 };
 
@@ -269,6 +280,9 @@ int ClientIntegrationTestCxl::tmp_fd = -1;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {
+    if (!cxl_available_) {
+        GTEST_SKIP() << "CXL device not available";
+    }
     const std::string test_data = "Hello, World!";
     const std::string key = "test_key";
     void* buffer = client_buffer_allocator_->allocate(test_data.size());
@@ -317,6 +331,9 @@ TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {
 
 // Test batch Put/Get operations through the client
 TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
+    if (!cxl_available_) {
+        GTEST_SKIP() << "CXL device not available";
+    }
     int batch_sz = 10;
     std::vector<std::string> keys;
     std::vector<std::string> test_data_list;

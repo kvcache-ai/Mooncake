@@ -27,6 +27,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "environ.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -259,51 +260,37 @@ static void setupP2PAccess(int num_devices) {
 }
 
 static int getNumStreams() {
-    const char *env = getenv("MC_HIP_NUM_STREAMS");
-    if (env) {
-        try {
-            int value = std::stoi(env);
-            if (value > 0) {
-                return value;
-            }
-            LOG(WARNING) << "MC_HIP_NUM_STREAMS value " << value
-                         << " must be positive, using default "
-                         << kDefaultNumStreams;
-        } catch (...) {
-            LOG(WARNING) << "Invalid MC_HIP_NUM_STREAMS value, using default "
-                         << kDefaultNumStreams;
-        }
+    int num_streams = Environ::Get().GetHipNumStreams();
+    if (num_streams > 0) {
+        return num_streams;
+    } else if (num_streams < 0) {
+        LOG(WARNING) << "MC_HIP_NUM_STREAMS value " << num_streams
+                     << " must be positive, using default "
+                     << kDefaultNumStreams;
     }
     return kDefaultNumStreams;
 }
 
 static int getNumEvents() {
-    const char *env = getenv("MC_HIP_NUM_EVENTS");
-    if (env) {
-        try {
-            int value = std::stoi(env);
-            if (value > 0) {
-                return value;
-            }
-            LOG(WARNING) << "MC_HIP_NUM_EVENTS value " << value
-                         << " must be positive, using default "
-                         << kDefaultNumEvents;
-        } catch (...) {
-            LOG(WARNING) << "Invalid MC_HIP_NUM_EVENTS value, using default "
-                         << kDefaultNumEvents;
-        }
+    int num_events = Environ::Get().GetHipNumEvents();
+    if (num_events > 0) {
+        return num_events;
+    } else if (num_events < 0) {
+        LOG(WARNING) << "MC_HIP_NUM_EVENTS value " << num_events
+                     << " must be positive, using default "
+                     << kDefaultNumEvents;
     }
     return kDefaultNumEvents;
 }
 
 static bool supportFabricMem() {
     // By default, use IPC mode. Fabric memory is enabled only when
-    // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
-    const char *hip_ipc = getenv("MC_USE_HIP_IPC");
-    const char *nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+    // MC_USE_HIP_IPC=false or MC_USE_NVLINK_IPC=false is explicitly set.
+    auto& env = Environ::Get();
+    bool hip_ipc = env.GetUseHipIpc();
+    bool nvlink_ipc = env.GetUseNvlinkIpc();
 
-    bool fabric_enabled = (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
-                          (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
+    bool fabric_enabled = !hip_ipc || !nvlink_ipc;
 
     if (!fabric_enabled) {
         return false;

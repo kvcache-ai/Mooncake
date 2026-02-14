@@ -49,6 +49,38 @@ class Environ {
     bool GetForceMnnvl() const { return force_mnnvl_; }
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
+    std::string GetCustomTopoJson() const { return custom_topo_json_; }
+    std::string GetCxlDevPath() const { return cxl_dev_path_; }
+    std::string GetCxlDevSize() const { return cxl_dev_size_; }
+    bool GetDisableGpuDirectRdma() const { return disable_gpu_direct_rdma_; }
+    bool GetEnableMnnvl() const { return enable_mnnvl_; }
+    int GetHandshakePort() const { return handshake_port_; }
+    int GetHipNumEvents() const { return hip_num_events_; }
+    int GetHipNumStreams() const { return hip_num_streams_; }
+    bool GetIntranodeNvlink() const { return intranode_nvlink_; }
+    bool GetLegacyRpcPortBinding() const { return legacy_rpc_port_binding_; }
+    std::string GetMetadataClusterId() const { return metadata_cluster_id_; }
+    size_t GetMinRegSize() const { return min_reg_size_; }
+    std::string GetMsAutoDisc() const { return ms_auto_disc_; }
+    std::string GetMsFilters() const { return ms_filters_; }
+    std::string GetRpcProtocol() const { return rpc_protocol_; }
+    int GetSliceTimeout() const { return slice_timeout_; }
+    std::string GetStoreClientMetric() const { return store_client_metric_; }
+    int GetStoreClientMetricInterval() const { return store_client_metric_interval_; }
+    std::string GetStoreClusterId() const { return store_cluster_id_; }
+    std::string GetStoreHugepageSize() const { return store_hugepage_size_; }
+    std::string GetStoreMemcpy() const { return store_memcpy_; }
+    std::string GetStoreUseHugepage() const { return store_use_hugepage_; }
+    std::string GetTcpBindAddress() const { return tcp_bind_address_; }
+    std::string GetTeMetric() const { return te_metric_; }
+    int GetTeMetricIntervalSeconds() const { return te_metric_interval_seconds_; }
+    std::string GetTentConf() const { return tent_conf_; }
+    int GetTransferTimeout() const { return transfer_timeout_; }
+    bool GetUseHipIpc() const { return use_hip_ipc_; }
+    bool GetUseNvlinkIpc() const { return use_nvlink_ipc_; }
+    bool GetUseTent() const { return use_tent_; }
+    bool GetUseTev1() const { return use_tev1_; }
+    std::string GetYltLogLevel() const { return ylt_log_level_; }
 
    private:
     Environ();
@@ -99,6 +131,38 @@ class Environ {
     bool force_mnnvl_;
     bool intra_nvlink_;
     bool path_roundrobin_;
+    std::string custom_topo_json_;
+    std::string cxl_dev_path_;
+    std::string cxl_dev_size_;
+    bool disable_gpu_direct_rdma_;
+    bool enable_mnnvl_;
+    int handshake_port_;
+    int hip_num_events_;
+    int hip_num_streams_;
+    bool intranode_nvlink_;
+    bool legacy_rpc_port_binding_;
+    std::string metadata_cluster_id_;
+    size_t min_reg_size_;
+    std::string ms_auto_disc_;
+    std::string ms_filters_;
+    std::string rpc_protocol_;
+    int slice_timeout_;
+    std::string store_client_metric_;
+    int store_client_metric_interval_;
+    std::string store_cluster_id_;
+    std::string store_hugepage_size_;
+    std::string store_memcpy_;
+    std::string store_use_hugepage_;
+    std::string tcp_bind_address_;
+    std::string te_metric_;
+    int te_metric_interval_seconds_;
+    std::string tent_conf_;
+    int transfer_timeout_;
+    bool use_hip_ipc_;
+    bool use_nvlink_ipc_;
+    bool use_tent_;
+    bool use_tev1_;
+    std::string ylt_log_level_;
 };
 
 }  // namespace mooncake
