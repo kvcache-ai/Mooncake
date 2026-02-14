@@ -102,6 +102,11 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
+    // HTTP metadata server configuration
+    bool enable_http_metadata_server = false;
+    uint32_t http_metadata_server_port = 8080;
+    std::string http_metadata_server_host = "0.0.0.0";
+
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
@@ -146,6 +151,10 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
 
+        // Set HTTP metadata server configuration
+        enable_http_metadata_server = config.enable_http_metadata_server;
+        http_metadata_server_port = config.http_metadata_server_port;
+        http_metadata_server_host = config.http_metadata_server_host;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;

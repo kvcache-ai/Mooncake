@@ -10,6 +10,7 @@
 
 #include "types.h"
 #include "master_config.h"
+#include "http_metadata_server.h"
 
 namespace mooncake {
 
