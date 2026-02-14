@@ -78,7 +78,11 @@ echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
 echo -e "  - yalantinglibs"
 echo -e "  - Git submodules"
-echo -e "  - Go $GOVER"
+if [ "${CI}" != "true" ]; then
+    echo -e "  - Go $GOVER"
+else
+    echo -e "  - Go $GOVER (skipped in CI environment)"
+fi
 echo
 
 # Ask for confirmation unless -y flag is used
@@ -234,51 +238,56 @@ print_success "ldd found: $(ldd --version 2>&1 | head -1)"
 
 print_section "Installing Go $GOVER"
 
-install_go() {
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "aarch64" ]; then
-        ARCH="arm64"
-    elif [ "$ARCH" = "x86_64" ]; then
-        ARCH="amd64"
+# Skip Go installation in CI environment
+if [ "${CI}" = "true" ]; then
+    echo -e "${YELLOW}CI environment detected. Skipping Go installation...${NC}"
+else
+    install_go() {
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "aarch64" ]; then
+            ARCH="arm64"
+        elif [ "$ARCH" = "x86_64" ]; then
+            ARCH="amd64"
+        else
+            echo "Unsupported architecture: $ARCH"
+            exit 1
+        fi
+        # Download Go
+        echo "Downloading Go $GOVER..."
+        wget -q --show-progress https://go.dev/dl/go$GOVER.linux-$ARCH.tar.gz
+        check_success "Failed to download Go $GOVER"
+
+        # Install Go
+        echo "Installing Go $GOVER..."
+        tar -C /usr/local -xzf go$GOVER.linux-$ARCH.tar.gz
+        check_success "Failed to install Go $GOVER"
+
+        # Clean up downloaded file
+        rm -f go$GOVER.linux-$ARCH.tar.gz
+        check_success "Failed to clean up Go installation file"
+
+        print_success "Go $GOVER installed successfully"
+    }
+
+    # Check if Go is already installed
+    if command -v go &> /dev/null; then
+        GO_VERSION=$(go version | awk '{print $3}')
+        if [[ "$GO_VERSION" == "go$GOVER" ]]; then
+            echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
+        else
+            echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
+            install_go
+        fi
     else
-        echo "Unsupported architecture: $ARCH"
-        exit 1
-    fi
-    # Download Go
-    echo "Downloading Go $GOVER..."
-    wget -q --show-progress https://go.dev/dl/go$GOVER.linux-$ARCH.tar.gz
-    check_success "Failed to download Go $GOVER"
-
-    # Install Go
-    echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf go$GOVER.linux-$ARCH.tar.gz
-    check_success "Failed to install Go $GOVER"
-
-    # Clean up downloaded file
-    rm -f go$GOVER.linux-$ARCH.tar.gz
-    check_success "Failed to clean up Go installation file"
-
-    print_success "Go $GOVER installed successfully"
-}
-
-# Check if Go is already installed
-if command -v go &> /dev/null; then
-    GO_VERSION=$(go version | awk '{print $3}')
-    if [[ "$GO_VERSION" == "go$GOVER" ]]; then
-        echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
-    else
-        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
         install_go
     fi
-else
-    install_go
-fi
 
-# Add Go to PATH if not already there
-if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
-    echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-    echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
+    # Add Go to PATH if not already there
+    if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
+        echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
+        echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+        echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
+    fi
 fi
 
 # Return to the repository root
@@ -291,7 +300,13 @@ echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} yalantinglibs"
 echo -e "  ${GREEN}✓${NC} Git submodules"
-echo -e "  ${GREEN}✓${NC} Go $GOVER"
+if [ "${CI}" = "true" ]; then
+    echo -e "  ${YELLOW}○${NC} Go $GOVER (skipped in CI)"
+else
+    echo -e "  ${GREEN}✓${NC} Go $GOVER"
+fi
 echo
 echo -e "You can now build and run Mooncake."
-echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
+if [ "${CI}" != "true" ]; then
+    echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
+fi
