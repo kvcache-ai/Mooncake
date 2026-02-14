@@ -77,7 +77,9 @@ class InProcMaster {
             wms_cfg.enable_metric_reporting = false;
             wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
             wms_cfg.eviction_high_watermark_ratio =
-                DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+                config.eviction_high_watermark_ratio.has_value()
+                    ? config.eviction_high_watermark_ratio.value()
+                    : DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
             wms_cfg.view_version = 0;
             // Use default client_live_ttl_sec to align with production defaults
             wms_cfg.enable_ha = false;
