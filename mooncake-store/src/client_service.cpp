@@ -2437,10 +2437,10 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 }
 
 size_t Client::GetLocalHotCacheSizeFromEnv() {
-    if (const char* ev_size = std::getenv("LOCAL_HOT_CACHE_SIZE")) {
+    if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
         std::string ev_size_str(ev_size);
-        std::string error_msg = "Invalid LOCAL_HOT_CACHE_SIZE='" + ev_size_str +
-                                "', disable local hot cache";
+        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_CACHE_SIZE='" +
+                                ev_size_str + "', disable local hot cache";
         // Check for negative values
         if (!ev_size_str.empty() && ev_size_str[0] == '-') {
             LOG(WARNING) << error_msg;
@@ -2463,9 +2463,10 @@ size_t Client::GetLocalHotCacheSizeFromEnv() {
 }
 
 size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
-    if (const char* ev_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE")) {
+    if (const char* ev_block_size =
+            std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE")) {
         std::string ev_block_size_str(ev_block_size);
-        std::string error_msg = "Invalid LOCAL_HOT_BLOCK_SIZE='" +
+        std::string error_msg = "Invalid MC_STORE_LOCAL_HOT_BLOCK_SIZE='" +
                                 ev_block_size_str +
                                 "', using default block size";
         // Check for negative values
@@ -2490,13 +2491,13 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 }
 
 ErrorCode Client::InitLocalHotCache() {
-    // Defaults: hot cache is disabled unless LOCAL_HOT_CACHE_SIZE is set to a
-    // positive value; when enabled, default block size is 16MB and thread_num
-    // is 2.
+    // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
+    // set to a positive value; when enabled, default block size is 16MB and
+    // thread_num is 2.
     size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
     size_t thread_num = 2;
 
-    // Read LOCAL_HOT_CACHE_SIZE from environment
+    // Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment
     size_t total_cache = GetLocalHotCacheSizeFromEnv();
     if (total_cache == 0) {
         // Environment variable not set or invalid, disable cache
@@ -2505,12 +2506,20 @@ ErrorCode Client::InitLocalHotCache() {
         return ErrorCode::OK;
     }
 
-    // Read LOCAL_HOT_BLOCK_SIZE from environment
+    // Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment
     block_size = GetLocalHotBlockSizeFromEnv(block_size);
+
+    // MC_STORE_LOCAL_HOT_CACHE_USE_SHM: "1" enables memfd-backed shm (default
+    // off). When enabled, hot cache is shareable with dummy clients via IPC.
+    bool use_shm = false;
+    if (const char* ev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM")) {
+        use_shm = (std::string(ev) == "1");
+    }
 
     // Enable hot cache
     {
-        hot_cache_ = std::make_shared<LocalHotCache>(total_cache, block_size);
+        hot_cache_ =
+            std::make_shared<LocalHotCache>(total_cache, block_size, use_shm);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
             LOG(ERROR)
@@ -2522,7 +2531,8 @@ ErrorCode Client::InitLocalHotCache() {
         }
         LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
                   << ", block size=" << block_size
-                  << ", block amount=" << hot_cache_->GetCacheSize();
+                  << ", block amount=" << hot_cache_->GetCacheSize()
+                  << ", shm=" << (use_shm ? "on" : "off");
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
@@ -2537,10 +2547,9 @@ void Client::ProcessSlicesAsync(const std::string& key,
         return;
     }
 
-    const auto& mem_desc = replica.get_memory_descriptor();
-
-    // Only cache slices that came from TE transfer (non-local).
-    if (mem_desc.buffer_descriptor.transport_endpoint_ == local_hostname_) {
+    // Skip local data unless hot cache is in shm mode (shared with dummy
+    // clients who need local data cached for zero-copy access).
+    if (!hot_cache_->IsShm() && IsReplicaOnLocalMemory(replica)) {
         return;
     }
 

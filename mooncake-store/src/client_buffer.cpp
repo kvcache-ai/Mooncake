@@ -86,14 +86,24 @@ BufferHandle::BufferHandle(
     mooncake::offset_allocator::OffsetAllocationHandle handle)
     : allocator_(std::move(allocator)), handle_(std::move(handle)) {}
 
+BufferHandle::BufferHandle(void* ptr, size_t size,
+                           std::function<void()> release_fn)
+    : view_ptr_(ptr), view_size_(size), release_fn_(std::move(release_fn)) {}
+
 BufferHandle::~BufferHandle() {
-    // The OffsetAllocationHandle destructor will automatically deallocate
-    // No need to manually call deallocate
+    if (release_fn_) {
+        release_fn_();
+    }
+    // Otherwise OffsetAllocationHandle destructor handles deallocation
 }
 
-void* BufferHandle::ptr() const { return handle_.ptr(); }
+void* BufferHandle::ptr() const {
+    return view_ptr_ ? view_ptr_ : handle_.ptr();
+}
 
-size_t BufferHandle::size() const { return handle_.size(); }
+size_t BufferHandle::size() const {
+    return view_ptr_ ? view_size_ : handle_.size();
+}
 
 // Utility functions for buffer and slice management
 std::vector<Slice> split_into_slices(BufferHandle& handle) {

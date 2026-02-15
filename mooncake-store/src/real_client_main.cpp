@@ -31,8 +31,6 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
-    server.register_handler<&RealClient::get_buffer_info_dummy_helper>(
-        &real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(
@@ -43,6 +41,14 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::acquire_hot_cache>(&real_client);
+    server.register_handler<&RealClient::release_hot_cache>(&real_client);
+    server.register_handler<&RealClient::batch_acquire_hot_cache>(&real_client);
+    server.register_handler<&RealClient::batch_release_hot_cache>(&real_client);
+    server.register_handler<&RealClient::acquire_buffer_dummy>(&real_client);
+    server.register_handler<&RealClient::release_buffer_dummy>(&real_client);
+    server.register_handler<&RealClient::batch_acquire_buffer_dummy>(
+        &real_client);
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);

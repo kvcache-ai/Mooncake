@@ -41,6 +41,7 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
+add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
