@@ -201,6 +201,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #else
 
+#ifdef USE_UBSHMEM
+    Transport* ubshmem_transport =
+        multi_transports_->installTransport("ubshmem", local_topology_);
+    if (!ubshmem_transport) {
+        LOG(ERROR) << "Failed to install UBShmem transport";
+        return -1;
+    }
+    auto_discover_ = false;
+#endif
+
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
