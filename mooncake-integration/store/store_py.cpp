@@ -246,6 +246,59 @@ inline int to_py_ret(ErrorCode error_code) {
     return static_cast<int>(error_code);
 }
 }  // namespace
+// Forward declaration for builder return type
+class MooncakeStorePyWrapper;
+// A lightweight Python-side builder that collects parameters and
+// invokes the existing setup() to initialize the store.
+class MooncakeStoreBuilderPy {
+   public:
+    // Defaults aligned with MooncakeDistributedStore.setup signature
+    std::string local_hostname_ = "";
+    std::string metadata_server_ = "";
+    size_t global_segment_size_ = 1024 * 1024 * 16;  // 16MB
+    size_t local_buffer_size_ = 1024 * 1024 * 16;    // 16MB
+    std::string protocol_ = "tcp";
+    std::string rdma_devices_ = "";
+    std::string master_server_addr_ = "127.0.0.1:50051";
+    py::object engine_ = py::none();
+
+    // Chainable setters
+    MooncakeStoreBuilderPy &local_hostname(const std::string &v) {
+        local_hostname_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &metadata_server(const std::string &v) {
+        metadata_server_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &global_segment_size(size_t v) {
+        global_segment_size_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &local_buffer_size(size_t v) {
+        local_buffer_size_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &protocol(const std::string &v) {
+        protocol_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &rdma_devices(const std::string &v) {
+        rdma_devices_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &master_server_addr(const std::string &v) {
+        master_server_addr_ = v;
+        return *this;
+    }
+    MooncakeStoreBuilderPy &engine(const py::object &obj) {
+        engine_ = obj;
+        return *this;
+    }
+
+    // Build and return a ready-to-use store (defined after wrapper type)
+    MooncakeStorePyWrapper build() const;
+};
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
    public:
@@ -889,6 +942,33 @@ class MooncakeHostMemAllocatorPyWrapper {
     ~MooncakeHostMemAllocatorPyWrapper() { shm_helper_ = nullptr; }
 };
 
+// Define builder::build() now that MooncakeStorePyWrapper is complete
+inline MooncakeStorePyWrapper MooncakeStoreBuilderPy::build() const {
+    MooncakeStorePyWrapper wrapper;
+
+    // Convert optional engine
+    std::shared_ptr<TransferEngine> transfer_engine = nullptr;
+    if (!engine_.is_none()) {
+        transfer_engine = engine_.cast<std::shared_ptr<TransferEngine>>();
+    }
+
+    // Execute setup with GIL released
+    int rc = 0;
+    {
+        py::gil_scoped_release release_gil;
+        rc = wrapper.store_->setup(local_hostname_, metadata_server_,
+                                   global_segment_size_, local_buffer_size_,
+                                   protocol_, rdma_devices_,
+                                   master_server_addr_, transfer_engine);
+    }
+    if (rc != 0) {
+        throw std::runtime_error(
+            std::string("Mooncake store setup failed, error code: ") +
+            std::to_string(rc));
+    }
+    return wrapper;
+}
+
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
@@ -1050,6 +1130,11 @@ PYBIND11_MODULE(store, m) {
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        // Provide a static builder() for convenience:
+        // MooncakeDistributedStore.builder()
+        .def_static(
+            "builder", []() { return MooncakeStoreBuilderPy(); },
+            "Create a new StoreBuilder to configure and build a store")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
@@ -1627,6 +1712,42 @@ PYBIND11_MODULE(store, m) {
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
             "success, error code: 0 if success, non-zero if failure)");
+
+    // Expose Python-side StoreBuilder
+    py::class_<MooncakeStoreBuilderPy>(m, "StoreBuilder")
+        .def(py::init<>())
+        .def("local_hostname", &MooncakeStoreBuilderPy::local_hostname,
+             py::return_value_policy::reference_internal,
+             "Set local hostname, e.g. 'host1' or 'host1:port'")
+        .def("metadata_server", &MooncakeStoreBuilderPy::metadata_server,
+             py::return_value_policy::reference_internal,
+             "Set metadata server connection string, e.g. '127.0.0.1:8080'")
+        .def("global_segment_size",
+             &MooncakeStoreBuilderPy::global_segment_size,
+             py::return_value_policy::reference_internal,
+             "Set total global segment size in bytes (for MountSegment)")
+        .def("local_buffer_size", &MooncakeStoreBuilderPy::local_buffer_size,
+             py::return_value_policy::reference_internal,
+             "Set size of local buffer allocator in bytes")
+        .def("protocol", &MooncakeStoreBuilderPy::protocol,
+             py::return_value_policy::reference_internal,
+             "Set transport protocol, e.g. 'tcp'|'rdma'|'ascend'")
+        .def("rdma_devices", &MooncakeStoreBuilderPy::rdma_devices,
+             py::return_value_policy::reference_internal,
+             "Set RDMA device names, e.g. 'mlx5_0' or ''")
+        .def("master_server_addr", &MooncakeStoreBuilderPy::master_server_addr,
+             py::return_value_policy::reference_internal,
+             "Set master server address, default '127.0.0.1:50051'")
+        .def("engine", &MooncakeStoreBuilderPy::engine,
+             py::return_value_policy::reference_internal,
+             "Set existing TransferEngine instance or None")
+        .def("build", &MooncakeStoreBuilderPy::build,
+             "Build and return a ready MooncakeDistributedStore instance");
+
+    // Module-level factory function: store.builder()
+    m.def(
+        "builder", []() { return MooncakeStoreBuilderPy(); },
+        "Create a new StoreBuilder to configure and build a store");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(
