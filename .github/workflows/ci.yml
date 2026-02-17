@@ -586,3 +586,32 @@ jobs:
         echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
+
+  clang-tidy:
+    name: Run clang-tidy checks
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout Actions Repository
+      uses: actions/checkout@v4
+
+    - name: Install clang-tidy 20
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 20
+        sudo apt-get install -y clang-tidy-20
+
+    - name: Install dependencies
+      run: |
+        sudo apt update -y
+        sudo bash -x dependencies.sh -y
+
+    - name: Generate compile_commands.json
+      run: |
+        mkdir build
+        cd build
+        cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ..
+
+    - name: Run clang-tidy
+      run: make tidy
+      shell: bash
