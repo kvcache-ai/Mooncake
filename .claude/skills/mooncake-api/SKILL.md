@@ -338,7 +338,7 @@ config.with_soft_pin = True
 
 # Store tensor with replication
 tensor = torch.randn(1000, 1000)
-store.pub_tensor("weights", tensor, config)
+store.put_tensor("weights", tensor, config)
 
 # Retrieve
 retrieved = store.get_tensor("weights")
