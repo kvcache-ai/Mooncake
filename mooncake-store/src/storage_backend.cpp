@@ -2095,8 +2095,10 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Add O_DIRECT flag when using uring for direct I/O
-    if (file_storage_config_.use_uring) {
+    // Use O_DIRECT only for reads: write latency is not sensitive in this
+    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
+    // corrupts meta file parsing and wastes disk space on data files.
+    if (file_storage_config_.use_uring && mode == FileMode::Read) {
         flags |= O_DIRECT;
     }
 #endif
@@ -2108,7 +2110,7 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring) {
+    if (file_storage_config_.use_uring && mode == FileMode::Read) {
         return std::make_unique<UringFile>(path, fd, 32, true);
     }
 #endif
