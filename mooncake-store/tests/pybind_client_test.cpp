@@ -817,7 +817,8 @@ TEST_F(RealClientTest, ErrOperationsBeforeSetup) {
     EXPECT_LT(py_client_->getSize(key), 0)
         << "getSize before setup should return negative";
 
-    py_client_->removeAll();
+    EXPECT_NE(py_client_->removeAll(), 0)
+        << "removeAll before setup should fail";
     // tearDownAll should be idempotent even before setup
     EXPECT_EQ(py_client_->tearDownAll(), 0)
         << "tearDownAll before setup should succeed (no-op)";
@@ -943,9 +944,10 @@ TEST_F(RealClientTest, ErrDuplicatePutSameKey) {
     auto buf = py_client_->get_buffer(key);
     ASSERT_NE(buf, nullptr) << "get_buffer should succeed after overwrite";
     EXPECT_EQ(buf->size(), data1.size())
-        << "Buffer size should match the second put";
+        << "Buffer size should match original data from the first put";
     std::string retrieved(static_cast<const char*>(buf->ptr()), buf->size());
-    EXPECT_EQ(retrieved, data1) << "Retrieved data should match the second put";
+    EXPECT_EQ(retrieved, data1)
+        << "Retrieved data should match original data from the first put";
 }
 
 // Buffer registration edge cases
@@ -979,7 +981,8 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
         // Second registration of the same memory
         {
             GLogMuter muter;
-            py_client_->register_buffer(buf, sizeof(buf));
+            EXPECT_NE(py_client_->register_buffer(buf, sizeof(buf)), 0)
+                << "Duplicate registration of the same buffer should fail.";
         }
 
         // Cleanup
