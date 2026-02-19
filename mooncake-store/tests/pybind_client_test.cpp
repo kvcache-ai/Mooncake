@@ -720,31 +720,78 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     py_client2->tearDownAll();
 }
 
+TEST_F(RealClientTest, SetupWithConfigDict) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client using ConfigDict
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+
+    ConfigDict config;
+    auto result = py_client_->setup_internal(config);
+    ASSERT_FALSE(result.has_value()) << "Setup with empty config should fail";
+
+    config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost:17813";
+    config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+    config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_PROTOCOL] = FLAGS_protocol;
+    config[CONFIG_KEY_RDMA_DEVICES] = rdma_devices;
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+
+    result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value()) << "Setup with ConfigDict should succeed";
+
+    const std::string test_data = "Hello, ConfigDict!";
+    const std::string key = "test_key_configdict";
+
+    // Test Put operation
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig rep_config;
+    rep_config.replica_num = 1;
+
+    int put_result = py_client_->put(key, data_span, rep_config);
+    EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+
+    // Test Get operation
+    auto buffer_handle = py_client_->get_buffer(key);
+    ASSERT_TRUE(buffer_handle != nullptr) << "Get buffer should succeed";
+
+    std::string retrieved_data(static_cast<const char*>(buffer_handle->ptr()),
+                               buffer_handle->size());
+    EXPECT_EQ(retrieved_data, test_data) << "Retrieved data should match";
+}
+
 TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
     GLogMuter muter;
     // Case 1: Setup with unreachable master address
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    int rc = py_client_->setup_real(
+    int result = py_client_->setup_real(
         "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
         FLAGS_protocol, rdma_devices, "192.0.2.1:99999");
-    EXPECT_NE(rc, 0) << "Setup with unreachable master should fail";
+    EXPECT_NE(result, 0) << "Setup with unreachable master should fail";
 
     // Case 2: Setup with invalid protocol
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
     master_address_ = master_.master_address();
 
-    rc = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                16 * 1024 * 1024, 16 * 1024 * 1024,
-                                "invalid_protocol", "", master_address_);
-    EXPECT_NE(rc, 0) << "Setup with invalid protocol should fail";
+    result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                    16 * 1024 * 1024, 16 * 1024 * 1024,
+                                    "invalid_protocol", "", master_address_);
+    EXPECT_NE(result, 0) << "Setup with invalid protocol should fail";
 
     // Case 3: Setup with empty hostname
-    rc = py_client_->setup_real("", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                                16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                                master_address_);
-    EXPECT_NE(rc, 0) << "Setup with empty hostname should fail";
+    result = py_client_->setup_real("", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                                    16 * 1024 * 1024, FLAGS_protocol,
+                                    rdma_devices, master_address_);
+    EXPECT_NE(result, 0) << "Setup with empty hostname should fail";
 }
 
 // Operations on uninitialized client (before setup_real)
@@ -919,8 +966,8 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
     {
         char unregistered_buf[64];
         GLogMuter muter;
-        int rc = py_client_->unregister_buffer(unregistered_buf);
-        EXPECT_NE(rc, 0) << "Unregistering unknown buffer should fail";
+        int result = py_client_->unregister_buffer(unregistered_buf);
+        EXPECT_NE(result, 0) << "Unregistering unknown buffer should fail";
     }
 
     // Normal register then duplicate register
