@@ -177,6 +177,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
 
+    // Validate required parameters
+    if (local_hostname.empty()) {
+        LOG(ERROR) << "Using Empty hostname";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Check if hostname already contains a port
     std::string hostname = local_hostname;
     size_t colon_pos = hostname.find(":");
