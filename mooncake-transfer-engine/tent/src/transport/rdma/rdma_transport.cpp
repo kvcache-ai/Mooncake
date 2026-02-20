@@ -345,13 +345,9 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
 }
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
+    if (length < kMrWarmupMinBytes) return false;
     unsigned hwc = std::thread::hardware_concurrency();
-    size_t context_count = 0;
-    for (auto& ctx : context_set_) {
-        if (ctx && ctx->status() == RdmaContext::DEVICE_ENABLED) ++context_count;
-    }
-    if (context_count == 0 || hwc < 4 || length < kMrWarmupMinBytes)
-        return false;
+    if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;
     for (auto& ctx : context_set_) {
         if (ctx && ctx->status() == RdmaContext::DEVICE_ENABLED) {

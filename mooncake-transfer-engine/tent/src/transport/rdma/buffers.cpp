@@ -23,14 +23,19 @@
 
 namespace mooncake {
 namespace tent {
-namespace {
-RdmaContext* pickMrWarmupContext(const std::vector<RdmaContext*>& contexts) {
-    for (auto* context : contexts) {
-        if (context) return context;
-    }
-    return nullptr;
+
+// MR warm-up is only beneficial for large buffers (>4GB) where the overhead
+// of temp registration is amortized by faster actual registration.
+const size_t kMrWarmupMinBytes = 4ull * 1024 * 1024 * 1024;
+
+static unsigned pickMrWarmupThreads(unsigned hwc) {
+    constexpr unsigned kMrWarmupMaxThreads = 8;
+    constexpr unsigned kMrWarmupMaxThreadsHighCore = 16;
+    constexpr unsigned kHighCoreCountThreshold = 64;
+    if (hwc == 0) hwc = 1;
+    if (hwc > kHighCoreCountThreshold) return kMrWarmupMaxThreadsHighCore;
+    return std::min(hwc, kMrWarmupMaxThreads);
 }
-}  // namespace
 
 int warmupMrRegistrationParallel(RdmaContext* context, void* addr,
                                  size_t length) {
