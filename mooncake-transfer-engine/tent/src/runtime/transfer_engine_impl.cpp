@@ -444,6 +444,16 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
+    auto pre_callback = [&](void* addr, size_t length) -> bool {
+        auto transports = getSupportedTransports(options.type);
+        for (auto type : transports) {
+            if (transport_list_[type]->warmupMemory(addr, length)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     auto status = local_segment_tracker_->addInBatch(
         addr_list, size_list,
         [&](std::vector<BufferDesc>& desc_list) -> Status {
@@ -458,7 +468,8 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();
-        });
+        },
+        pre_callback);
     if (!status.ok()) return status;
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers

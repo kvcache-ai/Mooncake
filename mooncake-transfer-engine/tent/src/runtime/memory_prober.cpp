@@ -189,7 +189,8 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
+const std::vector<RangeLocation> getCpuLocation(void* start, size_t len,
+                                                bool skip_prefault = false) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
@@ -205,18 +206,21 @@ const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
     }
 
     // Prefault pages to reduce page-fault overhead during numa_move_pages.
-    const PrefaultResult prefault_result =
-        prefaultPages(pages, n, aligned_start, PrefaultOptions{});
-    if (prefault_result.err != 0) {
-        LOG(WARNING) << "[MemoryProber] Prefault " << prefault_result.method
-                     << " failed with errno=" << prefault_result.err
-                     << ", continuing with unprefaulted pages";
-    } else {
-        VLOG(1) << "[MemoryProber] Prefault succeeded: method="
-                << prefault_result.method
-                << " duration_ms=" << prefault_result.duration_ms
-                << " threads=" << prefault_result.threads
-                << " chunk_bytes=" << prefault_result.chunk_bytes;
+    // Skip if caller has already pinned pages (e.g., via RDMA MR warm-up).
+    if (!skip_prefault) {
+        const PrefaultResult prefault_result =
+            prefaultPages(pages, n, aligned_start, PrefaultOptions{});
+        if (prefault_result.err != 0) {
+            LOG(WARNING) << "[MemoryProber] Prefault " << prefault_result.method
+                         << " failed with errno=" << prefault_result.err
+                         << ", continuing with unprefaulted pages";
+        } else {
+            VLOG(1) << "[MemoryProber] Prefault succeeded: method="
+                    << prefault_result.method
+                    << " duration_ms=" << prefault_result.duration_ms
+                    << " threads=" << prefault_result.threads
+                    << " chunk_bytes=" << prefault_result.chunk_bytes;
+        }
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
@@ -246,7 +250,8 @@ const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
     return entries;
 }
 
-const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size) {
+const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size,
+                                                      bool skip_prefault) {
     location_t list_buf[64];
     for (auto& p : plugins_) {
         if (!p.iface.query_location) continue;
@@ -261,7 +266,7 @@ const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size) {
             return out;
         }
     }
-    return getCpuLocation(addr, size);
+    return getCpuLocation(addr, size, skip_prefault);
 }
 
 std::string MemoryProber::type(void* addr) {
@@ -383,7 +388,8 @@ void MemoryProber::probeDeviceMemory(
                                                      sizeof(pci_bus_id));
         if (err) continue;
 
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+            ;
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
