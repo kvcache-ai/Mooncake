@@ -304,7 +304,8 @@ inline PrefaultResult prefaultPages(void** pages, int n,
 inline bool prefaultBeforeProbe(void** pages, int n, uintptr_t aligned_start,
                                 const char* tag,
                                 const PrefaultOptions& options = {}) {
-    const PrefaultResult result = prefaultPages(pages, n, aligned_start, options);
+    const PrefaultResult result =
+        prefaultPages(pages, n, aligned_start, options);
     if (result.err != 0) {
         LOG(WARNING) << "[" << tag << "] Prefault " << result.method
                      << " failed with errno=" << result.err

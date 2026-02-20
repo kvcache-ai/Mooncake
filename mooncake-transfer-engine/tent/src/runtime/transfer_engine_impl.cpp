@@ -486,8 +486,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
     auto status = local_segment_tracker_->addInBatch(
         desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
             for (auto type : transports) {
-                auto s =
-                    transport_list_[type]->addMemoryBuffer(descs, options);
+                auto s = transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();

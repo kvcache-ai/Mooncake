@@ -55,7 +55,7 @@ class MemoryProber {
     Status memcpy(void* dst, void* src, size_t size);
 
     const std::vector<RangeLocation> locate(void* addr, size_t size,
-                                              bool skip_prefault = false);
+                                            bool skip_prefault = false);
 
     std::string type(void* addr);
 

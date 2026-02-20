@@ -116,9 +116,9 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         for (size_t id = 0; id < context_list_.size(); ++id) {
             auto* context = context_list_[id];
             if (!context) continue;
-            tasks.emplace_back(
-                std::async(std::launch::async, [context, &mem_reg_list, id,
-                                                addr, length, access]() {
+            tasks.emplace_back(std::async(
+                std::launch::async,
+                [context, &mem_reg_list, id, addr, length, access]() {
                     mem_reg_list[id] =
                         context->registerMemReg(addr, length, access);
                 }));

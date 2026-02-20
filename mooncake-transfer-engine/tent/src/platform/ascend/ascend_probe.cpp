@@ -172,9 +172,8 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> AscendPlatform::getLocation(void* start,
-                                                             size_t len,
-                                                             bool skip_prefault) {
+const std::vector<RangeLocation> AscendPlatform::getLocation(
+    void* start, size_t len, bool skip_prefault) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 

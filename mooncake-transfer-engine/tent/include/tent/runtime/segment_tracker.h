@@ -46,9 +46,8 @@ class SegmentTracker {
     Status query(uint64_t base, size_t length,
                  std::vector<BufferDesc*>& result);
 
-    Status addInBatch(
-        std::vector<BufferDesc>& desc_list,
-        std::function<Status(std::vector<BufferDesc>&)> callback);
+    Status addInBatch(std::vector<BufferDesc>& desc_list,
+                      std::function<Status(std::vector<BufferDesc>&)> callback);
 
     Status add(uint64_t base, size_t length,
                std::function<Status(BufferDesc&)> callback);
