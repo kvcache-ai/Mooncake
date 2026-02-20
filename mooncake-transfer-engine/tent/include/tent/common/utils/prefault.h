@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -37,7 +38,6 @@ namespace tent {
 struct PrefaultCapabilities {
     bool madvise_available = false;
     bool mlock_available = false;
-    bool detected = false;
 
     static PrefaultCapabilities& getInstance() {
         static PrefaultCapabilities instance;
@@ -45,15 +45,19 @@ struct PrefaultCapabilities {
     }
 
     void detect() {
-        if (detected) return;
+        std::call_once(detect_flag_, [this]() { detectOnce(); });
+    }
 
+   private:
+    std::once_flag detect_flag_;
+
+    void detectOnce() {
         // Use mmap (not malloc) so the test region is page-aligned and
         // backed by a proper VMA – required by MADV_POPULATE_WRITE.
         const size_t test_size = 4096;
         void* test_mem = mmap(nullptr, test_size, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (test_mem == MAP_FAILED) {
-            detected = true;
             return;
         }
 
@@ -83,7 +87,6 @@ struct PrefaultCapabilities {
         }
 
         munmap(test_mem, test_size);
-        detected = true;
 
         // Log detected capabilities once for visibility
         LOG(INFO) << "Prefault capability detection: madvise="
@@ -166,7 +169,6 @@ inline PrefaultResult prefaultPages(void** pages, int n,
             size_t madvise_chunk = options.madvise_chunk_bytes;
             unsigned madvise_threads = static_cast<unsigned>(
                 (aligned_len + madvise_chunk - 1) / madvise_chunk);
-            if (madvise_threads == 0) madvise_threads = 1;
             unsigned madvise_thread_cap =
                 std::min(hwc, options.max_madvise_threads);
             if (madvise_threads > madvise_thread_cap) {

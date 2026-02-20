@@ -494,6 +494,8 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length,
                                               IBV_ACCESS_LOCAL_WRITE);
     if (!entry) {
+        PLOG(WARNING) << "ibv_reg_mr warm-up failed on " << device_name_
+                      << " for [" << addr << ", " << length << " bytes]";
         return -1;
     }
 

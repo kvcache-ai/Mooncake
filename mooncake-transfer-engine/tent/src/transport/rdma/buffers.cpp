@@ -109,7 +109,7 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                                                   nullptr);
     bool use_parallel_reg = !force_sequential && context_count > 1;
     if (use_parallel_reg) {
-        std::vector<std::pair<size_t, std::future<void>>> tasks;
+        std::vector<std::future<void>> tasks;
         tasks.reserve(context_count);
         void* addr = (void*)desc.addr;
         size_t length = desc.length;
@@ -117,13 +117,13 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             auto* context = context_list_[id];
             if (!context) continue;
             tasks.emplace_back(
-                id, std::async(std::launch::async, [context, &mem_reg_list, id,
-                                                    addr, length, access]() {
+                std::async(std::launch::async, [context, &mem_reg_list, id,
+                                                addr, length, access]() {
                     mem_reg_list[id] =
                         context->registerMemReg(addr, length, access);
                 }));
         }
-        for (auto& task : tasks) task.second.get();
+        for (auto& task : tasks) task.get();
     } else {
         for (size_t id = 0; id < context_list_.size(); ++id) {
             auto* context = context_list_[id];
