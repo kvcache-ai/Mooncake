@@ -22,7 +22,6 @@
 #include "tent/runtime/platform.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment_registry.h"
-#include "tent/common/utils/os.h"
 
 namespace mooncake {
 namespace tent {
@@ -86,51 +85,26 @@ Status SegmentTracker::add(uint64_t base, size_t length,
 }
 
 Status SegmentTracker::addInBatch(
-    std::vector<void*> base_list, std::vector<size_t> length_list,
-    std::function<Status(std::vector<BufferDesc>&)> callback,
-    std::function<bool(void* addr, size_t length)> pre_callback) {
-    assert(base_list.size() == length_list.size());
+    std::vector<BufferDesc>& desc_list,
+    std::function<Status(std::vector<BufferDesc>&)> callback) {
     std::vector<BufferDesc> new_desc_list;
-    for (size_t i = 0; i < base_list.size(); ++i) {
-        uint64_t base = (uint64_t)base_list[i];
-        size_t length = length_list[i];
+    for (auto& desc : desc_list) {
         bool found = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(local_desc_->type == SegmentType::Memory);
             auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
             for (auto& buf : detail.buffers) {
-                if (buf.addr == base && buf.length == length) {
+                if (buf.addr == desc.addr && buf.length == desc.length) {
                     buf.ref_count++;
                     found = true;
                     break;
                 }
             }
         }
-        if (found) continue;
-        BufferDesc new_desc;
-        new_desc.addr = base;
-        new_desc.length = length;
-        bool skip_prefault = false;
-        if (pre_callback) {
-            skip_prefault = pre_callback((void*)base, length);
-        }
-        auto entries =
-            Platform::getLoader().getLocation((void*)base, length, skip_prefault);
-        if (entries.size() == 1)
-            new_desc.location = entries[0].location;
-        else {
-            new_desc.location = entries[0].location;
-            for (auto& entry : entries)
-                new_desc.regions.push_back(Region{entry.len, entry.location});
-        }
-        new_desc.ref_count = 1;
-        new_desc_list.push_back(new_desc);
+        if (!found) new_desc_list.push_back(std::move(desc));
     }
-    // auto start_ts = getCurrentTimeInNano();
     auto status = callback(new_desc_list);
-    // auto end_ts = getCurrentTimeInNano();
-    // LOG(INFO) << "Reg time: " << (end_ts - start_ts) / 1000000.0 << " ms";
     if (!status.ok()) return status;
     {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -28,6 +28,7 @@
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -444,32 +445,53 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
-    auto pre_callback = [&](void* addr, size_t length) -> bool {
-        auto transports = getSupportedTransports(options.type);
+    auto transports = getSupportedTransports(options.type);
+
+    // Build BufferDescs: warm-up → NUMA probe → fill location
+    std::vector<BufferDesc> desc_list;
+    desc_list.reserve(addr_list.size());
+    for (size_t i = 0; i < addr_list.size(); ++i) {
+        BufferDesc desc;
+        desc.addr = (uint64_t)addr_list[i];
+        desc.length = size_list[i];
+
+        // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
+        // subsequent RDMA registration and NUMA probing
+        bool pages_pinned = false;
         for (auto type : transports) {
-            if (transport_list_[type]->warmupMemory(addr, length)) {
-                return true;
+            if (transport_list_[type]->warmupMemory(addr_list[i],
+                                                    size_list[i])) {
+                pages_pinned = true;
+                break;
             }
         }
-        return false;
-    };
+
+        // NUMA probe: skip prefault if warm-up already pinned pages
+        auto entries = Platform::getLoader().getLocation(
+            addr_list[i], size_list[i], pages_pinned);
+        if (entries.size() == 1) {
+            desc.location = entries[0].location;
+        } else {
+            desc.location = entries[0].location;
+            for (auto& entry : entries)
+                desc.regions.push_back(Region{entry.len, entry.location});
+        }
+        desc.ref_count = 1;
+        if (options.location != kWildcardLocation)
+            desc.location = options.location;
+        if (options.internal) desc.internal = options.internal;
+        desc_list.push_back(std::move(desc));
+    }
 
     auto status = local_segment_tracker_->addInBatch(
-        addr_list, size_list,
-        [&](std::vector<BufferDesc>& desc_list) -> Status {
-            if (options.location != kWildcardLocation)
-                for (auto& desc : desc_list) desc.location = options.location;
-            if (options.internal)
-                for (auto& desc : desc_list) desc.internal = options.internal;
-            auto transports = getSupportedTransports(options.type);
+        desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
             for (auto type : transports) {
                 auto s =
-                    transport_list_[type]->addMemoryBuffer(desc_list, options);
+                    transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();
-        },
-        pre_callback);
+        });
     if (!status.ok()) return status;
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
