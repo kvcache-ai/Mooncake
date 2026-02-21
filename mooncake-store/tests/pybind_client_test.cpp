@@ -775,7 +775,7 @@ TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
                                          : std::string("");
     int result = py_client_->setup_real(
         "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
-        FLAGS_protocol, rdma_devices, "192.0.2.1:99999");
+        FLAGS_protocol, rdma_devices, "192.0.2.1:1");
     EXPECT_NE(result, 0) << "Setup with unreachable master should fail";
 
     // Case 2: Setup with invalid protocol
@@ -942,7 +942,7 @@ TEST_F(RealClientTest, ErrDuplicatePutSameKey) {
 
     // If the second put succeeds, verify we get the original data
     auto buf = py_client_->get_buffer(key);
-    ASSERT_NE(buf, nullptr) << "get_buffer should succeed after overwrite";
+    ASSERT_NE(buf, nullptr) << "get_buffer should succeed";
     EXPECT_EQ(buf->size(), data1.size())
         << "Buffer size should match original data from the first put";
     std::string retrieved(static_cast<const char*>(buf->ptr()), buf->size());

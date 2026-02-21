@@ -179,7 +179,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     // Validate required parameters
     if (local_hostname.empty()) {
-        LOG(ERROR) << "Using Empty hostname";
+        LOG(ERROR) << "local_hostname is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
