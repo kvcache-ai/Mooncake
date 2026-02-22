@@ -173,7 +173,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
             uint64_t file_size = entry.file_size(ec);
             if (!ec) {
                 const std::string& path_str = entry.path().string();
-                file_write_queue_.push_back({path_str, file_size});
+                file_write_queue_.push_back({path_str, file_size, ""});
                 file_queue_map_[path_str] = std::prev(file_write_queue_.end());
                 used_space_ += file_size;
             } else {
@@ -245,8 +245,8 @@ bool StorageBackend::InitQuotaEvict() {
             break;
         }
 
-        std::string evicted_file = EvictFile();
-        if (evicted_file.empty()) {
+        FileRecord evicted = EvictFile();
+        if (evicted.path.empty()) {
             LOG(ERROR) << "Failed to evict file to meet quota. "
                        << "The queue might be empty or a file is unremovable.";
             return false;
@@ -269,14 +269,16 @@ bool StorageBackend::InitQuotaEvict() {
     return true;
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::vector<Slice>& slices) {
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::vector<Slice>& slices,
+    const std::string& key) {
     size_t total_size = 0;
     for (const auto& slice : slices) {
         total_size += slice.size;
     }
 
     // For eviction-enabled mode, check space and reserve
+    std::vector<std::string> evicted_keys;
     uint64_t reserved_size = 0;
     if (IsEvictionEnabled()) {
         if (!initialized_.load(std::memory_order_acquire)) {
@@ -288,8 +290,9 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
         auto space_result = EnsureDiskSpace(total_size);
         if (!space_result) {
-            return space_result;
+            return tl::make_unexpected(space_result.error());
         }
+        evicted_keys = std::move(space_result.value());
         reserved_size = total_size;
     }
 
@@ -307,22 +310,24 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     // For eviction-enabled mode, add file to tracking queue
     if (IsEvictionEnabled()) {
-        AddFileToWriteQueue(path, total_size);
+        AddFileToWriteQueue(path, total_size, key);
     }
 
-    return {};
+    return evicted_keys;
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::string& str) {
-    return StoreObject(path, std::span<const char>(str.data(), str.size()));
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::string& str, const std::string& key) {
+    return StoreObject(path, std::span<const char>(str.data(), str.size()), key);
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, std::span<const char> data) {
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, std::span<const char> data,
+    const std::string& key) {
     size_t file_total_size = data.size();
 
     // For eviction-enabled mode, check space and reserve
+    std::vector<std::string> evicted_keys;
     uint64_t reserved_size = 0;
     if (IsEvictionEnabled()) {
         if (!initialized_.load(std::memory_order_acquire)) {
@@ -334,8 +339,9 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
         auto space_result = EnsureDiskSpace(file_total_size);
         if (!space_result) {
-            return space_result;
+            return tl::make_unexpected(space_result.error());
         }
+        evicted_keys = std::move(space_result.value());
         reserved_size = file_total_size;
     }
 
@@ -353,10 +359,10 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     // For eviction-enabled mode, add file to tracking queue
     if (IsEvictionEnabled()) {
-        AddFileToWriteQueue(path, file_total_size);
+        AddFileToWriteQueue(path, file_total_size, key);
     }
 
-    return {};
+    return evicted_keys;
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
@@ -791,12 +797,12 @@ bool StorageBackend::CheckDiskSpace(size_t required_size) {
     return has_enough_space;
 }
 
-std::string StorageBackend::EvictFile() {
+FileRecord StorageBackend::EvictFile() {
     // Eviction is only enabled for local storage
     if (!IsEvictionEnabled()) {
         LOG(WARNING)
             << "Eviction is disabled for 3FS mode. Cannot evict files.";
-        return "";
+        return {};
     }
 
     // Use FIFO based strategy (earliest written first out)
@@ -804,7 +810,7 @@ std::string StorageBackend::EvictFile() {
 
     if (record_to_evict.path.empty()) {
         LOG(WARNING) << "No file selected for eviction";
-        return "";
+        return {};
     }
 
     namespace fs = std::filesystem;
@@ -814,22 +820,23 @@ std::string StorageBackend::EvictFile() {
     if (fs::remove(record_to_evict.path, ec)) {
         RemoveFileFromWriteQueue(record_to_evict.path);
         ReleaseSpace(file_size);
-        return record_to_evict.path;
+        return record_to_evict;
     } else {
         if (!ec || ec == std::errc::no_such_file_or_directory) {
             RemoveFileFromWriteQueue(record_to_evict.path);
-            return record_to_evict.path;
+            return record_to_evict;
         } else {
             LOG(ERROR) << "Failed to evict file: " << record_to_evict.path
                        << ", error: " << ec.message();
             RemoveFileFromWriteQueue(record_to_evict.path);
-            return "";
+            return {};
         }
     }
 }
 
 void StorageBackend::AddFileToWriteQueue(const std::string& path,
-                                         uint64_t size) {
+                                         uint64_t size,
+                                         const std::string& key) {
     std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
 
     auto it = file_queue_map_.find(path);
@@ -838,7 +845,7 @@ void StorageBackend::AddFileToWriteQueue(const std::string& path,
         file_queue_map_.erase(it);
     }
 
-    file_write_queue_.push_back({path, size});
+    file_write_queue_.push_back({path, size, key});
     file_queue_map_[path] = std::prev(file_write_queue_.end());
 }
 
@@ -864,12 +871,13 @@ FileRecord StorageBackend::SelectFileToEvictByFIFO() {
     return file_write_queue_.front();
 }
 
-tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::EnsureDiskSpace(
     size_t required_size) {
+    std::vector<std::string> evicted_keys;
     // If eviction is disabled (3FS mode), skip space checking and eviction
     // Let 3FS filesystem handle space management itself
     if (!IsEvictionEnabled()) {
-        return {};
+        return evicted_keys;
     }
 
     const size_t kMaxEvictionAttempts = 1000;
@@ -878,10 +886,13 @@ tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
     bool space_reserved = CheckDiskSpace(required_size);
 
     while (!space_reserved && attempts < kMaxEvictionAttempts) {
-        std::string evicted_file = EvictFile();
-        if (evicted_file.empty()) {
+        FileRecord evicted = EvictFile();
+        if (evicted.path.empty()) {
             LOG(ERROR) << "Failed to evict file to make space.";
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (!evicted.key.empty()) {
+            evicted_keys.push_back(evicted.key);
         }
         attempts++;
 
@@ -893,7 +904,7 @@ tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    return {};
+    return evicted_keys;
 }
 
 void StorageBackend::ReleaseSpace(uint64_t size_to_release) {

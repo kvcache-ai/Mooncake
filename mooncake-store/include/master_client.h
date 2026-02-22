@@ -392,6 +392,15 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
         const TaskCompleteRequest& task_complete);
 
+    /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, ReplicaType replica_type);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations
