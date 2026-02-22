@@ -869,9 +869,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     auto& metadata = accessor.Get();
 
     if (replica_type == ReplicaType::DISK) {
-        metadata.EraseReplicas([](const Replica& replica) {
-            return replica.is_disk_replica();
-        });
+        metadata.EraseReplicas(
+            [](const Replica& replica) { return replica.is_disk_replica(); });
         MasterMetricManager::instance().dec_file_cache_nums();
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
         metadata.EraseReplicas([&client_id](const Replica& replica) {

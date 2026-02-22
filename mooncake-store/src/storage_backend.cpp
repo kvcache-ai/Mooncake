@@ -318,7 +318,8 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
 
 tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     const std::string& path, const std::string& str, const std::string& key) {
-    return StoreObject(path, std::span<const char>(str.data(), str.size()), key);
+    return StoreObject(path, std::span<const char>(str.data(), str.size()),
+                       key);
 }
 
 tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
@@ -834,8 +835,7 @@ FileRecord StorageBackend::EvictFile() {
     }
 }
 
-void StorageBackend::AddFileToWriteQueue(const std::string& path,
-                                         uint64_t size,
+void StorageBackend::AddFileToWriteQueue(const std::string& path, uint64_t size,
                                          const std::string& key) {
     std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
 
@@ -871,8 +871,8 @@ FileRecord StorageBackend::SelectFileToEvictByFIFO() {
     return file_write_queue_.front();
 }
 
-tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::EnsureDiskSpace(
-    size_t required_size) {
+tl::expected<std::vector<std::string>, ErrorCode>
+StorageBackend::EnsureDiskSpace(size_t required_size) {
     std::vector<std::string> evicted_keys;
     // If eviction is disabled (3FS mode), skip space checking and eviction
     // Let 3FS filesystem handle space management itself

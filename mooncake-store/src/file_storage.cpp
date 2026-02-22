@@ -309,8 +309,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
 
         auto eviction_handler = [this](const std::string& evicted_key) {
-            auto result = client_->EvictDiskReplica(evicted_key,
-                                                     ReplicaType::LOCAL_DISK);
+            auto result =
+                client_->EvictDiskReplica(evicted_key, ReplicaType::LOCAL_DISK);
             if (!result) {
                 LOG(WARNING)
                     << "Failed to notify master about evicted local disk key: "
