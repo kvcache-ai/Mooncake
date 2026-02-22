@@ -2483,35 +2483,37 @@ TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadWriteDelete) {
     std::mutex buckets_mutex;
     std::vector<int64_t> created_buckets;
     std::unordered_map<std::string, std::string> key_values;
+    int counter = 0;
+    auto write_func = [&]() {
+        std::string key = "stress_key_" + std::to_string(counter++);
+        std::string value = "stress_value_" + std::to_string(counter) + "_data";
+
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+        if (result.has_value()) {
+            write_count.fetch_add(1);
+            std::lock_guard<std::mutex> lock(buckets_mutex);
+            created_buckets.push_back(result.value());
+            key_values[key] = value;
+        }
+    };
+
+    // cold start
+    write_func();
 
     // Writer thread: creates new buckets with unique keys
     std::thread writer_thread([&]() {
-        int counter = 0;
         while (!stop.load()) {
-            std::string key = "stress_key_" + std::to_string(counter++);
-            std::string value =
-                "stress_value_" + std::to_string(counter) + "_data";
-
-            auto buf = std::make_unique<char[]>(value.size());
-            std::memcpy(buf.get(), value.data(), value.size());
-
-            std::unordered_map<std::string, std::vector<Slice>> batch;
-            batch.emplace(key,
-                          std::vector<Slice>{Slice{buf.get(), value.size()}});
-
-            auto result = storage_backend.BatchOffload(
-                batch, [](const std::vector<std::string>&,
-                          std::vector<StorageObjectMetadata>&) {
-                    return ErrorCode::OK;
-                });
-
-            if (result.has_value()) {
-                write_count.fetch_add(1);
-                std::lock_guard<std::mutex> lock(buckets_mutex);
-                created_buckets.push_back(result.value());
-                key_values[key] = value;
-            }
-
+            write_func();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     });
