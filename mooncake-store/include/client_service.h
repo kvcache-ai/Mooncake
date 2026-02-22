@@ -232,7 +232,7 @@ class Client {
      * @param replica_type DISK or LOCAL_DISK
      */
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
-                                                    ReplicaType replica_type);
+                                                   ReplicaType replica_type);
 
     /**
      * @brief Registers a memory segment to master for allocation

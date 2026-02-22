@@ -807,8 +807,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
-    const UUID& client_id, const std::string& key,
-    ReplicaType replica_type) {
+    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
         "EvictDiskReplica",
         [&] {
@@ -819,8 +818,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", replica_type=", replica_type);
         },
-        [] {},
-        [] {});
+        [] {}, [] {});
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(

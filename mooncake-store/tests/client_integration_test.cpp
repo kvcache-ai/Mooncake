@@ -1321,12 +1321,9 @@ class EvictionNotificationTest : public ::testing::Test {
     }
 
     void CreateClientAndMount() {
-        auto client_opt =
-            Client::Create("localhost:17820",       // unique hostname
-                           "P2PHANDSHAKE",
-                           FLAGS_protocol,
-                           std::nullopt,
-                           master_address_);
+        auto client_opt = Client::Create("localhost:17820",  // unique hostname
+                                         "P2PHANDSHAKE", FLAGS_protocol,
+                                         std::nullopt, master_address_);
         ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
         client_ = client_opt.value();
 

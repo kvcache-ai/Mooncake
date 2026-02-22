@@ -147,9 +147,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key);
 
-    tl::expected<void, ErrorCode> EvictDiskReplica(
-        const UUID& client_id, const std::string& key,
-        ReplicaType replica_type);
+    tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
+                                                   const std::string& key,
+                                                   ReplicaType replica_type);
 
    private:
     MasterService master_service_;

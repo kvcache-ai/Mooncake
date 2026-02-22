@@ -453,8 +453,8 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplica_NonExistentKeyReturnsError) {
     auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
 
     UUID client_id = generate_uuid();
-    auto evict_result = service_->EvictDiskReplica(
-        client_id, "nonexistent_key", ReplicaType::DISK);
+    auto evict_result = service_->EvictDiskReplica(client_id, "nonexistent_key",
+                                                   ReplicaType::DISK);
     EXPECT_FALSE(evict_result.has_value());
     EXPECT_EQ(evict_result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
