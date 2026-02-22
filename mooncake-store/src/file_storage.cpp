@@ -308,8 +308,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto offload_res =
-            storage_backend_->BatchOffload(batch_object, complete_handler);
+        auto eviction_handler = [this](const std::string& evicted_key) {
+            auto result = client_->EvictDiskReplica(evicted_key,
+                                                     ReplicaType::LOCAL_DISK);
+            if (!result) {
+                LOG(WARNING)
+                    << "Failed to notify master about evicted local disk key: "
+                    << evicted_key << ", error: " << result.error();
+            }
+        };
+
+        auto offload_res = storage_backend_->BatchOffload(
+            batch_object, complete_handler, eviction_handler);
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
