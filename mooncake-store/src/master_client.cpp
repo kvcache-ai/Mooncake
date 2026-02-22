@@ -212,6 +212,11 @@ struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
     static constexpr const char* value = "MarkTaskToComplete";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
+    static constexpr const char* value = "EvictDiskReplica";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -773,6 +778,17 @@ tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(
     timer.LogRequest("client_id=", client_id_, ", task_id=", task_update.id);
     auto result = invoke_rpc<&WrappedMasterService::MarkTaskToComplete, void>(
         client_id_, task_update);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
+    const std::string& key, ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "MasterClient::EvictDiskReplica");
+    timer.LogRequest("key=", key, ", replica_type=", replica_type);
+
+    auto result = invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
+        client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
 }
