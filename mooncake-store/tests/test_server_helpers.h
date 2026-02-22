@@ -88,7 +88,8 @@ class InProcMaster {
                                       : DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
             if (config.enable_disk_eviction.has_value()) {
-                wms_cfg.enable_disk_eviction = config.enable_disk_eviction.value();
+                wms_cfg.enable_disk_eviction =
+                    config.enable_disk_eviction.value();
             }
             if (config.quota_bytes.has_value()) {
                 wms_cfg.quota_bytes = config.quota_bytes.value();

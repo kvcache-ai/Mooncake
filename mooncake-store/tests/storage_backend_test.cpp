@@ -2709,7 +2709,6 @@ TEST_F(StorageBackendTest, AdaptorBatchOffload_EvictionHandlerCalled) {
         << "FIFO eviction should evict key_1 first";
 }
 
-
 //-----------------------------------------------------------------------------
 
 }  // namespace mooncake::test
