@@ -231,7 +231,9 @@ class StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) = 0;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -624,7 +626,9 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -701,7 +705,9 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -966,7 +972,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.

@@ -1015,7 +1015,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    std::function<void(const std::string& evicted_key)> eviction_handler) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1050,12 +1051,19 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
         std::string kv_buf;
         struct_pb::to_pb(kv, kv_buf);
-        auto store_result = storage_backend_->StoreObject(path, kv_buf);
+        auto store_result = storage_backend_->StoreObject(path, kv_buf, kv.key);
         if (!store_result) {
             LOG(ERROR) << "Failed to store object for key: " << kv.key
                        << ", error: " << store_result.error()
                        << " - continuing with remaining keys";
             continue;  // Continue processing other keys
+        }
+
+        // Notify eviction handler about any evicted keys
+        if (eviction_handler) {
+            for (const auto& evicted_key : store_result.value()) {
+                eviction_handler(evicted_key);
+            }
         }
 
         {
@@ -1276,7 +1284,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    std::function<void(const std::string& evicted_key)> /*eviction_handler*/) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -2536,7 +2545,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    std::function<void(const std::string& evicted_key)> /*eviction_handler*/) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
