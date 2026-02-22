@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1284,6 +1285,182 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
 
     std::free(small_seg_ptr);
     std::free(big_seg_ptr);
+}
+
+// ---------------------------------------------------------------------------
+// Eviction notification integration test
+// Uses a separate InProcMaster with root_fs_dir and small quota_bytes so that
+// StorageBackend triggers FIFO eviction after a few Puts. Verifies that the
+// evicted key's DISK replica is removed from master metadata.
+// ---------------------------------------------------------------------------
+class EvictionNotificationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        // Create a temporary directory for storage
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+                   ("mc_evict_test_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(tmp_dir_);
+
+        // Start master with root_fs_dir pointing to our temp dir and small
+        // quota. The client will discover fsdir = root_fs_dir/cluster_id and
+        // initialise a StorageBackend with the given quota.
+        auto config = InProcMasterConfigBuilder()
+                          .set_root_fs_dir(tmp_dir_.string())
+                          .set_enable_disk_eviction(true)
+                          .set_quota_bytes(kQuotaBytes)
+                          .build();
+        ASSERT_TRUE(master_.Start(config));
+        master_address_ = master_.master_address();
+    }
+
+    void TearDown() override {
+        client_.reset();
+        master_.Stop();
+        std::error_code ec;
+        std::filesystem::remove_all(tmp_dir_, ec);
+    }
+
+    void CreateClientAndMount() {
+        auto client_opt =
+            Client::Create("localhost:17820",       // unique hostname
+                           "P2PHANDSHAKE",
+                           FLAGS_protocol,
+                           std::nullopt,
+                           master_address_);
+        ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
+        client_ = client_opt.value();
+
+        // Mount segment so that PutStart can allocate memory replicas
+        constexpr size_t kSegSize = 64 * 1024 * 1024;  // 64MB
+        seg_ptr_ = allocate_buffer_allocator_memory(kSegSize);
+        ASSERT_NE(seg_ptr_, nullptr);
+        seg_size_ = kSegSize;
+        auto mount = client_->MountSegment(seg_ptr_, seg_size_, FLAGS_protocol);
+        ASSERT_TRUE(mount.has_value())
+            << "MountSegment failed: " << toString(mount.error());
+
+        // Register local memory for client-side buffers
+        alloc_ = std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
+        auto reg = client_->RegisterLocalMemory(
+            alloc_->getBase(), 16 * 1024 * 1024, "cpu:0", false, false);
+        ASSERT_TRUE(reg.has_value())
+            << "RegisterLocalMemory failed: " << toString(reg.error());
+    }
+
+    // Helper: check if a key has a DISK replica in master
+    bool HasDiskReplica(const std::string& key) {
+        auto q = client_->Query(key);
+        if (!q.has_value()) return false;
+        for (const auto& r : q.value().replicas) {
+            if (r.is_disk_replica()) return true;
+        }
+        return false;
+    }
+
+    // Helper: wait until a key has a DISK replica (async PutToLocalFile)
+    bool WaitForDiskReplica(const std::string& key,
+                            std::chrono::milliseconds timeout) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            if (HasDiskReplica(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Helper: wait until a key no longer has a DISK replica
+    bool WaitForNoDiskReplica(const std::string& key,
+                              std::chrono::milliseconds timeout) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            if (!HasDiskReplica(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Quota: 3KB so that 3 × 1KB objects fit, and the 4th triggers eviction
+    static constexpr uint64_t kQuotaBytes = 3 * 1024;
+    static constexpr size_t kValueSize = 1024;
+
+    InProcMaster master_;
+    std::string master_address_;
+    std::filesystem::path tmp_dir_;
+    std::shared_ptr<Client> client_;
+    std::unique_ptr<SimpleAllocator> alloc_;
+    void* seg_ptr_ = nullptr;
+    size_t seg_size_ = 0;
+};
+
+TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
+    CreateClientAndMount();
+
+    // Put 3 keys — should all fit within quota
+    std::vector<std::string> keys;
+    for (int i = 0; i < 3; ++i) {
+        std::string key = "evict_test_key_" + std::to_string(i);
+        std::string payload(kValueSize, 'A' + i);
+
+        void* buf = alloc_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put(" << key << ") failed: " << toString(put.error());
+        alloc_->deallocate(buf, payload.size());
+        keys.push_back(key);
+    }
+
+    // Wait for DISK replicas to appear (PutToLocalFile is async)
+    for (const auto& key : keys) {
+        ASSERT_TRUE(WaitForDiskReplica(key, std::chrono::seconds(10)))
+            << "DISK replica did not appear for key: " << key;
+    }
+
+    // Put a 4th key — triggers eviction of the oldest (key 0) due to FIFO
+    {
+        std::string key = "evict_test_key_3";
+        std::string payload(kValueSize, 'D');
+
+        void* buf = alloc_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put(" << key << ") failed: " << toString(put.error());
+        alloc_->deallocate(buf, payload.size());
+        keys.push_back(key);
+    }
+
+    // Wait for the 4th key's DISK replica to appear
+    ASSERT_TRUE(WaitForDiskReplica(keys[3], std::chrono::seconds(10)))
+        << "DISK replica did not appear for eviction-trigger key";
+
+    // The oldest key (key 0) should have had its DISK replica evicted
+    EXPECT_TRUE(WaitForNoDiskReplica(keys[0], std::chrono::seconds(10)))
+        << "Evicted key's DISK replica was not removed from master";
+
+    // Keys 1..3 should still have DISK replicas
+    for (int i = 1; i <= 3; ++i) {
+        EXPECT_TRUE(HasDiskReplica(keys[i]))
+            << "Key " << keys[i] << " should still have a DISK replica";
+    }
+
+    // Clean up: unmount segment
+    auto unmount = client_->UnmountSegment(seg_ptr_, seg_size_);
+    EXPECT_TRUE(unmount.has_value()) << "UnmountSegment failed";
+    std::free(seg_ptr_);
+    seg_ptr_ = nullptr;
 }
 
 }  // namespace testing
