@@ -2612,5 +2612,61 @@ TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadWriteDelete) {
 }
 
 //-----------------------------------------------------------------------------
+// Tests for FileRecord key tracking and eviction return values
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, StoreObjectReturnsEvictedKeys) {
+    std::string test_dir = data_path + "/evict_return_test";
+    std::filesystem::create_directories(test_dir);
+
+    // Create backend with very small quota (2048 bytes = room for ~2 files of
+    // 1024 bytes)
+    StorageBackend backend(test_dir, "", true);
+    auto init_result = backend.Init(2048);
+    ASSERT_TRUE(init_result.has_value());
+
+    // Fill up storage with keyed objects
+    std::string data(1024, 'X');
+    auto r1 = backend.StoreObject(test_dir + "/f1", data, "key_a");
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_TRUE(r1.value().empty());  // No eviction yet
+
+    auto r2 = backend.StoreObject(test_dir + "/f2", data, "key_b");
+    ASSERT_TRUE(r2.has_value());
+
+    // This write should trigger eviction of key_a (FIFO)
+    auto r3 = backend.StoreObject(test_dir + "/f3", data, "key_c");
+    ASSERT_TRUE(r3.has_value());
+    auto evicted = r3.value();
+    ASSERT_FALSE(evicted.empty());
+    EXPECT_EQ(evicted[0], "key_a");
+}
+
+TEST_F(StorageBackendTest, StoreObjectEvictionWithEmptyKey) {
+    std::string test_dir = data_path + "/evict_empty_key_test";
+    std::filesystem::create_directories(test_dir);
+
+    // Create backend with very small quota
+    StorageBackend backend(test_dir, "", true);
+    auto init_result = backend.Init(2048);
+    ASSERT_TRUE(init_result.has_value());
+
+    // Fill storage without keys (empty string)
+    std::string data(1024, 'Y');
+    auto r1 = backend.StoreObject(test_dir + "/f1", data);
+    ASSERT_TRUE(r1.has_value());
+
+    auto r2 = backend.StoreObject(test_dir + "/f2", data);
+    ASSERT_TRUE(r2.has_value());
+
+    // This should trigger eviction but evicted keys vector should be empty
+    // (evicted file had no key)
+    auto r3 = backend.StoreObject(test_dir + "/f3", data);
+    ASSERT_TRUE(r3.has_value());
+    EXPECT_TRUE(r3.value().empty());
+}
+
+
+//-----------------------------------------------------------------------------
 
 }  // namespace mooncake::test

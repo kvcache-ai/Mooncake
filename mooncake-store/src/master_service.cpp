@@ -856,6 +856,42 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     return results;
 }
 
+auto MasterService::EvictDiskReplica(const UUID& client_id,
+                                     const std::string& key,
+                                     ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(INFO) << "key=" << key << ", info=object_not_found_for_eviction";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& metadata = accessor.Get();
+
+    if (replica_type == ReplicaType::DISK) {
+        metadata.EraseReplicas([](const Replica& replica) {
+            return replica.is_disk_replica();
+        });
+        MasterMetricManager::instance().dec_file_cache_nums();
+    } else if (replica_type == ReplicaType::LOCAL_DISK) {
+        metadata.EraseReplicas([&client_id](const Replica& replica) {
+            return replica.is_local_disk_replica() &&
+                   replica.get_descriptor()
+                           .get_local_disk_descriptor()
+                           .client_id == client_id;
+        });
+    } else {
+        LOG(ERROR) << "key=" << key
+                   << ", error=invalid_replica_type_for_eviction";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (!metadata.IsValid()) {
+        accessor.Erase();
+    }
+    return {};
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
