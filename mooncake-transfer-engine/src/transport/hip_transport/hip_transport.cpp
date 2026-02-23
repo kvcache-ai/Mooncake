@@ -78,18 +78,18 @@ static bool checkHip(hipError_t result, const char *message) {
 // the second argument is (void*)(uintptr_t)fd instead of a pointer to the fd
 static hipError_t importFromShareableHandle(
     hipMemGenericAllocationHandle_t *handle, hipxFabricHandle *export_handle) {
-    static int cached_version = -1;
-
-    if (cached_version < 0) {
-        int runtime_version = 0;
-        if (!checkHip(hipRuntimeGetVersion(&runtime_version),
+    static const int runtime_version = []() {
+        int version = 0;
+        if (!checkHip(hipRuntimeGetVersion(&version),
                       "HipTransport: hipRuntimeGetVersion failed")) {
-            return hipErrorInvalidValue;
+            return -1;
         }
-        cached_version = runtime_version;
-    }
+        return version;
+    }();
 
-    int runtime_version = cached_version;
+    if (runtime_version < 0) {
+        return hipErrorInvalidValue;
+    }
 
     if (runtime_version >= 70100000) {
         return hipMemImportFromShareableHandle(
