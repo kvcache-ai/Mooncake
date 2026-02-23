@@ -284,15 +284,10 @@ static int getNumEvents() {
 }
 
 static bool supportFabricMem() {
-    // By default, use IPC mode. Fabric memory is enabled only when
-    // MC_USE_HIP_IPC=false or MC_USE_NVLINK_IPC=false is explicitly set.
-    auto& env = Environ::Get();
-    bool hip_ipc = env.GetUseHipIpc();
-    bool nvlink_ipc = env.GetUseNvlinkIpc();
-
-    bool fabric_enabled = !hip_ipc || !nvlink_ipc;
-
-    if (!fabric_enabled) {
+    // By default, use IPC mode
+    // Fabric memory is enabled only when MC_USE_HIP_IPC=false
+    bool hip_ipc = Environ::Get().GetUseHipIpc();
+    if (!hip_ipc) {
         return false;
     }
 

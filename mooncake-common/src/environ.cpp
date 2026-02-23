@@ -108,7 +108,7 @@ Environ::Environ() {
     te_metric_interval_seconds_ = GetInt("MC_TE_METRIC_INTERVAL_SECONDS", 0);
     tent_conf_ = GetString("MC_TENT_CONF", "");
     transfer_timeout_ = GetInt("MC_TRANSFER_TIMEOUT", 0);
-    use_hip_ipc_ = GetBool("MC_USE_HIP_IPC", false);
+    use_hip_ipc_ = GetBool("MC_USE_HIP_IPC", true);
     use_nvlink_ipc_ = GetBool("MC_USE_NVLINK_IPC", false);
     use_tent_ = GetBool("MC_USE_TENT", false);
     use_tev1_ = GetBool("MC_USE_TEV1", false);
