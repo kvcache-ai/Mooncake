@@ -73,6 +73,34 @@ static bool checkHip(hipError_t result, const char *message) {
     return true;
 }
 
+// Wrapper around hipMemImportFromShareableHandle to handle ROCm version
+// differences. In ROCm 7.1+, the signature was changed:
+// the second argument is (void*)(uintptr_t)fd instead of a pointer to the fd
+static hipError_t importFromShareableHandle(
+    hipMemGenericAllocationHandle_t *handle, hipxFabricHandle *export_handle) {
+    static int cached_version = -1;
+
+    if (cached_version < 0) {
+        int runtime_version = 0;
+        if (!checkHip(hipRuntimeGetVersion(&runtime_version),
+                      "HipTransport: hipRuntimeGetVersion failed")) {
+            return hipErrorInvalidValue;
+        }
+        cached_version = runtime_version;
+    }
+
+    int runtime_version = cached_version;
+
+    if (runtime_version >= 70100000) {
+        return hipMemImportFromShareableHandle(
+            handle, (void *)(uintptr_t)export_handle->fd,
+            HIPX_MEM_HANDLE_TYPE_FABRIC);
+    } else {
+        return hipMemImportFromShareableHandle(handle, export_handle,
+                                               HIPX_MEM_HANDLE_TYPE_FABRIC);
+    }
+}
+
 static int open_fd(const hipxFabricHandle &export_handle) {
     int fd = export_handle.fd;
     int pid = export_handle.pid;
@@ -127,9 +155,8 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     }
 
     hipMemGenericAllocationHandle_t handle;
-    if (!checkHip(hipMemImportFromShareableHandle(&handle, &export_handle,
-                                                  HIPX_MEM_HANDLE_TYPE_FABRIC),
-                  "HipTransport: hipMemImportFromShareableHandle failed")) {
+    if (!checkHip(importFromShareableHandle(&handle, &export_handle),
+                  "HipTransport: importFromShareableHandle failed")) {
         return -1;
     }
 
