@@ -8,7 +8,7 @@
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
-  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3ig4fjai8-KH1zIm3x8Vm8WqyH0i_JaA" target="_blank"><strong>Slack</strong></a>
+  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA" target="_blank"><strong>Slack</strong></a>
   <br />
   <br />
 
