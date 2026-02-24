@@ -79,6 +79,7 @@ class UBShmemTransport : public Transport {
     struct OpenedShmEntry {
         void *shm_addr;
         uint64_t length;
+        char *key;
     };
 
     // Helper function to process a single transfer request

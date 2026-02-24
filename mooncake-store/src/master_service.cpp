@@ -31,7 +31,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      allocation_strategy_(
+          CreateAllocationStrategy(config.allocation_strategy_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
@@ -86,8 +87,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
-    } else {
-        allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
     }
 }
 

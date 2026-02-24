@@ -86,6 +86,17 @@ else
     echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
 fi
 
+# Copy ubshmem_fabric_allocator.so to mooncake directory (only if it exists - NPU builds only)
+if [ -f build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so ]; then
+    echo "Copying NPU ubshmem_fabric_allocator.so..."
+    cp build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
+    echo "Copying NPU allocator libraries..."
+    # Copy allocator_ascend_npu.py
+    cp mooncake-integration/allocator_ascend_npu.py mooncake-wheel/mooncake/allocator_ascend_npu.py
+else
+    echo "Skipping ubshmem_fabric_allocator.so (not built - likely CUDA or non-NPU build)"
+fi
+
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
 cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
@@ -137,6 +148,12 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
     fi
     cp mooncake/*.so ../mooncake-wheel/mooncake/
     cd ..
+fi
+
+# CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
+if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+    echo "Freeing disk space: removing build directory (artifacts already copied)"
+    rm -rf build/
 fi
 
 echo "Building wheel package..."
