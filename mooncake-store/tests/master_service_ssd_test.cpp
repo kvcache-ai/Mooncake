@@ -405,6 +405,92 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     test_discard_replica(ReplicaType::MEMORY);
 }
 
+TEST_F(MasterServiceSSDTest, EvictDiskReplica_RemovesDiskReplica) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::string key = "evict_disk_key";
+    auto put_result =
+        service_->PutStart(client_id, key, 1024, {.replica_num = 1});
+    ASSERT_TRUE(put_result.has_value());
+
+    // Complete both replicas
+    EXPECT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::DISK).has_value());
+
+    // Verify we have 2 replicas (MEM + DISK)
+    auto get_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_EQ(2, get_result.value().replicas.size());
+
+    // Evict disk replica
+    auto evict_result =
+        service_->EvictDiskReplica(client_id, key, ReplicaType::DISK);
+    ASSERT_TRUE(evict_result.has_value());
+
+    // Verify only memory replica remains
+    get_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+    EXPECT_TRUE(get_result.value().replicas[0].is_memory_replica());
+}
+
+TEST_F(MasterServiceSSDTest, EvictDiskReplica_NonExistentKeyReturnsError) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    UUID client_id = generate_uuid();
+    auto evict_result = service_->EvictDiskReplica(client_id, "nonexistent_key",
+                                                   ReplicaType::DISK);
+    EXPECT_FALSE(evict_result.has_value());
+    EXPECT_EQ(evict_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceSSDTest, EvictDiskReplica_InvalidReplicaTypeReturnsError) {
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 64;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = buffer;
+    segment.size = size;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::string key = "evict_invalid_type_key";
+    auto put_result =
+        service_->PutStart(client_id, key, 1024, {.replica_num = 1});
+    ASSERT_TRUE(put_result.has_value());
+    EXPECT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::DISK).has_value());
+
+    // Attempting to evict with MEMORY type should fail
+    auto evict_result =
+        service_->EvictDiskReplica(client_id, key, ReplicaType::MEMORY);
+    EXPECT_FALSE(evict_result.has_value());
+    EXPECT_EQ(evict_result.error(), ErrorCode::INVALID_PARAMS);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

@@ -806,6 +806,21 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
+    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    return execute_rpc(
+        "EvictDiskReplica",
+        [&] {
+            return master_service_.EvictDiskReplica(client_id, key,
+                                                    replica_type);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_type=", replica_type);
+        },
+        [] {}, [] {});
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return execute_rpc(
@@ -1015,6 +1030,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
         &wrapped_master_service);

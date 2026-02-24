@@ -224,6 +224,18 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
+     * @brief Evict a disk replica for a key (triggered by client-side disk
+     * eviction).
+     * @param client_id The client performing the eviction
+     * @param key The object key whose disk replica was evicted
+     * @param replica_type DISK or LOCAL_DISK
+     * @return ErrorCode::OK on success, OBJECT_NOT_FOUND if key missing
+     */
+    auto EvictDiskReplica(const UUID& client_id, const std::string& key,
+                          ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Start a copy operation
      *
      * This will allocate replica buffers to copy to.

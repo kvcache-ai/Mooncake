@@ -668,6 +668,9 @@ struct InProcMasterConfig {
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
+    std::optional<std::string> root_fs_dir;
+    std::optional<bool> enable_disk_eviction;
+    std::optional<uint64_t> quota_bytes;
 };
 
 // Builder class for InProcMasterConfig
@@ -680,6 +683,9 @@ class InProcMasterConfigBuilder {
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
+    std::optional<std::string> root_fs_dir_ = std::nullopt;
+    std::optional<bool> enable_disk_eviction_ = std::nullopt;
+    std::optional<uint64_t> quota_bytes_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -719,6 +725,21 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_root_fs_dir(const std::string& dir) {
+        root_fs_dir_ = dir;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_enable_disk_eviction(bool enable) {
+        enable_disk_eviction_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_quota_bytes(uint64_t bytes) {
+        quota_bytes_ = bytes;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -732,6 +753,9 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
+    config.root_fs_dir = root_fs_dir_;
+    config.enable_disk_eviction = enable_disk_eviction_;
+    config.quota_bytes = quota_bytes_;
     return config;
 }
 

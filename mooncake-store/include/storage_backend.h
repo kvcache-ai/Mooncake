@@ -18,6 +18,7 @@ namespace mooncake {
 struct FileRecord {
     std::string path;
     uint64_t size;
+    std::string key;  // Associated object key for eviction tracking
 };
 
 struct BucketObjectMetadata {
@@ -227,7 +228,9 @@ class StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) = 0;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         const std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -368,26 +371,31 @@ class StorageBackend {
      * @param slices Vector of data slices to store
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              const std::vector<Slice>& slices);
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
+        const std::string& path, const std::vector<Slice>& slices,
+        const std::string& key = "");
 
     /**
      * @brief Stores an object from a string
      * @param path path for the object
      * @param str String containing object data
-     * @return tl::expected<void, ErrorCode> indicating operation status
+     * @param key Optional object key for eviction tracking
+     * @return tl::expected with evicted keys on success, ErrorCode on failure
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              const std::string& str);
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
+        const std::string& path, const std::string& str,
+        const std::string& key = "");
 
     /**
      * @brief Stores an object from a span of data
      * @param path path for the object
      * @param data Span containing object data
-     * @return tl::expected<void, ErrorCode> indicating operation status
+     * @param key Optional object key for eviction tracking
+     * @return tl::expected with evicted keys on success, ErrorCode on failure
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              std::span<const char> data);
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
+        const std::string& path, std::span<const char> data,
+        const std::string& key = "");
 
     /**
      * @brief Loads an object into slices
@@ -478,16 +486,18 @@ class StorageBackend {
 
     /**
      * @brief Evicts a file based on FIFO order (earliest written first out)
-     * @return Path of the evicted file, or empty string if no file was evicted
+     * @return FileRecord of the evicted file, or empty record if no file was
+     * evicted
      */
-    std::string EvictFile();
+    FileRecord EvictFile();
 
     /**
      * @brief Add file to write queue for FIFO tracking
      * @param path Path of the file to add to queue
      * @param size Size of the file
      */
-    void AddFileToWriteQueue(const std::string& path, uint64_t size);
+    void AddFileToWriteQueue(const std::string& path, uint64_t size,
+                             const std::string& key = "");
 
     /**
      * @brief Remove file from write queue
@@ -519,7 +529,8 @@ class StorageBackend {
      *         ErrorCode::FILE_WRITE_FAIL if insufficient space remains after
      *         attempting evictions up to the maximum attempt limit.
      */
-    tl::expected<void, ErrorCode> EnsureDiskSpace(size_t required_size);
+    tl::expected<std::vector<std::string>, ErrorCode> EnsureDiskSpace(
+        size_t required_size);
 
     /**
      * @brief Releases a specified amount of disk space and updates internal
@@ -611,7 +622,9 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         const std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -686,7 +699,9 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -913,7 +928,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
