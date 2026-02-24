@@ -157,6 +157,22 @@ class CacheTier {
     virtual MemoryType GetMemoryType() const = 0;
     virtual const std::vector<std::string>& GetTags() const = 0;
 
+    /**
+     * @brief Commit (Register)
+     * Registers the key and finalizes the storage.
+     * For Storage Tiers, this triggers the actual persistence (or buffering).
+     */
+    virtual tl::expected<void, ErrorCode> Commit(const std::string& key,
+                                                 const DataSource& data) {
+        return {};
+    }
+
+    /**
+     * @brief Flush
+     * Forces any buffered data to be persisted to the underlying storage.
+     */
+    virtual tl::expected<void, ErrorCode> Flush() { return {}; }
+
    protected:
     // A pointer to the parent backend, allowing tiers to access shared services
     // like the DataCopier.

@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake {
 

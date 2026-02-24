@@ -4,11 +4,13 @@
 #include <limits>
 
 #include "tiered_cache/tiered_backend.h"
-#include "tiered_cache/cache_tier.h"
-#include "tiered_cache/dram_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
+#include "tiered_cache/tiers/dram_tier.h"
 #ifdef USE_ASCEND_CACHE_TIER
-#include "tiered_cache/ascend_tier.h"
+#include "tiered_cache/tiers/ascend_tier.h"
 #endif
+#include "tiered_cache/tiers/storage_tier.h"
+#include "tiered_cache/scheduler/client_scheduler.h"
 
 namespace mooncake {
 
@@ -20,6 +22,23 @@ AllocationEntry::~AllocationEntry() {
 }
 
 TieredBackend::TieredBackend() = default;
+
+TieredBackend::~TieredBackend() {
+    if (scheduler_) {
+        scheduler_->Stop();
+    }
+    // Explicitly flush all tiers to ensure pending data is written before
+    // metadata and buffers (held in metadata_index_) are destroyed.
+    for (auto& [id, tier] : tiers_) {
+        if (tier) {
+            auto res = tier->Flush();
+            if (!res) {
+                LOG(ERROR) << "Failed to flush tier " << id
+                           << " during shutdown: " << res.error();
+            }
+        }
+    }
+}
 
 tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
@@ -151,11 +170,31 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
         }
 #endif
-        else {
+        else if (type == "STORAGE" || type == "DISK") {
+            LOG(INFO) << "Creating Storage tier: id=" << id
+                      << ", capacity=" << capacity << ", priority=" << priority;
+            auto tier = std::make_unique<StorageTier>(id, tags, capacity);
+            auto init_result = tier->Init(this, engine);
+            if (!init_result) {
+                LOG(ERROR) << "Failed to initialize Storage tier: id=" << id
+                           << ", error=" << init_result.error();
+                return tl::unexpected(init_result.error());
+            }
+            tiers_[id] = std::move(tier);
+            tier_info_[id] = {priority, tags};
+            LOG(INFO) << "Successfully initialized Storage tier: id=" << id;
+        } else {
             LOG(ERROR) << "Unsupported tier type '" << type << "'";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
+
+    // Initialize and Start Scheduler
+    scheduler_ = std::make_unique<ClientScheduler>(this, root);
+    for (const auto& [id, tier] : tiers_) {
+        scheduler_->RegisterTier(tier.get());
+    }
+    scheduler_->Start();
 
     LOG(INFO) << "TieredBackend initialized successfully with "
               << tier_info_.size() << " tiers.";
@@ -235,20 +274,10 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
     return data_copier_->Copy(source, handle->loc.data);
 }
 
-tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
-                                                    AllocationHandle handle) {
+tl::expected<void, ErrorCode> TieredBackend::Commit(
+    const std::string& key, AllocationHandle handle,
+    std::optional<uint64_t> expected_version) {
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-
-    if (metadata_sync_callback_) {
-        auto result =
-            metadata_sync_callback_(key, handle->loc.tier->GetTierId(), COMMIT);
-
-        if (!result.has_value()) {
-            LOG(ERROR) << "Failed to Commit key " << key
-                       << " to Master, error_code=" << result.error();
-            return tl::make_unexpected(result.error());
-        }
-    }
 
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
@@ -263,8 +292,11 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
 
     // Create if not exists (Global Write Lock)
     if (!entry) {
+        if (expected_version.has_value()) {
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
+        }
+
         std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
-        // Double-check logic
         auto it = metadata_index_.find(key);
         if (it != metadata_index_.end()) {
             entry = it->second;
@@ -274,10 +306,47 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
         }
     }
 
-    //  Update Entry (Entry Write Lock)
-    // Global lock is released. We only lock this specific key's entry.
+    // CAS check BEFORE any side effects
+    if (expected_version.has_value()) {
+        std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
+        if (entry->version != expected_version.value()) {
+            VLOG(1) << "CAS Failed for key " << key
+                    << ": valid_version=" << entry->version
+                    << ", expected=" << expected_version.value();
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
+        }
+    }
+
+    // Side effects: tier commit + metadata sync (only after CAS passes)
+    auto tier_commit_res = handle->loc.tier->Commit(key, handle->loc.data);
+    if (!tier_commit_res) {
+        LOG(ERROR) << "Tier Commit failed for key " << key << ": "
+                   << tier_commit_res.error();
+        return tl::make_unexpected(tier_commit_res.error());
+    }
+
+    if (metadata_sync_callback_) {
+        auto result =
+            metadata_sync_callback_(key, handle->loc.tier->GetTierId(), COMMIT);
+
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to Commit key " << key
+                       << " to Master, error_code=" << result.error();
+            return tl::make_unexpected(result.error());
+        }
+    }
+
+    // Update Entry (Entry Write Lock)
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+
+        // Re-check version under write lock (another commit may have raced)
+        if (expected_version.has_value() &&
+            entry->version != expected_version.value()) {
+            VLOG(1) << "CAS Failed (re-check) for key " << key;
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
+        }
+
         // Insert or replace the handle for this tier
         UUID current_tier_id = handle->loc.tier->GetTierId();
         bool found = false;
@@ -298,13 +367,21 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
                                  tier_info_.at(b.first).priority;
                       });
         }
+
+        // Increment Version on modification
+        entry->version++;
+
+        if (scheduler_) {
+            scheduler_->OnAccess(key);
+        }
     }
 
     return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
-    const std::string& key, std::optional<UUID> tier_id) {
+    const std::string& key, std::optional<UUID> tier_id, bool record_access,
+    uint64_t* out_version) {
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
     // Find Entry (Global Read Lock)
@@ -318,8 +395,17 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         entry = it->second;
     }
 
+    if (record_access && scheduler_) {
+        scheduler_->OnAccess(key);
+    }
+
     // Read Entry (Entry Read Lock)
     std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
+
+    // Return current version if requested
+    if (out_version) {
+        *out_version = entry->version;
+    }
 
     if (entry->replicas.empty()) {
         LOG(ERROR) << "Empty replicas for key: " << key;
@@ -388,6 +474,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
                     handle_ref =
                         tier_it->second;  // Capture reference (+1 ref count)
                     entry->replicas.erase(tier_it);
+                    entry->version++;  // Increment version on replica deletion
                     found_tier = true;
                 }
 
@@ -464,12 +551,15 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     // Handles go out of scope here.
     // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
+    if (scheduler_) {
+        scheduler_->OnDelete(key);
+    }
     return tl::expected<void, ErrorCode>{};
 }
 
-tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
-                                                      const DataSource& source,
-                                                      UUID dest_tier_id) {
+tl::expected<void, ErrorCode> TieredBackend::CopyData(
+    const std::string& key, const DataSource& source, UUID dest_tier_id,
+    std::optional<uint64_t> expected_version) {
     if (!source.buffer || source.buffer->size() == 0) {
         LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -490,14 +580,50 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
 
     // Commit (Add Replica)
     // Takes ownership of dest_handle into the map
-    auto commit_result = Commit(key, dest_handle.value());
+    auto commit_result = Commit(key, dest_handle.value(), expected_version);
     if (!commit_result.has_value()) {
-        LOG(ERROR) << "Failed to commit key: " << key << " in Tier "
-                   << dest_tier_id;
+        // If CAS failed, we should probably warn specifically
+        if (commit_result.error() != ErrorCode::CAS_FAILED) {
+            LOG(ERROR) << "Failed to commit key: " << key << " in Tier "
+                       << dest_tier_id;
+        }
         return tl::make_unexpected(commit_result.error());
     }
 
     return tl::expected<void, ErrorCode>{};
+}
+
+tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
+                                                      UUID source_tier_id,
+                                                      UUID dest_tier_id) {
+    uint64_t start_version = 0;
+    auto source_handle_res = Get(key, source_tier_id, false, &start_version);
+    if (!source_handle_res) {
+        LOG(ERROR) << "Transfer failed: Source handle not found for key "
+                   << key;
+        return tl::make_unexpected(source_handle_res.error());
+    }
+    AllocationHandle source_handle = source_handle_res.value();
+
+    // Check if destination tier has enough space before attempting allocation
+    size_t required_size = source_handle->loc.data.buffer->size();
+    auto dest_tier_it = tiers_.find(dest_tier_id);
+    if (dest_tier_it != tiers_.end()) {
+        size_t dest_capacity = dest_tier_it->second->GetCapacity();
+        size_t dest_usage = dest_tier_it->second->GetUsage();
+        size_t dest_available =
+            (dest_capacity > dest_usage) ? (dest_capacity - dest_usage) : 0;
+
+        if (dest_available < required_size) {
+            // Insufficient space, skip this transfer silently
+            VLOG(2) << "Insufficient space in destination tier " << dest_tier_id
+                    << " for key " << key << " (required: " << required_size
+                    << ", available: " << dest_available << ")";
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    }
+
+    return CopyData(key, source_handle->loc.data, dest_tier_id, start_version);
 }
 
 std::vector<TierView> TieredBackend::GetTierViews() const {
@@ -510,6 +636,23 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
                          info.priority, info.tags});
     }
     return views;
+}
+
+std::vector<UUID> TieredBackend::GetReplicaTierIds(
+    const std::string& key) const {
+    std::shared_lock map_lock(map_mutex_);
+    auto it = metadata_index_.find(key);
+    if (it == metadata_index_.end()) {
+        return {};
+    }
+
+    std::shared_lock entry_lock(it->second->mutex);
+    std::vector<UUID> tiers;
+    tiers.reserve(it->second->replicas.size());
+    for (const auto& replica : it->second->replicas) {
+        tiers.push_back(replica.first);
+    }
+    return tiers;
 }
 
 const CacheTier* TieredBackend::GetTier(UUID tier_id) const {
