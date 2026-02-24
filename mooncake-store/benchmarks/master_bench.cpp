@@ -44,6 +44,10 @@ DEFINE_uint64(num_keys, 10 * 1000,
 DEFINE_uint64(batch_size, 128, "Batch size for batch operations");
 DEFINE_uint64(value_size, 4096, "Size of object values");
 DEFINE_uint64(duration, 60, "Test duration in seconds");
+DEFINE_double(
+    prefill_ratio, 0.0,
+    "Ratio of segment capacity to prefill before test (0.0-1.0). "
+    "E.g., 0.95 means fill segments to 95% before starting benchmark");
 
 static inline void unset_cpu_affinity() {
     // Ensure that the worker threads are not bound to any CPU cores.
@@ -399,6 +403,77 @@ int main(int argc, char** argv) {
         }
     }
     LOG(INFO) << "Segments mounted";
+
+    // Prefill segments if requested
+    if (FLAGS_prefill_ratio > 0.0) {
+        LOG(INFO) << "Prefilling segments to " << (FLAGS_prefill_ratio * 100)
+                  << "% capacity...";
+
+        // Calculate total capacity and target fill size
+        uint64_t total_capacity = FLAGS_num_segments * FLAGS_segment_size;
+        uint64_t target_bytes =
+            static_cast<uint64_t>(total_capacity * FLAGS_prefill_ratio);
+        uint64_t bytes_per_object = FLAGS_value_size;
+        uint64_t target_objects = target_bytes / bytes_per_object;
+
+        LOG(INFO) << "Target: " << target_objects << " objects ("
+                  << (target_bytes / GiB) << " GiB)";
+
+        // Create a temporary client for prefilling
+        mooncake::MasterClient prefill_client(mooncake::generate_uuid());
+        auto ec = prefill_client.Connect(FLAGS_master_server);
+        if (ec != mooncake::ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect prefill client";
+            return 1;
+        }
+
+        const mooncake::ReplicateConfig config;
+        uint64_t filled_objects = 0;
+        uint64_t key_id = 0;
+
+        while (filled_objects < target_objects) {
+            uint64_t batch =
+                std::min(FLAGS_batch_size, target_objects - filled_objects);
+            std::vector<std::string> keys;
+            std::vector<std::vector<uint64_t>> slice_lengths;
+
+            keys.reserve(batch);
+            slice_lengths.reserve(batch);
+
+            for (uint64_t i = 0; i < batch; i++) {
+                keys.push_back("prefill_" + std::to_string(key_id++));
+                slice_lengths.push_back({bytes_per_object});
+            }
+
+            auto put_start_result =
+                prefill_client.BatchPutStart(keys, slice_lengths, config);
+            std::vector<std::string> started_keys;
+            for (size_t i = 0; i < keys.size(); i++) {
+                if (put_start_result[i].has_value()) {
+                    started_keys.push_back(keys[i]);
+                }
+            }
+
+            if (!started_keys.empty()) {
+                auto put_end_result = prefill_client.BatchPutEnd(started_keys);
+                for (auto& result : put_end_result) {
+                    if (result.has_value()) {
+                        filled_objects++;
+                    }
+                }
+            }
+
+            if (filled_objects % 10000 == 0) {
+                double progress =
+                    (double)filled_objects / target_objects * 100.0;
+                LOG(INFO) << "Prefill progress: " << filled_objects << "/"
+                          << target_objects << " (" << std::fixed
+                          << std::setprecision(1) << progress << "%)";
+            }
+        }
+
+        LOG(INFO) << "Prefill completed: " << filled_objects << " objects";
+    }
 
     LOG(INFO) << "Starting " << FLAGS_num_clients << " bench clients with "
               << FLAGS_num_threads << " threads for each...";
