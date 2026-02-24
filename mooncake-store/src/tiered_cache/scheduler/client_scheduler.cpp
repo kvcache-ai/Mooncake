@@ -9,11 +9,12 @@
 
 namespace mooncake {
 
-ClientScheduler::ClientScheduler(TieredBackend* backend, const Json::Value& config)
+ClientScheduler::ClientScheduler(TieredBackend* backend,
+                                 const Json::Value& config)
     : backend_(backend) {
-
-    std::string policy_type = "SIMPLE"; // Default
-    if (config.isMember("scheduler") && config["scheduler"].isMember("policy")) {
+    std::string policy_type = "SIMPLE";  // Default
+    if (config.isMember("scheduler") &&
+        config["scheduler"].isMember("policy")) {
         policy_type = config["scheduler"]["policy"].asString();
     }
 
@@ -26,9 +27,11 @@ ClientScheduler::ClientScheduler(TieredBackend* backend, const Json::Value& conf
         if (config.isMember("scheduler")) {
             const auto& sched_conf = config["scheduler"];
             if (sched_conf.isMember("high_watermark"))
-                lru_config.high_watermark = sched_conf["high_watermark"].asDouble();
+                lru_config.high_watermark =
+                    sched_conf["high_watermark"].asDouble();
             if (sched_conf.isMember("low_watermark"))
-                lru_config.low_watermark = sched_conf["low_watermark"].asDouble();
+                lru_config.low_watermark =
+                    sched_conf["low_watermark"].asDouble();
         }
 
         auto lru_policy = std::make_unique<LRUPolicy>(lru_config);
@@ -40,11 +43,13 @@ ClientScheduler::ClientScheduler(TieredBackend* backend, const Json::Value& conf
 
         // Simple Policy Configuration
         SimplePolicy::Config simple_config;
-        simple_config.promotion_threshold = 5.0; // Default to 5.0 for tests (matches previous hardcoded value)
+        simple_config.promotion_threshold =
+            5.0;  // Default to 5.0 for tests (matches previous hardcoded value)
         if (config.isMember("scheduler")) {
             const auto& sched_conf = config["scheduler"];
             if (sched_conf.isMember("promotion_threshold"))
-                simple_config.promotion_threshold = sched_conf["promotion_threshold"].asDouble();
+                simple_config.promotion_threshold =
+                    sched_conf["promotion_threshold"].asDouble();
         }
 
         auto simple_policy = std::make_unique<SimplePolicy>(simple_config);
@@ -191,7 +196,8 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                               << action.key;
                 } else if (res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                     // Insufficient space is a normal condition during high load
-                    VLOG(2) << "Transfer skipped due to insufficient space for key: "
+                    VLOG(2) << "Transfer skipped due to insufficient space for "
+                               "key: "
                             << action.key;
                 } else {
                     LOG(ERROR) << "Transfer failed for key: " << action.key

@@ -25,7 +25,7 @@ struct KeyContext {
     std::string key;
     double heat_score;
     std::vector<UUID> current_locations;  // Which tiers currently hold this key
-    size_t size_bytes = 0;  // Size of the key's data in bytes
+    size_t size_bytes = 0;                // Size of the key's data in bytes
 };
 
 /**

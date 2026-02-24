@@ -9,6 +9,7 @@
 #include <cstring>
 #include <atomic>
 #include <thread>
+#include <condition_variable>
 
 #include "tiered_cache/tiers/cache_tier.h"
 #include "storage_backend.h"
@@ -44,16 +45,19 @@ class StorageBuffer : public BufferBase {
     // Helper to get raw pointer (only valid in Staging mode)
     char* data_ptr() {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        return is_on_disk_.load(std::memory_order_acquire) ? nullptr : data_.data();
+        return is_on_disk_.load(std::memory_order_acquire) ? nullptr
+                                                           : data_.data();
     }
     const char* data_ptr() const {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        return is_on_disk_.load(std::memory_order_acquire) ? nullptr : data_.data();
+        return is_on_disk_.load(std::memory_order_acquire) ? nullptr
+                                                           : data_.data();
     }
 
     Slice ToSlice() const {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        if (is_on_disk_.load(std::memory_order_acquire)) return Slice{nullptr, size_};
+        if (is_on_disk_.load(std::memory_order_acquire))
+            return Slice{nullptr, size_};
         return Slice{const_cast<char*>(data_.data()), data_.size()};
     }
 
@@ -70,7 +74,9 @@ class StorageBuffer : public BufferBase {
     }
 
     // Check if data has been persisted to disk
-    bool IsPersisted() const { return is_on_disk_.load(std::memory_order_acquire); }
+    bool IsPersisted() const {
+        return is_on_disk_.load(std::memory_order_acquire);
+    }
 
     // Flushing state management (for thread safety during FlushInternal)
     void SetFlushing(bool flushing) {
@@ -78,12 +84,6 @@ class StorageBuffer : public BufferBase {
     }
     bool IsFlushing() const {
         return is_flushing_.load(std::memory_order_acquire);
-    }
-    void WaitForFlushComplete() const {
-        // Spin-wait for flush to complete (should be brief)
-        while (is_flushing_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
     }
 
     // Read data to destination buffer (handles Staging vs Disk transparently)
@@ -160,6 +160,7 @@ class StorageTier : public CacheTier {
 
     // Pending Write Buffer for aggregation
     std::mutex batch_mutex_;
+    std::condition_variable flush_cv_;  // Signaled when flush completes
     std::unordered_map<std::string, StorageBuffer*> pending_batch_;
     std::atomic<size_t> pending_batch_size_{0};
 

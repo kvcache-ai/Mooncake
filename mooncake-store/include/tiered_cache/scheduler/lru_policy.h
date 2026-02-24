@@ -49,7 +49,8 @@ class LRUPolicy : public SchedulerPolicy {
         double usage_ratio = static_cast<double>(stats.used_capacity_bytes) /
                              static_cast<double>(stats.total_capacity_bytes);
 
-        // Only trigger scheduling when usage > high_watermark or < low_watermark
+        // Only trigger scheduling when usage > high_watermark or <
+        // low_watermark
         if (usage_ratio <= config_.high_watermark &&
             usage_ratio >= config_.low_watermark) {
             return actions;
@@ -65,8 +66,8 @@ class LRUPolicy : public SchedulerPolicy {
         }
 
         // Target: fill fast tier to low_watermark with hottest keys
-        size_t target_usage = static_cast<size_t>(
-            stats.total_capacity_bytes * config_.low_watermark);
+        size_t target_usage = static_cast<size_t>(stats.total_capacity_bytes *
+                                                  config_.low_watermark);
 
         // Step 1: Determine which keys SHOULD be in fast tier
         // active_keys is assumed sorted by heat (hottest first)
@@ -117,7 +118,8 @@ class LRUPolicy : public SchedulerPolicy {
                     continue;
                 }
                 actions.push_back(action);
-            } else if (!is_in_fast && should_be && !key_ctx.current_locations.empty()) {
+            } else if (!is_in_fast && should_be &&
+                       !key_ctx.current_locations.empty()) {
                 // Promote: should be in fast tier but isn't
                 SchedAction action;
                 action.type = SchedAction::Type::MIGRATE;
