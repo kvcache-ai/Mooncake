@@ -455,7 +455,15 @@ struct TcpContext {
 };
 
 TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
-    // TODO
+    if (getenv("MC_TCP_ENABLE_CONNECTION_POOL") != nullptr) {
+        std::string val(getenv("MC_TCP_ENABLE_CONNECTION_POOL"));
+        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+        if (val == "0" || val == "false" || val == "no") {
+            enable_connection_pool_ = false;
+        } else {
+            enable_connection_pool_ = true;
+        }
+    }
 }
 
 TcpTransport::~TcpTransport() {
@@ -898,13 +906,29 @@ void TcpTransport::startTransfer(Slice* slice) {
                    << ", opcode: " << (int)slice->opcode
                    << ", target_id: " << slice->target_id
                    << ". Exception: " << e.what();
+        // On exception, always close the socket and remove from pool if present
+        // Don't return it to the pool as it may be in an inconsistent state
+        if (socket && socket->is_open()) {
+            asio::error_code ec;
+            socket->close(ec);
+        }
         if (enable_connection_pool_) {
-            returnConnection(meta_entry.ip_or_host_name, desc->tcp_data_port,
-                             socket);
-        } else {
-            if (socket && socket->is_open()) {
-                asio::error_code ec;
-                socket->close(ec);
+            // Remove the connection from pool if it was pooled
+            ConnectionKey key{meta_entry.ip_or_host_name, desc->tcp_data_port};
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            auto it = connection_pool_.find(key);
+            if (it != connection_pool_.end()) {
+                auto& queue = it->second;
+                for (auto queue_it = queue.begin(); queue_it != queue.end();
+                     ++queue_it) {
+                    if ((*queue_it)->socket == socket) {
+                        queue.erase(queue_it);
+                        break;
+                    }
+                }
+                if (queue.empty()) {
+                    connection_pool_.erase(it);
+                }
             }
         }
         slice->markFailed();

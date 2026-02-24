@@ -110,7 +110,7 @@ class TcpTransport : public Transport {
     std::atomic_bool running_;
     std::thread thread_;
     bool enable_connection_pool_ =
-        false;  // Disable connection pool by default due to correctness issues
+        true;  // Use MC_TCP_ENABLE_CONNECTION_POOL=1 to enable connection pool
 
     // Client-side connection pool
     struct ConnectionKey {
