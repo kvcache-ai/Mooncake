@@ -73,9 +73,9 @@ mooncake_master \
   --enable_cxl=true \
   &
 CXL_MASTER_PID=$!
-trap 'if kill -0 $CXL_MASTER_PID 2>/dev/null; then kill $CXL_MASTER_PID 2>/dev/null; fi' EXIT
 sleep 3
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
+kill $CXL_MASTER_PID || true
 sleep 2
 echo "CXL protocol test completed successfully!"
 
