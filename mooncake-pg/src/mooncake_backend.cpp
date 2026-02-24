@@ -900,6 +900,8 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                         break;
                     }
                 }
+                auto s = engine_.freeBatchID(batchID);
+                LOG_ASSERT(s.ok());
             } else {
                 // Wait for the warmup signals
                 while (!warmup_recv_region_[pollingRank]) {
@@ -1114,7 +1116,8 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
         TORCH_CHECK(status.s != TransferStatusEnum::FAILED,
                     "P2P send transfer failed.");
     }
-
+    auto s = meta_.engine->freeBatchID(batchID);
+    LOG_ASSERT(s.ok());
     meta_.store->set(ctrlKey,
                      c10::str(baseSlot, "_", allocatedSlots, "_", numBytes));
 }
