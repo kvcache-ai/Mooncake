@@ -81,7 +81,12 @@ if(URING_LIB AND URING_INCLUDE)
     target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
 endif()
 
-if (USE_ASCEND_DIRECT)
+if(URING_LIB AND URING_INCLUDE)
+    target_compile_definitions(mooncake_store PUBLIC USE_URING)
+    target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
+endif()
+
+if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
     if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
         file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)

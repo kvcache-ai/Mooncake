@@ -13,7 +13,7 @@
 #include <csignal>
 #include <cstring>
 #include <sys/mman.h>
-#ifdef USE_ASCEND_DIRECT
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "acl/acl.h"
 #include "config.h"
 #include "common.h"
@@ -75,7 +75,8 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-#if defined(USE_ASCEND_DIRECT) && defined(ASCEND_SUPPORT_FABRIC_MEM)
+#if (defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)) && \
+    defined(ASCEND_SUPPORT_FABRIC_MEM)
 int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle) {
     int32_t user_dev_id;
     auto ret = aclrtGetDevice(&user_dev_id);
@@ -156,6 +157,34 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return buffer;
     }
 #endif
+
+#ifdef USE_UBSHMEM
+    if (protocol == "ubshmem" && total_size > 0) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+        if (globalConfig().ascend_use_fabric_mem) {
+            aclrtDrvMemHandle handle = nullptr;
+            if (allocate_physical_memory(total_size, handle) != 0) {
+                return nullptr;
+            }
+            void *va;
+            auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to reserve memory: " << ret;
+                return nullptr;
+            }
+            ret = aclrtMapMem(va, total_size, 0, handle, 0);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to map memory: " << ret;
+                return nullptr;
+            }
+            return va;
+        }
+#endif
+        LOG(ERROR) << "Ascend runtime not supprot fabirc mem ";
+        return nullptr;
+    }
+#endif
+
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
@@ -223,6 +252,37 @@ void free_memory(const std::string &protocol, void *ptr) {
         return;
     }
 #endif
+
+#ifdef USE_UBSHMEM
+    if (protocol == "ubshmem") {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+        if (globalConfig().ascend_use_fabric_mem) {
+            aclrtDrvMemHandle handle;
+            auto ret = aclrtMemRetainAllocationHandle(ptr, &handle);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to retain allocation handle: " << ptr;
+                return;
+            }
+            ret = aclrtUnmapMem(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to unmap memory: " << ptr;
+            }
+            aclrtReleaseMemAddress(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to release mem address: " << ptr;
+            }
+            ret = aclrtFreePhysical(handle);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to free physical handle: " << handle;
+            }
+            return;
+        }
+#endif
+        LOG(ERROR) << "Ascend runtime not supprot fabirc mem ";
+        return;
+    }
+#endif
+
     free(ptr);
 }
 

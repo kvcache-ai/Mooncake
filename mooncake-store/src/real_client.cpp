@@ -171,8 +171,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_offload) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-    const bool should_use_hugepage =
-        use_hugepage_ && this->protocol != "ascend";
+    const bool should_use_hugepage = use_hugepage_ &&
+                                     this->protocol != "ascend" &&
+                                     this->protocol != "ubshmem";
 
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
@@ -326,6 +327,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
             if (this->protocol == "ascend") {
                 ascend_segment_ptrs_.emplace_back(ptr);
+            } else if (this->protocol == "ubshmem") {
+                ubshmem_segment_ptrs_.emplace_back(ptr);
             } else if (should_use_hugepage) {
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
