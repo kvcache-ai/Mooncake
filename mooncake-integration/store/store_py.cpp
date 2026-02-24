@@ -333,7 +333,6 @@ class MooncakeStorePyWrapper {
                     data ? pybind11::bytes((char *)data->ptr(), data->size())
                          : kNullString);
             }
-
             return results;
         }
     }
@@ -988,7 +987,10 @@ PYBIND11_MODULE(store, m) {
             oss << "QueryTaskResponse(id=" << self.id
                 << ", type=" << static_cast<int>(self.type)
                 << ", status=" << static_cast<int>(self.status)
-                << ", assigned_client=" << self.assigned_client << ")";
+                << ", created_at=" << self.created_at_ms_epoch
+                << ", last_updated_at=" << self.last_updated_at_ms_epoch
+                << ", assigned_client=" << self.assigned_client
+                << ", message=\"" << self.message << "\")";
             return oss.str();
         });
 

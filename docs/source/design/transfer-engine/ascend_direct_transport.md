@@ -42,6 +42,33 @@ Complete command format is shown below:
 ./transfer_engine_ascend_direct_perf --metadata_server=P2PHANDSHAKE --local_server_name=127.0.0.1:12346 --operation=write --device_logicid=1 --mode=initiator --block_size=16384 --batch_size=32 --block_iteration=10  --segment_id=127.0.0.1:real_port
 ```
 
+### Environment Variables Configuration
+
+The following environment variables can be configured to control Ascend Direct Transport behavior:
+
+| Variable | Description | Default Value | Example |
+|----------|-------------|---------------|---------|
+| `ASCEND_AUTO_CONNECT` | Enable automatic connection management | 0 (disabled) | `ASCEND_AUTO_CONNECT=1` |
+| `ASCEND_ENABLE_USE_FABRIC_MEM` | Enable fabric memory transfer mode in Mooncake Store (A3 only) | 0 (disabled) | `ASCEND_ENABLE_USE_FABRIC_MEM=1` |
+| `ASCEND_USE_ASYNC_TRANSFER` | Enable asynchronous transfer mode | 0 (disabled) | `ASCEND_USE_ASYNC_TRANSFER=1` |
+| `ASCEND_GLOBAL_RESOURCE_CONFIG` | Global resource configuration | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
+| `ASCEND_CONNECT_TIMEOUT` | Link establishment timeout in milliseconds | 3000 | `ASCEND_CONNECT_TIMEOUT=5000` |
+| `ASCEND_TRANSFER_TIMEOUT` | Data transfer timeout in milliseconds | 3000 | `ASCEND_TRANSFER_TIMEOUT=10000` |
+| `ASCEND_THREAD_POOL_SIZE` | Number of worker threads in the transfer thread pool | 8 (1 for buffer pool mode) | `ASCEND_THREAD_POOL_SIZE=16` |
+| `ASCEND_USE_SHORT_CONNECTION` | Enable short connection mode (disconnect after each transfer) | 0 (disabled) | `ASCEND_USE_SHORT_CONNECTION=1` |
+| `ASCEND_BUFFER_POOL` | Buffer pool configuration for intermediate transfer mode (BUFFER_NUM:BUFFER_SIZE_MB) | "0:0" (disabled) | `ASCEND_BUFFER_POOL=4:8` |
+| `ASCEND_BASE_PORT` | Base port for ADXL engine port allocation | 11000 | `ASCEND_BASE_PORT=20000` |
+| `HCCL_INTRA_ROCE_ENABLE` | Enable RDMA protocol for intra-node communication | 0 (disabled) | `HCCL_INTRA_ROCE_ENABLE=1` |
+| `HCCL_RDMA_TIMEOUT` | RDMA packet retransmission timeout coefficient | - | `HCCL_RDMA_TIMEOUT=14` |
+| `HCCL_RDMA_RETRY_CNT` | RDMA packet retransmission count | - | `HCCL_RDMA_RETRY_CNT=7` |
+
+**Detailed Descriptions:**
+
+- **ASCEND_AUTO_CONNECT**: Requires CANN 9.0 or later. Default is 0, recommended to enable on supported versions: link can be automatically disconnected when the remote end goes offline abnormally.
+- **ASCEND_ENABLE_USE_FABRIC_MEM**: Requires CANN 9.0+ and HDK 26.0+. Recommended when using Mooncake Store on supported A3 platforms: it can significantly improve transmission performance.
+- **ASCEND_USE_ASYNC_TRANSFER**: Requires CANN 8.5+. Enables HIXL asynchronous transfer mode, defaults to synchronous mode.
+- **ASCEND_GLOBAL_RESOURCE_CONFIG**: Configures HIXL global resources. Refer to HIXL documentation for `OPTION_GLOBAL_RESOURCE_CONFIG` settings.
+
 ### Important Notes
 
 1. **Device Setup Required**: Before calling `TransferEngine.initialize()`, you must set the device (e.g., `torch.npu.set_device(0)`).
@@ -72,3 +99,5 @@ Complete command format is shown below:
 10. **Async transfer**: The asynchronous transfer mode can be enabled by configuring the ASCEND_USE_ASYNC_TRANSFER environment variable.
 
 12. **Fabric Memory mode**: On the A3, with the latest drivers and CANN installed, when using Mooncake store, the ASCEND_ENABLE_USE_FABRIC_MEM environment variable can be set to enable fabric memory transfer mode (which allows direct access remote HOST memory).
+
+13. **Auto Connect**: The auto connect feature can be enabled by configuring the `ASCEND_AUTO_CONNECT` environment variable. The default value is 0 (disabled).

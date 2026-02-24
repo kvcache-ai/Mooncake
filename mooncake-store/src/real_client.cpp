@@ -177,6 +177,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
 
+    // Validate required parameters
+    if (local_hostname.empty()) {
+        LOG(ERROR) << "local_hostname is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Check if hostname already contains a port
     std::string hostname = local_hostname;
     size_t colon_pos = hostname.find(":");
@@ -249,7 +255,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // can create client buffer allocator on the shared memory later.
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage);
-    if (local_buffer_size > 0) {
+    if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
@@ -501,7 +507,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
+        protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {

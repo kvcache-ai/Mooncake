@@ -31,7 +31,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      allocation_strategy_(
+          CreateAllocationStrategy(config.allocation_strategy_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
@@ -86,8 +87,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
-    } else {
-        allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
     }
 }
 
@@ -1583,6 +1582,10 @@ void MasterService::EvictionThreadFunc() {
             MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
+            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+                      << " high_watermark=" << eviction_high_watermark_ratio_
+                      << " need_eviction=" << need_eviction_
+                      << " eviction_ratio=" << eviction_ratio_;
             double evict_ratio_target = std::max(
                 eviction_ratio_,
                 used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
@@ -1590,6 +1593,7 @@ void MasterService::EvictionThreadFunc() {
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
@@ -1984,8 +1988,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects"
-            << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
@@ -2148,21 +2151,21 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     // Randomly pick a segment from the source replicas
     static thread_local std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
-    size_t random_index = dis(gen);
-
+    std::string selected_source_segment = segment_names[dis(gen)];
     UUID select_client;
     ErrorCode error = segment_accessor.GetClientIdBySegmentName(
-        segment_names[random_index], select_client);
+        selected_source_segment, select_client);
     if (error != ErrorCode::OK) {
         LOG(ERROR) << "key=" << key
-                   << ", segment_name=" << segment_names[random_index]
+                   << ", segment_name=" << selected_source_segment
                    << ", error=client_id_not_found";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.key = key, .targets = targets});
+            select_client, {.key = key,
+                            .source = selected_source_segment,
+                            .targets = targets});
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "local_hot_cache.h"
 
 namespace mooncake {
 
@@ -410,6 +412,22 @@ class Client {
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
+    /**
+     * @brief Check if local hot cache is enabled
+     * @return true if hot cache is enabled, false otherwise
+     */
+    bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
+
+    /**
+     * @brief Get the number of cache blocks in local hot cache
+     * @return Number of cache blocks if hot cache is enabled, 0 otherwise
+     */
+    size_t GetLocalHotCacheBlockCount() const {
+        if (hot_cache_ != nullptr) {
+            return hot_cache_->GetCacheSize();
+        }
+        return 0;
+    }
 
    private:
     /**
@@ -447,6 +465,48 @@ class Client {
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
                         const DiskDescriptor& disk_descriptor);
+    /**
+     * @brief Initialize local hot cache
+     * @return ErrorCode::OK if use local hot cache,
+     * ErrorCode::INVALID_PARAMS if invalid LOCAL_HOT_CACHE_SIZE config
+     */
+    ErrorCode InitLocalHotCache();
+
+    /**
+     * @brief Read LOCAL_HOT_CACHE_SIZE from environment variable
+     * @return Cache size in bytes, or 0 if not set or invalid
+     */
+    size_t GetLocalHotCacheSizeFromEnv();
+
+    /**
+     * @brief Read LOCAL_HOT_BLOCK_SIZE from environment variable
+     * @param default_value Default block size to use if env var is not set or
+     * invalid
+     * @return Parsed block size from environment, or default_value if not
+     * set/invalid
+     */
+    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
+
+    /**
+     * @brief Redirect replica descriptor to local hot cache if cache hit
+     * @param key Object key
+     * @param replica Replica descriptor
+     * @return true if cache hit and replica descriptor was updated, false
+     * otherwise
+     */
+    bool RedirectToHotCache(const std::string& key,
+                            Replica::Descriptor& replica);
+
+    /**
+     * @brief Asynchronously process slices and update hot cache for TE
+     * transfers.
+     * @param key Object key.
+     * @param slices Vector of slices to check and cache.
+     * @param replica Replica descriptor to identify slice sources.
+     */
+    void ProcessSlicesAsync(const std::string& key,
+                            const std::vector<Slice>& slices,
+                            const Replica::Descriptor& replica);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -509,6 +569,64 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    void PollAndDispatchTasks();
+    void SubmitTask(const TaskAssignment& assignment);
+
+    // For task management
+    // Client-side task representation
+    struct ClientTask {
+        TaskAssignment assignment;
+        uint32_t retry_count = 0;
+
+        void increment_retry() { retry_count++; }
+    };
+
+    void ExecuteTask(const ClientTask& client_task);
+
+    tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
+        const std::string& key, const std::string& action_name,
+        std::function<tl::expected<void, ErrorCode>()> end_fn,
+        std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+        const Replica::Descriptor& source,
+        const std::vector<Replica::Descriptor>& targets);
+
+    /**
+     * @brief Copy an object's replica to target segments
+     * @param key Object key
+     * @param source Source segment
+     * @param targets Target segments
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
+
+    /**
+     * @brief Move an object's replica from source segment to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+    // Task thread pool for async task execution
+    ThreadPool task_thread_pool_;
+    std::atomic<bool> task_running_{true};
+
+    // Task polling configuration
+    static constexpr size_t kTaskBatchSize =
+        16;  // Number of tasks to fetch per poll
+
+    bool te_initialized_{false};
+
+    // Local hot cache and async handler
+    std::shared_ptr<LocalHotCache> hot_cache_;
+    std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
 };
 
 }  // namespace mooncake
