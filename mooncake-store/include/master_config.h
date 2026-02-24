@@ -668,6 +668,7 @@ struct InProcMasterConfig {
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
+    std::optional<double> eviction_high_watermark_ratio;
 };
 
 // Builder class for InProcMasterConfig
@@ -680,6 +681,7 @@ class InProcMasterConfigBuilder {
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
+    std::optional<double> eviction_high_watermark_ratio_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -719,6 +721,15 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "eviction_high_watermark_ratio must be between 0.0 and 1.0");
+        }
+        eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -732,6 +743,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
+    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     return config;
 }
 
