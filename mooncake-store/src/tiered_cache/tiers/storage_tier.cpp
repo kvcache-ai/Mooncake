@@ -78,44 +78,37 @@ tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
 tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
     if (!data.buffer) return {};
 
-    // Check if this buffer is in our pending batch and remove it
-    if (auto* staging = dynamic_cast<StorageBuffer*>(data.buffer.get())) {
-        // Wait if buffer is being flushed to prevent use-after-free
-        staging->WaitForFlushComplete();
+    auto* staging = dynamic_cast<StorageBuffer*>(data.buffer.get());
+    if (!staging) return {};
 
-        size_t size = staging->size();
-        std::string key = staging->GetKey();
-        bool was_pending = false;
+    size_t size = staging->size();
+    std::string key = staging->GetKey();
+
+    {
+        std::unique_lock<std::mutex> lock(batch_mutex_);
+
+        // Wait for any in-progress flush referencing this buffer.
+        // State changes happen under batch_mutex_, so no TOCTOU race.
+        flush_cv_.wait(lock, [staging] { return !staging->IsFlushing(); });
 
         if (!key.empty()) {
-            std::unique_lock<std::mutex> lock(batch_mutex_);
             auto it = pending_batch_.find(key);
             if (it != pending_batch_.end() && it->second == staging) {
-                // Remove from pending batch
                 pending_batch_.erase(it);
                 pending_batch_size_.fetch_sub(size);
-                was_pending = true;
                 VLOG(1) << "Removed key " << key
                         << " from pending batch (Freed explicitly)";
+                return {};
             }
-        }
-
-        // If not in pending batch, it was persisted - update persisted_size_
-        if (!was_pending && staging->IsPersisted()) {
-            // Subtract from persisted size
-            size_t current = persisted_size_.load();
-            while (current >= size &&
-                   !persisted_size_.compare_exchange_weak(current, current - size)) {
-                // Retry CAS
-            }
-            VLOG(1) << "Freed persisted data for key " << key << ", size=" << size;
-            // Note: Actual disk file deletion would require StorageBackend::RemoveFile
-            // which is not exposed via StorageBackendInterface. For now, we just
-            // update the accounting. The storage backend handles its own eviction.
         }
     }
 
-    // Staging buffer will be freed by unique_ptr
+    // Not in pending batch — update persisted accounting if needed
+    if (staging->IsPersisted()) {
+        persisted_size_.fetch_sub(size, std::memory_order_acq_rel);
+        VLOG(1) << "Freed persisted data for key " << key << ", size=" << size;
+    }
+
     return {};
 }
 
@@ -155,48 +148,52 @@ tl::expected<void, ErrorCode> StorageTier::Commit(const std::string& key,
 tl::expected<void, ErrorCode> StorageTier::Flush() { return FlushInternal(); }
 
 tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
-    std::unique_lock<std::mutex> lock(batch_mutex_);
-    if (pending_batch_.empty()) return {};
-
-    // 1. Snapshot pending data for IO and mark buffers as flushing
+    std::unordered_map<std::string, StorageBuffer*> snapshot;
     std::unordered_map<std::string, std::vector<Slice>> batch_to_write;
-    std::vector<StorageBuffer*> buffers_to_persist;
-    batch_to_write.reserve(pending_batch_.size());
-    buffers_to_persist.reserve(pending_batch_.size());
-
     size_t batch_total_size = 0;
-    for (const auto& kv : pending_batch_) {
-        kv.second->SetFlushing(true);  // Mark as flushing to prevent Free()
-        batch_to_write[kv.first] = {kv.second->ToSlice()};
-        buffers_to_persist.push_back(kv.second);
-        batch_total_size += kv.second->size();
-    }
 
-    // 2. Clear pending state to allow new commits
-    pending_batch_.clear();
-    pending_batch_size_.store(0);
+    // 1. Snapshot under lock: mark flushing, swap out pending batch
+    {
+        std::unique_lock<std::mutex> lock(batch_mutex_);
+        if (pending_batch_.empty()) return {};
 
-    lock.unlock();
+        snapshot.swap(pending_batch_);
+        pending_batch_size_.store(0);
 
-    // 3. Execute IO (Slow, concurrent)
-    auto res = storage_backend_->BatchOffload(batch_to_write, nullptr);
-    if (!res) {
-        LOG(ERROR) << "Flush failed: " << res.error();
-        // Clear flushing flag even on failure
-        for (auto* buf : buffers_to_persist) {
-            buf->SetFlushing(false);
+        batch_to_write.reserve(snapshot.size());
+        for (const auto& kv : snapshot) {
+            kv.second->SetFlushing(true);
+            batch_to_write[kv.first] = {kv.second->ToSlice()};
+            batch_total_size += kv.second->size();
         }
-        return tl::make_unexpected(res.error());
     }
 
-    // 4. Update state (Persist / Free DRAM) and clear flushing flag
-    for (auto* buf : buffers_to_persist) {
-        buf->Persist();
-        buf->SetFlushing(false);
-    }
+    // 2. IO without lock
+    auto res = storage_backend_->BatchOffload(batch_to_write, nullptr);
 
-    // 5. Update persisted size tracking
-    persisted_size_.fetch_add(batch_total_size);
+    // 3. Finalize under lock: update state and notify waiters
+    {
+        std::unique_lock<std::mutex> lock(batch_mutex_);
+
+        if (!res) {
+            LOG(ERROR) << "Flush failed: " << res.error();
+            // Restore pending entries on failure
+            for (auto& kv : snapshot) {
+                kv.second->SetFlushing(false);
+                pending_batch_[kv.first] = kv.second;
+                pending_batch_size_.fetch_add(kv.second->size());
+            }
+            flush_cv_.notify_all();
+            return tl::make_unexpected(res.error());
+        }
+
+        for (auto& kv : snapshot) {
+            kv.second->Persist();
+            kv.second->SetFlushing(false);
+        }
+        persisted_size_.fetch_add(batch_total_size);
+    }
+    flush_cv_.notify_all();
 
     return {};
 }
@@ -248,11 +245,13 @@ static CopierRegistrar storage_tier_copier_registrar(
         if (dst.buffer->size() < src.buffer->size())
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
 
-        if (dst.buffer->data() == 0) {
+        // Snapshot destination pointer once to avoid TOCTOU with Persist()
+        uint64_t dst_addr = dst.buffer->data();
+        if (dst_addr == 0) {
             return tl::make_unexpected(
                 ErrorCode::INVALID_PARAMS);  // OnDisk, cannot write
         }
-        memcpy(reinterpret_cast<void*>(dst.buffer->data()),
+        memcpy(reinterpret_cast<void*>(dst_addr),
                reinterpret_cast<const void*>(src.buffer->data()),
                src.buffer->size());
         return {};

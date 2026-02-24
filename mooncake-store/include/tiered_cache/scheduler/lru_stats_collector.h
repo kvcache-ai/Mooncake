@@ -45,7 +45,8 @@ class LRUStatsCollector : public StatsCollector {
             stats.hot_keys.push_back({key, score--});
         }
 
-        // Note: For LRU, we do NOT clear the list. We need history for eviction.
+        // Note: For LRU, we do NOT clear the list. We need history for
+        // eviction.
         return stats;
     }
 

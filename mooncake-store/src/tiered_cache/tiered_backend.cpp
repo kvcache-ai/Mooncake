@@ -279,6 +279,45 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     std::optional<uint64_t> expected_version) {
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
+    std::shared_ptr<MetadataEntry> entry = nullptr;
+
+    // Try to find existing entry (Global Read Lock)
+    {
+        std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+        auto it = metadata_index_.find(key);
+        if (it != metadata_index_.end()) {
+            entry = it->second;
+        }
+    }
+
+    // Create if not exists (Global Write Lock)
+    if (!entry) {
+        if (expected_version.has_value()) {
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
+        }
+
+        std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
+        auto it = metadata_index_.find(key);
+        if (it != metadata_index_.end()) {
+            entry = it->second;
+        } else {
+            entry = std::make_shared<MetadataEntry>();
+            metadata_index_[key] = entry;
+        }
+    }
+
+    // CAS check BEFORE any side effects
+    if (expected_version.has_value()) {
+        std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
+        if (entry->version != expected_version.value()) {
+            VLOG(1) << "CAS Failed for key " << key
+                    << ": valid_version=" << entry->version
+                    << ", expected=" << expected_version.value();
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
+        }
+    }
+
+    // Side effects: tier commit + metadata sync (only after CAS passes)
     auto tier_commit_res = handle->loc.tier->Commit(key, handle->loc.data);
     if (!tier_commit_res) {
         LOG(ERROR) << "Tier Commit failed for key " << key << ": "
@@ -297,50 +336,15 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         }
     }
 
-    std::shared_ptr<MetadataEntry> entry = nullptr;
-
-    // Try to find existing entry (Global Read Lock)
-    {
-        std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
-        auto it = metadata_index_.find(key);
-        if (it != metadata_index_.end()) {
-            entry = it->second;
-        }
-    }
-
-    // Create if not exists (Global Write Lock)
-    if (!entry) {
-        // If we are doing a CAS commit but entry doesn't exist, it implies
-        // the key was deleted or never existed. If expected_version > 0, this
-        // is a failure.
-        if (expected_version.has_value()) {
-            return tl::make_unexpected(ErrorCode::CAS_FAILED);
-        }
-
-        std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
-        // Double-check logic
-        auto it = metadata_index_.find(key);
-        if (it != metadata_index_.end()) {
-            entry = it->second;
-        } else {
-            entry = std::make_shared<MetadataEntry>();
-            metadata_index_[key] = entry;
-        }
-    }
-
-    //  Update Entry (Entry Write Lock)
-    // Global lock is released. We only lock this specific key's entry.
+    // Update Entry (Entry Write Lock)
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
 
-        // CAS Check
-        if (expected_version.has_value()) {
-            if (entry->version != expected_version.value()) {
-                VLOG(1) << "CAS Failed for key " << key
-                        << ": valid_version=" << entry->version
-                        << ", expected=" << expected_version.value();
-                return tl::make_unexpected(ErrorCode::CAS_FAILED);
-            }
+        // Re-check version under write lock (another commit may have raced)
+        if (expected_version.has_value() &&
+            entry->version != expected_version.value()) {
+            VLOG(1) << "CAS Failed (re-check) for key " << key;
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
         }
 
         // Insert or replace the handle for this tier
@@ -419,9 +423,6 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     }
 
     // Fallback: Return highest priority replica
-    if (out_version) {
-        *out_version = entry->version;
-    }
     return entry->replicas.begin()->second;
 }
 
@@ -610,7 +611,8 @@ tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
     if (dest_tier_it != tiers_.end()) {
         size_t dest_capacity = dest_tier_it->second->GetCapacity();
         size_t dest_usage = dest_tier_it->second->GetUsage();
-        size_t dest_available = (dest_capacity > dest_usage) ? (dest_capacity - dest_usage) : 0;
+        size_t dest_available =
+            (dest_capacity > dest_usage) ? (dest_capacity - dest_usage) : 0;
 
         if (dest_available < required_size) {
             // Insufficient space, skip this transfer silently
