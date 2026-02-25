@@ -88,6 +88,20 @@ docker_launch(){
     local cleaned_path=${relative_path#/}
     pip_cmd=$(append_str "${pip_cmd}" "pip install /test_run/$cleaned_path/whls/$mooncake_whl_file")
 
+    # Check if sglang-router is needed and missing
+    if [[ "$registry_addr" == *"sglang"* ]]; then
+        echo "=== Detected sglang image, checking sglang-router ==="
+        if ! ${docker_exec} "python -c 'import sglang_router' 2>/dev/null"; then
+            echo "sglang-router not found, will install it"
+            pip_cmd=$(append_str "${pip_cmd}" \
+                "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
+            pip_cmd=$(append_str "${pip_cmd}" \
+                "pip install sglang-router")
+        else
+            echo "sglang-router already installed, skipping"
+        fi
+    fi
+
     echo "Installing ERDMA drivers"
     echo "Executing ERDMA driver installation command:"
     echo "${erdma_driver_cmd}"
@@ -184,7 +198,6 @@ check_server_ready() {
     return 1
 }
 
-# 6. 通用的服务就绪检查函数（支持自定义日志模式）
 check_server_ready_with_pattern() {
     local server_log_path=$1
     local ready_pattern=$2
