@@ -19,7 +19,11 @@ def get_client(store):
     protocol = os.getenv("PROTOCOL", "tcp")
     device_name = os.getenv("DEVICE_NAME", "ibp6s0")
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
-    metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
+    metadata_server = (
+        os.getenv("MC_METADATA_SERVER")
+        or os.getenv("MOONCAKE_TE_META_DATA_SERVER")
+        or "http://127.0.0.1:8080/metadata"
+    )
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = 512 * 1024 * 1024  # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
