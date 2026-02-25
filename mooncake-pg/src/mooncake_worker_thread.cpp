@@ -160,7 +160,12 @@ void MooncakeWorker::startWorker() {
 
                     if (!skipTransfer) {
                         auto s = group->engine->freeBatchID(task.batchID);
-                        LOG_ASSERT(s.ok());
+                        if (!s.ok()) {
+                            LOG(WARNING)
+                                << "BatchID leaked due to freeBatchID "
+                                   "failure (likely caused by a timeout): "
+                                << s.message();
+                        }
                     }
 
                     auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
@@ -254,7 +259,12 @@ void MooncakeWorker::startWorker() {
                             callback();
                         }
                         auto s = group->engine->freeBatchID(task.batchID);
-                        LOG_ASSERT(s.ok());
+                        if (!s.ok()) {
+                            LOG(WARNING)
+                                << "BatchID leaked due to freeBatchID "
+                                   "failure (likely caused by a timeout): "
+                                << s.message();
+                        }
                     }
                 }
             }
