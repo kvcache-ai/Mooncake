@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -8,6 +9,8 @@
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
+
+namespace fs = std::filesystem;
 
 // Snapshot storage backend type enumeration
 enum class SnapshotBackendType {
@@ -208,14 +211,17 @@ class LocalFileBackend : public SerializerBackend {
     std::string GetConnectionInfo() const override;
 
    private:
-    std::string base_path_;  // Base path for local file storage
+    fs::path base_path_;  // Base path for local file storage
 
     // Convert key to full file path
-    std::string KeyToPath(const std::string& key) const;
+    fs::path KeyToPath(const std::string& key) const;
 
     // Ensure directory exists
     tl::expected<void, std::string> EnsureDirectoryExists(
-        const std::string& dir_path) const;
+        const fs::path& dir_path) const;
+
+    // Check if path is within base_path_ (security check)
+    bool IsPathWithinBase(const fs::path& path) const;
 };
 
 }  // namespace mooncake
