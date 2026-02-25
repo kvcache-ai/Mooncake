@@ -22,6 +22,7 @@ set(MOONCAKE_STORE_SOURCES
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
+    aligned_client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
     http_metadata_server.cpp
@@ -40,6 +41,17 @@ if(USE_3FS)
     message(FATAL_ERROR "hf3fs_api_shared library not found in /usr/lib")
   endif()
   set(EXTRA_LIBS ${HF3FS_API_LIB})
+endif()
+
+# io_uring support (auto-detected)
+find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
+find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
+if(URING_LIB AND URING_INCLUDE)
+  message(STATUS "io_uring: Enabled for mooncake_store")
+  list(APPEND MOONCAKE_STORE_SOURCES uring_file.cpp)
+  list(APPEND EXTRA_LIBS ${URING_LIB})
+else()
+  message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
 
 # The cache_allocator library
@@ -61,6 +73,11 @@ target_link_libraries(mooncake_store
 )
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+
+if(URING_LIB AND URING_INCLUDE)
+    target_compile_definitions(mooncake_store PUBLIC USE_URING)
+    target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
 endif()
 
 if (USE_ASCEND_DIRECT)

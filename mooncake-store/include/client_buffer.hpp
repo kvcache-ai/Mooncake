@@ -51,19 +51,22 @@ class ClientBufferAllocator
 
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
+   protected:
+    // Constructors accessible to derived classes
+    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
+
+    void* buffer_;
+    bool use_hugepage_ = false;
+
    private:
-    // Private constructors for different memory types
     ClientBufferAllocator(size_t size, const std::string& protocol,
                           bool use_hugepage);
-    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
 
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;
-    void* buffer_;
     size_t buffer_size_;
     bool is_external_memory_ = false;
-    bool use_hugepage_ = false;
 };
 
 /**

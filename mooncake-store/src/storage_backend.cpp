@@ -767,6 +767,11 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
     }
 #endif
 
+#ifdef USE_URING
+    if (use_uring_) {
+        return std::make_unique<UringFile>(path, fd, 32, true);
+    }
+#endif
     return std::make_unique<PosixFile>(path, fd);
 }
 
@@ -932,6 +937,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
     storage_backend_ = std::make_unique<StorageBackend>(
         file_storage_config_.storage_filepath, file_per_key_config_.fsdir,
         file_per_key_config_.enable_eviction);
+    storage_backend_->use_uring_ = file_storage_config_.use_uring;
     auto init_result = storage_backend_->Init();
     if (!init_result) {
         LOG(ERROR) << "Failed to init storage backend";
@@ -1078,7 +1084,7 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
 }
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    std::unordered_map<std::string, Slice>& batched_slices) {
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
@@ -1231,7 +1237,29 @@ BucketStorageBackend::BucketStorageBackend(
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      bucket_backend_config_(bucket_backend_config_) {}
+      bucket_backend_config_(bucket_backend_config_) {
+    // Allocate aligned buffer for O_DIRECT I/O operations
+    void* buf = nullptr;
+    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
+    if (ret != 0) {
+        LOG(ERROR)
+            << "BucketStorageBackend: Failed to allocate aligned buffer: "
+            << strerror(ret);
+    } else {
+        aligned_io_buffer_.reset(buf);
+        // Update the deleter to use free
+        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
+            buf, [](void* p) { free(p); });
+        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
+                  << " bytes aligned buffer at " << buf;
+    }
+}
+
+BucketStorageBackend::~BucketStorageBackend() {
+    // Clear file cache to release UringFile instances before destruction
+    // This ensures orderly cleanup of io_uring resources
+    ClearFileCache();
+}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1331,7 +1359,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batch_object) {
+    std::unordered_map<std::string, Slice>& batch_object) {
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1413,10 +1441,44 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
         // Read each key's data
         for (const auto& plan : read_plans) {
-            // Read value (skip key in file: offset + key_size)
-            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-            auto read_res =
-                file->vector_read(&iov, 1, plan.offset + plan.key_size);
+            int64_t actual_offset = plan.offset + plan.key_size;
+            tl::expected<size_t, ErrorCode> read_res;
+
+#ifdef USE_URING
+            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
+            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+            if (uring_file != nullptr) {
+                // Calculate aligned read range
+                int64_t aligned_offset =
+                    align_down(actual_offset, kDirectIOAlignment);
+                int64_t data_end =
+                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t aligned_end = static_cast<int64_t>(align_up(
+                    static_cast<size_t>(data_end), kDirectIOAlignment));
+                size_t aligned_size =
+                    static_cast<size_t>(aligned_end - aligned_offset);
+                int64_t offset_in_buffer = actual_offset - aligned_offset;
+
+                // Zero-copy path: read directly into the slice buffer.
+                // dest_slice.ptr is 4096-aligned and oversized (from
+                // AllocateBatch) to accommodate the full aligned read range.
+                read_res = uring_file->read_aligned(
+                    plan.dest_slice.ptr, aligned_size, aligned_offset);
+
+                if (read_res) {
+                    // Adjust ptr to point to actual data start (no memcpy)
+                    batch_object.at(plan.key).ptr =
+                        static_cast<char*>(plan.dest_slice.ptr) +
+                        offset_in_buffer;
+                    read_res = plan.dest_slice.size;
+                }
+            } else
+#endif
+            {
+                // Fallback to vector_read for non-UringFile
+                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                read_res = file->vector_read(&iov, 1, actual_offset);
+            }
 
             if (!read_res) {
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
@@ -1873,18 +1935,105 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     auto file = std::move(open_file_result.value());
 
-    auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
-    if (!write_result) {
-        LOG(ERROR) << "vector_write failed for: " << bucket_id
-                   << ", error: " << write_result.error();
-        return tl::make_unexpected(write_result.error());
-    }
-    if (static_cast<int64_t>(write_result.value()) !=
-        bucket_metadata->data_size) {
-        LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
-                   << ", expected: " << bucket_metadata->data_size
-                   << ", got: " << write_result.value();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+#ifdef USE_URING
+    // Try to use write_aligned for O_DIRECT I/O if file is UringFile
+    UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+    if (uring_file != nullptr) {
+        size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
+        size_t aligned_size = align_up(total_size, kDirectIOAlignment);
+
+        // Allocate aligned buffer if needed
+        void* write_buffer = nullptr;
+        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
+                                                           [](void*) {}};
+
+        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
+            // Use the pre-allocated buffer
+            write_buffer = aligned_io_buffer_.get();
+        } else {
+            // Allocate a temporary larger buffer
+            void* buf = nullptr;
+            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
+            if (ret != 0) {
+                LOG(ERROR)
+                    << "Failed to allocate aligned buffer for WriteBucket: "
+                    << strerror(ret);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            temp_buffer.reset(buf);
+            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
+                buf, [](void* p) { free(p); });
+            write_buffer = buf;
+            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
+                         << " requires " << aligned_size
+                         << " bytes, exceeds buffer size " << kAlignedBufferSize
+                         << ", using temporary allocation";
+        }
+
+        // Aggregate all iovs data into the aligned buffer
+        char* dst = static_cast<char*>(write_buffer);
+        for (const auto& iov : iovs) {
+            memcpy(dst, iov.iov_base, iov.iov_len);
+            dst += iov.iov_len;
+        }
+
+        // Zero-pad the remaining bytes
+        if (aligned_size > total_size) {
+            memset(dst, 0, aligned_size - total_size);
+        }
+
+        // Write using write_aligned
+        auto write_result =
+            uring_file->write_aligned(write_buffer, aligned_size, 0);
+        if (!write_result) {
+            LOG(ERROR) << "write_aligned failed for: " << bucket_id
+                       << ", error: " << write_result.error();
+            return tl::make_unexpected(write_result.error());
+        }
+        if (write_result.value() != aligned_size) {
+            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
+                       << ", expected: " << aligned_size
+                       << ", got: " << write_result.value();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Flush bucket data to stable storage before writing metadata.
+        // This prevents a crash from leaving valid metadata pointing at
+        // incomplete data (write-ordering durability guarantee).
+        auto sync_result = uring_file->datasync();
+        if (!sync_result) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Invalidate cache for this file since content changed
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(bucket_data_path);
+        }
+    } else
+#endif
+    {
+        // Fallback to vector_write for non-UringFile
+        auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
+        if (!write_result) {
+            LOG(ERROR) << "vector_write failed for: " << bucket_id
+                       << ", error: " << write_result.error();
+            return tl::make_unexpected(write_result.error());
+        }
+        if (static_cast<int64_t>(write_result.value()) !=
+            bucket_metadata->data_size) {
+            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
+                       << ", expected: " << bucket_metadata->data_size
+                       << ", got: " << write_result.value();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Invalidate cache for this file since content changed
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(bucket_data_path);
+        }
     }
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
@@ -2138,11 +2287,60 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
             break;
     }
 
+#ifdef USE_URING
+    // Add O_DIRECT flag when using uring for direct I/O
+    if (file_storage_config_.use_uring) {
+        flags |= O_DIRECT;
+    }
+#endif
+
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
+        LOG(ERROR) << "Failed to open file: " << path << ", errno=" << errno
+                   << " (" << strerror(errno) << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
+#ifdef USE_URING
+    if (file_storage_config_.use_uring) {
+        return std::make_unique<UringFile>(path, fd, 32, true);
+    }
+#endif
     return std::make_unique<PosixFile>(path, fd);
+}
+
+tl::expected<std::shared_ptr<StorageFile>, ErrorCode>
+BucketStorageBackend::GetOrOpenFile(const std::string& path,
+                                    FileMode mode) const {
+    // Only cache read-mode files (write mode needs O_TRUNC which invalidates
+    // cache)
+    if (mode == FileMode::Read) {
+        MutexLocker locker(&file_cache_mutex_);
+        auto it = file_cache_.find(path);
+        if (it != file_cache_.end()) {
+            return it->second;
+        }
+    }
+
+    // Open new file
+    auto result = OpenFile(path, mode);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
+
+    auto file = std::shared_ptr<StorageFile>(std::move(result.value()));
+
+    // Cache read-mode files
+    if (mode == FileMode::Read) {
+        MutexLocker locker(&file_cache_mutex_);
+        file_cache_[path] = file;
+    }
+
+    return file;
+}
+
+void BucketStorageBackend::ClearFileCache() {
+    MutexLocker locker(&file_cache_mutex_);
+    file_cache_.clear();
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
@@ -2173,6 +2371,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
 tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
     MutexLocker locker(&iterator_mutex_);
     return next_bucket_ != 0;
+}
+
+tl::expected<std::shared_ptr<StorageFile>, ErrorCode>
+BucketStorageBackend::GetFileInstance() const {
+    // Create a temporary file to get access to the file instance
+    // This is used for external buffer registration with UringFile
+    namespace fs = std::filesystem;
+
+    std::string temp_path =
+        (fs::path(storage_path_) / "temp_for_registration").string();
+
+    auto open_result = OpenFile(temp_path, FileMode::Write);
+    if (!open_result) {
+        LOG(ERROR) << "Failed to open temporary file for GetFileInstance: "
+                   << temp_path;
+        return tl::make_unexpected(open_result.error());
+    }
+
+    auto file = std::move(open_result.value());
+
+    // Remove the temporary file from disk now that the fd is open.
+    // The fd remains valid (Unix semantics) until the StorageFile is destroyed.
+    fs::remove(temp_path);
+
+    // Convert unique_ptr to shared_ptr
+    return std::shared_ptr<StorageFile>(std::move(file));
 }
 
 // ============================================================================
@@ -2264,9 +2488,17 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             }
         }
 
-        // Release fd to PosixFile (PosixFile takes ownership and will close it)
-        data_file_ =
-            std::make_unique<PosixFile>(data_file_path_, fd_guard.release());
+        // Release fd to StorageFile (takes ownership and will close it)
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            data_file_ = std::make_unique<UringFile>(
+                data_file_path_, fd_guard.release(), 32, true);
+        } else
+#endif
+        {
+            data_file_ = std::make_unique<PosixFile>(data_file_path_,
+                                                     fd_guard.release());
+        }
 
         // Create allocator with base=0, size=capacity
         allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
@@ -2467,7 +2699,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 //-----------------------------------------------------------------------------
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    std::unordered_map<std::string, Slice>& batched_slices) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
