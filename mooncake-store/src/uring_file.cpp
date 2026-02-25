@@ -1,10 +1,10 @@
 #ifdef USE_URING
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <mutex>
 #include <string>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -18,144 +18,168 @@
 namespace mooncake {
 
 // ============================================================================
-// SharedUringRing — process-wide io_uring ring shared by all UringFile instances
+// GlobalBufInfo — process-wide buffer registration state.
+//
+// register_buffer() is called once from the storage-backend init path.
+// Each thread-local ring picks up the registration lazily on first I/O.
+// ============================================================================
+struct GlobalBufInfo {
+    std::atomic<void*>  base{nullptr};
+    std::atomic<size_t> size{0};
+};
+static GlobalBufInfo g_buf;
+
+// ============================================================================
+// SharedUringRing — per-thread io_uring ring.
 //
 // Design goals:
-//  - One ring per process: io_uring_queue_init / io_uring_queue_exit happen
-//    exactly once, eliminating the per-file mmap/munmap + TLB-shootdown cost.
-//  - Dynamic fd registration: alloc_slot() / free_slot() call
-//    io_uring_register_files_update(), which is a lightweight syscall that
-//    does NOT tear down the ring.
-//  - Thread safety: ring_mu_ serialises all SQ/CQ operations. slot_mu_
-//    protects the slot-allocator metadata independently.
+//  - One ring per *thread*: eliminates all mutex contention between threads.
+//    Different threads can perform I/O fully concurrently.
+//  - Within one thread: no lock needed (single owner), so multiple SQEs can
+//    be batched before waiting, exposing NVMe queue depth > 1.
+//  - Buffer registration: stored globally in g_buf, registered lazily on
+//    each thread-local ring on first use (ensure_buf_registered()).
+//  - File-descriptor registration (IOSQE_FIXED_FILE) intentionally omitted:
+//    the per-I/O fdget() overhead (~50 ns) is negligible compared to the
+//    mutex contention that the old global ring imposed (> 1 ms per read).
 // ============================================================================
 class SharedUringRing {
    public:
-    static constexpr unsigned QUEUE_DEPTH   = 32;
-    static constexpr int      MAX_FILES     = 1024;
-    static constexpr size_t   MIN_CHUNK     = 4096;
+    static constexpr unsigned QUEUE_DEPTH = 32;
+    static constexpr size_t   MIN_CHUNK   = 4096;
 
     static SharedUringRing& instance() {
-        static SharedUringRing s_ring;
-        return s_ring;
+        thread_local SharedUringRing tl_ring;
+        return tl_ring;
     }
 
     SharedUringRing(const SharedUringRing&)            = delete;
     SharedUringRing& operator=(const SharedUringRing&) = delete;
 
-    bool is_initialized()     const { return initialized_; }
-    bool files_registered()   const { return files_registered_; }
+    bool is_initialized()       const { return initialized_; }
     bool is_buffer_registered() const { return buf_registered_; }
-    void* buffer_base()       const { return buf_base_; }
-    size_t buffer_size()      const { return buf_size_; }
+    void* buffer_base()         const { return buf_base_; }
+    size_t buffer_size()        const { return buf_size_; }
 
     // -----------------------------------------------------------------
-    // Slot management
+    // Buffer registration
     // -----------------------------------------------------------------
 
-    /// Register @p fd into a free slot in the kernel's registered-files table.
-    /// Returns slot index >= 0 on success, -1 on failure.
-    int alloc_slot(int fd) {
-        if (!initialized_ || !files_registered_) return -1;
-
-        std::lock_guard<std::mutex> lk(slot_mu_);
-        int slot = -1;
-        if (!free_slots_.empty()) {
-            slot = free_slots_.back();
-            free_slots_.pop_back();
-        } else if (watermark_ < MAX_FILES) {
-            slot = watermark_++;
-        } else {
-            LOG(ERROR) << "[SharedUringRing] registered-files table full ("
-                       << MAX_FILES << " slots)";
-            return -1;
-        }
-
-        int ret = io_uring_register_files_update(&ring_, slot, &fd, 1);
-        if (ret < 0) {
-            LOG(WARNING) << "[SharedUringRing] io_uring_register_files_update "
-                            "failed (slot="
-                         << slot << "): " << strerror(-ret)
-                         << " — fd will be used directly";
-            free_slots_.push_back(slot);
-            return -1;
-        }
-        return slot;
-    }
-
-    /// Release slot back to the pool (writes -1 into the kernel's table).
-    void free_slot(int slot) {
-        if (slot < 0 || !initialized_ || !files_registered_) return;
-        std::lock_guard<std::mutex> lk(slot_mu_);
-        int minus_one = -1;
-        io_uring_register_files_update(&ring_, slot, &minus_one, 1);
-        free_slots_.push_back(slot);
-    }
-
-    // -----------------------------------------------------------------
-    // Buffer registration (at most one global buffer at a time)
-    // -----------------------------------------------------------------
-
-    bool register_buffer(void* buf, size_t len) {
+    // Register a buffer on THIS thread's ring.  Called lazily from each
+    // thread before the first fixed-buffer I/O.
+    bool ensure_buf_registered() {
+        if (buf_registered_) return true;
         if (!initialized_) return false;
-        std::lock_guard<std::mutex> lk(ring_mu_);
-        if (buf_registered_) {
-            LOG(WARNING) << "[SharedUringRing] a buffer is already registered";
-            return false;
-        }
-        struct iovec iov{buf, len};
+        void*  b = g_buf.base.load(std::memory_order_acquire);
+        size_t s = g_buf.size.load(std::memory_order_acquire);
+        if (!b || !s) return false;
+        struct iovec iov{b, s};
         int ret = io_uring_register_buffers(&ring_, &iov, 1);
         if (ret < 0) {
-            LOG(ERROR) << "[SharedUringRing] io_uring_register_buffers failed: "
-                       << strerror(-ret);
+            LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers: "
+                         << strerror(-ret);
             return false;
         }
         buf_registered_ = true;
-        buf_base_       = buf;
-        buf_size_       = len;
-        LOG(INFO) << "[SharedUringRing] registered buffer addr=" << buf
-                  << " size=" << len;
+        buf_base_        = b;
+        buf_size_        = s;
+        LOG(INFO) << "[SharedUringRing] tid registered buffer addr=" << b
+                  << " size=" << s;
         return true;
     }
 
-    void unregister_buffer() {
+    void unregister_buf_local() {
         if (!initialized_ || !buf_registered_) return;
-        std::lock_guard<std::mutex> lk(ring_mu_);
         io_uring_unregister_buffers(&ring_);
         buf_registered_ = false;
-        buf_base_       = nullptr;
-        buf_size_       = 0;
+        buf_base_        = nullptr;
+        buf_size_        = 0;
     }
 
     // -----------------------------------------------------------------
-    // I/O primitives — all thread-safe via ring_mu_
+    // I/O primitives  (no mutex — caller is the sole owner of this ring)
     // -----------------------------------------------------------------
 
-    tl::expected<size_t, ErrorCode> read(int slot, int raw_fd, void* buf,
-                                         size_t len, off_t off,
-                                         bool use_fixed_buf) {
-        return submit_rw(/*write=*/false, slot, raw_fd, buf, len, off,
-                         use_fixed_buf);
+    tl::expected<size_t, ErrorCode> read(int fd, void* buf, size_t len,
+                                         off_t off) {
+        ensure_buf_registered();
+        bool fix = in_registered_buf(buf, len);
+        return submit_rw(/*write=*/false, fd, buf, len, off, fix);
     }
 
-    tl::expected<size_t, ErrorCode> write(int slot, int raw_fd,
-                                          const void* buf, size_t len,
-                                          off_t off, bool use_fixed_buf) {
-        return submit_rw(/*write=*/true, slot, raw_fd,
-                         // cast away const — io_uring_prep_write takes void*
-                         const_cast<void*>(buf), len, off, use_fixed_buf);
+    tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
+                                          off_t off) {
+        return submit_rw(/*write=*/true, fd,
+                         const_cast<void*>(buf), len, off,
+                         /*use_fixed_buf=*/false);
     }
 
-    tl::expected<size_t, ErrorCode> vector_read(int slot, int raw_fd,
-                                                const iovec* iovs, int cnt,
-                                                off_t off) {
-        return submit_vector(/*write=*/false, slot, raw_fd, iovs, cnt, off);
+    tl::expected<size_t, ErrorCode> vector_read(int fd, const iovec* iovs,
+                                                int cnt, off_t off) {
+        return submit_vector(/*write=*/false, fd, iovs, cnt, off);
     }
 
-    tl::expected<size_t, ErrorCode> vector_write(int slot, int raw_fd,
-                                                 const iovec* iovs, int cnt,
-                                                 off_t off) {
-        return submit_vector(/*write=*/true, slot, raw_fd, iovs, cnt, off);
+    tl::expected<size_t, ErrorCode> vector_write(int fd, const iovec* iovs,
+                                                 int cnt, off_t off) {
+        return submit_vector(/*write=*/true, fd, iovs, cnt, off);
+    }
+
+    // Descriptor for one independently-addressed read in a batch.
+    struct ReadDesc {
+        void*  buf;
+        size_t len;
+        off_t  off;
+    };
+
+    /// Submit up to QUEUE_DEPTH reads at once (each at its own offset), then
+    /// collect completions. Repeat until all @p cnt descs are done.
+    /// This gives the NVMe device queue depth > 1 within a single thread.
+    tl::expected<size_t, ErrorCode> batch_read(int fd, const ReadDesc* descs,
+                                               int cnt) {
+        ensure_buf_registered();
+        size_t total     = 0;
+        int    remaining = cnt;
+        int    idx       = 0;
+
+        while (remaining > 0) {
+            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
+
+            for (int i = 0; i < batch; ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR) << "[SharedUringRing] SQ full (batch_read)";
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                const auto& d = descs[idx + i];
+                if (buf_registered_ && in_registered_buf(d.buf, d.len))
+                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
+                else
+                    io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
+            }
+
+            auto res = collect(batch);
+            if (!res) return res;
+            total     += res.value();
+            idx       += batch;
+            remaining -= batch;
+        }
+        return total;
+    }
+
+    /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
+    tl::expected<void, ErrorCode> fsync(int fd) {
+        if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) {
+            LOG(ERROR) << "[SharedUringRing] SQ full (fsync)";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+
+        auto res = collect(1);
+        if (!res) return tl::make_unexpected(res.error());
+        return {};
     }
 
    private:
@@ -164,46 +188,33 @@ class SharedUringRing {
     // -----------------------------------------------------------------
 
     SharedUringRing() {
-        std::fill(fd_table_, fd_table_ + MAX_FILES, -1);
-
         int ret = io_uring_queue_init(QUEUE_DEPTH, &ring_, 0);
         if (ret < 0) {
             LOG(ERROR) << "[SharedUringRing] io_uring_queue_init failed: "
                        << strerror(-ret);
             return;
         }
-
-        // Pre-register a table of MAX_FILES slots (all -1 = empty).
-        // Individual fds are inserted later via io_uring_register_files_update.
-        ret = io_uring_register_files(&ring_, fd_table_, MAX_FILES);
-        if (ret < 0) {
-            LOG(WARNING) << "[SharedUringRing] io_uring_register_files failed: "
-                         << strerror(-ret)
-                         << " — continuing without registered files";
-            files_registered_ = false;
-        } else {
-            files_registered_ = true;
-        }
-
         initialized_ = true;
-        LOG(INFO) << "[SharedUringRing] initialised  queue_depth=" << QUEUE_DEPTH
-                  << "  max_files=" << MAX_FILES
-                  << "  files_registered=" << files_registered_;
+        LOG(INFO) << "[SharedUringRing] thread-local ring initialised "
+                     "queue_depth=" << QUEUE_DEPTH;
     }
 
     ~SharedUringRing() {
         if (!initialized_) return;
-        // buffer and files are cleaned up automatically when the ring fd is
-        // closed inside io_uring_queue_exit, but unregister explicitly so the
-        // sequence is clear.
-        if (buf_registered_)    io_uring_unregister_buffers(&ring_);
-        if (files_registered_)  io_uring_unregister_files(&ring_);
+        if (buf_registered_) io_uring_unregister_buffers(&ring_);
         io_uring_queue_exit(&ring_);
     }
 
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------
+
+    bool in_registered_buf(const void* buf, size_t len) const {
+        if (!buf_registered_ || !buf_base_ || !buf_size_) return false;
+        uintptr_t ba = reinterpret_cast<uintptr_t>(buf);
+        uintptr_t rb = reinterpret_cast<uintptr_t>(buf_base_);
+        return ba >= rb && (ba + len) <= (rb + buf_size_);
+    }
 
     static size_t next_pow2(size_t n) {
         if (n == 0) return 1;
@@ -219,7 +230,7 @@ class SharedUringRing {
         return std::max(s, MIN_CHUNK);
     }
 
-    // Drain exactly @expected CQEs and accumulate bytes. Caller holds ring_mu_.
+    // Drain exactly @expected CQEs and accumulate bytes.
     tl::expected<size_t, ErrorCode> collect(int expected) {
         int ret = io_uring_submit_and_wait(&ring_, expected);
         if (ret < 0) {
@@ -227,8 +238,8 @@ class SharedUringRing {
                        << strerror(-ret);
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        size_t total = 0;
-        bool   err   = false;
+        size_t   total = 0;
+        bool     err   = false;
         unsigned head, cnt = 0;
         struct io_uring_cqe* cqe;
         io_uring_for_each_cqe(&ring_, head, cqe) {
@@ -247,17 +258,12 @@ class SharedUringRing {
     }
 
     // Chunked contiguous read or write.
-    tl::expected<size_t, ErrorCode> submit_rw(bool is_write, int slot,
-                                               int raw_fd, void* buf,
+    tl::expected<size_t, ErrorCode> submit_rw(bool is_write, int fd, void* buf,
                                                size_t len, off_t off,
                                                bool use_fixed_buf) {
-        const bool use_slot = (files_registered_ && slot >= 0);
-        const int  target   = use_slot ? slot : raw_fd;
-        const bool fix_buf  = (use_fixed_buf && buf_registered_);
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
-
-        std::lock_guard<std::mutex> lk(ring_mu_);
+        const bool fix_buf = (use_fixed_buf && buf_registered_);
 
         char*  ptr       = static_cast<char*>(buf);
         size_t total     = 0;
@@ -280,16 +286,15 @@ class SharedUringRing {
 
                 if (is_write) {
                     if (fix_buf)
-                        io_uring_prep_write_fixed(sqe, target, ptr, chunk, cur, 0);
+                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur, 0);
                     else
-                        io_uring_prep_write(sqe, target, ptr, chunk, cur);
+                        io_uring_prep_write(sqe, fd, ptr, chunk, cur);
                 } else {
                     if (fix_buf)
-                        io_uring_prep_read_fixed(sqe, target, ptr, chunk, cur, 0);
+                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur, 0);
                     else
-                        io_uring_prep_read(sqe, target, ptr, chunk, cur);
+                        io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
-                if (use_slot) io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
 
                 ptr       += chunk;
                 cur       += static_cast<off_t>(chunk);
@@ -300,22 +305,21 @@ class SharedUringRing {
             auto res = collect(static_cast<int>(n));
             if (!res) return res;
             total += res.value();
-            if (res.value() == 0) break;  // EOF
+            if (!is_write && res.value() == 0) break;  // read EOF
+            if (is_write && res.value() == 0) {
+                LOG(ERROR) << "[SharedUringRing] zero bytes written";
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
         }
         return total;
     }
 
-    // Scatter/gather read or write (one SQE per iovec entry).
-    tl::expected<size_t, ErrorCode> submit_vector(bool is_write, int slot,
-                                                  int raw_fd,
+    // Scatter/gather read or write (one SQE per iovec, sequential offsets).
+    tl::expected<size_t, ErrorCode> submit_vector(bool is_write, int fd,
                                                   const iovec* iovs, int cnt,
                                                   off_t off) {
-        const bool use_slot = (files_registered_ && slot >= 0);
-        const int  target   = use_slot ? slot : raw_fd;
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
-
-        std::lock_guard<std::mutex> lk(ring_mu_);
 
         size_t total     = 0;
         off_t  cur       = off;
@@ -333,13 +337,12 @@ class SharedUringRing {
                 }
 
                 if (is_write)
-                    io_uring_prep_write(sqe, target, iovs[idx].iov_base,
+                    io_uring_prep_write(sqe, fd, iovs[idx].iov_base,
                                         iovs[idx].iov_len, cur);
                 else
-                    io_uring_prep_read(sqe, target, iovs[idx].iov_base,
+                    io_uring_prep_read(sqe, fd, iovs[idx].iov_base,
                                        iovs[idx].iov_len, cur);
 
-                if (use_slot) io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
                 cur += static_cast<off_t>(iovs[idx].iov_len);
                 ++idx;
             }
@@ -356,15 +359,7 @@ class SharedUringRing {
     // Data members
     // -----------------------------------------------------------------
     struct io_uring ring_{};
-    bool initialized_     = false;
-    bool files_registered_ = false;
-
-    std::mutex ring_mu_;   // Serialises SQ/CQ access
-
-    std::mutex       slot_mu_;
-    int              fd_table_[MAX_FILES];
-    std::vector<int> free_slots_;
-    int              watermark_ = 0;
+    bool initialized_    = false;
 
     bool   buf_registered_ = false;
     void*  buf_base_       = nullptr;
@@ -378,26 +373,15 @@ class SharedUringRing {
 UringFile::UringFile(const std::string& filename, int fd,
                      unsigned /*queue_depth*/, bool use_direct_io)
     : StorageFile(filename, fd),
-      slot_index_(-1),
       use_direct_io_(use_direct_io) {
     if (fd < 0) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
         return;
     }
-
-    auto& ring = SharedUringRing::instance();
-    if (!ring.is_initialized()) {
-        LOG(WARNING) << "[UringFile] SharedUringRing not available — "
-                        "fd will be used directly";
-        // Still usable: slot_index_ stays -1, raw fd used in every SQE
-    } else {
-        slot_index_ = ring.alloc_slot(fd);
-        if (slot_index_ < 0) {
-            LOG(WARNING) << "[UringFile] Could not alloc slot for fd=" << fd
-                         << " (" << filename << ") — using raw fd";
-        }
+    if (!SharedUringRing::instance().is_initialized()) {
+        LOG(WARNING) << "[UringFile] thread-local ring not available for "
+                     << filename;
     }
-
     if (use_direct_io_) {
         LOG(INFO) << "[UringFile] O_DIRECT mode enabled for " << filename;
     }
@@ -405,11 +389,6 @@ UringFile::UringFile(const std::string& filename, int fd,
 
 UringFile::~UringFile() {
     auto t0 = std::chrono::steady_clock::now();
-
-    // Release the registered-files slot — no ring teardown, just a syscall
-    // that writes -1 into one slot of the kernel's file table.
-    SharedUringRing::instance().free_slot(slot_index_);
-    slot_index_ = -1;
 
     if (fd_ >= 0) {
         if (close(fd_) != 0) {
@@ -453,15 +432,15 @@ void UringFile::free_aligned_buffer(void* ptr) const {
 }
 
 bool UringFile::in_registered_buffer(const void* buf, size_t len) const {
-    auto& ring = SharedUringRing::instance();
-    if (!ring.is_buffer_registered()) return false;
-    uintptr_t ba  = reinterpret_cast<uintptr_t>(buf);
-    uintptr_t rb  = reinterpret_cast<uintptr_t>(ring.buffer_base());
-    return ba >= rb && (ba + len) <= (rb + ring.buffer_size());
+    auto& r = SharedUringRing::instance();
+    if (!r.is_buffer_registered()) return false;
+    uintptr_t ba = reinterpret_cast<uintptr_t>(buf);
+    uintptr_t rb = reinterpret_cast<uintptr_t>(r.buffer_base());
+    return ba >= rb && (ba + len) <= (rb + r.buffer_size());
 }
 
 // ---------------------------------------------------------------------------
-// write — arbitrary (possibly unaligned) span
+// write
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::write(const std::string& buffer,
@@ -489,8 +468,7 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
         src = static_cast<char*>(bounce);
     }
 
-    auto res = SharedUringRing::instance().write(
-        slot_index_, fd_, src, write_len, 0, /*use_fixed_buf=*/false);
+    auto res = SharedUringRing::instance().write(fd_, src, write_len, 0);
 
     if (bounce) free_aligned_buffer(bounce);
 
@@ -501,7 +479,7 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
 }
 
 // ---------------------------------------------------------------------------
-// read — reads into a std::string (allocates or uses aligned bounce)
+// read
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
@@ -509,9 +487,9 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     if (length == 0) return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
 
-    void*  bounce     = nullptr;
-    char*  read_ptr   = nullptr;
-    size_t read_len   = length;
+    void*  bounce   = nullptr;
+    char*  read_ptr = nullptr;
+    size_t read_len = length;
 
     if (use_direct_io_) {
         read_len = ((length + ALIGNMENT_ - 1) / ALIGNMENT_) * ALIGNMENT_;
@@ -523,8 +501,7 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
         read_ptr = buffer.data();
     }
 
-    auto res = SharedUringRing::instance().read(
-        slot_index_, fd_, read_ptr, read_len, 0, /*use_fixed_buf=*/false);
+    auto res = SharedUringRing::instance().read(fd_, read_ptr, read_len, 0);
 
     if (use_direct_io_) {
         if (res) {
@@ -542,7 +519,7 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
 }
 
 // ---------------------------------------------------------------------------
-// write_aligned / read_aligned — zero-copy O_DIRECT interface
+// write_aligned / read_aligned
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
@@ -559,9 +536,7 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    bool fix = in_registered_buffer(buffer, length);
-    return SharedUringRing::instance().write(slot_index_, fd_, buffer, length,
-                                             offset, fix);
+    return SharedUringRing::instance().write(fd_, buffer, length, offset);
 }
 
 tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
@@ -578,9 +553,26 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    bool fix = in_registered_buffer(buffer, length);
-    return SharedUringRing::instance().read(slot_index_, fd_, buffer, length,
-                                            offset, fix);
+    return SharedUringRing::instance().read(fd_, buffer, length, offset);
+}
+
+// ---------------------------------------------------------------------------
+// batch_read — submit multiple independent reads in one ring submission
+// ---------------------------------------------------------------------------
+
+tl::expected<size_t, ErrorCode> UringFile::batch_read(const ReadDesc* descs,
+                                                       int cnt) {
+    if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
+    if (!descs || cnt <= 0)
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+
+    // Map UringFile::ReadDesc → SharedUringRing::ReadDesc (same layout, but
+    // ensure they stay in sync if either changes).
+    static_assert(sizeof(ReadDesc) == sizeof(SharedUringRing::ReadDesc),
+                  "ReadDesc layout mismatch");
+    const auto* ring_descs =
+        reinterpret_cast<const SharedUringRing::ReadDesc*>(descs);
+    return SharedUringRing::instance().batch_read(fd_, ring_descs, cnt);
 }
 
 // ---------------------------------------------------------------------------
@@ -592,8 +584,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
                                                          off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     auto start = std::chrono::steady_clock::now();
-    auto res = SharedUringRing::instance().vector_write(slot_index_, fd_, iov,
-                                                        iovcnt, offset);
+    auto res = SharedUringRing::instance().vector_write(fd_, iov, iovcnt,
+                                                        offset);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
                   .count();
@@ -612,8 +604,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
     for (int i = 0; i < iovcnt; ++i) expected_bytes += iov[i].iov_len;
     auto start = std::chrono::steady_clock::now();
 
-    auto res = SharedUringRing::instance().vector_read(slot_index_, fd_, iov,
-                                                       iovcnt, offset);
+    auto res = SharedUringRing::instance().vector_read(fd_, iov, iovcnt,
+                                                       offset);
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
@@ -638,15 +630,24 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
 }
 
 // ---------------------------------------------------------------------------
-// Buffer registration — delegates to the shared ring
+// datasync
+// ---------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> UringFile::datasync() {
+    if (fd_ < 0) return make_error<void>(ErrorCode::FILE_NOT_FOUND);
+    auto res = SharedUringRing::instance().fsync(fd_);
+    if (!res) {
+        LOG(ERROR) << "[UringFile::datasync] fsync failed for: " << filename_;
+        return make_error<void>(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// Buffer registration
 // ---------------------------------------------------------------------------
 
 bool UringFile::register_buffer(void* buffer, size_t length) {
-    auto& ring = SharedUringRing::instance();
-    if (!ring.is_initialized()) {
-        LOG(ERROR) << "[UringFile::register_buffer] SharedUringRing not ready";
-        return false;
-    }
     if (!buffer || length == 0) {
         LOG(ERROR) << "[UringFile::register_buffer] invalid buffer or length";
         return false;
@@ -661,11 +662,22 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
             return false;
         }
     }
-    return ring.register_buffer(buffer, length);
+    // Publish globally; each thread-local ring registers lazily on first I/O.
+    g_buf.base.store(buffer, std::memory_order_release);
+    g_buf.size.store(length, std::memory_order_release);
+    // Register on the calling thread's ring immediately.
+    bool ok = SharedUringRing::instance().ensure_buf_registered();
+    LOG(INFO) << "[UringFile::register_buffer] addr=" << buffer
+              << " size=" << length << " calling-thread-registered=" << ok;
+    return ok;
 }
 
 void UringFile::unregister_buffer() {
-    SharedUringRing::instance().unregister_buffer();
+    // Clear the global state so no new thread picks it up.
+    g_buf.base.store(nullptr, std::memory_order_release);
+    g_buf.size.store(0, std::memory_order_release);
+    // Unregister on the calling thread's ring.
+    SharedUringRing::instance().unregister_buf_local();
 }
 
 bool UringFile::is_buffer_registered() const {
