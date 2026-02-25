@@ -60,6 +60,12 @@ struct OffsetAllocStorageReportFull {
 // RAII Handle class for automatic deallocation
 class OffsetAllocationHandle {
    public:
+    // Default constructor: creates an invalid (empty) handle
+    OffsetAllocationHandle()
+        : m_allocation(OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE),
+          real_base(0),
+          requested_size(0) {}
+
     // Constructor for valid allocation
     OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
                            OffsetAllocation allocation, uint64_t base,
@@ -310,7 +316,8 @@ void __Allocator::serialize_to(T& serializer) const {
     serializer.write(&m_binIndices, sizeof(m_binIndices));
     serializer.write(&m_freeOffset, sizeof(m_freeOffset));
     serializer.write(m_nodes.data(), m_current_capacity * sizeof(Node));
-    serializer.write(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
+    serializer.write(m_freeNodes.data(),
+                     m_current_capacity * sizeof(NodeIndex));
 }
 
 template <typename T>
@@ -336,7 +343,8 @@ __Allocator::__Allocator(T& serializer) {
 
         // Deserialize the arrays
         serializer.read(m_nodes.data(), m_current_capacity * sizeof(Node));
-        serializer.read(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
+        serializer.read(m_freeNodes.data(),
+                        m_current_capacity * sizeof(NodeIndex));
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
         throw std::runtime_error("Deserializing __Allocator failed");

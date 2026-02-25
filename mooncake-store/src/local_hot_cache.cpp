@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
-#include <shared_mutex>
 #include <cstdint>
+#include <shared_mutex>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -12,63 +12,60 @@ namespace {
 constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024;  // 16MB default block
 }
 
-LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
+LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes,
+                             bool use_shm)
     : block_size_((block_size_bytes > 0) ? block_size_bytes
                                          : DEFAULT_BLOCK_SIZE),
-      bulk_memory_standard_(nullptr) {
-    // calculate the block number
+      bulk_memory_standard_(nullptr),
+      use_shm_(use_shm) {
     size_t block_num = 0;
     if (total_size_bytes > 0) {
         block_num = total_size_bytes / block_size_;
     }
 
     blocks_.reserve(block_num);
-
-    // Try to allocate all blocks in one bulk allocation first
     size_t total_size = block_num * block_size_;
-    if (block_num > 0 && total_size > 0) {
-        bulk_memory_standard_ = std::malloc(total_size);
-        if (bulk_memory_standard_) {
-            // Bulk allocation succeeded: split into individual blocks
-            char* base_ptr = static_cast<char*>(bulk_memory_standard_);
-            for (size_t i = 0; i < block_num; ++i) {
-                auto block = std::make_unique<HotMemBlock>();
-                block->addr = base_ptr + i * block_size_;
-                block->size = block_size_;
-                block->ref_count = 0;
-                block->key_.clear();  // Initialize key as empty
-                lru_queue_.push_back(block.get());
-                blocks_.emplace_back(std::move(block));
-            }
-        } else {
-            // Bulk allocation failed: fall back to individual allocations
-            for (size_t i = 0; i < block_num; ++i) {
-                void* ptr = std::malloc(block_size_);
-                if (ptr) {
-                    auto block = std::make_unique<HotMemBlock>();
-                    block->addr = ptr;
-                    block->size = block_size_;
-                    block->ref_count = 0;
-                    block->key_.clear();  // Initialize key as empty
-                    lru_queue_.push_back(block.get());
-                    blocks_.emplace_back(std::move(block));
-                }
-            }
+    bulk_memory_size_ = total_size;
+
+    if (block_num == 0 || total_size == 0) return;
+
+    // Allocate bulk region: memfd (cross-process shareable) or malloc (private)
+    if (use_shm_) {
+        try {
+            bulk_memory_standard_ =
+                ShmHelper::getInstance()->allocate(total_size);
+            shm_segment_ =
+                ShmHelper::getInstance()->get_shm(bulk_memory_standard_);
+            LOG(INFO) << "Hot cache allocated via shm, size=" << total_size
+                      << " fd=" << shm_segment_->fd;
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to allocate shm for hot cache: " << e.what();
+            return;
         }
+    } else {
+        bulk_memory_standard_ = std::malloc(total_size);
+        if (!bulk_memory_standard_) return;
+    }
+
+    // Split bulk region into fixed-size blocks
+    char* base_ptr = static_cast<char*>(bulk_memory_standard_);
+    for (size_t i = 0; i < block_num; ++i) {
+        auto block = std::make_unique<HotMemBlock>();
+        block->addr = base_ptr + i * block_size_;
+        block->size = block_size_;
+        block->ref_count = 0;
+        block->key_.clear();
+        lru_queue_.push_back(block.get());
+        blocks_.emplace_back(std::move(block));
     }
 }
 
 LocalHotCache::~LocalHotCache() {
-    // Free bulk allocated memory if it exists
-    if (bulk_memory_standard_) {
+    if (use_shm_ && bulk_memory_standard_) {
+        // ShmHelper owns the mapping; release via its free()
+        ShmHelper::getInstance()->free(bulk_memory_standard_);
+    } else if (bulk_memory_standard_) {
         std::free(bulk_memory_standard_);
-    } else {
-        // Free individually allocated blocks
-        for (auto& block : blocks_) {
-            if (block && block->addr) {
-                std::free(block->addr);
-            }
-        }
     }
 }
 
@@ -206,6 +203,14 @@ void LocalHotCache::touchLRU(
 size_t LocalHotCache::GetCacheSize() const {
     std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     return lru_queue_.size();
+}
+
+size_t LocalHotCache::GetBlockOffset(const void* addr) const {
+    if (!bulk_memory_standard_ || !addr) return SIZE_MAX;
+    auto base = reinterpret_cast<uintptr_t>(bulk_memory_standard_);
+    auto target = reinterpret_cast<uintptr_t>(addr);
+    if (target < base || target >= base + bulk_memory_size_) return SIZE_MAX;
+    return static_cast<size_t>(target - base);
 }
 
 constexpr size_t kDefaultHotCacheWorkers = 2;
