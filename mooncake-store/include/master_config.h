@@ -3,6 +3,8 @@
 #include <optional>
 #include <stdexcept>
 
+#include <glog/logging.h>
+
 #include "config_helper.h"
 #include "types.h"
 
@@ -33,6 +35,7 @@ struct MasterConfig {
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
+    std::string allocation_strategy;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -218,6 +221,8 @@ class WrappedMasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -266,6 +271,22 @@ class WrappedMasterServiceConfig {
             memory_allocator = mooncake::BufferAllocatorType::CACHELIB;
         } else {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
+        }
+
+        // Convert string allocation_strategy to AllocationStrategyType enum
+        if (config.allocation_strategy == "free_ratio_first") {
+            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "cxl") {
+            allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else {
+            LOG(WARNING) << "Unrecognized allocation_strategy value: '"
+                         << config.allocation_strategy
+                         << "'. Defaulting to 'random'. "
+                         << "Valid options are: random, free_ratio_first, cxl "
+                            "(case-sensitive)";
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -344,6 +365,8 @@ class MasterServiceConfigBuilder {
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type_ =
+        AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -428,6 +451,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_memory_allocator(
         BufferAllocatorType allocator) {
         memory_allocator_ = allocator;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_allocation_strategy_type(
+        AllocationStrategyType type) {
+        allocation_strategy_type_ = type;
         return *this;
     }
 
@@ -522,6 +551,8 @@ class MasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -560,6 +591,7 @@ class MasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
+        allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -600,6 +632,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
+    config.allocation_strategy_type = allocation_strategy_type_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
@@ -635,6 +668,7 @@ struct InProcMasterConfig {
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
+    std::optional<double> eviction_high_watermark_ratio;
 };
 
 // Builder class for InProcMasterConfig
@@ -647,6 +681,7 @@ class InProcMasterConfigBuilder {
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
+    std::optional<double> eviction_high_watermark_ratio_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -686,6 +721,15 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "eviction_high_watermark_ratio must be between 0.0 and 1.0");
+        }
+        eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -699,6 +743,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
+    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     return config;
 }
 
