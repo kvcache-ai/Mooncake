@@ -29,6 +29,14 @@ DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024    # 8 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
 
+# Must match C++ TensorMetadata: int32_t dtype + int32_t ndim + int64_t shape[4]
+TENSOR_METADATA_SIZE = 4 + 4 + 8 * 4  # 40 bytes
+
+
+def serialized_tensor_size(tensor):
+    """Size in bytes of [TensorMetadata][tensor data] as stored by get_tensor_into."""
+    return TENSOR_METADATA_SIZE + tensor.numel() * tensor.element_size()
+
 def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
     """
     compare two tensors.
@@ -247,14 +255,8 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
     def test_04_tp_consistency(self):
         input_tensor = torch.arange(12).view(3, 4)
-        tp_size=2
-        self.store.batch_put_tensor_with_tp(['key'], [input_tensor], tp_size=tp_size, split_dim=1)
-        chunked_tensors = input_tensor.chunk(chunks=2, dim=1)
-        tmp_tensor_0 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size)[0]
-        tmp_tensor_1 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size)[0]
-        self.assertTrue(tmp_tensor_0.sum() == chunked_tensors[0].sum())
-        self.assertTrue(tmp_tensor_1.sum() == chunked_tensors[1].sum())
-
+        tp_size = 2
+        split_dim = 1
         buffer_spacing = 1 * 1024 * 1024
         buffer_2 = (ctypes.c_ubyte * buffer_spacing)()
         buffer_3 = (ctypes.c_ubyte * buffer_spacing)()
@@ -264,129 +266,147 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr_2}")
         res = self.store.register_buffer(buffer_ptr_3, buffer_spacing)
         self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr_3}")
+        # Zero-copy put: fill buffers from seed, then put_from (use actual serialized size)
+        self.store.put_tensor_with_tp("key_seed", input_tensor, tp_size=tp_size, split_dim=split_dim)
+        shard0 = self.store.get_tensor_with_tp_into("key_seed", buffer_ptr_2, buffer_spacing, tp_rank=0, tp_size=tp_size, split_dim=split_dim)
+        shard1 = self.store.get_tensor_with_tp_into("key_seed", buffer_ptr_3, buffer_spacing, tp_rank=1, tp_size=tp_size, split_dim=split_dim)
+        self.assertIsNotNone(shard0)
+        self.assertIsNotNone(shard1)
+        size0 = serialized_tensor_size(shard0)
+        size1 = serialized_tensor_size(shard1)
+        self.store.put_tensor_with_tp_from("key", buffer_ptr_2, size0, tp_rank=0, tp_size=tp_size, split_dim=split_dim)
+        self.store.put_tensor_with_tp_from("key", buffer_ptr_3, size1, tp_rank=1, tp_size=tp_size, split_dim=split_dim)
+        chunked_tensors = input_tensor.chunk(chunks=2, dim=1)
+        tmp_tensor_0 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size)[0]
+        tmp_tensor_1 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size)[0]
+        self.assertEqual(tmp_tensor_0.sum(), chunked_tensors[0].sum())
+        self.assertEqual(tmp_tensor_1.sum(), chunked_tensors[1].sum())
         tmp_tensor_2 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)[0]
         tmp_tensor_3 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)[0]
-        self.assertTrue(tmp_tensor_2.sum() == chunked_tensors[0].sum())
-        self.assertTrue(tmp_tensor_3.sum() == chunked_tensors[1].sum())
+        self.assertEqual(tmp_tensor_2.sum(), chunked_tensors[0].sum())
+        self.assertEqual(tmp_tensor_3.sum(), chunked_tensors[1].sum())
         res = self.store.unregister_buffer(buffer_ptr_2)
         self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buffer_ptr_2}")
         res = self.store.unregister_buffer(buffer_ptr_3)
         self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buffer_ptr_3}")
 
     def test_05_put_get_into(self):
-        """Verify basic put and get into functionality."""
+        """Verify basic put and get into functionality (zero-copy put + get_into)."""
         key = "get_into_test"
+        seed_key = "get_into_test_seed"
         tensor = torch.randn(1024, 1024, dtype=torch.float32)
         buffer_spacing = 64 * 1024 * 1024
         total_buffer_size = buffer_spacing
 
-        # Allocate large contiguous buffer
-        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
-        large_buffer_ptr = ctypes.addressof(large_buffer)
+        buf_put = (ctypes.c_ubyte * total_buffer_size)()
+        buf_get = (ctypes.c_ubyte * total_buffer_size)()
+        buf_put_ptr = ctypes.addressof(buf_put)
+        buf_get_ptr = ctypes.addressof(buf_get)
+        res = self.store.register_buffer(buf_put_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration failed for put buffer")
+        res = self.store.register_buffer(buf_get_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration failed for get buffer")
 
-        res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-        self.assertEqual(res, 0, "Buffer registration failed for buffer at {large_buffer_ptr}")
-
-        # Perform Put
-        rc = self.store.put_tensor(key, tensor)
-        self.assertEqual(rc, 0, f"put_tensor failed with rc={rc}")
+        # Zero-copy put: fill buffer from seed, then put_tensor_from (use actual serialized size)
+        rc = self.store.put_tensor(seed_key, tensor)
+        self.assertEqual(rc, 0, f"put_tensor(seed) failed with rc={rc}")
+        retrieved_seed = self.store.get_tensor_into(seed_key, buf_put_ptr, total_buffer_size)
+        self.assertIsNotNone(retrieved_seed)
+        put_size = serialized_tensor_size(retrieved_seed)
+        rc = self.store.put_tensor_from(key, buf_put_ptr, put_size)
+        self.assertEqual(rc, 0, f"put_tensor_from failed with rc={rc}")
         self.assertTrue(self.store.is_exist(key), "Key not found after put")
 
-        # Perform Get
-        retrieved = self.store.get_tensor_into(key, large_buffer_ptr, total_buffer_size)
+        retrieved = self.store.get_tensor_into(key, buf_get_ptr, total_buffer_size)
         self.assertIsNotNone(retrieved, "Get returned None")
         self.assertTrue(torch.equal(tensor, retrieved), f"Data mismatch between original and retrieved tensor, tensor: {tensor}, retrieved: {retrieved}")
-        # Unregister buffer
-        res = self.store.unregister_buffer(large_buffer_ptr),
-        for r in res:
-            self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
+        self.assertEqual(self.store.unregister_buffer(buf_put_ptr), 0, "Buffer unregistration failed for put buffer")
+        self.assertEqual(self.store.unregister_buffer(buf_get_ptr), 0, "Buffer unregistration failed for get buffer")
 
     def test_06_batch_put_get_into(self):
-        """Zero copy Batch Get."""
+        """Zero copy Batch Put and Batch Get."""
         num_tensors = 4
         keys, tensors = generate_tensors(num_tensors, 8)
+        seed_keys = [f"{k}_seed" for k in keys]
         buffer_spacing = 64 * 1024 * 1024  # 64MB per tensor slot
         batch_size = len(keys)
-        total_buffer_size = buffer_spacing * batch_size
+        total_buffer_size = buffer_spacing * batch_size * 2  # put slots + get slots
 
-        # Allocate large contiguous buffer
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
+        put_ptrs = [large_buffer_ptr + i * buffer_spacing for i in range(batch_size)]
+        get_ptrs = [large_buffer_ptr + (batch_size + i) * buffer_spacing for i in range(batch_size)]
+        buffer_sizes = [buffer_spacing] * batch_size
 
-        # Prepare pointers (only addresses, no ctypes array objects)
-        buffer_ptrs = []
-        buffer_sizes = []
-        for i in range(batch_size):
-            offset = i * buffer_spacing
-            ptr = large_buffer_ptr + offset
-            buffer_ptrs.append(ptr)
-            buffer_sizes.append(buffer_spacing)
-
-        # Register the entire buffer with the store
         res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-        self.assertEqual(res, 0, "Buffer registration failed for buffer at {large_buffer_ptr}")
+        self.assertEqual(res, 0, "Buffer registration failed")
 
-        results = self.store.batch_put_tensor(keys, tensors)
-        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+        results = self.store.batch_put_tensor(seed_keys, tensors)
+        self.assertTrue(all(r == 0 for r in results), f"Batch put(seed) failed. Results: {results}")
+        self.store.batch_get_tensor_into(seed_keys, put_ptrs, buffer_sizes)
+        put_sizes = [serialized_tensor_size(tensors[j]) for j in range(batch_size)]
+        results = self.store.batch_put_tensor_from(keys, put_ptrs, put_sizes)
+        self.assertTrue(all(r == 0 for r in results), f"Batch put_tensor_from failed. Results: {results}")
 
-        res = self.store.batch_get_tensor_into(keys, buffer_ptrs, buffer_sizes)
+        res = self.store.batch_get_tensor_into(keys, get_ptrs, buffer_sizes)
         self.assertEqual(len(res), len(tensors))
         for j in range(batch_size):
             self.assertTrue(
                 verify_tensor_equality(tensors[j], res[j]),
                 f"Tensor {j} content mismatch, tensor: {tensors[j]}, res: {res[j]}"
             )
-        # Unregister buffer
-        res = self.store.unregister_buffer(large_buffer_ptr),
-        for r in res:
-            self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration failed")
 
     def test_07_put_get_into_with_tp(self):
-        """Zero copy Batch Get with TP — each rank has its own buffer."""
+        """Zero copy Put/Get with TP — each rank has put buffer and get buffer."""
         tp_size = 4
         split_dim = 0
         key = "get_into_with_tp_test"
+        seed_key = "get_into_with_tp_seed"
         tensor = torch.randn(1024, 1024, dtype=torch.float32)
 
-        # Step 1: Put full tensors with TP splitting
+        # Step 1: Put seed with TP, then for each rank fill put buffer and put_tensor_with_tp_from
         result = self.store.put_tensor_with_tp(
-            key, tensor, tp_size=tp_size, split_dim=split_dim
+            seed_key, tensor, tp_size=tp_size, split_dim=split_dim
         )
-        self.assertEqual(result, 0, f"Put failed. Result: {result}")
+        self.assertEqual(result, 0, f"Put(seed) failed. Result: {result}")
 
-        # Step 2: For each TP rank, allocate its own buffer and get shards
         all_shards = []
-        registered_buffers = []  # Keep track of (ptr, size) for cleanup
+        registered_buffers = []  # (put_buf, put_ptr, get_buf, get_ptr, size) for cleanup
 
         for rank in range(tp_size):
-            buffer_spacing = 64 * 1024 * 1024  # 64MB per tensor slot
+            buffer_spacing = 64 * 1024 * 1024
             total_buffer_size = buffer_spacing
+            put_buffer = (ctypes.c_ubyte * total_buffer_size)()
+            get_buffer = (ctypes.c_ubyte * total_buffer_size)()
+            put_ptr = ctypes.addressof(put_buffer)
+            get_ptr = ctypes.addressof(get_buffer)
+            res = self.store.register_buffer(put_ptr, total_buffer_size)
+            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank} put")
+            res = self.store.register_buffer(get_ptr, total_buffer_size)
+            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank} get")
+            registered_buffers.append((put_buffer, put_ptr, get_buffer, get_ptr, total_buffer_size))
 
-            # Allocate buffer for this rank
-            large_buffer = (ctypes.c_ubyte * total_buffer_size)()
-            large_buffer_ptr = ctypes.addressof(large_buffer)
-
-            # Register buffer for this rank
-            res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank}")
-
-            # Keep buffer alive and record for cleanup
-            # We store (large_buffer, large_buffer_ptr, total_buffer_size)
-            # large_buffer must be kept alive until unregister!
-            registered_buffers.append((large_buffer, large_buffer_ptr, total_buffer_size))
-
-            # Get shard for this rank
             shard = self.store.get_tensor_with_tp_into(
-                key, large_buffer_ptr, total_buffer_size,
+                seed_key, put_ptr, total_buffer_size,
+                tp_rank=rank, tp_size=tp_size
+            )
+            self.assertIsNotNone(shard)
+            put_size = serialized_tensor_size(shard)
+            rc = self.store.put_tensor_with_tp_from(
+                key, put_ptr, put_size,
+                tp_rank=rank, tp_size=tp_size, split_dim=split_dim
+            )
+            self.assertEqual(rc, 0, f"put_tensor_with_tp_from failed for rank {rank}")
+            shard = self.store.get_tensor_with_tp_into(
+                key, get_ptr, total_buffer_size,
                 tp_rank=rank, tp_size=tp_size
             )
             all_shards.append(shard)
 
-        # Step 3: Validate reconstruction
         original = tensor
         expected_chunks = original.chunk(tp_size, split_dim)
         reconstruction_parts = []
-
         for rank in range(tp_size):
             shard = all_shards[rank]
             self.assertTrue(
@@ -394,77 +414,66 @@ class TestMooncakeFunctional(MooncakeTestBase):
                 f"Tensor Rank {rank} data mismatch"
             )
             reconstruction_parts.append(shard)
-
         recon = torch.cat(reconstruction_parts, dim=split_dim)
-        self.assertTrue(
-            torch.equal(recon, original),
-            f"Tensor final reconstruction mismatch"
-        )
+        self.assertTrue(torch.equal(recon, original), "Tensor final reconstruction mismatch")
 
-        # Step 4: Unregister all buffers
-        for large_buffer, ptr, size in registered_buffers:
-            res = self.store.unregister_buffer(ptr)
-            self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {ptr}")
-            # large_buffer will be GC'd after this; no need to explicitly delete
+        for put_buf, put_ptr, get_buf, get_ptr, size in registered_buffers:
+            self.assertEqual(self.store.unregister_buffer(put_ptr), 0, "Unregister put buffer failed")
+            self.assertEqual(self.store.unregister_buffer(get_ptr), 0, "Unregister get buffer failed")
 
     def test_08_batch_put_get_into_with_tp(self):
-        """Zero copy Batch Get with TP — each rank has its own buffer."""
+        """Zero copy Batch Put/Get with TP — each rank has put and get buffers."""
         tp_size = 4
         split_dim = 0
         num_tensors = 4
         keys, tensors = generate_tensors(num_tensors, 8)
+        seed_keys = [f"{k}_seed" for k in keys]
+        batch_size = len(keys)
 
-        # Step 1: Put full tensors with TP splitting
         results = self.store.batch_put_tensor_with_tp(
-            keys, tensors, tp_size=tp_size, split_dim=split_dim
+            seed_keys, tensors, tp_size=tp_size, split_dim=split_dim
         )
-        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+        self.assertTrue(all(r == 0 for r in results), f"Batch put(seed) failed. Results: {results}")
 
-        # Step 2: For each TP rank, allocate its own buffer and get shards
         all_shards = []
-        registered_buffers = []  # Keep track of (ptr, size) for cleanup
+        registered_buffers = []
 
         for rank in range(tp_size):
-            batch_size = len(keys)
-            buffer_spacing = 64 * 1024 * 1024  # 64MB per tensor slot
-            total_buffer_size = buffer_spacing * batch_size
-
-            # Allocate buffer for this rank
+            buffer_spacing = 64 * 1024 * 1024
+            total_buffer_size = buffer_spacing * batch_size * 2  # put + get
             large_buffer = (ctypes.c_ubyte * total_buffer_size)()
             large_buffer_ptr = ctypes.addressof(large_buffer)
+            put_ptrs = [large_buffer_ptr + i * buffer_spacing for i in range(batch_size)]
+            get_ptrs = [large_buffer_ptr + (batch_size + i) * buffer_spacing for i in range(batch_size)]
+            buffer_sizes = [buffer_spacing] * batch_size
 
-            # Prepare buffer pointers for this rank
-            buffer_ptrs = []
-            buffer_sizes = []
-            for i in range(batch_size):
-                offset = i * buffer_spacing
-                ptr = large_buffer_ptr + offset
-                buffer_ptrs.append(ptr)
-                buffer_sizes.append(buffer_spacing)
-
-            # Register buffer for this rank
             res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank}, at {large_buffer_ptr}")
+            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank}")
 
-            # Keep buffer alive and record for cleanup
-            # We store (large_buffer, large_buffer_ptr, total_buffer_size)
-            # large_buffer must be kept alive until unregister!
-            registered_buffers.append((large_buffer, large_buffer_ptr, total_buffer_size))
-
-            # Get shards for this rank
             shards = self.store.batch_get_tensor_with_tp_into(
-                keys, buffer_ptrs, buffer_sizes,
+                seed_keys, put_ptrs, buffer_sizes,
+                tp_rank=rank, tp_size=tp_size
+            )
+            self.assertEqual(len(shards), num_tensors)
+            put_sizes = [serialized_tensor_size(shards[j]) for j in range(num_tensors)]
+            results = self.store.batch_put_tensor_with_tp_from(
+                keys, put_ptrs, put_sizes,
+                tp_rank=rank, tp_size=tp_size
+            )
+            self.assertTrue(all(r == 0 for r in results), f"batch_put_tensor_with_tp_from failed for rank {rank}")
+
+            shards = self.store.batch_get_tensor_with_tp_into(
+                keys, get_ptrs, buffer_sizes,
                 tp_rank=rank, tp_size=tp_size
             )
             self.assertEqual(len(shards), num_tensors)
             all_shards.append(shards)
+            registered_buffers.append((large_buffer, large_buffer_ptr))
 
-        # Step 3: Validate reconstruction
         for i in range(num_tensors):
             original = tensors[i]
             expected_chunks = original.chunk(tp_size, split_dim)
             reconstruction_parts = []
-
             for rank in range(tp_size):
                 shard = all_shards[rank][i]
                 self.assertTrue(
@@ -472,15 +481,11 @@ class TestMooncakeFunctional(MooncakeTestBase):
                     f"Tensor {i} Rank {rank} data mismatch"
                 )
                 reconstruction_parts.append(shard)
-
             recon = torch.cat(reconstruction_parts, dim=split_dim)
             self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
 
-        # Step 4: Unregister all buffers
-        for large_buffer, ptr, size in registered_buffers:
-            res = self.store.unregister_buffer(ptr)
-            self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {ptr}")
-            # large_buffer will be GC'd after this; no need to explicitly delete
+        for large_buffer, ptr in registered_buffers:
+            self.assertEqual(self.store.unregister_buffer(ptr), 0, "Buffer unregistration failed")
 
     def test_09_pub_get(self):
         """Verify pub and get functionality."""
@@ -569,6 +574,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
             recon = torch.cat(reconstruction_parts, dim=split_dim)
             self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
+
 # ==========================================
 #  Performance/Benchmark Tests
 # ==========================================
@@ -649,43 +655,39 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
     def test_benchmark_03_batch_put_get_into(self):
-        """Benchmark: Zero copy Batch Get."""
+        """Benchmark: Zero copy Batch Put and Batch Get."""
         self.store.remove_all()
         buffer_spacing = 300 * 1024 * 1024  # 300MB per tensor slot
         batch_size = len(self.keys)
         total_buffer_size = buffer_spacing * batch_size
+        seed_keys = [f"seed_{k}" for k in self.keys]
 
-        # Allocate large contiguous buffer
         large_buffer = (ctypes.c_ubyte * total_buffer_size)()
         large_buffer_ptr = ctypes.addressof(large_buffer)
-
-        # Prepare pointers (only addresses, no ctypes array objects)
         buffer_ptrs = []
         buffer_sizes = []
         for i in range(batch_size):
             offset = i * buffer_spacing
-            ptr = large_buffer_ptr + offset
-            buffer_ptrs.append(ptr)
+            buffer_ptrs.append(large_buffer_ptr + offset)
             buffer_sizes.append(buffer_spacing)
 
-        # Register the entire buffer with the store
         res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(res, 0, "Buffer registration should succeed")
 
-        print(f"--- Running zero copy Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
+        print(f"--- Running zero copy Batch Put/Get Benchmark ({self.BENCH_ITERATIONS} iters) ---")
         put_times = []
         get_times = []
 
+        put_sizes = [serialized_tensor_size(self.tensors[j]) for j in range(batch_size)]
         for i in range(self.BENCH_ITERATIONS):
-            # Clean store before each iteration for "cold" writes
             self.store.remove_all()
+            self.store.batch_put_tensor(seed_keys, self.tensors)
+            self.store.batch_get_tensor_into(seed_keys, buffer_ptrs, buffer_sizes)
 
-            # Measure Put
             t0 = time.perf_counter()
-            self.store.batch_put_tensor(self.keys, self.tensors)
+            self.store.batch_put_tensor_from(self.keys, buffer_ptrs, put_sizes)
             put_times.append(time.perf_counter() - t0)
 
-            # Measure Get
             t0 = time.perf_counter()
             res = self.store.batch_get_tensor_into(self.keys, buffer_ptrs, buffer_sizes)
             get_times.append(time.perf_counter() - t0)
@@ -696,66 +698,58 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                     f"Tensor {j} content mismatch"
                 )
 
-        self._print_perf("Standard Batch Put", put_times)
+        self._print_perf("Zero copy Batch Put (put_tensor_from)", put_times)
         self._print_perf("Zero copy Batch Get", get_times)
-
-        # Unregister buffer
-        res = self.store.unregister_buffer(large_buffer_ptr),
-        for r in res:
-            self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration failed")
 
     def test_benchmark_04_batch_put_get_into_with_tp(self):
-        """Benchmark: Zero copy Batch Get with tp."""
+        """Benchmark: Zero copy Batch Put/Get with TP."""
         tp_size = 4
         split_dim = 0
         batch_size = len(self.keys)
         self.store.remove_all()
         buffer_spacing = 64 * 1024 * 1024  # 64MB per tensor slot
+        seed_keys = [f"seed_{k}" for k in self.keys]
 
-        # Allocate and register a separate buffer for each TP rank
-        rank_buffers = []  # Store metadata for cleanup
-
+        rank_buffers = []
         for rank in range(tp_size):
             total_buffer_size = buffer_spacing * batch_size
             large_buffer = (ctypes.c_ubyte * total_buffer_size)()
             large_buffer_ptr = ctypes.addressof(large_buffer)
-
-            buffer_ptrs = []
-            buffer_sizes = []
-            for i in range(batch_size):
-                offset = i * buffer_spacing
-                ptr = large_buffer_ptr + offset
-                buffer_ptrs.append(ptr)
-                buffer_sizes.append(buffer_spacing)
-
-            # Register buffer for this rank
+            buffer_ptrs = [large_buffer_ptr + i * buffer_spacing for i in range(batch_size)]
+            buffer_sizes = [buffer_spacing] * batch_size
             res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
             self.assertEqual(res, 0, f"Buffer registration failed for rank {rank}")
-
             rank_buffers.append({
-                'buffer_obj': large_buffer,      # keep alive
+                'buffer_obj': large_buffer,
                 'ptrs': buffer_ptrs,
                 'sizes': buffer_sizes,
                 'base_ptr': large_buffer_ptr,
-                'total_size': total_buffer_size
             })
 
-        print(f"--- Running zero copy Batch Benchmark (TP={tp_size}, {self.BENCH_ITERATIONS} iters) ---")
+        print(f"--- Running zero copy Batch Put/Get Benchmark (TP={tp_size}, {self.BENCH_ITERATIONS} iters) ---")
         put_times = []
         get_times = []
 
         for i in range(self.BENCH_ITERATIONS):
-            # Clean store before each iteration for "cold" writes
             self.store.remove_all()
+            self.store.batch_put_tensor_with_tp(seed_keys, self.tensors, tp_size=tp_size, split_dim=split_dim)
+            rank_put_sizes = []
+            for rank in range(tp_size):
+                shards = self.store.batch_get_tensor_with_tp_into(
+                    seed_keys, rank_buffers[rank]['ptrs'], rank_buffers[rank]['sizes'],
+                    tp_rank=rank, tp_size=tp_size
+                )
+                rank_put_sizes.append([serialized_tensor_size(shards[j]) for j in range(batch_size)])
 
-            # Measure Put
             t0 = time.perf_counter()
-            self.store.batch_put_tensor_with_tp(
-                self.keys, self.tensors, tp_size=tp_size, split_dim=split_dim
-            )
+            for rank in range(tp_size):
+                self.store.batch_put_tensor_with_tp_from(
+                    self.keys, rank_buffers[rank]['ptrs'], rank_put_sizes[rank],
+                    tp_rank=rank, tp_size=tp_size
+                )
             put_times.append(time.perf_counter() - t0)
 
-            # Measure Get: each rank uses its own buffer
             t0 = time.perf_counter()
             all_res = []
             for rank in range(tp_size):
@@ -770,23 +764,19 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                 all_res.append(res)
             get_times.append(time.perf_counter() - t0)
 
-            # Verify correctness using rank 0's result
             for j in range(batch_size):
                 original = self.tensors[j]
-                expected_shard = original.chunk(tp_size, split_dim)[0]  # rank 0 shard
+                expected_shard = original.chunk(tp_size, split_dim)[0]
                 actual = all_res[0][j]
                 self.assertTrue(
                     torch.equal(actual, expected_shard),
                     f"Tensor {j} content mismatch on rank 0"
                 )
 
-        self._print_perf(f"Standard Batch Put with tp (TP={tp_size})", put_times)
+        self._print_perf(f"Zero copy Batch Put with tp (TP={tp_size})", put_times)
         self._print_perf(f"Zero copy Batch Get with tp (TP={tp_size})", get_times)
-
-        # Unregister all buffers
         for buf_info in rank_buffers:
-            res = self.store.unregister_buffer(buf_info['base_ptr'])
-            self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buf_info['base_ptr']}")
+            self.assertEqual(self.store.unregister_buffer(buf_info['base_ptr']), 0, "Buffer unregistration failed")
 
     def test_benchmark_05_batch_pub_get(self):
         """Benchmark: Standard Batch Pub/Get."""
