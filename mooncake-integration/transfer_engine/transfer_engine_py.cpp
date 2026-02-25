@@ -205,6 +205,18 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
             return -1;
         }
         LOG(INFO) << "EFA transport installed successfully";
+    } else {
+        // For non-EFA protocols (e.g. TCP), manually install TCP transport
+        // since auto_discover is disabled to prevent RDMA installation
+        // (RDMA QP creation fails on EFA devices).
+        LOG(INFO)
+            << "Installing TCP transport (auto_discover disabled in EFA build)";
+        auto transport = engine_->installTransport("tcp", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install TCP transport";
+            return -1;
+        }
+        LOG(INFO) << "TCP transport installed successfully";
     }
 #endif
 

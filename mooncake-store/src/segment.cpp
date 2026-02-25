@@ -26,8 +26,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator};
             segment_manager_->client_by_name_[segment.name] = client_id;
-            MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
-                                                                   size);
 
             LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
                       << segment.name
@@ -915,5 +913,6 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 }  // namespace mooncake

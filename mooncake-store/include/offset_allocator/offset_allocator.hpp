@@ -62,6 +62,12 @@ struct OffsetAllocStorageReportFull {
 // RAII Handle class for automatic deallocation
 class OffsetAllocationHandle {
    public:
+    // Default constructor: creates an invalid (empty) handle
+    OffsetAllocationHandle()
+        : m_allocation(OffsetAllocation::NO_SPACE, OffsetAllocation::NO_SPACE),
+          real_base(0),
+          requested_size(0) {}
+
     // Constructor for valid allocation
     OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
                            OffsetAllocation allocation, uint64_t base,

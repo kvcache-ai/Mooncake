@@ -82,6 +82,9 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
+DEFINE_string(
+    allocation_strategy, "random",
+    "Allocation strategy for segments, random | free_ratio_first | cxl");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -199,6 +202,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
+    default_config.GetString("allocation_strategy",
+                             &master_config.allocation_strategy,
+                             FLAGS_allocation_strategy);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -415,6 +421,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.memory_allocator = FLAGS_memory_allocator;
+    }
+    if ((google::GetCommandLineFlagInfo("allocation_strategy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.allocation_strategy = FLAGS_allocation_strategy;
     }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||

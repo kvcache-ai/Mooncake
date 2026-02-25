@@ -360,6 +360,180 @@ class RandomAllocationStrategy : public AllocationStrategy {
     static constexpr size_t kMaxRetryLimit = 100;
 };
 
+/**
+ * @brief Free-ratio-first allocation strategy.
+ *
+ * For each allocation of N replicas:
+ * 1. Randomly sample min(2N, total) candidate segments from the eligible pool
+ * 2. Query each candidate's free space, sort descending, pick the top N
+ * 3. Try to allocate from these top-N segments
+ * 4. If insufficient replicas are allocated, fallback to the base Random
+ *    strategy for the remaining replicas
+ *
+ * This achieves near-optimal load balancing with low overhead:
+ * - Sampling 2N is O(N), sorting 2N is O(N log N) — both small since N
+ *   (replica count) is typically 1–3.
+ * - New empty segments naturally win the comparison, getting filled quickly.
+ * - Thread-safe: uses thread_local state for sampling, no shared mutable data.
+ */
+class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
+   public:
+    FreeRatioFirstAllocationStrategy() = default;
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>()) override {
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const auto& names = allocator_manager.getNames();
+        if (names.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        static thread_local std::mt19937 generator(std::random_device{}());
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_num);
+        std::set<std::string> used_segments;
+
+        // --- Handle preferred segments first (same as Random) ---
+        for (const auto& preferred_segment : preferred_segments) {
+            if (excluded_segments.contains(preferred_segment) ||
+                used_segments.contains(preferred_segment)) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING);
+                used_segments.insert(preferred_segment);
+                if (replicas.size() == replica_num) {
+                    return replicas;
+                }
+            }
+        }
+
+        const size_t remaining = replica_num - replicas.size();
+
+        // --- Sample candidates: pick a random start, take 6*remaining
+        // consecutive segments, then sort by free space ---
+        size_t sample_count =
+            std::min(kCandidateMultiplier * remaining, names.size());
+
+        std::uniform_int_distribution<size_t> start_dist(0, names.size() - 1);
+        size_t start_idx = start_dist(generator);
+
+        struct Candidate {
+            size_t name_idx;
+            double free_ratio;  // free_bytes / capacity
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(sample_count);
+
+        for (size_t i = 0; i < sample_count; ++i) {
+            size_t idx = (start_idx + i) % names.size();
+            double free_ratio =
+                getSegmentFreeRatio(allocator_manager, names[idx]);
+            candidates.push_back({idx, free_ratio});
+        }
+
+        // Sort by free space ratio descending
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.free_ratio > b.free_ratio;
+                  });
+
+        // Try to allocate from top candidates, skip excluded/used segments
+        for (const auto& candidate : candidates) {
+            if (replicas.size() >= replica_num) {
+                break;
+            }
+
+            const auto& name = names[candidate.name_idx];
+
+            // Skip excluded and used segments
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING);
+                used_segments.insert(name);
+            }
+        }
+
+        if (replicas.size() >= replica_num) {
+            return replicas;
+        }
+
+        // --- Fallback: Random allocation for any remaining replicas ---
+        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
+        size_t fallback_idx = distribution(generator);
+        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        size_t try_count = 0;
+
+        while (replicas.size() < replica_num && try_count < max_retry) {
+            auto index = fallback_idx % names.size();
+            fallback_idx++;
+            try_count++;
+
+            // Skip excluded and used segments
+            if (excluded_segments.contains(names[index]) ||
+                used_segments.contains(names[index])) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING);
+                used_segments.insert(names[index]);
+            }
+        }
+
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return replicas;
+    }
+
+   private:
+    static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr size_t kCandidateMultiplier = 6;
+
+    double getSegmentFreeRatio(const AllocatorManager& allocator_manager,
+                               const std::string& name) {
+        auto allocators = allocator_manager.getAllocators(name);
+        if (!allocators || allocators->empty()) return 0.0;
+
+        uint64_t total_capacity = 0;
+        uint64_t total_free = 0;
+        for (const auto& alloc : *allocators) {
+            if (!alloc) continue;
+            auto cap = static_cast<uint64_t>(alloc->capacity());
+            total_capacity += cap;
+            total_free += cap - static_cast<uint64_t>(alloc->size());
+        }
+
+        if (total_capacity == 0) return 0.0;
+        return static_cast<double>(total_free) /
+               static_cast<double>(total_capacity);
+    }
+};
+
 class CxlAllocationStrategy : public AllocationStrategy {
    public:
     CxlAllocationStrategy() = default;
@@ -418,5 +592,22 @@ class CxlAllocationStrategy : public AllocationStrategy {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 };
+
+/**
+ * @brief Factory function to create allocation strategy based on type
+ */
+inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
+    AllocationStrategyType type) {
+    switch (type) {
+        case AllocationStrategyType::RANDOM:
+            return std::make_shared<RandomAllocationStrategy>();
+        case AllocationStrategyType::FREE_RATIO_FIRST:
+            return std::make_shared<FreeRatioFirstAllocationStrategy>();
+        case AllocationStrategyType::CXL:
+            return std::make_shared<CxlAllocationStrategy>();
+        default:
+            return std::make_shared<RandomAllocationStrategy>();
+    }
+}
 
 }  // namespace mooncake
