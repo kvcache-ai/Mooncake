@@ -1,7 +1,7 @@
 #!/bin/bash
 
 
-test_case_name="test_ep_moe_mooncake"
+test_case_name="test_moe_mooncake"
 TEST_TYPE="single"
 
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
