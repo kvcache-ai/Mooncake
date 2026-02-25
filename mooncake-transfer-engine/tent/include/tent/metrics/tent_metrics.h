@@ -34,7 +34,6 @@
 #endif
 
 #if TENT_METRICS_ENABLED
-#include <csignal>
 #include <ylt/metric.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #endif

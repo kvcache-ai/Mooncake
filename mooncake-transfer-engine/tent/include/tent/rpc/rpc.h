@@ -22,7 +22,6 @@
 #include <memory>
 #include <string>
 #include <thread>
-#include <csignal>
 #include <vector>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
