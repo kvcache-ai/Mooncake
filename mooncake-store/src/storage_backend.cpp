@@ -1991,6 +1991,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
+        // Flush bucket data to stable storage before writing metadata.
+        // This prevents a crash from leaving valid metadata pointing at
+        // incomplete data (write-ordering durability guarantee).
+        auto sync_result = uring_file->datasync();
+        if (!sync_result) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
         // Invalidate cache for this file since content changed
         {
             MutexLocker cache_locker(&file_cache_mutex_);

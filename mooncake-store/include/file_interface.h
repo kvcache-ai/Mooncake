@@ -197,6 +197,10 @@ class UringFile : public StorageFile {
     tl::expected<size_t, ErrorCode> write_aligned(const void* buffer, size_t length,
                                                   off_t offset = 0);
 
+    // Flush data to stable storage via io_uring_prep_fsync(IORING_FSYNC_DATASYNC).
+    // Must be called after write and before writing dependent metadata files.
+    tl::expected<void, ErrorCode> datasync();
+
     // Buffer registration interface for high-performance I/O
     // Register a single buffer with io_uring to avoid get_user_pages() overhead
     // Returns true on success, false on failure

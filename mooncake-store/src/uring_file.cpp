@@ -810,6 +810,36 @@ void UringFile::unregister_buffer() {
     buffer_registered_ = false;
 }
 
+// ---------------------------------------------------------------------------
+// datasync — flush bucket data to stable storage before metadata write
+// ---------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> UringFile::datasync() {
+    if (fd_ < 0 || !ring_initialized_) {
+        return make_error<void>(ErrorCode::FILE_NOT_FOUND);
+    }
+
+    int target_fd = files_registered_ ? 0 : fd_;
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
+    if (!sqe) {
+        LOG(ERROR) << "[UringFile::datasync] Failed to get SQE";
+        return make_error<void>(ErrorCode::INTERNAL_ERROR);
+    }
+
+    io_uring_prep_fsync(sqe, target_fd, IORING_FSYNC_DATASYNC);
+    if (files_registered_) {
+        io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+    }
+
+    auto result = submit_and_wait_n(1);
+    if (!result) {
+        LOG(ERROR) << "[UringFile::datasync] fsync failed for: " << filename_;
+        return make_error<void>(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
 }  // namespace mooncake
 
 #endif  // USE_URING
