@@ -18,6 +18,7 @@ All_TEST_SCRIPTS_SGLANG=(
     "test_disaggregation_different_tp.sh"
     "test_1p1d_erdma.sh"
     "test_epd_sglang.sh"
+    "test_ep_moe_mooncake.sh"
 )
 
 All_TEST_SCRIPTS_VLLM=(
