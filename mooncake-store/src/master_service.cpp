@@ -290,8 +290,8 @@ void MasterService::TaskCleanupThreadFunc() {
             break;
         }
 
-        auto write_access = task_manager_.get_write_access();
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        auto write_access = task_manager_.get_write_access();
         write_access.prune_expired_tasks();
         write_access.prune_finished_tasks();
     }
@@ -2118,40 +2118,55 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         const auto& serialized_segment = segment_result.value();
         const auto& serialized_task_manager = task_manager_result.value();
 
-        bool upload_success = true;
-        std::string error_msg;
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
                       snapshot_backend_->GetConnectionInfo());
 
-        // upload metadata
+        // Upload metadata (fail-fast: return immediately on failure)
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         auto upload_result =
             UploadSnapshotFile(serialized_metadata, metadata_path,
                                SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
+            SNAP_LOG_ERROR(
+                "[Snapshot] metadata upload failed, snapshot_id={}, "
+                "path={}, code={}, msg={}",
+                snapshot_id, metadata_path,
+                static_cast<int>(upload_result.error().code),
+                upload_result.error().message);
+            return tl::make_unexpected(upload_result.error());
         }
 
-        // upload segment
+        // Upload segment
         std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         upload_result = UploadSnapshotFile(serialized_segment, segment_path,
                                            SNAPSHOT_SEGMENTS_FILE, snapshot_id);
         if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
+            SNAP_LOG_ERROR(
+                "[Snapshot] segment upload failed, snapshot_id={}, "
+                "path={}, code={}, msg={}",
+                snapshot_id, segment_path,
+                static_cast<int>(upload_result.error().code),
+                upload_result.error().message);
+            return tl::make_unexpected(upload_result.error());
         }
-        // upload task manager
+
+        // Upload task manager
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
         upload_result =
             UploadSnapshotFile(serialized_task_manager, task_manager_path,
                                SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
         if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
+            SNAP_LOG_ERROR(
+                "[Snapshot] task_manager upload failed, snapshot_id={}, "
+                "path={}, code={}, msg={}",
+                snapshot_id, task_manager_path,
+                static_cast<int>(upload_result.error().code),
+                upload_result.error().message);
+            return tl::make_unexpected(upload_result.error());
         }
 
+        // Upload manifest
         std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
             fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
@@ -2161,13 +2176,13 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
                                            SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        if (!upload_success) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
+            SNAP_LOG_ERROR(
+                "[Snapshot] manifest upload failed, snapshot_id={}, "
+                "path={}, code={}, msg={}",
+                snapshot_id, manifest_path,
+                static_cast<int>(upload_result.error().code),
+                upload_result.error().message);
+            return tl::make_unexpected(upload_result.error());
         }
 
         // Update latest marker (atomic operation)
@@ -3526,15 +3541,14 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
 std::string MasterService::FormatTimestamp(
     const std::chrono::system_clock::time_point& tp) {
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto time_t = std::chrono::system_clock::to_time_t(tp);
 
     std::stringstream ss;
     ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
 
     // Add milliseconds to ensure uniqueness
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  now.time_since_epoch()) %
+                  tp.time_since_epoch()) %
               1000;
 
     ss << "_" << std::setfill('0') << std::setw(3) << ms.count();

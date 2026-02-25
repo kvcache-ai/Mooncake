@@ -563,6 +563,62 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     restored_service.reset();
 }
 
+// ========== PersistState Fail-Fast ==========
+
+TEST_F(SnapshotChildProcessTest, PersistState_FailFast_StopsOnFirstError) {
+    CreateDefaultService();
+
+    // Mount a segment to have some data to serialize
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x200000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Create a FILE named "master_snapshot" to block directory creation
+    // This will cause the upload to fail when trying to create subdirectory
+    std::string snapshot_root = tmp_dir() + "/master_snapshot";
+    std::ofstream blocker(snapshot_root);
+    blocker << "blocking file";
+    blocker.close();
+
+    // PersistState should fail on first upload attempt
+    auto result = CallPersistState("20240701_failfast_000");
+    EXPECT_FALSE(result.has_value()) << "PersistState should fail";
+
+    // Remove the blocking file for cleanup
+    fs::remove(snapshot_root);
+
+    // Verify error message contains only first file error (fail-fast behavior)
+    // Upload order: metadata -> segments -> task_manager -> manifest.txt
+    ASSERT_FALSE(result.has_value()) << "PersistState should fail";
+
+    const auto& error_msg = result.error().message;
+    LOG(INFO) << "PersistState error: " << error_msg;
+
+    // Should contain "metadata" (first upload that fails)
+    EXPECT_NE(error_msg.find("metadata"), std::string::npos)
+        << "Error should be about metadata file (first upload), got: "
+        << error_msg;
+
+    // Should NOT contain subsequent files (fail-fast stops after first error)
+    EXPECT_EQ(error_msg.find("segments"), std::string::npos)
+        << "Error should NOT contain 'segments' (fail-fast should stop before "
+           "this), got: "
+        << error_msg;
+    EXPECT_EQ(error_msg.find("task_manager"), std::string::npos)
+        << "Error should NOT contain 'task_manager' (fail-fast should stop "
+           "before this), got: "
+        << error_msg;
+    EXPECT_EQ(error_msg.find("manifest"), std::string::npos)
+        << "Error should NOT contain 'manifest' (fail-fast should stop before "
+           "this), got: "
+        << error_msg;
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
