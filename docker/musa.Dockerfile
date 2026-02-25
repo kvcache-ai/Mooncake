@@ -40,16 +40,17 @@ RUN bash dependencies.sh -y
 RUN mkdir -p build && \
     cd build && \
     cmake .. \
+        -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=ON \
         -DUSE_MUSA=ON \
         -DSTORE_USE_ETCD=ON \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
-    cmake --build . -j"$(nproc)" && \
-    cmake --install .
+    cmake --build . -j"$(nproc)"
 
 # Build nvlink allocator to make wheel self-contained for MUSA paths
-RUN cd mooncake-transfer-engine/nvlink-allocator && \
+RUN mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
+    cd mooncake-transfer-engine/nvlink-allocator && \
     bash build.sh --use-mcc ../../build/mooncake-transfer-engine/nvlink-allocator/
 
 # Build the Python wheel from local sources
@@ -61,20 +62,17 @@ RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
 FROM mthreads/musa:${MUSA_VERSION}-devel-ubuntu${UBUNTU_VERSION}-amd64 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 # Install runtime dependencies required by Mooncake
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
-        python-is-python3 \
-        infiniband-diags \
         ibverbs-providers \
         rdma-core \
         libibverbs1 \
-        libibverbs-dev \
-        ibverbs-utils \
         librdmacm1 \
         libnuma1 \
         liburing2 \
@@ -83,6 +81,6 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-RUN pip install /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel
+RUN python3 -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]
