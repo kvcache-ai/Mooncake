@@ -50,8 +50,8 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
    private:
     // Private constructor - use create() factory method
     AlignedClientBufferAllocator(void* aligned_buffer, size_t size,
-                                  const std::string& protocol,
-                                  bool use_hugepage);
+                                 const std::string& protocol,
+                                 bool use_hugepage);
 
     // Store whether we own the memory (for cleanup)
     bool owns_memory_;

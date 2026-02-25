@@ -20,7 +20,8 @@ namespace mooncake {
 // Construction / Destruction
 // ---------------------------------------------------------------------------
 
-UringFile::UringFile(const std::string &filename, int fd, unsigned queue_depth, bool use_direct_io)
+UringFile::UringFile(const std::string &filename, int fd, unsigned queue_depth,
+                     bool use_direct_io)
     : StorageFile(filename, fd),
       ring_initialized_(false),
       files_registered_(false),
@@ -84,11 +85,13 @@ UringFile::~UringFile() {
     fd_ = -1;
 
     auto dtor_end = std::chrono::steady_clock::now();
-    auto dtor_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        dtor_end - dtor_start).count();
+    auto dtor_elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(dtor_end -
+                                                              dtor_start)
+            .count();
     if (dtor_elapsed_ms > 1) {
-        LOG(WARNING) << "[UringFile::~UringFile] cleanup took " << dtor_elapsed_ms
-                     << "ms for " << filename_;
+        LOG(WARNING) << "[UringFile::~UringFile] cleanup took "
+                     << dtor_elapsed_ms << "ms for " << filename_;
     }
 }
 
@@ -97,31 +100,32 @@ UringFile::~UringFile() {
 // ---------------------------------------------------------------------------
 
 namespace {
-    inline size_t next_power_of_2(size_t n) {
-        if (n == 0) return 1;
-        n--;
-        n |= n >> 1;
-        n |= n >> 2;
-        n |= n >> 4;
-        n |= n >> 8;
-        n |= n >> 16;
-        n |= n >> 32;
-        return n + 1;
-    }
+inline size_t next_power_of_2(size_t n) {
+    if (n == 0) return 1;
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    return n + 1;
 }
+}  // namespace
 
-void* UringFile::alloc_aligned_buffer(size_t size) const {
+void *UringFile::alloc_aligned_buffer(size_t size) const {
     // Align size up to ALIGNMENT_
     size_t aligned_size = ((size + ALIGNMENT_ - 1) / ALIGNMENT_) * ALIGNMENT_;
-    void* ptr = nullptr;
+    void *ptr = nullptr;
     if (posix_memalign(&ptr, ALIGNMENT_, aligned_size) != 0) {
-        LOG(ERROR) << "[UringFile] Failed to allocate aligned buffer of size " << aligned_size;
+        LOG(ERROR) << "[UringFile] Failed to allocate aligned buffer of size "
+                   << aligned_size;
         return nullptr;
     }
     return ptr;
 }
 
-void UringFile::free_aligned_buffer(void* ptr) const {
+void UringFile::free_aligned_buffer(void *ptr) const {
     if (ptr) {
         free(ptr);
     }
@@ -213,8 +217,8 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
     constexpr size_t MIN_CHUNK_SIZE = 4096;
 
     // If using O_DIRECT, allocate aligned buffer and copy data
-    void* aligned_buffer = nullptr;
-    const char* source_ptr = data.data();
+    void *aligned_buffer = nullptr;
+    const char *source_ptr = data.data();
     size_t actual_length = length;
 
     if (use_direct_io_) {
@@ -227,9 +231,10 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
         // Copy data to aligned buffer and zero-pad if necessary
         std::memcpy(aligned_buffer, data.data(), length);
         if (actual_length > length) {
-            std::memset(static_cast<char*>(aligned_buffer) + length, 0, actual_length - length);
+            std::memset(static_cast<char *>(aligned_buffer) + length, 0,
+                        actual_length - length);
         }
-        source_ptr = static_cast<const char*>(aligned_buffer);
+        source_ptr = static_cast<const char *>(aligned_buffer);
     }
 
     size_t total_written = 0;
@@ -239,11 +244,11 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
     int target_fd = files_registered_ ? 0 : fd_;
 
     while (remaining > 0) {
-        size_t chunk_size = calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
+        size_t chunk_size =
+            calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
         unsigned num_chunks = std::min(
             static_cast<unsigned>((remaining + chunk_size - 1) / chunk_size),
-            queue_depth_
-        );
+            queue_depth_);
 
         for (unsigned i = 0; i < num_chunks; i++) {
             size_t this_chunk = std::min(chunk_size, remaining);
@@ -255,7 +260,8 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
                 return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
             }
 
-            io_uring_prep_write(sqe, target_fd, ptr, this_chunk, current_offset);
+            io_uring_prep_write(sqe, target_fd, ptr, this_chunk,
+                                current_offset);
             if (files_registered_) {
                 io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
             }
@@ -289,8 +295,8 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
     // For O_DIRECT, we may have written more than requested (due to alignment)
     // but return the original length
     if (total_written < length) {
-        LOG(WARNING) << "[UringFile::write] Incomplete write: "
-                     << total_written << " / " << length;
+        LOG(WARNING) << "[UringFile::write] Incomplete write: " << total_written
+                     << " / " << length;
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -313,8 +319,8 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string &buffer,
     constexpr size_t MIN_CHUNK_SIZE = 4096;
 
     // If using O_DIRECT, allocate aligned buffer
-    void* aligned_buffer = nullptr;
-    char* read_ptr = nullptr;
+    void *aligned_buffer = nullptr;
+    char *read_ptr = nullptr;
     size_t actual_length = length;
 
     if (use_direct_io_) {
@@ -324,7 +330,7 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string &buffer,
         if (!aligned_buffer) {
             return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
-        read_ptr = static_cast<char*>(aligned_buffer);
+        read_ptr = static_cast<char *>(aligned_buffer);
     } else {
         buffer.resize(length);
         read_ptr = buffer.data();
@@ -337,11 +343,11 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string &buffer,
     int target_fd = files_registered_ ? 0 : fd_;
 
     while (remaining > 0) {
-        size_t chunk_size = calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
+        size_t chunk_size =
+            calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
         unsigned num_chunks = std::min(
             static_cast<unsigned>((remaining + chunk_size - 1) / chunk_size),
-            queue_depth_
-        );
+            queue_depth_);
 
         size_t batch_size = 0;
         for (unsigned i = 0; i < num_chunks; i++) {
@@ -394,7 +400,7 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string &buffer,
     // Copy from aligned buffer to std::string if using O_DIRECT
     if (use_direct_io_) {
         size_t actual_read = std::min(total_read, length);
-        buffer.assign(static_cast<const char*>(aligned_buffer), actual_read);
+        buffer.assign(static_cast<const char *>(aligned_buffer), actual_read);
         free_aligned_buffer(aligned_buffer);
         total_read = actual_read;
     } else {
@@ -412,9 +418,9 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string &buffer,
 // Zero-copy aligned I/O interface for O_DIRECT
 // ---------------------------------------------------------------------------
 
-tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
-                                                         size_t length,
-                                                         off_t offset) {
+tl::expected<size_t, ErrorCode> UringFile::read_aligned(void *buffer,
+                                                        size_t length,
+                                                        off_t offset) {
     MutexLocker lock(&ring_mutex_);
     if (fd_ < 0 || !ring_initialized_) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
@@ -426,41 +432,45 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
     // Verify alignment when using O_DIRECT
     if (use_direct_io_) {
         if (reinterpret_cast<uintptr_t>(buffer) % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::read_aligned] Buffer not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::read_aligned] Buffer not aligned to "
+                       << ALIGNMENT_;
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
         }
         if (length % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::read_aligned] Length not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::read_aligned] Length not aligned to "
+                       << ALIGNMENT_;
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
         }
         if (offset % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::read_aligned] Offset not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::read_aligned] Offset not aligned to "
+                       << ALIGNMENT_;
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
         }
     }
 
     constexpr size_t MIN_CHUNK_SIZE = 4096;
 
-    char* ptr = static_cast<char*>(buffer);
+    char *ptr = static_cast<char *>(buffer);
     size_t remaining = length;
     size_t total_read = 0;
     off_t current_offset = offset;
     int target_fd = files_registered_ ? 0 : fd_;
 
     // Check if this buffer falls within the registered buffer range
-    bool use_fixed_buffer = (buffer_registered_ &&
-                             reinterpret_cast<uintptr_t>(buffer) >=
-                                 reinterpret_cast<uintptr_t>(registered_buffer_) &&
-                             reinterpret_cast<uintptr_t>(buffer) + length <=
-                                 reinterpret_cast<uintptr_t>(registered_buffer_) +
-                                     registered_buffer_size_);
+    bool use_fixed_buffer =
+        (buffer_registered_ &&
+         reinterpret_cast<uintptr_t>(buffer) >=
+             reinterpret_cast<uintptr_t>(registered_buffer_) &&
+         reinterpret_cast<uintptr_t>(buffer) + length <=
+             reinterpret_cast<uintptr_t>(registered_buffer_) +
+                 registered_buffer_size_);
 
     while (remaining > 0) {
-        size_t chunk_size = calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
+        size_t chunk_size =
+            calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
         unsigned num_chunks = std::min(
             static_cast<unsigned>((remaining + chunk_size - 1) / chunk_size),
-            queue_depth_
-        );
+            queue_depth_);
 
         size_t batch_size = 0;
         for (unsigned i = 0; i < num_chunks; i++) {
@@ -473,11 +483,14 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
             }
 
             if (use_fixed_buffer) {
-                // Use registered fixed buffer - avoids get_user_pages() overhead
-                io_uring_prep_read_fixed(sqe, target_fd, ptr, this_chunk, current_offset, 0);
+                // Use registered fixed buffer - avoids get_user_pages()
+                // overhead
+                io_uring_prep_read_fixed(sqe, target_fd, ptr, this_chunk,
+                                         current_offset, 0);
             } else {
                 // Use regular buffer
-                io_uring_prep_read(sqe, target_fd, ptr, this_chunk, current_offset);
+                io_uring_prep_read(sqe, target_fd, ptr, this_chunk,
+                                   current_offset);
             }
 
             if (files_registered_) {
@@ -510,9 +523,9 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
     return total_read;
 }
 
-tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
-                                                          size_t length,
-                                                          off_t offset) {
+tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void *buffer,
+                                                         size_t length,
+                                                         off_t offset) {
     if (fd_ < 0 || !ring_initialized_) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
@@ -523,41 +536,45 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
     // Verify alignment when using O_DIRECT
     if (use_direct_io_) {
         if (reinterpret_cast<uintptr_t>(buffer) % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::write_aligned] Buffer not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::write_aligned] Buffer not aligned to "
+                       << ALIGNMENT_;
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
         }
         if (length % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::write_aligned] Length not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::write_aligned] Length not aligned to "
+                       << ALIGNMENT_;
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
         }
         if (offset % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::write_aligned] Offset not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::write_aligned] Offset not aligned to "
+                       << ALIGNMENT_;
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
         }
     }
 
     constexpr size_t MIN_CHUNK_SIZE = 4096;
 
-    const char* ptr = static_cast<const char*>(buffer);
+    const char *ptr = static_cast<const char *>(buffer);
     size_t remaining = length;
     size_t total_written = 0;
     off_t current_offset = offset;
     int target_fd = files_registered_ ? 0 : fd_;
 
     // Check if this buffer falls within the registered buffer range
-    bool use_fixed_buffer = (buffer_registered_ &&
-                             reinterpret_cast<uintptr_t>(buffer) >=
-                                 reinterpret_cast<uintptr_t>(registered_buffer_) &&
-                             reinterpret_cast<uintptr_t>(buffer) + length <=
-                                 reinterpret_cast<uintptr_t>(registered_buffer_) +
-                                     registered_buffer_size_);
+    bool use_fixed_buffer =
+        (buffer_registered_ &&
+         reinterpret_cast<uintptr_t>(buffer) >=
+             reinterpret_cast<uintptr_t>(registered_buffer_) &&
+         reinterpret_cast<uintptr_t>(buffer) + length <=
+             reinterpret_cast<uintptr_t>(registered_buffer_) +
+                 registered_buffer_size_);
 
     while (remaining > 0) {
-        size_t chunk_size = calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
+        size_t chunk_size =
+            calculate_chunk_size(remaining, queue_depth_, MIN_CHUNK_SIZE);
         unsigned num_chunks = std::min(
             static_cast<unsigned>((remaining + chunk_size - 1) / chunk_size),
-            queue_depth_
-        );
+            queue_depth_);
 
         for (unsigned i = 0; i < num_chunks; i++) {
             size_t this_chunk = std::min(chunk_size, remaining);
@@ -569,11 +586,14 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
             }
 
             if (use_fixed_buffer) {
-                // Use registered fixed buffer - avoids get_user_pages() overhead
-                io_uring_prep_write_fixed(sqe, target_fd, ptr, this_chunk, current_offset, 0);
+                // Use registered fixed buffer - avoids get_user_pages()
+                // overhead
+                io_uring_prep_write_fixed(sqe, target_fd, ptr, this_chunk,
+                                          current_offset, 0);
             } else {
                 // Use regular buffer
-                io_uring_prep_write(sqe, target_fd, ptr, this_chunk, current_offset);
+                io_uring_prep_write(sqe, target_fd, ptr, this_chunk,
+                                    current_offset);
             }
 
             if (files_registered_) {
@@ -618,8 +638,8 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec *iov,
-                                                         int iovcnt,
-                                                         off_t offset) {
+                                                        int iovcnt,
+                                                        off_t offset) {
     if (fd_ < 0 || !ring_initialized_) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
@@ -662,8 +682,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec *iov,
 }
 
 tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec *iov,
-                                                        int iovcnt,
-                                                        off_t offset) {
+                                                       int iovcnt,
+                                                       off_t offset) {
     if (fd_ < 0 || !ring_initialized_) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
@@ -705,8 +725,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec *iov,
         if (!result) {
             auto end = std::chrono::steady_clock::now();
             auto elapsed_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    end - start)
+                std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                      start)
                     .count();
             LOG(ERROR) << "[UringFile::vector_read] FAILED: fd=" << fd_
                        << ", offset=" << offset << ", iovcnt=" << iovcnt
@@ -743,14 +763,15 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec *iov,
 // Buffer registration for high-performance I/O
 // ---------------------------------------------------------------------------
 
-bool UringFile::register_buffer(void* buffer, size_t length) {
+bool UringFile::register_buffer(void *buffer, size_t length) {
     if (!ring_initialized_) {
         LOG(ERROR) << "[UringFile::register_buffer] io_uring not initialized";
         return false;
     }
 
     if (buffer_registered_) {
-        LOG(WARNING) << "[UringFile::register_buffer] Buffer already registered, unregistering first";
+        LOG(WARNING) << "[UringFile::register_buffer] Buffer already "
+                        "registered, unregistering first";
         unregister_buffer();
     }
 
@@ -762,11 +783,13 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
     // Verify alignment when using O_DIRECT
     if (use_direct_io_) {
         if (reinterpret_cast<uintptr_t>(buffer) % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::register_buffer] Buffer not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::register_buffer] Buffer not aligned to "
+                       << ALIGNMENT_;
             return false;
         }
         if (length % ALIGNMENT_ != 0) {
-            LOG(ERROR) << "[UringFile::register_buffer] Length not aligned to " << ALIGNMENT_;
+            LOG(ERROR) << "[UringFile::register_buffer] Length not aligned to "
+                       << ALIGNMENT_;
             return false;
         }
     }
@@ -776,8 +799,9 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
 
     int ret = io_uring_register_buffers(&ring_, &registered_iovec_, 1);
     if (ret < 0) {
-        LOG(ERROR) << "[UringFile::register_buffer] io_uring_register_buffers failed: "
-                   << strerror(-ret);
+        LOG(ERROR)
+            << "[UringFile::register_buffer] io_uring_register_buffers failed: "
+            << strerror(-ret);
         return false;
     }
 
@@ -798,10 +822,12 @@ void UringFile::unregister_buffer() {
     if (ring_initialized_) {
         int ret = io_uring_unregister_buffers(&ring_);
         if (ret < 0) {
-            LOG(ERROR) << "[UringFile::unregister_buffer] io_uring_unregister_buffers failed: "
+            LOG(ERROR) << "[UringFile::unregister_buffer] "
+                          "io_uring_unregister_buffers failed: "
                        << strerror(-ret);
         } else {
-            LOG(INFO) << "[UringFile::unregister_buffer] Successfully unregistered buffer";
+            LOG(INFO) << "[UringFile::unregister_buffer] Successfully "
+                         "unregistered buffer";
         }
     }
 
