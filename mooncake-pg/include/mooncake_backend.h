@@ -2,14 +2,10 @@
 #define MOONCAKE_BACKEND_H
 
 #include <mooncake_worker.cuh>
+#include <p2p_proxy.hh>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
-#include <thread>
 
 namespace mooncake {
 
@@ -98,7 +94,16 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     std::string getPreferredHca(std::string location) {
         auto matrix = engine_.getLocalTopology()->getMatrix();
-        return matrix[location].preferred_hca[0];
+        auto it = matrix.find(location);
+        if (it == matrix.end()) {
+            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(ERROR) << "Topology entry not found for location: " << location;
+        } else if (it->second.preferred_hca.empty()) {
+            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(ERROR) << "Preferred HCA list is empty for location: "
+                       << location;
+        }
+        return it->second.preferred_hca[0];
     }
 
     at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
@@ -112,27 +117,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     void recoverRanks(const std::vector<int>& ranks);
 
    private:
-    enum class P2POpType { SEND, RECV };
-
-    struct P2POp {
-        P2POpType opType;
-        at::Tensor tensor;  // For SEND: contiguous tensor to send; For RECV:
-                            // contiguous target tensor
-        at::Tensor originalTensor;  // For RECV: original (possibly
-                                    // non-contiguous) tensor to update
-        int peerRank;
-        int tag;
-        int64_t seq;  // Sequence number assigned at enqueue time for ordering
-        std::shared_ptr<std::atomic<bool>> completed;
-        std::shared_ptr<std::string> errorMsg;
-    };
-
     void startP2PWorker();
     void stopP2PWorker();
-    void p2PSendWorkerThread();
-    void p2PRecvWorkerThread();
-    void processSendOp(const P2POp& op);
-    void processRecvOp(const P2POp& op);
 
     static TransferEngine engine_;
     static bool engineInitialized_;
@@ -154,18 +140,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                           int backendIndex);
 
-    // P2P async infrastructure: separate queues and threads for send/recv
-    std::queue<P2POp> p2pSendQueue_;
-    std::mutex p2pSendQueueMutex_;
-    std::condition_variable p2pSendQueueCv_;
-    std::atomic<bool> p2pSendWorkerRunning_{false};
-    std::thread p2pSendWorkerThread_;
-
-    std::queue<P2POp> p2pRecvQueue_;
-    std::mutex p2pRecvQueueMutex_;
-    std::condition_variable p2pRecvQueueCv_;
-    std::atomic<bool> p2pRecvWorkerRunning_{false};
-    std::thread p2pRecvWorkerThread_;
+    // P2P async infrastructure
+    std::unique_ptr<P2PProxy> p2p_proxy_;
 };
 
 }  // namespace mooncake

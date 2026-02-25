@@ -19,6 +19,7 @@ jobs:
       matrix:
         python-version: ['3.10', '3.12']
     env:
+      CI: "true"
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -179,11 +180,17 @@ jobs:
         echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
       shell: bash
 
+    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
     - name: Build Python wheel
       run: |
-        # Build wheel with specific Python version
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
+
+    - name: Upload wheel for ZMQ test job
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   build-musa:
     if: >-
@@ -319,6 +326,17 @@ jobs:
         python scripts/test_async_store.py
       shell: bash
 
+    - name: Test Mooncake Copy/Move API
+      env:
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
+      run: |
+        source test_env/bin/activate
+        python scripts/test_copy_move_api.py
+      shell: bash
+
     - name: Run RPC Communicator Bandwidth Test
       run: |
         source test_env/bin/activate
@@ -350,6 +368,7 @@ jobs:
       matrix:
         python-version: ['3.10', '3.12']
     env:
+      CI: "true"
       BUILD_WITH_EP: "1"
       EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
@@ -408,7 +427,7 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
         make -j4
         sudo make install
         df -h
@@ -418,7 +437,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -452,7 +471,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON
       shell: bash
 
     - name: Build project
@@ -480,9 +499,9 @@ jobs:
         echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
       shell: bash
 
+    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
     - name: Build Python wheel
       run: |
-        # Build wheel with specific Python version
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 

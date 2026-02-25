@@ -82,6 +82,9 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
+DEFINE_string(
+    allocation_strategy, "random",
+    "Allocation strategy for segments, random | free_ratio_first | cxl");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -113,6 +116,8 @@ DEFINE_uint64(pending_task_timeout_sec, 300,
               "Timeout in seconds for pending tasks (0 = no timeout)");
 DEFINE_uint64(processing_task_timeout_sec, 300,
               "Timeout in seconds for processing tasks (0 = no timeout)");
+DEFINE_uint32(max_retry_attempts, 10,
+              "Maximum number of retry attempts for failed tasks");
 
 DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
@@ -178,6 +183,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
+    default_config.GetString("allocation_strategy",
+                             &master_config.allocation_strategy,
+                             FLAGS_allocation_strategy);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -213,6 +221,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("processing_task_timeout_sec",
                              &master_config.processing_task_timeout_sec,
                              FLAGS_processing_task_timeout_sec);
+    default_config.GetUInt32("max_retry_attempts",
+                             &master_config.max_retry_attempts,
+                             FLAGS_max_retry_attempts);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -371,6 +382,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.memory_allocator = FLAGS_memory_allocator;
     }
+    if ((google::GetCommandLineFlagInfo("allocation_strategy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.allocation_strategy = FLAGS_allocation_strategy;
+    }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -439,6 +455,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.processing_task_timeout_sec =
             FLAGS_processing_task_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("max_retry_attempts", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_retry_attempts = FLAGS_max_retry_attempts;
     }
 }
 
@@ -559,6 +580,7 @@ int main(int argc, char* argv[]) {
         << master_config.pending_task_timeout_sec
         << ", processing_task_timeout_sec="
         << master_config.processing_task_timeout_sec
+        << ", max_retry_attempts=" << master_config.max_retry_attempts
         << ", enable_cxl=" << master_config.enable_cxl
         << ", cxl_path=" << master_config.cxl_path
         << ", cxl_size=" << master_config.cxl_size;

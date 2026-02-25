@@ -684,6 +684,7 @@ bool UringFile::is_buffer_registered() const {
     return SharedUringRing::instance().is_buffer_registered();
 }
 
+
 }  // namespace mooncake
 
 #endif  // USE_URING

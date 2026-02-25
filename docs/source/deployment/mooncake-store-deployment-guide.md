@@ -20,6 +20,11 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--http_metadata_server_host` (str, default `0.0.0.0`): Metadata bind host.
   - `--http_metadata_server_port` (int, default `8080`): Metadata TCP port.
 
+- Allocation Strategy
+  - `--allocation_strategy` (str, default `random`): Memory allocation strategy for replica placement. Available options:
+    - `random`: Pure random selection across segments (baseline, fastest).
+    - `free_ratio_first`: Free-ratio-first strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
+
 - Eviction and TTLs
   - `--default_kv_lease_ttl` (uint64, default `5000` ms): Default lease TTL for KV objects.
   - `--default_kv_soft_pin_ttl` (uint64, default `1800000` ms): Soft pin TTL (30 minutes).
@@ -32,6 +37,12 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
+
+- Task Manager (optional)
+  - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
+  - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.
+  - `--max_total_processing_tasks` (uint32, default `10000`): Maximum number of tasks that can be processing simultaneously. When this limit is reached, no new tasks will be popped from the pending queue until some processing tasks complete.
+  - `--max_retry_attempts` (uint32, default `10`): Maximum number of retry attempts for failed tasks. Tasks that fail with `NO_AVAILABLE_HANDLE` error will be retried up to this many times before being marked as failed.
 
 - DFS Storage (optional)
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
@@ -49,13 +60,22 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
+Example (use free-ratio-first allocation strategy for better load balancing):
+
+```bash
+mooncake_master \
+  --allocation_strategy=free_ratio_first \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_port=8080
+```
+
 **Tips:**
 
 In addition to command-line flags, the Master also supports configuration via JSON and YAML files. For example:
 
 ```bash
 mooncake_master \
-  --config_path=mooncake-store/conf/master.yaml 
+  --config_path=mooncake-store/conf/master.yaml
 ```
 
 ## Metrics Endpoints

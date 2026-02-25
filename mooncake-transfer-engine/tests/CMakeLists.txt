@@ -54,6 +54,12 @@ if (USE_UBSHMEM)
     add_test(NAME ubshmem_transport_test COMMAND ubshmem_transport_test)
 endif()
 
+if (USE_EFA)
+    add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
+    target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_transport_test COMMAND efa_transport_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
@@ -69,3 +75,23 @@ add_test(NAME memory_location_test COMMAND memory_location_test)
 add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
+
+if (USE_ASCEND_DIRECT)
+    # AscendDirectTransport unit test with mock implementations
+    # Mock implementations are included in the test file via anonymous namespace
+    add_executable(ascend_direct_transport_test
+        ${WORKSPACE}/ascend_direct_transport_test.cpp
+    )
+    target_link_libraries(ascend_direct_transport_test PUBLIC
+        transfer_engine
+        gtest
+        gtest_main
+        metadef
+    )
+    # Allow shared library undefined symbols (Ascend libraries have circular deps)
+    set_target_properties(ascend_direct_transport_test PROPERTIES
+        LINK_FLAGS "-Wl,--allow-shlib-undefined"
+    )
+
+    add_test(NAME ascend_direct_transport_test COMMAND ascend_direct_transport_test)
+endif()

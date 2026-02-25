@@ -5,6 +5,7 @@
 #include <sys/uio.h>
 #include <cstdio>
 #include "types.h"
+#include "mutex.h"
 #include <atomic>
 #include <thread>
 #include <sys/file.h>
@@ -184,8 +185,8 @@ class PosixFile : public StorageFile {
  */
 class UringFile : public StorageFile {
    public:
-    UringFile(const std::string &filename, int fd,
-              unsigned queue_depth = 32, bool use_direct_io = false);
+    UringFile(const std::string &filename, int fd, unsigned queue_depth = 32,
+              bool use_direct_io = false);
     ~UringFile() override;
 
     tl::expected<size_t, ErrorCode> write(const std::string &buffer,
@@ -200,7 +201,7 @@ class UringFile : public StorageFile {
                                                 off_t offset) override;
 
     // Zero-copy interface for O_DIRECT: caller must provide aligned buffer
-    tl::expected<size_t, ErrorCode> read_aligned(void* buffer, size_t length,
+    tl::expected<size_t, ErrorCode> read_aligned(void *buffer, size_t length,
                                                  off_t offset = 0);
     tl::expected<size_t, ErrorCode> write_aligned(const void* buffer,
                                                   size_t length,

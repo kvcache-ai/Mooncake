@@ -17,6 +17,7 @@ All_TEST_SCRIPTS_SGLANG=(
     "test_hicache_storage_mooncake_backend.sh"
     "test_disaggregation_different_tp.sh"
     "test_1p1d_erdma.sh"
+    "test_epd_sglang.sh"
 )
 
 All_TEST_SCRIPTS_VLLM=(
