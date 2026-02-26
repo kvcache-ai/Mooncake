@@ -750,6 +750,15 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
             break;
     }
 
+#ifdef USE_URING
+    // Use O_DIRECT only for reads: write latency is not sensitive in this
+    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
+    // corrupts meta file parsing and wastes disk space on data files.
+    if (use_uring_ && mode == FileMode::Read) {
+        flags |= O_DIRECT;
+    }
+#endif
+
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
         return nullptr;
@@ -769,7 +778,11 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 
 #ifdef USE_URING
     if (use_uring_) {
-        return std::make_unique<UringFile>(path, fd, 32, true);
+        // use_direct_io mirrors the O_DIRECT flag: true for reads, false for
+        // writes. This avoids unnecessary bounce-buffer allocation on the write
+        // path while keeping correct alignment enforcement on the read path.
+        bool use_direct_io = (mode == FileMode::Read);
+        return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
     return std::make_unique<PosixFile>(path, fd);
