@@ -26,6 +26,7 @@
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
+#include "transport/gds_transport/gds_transport.h"
 #endif
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
@@ -241,6 +242,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();
+    } else if (std::string(proto) == "gds") {
+        transport = new GdsTransport();
     }
 #endif
 #ifdef USE_ASCEND_DIRECT
