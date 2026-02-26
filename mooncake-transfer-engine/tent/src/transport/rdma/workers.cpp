@@ -162,8 +162,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        auto status =
-            endpoint->connect(target_seg_name, target_dev_name, rpc_server_addr);
+        auto status = endpoint->connect(target_seg_name, target_dev_name,
+                                        rpc_server_addr);
         if (!status.ok()) {
             thread_local uint64_t tl_last_output_ts = 0;
             uint64_t current_ts = getCurrentTimeInNano();

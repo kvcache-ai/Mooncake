@@ -214,7 +214,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                              const std::string& peer_nic_name,
                              const std::string& peer_rpc_server_addr) {
     auto& transport = context_->transport_;
-    auto qp_num = qpNum();
+    std::vector<uint32_t> qp_num;
     BootstrapDesc local_desc, peer_desc;
     bool same_nic = false;
     bool is_self = false;
@@ -239,6 +239,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         local_desc.local_nic_path =
             MakeNicPath(transport.local_segment_name_, context_->name());
         local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
+        qp_num = qpNum();
         local_desc.qp_num = qp_num;
         local_desc.notify_qp_num = notifyQpNum();
         local_desc.local_lid = context_->lid();
@@ -288,7 +289,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
     }
 
     if (peer_gid.empty()) {
-        return Status::InvalidArgument("Missing peer GID in bootstrap" LOC_MARK);
+        return Status::InvalidArgument(
+            "Missing peer GID in bootstrap" LOC_MARK);
     }
 
     // ===== Phase 3: Finalize (locked) =====
@@ -362,12 +364,13 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.local_gid = context_->gid();
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
     if (peer_desc.local_gid.empty()) {
-        return Status::InvalidArgument("Missing peer GID in bootstrap" LOC_MARK);
+        return Status::InvalidArgument(
+            "Missing peer GID in bootstrap" LOC_MARK);
     }
     peer_server_name_ = peer_server_name;
     peer_nic_name_ = peer_nic_name;
-    int rc = setupAllQPs(peer_desc.local_gid, peer_desc.local_lid,
-                         peer_desc.qp_num);
+    int rc =
+        setupAllQPs(peer_desc.local_gid, peer_desc.local_lid, peer_desc.qp_num);
     if (rc) {
         return Status::InternalError(
             "Failed to configure RDMA endpoint" LOC_MARK);
@@ -398,6 +401,17 @@ int RdmaEndPoint::resetUnlocked() {
     if (status_ != EP_READY) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
+
+    if (notify_qp_) {
+        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
+        notify_connected_ = false;
+        {
+            std::lock_guard<std::mutex> lock(notify_send_mutex_);
+            notify_pending_count_ = 0;
+        }
+        notify_send_cv_.notify_all();
+    }
+
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
@@ -719,6 +733,29 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
                                    uint16_t peer_lid, uint32_t peer_qp_num) {
+    // Reconnect path may call this when QP is already in RTS; force a clean
+    // state machine: RESET -> INIT -> RTR -> RTS.
+    ibv_qp_attr qp_attr = {};
+    qp_attr.qp_state = IBV_QPS_RESET;
+    int ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE);
+    if (ret) {
+        PLOG(ERROR) << "Failed to modify notification QP to RESET";
+        return -1;
+    }
+
+    memset(&qp_attr, 0, sizeof(qp_attr));
+    qp_attr.qp_state = IBV_QPS_INIT;
+    qp_attr.pkey_index = 0;
+    qp_attr.port_num = ctx->portNum();
+    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+    ret = ibv_modify_qp(qp, &qp_attr,
+                        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                            IBV_QP_ACCESS_FLAGS);
+    if (ret) {
+        PLOG(ERROR) << "Failed to modify notification QP to INIT";
+        return -1;
+    }
+
     // Parse GID string to raw bytes
     ibv_gid peer_gid = {};
     std::istringstream iss(peer_gid_str);
@@ -730,7 +767,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     }
 
     // Modify to RTR
-    ibv_qp_attr qp_attr = {};
+    memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_RTR;
     qp_attr.path_mtu = IBV_MTU_4096;
     qp_attr.dest_qp_num = peer_qp_num;
@@ -748,10 +785,10 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.ah_attr.grh.hop_limit = 255;
     qp_attr.ah_attr.grh.traffic_class = 0;
 
-    int ret = ibv_modify_qp(qp, &qp_attr,
-                            IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
-                                IBV_QP_MIN_RNR_TIMER | IBV_QP_AV);
+    ret = ibv_modify_qp(qp, &qp_attr,
+                        IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                            IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+                            IBV_QP_MIN_RNR_TIMER | IBV_QP_AV);
     if (ret) {
         PLOG(ERROR) << "Failed to modify notification QP to RTR";
         return -1;
