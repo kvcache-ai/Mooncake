@@ -21,7 +21,7 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             SHA="${{ github.sha }}"
           fi
-          max_attempts=10
+          max_attempts=120
           attempt=1
           while [ $attempt -le $max_attempts ]; do
             echo "Attempt $attempt: Fetching artifact..."
@@ -38,7 +38,7 @@ jobs:
               else
                 echo "Failed to fetch expected artifact. Retrying..."
                 if [ $attempt -lt $max_attempts ]; then
-                  sleep $((attempt * 60))
+                  sleep $((attempt * 60 < 600 ? attempt * 60 : 600))
                 fi
               fi
             else
