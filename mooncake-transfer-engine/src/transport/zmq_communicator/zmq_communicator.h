@@ -1,13 +1,18 @@
 #pragma once
 
 #include "zmq_types.h"
-#include "base_pattern.h"
-#include <unordered_map>
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
-#include <atomic>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace mooncake {
+
+class BasePattern;
 
 class ZmqCommunicator {
    public:

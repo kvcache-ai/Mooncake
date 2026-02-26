@@ -30,6 +30,10 @@ set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
+set(MOONCAKE_PROJECT_HOME "$ENV{PROJECT_HOME}")
+if("${MOONCAKE_PROJECT_HOME}" STREQUAL "")
+    set(MOONCAKE_PROJECT_HOME "${CMAKE_SOURCE_DIR}")
+endif()
 
 set(ENGINE_EXTRA_SOURCES transfer_engine/transfer_engine_py.cpp)
 set(ENGINE_EXTRA_INCLUDES "")
@@ -57,7 +61,7 @@ if (WITH_TE)
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
     target_include_directories(engine PRIVATE
         ${Python3_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/src
+        ${MOONCAKE_PROJECT_HOME}/mooncake-transfer-engine/src
         ${ENGINE_EXTRA_INCLUDES}
     )
     if (USE_ASCEND_DIRECT)

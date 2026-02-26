@@ -1,4 +1,5 @@
 #include "zmq_communicator.h"
+#include "base_pattern.h"
 #include "patterns.h"
 #include <glog/logging.h>
 #include <cstdlib>
@@ -29,15 +30,13 @@ bool ZmqCommunicator::initialize(const ZmqConfig& config) {
         pool_conf.max_connection = static_cast<uint32_t>(config.pool_size);
     }
     // TODO: RDMA support requires additional configuration
-    // if (use_rdma) {
-    //     pool_conf.client_config.socket_config =
-    //     coro_io::ib_socket_t::config_t{}; LOG(INFO) << "ZMQ Communicator
-    //     using RDMA transport";
-    // } else {
-    (void)use_rdma;
-    LOG(INFO)
-        << "ZMQ Communicator using TCP transport (RDMA not yet configured)";
-    // }
+    if (use_rdma) {
+        LOG(WARNING)
+            << "RDMA requested but not yet configured, falling back to "
+               "TCP transport";
+    } else {
+        LOG(INFO) << "ZMQ Communicator using TCP transport";
+    }
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
