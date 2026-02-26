@@ -163,39 +163,22 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
     storage_backend_ = create_storage_backend_result.value();
 
-    // Register buffer with UringFile if using BucketStorageBackend
+    // Register the client buffer with the process-wide io_uring fixed-buffer
+    // mechanism. This must happen before any I/O threads start so that they
+    // can lazily pick up the registration on their first I/O call.
 #ifdef USE_URING
-    if (config.storage_backend_type == StorageBackendType::kBucket) {
-        auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
-        if (bucket_backend) {
-            auto file_result = bucket_backend->GetFileInstance();
-            if (file_result) {
-                auto file = file_result.value();
-                auto uring_file = std::dynamic_pointer_cast<UringFile>(file);
-                if (uring_file) {
-                    auto aligned_allocator =
-                        std::static_pointer_cast<AlignedClientBufferAllocator>(
-                            client_buffer_allocator_);
-                    if (aligned_allocator) {
-                        void* base_ptr = aligned_allocator->get_base_pointer();
-                        size_t size = aligned_allocator->get_total_size();
-
-                        if (uring_file->register_buffer(base_ptr, size)) {
-                            LOG(INFO)
-                                << "Successfully registered buffer with "
-                                   "UringFile: "
-                                << "base=" << base_ptr << ", size=" << size;
-                        } else {
-                            LOG(WARNING)
-                                << "Failed to register buffer with UringFile";
-                        }
-                    }
-                }
+    if (config.use_uring) {
+        auto aligned_allocator =
+            std::static_pointer_cast<AlignedClientBufferAllocator>(
+                client_buffer_allocator_);
+        if (aligned_allocator) {
+            void* base_ptr = aligned_allocator->get_base_pointer();
+            size_t size = aligned_allocator->get_total_size();
+            if (UringFile::register_global_buffer(base_ptr, size)) {
+                LOG(INFO) << "Successfully registered buffer with UringFile: "
+                          << "base=" << base_ptr << ", size=" << size;
             } else {
-                LOG(WARNING)
-                    << "Failed to get file instance for buffer registration: "
-                    << file_result.error();
+                LOG(WARNING) << "Failed to register buffer with UringFile";
             }
         }
     }

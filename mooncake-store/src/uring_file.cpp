@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <vector>
@@ -69,6 +70,7 @@ class SharedUringRing {
     // thread before the first fixed-buffer I/O.
     bool ensure_buf_registered() {
         if (buf_registered_) return true;
+        if (buf_register_failed_) return false;  // don't retry after failure
         if (!initialized_) return false;
         void*  b = g_buf.base.load(std::memory_order_acquire);
         size_t s = g_buf.size.load(std::memory_order_acquire);
@@ -76,8 +78,13 @@ class SharedUringRing {
         struct iovec iov{b, s};
         int ret = io_uring_register_buffers(&ring_, &iov, 1);
         if (ret < 0) {
-            LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers: "
-                         << strerror(-ret);
+            int err = -ret;
+            LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers failed"
+                         << " errno=" << err << " (" << strerror(err) << ")"
+                         << " buf=" << b << " size=" << s
+                         << " pages=" << (s >> 12)
+                         << " — falling back to non-fixed-buffer I/O";
+            buf_register_failed_ = true;
             return false;
         }
         buf_registered_ = true;
@@ -361,9 +368,10 @@ class SharedUringRing {
     struct io_uring ring_{};
     bool initialized_    = false;
 
-    bool   buf_registered_ = false;
-    void*  buf_base_       = nullptr;
-    size_t buf_size_       = 0;
+    bool   buf_registered_      = false;
+    bool   buf_register_failed_ = false;  // set on first failure; skip retries
+    void*  buf_base_            = nullptr;
+    size_t buf_size_            = 0;
 };
 
 // ============================================================================
@@ -646,6 +654,44 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
 // ---------------------------------------------------------------------------
 // Buffer registration
 // ---------------------------------------------------------------------------
+
+bool UringFile::register_global_buffer(void* buffer, size_t length) {
+    if (!buffer || length == 0) {
+        LOG(ERROR) << "[UringFile::register_global_buffer] invalid buffer or length";
+        return false;
+    }
+    // Disable Transparent Huge Pages on this region before pinning.
+    // io_uring uses FOLL_LONGTERM to pin pages; on kernel 5.15 the kernel
+    // must split any 2MB THP into 4KB pages before long-term pinning, which
+    // can fail (ENOMEM) when huge pages are in use or memory is fragmented.
+    // MADV_NOHUGEPAGE prevents the kernel from backing this range with THPs,
+    // making pin_user_pages() reliable regardless of system THP policy.
+    if (madvise(buffer, length, MADV_NOHUGEPAGE) != 0) {
+        LOG(WARNING) << "[UringFile::register_global_buffer] madvise(NOHUGEPAGE)"
+                     << " failed errno=" << errno << " (" << strerror(errno)
+                     << ") — continuing anyway";
+    }
+    g_buf.base.store(buffer, std::memory_order_release);
+    g_buf.size.store(length, std::memory_order_release);
+    bool ok = SharedUringRing::instance().ensure_buf_registered();
+    if (ok) {
+        LOG(INFO) << "[UringFile::register_global_buffer] registered"
+                  << " addr=" << buffer << " size=" << length
+                  << " pages=" << (length >> 12);
+    } else {
+        LOG(WARNING) << "[UringFile::register_global_buffer] registration failed"
+                     << " addr=" << buffer << " size=" << length
+                     << " — I/O will use regular (non-fixed-buffer) io_uring,"
+                     << " which is correct but slightly less optimal";
+    }
+    return ok;
+}
+
+void UringFile::unregister_global_buffer() {
+    g_buf.base.store(nullptr, std::memory_order_release);
+    g_buf.size.store(0, std::memory_order_release);
+    SharedUringRing::instance().unregister_buf_local();
+}
 
 bool UringFile::register_buffer(void* buffer, size_t length) {
     if (!buffer || length == 0) {

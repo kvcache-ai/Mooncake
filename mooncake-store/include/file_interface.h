@@ -222,6 +222,12 @@ class UringFile : public StorageFile {
     tl::expected<void, ErrorCode> datasync();
 
     // Buffer registration — delegates to the shared ring (process-wide).
+    // Static variant: no file instance needed. Must be called once from a
+    // single thread before I/O threads begin. Other threads lazily pick up
+    // the registration on their first I/O call via ensure_buf_registered().
+    static bool register_global_buffer(void* buffer, size_t length);
+    static void unregister_global_buffer();
+
     bool register_buffer(void* buffer, size_t length);
     void unregister_buffer();
     bool is_buffer_registered() const;
