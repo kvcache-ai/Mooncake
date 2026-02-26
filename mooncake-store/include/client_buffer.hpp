@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <vector>
 #include <string>
@@ -79,8 +80,13 @@ class ClientBufferAllocator
  */
 class BufferHandle {
    public:
+    // Owning mode: backed by allocator
     BufferHandle(std::shared_ptr<ClientBufferAllocator> allocator,
                  offset_allocator::OffsetAllocationHandle handle);
+
+    // View mode: non-owning, calls release_fn on destruction
+    BufferHandle(void* ptr, size_t size, std::function<void()> release_fn);
+
     ~BufferHandle();
 
     BufferHandle(BufferHandle&&) = default;  // Allow move operations
@@ -94,8 +100,14 @@ class BufferHandle {
     [[nodiscard]] size_t size() const;
 
    private:
+    // Owning mode members
     std::shared_ptr<ClientBufferAllocator> allocator_;
     offset_allocator::OffsetAllocationHandle handle_;
+
+    // View mode members
+    void* view_ptr_ = nullptr;
+    size_t view_size_ = 0;
+    std::function<void()> release_fn_;
 };
 
 // Utility functions for buffer and slice management

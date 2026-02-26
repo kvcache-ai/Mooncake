@@ -88,6 +88,20 @@ docker_launch(){
     local cleaned_path=${relative_path#/}
     pip_cmd=$(append_str "${pip_cmd}" "pip install /test_run/$cleaned_path/whls/$mooncake_whl_file")
 
+    # Check if sglang-router is needed and missing
+    if [[ "$registry_addr" == *"sglang"* ]]; then
+        echo "=== Detected sglang image, checking sglang-router ==="
+        if ! ${docker_exec} "python -c 'import sglang_router' 2>/dev/null"; then
+            echo "sglang-router not found, will install it"
+            pip_cmd=$(append_str "${pip_cmd}" \
+                "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
+            pip_cmd=$(append_str "${pip_cmd}" \
+                "pip install sglang-router")
+        else
+            echo "sglang-router already installed, skipping"
+        fi
+    fi
+
     echo "Installing ERDMA drivers"
     echo "Executing ERDMA driver installation command:"
     echo "${erdma_driver_cmd}"
@@ -184,7 +198,6 @@ check_server_ready() {
     return 1
 }
 
-# 6. 通用的服务就绪检查函数（支持自定义日志模式）
 check_server_ready_with_pattern() {
     local server_log_path=$1
     local ready_pattern=$2
@@ -294,15 +307,18 @@ check_proxy_ready() {
     echo "Checking log file: $proxy_log_path"
     
     for i in $(seq 1 $max_attempts); do
+        activated_count=0
+        tokenizer_ready=0
+        server_started=0
         if [ -f "$proxy_log_path" ]; then
             # "Activated 1 worker(s) (marked as healthy)"
-            activated_count=$(grep -c "Activated 1 worker(s) (marked as healthy)" "$proxy_log_path" 2>/dev/null) || activated_count=0
+            activated_count=$(grep -cF "Activated 1 worker(s) (marked as healthy)" "$proxy_log_path" 2>/dev/null) || activated_count=0
             
             # "Successfully loaded tokenizer"
-            tokenizer_ready=$(grep -c "Successfully loaded tokenizer" "$proxy_log_path" 2>/dev/null) || tokenizer_ready=0
+            tokenizer_ready=$(grep -cE "Successfully (loaded|registered) tokenizer" "$proxy_log_path" 2>/dev/null) || tokenizer_ready=0
 
             # "Starting server on 0.0.0.0:8000"
-            server_started=$(grep -c "Starting server on 0.0.0.0" "$proxy_log_path" 2>/dev/null) || server_started=0
+            server_started=$(grep -cF "Starting server on 0.0.0.0" "$proxy_log_path" 2>/dev/null) || server_started=0
             
             if [ "$activated_count" -ge "$expected_workers" ] && [ "$tokenizer_ready" -gt 0 ]; then
                 echo "Router is ready!"
