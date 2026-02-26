@@ -25,7 +25,7 @@ namespace mooncake {
 // Each thread-local ring picks up the registration lazily on first I/O.
 // ============================================================================
 struct GlobalBufInfo {
-    std::atomic<void*>  base{nullptr};
+    std::atomic<void*> base{nullptr};
     std::atomic<size_t> size{0};
 };
 static GlobalBufInfo g_buf;
@@ -47,20 +47,20 @@ static GlobalBufInfo g_buf;
 class SharedUringRing {
    public:
     static constexpr unsigned QUEUE_DEPTH = 32;
-    static constexpr size_t   MIN_CHUNK   = 4096;
+    static constexpr size_t MIN_CHUNK = 4096;
 
     static SharedUringRing& instance() {
         thread_local SharedUringRing tl_ring;
         return tl_ring;
     }
 
-    SharedUringRing(const SharedUringRing&)            = delete;
+    SharedUringRing(const SharedUringRing&) = delete;
     SharedUringRing& operator=(const SharedUringRing&) = delete;
 
-    bool is_initialized()       const { return initialized_; }
+    bool is_initialized() const { return initialized_; }
     bool is_buffer_registered() const { return buf_registered_; }
-    void* buffer_base()         const { return buf_base_; }
-    size_t buffer_size()        const { return buf_size_; }
+    void* buffer_base() const { return buf_base_; }
+    size_t buffer_size() const { return buf_size_; }
 
     // -----------------------------------------------------------------
     // Buffer registration
@@ -72,7 +72,7 @@ class SharedUringRing {
         if (buf_registered_) return true;
         if (buf_register_failed_) return false;  // don't retry after failure
         if (!initialized_) return false;
-        void*  b = g_buf.base.load(std::memory_order_acquire);
+        void* b = g_buf.base.load(std::memory_order_acquire);
         size_t s = g_buf.size.load(std::memory_order_acquire);
         if (!b || !s) return false;
         struct iovec iov{b, s};
@@ -88,8 +88,8 @@ class SharedUringRing {
             return false;
         }
         buf_registered_ = true;
-        buf_base_        = b;
-        buf_size_        = s;
+        buf_base_ = b;
+        buf_size_ = s;
         LOG(INFO) << "[SharedUringRing] tid registered buffer addr=" << b
                   << " size=" << s;
         return true;
@@ -99,8 +99,8 @@ class SharedUringRing {
         if (!initialized_ || !buf_registered_) return;
         io_uring_unregister_buffers(&ring_);
         buf_registered_ = false;
-        buf_base_        = nullptr;
-        buf_size_        = 0;
+        buf_base_ = nullptr;
+        buf_size_ = 0;
     }
 
     // -----------------------------------------------------------------
@@ -116,8 +116,7 @@ class SharedUringRing {
 
     tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
                                           off_t off) {
-        return submit_rw(/*write=*/true, fd,
-                         const_cast<void*>(buf), len, off,
+        return submit_rw(/*write=*/true, fd, const_cast<void*>(buf), len, off,
                          /*use_fixed_buf=*/false);
     }
 
@@ -133,9 +132,9 @@ class SharedUringRing {
 
     // Descriptor for one independently-addressed read in a batch.
     struct ReadDesc {
-        void*  buf;
+        void* buf;
         size_t len;
-        off_t  off;
+        off_t off;
     };
 
     /// Submit up to QUEUE_DEPTH reads at once (each at its own offset), then
@@ -144,9 +143,9 @@ class SharedUringRing {
     tl::expected<size_t, ErrorCode> batch_read(int fd, const ReadDesc* descs,
                                                int cnt) {
         ensure_buf_registered();
-        size_t total     = 0;
-        int    remaining = cnt;
-        int    idx       = 0;
+        size_t total = 0;
+        int remaining = cnt;
+        int idx = 0;
 
         while (remaining > 0) {
             int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
@@ -166,8 +165,8 @@ class SharedUringRing {
 
             auto res = collect(batch);
             if (!res) return res;
-            total     += res.value();
-            idx       += batch;
+            total += res.value();
+            idx += batch;
             remaining -= batch;
         }
         return total;
@@ -175,7 +174,8 @@ class SharedUringRing {
 
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
     tl::expected<void, ErrorCode> fsync(int fd) {
-        if (!initialized_) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
@@ -203,7 +203,8 @@ class SharedUringRing {
         }
         initialized_ = true;
         LOG(INFO) << "[SharedUringRing] thread-local ring initialised "
-                     "queue_depth=" << QUEUE_DEPTH;
+                     "queue_depth="
+                  << QUEUE_DEPTH;
     }
 
     ~SharedUringRing() {
@@ -226,8 +227,12 @@ class SharedUringRing {
     static size_t next_pow2(size_t n) {
         if (n == 0) return 1;
         --n;
-        n |= n >> 1; n |= n >> 2; n |= n >> 4;
-        n |= n >> 8; n |= n >> 16; n |= n >> 32;
+        n |= n >> 1;
+        n |= n >> 2;
+        n |= n >> 4;
+        n |= n >> 8;
+        n |= n >> 16;
+        n |= n >> 32;
         return n + 1;
     }
 
@@ -245,8 +250,8 @@ class SharedUringRing {
                        << strerror(-ret);
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        size_t   total = 0;
-        bool     err   = false;
+        size_t total = 0;
+        bool err = false;
         unsigned head, cnt = 0;
         struct io_uring_cqe* cqe;
         io_uring_for_each_cqe(&ring_, head, cqe) {
@@ -266,20 +271,20 @@ class SharedUringRing {
 
     // Chunked contiguous read or write.
     tl::expected<size_t, ErrorCode> submit_rw(bool is_write, int fd, void* buf,
-                                               size_t len, off_t off,
-                                               bool use_fixed_buf) {
+                                              size_t len, off_t off,
+                                              bool use_fixed_buf) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const bool fix_buf = (use_fixed_buf && buf_registered_);
 
-        char*  ptr       = static_cast<char*>(buf);
-        size_t total     = 0;
+        char* ptr = static_cast<char*>(buf);
+        size_t total = 0;
         size_t remaining = len;
-        off_t  cur       = off;
+        off_t cur = off;
 
         while (remaining > 0) {
-            size_t   cs = calc_chunk(remaining, QUEUE_DEPTH);
-            unsigned n  = std::min(
+            size_t cs = calc_chunk(remaining, QUEUE_DEPTH);
+            unsigned n = std::min(
                 static_cast<unsigned>((remaining + cs - 1) / cs), QUEUE_DEPTH);
 
             for (unsigned i = 0; i < n; ++i) {
@@ -303,8 +308,8 @@ class SharedUringRing {
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
 
-                ptr       += chunk;
-                cur       += static_cast<off_t>(chunk);
+                ptr += chunk;
+                cur += static_cast<off_t>(chunk);
                 remaining -= chunk;
                 if (remaining == 0) break;
             }
@@ -328,10 +333,10 @@ class SharedUringRing {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
 
-        size_t total     = 0;
-        off_t  cur       = off;
-        int    remaining = cnt;
-        int    idx       = 0;
+        size_t total = 0;
+        off_t cur = off;
+        int remaining = cnt;
+        int idx = 0;
 
         while (remaining > 0) {
             int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
@@ -356,7 +361,7 @@ class SharedUringRing {
 
             auto res = collect(batch);
             if (!res) return res;
-            total     += res.value();
+            total += res.value();
             remaining -= batch;
         }
         return total;
@@ -366,12 +371,12 @@ class SharedUringRing {
     // Data members
     // -----------------------------------------------------------------
     struct io_uring ring_{};
-    bool initialized_    = false;
+    bool initialized_ = false;
 
-    bool   buf_registered_      = false;
-    bool   buf_register_failed_ = false;  // set on first failure; skip retries
-    void*  buf_base_            = nullptr;
-    size_t buf_size_            = 0;
+    bool buf_registered_ = false;
+    bool buf_register_failed_ = false;  // set on first failure; skip retries
+    void* buf_base_ = nullptr;
+    size_t buf_size_ = 0;
 };
 
 // ============================================================================
@@ -380,8 +385,7 @@ class SharedUringRing {
 
 UringFile::UringFile(const std::string& filename, int fd,
                      unsigned /*queue_depth*/, bool use_direct_io)
-    : StorageFile(filename, fd),
-      use_direct_io_(use_direct_io) {
+    : StorageFile(filename, fd), use_direct_io_(use_direct_io) {
     if (fd < 0) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
         return;
@@ -407,7 +411,8 @@ UringFile::~UringFile() {
                 LOG(ERROR) << "[UringFile] failed to delete corrupted file: "
                            << filename_;
             else
-                LOG(INFO) << "[UringFile] deleted corrupted file: " << filename_;
+                LOG(INFO) << "[UringFile] deleted corrupted file: "
+                          << filename_;
         }
     }
     fd_ = -1;
@@ -452,22 +457,22 @@ bool UringFile::in_registered_buffer(const void* buf, size_t len) const {
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::write(const std::string& buffer,
-                                                  size_t length) {
+                                                 size_t length) {
     return write(std::span<const char>(buffer.data(), length), length);
 }
 
 tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
-                                                  size_t length) {
+                                                 size_t length) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     if (length == 0) return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
 
-    void*       bounce    = nullptr;
-    const char* src       = data.data();
-    size_t      write_len = length;
+    void* bounce = nullptr;
+    const char* src = data.data();
+    size_t write_len = length;
 
     if (use_direct_io_) {
         write_len = ((length + ALIGNMENT_ - 1) / ALIGNMENT_) * ALIGNMENT_;
-        bounce    = alloc_aligned_buffer(write_len);
+        bounce = alloc_aligned_buffer(write_len);
         if (!bounce) return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         std::memcpy(bounce, data.data(), length);
         if (write_len > length)
@@ -491,17 +496,17 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
-                                                 size_t length) {
+                                                size_t length) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     if (length == 0) return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
 
-    void*  bounce   = nullptr;
-    char*  read_ptr = nullptr;
+    void* bounce = nullptr;
+    char* read_ptr = nullptr;
     size_t read_len = length;
 
     if (use_direct_io_) {
         read_len = ((length + ALIGNMENT_ - 1) / ALIGNMENT_) * ALIGNMENT_;
-        bounce   = alloc_aligned_buffer(read_len);
+        bounce = alloc_aligned_buffer(read_len);
         if (!bounce) return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         read_ptr = static_cast<char*>(bounce);
     } else {
@@ -531,8 +536,8 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
-                                                          size_t length,
-                                                          off_t offset) {
+                                                         size_t length,
+                                                         off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     if (!buffer || length == 0)
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
@@ -548,8 +553,8 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
 }
 
 tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
-                                                         size_t length,
-                                                         off_t offset) {
+                                                        size_t length,
+                                                        off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     if (!buffer || length == 0)
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
@@ -569,7 +574,7 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::batch_read(const ReadDesc* descs,
-                                                       int cnt) {
+                                                      int cnt) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     if (!descs || cnt <= 0)
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
@@ -588,12 +593,12 @@ tl::expected<size_t, ErrorCode> UringFile::batch_read(const ReadDesc* descs,
 // ---------------------------------------------------------------------------
 
 tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
-                                                         int iovcnt,
-                                                         off_t offset) {
+                                                        int iovcnt,
+                                                        off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     auto start = std::chrono::steady_clock::now();
-    auto res = SharedUringRing::instance().vector_write(fd_, iov, iovcnt,
-                                                        offset);
+    auto res =
+        SharedUringRing::instance().vector_write(fd_, iov, iovcnt, offset);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
                   .count();
@@ -604,16 +609,16 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
 }
 
 tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
-                                                        int iovcnt,
-                                                        off_t offset) {
+                                                       int iovcnt,
+                                                       off_t offset) {
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
 
     size_t expected_bytes = 0;
     for (int i = 0; i < iovcnt; ++i) expected_bytes += iov[i].iov_len;
     auto start = std::chrono::steady_clock::now();
 
-    auto res = SharedUringRing::instance().vector_read(fd_, iov, iovcnt,
-                                                       offset);
+    auto res =
+        SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
@@ -657,7 +662,8 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
 
 bool UringFile::register_global_buffer(void* buffer, size_t length) {
     if (!buffer || length == 0) {
-        LOG(ERROR) << "[UringFile::register_global_buffer] invalid buffer or length";
+        LOG(ERROR)
+            << "[UringFile::register_global_buffer] invalid buffer or length";
         return false;
     }
     // Disable Transparent Huge Pages on this region before pinning.
@@ -667,9 +673,10 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
     // MADV_NOHUGEPAGE prevents the kernel from backing this range with THPs,
     // making pin_user_pages() reliable regardless of system THP policy.
     if (madvise(buffer, length, MADV_NOHUGEPAGE) != 0) {
-        LOG(WARNING) << "[UringFile::register_global_buffer] madvise(NOHUGEPAGE)"
-                     << " failed errno=" << errno << " (" << strerror(errno)
-                     << ") — continuing anyway";
+        LOG(WARNING)
+            << "[UringFile::register_global_buffer] madvise(NOHUGEPAGE)"
+            << " failed errno=" << errno << " (" << strerror(errno)
+            << ") — continuing anyway";
     }
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
@@ -679,10 +686,11 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
                   << " addr=" << buffer << " size=" << length
                   << " pages=" << (length >> 12);
     } else {
-        LOG(WARNING) << "[UringFile::register_global_buffer] registration failed"
-                     << " addr=" << buffer << " size=" << length
-                     << " — I/O will use regular (non-fixed-buffer) io_uring,"
-                     << " which is correct but slightly less optimal";
+        LOG(WARNING)
+            << "[UringFile::register_global_buffer] registration failed"
+            << " addr=" << buffer << " size=" << length
+            << " — I/O will use regular (non-fixed-buffer) io_uring,"
+            << " which is correct but slightly less optimal";
     }
     return ok;
 }
@@ -729,7 +737,6 @@ void UringFile::unregister_buffer() {
 bool UringFile::is_buffer_registered() const {
     return SharedUringRing::instance().is_buffer_registered();
 }
-
 
 }  // namespace mooncake
 

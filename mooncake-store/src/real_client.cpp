@@ -2368,7 +2368,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
     if (!file_storage_) {
-        LOG(WARNING) << "release_offload_buffer called but file_storage_ is null";
+        LOG(WARNING)
+            << "release_offload_buffer called but file_storage_ is null";
         return false;
     }
     return file_storage_->ReleaseBuffer(batch_id);
@@ -2453,14 +2454,14 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
 void ClientRequester::release_offload_buffer(const std::string &client_addr,
                                              uint64_t batch_id) {
     // Fire-and-forget: attempt to release buffer, log errors but don't block
-    auto result =
-        invoke_rpc<&RealClient::release_offload_buffer, bool>(client_addr,
-                                                              batch_id);
+    auto result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
+        client_addr, batch_id);
     if (!result) {
         // This is expected in some cases (e.g., network issues, buffer already
         // GC'd) Log at INFO level since GC will eventually clean up anyway
         VLOG(1) << "Failed to release_offload_buffer for batch_id=" << batch_id
-                << " at " << client_addr << " (will be GC'd): " << result.error();
+                << " at " << client_addr
+                << " (will be GC'd): " << result.error();
     } else {
         VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
                 << " at " << client_addr;

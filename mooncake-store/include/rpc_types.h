@@ -159,7 +159,7 @@ struct BatchGetOffloadObjectResponse {
           transfer_engine_addr(std::move(transfer_engine_addr_param)),
           gc_ttl_ms(gc_ttl_ms_param) {}
 };
-YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers, transfer_engine_addr,
-         gc_ttl_ms);
+YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
+         transfer_engine_addr, gc_ttl_ms);
 
 }  // namespace mooncake

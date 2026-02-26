@@ -203,7 +203,7 @@ class UringFile : public StorageFile {
     // Zero-copy interface for O_DIRECT: caller must provide aligned buffer
     tl::expected<size_t, ErrorCode> read_aligned(void *buffer, size_t length,
                                                  off_t offset = 0);
-    tl::expected<size_t, ErrorCode> write_aligned(const void* buffer,
+    tl::expected<size_t, ErrorCode> write_aligned(const void *buffer,
                                                   size_t length,
                                                   off_t offset = 0);
 
@@ -211,11 +211,11 @@ class UringFile : public StorageFile {
     // offset) before waiting for completions, giving NVMe queue depth > 1.
     // Use in BatchLoadBucket instead of per-key read_aligned() loops.
     struct ReadDesc {
-        void*  buf;
+        void *buf;
         size_t len;
-        off_t  off;
+        off_t off;
     };
-    tl::expected<size_t, ErrorCode> batch_read(const ReadDesc* descs, int cnt);
+    tl::expected<size_t, ErrorCode> batch_read(const ReadDesc *descs, int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.
@@ -225,10 +225,10 @@ class UringFile : public StorageFile {
     // Static variant: no file instance needed. Must be called once from a
     // single thread before I/O threads begin. Other threads lazily pick up
     // the registration on their first I/O call via ensure_buf_registered().
-    static bool register_global_buffer(void* buffer, size_t length);
+    static bool register_global_buffer(void *buffer, size_t length);
     static void unregister_global_buffer();
 
-    bool register_buffer(void* buffer, size_t length);
+    bool register_buffer(void *buffer, size_t length);
     void unregister_buffer();
     bool is_buffer_registered() const;
 
@@ -237,11 +237,12 @@ class UringFile : public StorageFile {
     static constexpr size_t ALIGNMENT_ = 4096;
 
     /// Allocate / free an O_DIRECT aligned bounce buffer.
-    void* alloc_aligned_buffer(size_t size) const;
-    void  free_aligned_buffer(void* ptr) const;
+    void *alloc_aligned_buffer(size_t size) const;
+    void free_aligned_buffer(void *ptr) const;
 
-    /// Return true if @p buf falls entirely within the shared registered buffer.
-    bool in_registered_buffer(const void* buf, size_t len) const;
+    /// Return true if @p buf falls entirely within the shared registered
+    /// buffer.
+    bool in_registered_buffer(const void *buf, size_t len) const;
 };
 #endif  // USE_URING
 

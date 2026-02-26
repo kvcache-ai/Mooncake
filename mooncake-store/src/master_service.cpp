@@ -722,20 +722,16 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_offload_) {
         auto& shard = accessor.GetShard();
-        metadata.VisitReplicas(&Replica::fn_is_completed,
-                               [this, &key, &shard](Replica& replica) {
-                                   auto result =
-                                       PushOffloadingQueue(key, replica);
-                                   if (result) {
-                                       replica.inc_refcnt();
-                                       shard->offloading_tasks.emplace(
-                                           key,
-                                           OffloadingTask{
-                                               replica.id(),
-                                               std::chrono::steady_clock::
-                                                   now()});
-                                   }
-                               });
+        metadata.VisitReplicas(
+            &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
+                auto result = PushOffloadingQueue(key, replica);
+                if (result) {
+                    replica.inc_refcnt();
+                    shard->offloading_tasks.emplace(
+                        key, OffloadingTask{replica.id(),
+                                            std::chrono::steady_clock::now()});
+                }
+            });
     }
 
     // If the object is completed, remove it from the processing set.
@@ -1539,8 +1535,8 @@ auto MasterService::NotifyOffloadSuccess(
                 auto& shard = accessor.GetShard();
                 auto task_it = shard->offloading_tasks.find(key);
                 if (task_it != shard->offloading_tasks.end()) {
-                    auto source = obj_metadata.GetReplicaByID(
-                        task_it->second.source_id);
+                    auto source =
+                        obj_metadata.GetReplicaByID(task_it->second.source_id);
                     if (source != nullptr) {
                         source->dec_refcnt();
                     }
@@ -1762,15 +1758,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         auto metadata_it = shard->metadata.find(task_it->first);
         if (metadata_it != shard->metadata.end()) {
-            auto source = metadata_it->second.GetReplicaByID(
-                task_it->second.source_id);
+            auto source =
+                metadata_it->second.GetReplicaByID(task_it->second.source_id);
             if (source != nullptr) {
                 source->dec_refcnt();
             }
         }
 
-        LOG(WARNING) << "Offloading task expired for key: "
-                     << task_it->first;
+        LOG(WARNING) << "Offloading task expired for key: " << task_it->first;
         task_it = shard->offloading_tasks.erase(task_it);
     }
 
