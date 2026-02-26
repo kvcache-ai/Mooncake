@@ -213,41 +213,41 @@ int RdmaEndPoint::deconstruct() {
 Status RdmaEndPoint::connect(const std::string& peer_server_name,
                              const std::string& peer_nic_name,
                              const std::string& peer_rpc_server_addr) {
+    auto& transport = context_->transport_;
+    auto qp_num = qpNum();
+    BootstrapDesc local_desc, peer_desc;
+    bool same_nic = false;
+    bool is_self = false;
+
     // ===== Phase 1: Prepare (locked) =====
     // Validate state and build bootstrap descriptors under lock, then release
     // before any blocking call to avoid self-deadlock when the bootstrap RPC
     // loops back into the same tent instance.
-    lock_.lock();
-    if (peer_server_name.empty() || peer_nic_name.empty()) {
-        lock_.unlock();
-        return Status::InvalidArgument("Invalid peer path" LOC_MARK);
-    }
-    if (status_ == EP_READY) {
-        lock_.unlock();
-        return Status::OK();
-    }
-    if (status_ != EP_HANDSHAKING) {
-        lock_.unlock();
-        return Status::InvalidArgument(
-            "Endpoint not in handshaking state" LOC_MARK);
-    }
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (peer_server_name.empty() || peer_nic_name.empty()) {
+            return Status::InvalidArgument("Invalid peer path" LOC_MARK);
+        }
+        if (status_ == EP_READY) {
+            return Status::OK();
+        }
+        if (status_ != EP_HANDSHAKING) {
+            return Status::InvalidArgument(
+                "Endpoint not in handshaking state" LOC_MARK);
+        }
 
-    auto& transport = context_->transport_;
-    auto qp_num = qpNum();
-    BootstrapDesc local_desc, peer_desc;
-    local_desc.local_nic_path =
-        MakeNicPath(transport.local_segment_name_, context_->name());
-    local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
-    local_desc.qp_num = qp_num;
-    local_desc.notify_qp_num = notifyQpNum();
-    local_desc.local_lid = context_->lid();
-    local_desc.local_gid = context_->gid();
+        local_desc.local_nic_path =
+            MakeNicPath(transport.local_segment_name_, context_->name());
+        local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
+        local_desc.qp_num = qp_num;
+        local_desc.notify_qp_num = notifyQpNum();
+        local_desc.local_lid = context_->lid();
+        local_desc.local_gid = context_->gid();
 
-    bool same_nic =
-        (local_desc.local_nic_path == local_desc.peer_nic_path);
-    bool is_self =
-        (!same_nic && peer_server_name == transport.local_segment_name_);
-    lock_.unlock();
+        same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
+        is_self =
+            (!same_nic && peer_server_name == transport.local_segment_name_);
+    }
 
     // ===== Phase 2: Bootstrap (unlocked) =====
     // Blocking operations (RPC / direct call) happen here without holding
@@ -294,42 +294,40 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
     // ===== Phase 3: Finalize (locked) =====
     // Re-acquire lock and re-validate: another thread may have completed the
     // connection while we were doing bootstrap without the lock.
-    lock_.lock();
-    if (status_ == EP_READY) {
-        lock_.unlock();
-        return Status::OK();
-    }
-    if (status_ != EP_HANDSHAKING) {
-        lock_.unlock();
-        return Status::InvalidArgument(
-            "Endpoint state changed during bootstrap" LOC_MARK);
-    }
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (status_ == EP_READY) {
+            return Status::OK();
+        }
+        if (status_ != EP_HANDSHAKING) {
+            return Status::InvalidArgument(
+                "Endpoint state changed during bootstrap" LOC_MARK);
+        }
 
-    assert(qp_num.size());
-    peer_server_name_ = peer_server_name;
-    peer_nic_name_ = peer_nic_name;
-    int rc = setupAllQPs(peer_gid, peer_lid, qp_num);
-    if (rc) {
-        lock_.unlock();
-        return Status::InternalError(
-            "Failed to configure RDMA endpoint" LOC_MARK);
-    }
-
-    // Setup notification QP connection if peer supports it
-    if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-        rc = setupNotifyQpConnection(notify_qp_, context_, peer_gid, peer_lid,
-                                     peer_desc.notify_qp_num);
+        assert(qp_num.size());
+        peer_server_name_ = peer_server_name;
+        peer_nic_name_ = peer_nic_name;
+        int rc = setupAllQPs(peer_gid, peer_lid, qp_num);
         if (rc) {
-            LOG(WARNING)
-                << "Failed to setup notification QP, notification disabled";
-            notify_connected_ = false;
-        } else {
-            notify_connected_ = true;
-            context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
+            return Status::InternalError(
+                "Failed to configure RDMA endpoint" LOC_MARK);
+        }
+
+        // Setup notification QP connection if peer supports it
+        if (peer_desc.notify_qp_num != 0 && notify_qp_) {
+            rc = setupNotifyQpConnection(notify_qp_, context_, peer_gid,
+                                         peer_lid, peer_desc.notify_qp_num);
+            if (rc) {
+                LOG(WARNING)
+                    << "Failed to setup notification QP, notification disabled";
+                notify_connected_ = false;
+            } else {
+                notify_connected_ = true;
+                context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
+            }
         }
     }
 
-    lock_.unlock();
     return Status::OK();
 }
 
