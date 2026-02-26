@@ -230,6 +230,10 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 - Notes
   - Because snapshots are taken periodically rather than continuously, metadata changes after the last successful snapshot may be lost if the master fails before the next snapshot completes.
 
+> **Warning: Managed Storage**
+>
+> The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
+
 #### Master Service APIs
 
 The protobuf definition between Master and Client is as follows:

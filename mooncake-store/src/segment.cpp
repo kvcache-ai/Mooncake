@@ -390,11 +390,6 @@ ErrorCode SegmentView::GetMountedSegment(const UUID& segment_id,
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
 
-    // Check segment status
-    //    if (it->second.status != SegmentStatus::OK) {
-    //        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-    //    }
-
     // Return the found segment
     mountedSegment = it->second;
     return ErrorCode::OK;

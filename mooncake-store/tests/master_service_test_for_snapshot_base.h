@@ -183,12 +183,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Get msgpack snapshot directory path
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
-        return tmp_dir() + "/master_snapshot/" + snapshot_id + "/";
+        return tmp_dir() + "/mooncake_master_snapshot/" + snapshot_id + "/";
     }
 
     // Get backup directory path
     std::string GetBackupDir(const std::string& snapshot_id) const {
-        return tmp_dir() + "/master_snapshot_backup/" + snapshot_id + "/";
+        return tmp_dir() + "/mooncake_master_snapshot_backup/" + snapshot_id +
+               "/";
     }
 
     // ==================== State Capture Methods ====================
@@ -721,6 +722,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             MasterServiceConfig::builder()
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
+                .set_snapshot_backend_type("local")
                 .set_root_fs_dir(service->root_fs_dir_)
                 .build();
         std::unique_ptr<MasterService> restored_service(

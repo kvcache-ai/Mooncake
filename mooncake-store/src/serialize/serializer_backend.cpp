@@ -32,8 +32,9 @@ std::unique_ptr<SerializerBackend> SerializerBackend::Create(
                 "Please rebuild with HAVE_AWS_SDK or use 'local' backend.");
 #endif
         case SnapshotBackendType::LOCAL_FILE:
-        default:
             return std::make_unique<LocalFileBackend>();
+        default:
+            throw std::invalid_argument("Unknown snapshot backend type");
     }
 }
 
@@ -176,8 +177,9 @@ LocalFileBackend::LocalFileBackend(const std::string& base_path) {
 }
 
 fs::path LocalFileBackend::KeyToPath(const std::string& key) const {
-    // key format: "master_snapshot/20231201_123456_000/metadata"
-    // converts to: "/base_path/master_snapshot/20231201_123456_000/metadata"
+    // key format: "mooncake_master_snapshot/20231201_123456_000/metadata"
+    // converts to:
+    // "/base_path/mooncake_master_snapshot/20231201_123456_000/metadata"
     return base_path_ / key;
 }
 
@@ -372,7 +374,7 @@ tl::expected<void, std::string> LocalFileBackend::DownloadString(
 tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
     const std::string& prefix) {
     // In snapshot scenarios, the prefix is always a directory path
-    // (e.g., "master_snapshot/20240101_123456_000/").
+    // (e.g., "mooncake_master_snapshot/20240101_123456_000/").
     // This method deletes the entire directory corresponding to the prefix.
     fs::path target_dir = KeyToPath(prefix);
 
@@ -425,8 +427,9 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
 tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
     const std::string& prefix, std::vector<std::string>& object_keys) {
     // In snapshot scenarios, the prefix is always a directory path
-    // (e.g., "master_snapshot/" or "master_snapshot/20240101_123456_000/").
-    // This method lists all files recursively under that directory.
+    // (e.g., "mooncake_master_snapshot/" or
+    // "mooncake_master_snapshot/20240101_123456_000/"). This method lists all
+    // files recursively under that directory.
     object_keys.clear();
     fs::path target_dir = KeyToPath(prefix);
 

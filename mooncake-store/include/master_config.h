@@ -7,7 +7,6 @@
 
 #include "config_helper.h"
 #include "types.h"
-#include "serialize/serializer_backend.h"
 
 namespace mooncake {
 
@@ -57,7 +56,8 @@ struct MasterConfig {
     uint64_t snapshot_child_timeout_seconds;
     uint32_t snapshot_retention_count;
 
-    // Snapshot storage backend type: "local" or "s3", default "local"
+    // Snapshot storage backend type: "local" or "s3", required when snapshot
+    // or restore is enabled
     std::string snapshot_backend_type;
 
     // Task manager configuration
@@ -120,7 +120,7 @@ class MasterServiceSupervisorConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string snapshot_backend_type;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -172,8 +172,7 @@ class MasterServiceSupervisorConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type =
-            ParseSnapshotBackendType(config.snapshot_backend_type);
+        snapshot_backend_type = config.snapshot_backend_type;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -263,7 +262,7 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string snapshot_backend_type;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -334,8 +333,7 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type =
-            ParseSnapshotBackendType(config.snapshot_backend_type);
+        snapshot_backend_type = config.snapshot_backend_type;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -430,8 +428,7 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    SnapshotBackendType snapshot_backend_type_ =
-        SnapshotBackendType::LOCAL_FILE;
+    std::string snapshot_backend_type_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -567,7 +564,7 @@ class MasterServiceConfigBuilder {
     }
 
     MasterServiceConfigBuilder& set_snapshot_backend_type(
-        SnapshotBackendType type) {
+        const std::string& type) {
         snapshot_backend_type_ = type;
         return *this;
     }
@@ -664,7 +661,7 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string snapshot_backend_type;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,

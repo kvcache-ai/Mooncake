@@ -9,6 +9,13 @@
 
 namespace mooncake {
 
+// Node serialization size constants for offset_allocator::__Allocator
+constexpr size_t OFFSET_ALLOCATOR_NODE_BOOL_SIZE = 1;
+constexpr size_t OFFSET_ALLOCATOR_NODE_UINT32_COUNT = 6;
+constexpr size_t OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE =
+    OFFSET_ALLOCATOR_NODE_BOOL_SIZE +
+    OFFSET_ALLOCATOR_NODE_UINT32_COUNT * sizeof(uint32_t);
+
 // __Allocator serialize_msgpack
 tl::expected<void, SerializationError>
 Serializer<offset_allocator::__Allocator>::serialize(
@@ -41,7 +48,7 @@ Serializer<offset_allocator::__Allocator>::serialize(
     // (fields)
     std::vector<uint8_t> serialized_nodes;
     serialized_nodes.reserve(allocator.m_max_capacity *
-                             (1 + 6 * sizeof(uint32_t)));
+                             OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE);
 
     for (uint32_t i = 0; i < allocator.m_current_capacity; i++) {
         const auto &node = allocator.m_nodes[i];
@@ -196,28 +203,34 @@ Serializer<offset_allocator::__Allocator>::deserialize(
             zstd_decompress(compressed_data);
 
         // Verify decompressed data size is reasonable
-        if (serialized_nodes.size() % 25 != 0) {
+        if (serialized_nodes.size() % OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE !=
+            0) {
             return tl::unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
                 fmt::format("deserialize offset_allocator::__Allocator invalid "
                             "serialized nodes data size: expected multiple of "
-                            "25, actual size: {}",
+                            "{}, actual size: {}",
+                            OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE,
                             serialized_nodes.size())));
         }
 
-        if (serialized_nodes.size() / 25 != current_capacity) {
+        if (serialized_nodes.size() / OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE !=
+            current_capacity) {
             return tl::unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
                 fmt::format("deserialize offset_allocator::__Allocator invalid "
                             "serialized nodes data size: expected quotient of "
                             "{}, actual quotient: {}",
-                            current_capacity, serialized_nodes.size() / 25)));
+                            current_capacity,
+                            serialized_nodes.size() /
+                                OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE)));
         }
 
         // Deserialize nodes array in standardized format
         size_t offset = 0;
         for (uint32_t i = 0; i < current_capacity; i++) {
-            if (offset + 25 > serialized_nodes.size()) {
+            if (offset + OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE >
+                serialized_nodes.size()) {
                 return tl::unexpected(SerializationError(
                     ErrorCode::DESERIALIZE_FAIL,
                     fmt::format("deserialize offset_allocator::__Allocator "
@@ -358,7 +371,7 @@ auto Serializer<offset_allocator::OffsetAllocator>::deserialize(
                                "invalid msgpack data, expected array"));
     }
 
-    // Verify array size is correct (should have 3 elements, consistent with
+    // Verify array size is correct (should have 6 elements, consistent with
     // serialize_msgpack)
     if (obj.via.array.size != 6) {
         return tl::unexpected(SerializationError(

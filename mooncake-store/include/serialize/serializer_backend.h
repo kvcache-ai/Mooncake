@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 
 // Snapshot storage backend type enumeration
 enum class SnapshotBackendType {
-    LOCAL_FILE = 0,  // Local file system (default)
+    LOCAL_FILE = 0,  // Local file system
     S3 = 1           // S3 storage
 };
 
@@ -32,7 +32,13 @@ inline SnapshotBackendType ParseSnapshotBackendType(
             "Please rebuild with HAVE_AWS_SDK or use 'local' backend.");
     }
 #endif
-    return SnapshotBackendType::LOCAL_FILE;  // Default to local file
+    if (type_str == "local" || type_str == "LOCAL") {
+        return SnapshotBackendType::LOCAL_FILE;
+    }
+
+    // Unknown backend type - fail fast
+    throw std::invalid_argument("Unknown snapshot backend type: '" + type_str +
+                                "'");
 }
 
 // Convert SnapshotBackendType to string

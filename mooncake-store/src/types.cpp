@@ -55,7 +55,11 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::KEYS_EXCEED_BUCKET_LIMIT, "KEYS_EXCEED_BUCKET_LIMIT"},
         {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
-        {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"}};
+        {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
+        {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},
+        {ErrorCode::SERIALIZE_FAIL, "SERIALIZE_FAIL"},
+        {ErrorCode::DESERIALIZE_FAIL, "DESERIALIZE_FAIL"},
+        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

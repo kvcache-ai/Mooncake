@@ -1,7 +1,6 @@
 #pragma once
 
 #include <zstd.h>
-#include <iostream>
 #include <vector>
 
 namespace mooncake {

@@ -121,7 +121,7 @@ DEFINE_uint32(snapshot_retention_count,
               mooncake::DEFAULT_SNAPSHOT_RETENTION_COUNT,
               "Number of recent snapshots to keep (older snapshots will be "
               "automatically deleted)");
-DEFINE_string(snapshot_backend, "local",
+DEFINE_string(snapshot_backend_type, "",
               "Snapshot storage backend type: 'local' for local filesystem, "
               "'s3' for S3 storage");
 // Task manager configuration
@@ -243,9 +243,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("snapshot_retention_count",
                              &master_config.snapshot_retention_count,
                              FLAGS_snapshot_retention_count);
-    default_config.GetString("snapshot_backend",
+    default_config.GetString("snapshot_backend_type",
                              &master_config.snapshot_backend_type,
-                             FLAGS_snapshot_backend);
+                             FLAGS_snapshot_backend_type);
     default_config.GetUInt32("max_total_finished_tasks",
                              &master_config.max_total_finished_tasks,
                              FLAGS_max_total_finished_tasks);
@@ -534,10 +534,10 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
     }
-    if ((google::GetCommandLineFlagInfo("snapshot_backend", &info) &&
+    if ((google::GetCommandLineFlagInfo("snapshot_backend_type", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.snapshot_backend_type = FLAGS_snapshot_backend;
+        master_config.snapshot_backend_type = FLAGS_snapshot_backend_type;
     }
 }
 
@@ -663,7 +663,7 @@ int main(int argc, char* argv[]) {
         << ", snapshot_interval_seconds="
         << master_config.snapshot_interval_seconds
         << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
-        << ", snapshot_backend=" << master_config.snapshot_backend_type
+        << ", snapshot_backend_type=" << master_config.snapshot_backend_type
         << ", snapshot_retention_count="
         << master_config.snapshot_retention_count
         << ", max_retry_attempts=" << master_config.max_retry_attempts

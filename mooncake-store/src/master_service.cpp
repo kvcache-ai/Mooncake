@@ -5,7 +5,6 @@
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
-#include <shared_mutex>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -16,6 +15,7 @@
 #include "segment.h"
 #include "types.h"
 #include "serialize/serializer.hpp"
+#include "serialize/serializer_backend.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils/snapshot_logger.h"
@@ -28,7 +28,7 @@ static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_ROOT = "master_snapshot";
+static const std::string SNAPSHOT_ROOT = "mooncake_master_snapshot";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
@@ -66,8 +66,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_cxl_(config.enable_cxl) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
-            snapshot_backend_ =
-                SerializerBackend::Create(config.snapshot_backend_type);
+            auto backend_type =
+                ParseSnapshotBackendType(config.snapshot_backend_type);
+            snapshot_backend_ = SerializerBackend::Create(backend_type);
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot backend: " << e.what();
             throw std::runtime_error(
@@ -1880,7 +1881,7 @@ void MasterService::SnapshotThreadFunc() {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
                     "snapshot_id={},code={},msg={}",
-                    snapshot_id, static_cast<int32_t>(result.error().code),
+                    snapshot_id, toString(result.error().code),
                     result.error().message);
                 close(log_pipe[1]);
                 _exit(1);  // Exit child process with error
@@ -2081,7 +2082,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] metadata serialization failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, static_cast<int>(metadata_result.error().code),
+                snapshot_id, toString(metadata_result.error().code),
                 metadata_result.error().message);
 
             return tl::make_unexpected(metadata_result.error());
@@ -2095,7 +2096,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] segment serialization failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, static_cast<int>(segment_result.error().code),
+                snapshot_id, toString(segment_result.error().code),
                 segment_result.error().message);
             return tl::make_unexpected(segment_result.error());
         }
@@ -2108,7 +2109,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] task manager serialization failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, static_cast<int>(task_manager_result.error().code),
+                snapshot_id, toString(task_manager_result.error().code),
                 task_manager_result.error().message);
             return tl::make_unexpected(task_manager_result.error());
         }
@@ -2135,7 +2136,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "[Snapshot] metadata upload failed, snapshot_id={}, "
                 "path={}, code={}, msg={}",
                 snapshot_id, metadata_path,
-                static_cast<int>(upload_result.error().code),
+                toString(upload_result.error().code),
                 upload_result.error().message);
             return tl::make_unexpected(upload_result.error());
         }
@@ -2148,8 +2149,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] segment upload failed, snapshot_id={}, "
                 "path={}, code={}, msg={}",
-                snapshot_id, segment_path,
-                static_cast<int>(upload_result.error().code),
+                snapshot_id, segment_path, toString(upload_result.error().code),
                 upload_result.error().message);
             return tl::make_unexpected(upload_result.error());
         }
@@ -2165,7 +2165,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "[Snapshot] task_manager upload failed, snapshot_id={}, "
                 "path={}, code={}, msg={}",
                 snapshot_id, task_manager_path,
-                static_cast<int>(upload_result.error().code),
+                toString(upload_result.error().code),
                 upload_result.error().message);
             return tl::make_unexpected(upload_result.error());
         }
@@ -2184,7 +2184,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "[Snapshot] manifest upload failed, snapshot_id={}, "
                 "path={}, code={}, msg={}",
                 snapshot_id, manifest_path,
-                static_cast<int>(upload_result.error().code),
+                toString(upload_result.error().code),
                 upload_result.error().message);
             return tl::make_unexpected(upload_result.error());
         }
