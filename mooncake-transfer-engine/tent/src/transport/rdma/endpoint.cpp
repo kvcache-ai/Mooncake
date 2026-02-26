@@ -748,9 +748,9 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.pkey_index = 0;
     qp_attr.port_num = ctx->portNum();
     qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
-    ret = ibv_modify_qp(qp, &qp_attr,
-                        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-                            IBV_QP_ACCESS_FLAGS);
+    ret = ibv_modify_qp(
+        qp, &qp_attr,
+        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         PLOG(ERROR) << "Failed to modify notification QP to INIT";
         return -1;
