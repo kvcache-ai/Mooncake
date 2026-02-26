@@ -10,7 +10,7 @@ type ServiceConfig struct {
 	ReplayEndpoint string // optional
 	Type           string // kv publisher type
 	ModelName      string // Model name hosted by the service
-	LoraName       string
+	LoraName       string // (optinoal)
 	TenantID       string // (optional), default use 'default'
 	InstanceID     string // (optional), default use 'vllm-prefill-node1'
 	BlockSize      int

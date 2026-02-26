@@ -32,6 +32,7 @@ type RegisterReq struct {
 	AdditionalSalt string  `json:"additionalsalt"`
 }
 
+// Define dynamic unregister structure to match the JSON request body
 type UnregisterReq struct {
 	Type       string  `json:"type"`
 	ModelName  string  `json:"modelname"`
@@ -278,7 +279,6 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	return nil
 }
 
-// unsubscribeFromService 提供注销能力
 func (m *EventManager) unsubscribeFromService(instanceID string) {
 	if client, exists := m.subscribers.Load(instanceID); exists {
 		client.Stop()
