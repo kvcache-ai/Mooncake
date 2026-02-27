@@ -31,6 +31,7 @@ RUN apt-get update && \
         python3 \
         python3-dev \
         python3-pip \
+        python3-wheel \
         python-is-python3 \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
