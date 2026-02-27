@@ -344,6 +344,28 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+bool RdmaTransport::warmupMemory(void* addr, size_t length) {
+    if (length < kMrWarmupMinBytes) return false;
+    unsigned hwc = std::thread::hardware_concurrency();
+    if (hwc < 4) return false;
+    RdmaContext* warmup_ctx = nullptr;
+    for (auto& ctx : context_set_) {
+        if (ctx && ctx->status() == RdmaContext::DEVICE_ENABLED) {
+            warmup_ctx = ctx.get();
+            break;
+        }
+    }
+    if (!warmup_ctx) return false;
+    int ret = warmupMrRegistrationParallel(warmup_ctx, addr, length);
+    if (ret != 0) {
+        LOG(WARNING) << "MR warm-up failed (rc=" << ret
+                     << "), falling back to cold registration";
+        return false;
+    }
+    VLOG(1) << "MR warm-up succeeded for " << length << " bytes";
+    return true;
+}
+
 Status RdmaTransport::addMemoryBuffer(BufferDesc& desc,
                                       const MemoryOptions& options) {
     CHECK_STATUS(local_buffer_manager_.addBuffer(desc, options));

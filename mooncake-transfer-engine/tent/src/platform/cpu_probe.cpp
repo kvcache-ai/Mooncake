@@ -14,6 +14,7 @@
 
 #include "tent/platform/cpu.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
 
 #include <glog/logging.h>
@@ -33,7 +34,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unordered_set>
-#include <future>
 #include <unistd.h>
 
 namespace mooncake {
@@ -280,7 +280,8 @@ static inline std::string genCpuNodeName(int node) {
 }
 
 const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
-                                                          size_t len) {
+                                                          size_t len,
+                                                          bool skip_prefault) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
@@ -295,9 +296,8 @@ const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
 
-    for (int i = 0; i < n; i++) {
-        volatile char* p = (volatile char*)pages[i];
-        *p = *p;
+    if (!skip_prefault) {
+        prefaultBeforeProbe(pages, n, aligned_start, "CpuPlatform");
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
