@@ -2,21 +2,28 @@
 
 <!-- A clear and concise description of the changes. Link to any relevant issues. -->
 
+## Module
+
+- [ ] Transfer Engine (`mooncake-transfer-engine`)
+- [ ] Mooncake Store (`mooncake-store`)
+- [ ] Mooncake EP (`mooncake-ep`)
+- [ ] Integration (`mooncake-integration`)
+- [ ] P2P Store (`mooncake-p2p-store`)
+- [ ] Python Wheel (`mooncake-wheel`)
+- [ ] PyTorch Backend (`mooncake-pg`)
+- [ ] Mooncake RL (`mooncake-rl`)
+- [ ] CI/CD
+- [ ] Documentation
+- [ ] Other
+
 ## Type of Change
 
-* Types
-  - [ ] Bug fix
-  - [ ] New feature
-    - [ ] Transfer Engine
-    - [ ] Mooncake Store
-    - [ ] Mooncake EP
-    - [ ] Integration
-    - [ ] P2P Store
-    - [ ] Python Wheel
-  - [ ] Breaking change
-  - [ ] CI/CD
-  - [ ] Documentation update
-  - [ ] Other
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Refactor
+- [ ] Breaking change
+- [ ] Documentation update
+- [ ] Other
 
 ## How Has This Been Tested?
 
