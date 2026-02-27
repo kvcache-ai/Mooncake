@@ -461,7 +461,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
     if [ -n "$REPAIRED_WHEEL" ]; then
         echo "Injecting CUDA extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
-        wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        python -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
         for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
             if [ -f "$so_file" ]; then
@@ -470,7 +470,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
             fi
         done
         rm "$REPAIRED_WHEEL"
-        wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        python -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
     rm -rf "$CUDA_EP_STAGING_DIR"
