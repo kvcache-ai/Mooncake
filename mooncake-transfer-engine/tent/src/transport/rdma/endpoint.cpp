@@ -854,18 +854,26 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     auto& send_buf = notify_send_buffers_[slot];
 
     // Serialize: [name_len(4)][name][msg_len(4)][msg]
-    uint32_t name_len = name.size();
-    uint32_t msg_len = msg.size();
+    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) {
+        LOG(ERROR) << "Notification field exceeds uint32 limit";
+        return false;
+    }
+    uint32_t name_len = static_cast<uint32_t>(name.size());
+    uint32_t msg_len = static_cast<uint32_t>(msg.size());
     size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
     if (total_size > send_buf.size()) {
         LOG(ERROR) << "Notification message too large: " << total_size;
         return false;
     }
 
-    std::memcpy(send_buf.data(), &name_len, 4);
-    std::memcpy(send_buf.data() + 4, name.data(), name.size());
-    std::memcpy(send_buf.data() + 4 + name.size(), &msg_len, 4);
-    std::memcpy(send_buf.data() + 4 + name.size() + 4, msg.data(), msg.size());
+    auto* ptr = send_buf.data();
+    std::memcpy(ptr, &name_len, sizeof(name_len));
+    ptr += sizeof(name_len);
+    std::memcpy(ptr, name.data(), name_len);
+    ptr += name_len;
+    std::memcpy(ptr, &msg_len, sizeof(msg_len));
+    ptr += sizeof(msg_len);
+    std::memcpy(ptr, msg.data(), msg_len);
 
     // Post send
     ibv_sge sge = {};
