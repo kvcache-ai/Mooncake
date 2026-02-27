@@ -29,6 +29,10 @@ static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
 static const std::string SNAPSHOT_ROOT = "mooncake_master_snapshot";
+static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
+    "mooncake_snapshot_save_backup";
+static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
+    "mooncake_snapshot_restore_backup";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
@@ -2123,10 +2127,14 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         const auto& serialized_segment = segment_result.value();
         const auto& serialized_task_manager = task_manager_result.value();
 
+        // When backup_dir is enabled, try all uploads to ensure complete backup
+        // When backup_dir is disabled, use fail-fast mode
+        bool upload_success = true;
+        std::string error_msg;
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
                       snapshot_backend_->GetConnectionInfo());
 
-        // Upload metadata (fail-fast: return immediately on failure)
+        // Upload metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         auto upload_result =
             UploadSnapshotFile(serialized_metadata, metadata_path,
@@ -2138,7 +2146,11 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 snapshot_id, metadata_path,
                 toString(upload_result.error().code),
                 upload_result.error().message);
-            return tl::make_unexpected(upload_result.error());
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(upload_result.error());
+            }
+            error_msg.append(upload_result.error().message + "\n");
+            upload_success = false;
         }
 
         // Upload segment
@@ -2151,7 +2163,11 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "path={}, code={}, msg={}",
                 snapshot_id, segment_path, toString(upload_result.error().code),
                 upload_result.error().message);
-            return tl::make_unexpected(upload_result.error());
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(upload_result.error());
+            }
+            error_msg.append(upload_result.error().message + "\n");
+            upload_success = false;
         }
 
         // Upload task manager
@@ -2167,7 +2183,11 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 snapshot_id, task_manager_path,
                 toString(upload_result.error().code),
                 upload_result.error().message);
-            return tl::make_unexpected(upload_result.error());
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(upload_result.error());
+            }
+            error_msg.append(upload_result.error().message + "\n");
+            upload_success = false;
         }
 
         // Upload manifest
@@ -2186,7 +2206,16 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 snapshot_id, manifest_path,
                 toString(upload_result.error().code),
                 upload_result.error().message);
-            return tl::make_unexpected(upload_result.error());
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(upload_result.error());
+            }
+            error_msg.append(upload_result.error().message + "\n");
+            upload_success = false;
+        }
+
+        if (!upload_success) {
+            return tl::make_unexpected(
+                SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
         }
 
         // Update latest marker (atomic operation)
@@ -2201,7 +2230,8 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}",
                 snapshot_id, latest_path);
             if (use_snapshot_backup_dir_) {
-                auto save_path = fs::path(snapshot_backup_dir_) / "save" /
+                auto save_path = fs::path(snapshot_backup_dir_) /
+                                 SNAPSHOT_BACKUP_SAVE_DIR /
                                  SNAPSHOT_LATEST_FILE;
                 auto save_result =
                     FileUtil::SaveStringToFile(latest_content, save_path);
@@ -2262,8 +2292,8 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
         // Upload failed, save locally for manual recovery in exception
         // scenarios
         if (use_snapshot_backup_dir_) {
-            auto save_path =
-                fs::path(snapshot_backup_dir_) / "save" / local_filename;
+            auto save_path = fs::path(snapshot_backup_dir_) /
+                             SNAPSHOT_BACKUP_SAVE_DIR / local_filename;
             auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
             if (!save_result) {
                 SNAP_LOG_ERROR(
@@ -2406,7 +2436,8 @@ void MasterService::RestoreState() {
 
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveStringToFile(
-                manifest_content, fs::path(snapshot_backup_dir_) / "restore" /
+                manifest_content, fs::path(snapshot_backup_dir_) /
+                                      SNAPSHOT_BACKUP_RESTORE_DIR /
                                       SNAPSHOT_MANIFEST_FILE);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save manifest to file: "
@@ -2462,7 +2493,8 @@ void MasterService::RestoreState() {
 
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
-                metadata_content, fs::path(snapshot_backup_dir_) / "restore" /
+                metadata_content, fs::path(snapshot_backup_dir_) /
+                                      SNAPSHOT_BACKUP_RESTORE_DIR /
                                       SNAPSHOT_METADATA_FILE);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save metadata to file: "
@@ -2483,7 +2515,8 @@ void MasterService::RestoreState() {
         }
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
-                segments_content, fs::path(snapshot_backup_dir_) / "restore" /
+                segments_content, fs::path(snapshot_backup_dir_) /
+                                      SNAPSHOT_BACKUP_RESTORE_DIR /
                                       SNAPSHOT_SEGMENTS_FILE);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save segments to file: "
@@ -2507,7 +2540,7 @@ void MasterService::RestoreState() {
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
                 task_manager_content, fs::path(snapshot_backup_dir_) /
-                                          "restore" /
+                                          SNAPSHOT_BACKUP_RESTORE_DIR /
                                           SNAPSHOT_TASK_MANAGER_FILE);
             if (!save_result) {
                 LOG(ERROR) << "[Restore] Failed to save task manager to file: "

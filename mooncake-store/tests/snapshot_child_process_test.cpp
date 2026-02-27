@@ -319,8 +319,9 @@ TEST_F(SnapshotChildProcessTest, RestoreWithBackupDir_CreatesBackupFiles) {
                       .build();
     auto restore_service = std::make_unique<MasterService>(config);
 
-    // Step 3: Verify backup files were created in {backup_dir}/restore/
-    std::string restore_dir = backup_dir + "/restore";
+    // Step 3: Verify backup files were created in
+    // {backup_dir}/mooncake_snapshot_restore_backup/
+    std::string restore_dir = backup_dir + "/mooncake_snapshot_restore_backup";
     EXPECT_TRUE(fs::exists(restore_dir + "/manifest.txt"))
         << "manifest.txt should be backed up during restore";
     EXPECT_TRUE(fs::exists(restore_dir + "/metadata"))
@@ -360,7 +361,8 @@ TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
     // and no restore directory should exist anywhere in tmp_dir()
     bool any_restore_dir_found = false;
     for (auto& entry : fs::recursive_directory_iterator(tmp_dir())) {
-        if (entry.is_directory() && entry.path().filename() == "restore") {
+        if (entry.is_directory() &&
+            entry.path().filename() == "mooncake_snapshot_restore_backup") {
             any_restore_dir_found = true;
             break;
         }
@@ -558,7 +560,18 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
 // ========== PersistState Fail-Fast ==========
 
 TEST_F(SnapshotChildProcessTest, PersistState_FailFast_StopsOnFirstError) {
-    CreateDefaultService();
+    // Create service WITHOUT backup_dir to test fail-fast behavior
+    auto config =
+        MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir("")  // empty = no backup, fail-fast
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_backend_type("local")
+            .build();
+    service_ = std::make_unique<MasterService>(config);
 
     // Mount a segment to have some data to serialize
     Segment segment;
@@ -610,6 +623,71 @@ TEST_F(SnapshotChildProcessTest, PersistState_FailFast_StopsOnFirstError) {
         << "Error should NOT contain 'manifest' (fail-fast should stop before "
            "this), got: "
         << error_msg;
+}
+
+// ========== Backup Dir Upload Fail ==========
+
+TEST_F(SnapshotChildProcessTest, UploadFail_WithBackupDir_SavesAllFiles) {
+    // Create service WITH backup_dir to test non-fail-fast behavior
+    std::string backup_dir = tmp_dir() + "/backup_upload_fail";
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_backup_dir(backup_dir)
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_backend_type("local")
+                      .build();
+    service_ = std::make_unique<MasterService>(config);
+
+    // Mount a segment to have some data to serialize
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x200000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Create a FILE named "mooncake_master_snapshot" to block directory
+    // creation, causing all uploads to fail
+    std::string snapshot_root = tmp_dir() + "/mooncake_master_snapshot";
+    std::ofstream blocker(snapshot_root);
+    blocker << "blocking file";
+    blocker.close();
+
+    // PersistState should fail but try all uploads
+    auto result = CallPersistState("20240701_backup_all_000");
+    EXPECT_FALSE(result.has_value()) << "PersistState should fail";
+
+    // Verify error message contains ALL files (non-fail-fast with backup_dir)
+    const auto& error_msg = result.error().message;
+    LOG(INFO) << "PersistState error: " << error_msg;
+
+    EXPECT_NE(error_msg.find("metadata"), std::string::npos)
+        << "Error should contain 'metadata', got: " << error_msg;
+    EXPECT_NE(error_msg.find("segments"), std::string::npos)
+        << "Error should contain 'segments', got: " << error_msg;
+    EXPECT_NE(error_msg.find("task_manager"), std::string::npos)
+        << "Error should contain 'task_manager', got: " << error_msg;
+    EXPECT_NE(error_msg.find("manifest"), std::string::npos)
+        << "Error should contain 'manifest', got: " << error_msg;
+
+    // Verify ALL files were saved to backup_dir/mooncake_snapshot_save_backup/
+    std::string save_dir = backup_dir + "/mooncake_snapshot_save_backup";
+    EXPECT_TRUE(fs::exists(save_dir + "/metadata"))
+        << "metadata should be saved to backup dir";
+    EXPECT_TRUE(fs::exists(save_dir + "/segments"))
+        << "segments should be saved to backup dir";
+    EXPECT_TRUE(fs::exists(save_dir + "/task_manager"))
+        << "task_manager should be saved to backup dir";
+    EXPECT_TRUE(fs::exists(save_dir + "/manifest.txt"))
+        << "manifest.txt should be saved to backup dir";
+
+    // Remove the blocking file for cleanup
+    fs::remove(snapshot_root);
 }
 
 }  // namespace mooncake::test
