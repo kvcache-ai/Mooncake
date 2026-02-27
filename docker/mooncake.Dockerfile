@@ -31,7 +31,6 @@ RUN apt-get update && \
         python3 \
         python3-dev \
         python3-pip \
-        python3-wheel \
         python-is-python3 \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
@@ -41,6 +40,9 @@ COPY . /workspace
 
 # Install Mooncake dependencies (yalantinglibs, Go, etc.)
 RUN bash dependencies.sh -y
+
+# Install wheel as required by ./scripts/build_wheel.sh
+RUN pip3 install wheel
 
 # Configure & build Mooncake
 RUN mkdir -p build && \
