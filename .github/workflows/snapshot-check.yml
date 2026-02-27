@@ -1,0 +1,90 @@
+name: Snapshot Serialization Check
+
+on:
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      # Snapshot-related headers
+      - "mooncake-store/include/replica.h"
+      - "mooncake-store/include/allocator.h"
+      - "mooncake-store/include/segment.h"
+      - "mooncake-store/include/master_service.h"
+      - "mooncake-store/include/task_manager.h"
+      - "mooncake-store/include/offset_allocator/offset_allocator.hpp"
+      # Snapshot serialization implementations
+      - "mooncake-store/src/serialize/serializer.cpp"
+      - "mooncake-store/src/master_service.cpp"
+      - "mooncake-store/src/segment.cpp"
+      - "mooncake-store/src/task_manager.cpp"
+      # Checker assets
+      - "scripts/check_snapshot_serialization.py"
+      - "scripts/snapshot_serialization_map.json"
+      - ".github/workflows/snapshot-check.yml"
+
+jobs:
+  check-serialization:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y wget gnupg software-properties-common
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            cmake \
+            libclang-18-dev \
+            libmsgpack-dev \
+            libgoogle-glog-dev \
+            libgtest-dev \
+            libjsoncpp-dev \
+            libboost-all-dev \
+            libzstd-dev \
+            libyaml-cpp-dev \
+            libasio-dev \
+            libcurl4-openssl-dev \
+            libhiredis-dev
+
+          python3 -m pip install --upgrade pip
+          pip install libclang
+
+      - name: Generate compile_commands.json
+        run: |
+          set -euxo pipefail
+          git submodule update --init --recursive
+
+          cmake -S . -B build \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DWITH_STORE=ON \
+            -DBUILD_UNIT_TESTS=OFF \
+            -DBUILD_EXAMPLES=OFF || true
+
+          if [ ! -f build/compile_commands.json ]; then
+            echo "compile_commands.json not generated"
+            exit 1
+          fi
+
+      - name: Run snapshot serialization consistency check
+        run: |
+          set -euxo pipefail
+          python3 scripts/check_snapshot_serialization.py \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.sha }}" \
+            --build-dir build \
+            --strict-ci \
+            --github-actions

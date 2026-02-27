@@ -1,0 +1,243 @@
+{
+  "_comment": [
+    "Mapping between snapshot-related structs and serialization code anchors.",
+    "When struct fields change, the checker verifies matching serialization",
+    "functions were also updated in the PR.",
+    "",
+    "Schema:",
+    "  struct_name: target struct/class name in header",
+    "  header_file: where the struct is defined",
+    "  match_policy: all|any across targets (default any)",
+    "  targets: list of serialization files + anchors",
+    "  anchor_policy: all|any across anchors in one target (default all)",
+    "",
+    "To skip a field, add a NOSNAPSHOT marker on the declaration line."
+  ],
+  "mappings": [
+    {
+      "struct_name": "Replica",
+      "header_file": "mooncake-store/include/replica.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<Replica>::serialize(",
+            "Serializer<Replica>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "MemoryReplicaData",
+      "header_file": "mooncake-store/include/replica.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<Replica>::serialize(",
+            "Serializer<Replica>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "DiskReplicaData",
+      "header_file": "mooncake-store/include/replica.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<Replica>::serialize(",
+            "Serializer<Replica>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "LocalDiskReplicaData",
+      "header_file": "mooncake-store/include/replica.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<Replica>::serialize(",
+            "Serializer<Replica>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "AllocatedBuffer",
+      "header_file": "mooncake-store/include/allocator.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<AllocatedBuffer>::serialize(",
+            "Serializer<AllocatedBuffer>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "OffsetBufferAllocator",
+      "header_file": "mooncake-store/include/allocator.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<OffsetBufferAllocator>::serialize(",
+            "Serializer<OffsetBufferAllocator>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "OffsetAllocationHandle",
+      "header_file": "mooncake-store/include/offset_allocator/offset_allocator.hpp",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<offset_allocator::OffsetAllocationHandle>::serialize(",
+            "Serializer<offset_allocator::OffsetAllocationHandle>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "OffsetAllocator",
+      "header_file": "mooncake-store/include/offset_allocator/offset_allocator.hpp",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<offset_allocator::OffsetAllocator>::serialize(",
+            "Serializer<offset_allocator::OffsetAllocator>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "__Allocator",
+      "header_file": "mooncake-store/include/offset_allocator/offset_allocator.hpp",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<offset_allocator::__Allocator>::serialize(",
+            "Serializer<offset_allocator::__Allocator>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "MountedSegment",
+      "header_file": "mooncake-store/include/segment.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/serialize/serializer.cpp",
+          "anchors": [
+            "Serializer<MountedSegment>::serialize(",
+            "Serializer<MountedSegment>::deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "LocalDiskSegment",
+      "header_file": "mooncake-store/include/segment.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/segment.cpp",
+          "anchors": [
+            "SegmentSerializer::Serialize()",
+            "SegmentSerializer::Deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "ObjectMetadata",
+      "header_file": "mooncake-store/include/master_service.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/master_service.cpp",
+          "anchors": [
+            "MetadataSerializer::SerializeMetadata(",
+            "MetadataSerializer::DeserializeMetadata("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "DiscardedReplicas",
+      "header_file": "mooncake-store/include/master_service.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/master_service.cpp",
+          "anchors": [
+            "MetadataSerializer::SerializeDiscardedReplicas(",
+            "MetadataSerializer::DeserializeDiscardedReplicas("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "MetadataShard",
+      "header_file": "mooncake-store/include/master_service.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/master_service.cpp",
+          "anchors": [
+            "MetadataSerializer::SerializeShard(",
+            "MetadataSerializer::DeserializeShard("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    },
+    {
+      "struct_name": "Task",
+      "header_file": "mooncake-store/include/task_manager.h",
+      "match_policy": "all",
+      "targets": [
+        {
+          "file": "mooncake-store/src/task_manager.cpp",
+          "anchors": [
+            "TaskManagerSerializer::Serialize()",
+            "TaskManagerSerializer::Deserialize("
+          ],
+          "anchor_policy": "all"
+        }
+      ]
+    }
+  ]
+}
