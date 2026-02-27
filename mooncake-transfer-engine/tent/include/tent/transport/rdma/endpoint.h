@@ -89,7 +89,8 @@ class RdmaEndPoint {
     int deconstruct();
 
     Status connect(const std::string& peer_server_name,
-                   const std::string& peer_nic_name);
+                   const std::string& peer_nic_name,
+                   const std::string& peer_rpc_server_addr = "");
 
     Status accept(const BootstrapDesc& peer_desc, BootstrapDesc& local_desc);
 

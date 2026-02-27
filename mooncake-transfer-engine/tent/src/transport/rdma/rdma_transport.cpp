@@ -421,10 +421,12 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id) {
     SegmentDesc* segment_desc = nullptr;
+    std::string rpc_server_addr;
     if (target_id == LOCAL_SEGMENT_ID) {
         segment_desc = metadata_->segmentManager().getLocal().get();
     } else {
         metadata_->segmentManager().getRemoteCached(segment_desc, target_id);
+        rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
     }
     if (segment_desc->type != SegmentType::Memory) return nullptr;
     auto context = context_set_[0].get();
@@ -450,7 +452,8 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        auto status = endpoint->connect(target_seg_name, target_dev_name);
+        auto status = endpoint->connect(target_seg_name, target_dev_name,
+                                        rpc_server_addr);
         if (!status.ok()) {
             thread_local uint64_t tl_last_output_ts = 0;
             uint64_t current_ts = getCurrentTimeInNano();

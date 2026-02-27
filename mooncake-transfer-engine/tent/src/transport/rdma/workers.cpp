@@ -123,6 +123,7 @@ Status Workers::cancel(RdmaSliceList& slice_list) {
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     std::string target_seg_name, target_dev_name;
+    std::string rpc_server_addr;
     RouteHint hint;
     auto target_id = path.remote_segment_id;
     auto device_id = path.remote_device_id;
@@ -134,6 +135,9 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     }
     if (hint.segment->type != SegmentType::Memory) return nullptr;
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
+    if (target_id != LOCAL_SEGMENT_ID) {
+        rpc_server_addr = hint.segment->getMemory().rpc_server_addr;
+    }
     target_seg_name = hint.segment->name;
     target_dev_name = hint.topo->getNicName(device_id);
     if (target_seg_name.empty() || target_dev_name.empty()) {
@@ -158,7 +162,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        auto status = endpoint->connect(target_seg_name, target_dev_name);
+        auto status = endpoint->connect(target_seg_name, target_dev_name,
+                                        rpc_server_addr);
         if (!status.ok()) {
             thread_local uint64_t tl_last_output_ts = 0;
             uint64_t current_ts = getCurrentTimeInNano();
