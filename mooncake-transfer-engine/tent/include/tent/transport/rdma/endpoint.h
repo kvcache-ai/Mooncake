@@ -160,6 +160,7 @@ class RdmaEndPoint {
     void resetInflightSlices();
 
     void postNotifyRecv(size_t idx);
+    void repostAllNotifyRecvs();
 
    private:
     std::atomic<EndPointStatus> status_;

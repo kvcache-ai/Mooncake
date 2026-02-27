@@ -334,6 +334,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 notify_connected_ = false;
             } else {
                 notify_connected_ = true;
+                repostAllNotifyRecvs();
                 context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
             }
         }
@@ -394,6 +395,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             notify_connected_ = false;
         } else {
             notify_connected_ = true;
+            repostAllNotifyRecvs();
             context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
         }
     }
@@ -412,7 +414,10 @@ int RdmaEndPoint::resetUnlocked() {
     resetInflightSlices();
 
     if (notify_qp_) {
-        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
+        // Keep the QP registered in the transport map — the qp_num doesn't
+        // change across resets, and the notify worker may still poll
+        // completions (flush errors) from the CQ between reset and reconnect.
+        // Unregistering here would cause "unknown QP" warnings.
         notify_connected_ = false;
         {
             std::lock_guard<std::mutex> lock(notify_send_mutex_);
@@ -736,6 +741,12 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     ibv_recv_wr* bad_wr = nullptr;
     if (ibv_post_recv(notify_qp_, &wr, &bad_wr)) {
         PLOG(ERROR) << "Failed to post notification recv";
+    }
+}
+
+void RdmaEndPoint::repostAllNotifyRecvs() {
+    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
+        postNotifyRecv(i);
     }
 }
 
