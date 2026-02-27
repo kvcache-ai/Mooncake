@@ -137,10 +137,15 @@ func (m *EventManager) Stop() {
 }
 
 func parseEndpoint(ep string) (string, string, int, error) {
-	if !strings.HasPrefix(ep, "tcp://") {
+	// Protocol parsing section
+	protocolEnd := strings.Index(ep, "://")
+	if protocolEnd == -1 {
 		return "", "", 0, fmt.Errorf("invalid endpoint format: %s", ep)
 	}
-	trimmed := strings.TrimPrefix(ep, "tcp://")
+	protocol := ep[:protocolEnd]
+
+	// Trim protocol header
+	trimmed := ep[protocolEnd+3:]
 	parts := strings.Split(trimmed, ":")
 	if len(parts) != 2 {
 		return "", "", 0, fmt.Errorf("invalid endpoint format: %s", ep)
@@ -153,7 +158,7 @@ func parseEndpoint(ep string) (string, string, int, error) {
 		return "", "", 0, fmt.Errorf("invalid port number: %w", err)
 	}
 
-	return "tcp", ip, port, nil
+	return protocol, ip, port, nil
 }
 
 func loraNameToID(name string) int64 {
@@ -165,54 +170,8 @@ func loraNameToID(name string) int64 {
 	return int64(h.Sum64())
 }
 
-// func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
-// 	if _, exists := m.subscribers.Load(svc.Name); exists {
-// 		return nil
-// 	}
-
-// 	handler := &KVEventHandler{
-// 		manager:   m,
-// 		svcName:   svc.IP,
-// 		modelName: svc.ModelName,
-// 		loraID:    svc.LoraID,
-// 	}
-
-// 	// Configure ZMQ Client
-// 	zmqConfig := &zmq.ZMQClientConfig{
-// 		CachePoolKey:   svc.Name,
-// 		ServiceIP:      svc.IP,
-// 		Port:           svc.Port,
-// 		ModelName:      svc.ModelName,
-// 		PollTimeout:    100 * time.Millisecond,
-// 		ReplayTimeout:  5 * time.Second,
-// 		ReconnectDelay: 1 * time.Second,
-// 		RouterPort:     svc.Port + 1,
-// 	}
-
-// 	// Validate ZMQ config
-// 	if err := zmq.ValidateConfig(zmqConfig); err != nil {
-// 		return fmt.Errorf("invalid ZMQ config: %w", err)
-// 	}
-
-// 	// Create and start client
-// 	client := zmq.NewZMQClient(zmqConfig, handler)
-// 	if err := client.Start(); err != nil {
-// 		return fmt.Errorf("failed to start ZMQ client: %w", err)
-// 	}
-
-// 	m.subscribers.Store(svc.Name, client)
-// 	slog.Info("Successfully subscribed to service",
-// 		"service_type", svc.Type,
-// 		"service_name", svc.Name,
-// 		"service_ip", svc.IP,
-// 		"service_port", svc.Port,
-// 	)
-
-// 	return nil
-// }
-
 func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
-	// 1. 使用 InstanceID 作为唯一键（兜底使用 Endpoint）
+	// Use InstanceID as the unique key (with Endpoint as a fallback).
 	svcKey := svc.InstanceID
 	if svcKey == "" {
 		svcKey = svc.Endpoint
@@ -222,22 +181,22 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 		return nil
 	}
 
-	// 2. 解析 Endpoint 获取 IP 和 Port
-	ip, port, err := parseEndpoint(svc.Endpoint)
+	// Parse the Endpoint to obtain the IP and Port
+	protocol, ip, port, err := parseEndpoint(svc.Endpoint)
 	if err != nil {
 		return fmt.Errorf("invalid endpoint format: %w", err)
 	}
 
-	// 解析 ReplayEndpoint
-	routerPort := port + 1 // 默认降级策略
+	// Parse ReplayEndpoint
+	routerPort := port + 1 // Default degradation strategy
 	if svc.ReplayEndpoint != "" {
-		_, rPort, err := parseEndpoint(svc.ReplayEndpoint)
+		rProtocol, rIP, rPort, err := parseEndpoint(svc.ReplayEndpoint)
 		if err == nil {
 			routerPort = rPort
 		}
 	}
 
-	// 3. 构建 EventHandler，转化 LoraName 为 LoraID 适配旧结构
+	// Construct an EventHandler to convert LoraName to LoraID to adapt to the old structure.
 	handler := &KVEventHandler{
 		manager:   m,
 		svcName:   svcKey,
@@ -292,98 +251,10 @@ func (m *EventManager) getIndexer() *prefixindex.PrefixCacheTable {
 	return m.indexer
 }
 
-// func (m *EventManager) StartHTTPServer() error {
-// 	mux := http.NewServeMux()
-// 	mux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
-// 		if r.Method != http.MethodPost {
-// 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-// 			return
-// 		}
-
-// 		var jsonBody map[string]interface{}
-// 		slog.Debug(
-// 			"receive req",
-// 			"method", r.Method,
-// 			"path", r.URL.Path,
-// 			"remote", r.RemoteAddr,
-// 		)
-// 		if err := json.NewDecoder(r.Body).Decode(&jsonBody); err != nil {
-// 			slog.Error("Failed to decode JSON", "err", err)
-// 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-// 			return
-// 		}
-// 		tokenIDs, err := common.ExtractTokenIdFromRequest(jsonBody, "token_ids")
-// 		if err != nil {
-// 			http.Error(w, err.Error(), http.StatusBadRequest)
-// 			return
-// 		}
-// 		candidates, err := common.ExtractCandidateEngineFromRequest(jsonBody, "instances")
-// 		if err != nil {
-// 			http.Error(w, err.Error(), http.StatusBadRequest)
-// 			return
-// 		}
-// 		modelName, err := common.ExtractStringValueFromRequest(jsonBody, "model_name")
-// 		if err != nil {
-// 			slog.Error("Failed to decode string", "err", err)
-// 			http.Error(w, err.Error(), http.StatusBadRequest)
-// 			return
-// 		}
-// 		loraID, err := common.ExtractIntFromRequest(jsonBody, "lora_id")
-// 		if err != nil {
-// 			slog.Error("Failed to decode int", "err", err)
-// 			http.Error(w, err.Error(), http.StatusBadRequest)
-// 			return
-// 		}
-
-// 		cacheHitResult := m.indexer.CacheHitCompute(modelName, loraID, tokenIDs, candidates)
-// 		slog.Debug("cache hit status", "hitresult", cacheHitResult)
-// 		response := map[string]interface{}{
-// 			"HitStatus": cacheHitResult,
-// 			"status":    "ok",
-// 		}
-// 		w.Header().Set("Content-Type", "application/json")
-// 		if err := json.NewEncoder(w).Encode(response); err != nil {
-// 			slog.Error("Failed to encode response", "err", err)
-// 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-// 			return
-// 		}
-// 	})
-
-// 	server := &http.Server{
-// 		Addr:    fmt.Sprintf(":%d", m.httpserverport),
-// 		Handler: mux,
-// 	}
-
-// 	var wg sync.WaitGroup
-// 	wg.Add(1)
-// 	go func() {
-// 		defer wg.Done()
-// 		slog.Info("HTTP server listening", "port", m.httpserverport)
-// 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-// 			slog.Error("HTTP server failed", "err", err)
-// 		}
-// 	}()
-
-// 	// Start a goroutine to listen for context cancellation, used for graceful shutdown.
-// 	go func() {
-// 		<-m.ctx.Done()
-// 		slog.Info("Shutting down HTTP server")
-// 		// 5-second timeout for forced shutdown
-// 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-// 		defer cancel()
-// 		if err := server.Shutdown(shutdownCtx); err != nil {
-// 			slog.Error("HTTP server shutdown error", "err", err)
-// 			server.Close()
-// 		}
-// 	}()
-
-// 	return nil
-// }
-
 func (m *EventManager) StartHTTPServer() error {
 	mux := http.NewServeMux()
 
-	// === 1. 原有的 /cache 接口 ===
+	// Original /cache interface
 	mux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -439,7 +310,7 @@ func (m *EventManager) StartHTTPServer() error {
 		}
 	})
 
-	// === 2. 完善的 /register 接口 ===
+	// Register interface
 	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -453,7 +324,7 @@ func (m *EventManager) StartHTTPServer() error {
 			return
 		}
 
-		// 处理 Optional 字段的默认值
+		// Handle Optional fields' default values
 		tenantID := "default"
 		if req.TenantID != nil && *req.TenantID != "" {
 			tenantID = *req.TenantID
@@ -476,7 +347,7 @@ func (m *EventManager) StartHTTPServer() error {
 			AdditionalSalt: req.AdditionalSalt,
 		}
 
-		// 调用之前实现好的 subscribeToService
+		// Use the existing subscribeToService method
 		if err := m.subscribeToService(svc); err != nil {
 			slog.Error("Dynamic register failed", "instance_id", req.InstanceID, "err", err)
 			http.Error(w, fmt.Sprintf("Failed to subscribe: %v", err), http.StatusInternalServerError)
@@ -490,7 +361,7 @@ func (m *EventManager) StartHTTPServer() error {
 		})
 	})
 
-	// === 3. 补充的 /unregister 接口 ===
+	// Unregister interface
 	mux.HandleFunc("/unregister", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -512,19 +383,19 @@ func (m *EventManager) StartHTTPServer() error {
 
 		removedInstances := []string{}
 
-		// 遍历当前运行的服务，进行精准过滤和注销
+		// Traverse the currently running services, performing precise filtering and unregistration
 		m.activeConfigs.Range(func(key string, val common.ServiceConfig) bool {
-			// 必须匹配 Type 和 ModelName
+			// Match Type and ModelName
 			if val.Type == req.Type && val.ModelName == req.ModelName {
-				// TenantID 过滤: 传入为空说明注销所有租户，如果不为空则必须匹配
+				// TenantID filter: If empty, unregister all tenants; otherwise, must match
 				if targetTenant == "" || val.TenantID == targetTenant {
-					// InstanceID 过滤: 精确匹配某一个实例
+					// InstanceID filter: Exact match for a single instance
 					if targetInstance == "" || val.InstanceID == targetInstance {
 						removedInstances = append(removedInstances, key)
 					}
 				}
 			}
-			return true // 继续遍历
+			return true // Continue traversal
 		})
 
 		for _, instanceKey := range removedInstances {
@@ -543,10 +414,7 @@ func (m *EventManager) StartHTTPServer() error {
 		Handler: mux,
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		slog.Info("HTTP server listening", "port", m.httpserverport)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server failed", "err", err)
