@@ -47,8 +47,10 @@ setup(
                 ],
             },
             libraries=["ibverbs", "mlx5"],
-            extra_objects=[
-                os.path.join(current_dir, "../mooncake-wheel/mooncake/engine.so"),
+            extra_link_args=[
+                "-Wl,-rpath,$ORIGIN",
+                "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                "-l:engine.so",
             ],
         )
     ],

@@ -32,6 +32,9 @@ echo "Creating directory structure..."
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
+# Copy libasio.so to mooncake directory (runtime dependency of engine.so)
+cp build/mooncake-asio/libasio.so mooncake-wheel/mooncake/libasio.so
+
 # Copy store.so to mooncake directory
 if [ -f build/mooncake-integration/store.*.so ]; then
     echo "Copying store.so..."
@@ -108,6 +111,10 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
+# Build EP/PG CUDA extensions and stage them; they are injected into the wheel
+# AFTER auditwheel so that patchelf never touches CUDA fatbins (see below).
+CUDA_EP_STAGING_DIR=$(mktemp -d)
+
 if [ "$BUILD_WITH_EP" = "1" ]; then
     echo "Building Mooncake EP"
     cd mooncake-ep
@@ -125,7 +132,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cp mooncake/*.so "$CUDA_EP_STAGING_DIR/"
     cd ..
 fi
 
@@ -146,7 +153,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cp mooncake/*.so "$CUDA_EP_STAGING_DIR/"
     cd ..
 fi
 
@@ -446,6 +453,28 @@ else
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
 
+# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
+# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
+# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+    if [ -n "$REPAIRED_WHEEL" ]; then
+        echo "Injecting CUDA extension .so files into repaired wheel..."
+        WHEEL_UNPACK_DIR=$(mktemp -d)
+        wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
+            if [ -f "$so_file" ]; then
+                echo "  Adding $(basename "$so_file")"
+                cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
+            fi
+        done
+        rm "$REPAIRED_WHEEL"
+        wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        rm -rf "$WHEEL_UNPACK_DIR"
+    fi
+    rm -rf "$CUDA_EP_STAGING_DIR"
+fi
 
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl
