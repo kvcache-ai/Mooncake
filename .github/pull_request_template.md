@@ -13,7 +13,7 @@
 - [ ] PyTorch Backend (`mooncake-pg`)
 - [ ] Mooncake RL (`mooncake-rl`)
 - [ ] CI/CD
-- [ ] Documentation
+- [ ] Docs
 - [ ] Other
 
 ## Type of Change
