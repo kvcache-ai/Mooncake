@@ -1,5 +1,6 @@
 #pragma once
 
+#include "base_pattern.h"
 #include "zmq_types.h"
 #include <atomic>
 #include <functional>
