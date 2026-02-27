@@ -134,20 +134,16 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     notify_recv_buffers_.resize(kNotifyMaxPendingSends);
     notify_recv_mrs_.resize(kNotifyMaxPendingSends);
 
-    /* Allocate and register per-slot send buffers to avoid DMA-vs-overwrite
-    races */
-    notify_send_buffers_.resize(kNotifyMaxPendingSends);
-    notify_send_mrs_.resize(kNotifyMaxPendingSends);
-    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
-        notify_send_buffers_[i].resize(kNotifyBufferSize);
-        notify_send_mrs_[i] = context_->verbs_.ibv_reg_mr_default(
-            context_->nativePD(), notify_send_buffers_[i].data(),
-            kNotifyBufferSize, IBV_ACCESS_LOCAL_WRITE);
-        if (!notify_send_mrs_[i]) {
-            PLOG(ERROR) << "Failed to register notification send buffer " << i;
-            deconstruct();
-            return -1;
-        }
+    // Allocate one contiguous send buffer, logically split into
+    // kNotifyMaxPendingSends slots to avoid DMA-vs-overwrite races.
+    notify_send_buffer_.resize(kNotifyBufferSize * kNotifyMaxPendingSends);
+    notify_send_mr_ = context_->verbs_.ibv_reg_mr_default(
+        context_->nativePD(), notify_send_buffer_.data(),
+        notify_send_buffer_.size(), IBV_ACCESS_LOCAL_WRITE);
+    if (!notify_send_mr_) {
+        PLOG(ERROR) << "Failed to register notification send buffer";
+        deconstruct();
+        return -1;
     }
 
     for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
@@ -194,17 +190,14 @@ int RdmaEndPoint::deconstruct() {
         }
     }
     notify_recv_mrs_.clear();
-    for (auto& mr : notify_send_mrs_) {
-        if (mr) {
-            if (context_->verbs_.ibv_dereg_mr(mr))
-                PLOG(ERROR) << "Failed to deregister notification send MR";
-            mr = nullptr;
-        }
+    if (notify_send_mr_) {
+        if (context_->verbs_.ibv_dereg_mr(notify_send_mr_))
+            PLOG(ERROR) << "Failed to deregister notification send MR";
+        notify_send_mr_ = nullptr;
     }
-    notify_send_mrs_.clear();
 
     notify_recv_buffers_.clear();
-    notify_send_buffers_.clear();
+    notify_send_buffer_.clear();
 
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i]))
@@ -851,7 +844,7 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     // Pick the next send slot — flow control guarantees this slot's previous
     // DMA has completed (at most kNotifyMaxPendingSends-1 in-flight).
     size_t slot = notify_send_wr_id_ % kNotifyMaxPendingSends;
-    auto& send_buf = notify_send_buffers_[slot];
+    char* slot_ptr = notify_send_buffer_.data() + slot * kNotifyBufferSize;
 
     // Serialize: [name_len(4)][name][msg_len(4)][msg]
     if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) {
@@ -861,12 +854,12 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     uint32_t name_len = static_cast<uint32_t>(name.size());
     uint32_t msg_len = static_cast<uint32_t>(msg.size());
     size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
-    if (total_size > send_buf.size()) {
+    if (total_size > kNotifyBufferSize) {
         LOG(ERROR) << "Notification message too large: " << total_size;
         return false;
     }
 
-    auto* ptr = send_buf.data();
+    auto* ptr = slot_ptr;
     std::memcpy(ptr, &name_len, sizeof(name_len));
     ptr += sizeof(name_len);
     std::memcpy(ptr, name.data(), name_len);
@@ -877,9 +870,9 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
 
     // Post send
     ibv_sge sge = {};
-    sge.addr = reinterpret_cast<uint64_t>(send_buf.data());
+    sge.addr = reinterpret_cast<uint64_t>(slot_ptr);
     sge.length = total_size;
-    sge.lkey = notify_send_mrs_[slot]->lkey;
+    sge.lkey = notify_send_mr_->lkey;
 
     ibv_send_wr wr = {};
     wr.wr_id = notify_send_wr_id_++;
