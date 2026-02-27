@@ -41,9 +41,6 @@ COPY . /workspace
 # Install Mooncake dependencies (yalantinglibs, Go, etc.)
 RUN bash dependencies.sh -y
 
-# Install wheel as required by ./scripts/build_wheel.sh
-RUN pip3 install wheel
-
 # Configure & build Mooncake
 RUN mkdir -p build && \
     cd build && \
