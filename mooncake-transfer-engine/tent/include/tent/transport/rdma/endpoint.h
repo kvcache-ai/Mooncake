@@ -186,8 +186,9 @@ class RdmaEndPoint {
     static constexpr size_t kNotifyMaxPendingSends = 256;
     std::vector<std::vector<char>> notify_recv_buffers_;
     std::vector<ibv_mr*> notify_recv_mrs_;  // Memory regions for recv buffers
-    std::vector<char> notify_send_buffer_;  // Pre-allocated send buffer
-    ibv_mr* notify_send_mr_ = nullptr;      // Memory region for send buffer
+    std::vector<std::vector<char>>
+        notify_send_buffers_;               // Ring of send buffers
+    std::vector<ibv_mr*> notify_send_mrs_;  // MRs for send buffers
     std::mutex notify_send_mutex_;
     std::condition_variable notify_send_cv_;
     int notify_pending_count_ = 0;    // Number of pending sends
