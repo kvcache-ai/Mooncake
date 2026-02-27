@@ -5,7 +5,7 @@ set(ZMQ_COMM_SOURCES message_codec.cpp patterns.cpp zmq_communicator.cpp)
 add_library(zmq_communicator_lib OBJECT ${ZMQ_COMM_SOURCES})
 
 target_include_directories(zmq_communicator_lib PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../include/zmq_communicator
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
 )
 

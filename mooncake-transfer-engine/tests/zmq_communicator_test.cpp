@@ -21,8 +21,8 @@
 #include <vector>
 #include <cstring>
 
-#include "transport/zmq_communicator/zmq_communicator.h"
-#include "transport/zmq_communicator/message_codec.h"
+#include "zmq_communicator/zmq_communicator.h"
+#include "zmq_communicator/message_codec.h"
 
 using namespace mooncake;
 
