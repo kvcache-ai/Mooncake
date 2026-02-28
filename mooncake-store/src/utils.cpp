@@ -236,16 +236,10 @@ void *allocate_buffer_numa_segments(size_t total_size,
         }
     }
 
-    // prefault — pages allocated directly on target NUMA
-    int rc = madvise(ptr, map_size, MADV_POPULATE_WRITE);
-    if (rc != 0) {
-        LOG(WARNING) << "MADV_POPULATE_WRITE failed (kernel < 5.14?), "
-                     << "falling back to manual touch";
-        volatile char *p = static_cast<volatile char *>(ptr);
-        for (size_t off = 0; off < map_size; off += page_size) {
-            p[off] = 0;
-        }
-    }
+    // No explicit prefault needed — ibv_reg_mr() will call get_user_pages()
+    // which triggers page faults that respect the mbind NUMA policy.
+    // Pages are allocated directly on the target NUMA during MR registration,
+    // avoiding a redundant full-buffer traversal.
 
     LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size
               << " bytes, " << n << " regions, page_size=" << page_size
