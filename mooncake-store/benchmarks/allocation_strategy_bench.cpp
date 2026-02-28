@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -51,6 +52,8 @@ DEFINE_int32(convergence_sample_interval, 100,
              "Sample utilization stddev every N allocations");
 DEFINE_bool(run_all, false,
             "Run a standard matrix of configurations for comparison");
+DEFINE_string(dump_distribution_file, "",
+              "File path to dump final segment utilization distribution (CSV format)");
 
 using namespace mooncake;
 
@@ -154,6 +157,41 @@ static std::string strategyName(AllocationStrategyType type) {
 //  Core benchmark runner
 // ============================================================
 
+static void dumpDistribution(const BenchConfig& cfg, const AllocatorManager& manager, const std::string& filepath) {
+    if (filepath.empty()) return;
+    
+    std::ofstream out(filepath, std::ios::app);
+    if (!out.is_open()) {
+        std::cerr << "Failed to open dump file: " << filepath << std::endl;
+        return;
+    }
+    
+    out.seekp(0, std::ios::end);
+    if (out.tellp() == 0) {
+        out << "Strategy,NumSegments,AllocSize,ReplicaNum,Skewed,SegmentName,Capacity,Used,Utilization\n";
+    }
+    
+    for (const auto& name : manager.getNames()) {
+        const auto* allocators = manager.getAllocators(name);
+        if (!allocators || allocators->empty()) continue;
+        for (const auto& alloc : *allocators) {
+            size_t cap = alloc->capacity();
+            size_t used = alloc->size();
+            double util = cap > 0 ? static_cast<double>(used) / cap : 0.0;
+            
+            out << cfg.strategy_name << ","
+                << cfg.num_segments << ","
+                << cfg.alloc_size << ","
+                << cfg.replica_num << ","
+                << (cfg.skewed ? "true" : "false") << ","
+                << name << ","
+                << cap << ","
+                << used << ","
+                << std::fixed << std::setprecision(4) << util << "\n";
+        }
+    }
+}
+
 struct BenchResult {
     std::string strategy_name;
     int num_segments;
@@ -256,6 +294,10 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 
     double final_stddev = computeUtilizationStdDev(manager);
 
+    if (!FLAGS_dump_distribution_file.empty()) {
+        dumpDistribution(cfg, manager, FLAGS_dump_distribution_file);
+    }
+
     BenchResult res;
     res.strategy_name = cfg.strategy_name;
     res.num_segments = cfg.num_segments;
@@ -310,7 +352,7 @@ static void printResult(const BenchResult& r) {
 
 static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512};
-    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB};
+    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB}; // TODO: 100+MB
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
