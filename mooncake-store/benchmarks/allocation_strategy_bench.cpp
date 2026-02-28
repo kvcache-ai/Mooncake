@@ -389,11 +389,18 @@ class FillUpWorkloadRunner : public WorkloadRunner {
              std::vector<double>& stddev_over_time,
              std::vector<double>& avg_util_over_time,
              double& out_final_avg_util, double& out_final_stddev) override {
-        const int sample_interval = FLAGS_convergence_sample_interval;
+        // num_allocations is a safety upper-bound.
+        // Primary exit conditions:
+        //   (a) avg_util >= 0.99 at a sample point  — cluster is full
+        //   (b) kMaxConsecFailures consecutive alloc failures — no space left
+        // This lets callers set a large num_allocations and let the cluster
+        // fill naturally, keeping benchmark run-time predictable.
+        const int kMaxConsecFailures = 10;
+        int consec_failures = 0;
 
-        // Hold allocated replicas to prevent immediate deallocation
-        std::vector<std::vector<Replica>> active_allocations;
-        active_allocations.reserve(cfg.num_allocations);
+        // Reserve only a rough bound; vector will grow if needed.
+        active_allocations.reserve(
+            std::min(cfg.num_allocations, 1 << 20 /* 1M entries max */));
 
         for (int i = 0; i < cfg.num_allocations; ++i) {
             auto t0 = std::chrono::high_resolution_clock::now();
@@ -406,11 +413,17 @@ class FillUpWorkloadRunner : public WorkloadRunner {
 
             if (result.has_value()) {
                 active_allocations.push_back(std::move(result.value()));
+                consec_failures = 0;
+            } else {
+                // Fast-path: if allocs keep failing the cluster is full
+                if (++consec_failures >= kMaxConsecFailures) break;
             }
 
             if (i > 0 && i % sample_interval == 0) {
+                double avg_util = computeAverageUtilAll(manager);
                 stddev_over_time.push_back(computeUtilizationStdDev(manager));
-                avg_util_over_time.push_back(computeAverageUtilAll(manager));
+                avg_util_over_time.push_back(avg_util);
+                if (avg_util >= 0.99) break;  // cluster is full
             }
         }
 
