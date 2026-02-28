@@ -134,11 +134,12 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     notify_recv_buffers_.resize(kNotifyMaxPendingSends);
     notify_recv_mrs_.resize(kNotifyMaxPendingSends);
 
-    // Allocate and register send buffer
-    notify_send_buffer_.resize(kNotifyBufferSize);
+    // Allocate one contiguous send buffer, logically split into
+    // kNotifyMaxPendingSends slots to avoid DMA-vs-overwrite races.
+    notify_send_buffer_.resize(kNotifyBufferSize * kNotifyMaxPendingSends);
     notify_send_mr_ = context_->verbs_.ibv_reg_mr_default(
-        context_->nativePD(), notify_send_buffer_.data(), kNotifyBufferSize,
-        IBV_ACCESS_LOCAL_WRITE);
+        context_->nativePD(), notify_send_buffer_.data(),
+        notify_send_buffer_.size(), IBV_ACCESS_LOCAL_WRITE);
     if (!notify_send_mr_) {
         PLOG(ERROR) << "Failed to register notification send buffer";
         deconstruct();
@@ -196,6 +197,7 @@ int RdmaEndPoint::deconstruct() {
     }
 
     notify_recv_buffers_.clear();
+    notify_send_buffer_.clear();
 
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i]))
@@ -325,6 +327,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 notify_connected_ = false;
             } else {
                 notify_connected_ = true;
+                repostAllNotifyRecvs();
                 context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
             }
         }
@@ -385,6 +388,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             notify_connected_ = false;
         } else {
             notify_connected_ = true;
+            repostAllNotifyRecvs();
             context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
         }
     }
@@ -403,7 +407,10 @@ int RdmaEndPoint::resetUnlocked() {
     resetInflightSlices();
 
     if (notify_qp_) {
-        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
+        // Keep the QP registered in the transport map — the qp_num doesn't
+        // change across resets, and the notify worker may still poll
+        // completions (flush errors) from the CQ between reset and reconnect.
+        // Unregistering here would cause "unknown QP" warnings.
         notify_connected_ = false;
         {
             std::lock_guard<std::mutex> lock(notify_send_mutex_);
@@ -730,6 +737,12 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     }
 }
 
+void RdmaEndPoint::repostAllNotifyRecvs() {
+    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
+        postNotifyRecv(i);
+    }
+}
+
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
                                    uint16_t peer_lid, uint32_t peer_qp_num) {
@@ -828,24 +841,36 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
         return notify_pending_count_ < kNotifyMaxPendingSends;
     });
 
+    // Pick the next send slot — flow control guarantees this slot's previous
+    // DMA has completed (at most kNotifyMaxPendingSends-1 in-flight).
+    size_t slot = notify_send_wr_id_ % kNotifyMaxPendingSends;
+    char* slot_ptr = notify_send_buffer_.data() + slot * kNotifyBufferSize;
+
     // Serialize: [name_len(4)][name][msg_len(4)][msg]
-    uint32_t name_len = name.size();
-    uint32_t msg_len = msg.size();
+    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) {
+        LOG(ERROR) << "Notification field exceeds uint32 limit";
+        return false;
+    }
+    uint32_t name_len = static_cast<uint32_t>(name.size());
+    uint32_t msg_len = static_cast<uint32_t>(msg.size());
     size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
-    if (total_size > notify_send_buffer_.size()) {
+    if (total_size > kNotifyBufferSize) {
         LOG(ERROR) << "Notification message too large: " << total_size;
         return false;
     }
 
-    std::memcpy(notify_send_buffer_.data(), &name_len, 4);
-    std::memcpy(notify_send_buffer_.data() + 4, name.data(), name.size());
-    std::memcpy(notify_send_buffer_.data() + 4 + name.size(), &msg_len, 4);
-    std::memcpy(notify_send_buffer_.data() + 4 + name.size() + 4, msg.data(),
-                msg.size());
+    auto* ptr = slot_ptr;
+    std::memcpy(ptr, &name_len, sizeof(name_len));
+    ptr += sizeof(name_len);
+    std::memcpy(ptr, name.data(), name_len);
+    ptr += name_len;
+    std::memcpy(ptr, &msg_len, sizeof(msg_len));
+    ptr += sizeof(msg_len);
+    std::memcpy(ptr, msg.data(), msg_len);
 
     // Post send
     ibv_sge sge = {};
-    sge.addr = reinterpret_cast<uint64_t>(notify_send_buffer_.data());
+    sge.addr = reinterpret_cast<uint64_t>(slot_ptr);
     sge.length = total_size;
     sge.lkey = notify_send_mr_->lkey;
 
