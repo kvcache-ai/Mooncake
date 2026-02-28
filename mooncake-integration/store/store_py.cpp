@@ -270,6 +270,11 @@ class MooncakeStorePyWrapper {
         return (store_ && (use_dummy_client_ || store_->client_));
     }
 
+    int health_check() {
+        if (!store_) return 1;
+        return store_->health_check();
+    }
+
     std::string get_tp_key_name(const std::string &base_key, int rank) {
         return base_key + "_tp_" + std::to_string(rank);
     }
@@ -1280,6 +1285,11 @@ PYBIND11_MODULE(store, m) {
                  self.store_.reset();
                  return rc;
              })
+        .def("health_check",
+             &MooncakeStorePyWrapper::health_check,
+             "Health check for store connectivity. "
+             "Returns 0 if healthy, 1 if not initialized/closed, "
+             "2 if master unreachable.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
