@@ -610,7 +610,17 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     for (size_t i = 0; i < stddev_over_time.size(); ++i) {
         int allocs_done =
             static_cast<int>((i + 1) * FLAGS_convergence_sample_interval);
-        if (stddev_over_time[i] < convergence_threshold) {
+        // Only evaluate convergence once the cluster is at least 10% utilized.
+        // Before that, stddev is naturally near 0 (all segments nearly empty)
+        // which would cause a spurious early "converged" reading.
+        const double min_util_to_check = 0.10;
+        bool util_sufficient =
+            i < avg_util_over_time.size() &&
+            avg_util_over_time[i] >= min_util_to_check;
+
+        if (!util_sufficient) {
+            // Too early in the run — don't count as converged or diverged yet
+        } else if (stddev_over_time[i] < convergence_threshold) {
             if (!in_converged_window) {
                 // Record the start of this convergence window
                 converged_at = allocs_done;
