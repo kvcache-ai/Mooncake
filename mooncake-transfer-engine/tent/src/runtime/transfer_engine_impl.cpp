@@ -249,19 +249,40 @@ Status TransferEngineImpl::construct() {
 Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
 
-    local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
-        for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-            if (transport_list_[type])
-                transport_list_[type]->removeMemoryBuffer(desc);
-        }
-        return Status::OK();
-    });
+    // Destroy staging_proxy_ first: its destructor calls back into
+    // unregisterLocalMemory/freeLocalMemory, which require
+    // local_segment_tracker_ and metadata_ to be alive.
+    staging_proxy_.reset();
+
+    if (local_segment_tracker_) {
+        local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                if (transport_list_[type])
+                    transport_list_[type]->removeMemoryBuffer(desc);
+            }
+            return Status::OK();
+        });
+    }
 
     // Free all batches BEFORE destroying transports, so that
     // freeSubBatch() can properly return SubBatch/Slice objects
-    // to each transport's Slab allocator.
+    // to the global Slab/allocator instances used by the transports.
+    //
+    // Safety note: freeSubBatch() only performs Slab deallocation and
+    // does not access transport-internal state (workers, connections).
+    // Callers must ensure no transfers are in-flight before calling
+    // deconstruct().
     batch_set_.forEach([&](BatchSet& entry) {
         for (auto& batch : entry.active) {
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                auto& sub_batch = batch->sub_batch[type];
+                if (!transport || !sub_batch) continue;
+                transport->freeSubBatch(sub_batch);
+            }
+            Slab<Batch>::Get().deallocate(batch);
+        }
+        for (auto& batch : entry.freelist) {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 auto& transport = transport_list_[type];
                 auto& sub_batch = batch->sub_batch[type];
@@ -277,8 +298,10 @@ Status TransferEngineImpl::deconstruct() {
     // Now safe to destroy transports (workers join here)
     for (auto& transport : transport_list_) transport.reset();
     local_segment_tracker_.reset();
-    metadata_->segmentManager().deleteLocal();
-    metadata_.reset();
+    if (metadata_) {
+        metadata_->segmentManager().deleteLocal();
+        metadata_.reset();
+    }
     return Status::OK();
 }
 
