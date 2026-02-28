@@ -103,6 +103,26 @@ class RdmaTransport : public Transport {
 
     int preTouchMemory(void *addr, size_t length);
 
+    // Configuration for slice preparation, constant during a submitTransferTask
+    // call.
+    struct SliceAllocateConfig {
+        size_t block_size;
+        size_t fragment_size;
+        int max_retry_cnt;
+        size_t submit_watermark;
+        SegmentDesc *local_segment_desc;
+    };
+
+    // Prepare slices for a single task.
+    // - If slices_to_post is nullptr: only compute task.slice_count and
+    // task.total_bytes.
+    // - If slices_to_post is not nullptr: allocate slices and add to the map.
+    // This ensures the slicing logic is maintained in exactly one place.
+    Status prepareTaskSlices(
+        TransferTask &task, const SliceAllocateConfig &config,
+        std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+            *slices_to_post);
+
    public:
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                HandShakeDesc &local_desc);
