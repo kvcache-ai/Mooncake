@@ -78,8 +78,7 @@ struct BenchConfig {
  * Each allocator manages only offset metadata, so memory overhead is minimal
  * even for very large simulated capacities.
  */
-static AllocatorManager createCluster(int num_segments,
-                                      size_t base_capacity,
+static AllocatorManager createCluster(int num_segments, size_t base_capacity,
                                       bool skewed) {
     AllocatorManager manager;
     for (int i = 0; i < num_segments; ++i) {
@@ -133,9 +132,10 @@ static double computeUtilizationStdDev(const AllocatorManager& manager) {
  */
 static AllocationStrategyType parseStrategy(const std::string& name) {
     if (name == "Random") return AllocationStrategyType::RANDOM;
-    if (name == "FreeRatioFirst") return AllocationStrategyType::FREE_RATIO_FIRST;
-    std::cerr << "Unknown strategy: " << name
-              << ", falling back to Random" << std::endl;
+    if (name == "FreeRatioFirst")
+        return AllocationStrategyType::FREE_RATIO_FIRST;
+    std::cerr << "Unknown strategy: " << name << ", falling back to Random"
+              << std::endl;
     return AllocationStrategyType::RANDOM;
 }
 
@@ -196,8 +196,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     for (int i = 0; i < cfg.num_allocations; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        auto result = strategy->Allocate(manager, cfg.alloc_size,
-                                         cfg.replica_num);
+        auto result =
+            strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
 
         auto t1 = std::chrono::high_resolution_clock::now();
         latencies.push_back(
@@ -214,9 +214,9 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     }
     auto total_end = std::chrono::high_resolution_clock::now();
 
-    double total_us = std::chrono::duration<double, std::micro>(
-                          total_end - total_start)
-                          .count();
+    double total_us =
+        std::chrono::duration<double, std::micro>(total_end - total_start)
+            .count();
 
     // --- Compute latency percentiles ---
     std::sort(latencies.begin(), latencies.end());
@@ -226,9 +226,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
         return latencies[idx];
     };
 
-    double avg_ns =
-        std::accumulate(latencies.begin(), latencies.end(), 0.0) /
-        latencies.size();
+    double avg_ns = std::accumulate(latencies.begin(), latencies.end(), 0.0) /
+                    latencies.size();
 
     // --- Find convergence point ---
     int converged_at = -1;
@@ -249,8 +248,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
     res.total_time_us = total_us;
-    res.throughput =
-        cfg.num_allocations / (total_us / 1e6);
+    res.throughput = cfg.num_allocations / (total_us / 1e6);
     res.avg_ns = avg_ns;
     res.p50_ns = percentile(0.50);
     res.p90_ns = percentile(0.90);
@@ -265,21 +263,19 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 // ============================================================
 
 static void printHeader() {
-    std::cout << std::left << std::setw(18) << "Strategy"
-              << std::setw(10) << "Segments" << std::setw(12) << "AllocSize"
-              << std::setw(9) << "Replica" << std::setw(8) << "Skewed"
-              << std::right << std::setw(14) << "Throughput"
-              << std::setw(12) << "Avg(ns)" << std::setw(12) << "P50(ns)"
-              << std::setw(12) << "P90(ns)" << std::setw(12) << "P99(ns)"
-              << std::setw(12) << "UtilStdDev"
-              << std::setw(14) << "Converge@"
-              << std::endl;
+    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
+              << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
+              << "Replica" << std::setw(8) << "Skewed" << std::right
+              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
+              << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
+              << std::setw(12) << "P99(ns)" << std::setw(12) << "UtilStdDev"
+              << std::setw(14) << "Converge@" << std::endl;
     std::cout << std::string(135, '-') << std::endl;
 }
 
 static void printResult(const BenchResult& r) {
-    std::cout << std::left << std::setw(18) << r.strategy_name
-              << std::setw(10) << r.num_segments << std::setw(12)
+    std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
+              << r.num_segments << std::setw(12)
               << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(9)
               << r.replica_num << std::setw(8) << (r.skewed ? "yes" : "no")
               << std::right << std::fixed << std::setprecision(0)
@@ -310,7 +306,7 @@ static void runAllBenchmarks() {
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
     printHeader();
 
-    for (auto strat : strategies) {
+    for (auto strategy : strategies) {
         for (auto segs : segment_counts) {
             for (auto asize : alloc_sizes) {
                 for (auto rep : replica_nums) {
@@ -326,8 +322,8 @@ static void runAllBenchmarks() {
                         cfg.replica_num = rep;
                         cfg.num_allocations = FLAGS_num_allocations;
                         cfg.skewed = skew;
-                        cfg.strategy_type = strat;
-                        cfg.strategy_name = strategyName(strat);
+                        cfg.strategy_type = strategy;
+                        cfg.strategy_name = strategyName(strategy);
 
                         auto result = runBenchmark(cfg);
                         printResult(result);
@@ -337,10 +333,6 @@ static void runAllBenchmarks() {
         }
     }
 }
-
-// ============================================================
-//  main
-// ============================================================
 
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
@@ -377,7 +369,7 @@ int main(int argc, char* argv[]) {
 
     printHeader();
 
-    for (auto strat : strategies_to_run) {
+    for (auto strategy : strategies_to_run) {
         BenchConfig cfg;
         cfg.num_segments = FLAGS_num_segments;
         cfg.segment_capacity =
@@ -386,8 +378,8 @@ int main(int argc, char* argv[]) {
         cfg.replica_num = FLAGS_replica_num;
         cfg.num_allocations = FLAGS_num_allocations;
         cfg.skewed = FLAGS_skewed;
-        cfg.strategy_type = strat;
-        cfg.strategy_name = strategyName(strat);
+        cfg.strategy_type = strategy;
+        cfg.strategy_name = strategyName(strategy);
 
         auto result = runBenchmark(cfg);
         printResult(result);
