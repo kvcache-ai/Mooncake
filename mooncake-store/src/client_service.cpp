@@ -16,6 +16,7 @@
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
+#include "topology.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
@@ -1627,6 +1628,20 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     //     storage_backend_->RemoveAll();
     // }
     return master_client_.RemoveAll(force);
+}
+
+std::vector<int> Client::GetNicNumaNodes() const {
+    std::set<int> nodes;
+    if (!transfer_engine_) return {};
+    auto topo = transfer_engine_->getLocalTopology();
+    if (!topo) return {};
+    for (auto &[name, entry] : topo->getMatrix()) {
+        if (name.rfind("cpu:", 0) != 0 || entry.preferred_hca.empty())
+            continue;
+        int node = std::stoi(name.substr(4));
+        nodes.insert(node);
+    }
+    return {nodes.begin(), nodes.end()};
 }
 
 tl::expected<void, ErrorCode> Client::MountSegment(

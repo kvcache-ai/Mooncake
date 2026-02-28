@@ -304,22 +304,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
 
-        // Parse NUMA nodes for NIC-aware segment allocation.
-        // Env: MC_SEGMENT_NUMA_NODES=1,3,5,7  (NUMA nodes with NICs)
-        // When set, global_segment is divided into equal regions bound
-        // to each NUMA node, enabling all RDMA NICs to serve traffic.
+        // In standalone mode (ipc_socket_path set), auto-discover NUMA nodes
+        // with RDMA NICs and distribute global_segment across them so that
+        // all NICs can serve RDMA traffic.
         std::vector<int> seg_numa_nodes;
-        const char *numa_env = std::getenv("MC_SEGMENT_NUMA_NODES");
-        if (numa_env) {
-            std::string s(numa_env);
-            size_t pos = 0;
-            while (pos < s.size()) {
-                auto comma = s.find(',', pos);
-                std::string tok = (comma == std::string::npos)
-                                      ? s.substr(pos)
-                                      : s.substr(pos, comma - pos);
-                seg_numa_nodes.push_back(std::stoi(tok));
-                pos = (comma == std::string::npos) ? s.size() : comma + 1;
+        if (!ipc_socket_path_.empty()) {
+            seg_numa_nodes = client_->GetNicNumaNodes();
+            if (seg_numa_nodes.size() > 1) {
+                std::string nodes_str;
+                for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
+                    if (i) nodes_str += ",";
+                    nodes_str += std::to_string(seg_numa_nodes[i]);
+                }
+                LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=[" << nodes_str << "]";
+            } else {
+                seg_numa_nodes.clear();  // single NUMA, no need to segment
             }
         }
 

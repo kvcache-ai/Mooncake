@@ -411,6 +411,9 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    // Return sorted NUMA node IDs that have at least one RDMA NIC.
+    [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
+
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
     /**
