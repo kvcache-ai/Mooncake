@@ -581,17 +581,68 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
   - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
   - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
 
-#### Implementation Strategies
+#### Allocation Strategies
 
-`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy` that provides intelligent allocation with the following features:
+Mooncake Store provides multiple built-in allocation strategies to control how storage space is distributed across segments. Users can select a strategy via the `--allocation_strategy` flag when starting the master service:
 
-1. **Preferred Segment Support**: If a preferred segment is specified in the `ReplicateConfig`, the strategy first attempts to allocate from that segment before falling back to random allocation.
+```bash
+./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
+```
 
-2. **Random Allocation with Retry Logic**: When multiple allocators are available, it uses a randomized approach with up to 10 retry attempts to find a suitable allocator.
+Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive).
 
-3. **Deterministic Randomization**: Uses a Mersenne Twister random number generator with proper seeding for consistent behavior.
+##### How to Choose
 
-The strategy automatically handles cases where the preferred segment is unavailable, full, or doesn't exist by gracefully falling back to random allocation among all available segments.
+| Strategy | Best For | Trade-off |
+|---|---|---|
+| `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
+| `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput (~18% overhead) due to sampling and sorting |
+| `cxl` | CXL memory hardware | CXL-specific; single-replica only |
+
+**Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
+
+**Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
+- Segments have different capacities and you want even utilization ratios.
+- New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence can take ~30 minutes in practice; `free_ratio_first` accelerates this by preferentially filling emptier segments — the probability of assigning to a newly joined segment increases from `1/n` to approximately `sample_count/n`.
+
+**Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
+
+##### Strategy Details
+
+**`random` — RandomAllocationStrategy**
+
+Pure random allocation with preferred segment support. The allocation process for N replicas is:
+
+1. **Preferred segment phase**: If preferred segments are specified in the `ReplicateConfig`, they are tried first in order. Each successful allocation consumes one replica slot. If all replicas are satisfied, the process finishes early.
+2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. Segments already used for a previous replica of the same slice, as well as explicitly excluded segments, are skipped to guarantee that each replica resides on a different segment.
+3. **Retry limit**: The iteration is capped at `min(100, total_segments)` to avoid excessive scanning when most segments are full.
+4. **Best-effort result**: If fewer than N replicas are allocated but at least one succeeds, the partial result is returned. The call fails only if zero replicas can be allocated.
+
+All random state uses a thread-local Mersenne Twister (`std::mt19937`), so no locks or shared mutable data are involved.
+
+**`free_ratio_first` — FreeRatioFirstAllocationStrategy (Best-of-N)**
+
+An improved strategy built on top of `RandomAllocationStrategy`. Instead of picking segments purely at random, it samples a small pool of candidates and selects the ones with the most free space. The allocation process for N replicas is:
+
+1. **Preferred segment phase**: Same as `random` — preferred segments are tried first in order.
+2. **Sampling phase**: Randomly picks a starting index and takes `min(6×remaining_replicas, total_segments)` consecutive segments as candidates. For each candidate, queries its free space ratio: `free_bytes / total_capacity`.
+3. **Sorting phase**: Sorts the candidates in descending order by free space ratio (most free first).
+4. **Allocation phase**: Iterates through the sorted candidates from top to bottom, attempting to allocate from each. Excluded and already-used segments are skipped.
+5. **Fallback phase**: If insufficient replicas are allocated from the sorted candidates, falls back to the base `RandomAllocationStrategy` random iteration logic for the remaining replicas.
+
+The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6×N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
+
+The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`cxl` — CxlAllocationStrategy**
+
+Specialized for CXL (Compute Express Link) memory hardware. Unlike the other strategies, this one does not perform random or load-balanced selection — it always allocates from a specific CXL segment:
+
+1. Requires `preferred_segments` to be non-empty; the first element is used as the target CXL segment name.
+2. Allocates a single replica from the specified CXL segment's allocator.
+3. Marks the allocated buffer as CXL type via `change_to_cxl()`, so downstream components can distinguish CXL-backed data from regular DRAM.
+
+Limitations: This strategy only supports single-replica allocation (does not distribute across multiple segments) and does not support the `AllocateFrom()` interface.
 
 ### Eviction Policy
 
