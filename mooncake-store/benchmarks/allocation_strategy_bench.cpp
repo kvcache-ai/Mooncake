@@ -84,9 +84,13 @@ struct BenchConfig {
 static AllocatorManager createCluster(int num_segments, size_t base_capacity,
                                       bool skewed) {
     AllocatorManager manager;
+    // Distribute segments evenly across 10 virtual nodes if num_segments > 10,
+    // otherwise 1 segment per node.
+    int segments_per_node = std::max(1, num_segments / 10);
+    
     for (int i = 0; i < num_segments; ++i) {
         std::string name =
-            "node_" + std::to_string(i / 8) + "_seg_" + std::to_string(i % 8);
+            "node_" + std::to_string(i / segments_per_node) + "_seg_" + std::to_string(i % segments_per_node);
         size_t capacity =
             skewed ? base_capacity * (1 + static_cast<size_t>(i % 10))
                    : base_capacity;
@@ -352,7 +356,7 @@ static void printResult(const BenchResult& r) {
 
 static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512};
-    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB}; // TODO: 100+MB
+    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB, 128 * MiB}; // Tested up to 128MB
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
