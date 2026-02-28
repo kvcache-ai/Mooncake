@@ -22,7 +22,7 @@ type ServiceConfig struct {
 type StoredEvent struct {
 	BlockHashes     []uint64
 	ModelName       string
-	LoraID          int64
+	LoraName        string
 	EngineIp        string
 	ParentBlockHash uint64
 	TokenIds        []int32
@@ -31,6 +31,6 @@ type StoredEvent struct {
 type RemovedEvent struct {
 	BlockHashes []uint64
 	ModelName   string
-	LoraID      int64
+	LoraName    string
 	SourcePod   string
 }

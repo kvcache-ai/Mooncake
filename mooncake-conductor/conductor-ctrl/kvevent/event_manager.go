@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -134,15 +133,6 @@ func (m *EventManager) Stop() {
 	})
 }
 
-func loraNameToID(name string) int64 {
-	if name == "" {
-		return 0
-	}
-	h := fnv.New64a()
-	h.Write([]byte(name))
-	return int64(h.Sum64())
-}
-
 func makeServiceKey(instanceID, tenantID string) string {
 	return fmt.Sprintf("%s|%s", instanceID, tenantID)
 }
@@ -166,12 +156,12 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	// Use ReplayEndpoint directly, fallback to empty if not provided
 	replayEndpoint := svc.ReplayEndpoint
 
-	// Construct an EventHandler to convert LoraName to LoraID to adapt to the old structure.
+	// Construct an EventHandler to adapt to the old structure.
 	handler := &KVEventHandler{
 		manager:   m,
 		svcName:   svcKey,
 		modelName: svc.ModelName,
-		loraID:    loraNameToID(svc.LoraName),
+		loraName:  svc.LoraName,
 	}
 
 	// Configure ZMQ Client
@@ -265,14 +255,14 @@ func (m *EventManager) StartHTTPServer() error {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		loraID, err := common.ExtractIntFromRequest(jsonBody, "lora_id")
+		loraName, err := common.ExtractStringValueFromRequest(jsonBody, "lora_name")
 		if err != nil {
-			slog.Error("Failed to decode int", "err", err)
+			slog.Error("Failed to decode string", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		cacheHitResult := m.indexer.CacheHitCompute(modelName, loraID, tokenIDs, candidates)
+		cacheHitResult := m.indexer.CacheHitCompute(modelName, loraName, tokenIDs, candidates)
 		slog.Debug("cache hit status", "hitresult", cacheHitResult)
 		response := map[string]interface{}{
 			"HitStatus": cacheHitResult,
@@ -351,48 +341,25 @@ func (m *EventManager) StartHTTPServer() error {
 			return
 		}
 
-		targetInstance := req.InstanceID
-		targetTenant := ""
-		if req.TenantID != nil {
+		// Build target service key from instance_id and tenant_id
+		targetTenant := "default"
+		if req.TenantID != nil && *req.TenantID != "" {
 			targetTenant = *req.TenantID
 		}
+		targetKey := makeServiceKey(req.InstanceID, targetTenant)
 
-		removedInstances := []string{}
-
-		// Traverse the currently running services, performing precise filtering and unregistration
-		m.activeConfigs.Range(func(key string, val common.ServiceConfig) bool {
-			// Match Type and ModelName
-			if val.Type == req.Type && val.ModelName == req.ModelName {
-				// TenantID filter: If empty, unregister all tenants; otherwise, must match
-				if targetTenant == "" || val.TenantID == targetTenant {
-					// InstanceID filter: Exact match for a single instance
-					if targetInstance == "" || val.InstanceID == targetInstance {
-						removedInstances = append(removedInstances, key)
-					}
-				}
-			}
-			return true // Continue traversal
-		})
-
-		for _, svcKey := range removedInstances {
-			// Parse the composite key to get instance_id and tenant_id
-			var instanceID, tenantID string
-			parts := strings.SplitN(svcKey, "|", 2)
-			if len(parts) == 2 {
-				instanceID = parts[0]
-				tenantID = parts[1]
-			} else {
-				// Fallback for backward compatibility
-				instanceID = svcKey
-				tenantID = "default"
-			}
-			m.unsubscribeFromService(instanceID, tenantID)
+		// Direct lookup and removal
+		if _, exists := m.activeConfigs.Load(targetKey); !exists {
+			http.Error(w, fmt.Sprintf("service not found: %s", targetKey), http.StatusNotFound)
+			return
 		}
+
+		m.unsubscribeFromService(req.InstanceID, targetTenant)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":            "unregistered successfully",
-			"removed_instances": removedInstances,
+			"removed_instances": []string{targetKey},
 		})
 	})
 
