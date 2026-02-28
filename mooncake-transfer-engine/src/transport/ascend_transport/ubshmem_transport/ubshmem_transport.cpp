@@ -35,6 +35,8 @@ namespace mooncake {
 namespace {
 constexpr size_t kIPCHandleKeyLength = 65;
 constexpr int kDefaultNumStreams = 4;
+constexpr size_t kDefaultThreadPool = 8;
+constexpr uint64_t kGetStreamTimeoutMillis = 3000;
 }  // namespace
 
 // Pool configuration constants
@@ -176,9 +178,9 @@ static bool supportFabricMem() {
 
 UBShmemTransport::UBShmemTransport()
     : use_fabric_mem_(supportFabricMem()),
-      num_streams_per_transfer_(4),  // Default: 4 streams per transfer
-      thread_pool_size_(8),          // Default: 8 threads
-      stream_pool_timeout_ms_(3000)  // Default: 3000 ms
+      num_streams_per_transfer_(kDefaultNumStreams),  // Default: 4 streams per transfer
+      thread_pool_size_(kDefaultThreadPool),          // Default: 8 threads
+      stream_pool_timeout_ms_(kGetStreamTimeoutMillis)  // Default: 3000 ms
 {
     // Read configuration from environment variables
     const char *num_streams_per_transfer_env =
@@ -191,7 +193,7 @@ UBShmemTransport::UBShmemTransport()
     }
 
     const char *max_streams_env = getenv("MC_UBSHMEM_MAX_STREAMS");
-    int max_streams = 32;  // Default: 32 streams total
+    int max_streams = kDefaultNumStreams * kDefaultThreadPool;
     if (max_streams_env != nullptr) {
         int env_value = atoi(max_streams_env);
         if (env_value > 0) {
@@ -257,7 +259,7 @@ UBShmemTransport::~UBShmemTransport() {
 void UBShmemTransport::initializeThreadPool() {
     running_ = true;
     workers_.reserve(thread_pool_size_);
-    for (int i = 0; i < thread_pool_size_; ++i) {
+    for (auto i = 0U; i < thread_pool_size_; ++i) {
         workers_.emplace_back([this] { workerThread(); });
     }
     LOG(INFO) << "UBShmemTransport: Thread pool initialized with "
