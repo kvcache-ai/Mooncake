@@ -290,9 +290,22 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 
     double final_stddev = computeUtilizationStdDev(manager);
 
-    // Only consider it converged if it REMAINED converged at the end
+    // If it hasn't converged (or diverged), trace further allocations to see if it converges later
+    int extra_converge_allocs = -1;
     if (final_stddev >= convergence_threshold) {
-        converged_at = -1;
+        converged_at = -1; // Reset false positive
+
+        // Keep allocating up to 10x more times to see if it ever converges
+        int max_extra = cfg.num_allocations * 10;
+        for (int i = 0; i < max_extra; ++i) {
+            strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
+            if (i > 0 && i % sample_interval == 0) {
+                if (computeUtilizationStdDev(manager) < convergence_threshold) {
+                    extra_converge_allocs = cfg.num_allocations + i;
+                    break;
+                }
+            }
+        }
     }
 
     if (!FLAGS_dump_distribution_file.empty()) {
@@ -313,6 +326,12 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     res.p99_ns = percentile(0.99);
     res.final_util_stddev = final_stddev;
     res.convergence_alloc_count = converged_at;
+    
+    // Store extra convergence if it happened later
+    if (converged_at == -1 && extra_converge_allocs > 0) {
+        res.convergence_alloc_count = -extra_converge_allocs; // Encode as negative to show it was an extended run
+    }
+    
     return res;
 }
 
@@ -332,6 +351,14 @@ static void printHeader() {
 }
 
 static void printResult(const BenchResult& r) {
+    std::string converge_str = "N/A";
+    if (r.convergence_alloc_count > 0) {
+        converge_str = std::to_string(r.convergence_alloc_count);
+    } else if (r.convergence_alloc_count < 0) {
+        // Did not converge in original run, but converged in extended run
+        converge_str = std::to_string(-r.convergence_alloc_count) + "*";
+    }
+
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
               << r.num_segments << std::setw(12)
               << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(9)
@@ -341,9 +368,7 @@ static void printResult(const BenchResult& r) {
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev << std::setw(14)
-              << (r.convergence_alloc_count >= 0
-                      ? std::to_string(r.convergence_alloc_count)
-                      : "N/A")
+              << converge_str
               << std::endl;
 }
 
@@ -371,11 +396,18 @@ static void runAllBenchmarks() {
                 for (auto asize : alloc_sizes) {
                     for (auto rep : replica_nums) {
                         // Skip impossible configs: can't have more replicas than segments
-                        if (rep > segs) continue; // TODO： 感觉也能测？
+                        if (rep > segs) continue;
 
                         BenchConfig cfg;
                         cfg.num_segments = segs;
-                        cfg.segment_capacity = FLAGS_segment_capacity * MiB;
+                        
+                        // Scale segment capacity to prevent OOM when allocating 128MB.
+                        // Since OffsetBufferAllocator only stores metadata, we can safely simulate realistic 80GB VRAM sizes.
+                        size_t required_capacity = (asize * rep * FLAGS_num_allocations) / std::max(1, segs);
+                        size_t configured_capacity = FLAGS_segment_capacity * MiB;
+                        size_t realistic_capacity = 80ULL * 1024 * MiB; // 80GB
+                        cfg.segment_capacity = std::max({configured_capacity, required_capacity * 2, realistic_capacity});
+                        
                         cfg.alloc_size = asize;
                         cfg.replica_num = rep;
                         cfg.num_allocations = FLAGS_num_allocations;
