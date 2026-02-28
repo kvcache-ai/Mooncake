@@ -494,10 +494,9 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
 
-    std::vector<ibv_send_wr> wr_list(wr_count);
+    std::vector<ibv_send_wr> wr_list(wr_count, ibv_send_wr{});
     std::vector<ibv_sge> sge_list(sge_count);
     ibv_send_wr* bad_wr = nullptr;
-    memset(wr_list.data(), 0, sizeof(ibv_send_wr) * wr_count);
     int sge_idx = 0;
 
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {

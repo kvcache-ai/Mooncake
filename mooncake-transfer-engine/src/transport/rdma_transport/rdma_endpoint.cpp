@@ -275,10 +275,9 @@ int RdmaEndPoint::submitPostSend(
         std::min(int(globalConfig().max_cqe) - *cq_outstanding_, wr_count);
     if (wr_count <= 0) return 0;
 
-    std::vector<ibv_send_wr> wr_list(wr_count);
+    std::vector<ibv_send_wr> wr_list(wr_count, ibv_send_wr{});
     std::vector<ibv_sge> sge_list(wr_count);
     ibv_send_wr *bad_wr = nullptr;
-    memset(wr_list.data(), 0, sizeof(ibv_send_wr) * wr_count);
     for (int i = 0; i < wr_count; ++i) {
         auto slice = slice_list[i];
         auto &sge = sge_list[i];
