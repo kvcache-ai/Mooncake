@@ -3,6 +3,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <numa.h>
+#include <numaif.h>
 #include <pthread.h>
 #include <signal.h>
 #include <thread>
@@ -24,6 +25,7 @@
 #include "file_storage.h"
 #include "default_config.h"
 #include "shm_helper.h"
+#include "memory_location.h"
 
 namespace mooncake {
 
@@ -301,6 +303,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
+
+        // Parse NUMA nodes for NIC-aware segment allocation.
+        // Env: MC_SEGMENT_NUMA_NODES=1,3,5,7  (NUMA nodes with NICs)
+        // When set, global_segment is divided into equal regions bound
+        // to each NUMA node, enabling all RDMA NICs to serve traffic.
+        std::vector<int> seg_numa_nodes;
+        const char *numa_env = std::getenv("MC_SEGMENT_NUMA_NODES");
+        if (numa_env) {
+            std::string s(numa_env);
+            size_t pos = 0;
+            while (pos < s.size()) {
+                auto comma = s.find(',', pos);
+                std::string tok = (comma == std::string::npos)
+                                      ? s.substr(pos)
+                                      : s.substr(pos, comma - pos);
+                seg_numa_nodes.push_back(std::stoi(tok));
+                pos = (comma == std::string::npos) ? s.size() : comma + 1;
+            }
+        }
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
@@ -310,7 +332,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
-            if (should_use_hugepage) {
+            std::string seg_location = kWildcardLocation;
+
+            if (!seg_numa_nodes.empty()) {
+                // NUMA-segmented allocation: contiguous VMA, per-region binding
+                size_t page_sz = should_use_hugepage
+                                     ? get_hugepage_size_from_env()
+                                     : static_cast<size_t>(getpagesize());
+                mapped_size = align_up(segment_size, page_sz * seg_numa_nodes.size());
+                ptr = allocate_buffer_numa_segments(
+                    mapped_size, seg_numa_nodes, page_sz);
+                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+            } else if (should_use_hugepage) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
@@ -326,6 +359,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
             if (this->protocol == "ascend") {
                 ascend_segment_ptrs_.emplace_back(ptr);
+            } else if (!seg_numa_nodes.empty()) {
+                // NUMA-segmented: track as mmap allocation for munmap cleanup
+                hugepage_segment_ptrs_.emplace_back(
+                    ptr, HugepageSegmentDeleter{mapped_size});
             } else if (should_use_hugepage) {
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
@@ -333,7 +370,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol);
+                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());

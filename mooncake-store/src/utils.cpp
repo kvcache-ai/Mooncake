@@ -13,6 +13,8 @@
 #include <csignal>
 #include <cstring>
 #include <sys/mman.h>
+#include <numa.h>
+#include <numaif.h>
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl.h"
 #include "config.h"
@@ -191,6 +193,71 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
         LOG(ERROR) << "munmap hugepage failed, size=" << map_size
                    << ", errno=" << errno << " (" << strerror(errno) << ")";
     }
+}
+
+// NUMA-segmented buffer allocation
+void *allocate_buffer_numa_segments(size_t total_size,
+                                    const std::vector<int> &numa_nodes,
+                                    size_t page_size) {
+    if (total_size == 0 || numa_nodes.empty()) {
+        LOG(ERROR) << "Invalid params: total_size=" << total_size
+                   << " numa_nodes.size=" << numa_nodes.size();
+        return nullptr;
+    }
+
+    if (page_size == 0) page_size = getpagesize();
+    size_t n = numa_nodes.size();
+    size_t region_size = align_up(total_size / n, page_size);
+    size_t map_size = region_size * n;
+
+    // reserve contiguous VMA, no physical pages yet
+    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << map_size
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+
+    // bind each region to its NUMA node
+    int max_node = numa_num_configured_nodes();
+    for (size_t i = 0; i < n; ++i) {
+        struct bitmask *mask = numa_bitmask_alloc(max_node);
+        numa_bitmask_setbit(mask, numa_nodes[i]);
+        char *region = static_cast<char *>(ptr) + i * region_size;
+        long rc = mbind(region, region_size, MPOL_BIND,
+                        mask->maskp, mask->size + 1, 0);
+        numa_bitmask_free(mask);
+        if (rc != 0) {
+            LOG(ERROR) << "mbind failed for NUMA " << numa_nodes[i]
+                       << ", errno=" << errno << " (" << strerror(errno) << ")";
+            munmap(ptr, map_size);
+            return nullptr;
+        }
+    }
+
+    // prefault — pages allocated directly on target NUMA
+    int rc = madvise(ptr, map_size, MADV_POPULATE_WRITE);
+    if (rc != 0) {
+        LOG(WARNING) << "MADV_POPULATE_WRITE failed (kernel < 5.14?), "
+                     << "falling back to manual touch";
+        volatile char *p = static_cast<volatile char *>(ptr);
+        for (size_t off = 0; off < map_size; off += page_size) {
+            p[off] = 0;
+        }
+    }
+
+    LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size
+              << " bytes, " << n << " regions, page_size=" << page_size
+              << ", nodes=[" << [&]() {
+                    std::string s;
+                    for (size_t i = 0; i < n; ++i) {
+                        if (i) s += ",";
+                        s += std::to_string(numa_nodes[i]);
+                    }
+                    return s;
+                 }() << "]";
+    return ptr;
 }
 
 void free_memory(const std::string &protocol, void *ptr) {

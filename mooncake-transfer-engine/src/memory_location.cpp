@@ -96,4 +96,54 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     return entries;
 }
 
+/* ------------------------------------------------------------------ */
+/* Segments location helpers                                          */
+/* ------------------------------------------------------------------ */
+
+std::string buildSegmentsLocation(size_t page_size,
+                                  const std::vector<int> &numa_nodes) {
+    std::string result = kSegmentsLocationPrefix + std::to_string(page_size) + ":";
+    for (size_t i = 0; i < numa_nodes.size(); ++i) {
+        if (i > 0) result += ",";
+        result += std::to_string(numa_nodes[i]);
+    }
+    return result;
+}
+
+bool parseSegmentsLocation(const std::string &name, SegmentsLocationInfo &info) {
+    if (name.rfind(kSegmentsLocationPrefix, 0) != 0) return false;
+
+    // "segments:<page_size>:<n0>,<n1>,..."
+    std::string body = name.substr(kSegmentsLocationPrefix.size());
+    auto colon = body.find(':');
+    if (colon == std::string::npos) return false;
+
+    info.page_size = std::stoull(body.substr(0, colon));
+    info.numa_nodes.clear();
+
+    std::string nodes_str = body.substr(colon + 1);
+    size_t pos = 0;
+    while (pos < nodes_str.size()) {
+        auto comma = nodes_str.find(',', pos);
+        std::string tok = (comma == std::string::npos)
+                              ? nodes_str.substr(pos)
+                              : nodes_str.substr(pos, comma - pos);
+        info.numa_nodes.push_back(std::stoi(tok));
+        pos = (comma == std::string::npos) ? nodes_str.size() : comma + 1;
+    }
+    return !info.numa_nodes.empty();
+}
+
+std::string resolveSegmentsLocation(const SegmentsLocationInfo &info,
+                                    uint64_t buffer_length,
+                                    uint64_t offset) {
+    size_t n = info.numa_nodes.size();
+    if (n == 0) return kWildcardLocation;
+    size_t region_size = buffer_length / n;
+    if (region_size == 0) return kWildcardLocation;
+    size_t idx = offset / region_size;
+    if (idx >= n) idx = n - 1;  // clamp for tail bytes
+    return "cpu:" + std::to_string(info.numa_nodes[idx]);
+}
+
 }  // namespace mooncake

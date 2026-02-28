@@ -233,7 +233,8 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> MountSegment(
-        const void* buffer, size_t size, const std::string& protocol = "tcp");
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = "*");
 
     /**
      * @brief Unregisters a memory segment from master
