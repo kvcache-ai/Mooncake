@@ -4,9 +4,15 @@
 #include <csignal>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 #include <ylt/coro_http/coro_http_server.hpp>
+#include "types.h"
+#include "rpc_service.h"
 
 namespace mooncake {
 
@@ -21,6 +27,9 @@ enum class KVPoll {
 class HttpMetadataServer {
    public:
     HttpMetadataServer(uint16_t port, const std::string& host = "0.0.0.0");
+    HttpMetadataServer(
+        uint16_t port, const std::string& host,
+        std::shared_ptr<WrappedMasterService> wrapped_master_service);
     ~HttpMetadataServer();
 
     // Start the HTTP metadata server
@@ -41,6 +50,12 @@ class HttpMetadataServer {
 
    private:
     void init_server();
+    void health_monitor_thread_func();
+    void check_and_cleanup_metadata();
+    bool is_segment_healthy(
+        const std::string& segment_name,
+        const std::unordered_set<std::string>& all_segments);
+    void cleanup_segment_metadata(const std::string& segment_name);
 
     uint16_t port_;
     std::string host_;
@@ -48,6 +63,12 @@ class HttpMetadataServer {
     std::unordered_map<std::string, std::string> store_;
     mutable std::mutex store_mutex_;
     bool running_;
+
+    // Health monitoring
+    std::shared_ptr<WrappedMasterService> wrapped_master_service_;
+    std::thread health_monitor_thread_;
+    std::atomic<bool> health_monitor_running_{false};
+    static constexpr uint64_t kHealthMonitorSleepMs = 600000;  // 10 minutes
 };
 
 }  // namespace mooncake

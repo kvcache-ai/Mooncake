@@ -585,22 +585,6 @@ int main(int argc, char* argv[]) {
         << ", cxl_path=" << master_config.cxl_path
         << ", cxl_size=" << master_config.cxl_size;
 
-    // Start HTTP metadata server if enabled
-    std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
-    if (master_config.enable_http_metadata_server) {
-        http_metadata_server =
-            StartHttpMetadataServer(master_config.http_metadata_server_port,
-                                    master_config.http_metadata_server_host);
-
-        if (!http_metadata_server) {
-            LOG(FATAL) << "Failed to start HTTP metadata server";
-            return 1;
-        }
-
-        // Give the server some time to start
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-
     if (master_config.enable_ha) {
         mooncake::MasterServiceSupervisor supervisor(
             mooncake::MasterServiceSupervisorConfig{master_config});
@@ -619,6 +603,32 @@ int main(int argc, char* argv[]) {
         }
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(master_config, version));
+
+        // Start HTTP metadata server if enabled, passing the master service
+        std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
+        if (master_config.enable_http_metadata_server) {
+            // Create a shared_ptr with a no-op deleter since
+            // wrapped_master_service is stack-allocated and will be cleaned up
+            // automatically
+            auto wrapped_service_ptr =
+                std::shared_ptr<mooncake::WrappedMasterService>(
+                    &wrapped_master_service,
+                    [](mooncake::WrappedMasterService*) {});
+            http_metadata_server =
+                std::make_unique<mooncake::HttpMetadataServer>(
+                    master_config.http_metadata_server_port,
+                    master_config.http_metadata_server_host,
+                    wrapped_service_ptr);
+            http_metadata_server->start();
+
+            if (!http_metadata_server->is_running()) {
+                LOG(FATAL) << "Failed to start HTTP metadata server";
+                return 1;
+            }
+
+            // Give the server some time to start
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();
