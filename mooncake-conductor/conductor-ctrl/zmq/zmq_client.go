@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
-	"net"
-	"strconv"
 	"sync"
 	"time"
 
@@ -146,10 +144,9 @@ func (c *ZMQClient) Connect() error {
 		return fmt.Errorf("failed to enable IPv6 on socket: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("tcp://%s", net.JoinHostPort(c.config.ServiceIP, strconv.Itoa(c.config.Port)))
-	if err := sock.Connect(endpoint); err != nil {
+	if err := sock.Connect(c.config.Endpoint); err != nil {
 		_ = sock.Close()
-		return fmt.Errorf("failed to connect to %s: %w", endpoint, err)
+		return fmt.Errorf("failed to connect to %s: %w", c.config.Endpoint, err)
 	}
 
 	// Important: Subscribe to all topics
@@ -171,11 +168,10 @@ func (c *ZMQClient) Connect() error {
 		return fmt.Errorf("failed to enable IPv6 on DEALER socket: %w", err)
 	}
 
-	replayEndpoint := fmt.Sprintf("tcp://%s", net.JoinHostPort(c.config.ServiceIP, strconv.Itoa(c.config.RouterPort)))
-	if err := replaySocket.Connect(replayEndpoint); err != nil {
+	if err := replaySocket.Connect(c.config.ReplayEndpoint); err != nil {
 		_ = sock.Close()
 		_ = replaySocket.Close()
-		return fmt.Errorf("failed to connect to replay endpoint: %w", err)
+		return fmt.Errorf("failed to connect to replay endpoint %s: %w", c.config.ReplayEndpoint, err)
 	}
 
 	c.subSocket = sock
@@ -184,7 +180,7 @@ func (c *ZMQClient) Connect() error {
 
 	c.reconnectDelay = c.config.ReconnectDelay
 
-	slog.Info("Successfully connected to vLLM publisher", "service", c.config.CachePoolKey, "ip", c.config.ServiceIP)
+	slog.Info("Successfully connected to vLLM publisher", "service", c.config.CachePoolKey, "endpoint", c.config.Endpoint)
 
 	return nil
 }

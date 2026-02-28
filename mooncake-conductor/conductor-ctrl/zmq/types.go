@@ -2,7 +2,6 @@ package zmq
 
 import (
 	"fmt"
-	"net"
 	"time"
 )
 
@@ -14,19 +13,15 @@ type EventHandler interface {
 // ZMQClientConfig contains configuration for the ZMQ client
 type ZMQClientConfig struct {
 	CachePoolKey   string
-	ServiceIP      string
+	Endpoint       string
+	ReplayEndpoint string
 	ModelName      string
-	Port           int
-	RouterPort     int
 	PollTimeout    time.Duration
 	ReplayTimeout  time.Duration
 	ReconnectDelay time.Duration
 }
 
 const (
-	DefaultPubPort    = 5557
-	DefaultRouterPort = 5558
-
 	// Timeouts and intervals
 	DefaultPollTimeout       = 100 * time.Millisecond
 	DefaultReplayTimeout     = 5 * time.Second
@@ -38,20 +33,8 @@ const (
 )
 
 func ValidateConfig(config *ZMQClientConfig) error {
-	if config.ServiceIP == "" {
-		return fmt.Errorf("publisher IP is required")
-	}
-
-	if ip := net.ParseIP(config.ServiceIP); ip == nil {
-		return fmt.Errorf("invalid IP address: %s", config.ServiceIP)
-	}
-
-	if config.Port <= 0 || config.Port > 65535 {
-		return fmt.Errorf("invalid publisher port: %d", config.Port)
-	}
-
-	if config.RouterPort <= 0 || config.RouterPort > 65535 {
-		return fmt.Errorf("invalid router port: %d", config.RouterPort)
+	if config.Endpoint == "" {
+		return fmt.Errorf("endpoint is required")
 	}
 
 	return nil
