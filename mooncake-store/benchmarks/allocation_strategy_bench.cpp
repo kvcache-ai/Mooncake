@@ -48,12 +48,15 @@ DEFINE_bool(skewed, false,
             "Use skewed segment capacities (capacity varies by index)");
 DEFINE_string(strategy, "all",
               "Strategy to benchmark: Random, FreeRatioFirst, or all");
-DEFINE_int32(convergence_sample_interval, 100,
-             "Sample utilization stddev every N allocations");
+DEFINE_int32(
+    convergence_sample_interval, 100,
+    "Sample utilization stddev every N allocations");  // TODO：
+                                                       // 加到上面的注释里；看下还有其他缺了的flag也一起加上
 DEFINE_bool(run_all, false,
             "Run a standard matrix of configurations for comparison");
-DEFINE_string(dump_distribution_file, "",
-              "File path to dump final segment utilization distribution (CSV format)");
+DEFINE_string(
+    dump_distribution_file, "",
+    "File path to dump final segment utilization distribution (CSV format)");
 
 using namespace mooncake;
 
@@ -87,10 +90,10 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
     // Distribute segments evenly across 10 virtual nodes if num_segments > 10,
     // otherwise 1 segment per node.
     int segments_per_node = std::max(1, num_segments / 10);
-    
+
     for (int i = 0; i < num_segments; ++i) {
-        std::string name =
-            "node_" + std::to_string(i / segments_per_node) + "_seg_" + std::to_string(i % segments_per_node);
+        std::string name = "node_" + std::to_string(i / segments_per_node) +
+                           "_seg_" + std::to_string(i % segments_per_node);
         size_t capacity =
             skewed ? base_capacity * (1 + static_cast<size_t>(i % 10))
                    : base_capacity;
@@ -161,20 +164,23 @@ static std::string strategyName(AllocationStrategyType type) {
 //  Core benchmark runner
 // ============================================================
 
-static void dumpDistribution(const BenchConfig& cfg, const AllocatorManager& manager, const std::string& filepath) {
+static void dumpDistribution(const BenchConfig& cfg,
+                             const AllocatorManager& manager,
+                             const std::string& filepath) {
     if (filepath.empty()) return;
-    
+
     std::ofstream out(filepath, std::ios::app);
     if (!out.is_open()) {
         std::cerr << "Failed to open dump file: " << filepath << std::endl;
         return;
     }
-    
+
     out.seekp(0, std::ios::end);
     if (out.tellp() == 0) {
-        out << "Strategy,NumSegments,AllocSize,ReplicaNum,Skewed,SegmentName,Capacity,Used,Utilization\n";
+        out << "Strategy,NumSegments,AllocSize,ReplicaNum,Skewed,SegmentName,"
+               "Capacity,Used,Utilization\n";
     }
-    
+
     for (const auto& name : manager.getNames()) {
         const auto* allocators = manager.getAllocators(name);
         if (!allocators || allocators->empty()) continue;
@@ -182,16 +188,12 @@ static void dumpDistribution(const BenchConfig& cfg, const AllocatorManager& man
             size_t cap = alloc->capacity();
             size_t used = alloc->size();
             double util = cap > 0 ? static_cast<double>(used) / cap : 0.0;
-            
-            out << cfg.strategy_name << ","
-                << cfg.num_segments << ","
-                << cfg.alloc_size << ","
-                << cfg.replica_num << ","
-                << (cfg.skewed ? "true" : "false") << ","
-                << name << ","
-                << cap << ","
-                << used << ","
-                << std::fixed << std::setprecision(4) << util << "\n";
+
+            out << cfg.strategy_name << "," << cfg.num_segments << ","
+                << cfg.alloc_size << "," << cfg.replica_num << ","
+                << (cfg.skewed ? "true" : "false") << "," << name << "," << cap
+                << "," << used << "," << std::fixed << std::setprecision(4)
+                << util << "\n";
         }
     }
 }
@@ -273,9 +275,9 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
                     latencies.size();
 
     // --- Find convergence point ---
-    // A strategy is considered converged if the utilization stddev is below the threshold
-    // AND we have completed at least 10% of the total configured allocations
-    // to avoid false positives when the cluster is almost empty.
+    // A strategy is considered converged if the utilization stddev is below the
+    // threshold AND we have completed at least 10% of the total configured
+    // allocations to avoid false positives when the cluster is almost empty.
     int converged_at = -1;
     const double convergence_threshold = 0.05;
     int min_allocs_to_converge = std::max(1, cfg.num_allocations / 10);
@@ -283,7 +285,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     for (size_t i = 0; i < stddev_over_time.size(); ++i) {
         int allocs_done = static_cast<int>((i + 1) * sample_interval);
 
-        if (allocs_done >= min_allocs_to_converge && stddev_over_time[i] < convergence_threshold) {
+        if (allocs_done >= min_allocs_to_converge &&
+            stddev_over_time[i] < convergence_threshold) {
             converged_at = allocs_done;
             break;
         }
@@ -342,6 +345,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 // ============================================================
 
 static void printHeader() {
+    std::cout << std::string(140, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
               << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
               << "Replica" << std::setw(8) << "Skewed" << std::right
@@ -349,7 +353,7 @@ static void printHeader() {
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12) << "UtilStdDev"
               << std::setw(14) << "Converge@" << std::endl;
-    std::cout << std::string(135, '-') << std::endl;
+    std::cout << std::string(140, '-') << std::endl;
 }
 
 static void printResult(const BenchResult& r) {
@@ -381,7 +385,8 @@ static void printResult(const BenchResult& r) {
 
 static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512};
-    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB, 128 * MiB}; // Tested up to 128MB
+    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB,
+                                       128 * MiB};  // Tested up to 128MB
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
@@ -390,11 +395,11 @@ static void runAllBenchmarks() {
     std::vector<bool> skewed_options = {false, true};
 
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
-    printHeader();
 
     // TODO：for循环收敛一点；一些配置数组直接放到cfg里，宁可搞cfg数组也不要搞那么多层for循环。
     for (auto skew : skewed_options) {
         for (auto strategy : strategies) {
+            printHeader();
             for (auto segs : segment_counts) {
                 for (auto asize : alloc_sizes) {
                     for (auto rep : replica_nums) {
