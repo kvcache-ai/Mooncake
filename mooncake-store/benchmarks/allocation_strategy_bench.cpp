@@ -777,49 +777,91 @@ static void runAllBenchmarks() {
     }
 }
 
-// ============================================================
-//  Scale-Out benchmark runner
-// ============================================================
+// ---- ScaleOut scenario matrix ----------------------------------------
+// Each row is one logical "test case".  Add new rows here to extend coverage.
+// Fields: num_segments, alloc_size, replica_num, new_segments, trigger_pct
+struct ScaleOutScenario {
+    int    num_segments;
+    size_t alloc_size;       // bytes
+    int    replica_num;
+    int    new_segments;
+    int    trigger_pct;
+    std::string label;       // human-readable description
+};
+
+// Convenience macro-style helper to convert KB/MB inline
+static constexpr size_t kScenarioKiB = KiB; // TODO：要你麻痹的这个奇怪命名干什么？
+static constexpr size_t kScenarioMiB = MiB;
+
+// clang-format off
+static const std::vector<ScaleOutScenario> kScaleOutScenarios = { // TODO: 清理没有用的垃圾参数和注释；
+    // {num_segs, alloc_size,        replica, new_segs, trigger%, label}
+    // Small cluster, small allocs —— typical KV-cache shard
+    { 10,  64*kScenarioKiB, 1,  5, 50, "small-cluster / small-alloc" },
+    { 10,  64*kScenarioKiB, 1, 10, 50, "small-cluster / double scale-out" },
+    // Medium cluster, big allocs —— model-weight sharding
+    { 50,   4*kScenarioMiB, 1, 10, 50, "medium-cluster / 4MB alloc" },
+    { 50,  32*kScenarioMiB, 1, 10, 50, "medium-cluster / 32MB alloc" },
+    // Large cluster —— production-scale
+    {100,   1*kScenarioMiB, 1, 20, 50, "large-cluster / 1MB alloc" },
+    {100,   1*kScenarioMiB, 2, 20, 50, "large-cluster / 1MB alloc / replica=2" },
+    // Late injection (80%) —— almost-full cluster gets new nodes
+    { 50,   4*kScenarioMiB, 1, 10, 80, "near-full / late injection" },
+};
+// clang-format on
 
 static void runScaleOutBenchmark(
     const std::vector<AllocationStrategyType>& strategies) {
-    // Build a shared BenchConfig (same for all strategies in a single run)
-    BenchConfig cfg;
-    cfg.num_segments = FLAGS_num_segments;
-    cfg.segment_capacity = static_cast<size_t>(FLAGS_segment_capacity) * MiB;
-    cfg.alloc_size = static_cast<size_t>(FLAGS_alloc_size) * KiB;
-    cfg.replica_num = FLAGS_replica_num;
-    cfg.num_allocations = FLAGS_num_allocations;
-    cfg.skewed = FLAGS_skewed;
-    cfg.workload_type = WorkloadType::SCALE_OUT;
-    cfg.scale_out_trigger_pct = FLAGS_scale_out_trigger_pct;
-    cfg.scale_out_new_segments = FLAGS_scale_out_new_segments;
-
-    std::cout << "\n=== Scale-Out Workload Benchmark ==="
-              << "\n  Initial segments : " << cfg.num_segments
-              << "  |  New segments  : " << cfg.scale_out_new_segments
-              << " (injected at " << cfg.scale_out_trigger_pct << "% = alloc #"
-              << cfg.num_allocations * cfg.scale_out_trigger_pct / 100 << ")"
-              << "\n  Alloc size       : " << FLAGS_alloc_size << " KB"
-              << "  |  Replica num   : " << cfg.replica_num
-              << "  |  Total allocs  : " << cfg.num_allocations << "\n";
-
-    // --- Collect results for all strategies first, then print ---
-    std::vector<ScaleOutResult> all_results;
-    all_results.reserve(strategies.size());
-
-    for (auto strategy : strategies) {
-        cfg.strategy_type = strategy;
-        cfg.strategy_name = strategyName(strategy);
-
-        ScaleOutResult res;
-        res.base = runBenchmark(cfg, &res);
-        all_results.push_back(std::move(res));
+    std::cout << "\n=== Scale-Out Workload Benchmark (Matrix) ===\n";
+    std::cout << "  Total allocs per run : " << FLAGS_num_allocations << "\n";
+    std::cout << "  Strategies           : ";
+    for (size_t i = 0; i < strategies.size(); ++i) {
+        if (i) std::cout << ", ";
+        std::cout << strategyName(strategies[i]);
     }
+    std::cout << "\n";
 
-    // --- Print formatted report ---
-    printScaleOutReport(all_results, cfg);
+    for (const auto& scenario : kScaleOutScenarios) {
+        // Build base config from scenario
+        BenchConfig cfg;
+        cfg.num_segments          = scenario.num_segments;
+        cfg.segment_capacity      = static_cast<size_t>(FLAGS_segment_capacity) * MiB;
+        cfg.alloc_size            = scenario.alloc_size;
+        cfg.replica_num           = scenario.replica_num;
+        cfg.num_allocations       = FLAGS_num_allocations;
+        cfg.skewed                = FLAGS_skewed;
+        cfg.workload_type         = WorkloadType::SCALE_OUT;
+        cfg.scale_out_trigger_pct = scenario.trigger_pct;
+        cfg.scale_out_new_segments = scenario.new_segments;
+
+        // Skip impossible configs
+        if (scenario.replica_num > scenario.num_segments) continue;
+
+        std::cout << "\n  Scenario: " << scenario.label << "\n";
+        std::cout << "    Segments " << scenario.num_segments
+                  << "  →  +" << scenario.new_segments
+                  << " new (at " << scenario.trigger_pct << "% = alloc #"
+                  << cfg.num_allocations * scenario.trigger_pct / 100 << ")"
+                  << "  |  AllocSize " << scenario.alloc_size / KiB << " KB"
+                  << "  |  Replica " << scenario.replica_num << "\n";
+
+        // Collect results for all strategies, then print grouped
+        std::vector<ScaleOutResult> all_results;
+        all_results.reserve(strategies.size());
+
+        for (auto strategy : strategies) {
+            cfg.strategy_type = strategy;
+            cfg.strategy_name = strategyName(strategy);
+
+            ScaleOutResult res;
+            res.base = runBenchmark(cfg, &res);
+            all_results.push_back(std::move(res));
+        }
+
+        printScaleOutReport(all_results, cfg);
+    }
 }
+
 
 // ============================================================
 //  main
