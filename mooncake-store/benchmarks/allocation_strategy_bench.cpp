@@ -7,18 +7,25 @@
  * - Throughput (allocations per second)
  * - Load balance across segments (utilization std-dev)
  * - Convergence time to balanced state
+ * - [Scale-Out] Speed of load redistribution after new nodes are added
  *
  * Usage:
  *   ./allocation_strategy_bench [flags]
  *
  * Key flags:
- *   --num_segments      Number of segments (default: 100)
- *   --segment_capacity  Per-segment capacity in MB (default: 64)
- *   --alloc_size        Allocation size in KB (default: 64)
- *   --replica_num       Replicas per allocation (default: 1)
- *   --num_allocations   Total allocations to run (default: 10000)
- *   --skewed            Use skewed segment capacities (default: false)
- *   --run_all           Run all strategies with a standard matrix
+ *   --num_segments           Number of segments (default: 10)
+ *   --segment_capacity       Per-segment capacity in MB (default: 64)
+ *   --alloc_size             Allocation size in KB (default: 64)
+ *   --replica_num            Replicas per allocation (default: 1)
+ *   --num_allocations        Total allocations to run (default: 10000)
+ *   --skewed                 Use skewed segment capacities (default: false)
+ *   --run_all                Run all strategies with a standard matrix
+ *   --workload               Workload type: fillup, scaleout (default: fillup)
+ *   --scale_out_trigger_pct  % of allocs after which new nodes are added
+ *                            (scaleout mode, default: 50)
+ *   --scale_out_new_segments Number of new segments to inject (default: 10)
+ *   --convergence_sample_interval
+ *                            Sample utilization stddev every N allocations
  */
 
 #include <algorithm>
@@ -48,15 +55,22 @@ DEFINE_bool(skewed, false,
             "Use skewed segment capacities (capacity varies by index)");
 DEFINE_string(strategy, "all",
               "Strategy to benchmark: Random, FreeRatioFirst, or all");
-DEFINE_int32(
-    convergence_sample_interval, 100,
-    "Sample utilization stddev every N allocations");  // TODO：
-                                                       // 加到上面的注释里；看下还有其他缺了的flag也一起加上
+DEFINE_int32(convergence_sample_interval, 100,
+             "Sample utilization stddev every N allocations");
 DEFINE_bool(run_all, false,
             "Run a standard matrix of configurations for comparison");
 DEFINE_string(
     dump_distribution_file, "",
     "File path to dump final segment utilization distribution (CSV format)");
+
+// Scale-Out workload flags
+DEFINE_string(workload, "fillup",
+              "Workload type: fillup (default), scaleout");
+DEFINE_int32(scale_out_trigger_pct, 50,
+             "Percentage of num_allocations after which new nodes are injected "
+             "(scaleout mode only)");
+DEFINE_int32(scale_out_new_segments, 10,
+             "Number of new segments to inject in scaleout mode");
 
 using namespace mooncake;
 
@@ -64,7 +78,23 @@ static constexpr size_t MiB = 1024ULL * 1024;
 static constexpr size_t KiB = 1024ULL;
 
 // ============================================================
-//  Helpers
+//  Enums
+// ============================================================
+
+enum class WorkloadType {
+    FILL_UP,    // Only allocate, measure throughput/latency/convergence
+    SCALE_OUT,  // Inject new nodes mid-run, measure adoption speed
+};
+
+static WorkloadType parseWorkload(const std::string& s) {
+    if (s == "scaleout") return WorkloadType::SCALE_OUT;
+    if (s == "fillup") return WorkloadType::FILL_UP;
+    std::cerr << "Unknown workload: " << s << ", falling back to fillup\n";
+    return WorkloadType::FILL_UP;
+}
+
+// ============================================================
+//  Config & Result structs
 // ============================================================
 
 struct BenchConfig {
@@ -76,33 +106,107 @@ struct BenchConfig {
     bool skewed;
     std::string strategy_name;
     AllocationStrategyType strategy_type;
+
+    // Workload
+    WorkloadType workload_type = WorkloadType::FILL_UP;
+    int scale_out_trigger_pct  = 50;
+    int scale_out_new_segments = 10;
 };
+
+struct BenchResult {
+    std::string strategy_name;
+    int num_segments;
+    size_t alloc_size;
+    int replica_num;
+    bool skewed;
+
+    double total_time_us;
+    double throughput;  // allocs/sec
+    double avg_ns;
+    double p50_ns;
+    double p90_ns;
+    double p99_ns;
+
+    double final_util_stddev;
+    int convergence_alloc_count;  // -1 if not converged
+    bool converged_in_extra_run =
+        false;  // true if it converged in the lookahead loop
+};
+
+struct ScaleOutResult {
+    BenchResult base;
+
+    // stddev snapshots around the scale-out event
+    double stddev_before_scale;
+    double stddev_just_after_scale;
+
+    // How many allocs (after trigger) until stddev re-converges
+    // -1 = never re-converged within the remaining allocs
+    int re_converge_allocs;
+
+    // Utilization of the newly added nodes sampled over time (post-injection)
+    std::vector<double> new_node_util_over_time;
+};
+
+// ============================================================
+//  Helpers
+// ============================================================
 
 /**
  * @brief Create an AllocatorManager populated with N OffsetBufferAllocators.
  *
  * Each allocator manages only offset metadata, so memory overhead is minimal
  * even for very large simulated capacities.
+ *
+ * @param id_offset Starting index for segment naming (for Scale-Out additions)
  */
 static AllocatorManager createCluster(int num_segments, size_t base_capacity,
-                                      bool skewed) {
+                                      bool skewed, int id_offset = 0) {
     AllocatorManager manager;
     // Distribute segments evenly across 10 virtual nodes if num_segments > 10,
     // otherwise 1 segment per node.
     int segments_per_node = std::max(1, num_segments / 10);
 
     for (int i = 0; i < num_segments; ++i) {
-        std::string name = "node_" + std::to_string(i / segments_per_node) +
-                           "_seg_" + std::to_string(i % segments_per_node);
+        int global_i = i + id_offset;
+        std::string name =
+            "node_" + std::to_string(global_i / segments_per_node) + "_seg_" +
+            std::to_string(global_i % segments_per_node);
+        // skew is based on capacity variation by index
         size_t capacity =
             skewed ? base_capacity * (1 + static_cast<size_t>(i % 10))
                    : base_capacity;
-        uint64_t base_addr = 0x100000000ULL + (i * base_capacity);
+        uint64_t base_addr = 0x100000000ULL + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
         manager.addAllocator(name, allocator);
     }
     return manager;
+}
+
+/**
+ * @brief Inject `count` new, fully-empty segments into an existing manager.
+ *
+ * New segments are named with the id_offset to avoid collisions.
+ * Each new segment has the same capacity as the original segments
+ * (not skewed) to represent freshly-joined rack nodes.
+ *
+ * @return The shared_ptrs of the newly added allocators (for tracking util)
+ */
+static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
+    AllocatorManager& manager, int count, size_t capacity, int id_offset) {
+    std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
+    new_allocs.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        std::string name = "new_node_" + std::to_string(id_offset + i);
+        uint64_t base_addr =
+            0x800000000ULL + (static_cast<uint64_t>(id_offset + i) * capacity);
+        auto allocator =
+            std::make_shared<OffsetBufferAllocator>(name, base_addr, capacity, name);
+        manager.addAllocator(name, allocator);
+        new_allocs.push_back(allocator);
+    }
+    return new_allocs;
 }
 
 /**
@@ -138,6 +242,24 @@ static double computeUtilizationStdDev(const AllocatorManager& manager) {
 }
 
 /**
+ * @brief Compute average utilization ratio of a set of allocators.
+ */
+static double computeAverageUtil(
+    const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocs) {
+    if (allocs.empty()) return 0.0;
+    double sum = 0.0;
+    int count = 0;
+    for (const auto& alloc : allocs) {
+        if (!alloc) continue;
+        double cap = static_cast<double>(alloc->capacity());
+        if (cap == 0) continue;
+        sum += static_cast<double>(alloc->size()) / cap;
+        ++count;
+    }
+    return count > 0 ? sum / count : 0.0;
+}
+
+/**
  * @brief Parse a strategy name string to the enum type.
  */
 static AllocationStrategyType parseStrategy(const std::string& name) {
@@ -161,7 +283,7 @@ static std::string strategyName(AllocationStrategyType type) {
 }
 
 // ============================================================
-//  Core benchmark runner
+//  CSV dump
 // ============================================================
 
 static void dumpDistribution(const BenchConfig& cfg,
@@ -198,66 +320,211 @@ static void dumpDistribution(const BenchConfig& cfg,
     }
 }
 
-struct BenchResult {
-    std::string strategy_name;
-    int num_segments;
-    size_t alloc_size;
-    int replica_num;
-    bool skewed;
+// ============================================================
+//  WorkloadRunner abstraction
+// ============================================================
 
-    double total_time_us;
-    double throughput;  // allocs/sec
-    double avg_ns;
-    double p50_ns;
-    double p90_ns;
-    double p99_ns;
+/**
+ * @brief Abstract base for workload generators.
+ *
+ * Each WorkloadRunner drives the allocation/deallocation loop and fills:
+ *   - latencies: per-operation latency in nanoseconds
+ *   - stddev_over_time: snapshot of utilization stddev every sample_interval ops
+ */
+class WorkloadRunner {
+   public:
+    virtual ~WorkloadRunner() = default;
 
-    double final_util_stddev;
-    int convergence_alloc_count;  // -1 if not converged
-    bool converged_in_extra_run =
-        false;  // true if it converged in the lookahead loop
+    virtual void run(AllocatorManager& manager, AllocationStrategy* strategy,
+                     const BenchConfig& cfg, std::vector<double>& latencies,
+                     std::vector<double>& stddev_over_time) = 0;
 };
 
-static BenchResult runBenchmark(const BenchConfig& cfg) {
-    // Build the cluster
+// ============================================================
+//  FillUpWorkloadRunner
+// ============================================================
+
+/**
+ * @brief The original fill-up workload: allocate N times, never deallocate.
+ *
+ * Measures pure allocation throughput, latency, and convergence speed.
+ */
+class FillUpWorkloadRunner : public WorkloadRunner {
+   public:
+    void run(AllocatorManager& manager, AllocationStrategy* strategy,
+             const BenchConfig& cfg, std::vector<double>& latencies,
+             std::vector<double>& stddev_over_time) override {
+        const int sample_interval = FLAGS_convergence_sample_interval;
+
+        // Hold allocated replicas to prevent immediate deallocation
+        std::vector<std::vector<Replica>> active_allocations;
+        active_allocations.reserve(cfg.num_allocations);
+
+        for (int i = 0; i < cfg.num_allocations; ++i) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto result =
+                strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            latencies.push_back(
+                std::chrono::duration<double, std::nano>(t1 - t0).count());
+
+            if (result.has_value()) {
+                active_allocations.push_back(std::move(result.value()));
+            }
+
+            if (i > 0 && i % sample_interval == 0) {
+                stddev_over_time.push_back(computeUtilizationStdDev(manager));
+            }
+        }
+    }
+};
+
+// ============================================================
+//  ScaleOutWorkloadRunner
+// ============================================================
+
+/**
+ * @brief Scale-Out workload: partway through the run, inject new empty nodes.
+ *
+ * Phases:
+ *   Phase 1 [0, trigger):    Run with original cluster, let it fill up.
+ *   Trigger [trigger]:       Inject `scale_out_new_segments` new empty nodes.
+ *   Phase 2 [trigger, end):  Continue allocating; observe how the strategy
+ *                            routes traffic to the new nodes.
+ *
+ * The initial segment capacity is intentionally sized so that the original
+ * cluster approaches ~80% utilization by the trigger point, making the
+ * new-node adoption clearly visible.
+ *
+ * Extra results are stored in the ScaleOutResult passed by pointer; the base
+ * latencies / stddev_over_time are filled normally so the common statistics
+ * path remains unchanged.
+ */
+class ScaleOutWorkloadRunner : public WorkloadRunner {
+   public:
+    explicit ScaleOutWorkloadRunner(ScaleOutResult* out) : out_(out) {}
+
+    void run(AllocatorManager& manager, AllocationStrategy* strategy,
+             const BenchConfig& cfg, std::vector<double>& latencies,
+             std::vector<double>& stddev_over_time) override {
+        const int sample_interval = FLAGS_convergence_sample_interval;
+        const int trigger_at =
+            cfg.num_allocations * cfg.scale_out_trigger_pct / 100;
+        const double convergence_threshold = 0.05;
+
+        std::vector<std::vector<Replica>> active_allocations;
+        active_allocations.reserve(cfg.num_allocations);
+
+        std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs;
+        bool injected = false;
+
+        for (int i = 0; i < cfg.num_allocations; ++i) {
+            // --- Inject new nodes at the trigger point ---
+            if (!injected && i >= trigger_at) {
+                out_->stddev_before_scale = computeUtilizationStdDev(manager);
+                new_node_allocs = injectNewSegments(
+                    manager, cfg.scale_out_new_segments, cfg.segment_capacity,
+                    /*id_offset=*/cfg.num_segments);
+                out_->stddev_just_after_scale =
+                    computeUtilizationStdDev(manager);
+                injected = true;
+                std::cout << "  [ScaleOut] Injected " << cfg.scale_out_new_segments
+                          << " new segments at alloc #" << i
+                          << "  (stddev: " << std::fixed << std::setprecision(4)
+                          << out_->stddev_before_scale << " -> "
+                          << out_->stddev_just_after_scale << ")\n";
+            }
+
+            // --- Allocate ---
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto result =
+                strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            latencies.push_back(
+                std::chrono::duration<double, std::nano>(t1 - t0).count());
+
+            if (result.has_value()) {
+                active_allocations.push_back(std::move(result.value()));
+            }
+
+            // --- Sample stddev & new-node utilization ---
+            if (i > 0 && i % sample_interval == 0) {
+                stddev_over_time.push_back(computeUtilizationStdDev(manager));
+
+                if (injected && !new_node_allocs.empty()) {
+                    out_->new_node_util_over_time.push_back(
+                        computeAverageUtil(new_node_allocs));
+                }
+            }
+        }
+
+        // --- Find re-convergence point after injection ---
+        out_->re_converge_allocs = -1;
+        if (injected) {
+            // Walk the stddev_over_time samples recorded after the trigger
+            int trigger_sample_idx = trigger_at / sample_interval;
+            for (int idx = trigger_sample_idx;
+                 idx < static_cast<int>(stddev_over_time.size()); ++idx) {
+                if (stddev_over_time[idx] < convergence_threshold) {
+                    out_->re_converge_allocs =
+                        (idx + 1) * sample_interval - trigger_at;
+                    break;
+                }
+            }
+        }
+    }
+
+   private:
+    ScaleOutResult* out_;
+};
+
+// ============================================================
+//  Core benchmark runner (thin dispatcher)
+// ============================================================
+
+static BenchResult runBenchmark(const BenchConfig& cfg,
+                                ScaleOutResult* scaleout_result = nullptr) {
+    // --- Build cluster ---
+    // For ScaleOut, intentionally size down per-segment capacity so that
+    // the original cluster fills up significantly by the trigger point.
+    size_t effective_capacity = cfg.segment_capacity;
+    if (cfg.workload_type == WorkloadType::SCALE_OUT) {
+        // Target ~80% utilization at trigger point:
+        //   needed = alloc_size * replica_num * trigger_allocs / num_segments
+        int trigger_allocs =
+            cfg.num_allocations * cfg.scale_out_trigger_pct / 100;
+        size_t needed = static_cast<size_t>(cfg.alloc_size) * cfg.replica_num *
+                        trigger_allocs / std::max(1, cfg.num_segments);
+        // Add 25% headroom → ~80% fill at trigger point
+        size_t scaleout_cap = needed * 100 / 80;
+        effective_capacity = std::max(cfg.segment_capacity, scaleout_cap);
+    }
+
     AllocatorManager manager =
-        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+        createCluster(cfg.num_segments, effective_capacity, cfg.skewed);
 
     auto strategy = CreateAllocationStrategy(cfg.strategy_type);
 
     std::vector<double> latencies;
     latencies.reserve(cfg.num_allocations);
 
-    // For convergence tracking
     std::vector<double> stddev_over_time;
-    const int sample_interval = FLAGS_convergence_sample_interval;
-    stddev_over_time.reserve(cfg.num_allocations / sample_interval + 1);
+    stddev_over_time.reserve(cfg.num_allocations /
+                                 FLAGS_convergence_sample_interval +
+                             1);
 
-    // Hold allocated replicas to prevent immediate deallocation
-    std::vector<std::vector<Replica>> active_allocations;
-    active_allocations.reserve(cfg.num_allocations);
-
-    // --- Main benchmark loop ---
-    auto total_start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < cfg.num_allocations; ++i) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-
-        auto result =
-            strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
-
-        auto t1 = std::chrono::high_resolution_clock::now();
-        latencies.push_back(
-            std::chrono::duration<double, std::nano>(t1 - t0).count());
-
-        if (result.has_value()) {
-            active_allocations.push_back(std::move(result.value()));
-        }
-
-        // Periodically sample utilization stddev for convergence tracking
-        if (i > 0 && i % sample_interval == 0) {
-            stddev_over_time.push_back(computeUtilizationStdDev(manager));
-        }
+    // --- Dispatch to WorkloadRunner ---
+    std::unique_ptr<WorkloadRunner> runner;
+    if (cfg.workload_type == WorkloadType::SCALE_OUT && scaleout_result) {
+        runner = std::make_unique<ScaleOutWorkloadRunner>(scaleout_result);
+    } else {
+        runner = std::make_unique<FillUpWorkloadRunner>();
     }
+
+    auto total_start = std::chrono::high_resolution_clock::now();
+    runner->run(manager, strategy.get(), cfg, latencies, stddev_over_time);
     auto total_end = std::chrono::high_resolution_clock::now();
 
     double total_us =
@@ -267,27 +534,26 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     // --- Compute latency percentiles ---
     std::sort(latencies.begin(), latencies.end());
     auto percentile = [&](double p) -> double {
+        if (latencies.empty()) return 0.0;
         size_t idx = static_cast<size_t>(p * latencies.size());
         if (idx >= latencies.size()) idx = latencies.size() - 1;
         return latencies[idx];
     };
 
-    double avg_ns = std::accumulate(latencies.begin(), latencies.end(), 0.0) /
-                    latencies.size();
+    double avg_ns =
+        latencies.empty()
+            ? 0.0
+            : std::accumulate(latencies.begin(), latencies.end(), 0.0) /
+                  latencies.size();
 
-    // --- Find convergence point ---
-    // A strategy is considered converged if the utilization stddev is below the
-    // threshold AND we have completed at least 10% of the total configured
-    // allocations to avoid false positives when the cluster is almost empty.
-    int converged_at = -1;
+    // --- Find convergence point (fill-up semantics) ---
     const double convergence_threshold = 0.05;
     int min_allocs_to_converge = std::max(1, cfg.num_allocations / 10);
-    // int min_allocs_to_converge = 100; // TODO: 临时看看最小稳态次数是多少；
+    int converged_at = -1;
 
-    for (size_t i = 0; i < stddev_over_time.size();
-         ++i) {  // TODO：为什么不放在alloc的循环里？如果带break的话
-        int allocs_done = static_cast<int>((i + 1) * sample_interval);
-
+    for (size_t i = 0; i < stddev_over_time.size(); ++i) {
+        int allocs_done =
+            static_cast<int>((i + 1) * FLAGS_convergence_sample_interval);
         if (allocs_done >= min_allocs_to_converge &&
             stddev_over_time[i] < convergence_threshold) {
             converged_at = allocs_done;
@@ -297,19 +563,21 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 
     double final_stddev = computeUtilizationStdDev(manager);
 
-    // If it hasn't converged (or diverged), trace further allocations to see if
-    // it converges later // TODO：好像用处不大；考虑去掉
+    // For fill-up mode: if still not converged, run a lookahead to see if it
+    // ever converges
     int extra_converge_allocs = -1;
-    if (final_stddev >= convergence_threshold) {
+    bool converged_in_extra_run = false;
+    if (cfg.workload_type == WorkloadType::FILL_UP &&
+        final_stddev >= convergence_threshold) {
         converged_at = -1;  // Reset false positive
 
-        // Keep allocating up to 10x more times to see if it ever converges
         int max_extra = cfg.num_allocations * 10;
         for (int i = 0; i < max_extra; ++i) {
             strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
-            if (i > 0 && i % sample_interval == 0) {
+            if (i > 0 && i % FLAGS_convergence_sample_interval == 0) {
                 if (computeUtilizationStdDev(manager) < convergence_threshold) {
                     extra_converge_allocs = cfg.num_allocations + i;
+                    converged_in_extra_run = true;
                     break;
                 }
             }
@@ -327,18 +595,18 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
     res.total_time_us = total_us;
-    res.throughput = cfg.num_allocations / (total_us / 1e6);
+    res.throughput =
+        latencies.empty() ? 0.0 : cfg.num_allocations / (total_us / 1e6);
     res.avg_ns = avg_ns;
     res.p50_ns = percentile(0.50);
     res.p90_ns = percentile(0.90);
     res.p99_ns = percentile(0.99);
     res.final_util_stddev = final_stddev;
     res.convergence_alloc_count = converged_at;
+    res.converged_in_extra_run = converged_in_extra_run;
 
-    // Store extra convergence if it happened later
     if (converged_at == -1 && extra_converge_allocs > 0) {
         res.convergence_alloc_count = extra_converge_allocs;
-        res.converged_in_extra_run = true;
     }
 
     return res;
@@ -363,11 +631,8 @@ static void printHeader() {
 static void printResult(const BenchResult& r) {
     std::string converge_str = "N/A";
     if (r.convergence_alloc_count > 0) {
-        if (r.converged_in_extra_run) {
-            converge_str = std::to_string(r.convergence_alloc_count) + "*";
-        } else {
-            converge_str = std::to_string(r.convergence_alloc_count);
-        }
+        converge_str = std::to_string(r.convergence_alloc_count);
+        if (r.converged_in_extra_run) converge_str += "*";
     }
 
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
@@ -382,6 +647,39 @@ static void printResult(const BenchResult& r) {
               << converge_str << std::endl;
 }
 
+static void printScaleOutHeader() {
+    std::cout << std::string(175, '-') << std::endl;
+    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
+              << "Segs" << std::setw(14) << "AllocSize" << std::setw(9)
+              << "Replica" << std::right << std::setw(14) << "Throughput"
+              << std::setw(12) << "Avg(ns)" << std::setw(12) << "P99(ns)"
+              << std::setw(14) << "StdDev@Trig" << std::setw(14)
+              << "StdDev@Inj" << std::setw(16) << "ReConvAllocs"
+              << std::setw(16) << "NewNodeUtil%" << std::endl;
+    std::cout << std::string(175, '-') << std::endl;
+}
+
+static void printScaleOutResult(const ScaleOutResult& r) {
+    double final_new_util = r.new_node_util_over_time.empty()
+                                ? 0.0
+                                : r.new_node_util_over_time.back();
+
+    std::string reconverge_str =
+        r.re_converge_allocs > 0 ? std::to_string(r.re_converge_allocs) : "N/A";
+
+    std::cout << std::left << std::setw(18) << r.base.strategy_name
+              << std::setw(9) << r.base.num_segments << std::setw(14)
+              << (std::to_string(r.base.alloc_size / KiB) + "KB")
+              << std::setw(9) << r.base.replica_num << std::right << std::fixed
+              << std::setprecision(0) << std::setw(14) << r.base.throughput
+              << std::setw(12) << r.base.avg_ns << std::setw(12)
+              << r.base.p99_ns << std::setprecision(4) << std::setw(14)
+              << r.stddev_before_scale << std::setw(14)
+              << r.stddev_just_after_scale << std::setw(16) << reconverge_str
+              << std::setprecision(1) << std::setw(16)
+              << (final_new_util * 100.0) << std::endl;
+}
+
 // ============================================================
 //  Matrix benchmark (--run_all)
 // ============================================================
@@ -391,21 +689,18 @@ static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {
         64 * KiB, 1 * MiB, 4 * MiB, 32 * MiB
-        /*128 * MiB*/};  // Tested up to 128MB //
-                         // TODO：128MB需要分配更大的内存，现在还没有逻辑，默认64GB
-                         // segment size不够分配。用过大的seg
-                         // size会导致stddev偏差太小。
+        /*128 * MiB*/};  // Tested up to 128MB
+                         // TODO: 有几个case,副本总容量不够分配足够多的次数;
+                         //       allocate应该是静默失败了; 是否要处理?
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
         AllocationStrategyType::FREE_RATIO_FIRST,
     };
     std::vector<bool> skewed_options = {false, true};
-    // TODO: skew是怎么设置的，能模拟突然加入的节点的场景吗？
 
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
 
-    // TODO：for循环收敛一点；一些配置数组直接放到cfg里，宁可搞cfg数组也不要搞那么多层for循环。
     for (auto skew : skewed_options) {
         for (auto strategy : strategies) {
             printHeader();
@@ -418,30 +713,15 @@ static void runAllBenchmarks() {
 
                         BenchConfig cfg;
                         cfg.num_segments = segs;
-
-                        // Scale segment capacity to prevent OOM when allocating
-                        // 128MB. Since OffsetBufferAllocator only stores
-                        // metadata, we can safely simulate realistic 80GB VRAM
-                        // sizes.
-                        size_t required_capacity = 0;
-                        // (asize * rep * FLAGS_num_allocations) /
-                        // std::max(1, segs);
-                        size_t configured_capacity =
-                            FLAGS_segment_capacity * MiB;
-                        // size_t realistic_capacity = 80ULL * 1024 * MiB;  //
-                        // 80GB
-                        size_t realistic_capacity =
-                            0;  // TODO: 暂时先不用这个max 80GB
-                        cfg.segment_capacity = std::max(
-                            {configured_capacity, required_capacity * 2,
-                             realistic_capacity});  // TODO：直接默认80GB不行吗？那就不好对比偏差了；按默认64MB的来吧；不对啊，应该检测到128MB的再扩成80GB？或者其他建议的值；
-
+                        cfg.segment_capacity =
+                            static_cast<size_t>(FLAGS_segment_capacity) * MiB;
                         cfg.alloc_size = asize;
                         cfg.replica_num = rep;
                         cfg.num_allocations = FLAGS_num_allocations;
                         cfg.skewed = skew;
                         cfg.strategy_type = strategy;
                         cfg.strategy_name = strategyName(strategy);
+                        cfg.workload_type = WorkloadType::FILL_UP;
 
                         auto result = runBenchmark(cfg);
                         printResult(result);
@@ -451,6 +731,55 @@ static void runAllBenchmarks() {
         }
     }
 }
+
+// ============================================================
+//  Scale-Out benchmark runner
+// ============================================================
+
+static void runScaleOutBenchmark(
+    const std::vector<AllocationStrategyType>& strategies) {
+    std::cout << "\n=== Scale-Out Workload Benchmark ===\n";
+    std::cout << "Configuration:\n";
+    std::cout << "  Initial segments:    " << FLAGS_num_segments << "\n";
+    std::cout << "  New segments:        " << FLAGS_scale_out_new_segments
+              << " (injected at " << FLAGS_scale_out_trigger_pct << "%)\n";
+    std::cout << "  Alloc size:          " << FLAGS_alloc_size << " KB\n";
+    std::cout << "  Replica num:         " << FLAGS_replica_num << "\n";
+    std::cout << "  Num allocations:     " << FLAGS_num_allocations << "\n\n";
+
+    printScaleOutHeader();
+
+    for (auto strategy : strategies) {
+        BenchConfig cfg;
+        cfg.num_segments = FLAGS_num_segments;
+        cfg.segment_capacity =
+            static_cast<size_t>(FLAGS_segment_capacity) * MiB;
+        cfg.alloc_size = static_cast<size_t>(FLAGS_alloc_size) * KiB;
+        cfg.replica_num = FLAGS_replica_num;
+        cfg.num_allocations = FLAGS_num_allocations;
+        cfg.skewed = FLAGS_skewed;
+        cfg.strategy_type = strategy;
+        cfg.strategy_name = strategyName(strategy);
+        cfg.workload_type = WorkloadType::SCALE_OUT;
+        cfg.scale_out_trigger_pct = FLAGS_scale_out_trigger_pct;
+        cfg.scale_out_new_segments = FLAGS_scale_out_new_segments;
+
+        ScaleOutResult scaleout_res;
+        scaleout_res.stddev_before_scale = 0;
+        scaleout_res.stddev_just_after_scale = 0;
+        scaleout_res.re_converge_allocs = -1;
+
+        scaleout_res.base = runBenchmark(cfg, &scaleout_res);
+        printScaleOutResult(scaleout_res);
+    }
+    std::cout << "\n* ReConvAllocs: number of allocations AFTER injection for "
+                 "stddev to drop below 0.05\n";
+    std::cout << "* NewNodeUtil%: final average utilization of injected nodes\n";
+}
+
+// ============================================================
+//  main
+// ============================================================
 
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
@@ -463,7 +792,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Single strategy run
+    // Resolve strategies
     std::vector<AllocationStrategyType> strategies_to_run;
     if (FLAGS_strategy == "all") {
         strategies_to_run = {AllocationStrategyType::RANDOM,
@@ -472,6 +801,14 @@ int main(int argc, char* argv[]) {
         strategies_to_run = {parseStrategy(FLAGS_strategy)};
     }
 
+    WorkloadType wl = parseWorkload(FLAGS_workload);
+
+    if (wl == WorkloadType::SCALE_OUT) {
+        runScaleOutBenchmark(strategies_to_run);
+        return 0;
+    }
+
+    // Default: Fill-Up
     std::cout << "\n=== AllocationStrategy Benchmark ===" << std::endl;
     std::cout << "Configuration:" << std::endl;
     std::cout << "  Segments:        " << FLAGS_num_segments << std::endl;
@@ -498,6 +835,7 @@ int main(int argc, char* argv[]) {
         cfg.skewed = FLAGS_skewed;
         cfg.strategy_type = strategy;
         cfg.strategy_name = strategyName(strategy);
+        cfg.workload_type = WorkloadType::FILL_UP;
 
         auto result = runBenchmark(cfg);
         printResult(result);
