@@ -17,3 +17,15 @@ target_link_libraries(storage_backend_bench PRIVATE
     glog::glog
     pthread
 )
+
+# Add allocation strategy benchmark executable
+# This benchmark tests AllocationStrategy performance with configurable
+# segment counts, allocation sizes, replica counts, and workload patterns
+add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
+target_link_libraries(allocation_strategy_bench PRIVATE
+    mooncake_store
+    cachelib_memory_allocator
+    gflags::gflags
+    spdlog::spdlog
+    pthread
+)
