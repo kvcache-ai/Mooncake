@@ -556,6 +556,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
 
+int RealClient::health_check() {
+    if (closed_.load()) return 1;
+    if (!client_) return 1;
+    if (!client_->is_ping_healthy()) return 2;
+    return 0;
+}
+
 tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,

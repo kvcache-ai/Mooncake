@@ -245,6 +245,8 @@ class RealClient : public PyClient {
 
     int tearDownAll();
 
+    int health_check() override;
+
     /**
      * @brief Check if an object exists
      * @param key Key to check
