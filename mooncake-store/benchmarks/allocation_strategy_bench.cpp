@@ -137,12 +137,15 @@ struct ScaleOutResult {
     BenchResult base;
 
     // stddev snapshots around the scale-out event
-    double stddev_before_scale;
-    double stddev_just_after_scale;
+    double stddev_before_scale = 0.0;
+    double stddev_just_after_scale = 0.0;
 
-    // How many allocs (after trigger) until stddev re-converges
+    // Alloc index at which injection happened
+    int trigger_alloc_idx = -1;
+
+    // How many allocs (after trigger) until stddev re-converges below 0.05
     // -1 = never re-converged within the remaining allocs
-    int re_converge_allocs;
+    int re_converge_allocs = -1;
 
     // Utilization of the newly added nodes sampled over time (post-injection)
     std::vector<double> new_node_util_over_time;
@@ -428,12 +431,8 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
                     /*id_offset=*/cfg.num_segments);
                 out_->stddev_just_after_scale =
                     computeUtilizationStdDev(manager);
+                out_->trigger_alloc_idx = i;
                 injected = true;
-                std::cout << "  [ScaleOut] Injected " << cfg.scale_out_new_segments
-                          << " new segments at alloc #" << i
-                          << "  (stddev: " << std::fixed << std::setprecision(4)
-                          << out_->stddev_before_scale << " -> "
-                          << out_->stddev_just_after_scale << ")\n";
             }
 
             // --- Allocate ---
@@ -660,37 +659,70 @@ static void printResult(const BenchResult& r) {
               << converge_str << std::endl;
 }
 
-static void printScaleOutHeader() {
-    std::cout << std::string(175, '-') << std::endl;
-    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
-              << "Segs" << std::setw(14) << "AllocSize" << std::setw(9)
-              << "Replica" << std::right << std::setw(14) << "Throughput"
-              << std::setw(12) << "Avg(ns)" << std::setw(12) << "P99(ns)"
-              << std::setw(14) << "StdDev@Trig" << std::setw(14)
-              << "StdDev@Inj" << std::setw(16) << "ReConvAllocs"
-              << std::setw(16) << "NewNodeUtil%" << std::endl;
-    std::cout << std::string(175, '-') << std::endl;
-}
+// Print two-section Scale-Out report for a list of results.
+// Section 1: Baseline perf (throughput/latency) — what the strategy costs.
+// Section 2: Adoption speed — how fast new nodes get utilized.
+static void printScaleOutReport(
+    const std::vector<ScaleOutResult>& results, const BenchConfig& cfg) {
+    const std::string sep(100, '-');
+    const std::string thin_sep(100, ' ');
 
-static void printScaleOutResult(const ScaleOutResult& r) {
-    double final_new_util = r.new_node_util_over_time.empty()
-                                ? 0.0
-                                : r.new_node_util_over_time.back();
+    // ---- Section 1: Performance baseline --------------------------------
+    std::cout << "\n  [Phase 1 & 2 : Performance Baseline]\n";
+    std::cout << "  Measured over all " << cfg.num_allocations
+              << " allocations (both phases)\n";
+    std::cout << sep << "\n";
+    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(14)
+              << "Throughput" << std::setw(12) << "Avg(ns)" << std::setw(12)
+              << "P50(ns)" << std::setw(12) << "P90(ns)" << std::setw(12)
+              << "P99(ns)" << "\n";
+    std::cout << sep << "\n";
+    for (const auto& r : results) {
+        std::cout << std::left << std::setw(18) << r.base.strategy_name
+                  << std::right << std::fixed << std::setprecision(0)
+                  << std::setw(14) << r.base.throughput << std::setw(12)
+                  << r.base.avg_ns << std::setw(12) << r.base.p50_ns
+                  << std::setw(12) << r.base.p90_ns << std::setw(12)
+                  << r.base.p99_ns << "\n";
+    }
 
-    std::string reconverge_str =
-        r.re_converge_allocs > 0 ? std::to_string(r.re_converge_allocs) : "N/A";
-
-    std::cout << std::left << std::setw(18) << r.base.strategy_name
-              << std::setw(9) << r.base.num_segments << std::setw(14)
-              << (std::to_string(r.base.alloc_size / KiB) + "KB")
-              << std::setw(9) << r.base.replica_num << std::right << std::fixed
-              << std::setprecision(0) << std::setw(14) << r.base.throughput
-              << std::setw(12) << r.base.avg_ns << std::setw(12)
-              << r.base.p99_ns << std::setprecision(4) << std::setw(14)
-              << r.stddev_before_scale << std::setw(14)
-              << r.stddev_just_after_scale << std::setw(16) << reconverge_str
-              << std::setprecision(1) << std::setw(16)
-              << (final_new_util * 100.0) << std::endl;
+    // ---- Section 2: Scale-Out adoption metrics --------------------------
+    std::cout << "\n  [Scale-Out Adoption Metrics]\n";
+    std::cout << "  Injection point: alloc #" << results[0].trigger_alloc_idx
+              << " (+" << cfg.scale_out_new_segments << " nodes)\n";
+    std::cout << sep << "\n";
+    // Column headers
+    std::cout << std::left << std::setw(18) << "Strategy";
+    // stddev columns
+    std::cout << std::right << std::setw(16) << "StdDev(pre-inj)";
+    std::cout << std::setw(16) << "StdDev(post-inj)";
+    std::cout << std::setw(16) << "ReConvAllocs";
+    std::cout << std::setw(16) << "NewNodeUtil%(f)";
+    std::cout << "\n";
+    std::cout << sep << "\n";
+    for (const auto& r : results) {
+        double final_new_util = r.new_node_util_over_time.empty()
+                                    ? 0.0
+                                    : r.new_node_util_over_time.back();
+        std::string reconverge_str = r.re_converge_allocs > 0
+                                         ? std::to_string(r.re_converge_allocs)
+                                         : "N/A";
+        std::cout << std::left << std::setw(18) << r.base.strategy_name
+                  << std::right << std::fixed << std::setprecision(4)
+                  << std::setw(16) << r.stddev_before_scale << std::setw(16)
+                  << r.stddev_just_after_scale << std::setw(16) << reconverge_str
+                  << std::setprecision(1) << std::setw(15)
+                  << (final_new_util * 100.0) << "%\n";
+    }
+    std::cout << "\n";
+    std::cout << "  StdDev(pre-inj):  utilization std-dev of original nodes at"
+                 " injection\n";
+    std::cout << "  StdDev(post-inj): std-dev spike right after injection"
+                 " (new nodes are empty)\n";
+    std::cout << "  ReConvAllocs:     allocs AFTER injection to re-settle below"
+                 " stddev=0.05\n";
+    std::cout << "  NewNodeUtil%(f):  final avg utilization of injected"
+                 " nodes\n";
 }
 
 // ============================================================
@@ -751,43 +783,42 @@ static void runAllBenchmarks() {
 
 static void runScaleOutBenchmark(
     const std::vector<AllocationStrategyType>& strategies) {
-    std::cout << "\n=== Scale-Out Workload Benchmark ===\n";
-    std::cout << "Configuration:\n";
-    std::cout << "  Initial segments:    " << FLAGS_num_segments << "\n";
-    std::cout << "  New segments:        " << FLAGS_scale_out_new_segments
-              << " (injected at " << FLAGS_scale_out_trigger_pct << "%)\n";
-    std::cout << "  Alloc size:          " << FLAGS_alloc_size << " KB\n";
-    std::cout << "  Replica num:         " << FLAGS_replica_num << "\n";
-    std::cout << "  Num allocations:     " << FLAGS_num_allocations << "\n\n";
+    // Build a shared BenchConfig (same for all strategies in a single run)
+    BenchConfig cfg;
+    cfg.num_segments = FLAGS_num_segments;
+    cfg.segment_capacity = static_cast<size_t>(FLAGS_segment_capacity) * MiB;
+    cfg.alloc_size = static_cast<size_t>(FLAGS_alloc_size) * KiB;
+    cfg.replica_num = FLAGS_replica_num;
+    cfg.num_allocations = FLAGS_num_allocations;
+    cfg.skewed = FLAGS_skewed;
+    cfg.workload_type = WorkloadType::SCALE_OUT;
+    cfg.scale_out_trigger_pct = FLAGS_scale_out_trigger_pct;
+    cfg.scale_out_new_segments = FLAGS_scale_out_new_segments;
 
-    printScaleOutHeader();
+    std::cout << "\n=== Scale-Out Workload Benchmark ==="
+              << "\n  Initial segments : " << cfg.num_segments
+              << "  |  New segments  : " << cfg.scale_out_new_segments
+              << " (injected at " << cfg.scale_out_trigger_pct << "% = alloc #"
+              << cfg.num_allocations * cfg.scale_out_trigger_pct / 100 << ")"
+              << "\n  Alloc size       : " << FLAGS_alloc_size << " KB"
+              << "  |  Replica num   : " << cfg.replica_num
+              << "  |  Total allocs  : " << cfg.num_allocations << "\n";
+
+    // --- Collect results for all strategies first, then print ---
+    std::vector<ScaleOutResult> all_results;
+    all_results.reserve(strategies.size());
 
     for (auto strategy : strategies) {
-        BenchConfig cfg;
-        cfg.num_segments = FLAGS_num_segments;
-        cfg.segment_capacity =
-            static_cast<size_t>(FLAGS_segment_capacity) * MiB;
-        cfg.alloc_size = static_cast<size_t>(FLAGS_alloc_size) * KiB;
-        cfg.replica_num = FLAGS_replica_num;
-        cfg.num_allocations = FLAGS_num_allocations;
-        cfg.skewed = FLAGS_skewed;
         cfg.strategy_type = strategy;
         cfg.strategy_name = strategyName(strategy);
-        cfg.workload_type = WorkloadType::SCALE_OUT;
-        cfg.scale_out_trigger_pct = FLAGS_scale_out_trigger_pct;
-        cfg.scale_out_new_segments = FLAGS_scale_out_new_segments;
 
-        ScaleOutResult scaleout_res;
-        scaleout_res.stddev_before_scale = 0;
-        scaleout_res.stddev_just_after_scale = 0;
-        scaleout_res.re_converge_allocs = -1;
-
-        scaleout_res.base = runBenchmark(cfg, &scaleout_res);
-        printScaleOutResult(scaleout_res);
+        ScaleOutResult res;
+        res.base = runBenchmark(cfg, &res);
+        all_results.push_back(std::move(res));
     }
-    std::cout << "\n* ReConvAllocs: number of allocations AFTER injection for "
-                 "stddev to drop below 0.05\n";
-    std::cout << "* NewNodeUtil%: final average utilization of injected nodes\n";
+
+    // --- Print formatted report ---
+    printScaleOutReport(all_results, cfg);
 }
 
 // ============================================================
@@ -816,7 +847,7 @@ int main(int argc, char* argv[]) {
 
     WorkloadType wl = parseWorkload(FLAGS_workload);
 
-    if (wl == WorkloadType::SCALE_OUT) { // TODO: 这里函数出口也太不同意了
+    if (wl == WorkloadType::SCALE_OUT) { // TODO: 这里函数出口也太不统一了
         runScaleOutBenchmark(strategies_to_run);
         return 0;
     }
