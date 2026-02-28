@@ -547,17 +547,30 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
                   latencies.size();
 
     // --- Find convergence point (fill-up semantics) ---
+    // We track the START of the last stable convergence window:
+    // - When stddev drops below the threshold, record the alloc count if we
+    //   haven't already started a window.
+    // - When stddev rises back above the threshold, reset (the strategy
+    //   diverged again, so the previous window doesn't count as stable).
+    // This way converged_at reflects when the strategy *finally* settled.
     const double convergence_threshold = 0.05;
-    int min_allocs_to_converge = std::max(1, cfg.num_allocations / 10);
     int converged_at = -1;
+    bool in_converged_window = false;
 
     for (size_t i = 0; i < stddev_over_time.size(); ++i) {
         int allocs_done =
             static_cast<int>((i + 1) * FLAGS_convergence_sample_interval);
-        if (allocs_done >= min_allocs_to_converge &&
-            stddev_over_time[i] < convergence_threshold) {
-            converged_at = allocs_done;
-            break;
+        if (stddev_over_time[i] < convergence_threshold) {
+            if (!in_converged_window) {
+                // Record the start of this convergence window
+                converged_at = allocs_done;
+                in_converged_window = true;
+            }
+            // else: already in a stable window, keep the earlier start
+        } else {
+            // Diverged — reset; the next time it drops will start a new window
+            converged_at = -1;
+            in_converged_window = false;
         }
     }
 
@@ -803,7 +816,7 @@ int main(int argc, char* argv[]) {
 
     WorkloadType wl = parseWorkload(FLAGS_workload);
 
-    if (wl == WorkloadType::SCALE_OUT) {
+    if (wl == WorkloadType::SCALE_OUT) { // TODO: 这里函数出口也太不同意了
         runScaleOutBenchmark(strategies_to_run);
         return 0;
     }
