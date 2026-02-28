@@ -208,6 +208,8 @@ class PyClient {
 
     virtual int tearDownAll() = 0;
 
+    virtual int health_check() = 0;
+
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;
 
