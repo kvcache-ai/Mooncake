@@ -1635,9 +1635,8 @@ std::vector<int> Client::GetNicNumaNodes() const {
     if (!transfer_engine_) return {};
     auto topo = transfer_engine_->getLocalTopology();
     if (!topo) return {};
-    for (auto &[name, entry] : topo->getMatrix()) {
-        if (name.rfind("cpu:", 0) != 0 || entry.preferred_hca.empty())
-            continue;
+    for (auto& [name, entry] : topo->getMatrix()) {
+        if (name.rfind("cpu:", 0) != 0 || entry.preferred_hca.empty()) continue;
         int node = std::stoi(name.substr(4));
         nodes.insert(node);
     }
@@ -1669,8 +1668,8 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         }
     }
 
-    int rc = transfer_engine_->registerLocalMemory(
-        (void*)buffer, size, location, true, true);
+    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+                                                   location, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
                    << " size=" << size << ", error=" << rc;

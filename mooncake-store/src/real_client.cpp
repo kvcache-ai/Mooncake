@@ -304,11 +304,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
 
-        // In standalone mode (ipc_socket_path set), auto-discover NUMA nodes
-        // with RDMA NICs and distribute global_segment across them so that
-        // all NICs can serve RDMA traffic.
+        // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
+        // and distribute global_segment across them for full NIC utilization.
         std::vector<int> seg_numa_nodes;
-        if (!ipc_socket_path_.empty()) {
+        if (!ipc_socket_path_.empty() && protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
             if (seg_numa_nodes.size() > 1) {
                 std::string nodes_str;
@@ -316,9 +315,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     if (i) nodes_str += ",";
                     nodes_str += std::to_string(seg_numa_nodes[i]);
                 }
-                LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=[" << nodes_str << "]";
+                LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
+                          << nodes_str << "]";
             } else {
-                seg_numa_nodes.clear();  // single NUMA, no need to segment
+                seg_numa_nodes.clear();
             }
         }
 
@@ -338,9 +338,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
-                mapped_size = align_up(segment_size, page_sz * seg_numa_nodes.size());
-                ptr = allocate_buffer_numa_segments(
-                    mapped_size, seg_numa_nodes, page_sz);
+                mapped_size =
+                    align_up(segment_size, page_sz * seg_numa_nodes.size());
+                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
+                                                    page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
             } else if (should_use_hugepage) {
                 mapped_size =
