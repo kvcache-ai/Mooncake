@@ -273,24 +273,16 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 
     // --- Find convergence point ---
     // A strategy is considered converged if the utilization stddev is below the threshold
-    // AND the overall cluster utilization is at least 10% (to ignore the initial empty state)
+    // AND we have completed at least 10% of the total configured allocations
+    // to avoid false positives when the cluster is almost empty.
     int converged_at = -1;
     const double convergence_threshold = 0.05;
-    const double min_utilization_to_converge = 0.10; // 10%
-
-    double total_capacity = 0;
-    for (const auto& name : manager.getNames()) {
-        const auto* allocs = manager.getAllocators(name);
-        if (allocs) {
-            for (const auto& a : *allocs) total_capacity += a->capacity();
-        }
-    }
+    int min_allocs_to_converge = std::max(1, cfg.num_allocations / 10);
 
     for (size_t i = 0; i < stddev_over_time.size(); ++i) {
         int allocs_done = static_cast<int>((i + 1) * sample_interval);
-        double current_utilization = (allocs_done * cfg.alloc_size * cfg.replica_num) / total_capacity;
 
-        if (current_utilization >= min_utilization_to_converge && stddev_over_time[i] < convergence_threshold) {
+        if (allocs_done >= min_allocs_to_converge && stddev_over_time[i] < convergence_threshold) {
             converged_at = allocs_done;
             break;
         }
