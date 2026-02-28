@@ -39,7 +39,7 @@ transfer_engine_t createTransferEngine(const char *metadata_conn_string,
 int getLocalIpAndPort(transfer_engine_t engine, char *buf_out, size_t buf_len) {
     TransferEngine *native = (TransferEngine *)engine;
     auto str = native->getLocalIpAndPort();
-    strncpy(buf_out, str.c_str(), buf_len);
+    snprintf(buf_out, buf_len, "%s", str.c_str());
     return 0;
 }
 
