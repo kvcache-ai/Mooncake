@@ -128,6 +128,7 @@ struct BenchResult {
     double p99_ns;
 
     double final_util_stddev;
+    double avg_util = 0.0;          // average utilization ratio across all segments
     int convergence_alloc_count;  // -1 if not converged
     bool converged_in_extra_run =
         false;  // true if it converged in the lookahead loop
@@ -210,6 +211,27 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
         new_allocs.push_back(allocator);
     }
     return new_allocs;
+}
+
+/**
+ * @brief Compute average utilization ratio across all segments.
+ */
+static double computeAverageUtilAll(const AllocatorManager& manager) {
+    const auto& names = manager.getNames();
+    if (names.empty()) return 0.0;
+    double sum = 0.0;
+    int count = 0;
+    for (const auto& name : names) {
+        const auto* allocators = manager.getAllocators(name);
+        if (!allocators || allocators->empty()) continue;
+        for (const auto& alloc : *allocators) {
+            double cap = static_cast<double>(alloc->capacity());
+            if (cap == 0) continue;
+            sum += static_cast<double>(alloc->size()) / cap;
+            ++count;
+        }
+    }
+    return count > 0 ? sum / count : 0.0;
 }
 
 /**
@@ -553,6 +575,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     //   diverged again, so the previous window doesn't count as stable).
     // This way converged_at reflects when the strategy *finally* settled.
     const double convergence_threshold = 0.05;
+    double first_converge_stddev = -1;
     int converged_at = -1;
     bool in_converged_window = false;
 
@@ -564,12 +587,14 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
                 // Record the start of this convergence window
                 converged_at = allocs_done;
                 in_converged_window = true;
+                first_converge_stddev = stddev_over_time[i];
             }
             // else: already in a stable window, keep the earlier start
         } else {
             // Diverged — reset; the next time it drops will start a new window
             converged_at = -1;
             in_converged_window = false;
+            first_converge_stddev = -1;
         }
     }
 
@@ -613,7 +638,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     res.p50_ns = percentile(0.50);
     res.p90_ns = percentile(0.90);
     res.p99_ns = percentile(0.99);
-    res.final_util_stddev = final_stddev;
+    res.final_util_stddev = converged_at == -1 ? final_stddev : first_converge_stddev; // TODO: would it be better to output both first_converge_stddev and final_stddev?
+    res.avg_util = computeAverageUtilAll(manager);
     res.convergence_alloc_count = converged_at;
     res.converged_in_extra_run = converged_in_extra_run;
 
@@ -629,15 +655,16 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
 // ============================================================
 
 static void printHeader() {
-    std::cout << std::string(145, '-') << std::endl;
+    std::cout << std::string(157, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
               << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
               << "Replica" << std::setw(8) << "Skewed" << std::right
               << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
-              << std::setw(12) << "P99(ns)" << std::setw(12) << "UtilStdDev"
+              << std::setw(12) << "P99(ns)" << std::setw(12) << "UtilStdDev" // when first converged
+              << std::setw(10) << "AvgUtil%"
               << std::setw(14) << "Converge@" << std::endl;
-    std::cout << std::string(145, '-') << std::endl;
+    std::cout << std::string(157, '-') << std::endl;
 }
 
 static void printResult(const BenchResult& r) {
@@ -655,8 +682,9 @@ static void printResult(const BenchResult& r) {
               << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
-              << std::setw(12) << r.final_util_stddev << std::setw(14)
-              << converge_str << std::endl;
+              << std::setw(12) << r.final_util_stddev
+              << std::setprecision(1) << std::setw(9) << (r.avg_util * 100.0) << "%"
+              << std::setw(14) << converge_str << std::endl;
 }
 
 // Print two-section Scale-Out report for a list of results.
