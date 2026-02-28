@@ -77,7 +77,7 @@ void loadGlobalConfig(GlobalConfig &config) {
     const char *max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
     if (max_ep_per_ctx_env) {
         size_t val = atoi(max_ep_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
+        if (val > 0 && val <= UINT32_MAX)
             config.max_ep_per_ctx = val;
         else
             LOG(WARNING)
