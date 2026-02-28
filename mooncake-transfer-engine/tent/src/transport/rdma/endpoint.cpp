@@ -494,9 +494,10 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
     if (wr_count <= 0 || !reserveQuota(qp_index, wr_count)) return 0;
 
-    ibv_send_wr wr_list[wr_count], *bad_wr = nullptr;
-    ibv_sge sge_list[sge_count];
-    memset(wr_list, 0, sizeof(ibv_send_wr) * wr_count);
+    std::vector<ibv_send_wr> wr_list(wr_count);
+    std::vector<ibv_sge> sge_list(sge_count);
+    ibv_send_wr* bad_wr = nullptr;
+    memset(wr_list.data(), 0, sizeof(ibv_send_wr) * wr_count);
     int sge_idx = 0;
 
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
@@ -526,11 +527,11 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         sge_idx += wr.num_sge;
     }
 
-    int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
+    int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
     if (rc) {
         PLOG(ERROR) << "ibv_post_send";
         while (bad_wr) {
-            slice_list[bad_wr - wr_list]->failed = true;
+            slice_list[bad_wr - wr_list.data()]->failed = true;
             cancelQuota(qp_index, 1);
             bad_wr = bad_wr->next;
         }
