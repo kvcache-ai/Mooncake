@@ -689,6 +689,7 @@ void DummyClient::ping_thread_main() {
         if (ping_result.has_value() &&
             ping_result.value().client_status == ClientStatus::OK) {
             ping_fail_count = 0;
+            last_ping_healthy_.store(true);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
             continue;
@@ -696,6 +697,7 @@ void DummyClient::ping_thread_main() {
 
         // Ping failed
         ping_fail_count++;
+        last_ping_healthy_.store(false);
         LOG(WARNING) << "Ping failed " << ping_fail_count << "/"
                      << max_ping_fail_count;
 
@@ -748,6 +750,12 @@ void DummyClient::ping_thread_main() {
                 std::chrono::milliseconds(fail_ping_interval_ms));
         }
     }
+}
+
+int DummyClient::health_check() {
+    if (!connected_) return 1;
+    if (!last_ping_healthy_.load()) return 2;
+    return 0;
 }
 
 int DummyClient::request_hot_cache_fd() {
