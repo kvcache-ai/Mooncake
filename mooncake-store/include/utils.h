@@ -337,6 +337,23 @@ inline size_t align_up(size_t size, size_t alignment) {
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
 
+/**
+ * @brief Allocate a contiguous buffer with per-NUMA-region binding.
+ *
+ * Reserves a single VMA via mmap, divides it into N equal regions,
+ * binds each region to the corresponding NUMA node via mbind(MPOL_BIND),
+ * then prefaults all pages with madvise(MADV_POPULATE_WRITE).
+ * Pages are allocated directly on the target NUMA — no migration.
+ *
+ * @param total_size  Total buffer size in bytes
+ * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})
+ * @param page_size   Page size for alignment (0 = auto-detect via getpagesize())
+ * @return Pointer to the allocated buffer, or nullptr on failure
+ */
+void* allocate_buffer_numa_segments(size_t total_size,
+                                    const std::vector<int>& numa_nodes,
+                                    size_t page_size = 0);
+
 void free_memory(const std::string& protocol, void* ptr);
 
 // Network utility functions
