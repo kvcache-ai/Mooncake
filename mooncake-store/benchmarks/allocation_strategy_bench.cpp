@@ -359,15 +359,15 @@ static void runAllBenchmarks() {
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
     printHeader();
 
-    for (auto strategy : strategies) {
-        for (auto segs : segment_counts) {
-            for (auto asize : alloc_sizes) {
-                for (auto rep : replica_nums) {
-                    // Skip impossible configs: can't have more replicas than
-                    // segments
-                    if (rep > segs) continue;
+    // TODO：for循环收敛一点
+    for (auto skew : skewed_options) {
+        for (auto strategy : strategies) {
+            for (auto segs : segment_counts) {
+                for (auto asize : alloc_sizes) {
+                    for (auto rep : replica_nums) {
+                        // Skip impossible configs: can't have more replicas than segments
+                        if (rep > segs) continue; // TODO： 感觉也能测？
 
-                    for (auto skew : skewed_options) {
                         BenchConfig cfg;
                         cfg.num_segments = segs;
                         cfg.segment_capacity = FLAGS_segment_capacity * MiB;
