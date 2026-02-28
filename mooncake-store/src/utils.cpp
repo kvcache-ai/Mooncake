@@ -220,13 +220,13 @@ void *allocate_buffer_numa_segments(size_t total_size,
     }
 
     // bind each region to its NUMA node
-    int max_node = numa_num_configured_nodes();
+    int max_node = numa_num_possible_nodes();
     for (size_t i = 0; i < n; ++i) {
         struct bitmask *mask = numa_bitmask_alloc(max_node);
         numa_bitmask_setbit(mask, numa_nodes[i]);
         char *region = static_cast<char *>(ptr) + i * region_size;
-        long rc = mbind(region, region_size, MPOL_BIND, mask->maskp,
-                        mask->size + 1, 0);
+        long rc =
+            mbind(region, region_size, MPOL_BIND, mask->maskp, mask->size, 0);
         numa_bitmask_free(mask);
         if (rc != 0) {
             LOG(ERROR) << "mbind failed for NUMA " << numa_nodes[i]

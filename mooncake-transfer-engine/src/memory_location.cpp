@@ -115,23 +115,29 @@ bool parseSegmentsLocation(const std::string &name,
                            SegmentsLocationInfo &info) {
     if (name.rfind(kSegmentsLocationPrefix, 0) != 0) return false;
 
-    // "segments:<page_size>:<n0>,<n1>,..."
-    std::string body = name.substr(kSegmentsLocationPrefix.size());
-    auto colon = body.find(':');
-    if (colon == std::string::npos) return false;
+    try {
+        // "segments:<page_size>:<n0>,<n1>,..."
+        std::string body = name.substr(kSegmentsLocationPrefix.size());
+        auto colon = body.find(':');
+        if (colon == std::string::npos) return false;
 
-    info.page_size = std::stoull(body.substr(0, colon));
-    info.numa_nodes.clear();
+        info.page_size = std::stoull(body.substr(0, colon));
+        info.numa_nodes.clear();
 
-    std::string nodes_str = body.substr(colon + 1);
-    size_t pos = 0;
-    while (pos < nodes_str.size()) {
-        auto comma = nodes_str.find(',', pos);
-        std::string tok = (comma == std::string::npos)
-                              ? nodes_str.substr(pos)
-                              : nodes_str.substr(pos, comma - pos);
-        info.numa_nodes.push_back(std::stoi(tok));
-        pos = (comma == std::string::npos) ? nodes_str.size() : comma + 1;
+        std::string nodes_str = body.substr(colon + 1);
+        size_t pos = 0;
+        while (pos < nodes_str.size()) {
+            auto comma = nodes_str.find(',', pos);
+            std::string tok = (comma == std::string::npos)
+                                  ? nodes_str.substr(pos)
+                                  : nodes_str.substr(pos, comma - pos);
+            if (!tok.empty()) {
+                info.numa_nodes.push_back(std::stoi(tok));
+            }
+            pos = (comma == std::string::npos) ? nodes_str.size() : comma + 1;
+        }
+    } catch (const std::exception &) {
+        return false;
     }
     return !info.numa_nodes.empty();
 }
