@@ -386,6 +386,7 @@ static void printResult(const BenchResult& r) {
 //  Matrix benchmark (--run_all)
 // ============================================================
 
+// TODO: 加一个带deallocate的稳态运行case？但是我感觉deallocate只是在节点离开时才会出现？应该并不频繁吧？有必要吗？
 static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {
@@ -400,6 +401,7 @@ static void runAllBenchmarks() {
         AllocationStrategyType::FREE_RATIO_FIRST,
     };
     std::vector<bool> skewed_options = {false, true};
+    // TODO: skew是怎么设置的，能模拟突然加入的节点的场景吗？
 
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
 
