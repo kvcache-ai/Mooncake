@@ -524,6 +524,33 @@ check_vllm_server_ready(){
     return 1
 }
 
+check_vllm_proxy_ready(){
+    local proxy_log_path=$1
+    local ready_pattern=${2:-"All prefiller instances are ready."}
+    local max_attempts=${3:-120}
+
+    if [ -z "$proxy_log_path" ]; then
+        echo "ERROR: Proxy log path not provided" >&2
+        return 1
+    fi
+
+    echo "Waiting for proxy to be ready (checking: $proxy_log_path)..."
+    echo "Looking for pattern: '$ready_pattern'"
+    for i in $(seq 1 $max_attempts); do
+        if [ -f "$proxy_log_path" ]; then
+            if grep -q "$ready_pattern" "$proxy_log_path" 2>/dev/null; then
+                echo "Proxy is ready!"
+                return 0
+            fi
+            echo "Waiting... ($i/$max_attempts)"
+            sleep 2
+        fi
+    done
+    
+    echo "ERROR: Proxy failed to start within timeout"
+    return 1
+}
+
 wait_for_server_ready() {
     local host=$1
     local port=$2
