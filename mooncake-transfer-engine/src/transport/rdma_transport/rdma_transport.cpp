@@ -695,8 +695,8 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         std::string location = buffer.name;
         SegmentsLocationInfo seg_info;
         if (parseSegmentsLocation(buffer.name, seg_info)) {
-            location = resolveSegmentsLocation(
-                seg_info, buffer.length, offset - buffer.addr);
+            location = resolveSegmentsLocation(seg_info, buffer.length,
+                                               offset - buffer.addr);
         }
 
         device_id =

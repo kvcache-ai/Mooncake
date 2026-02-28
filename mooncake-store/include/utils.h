@@ -347,7 +347,8 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
  *
  * @param total_size  Total buffer size in bytes
  * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})
- * @param page_size   Page size for alignment (0 = auto-detect via getpagesize())
+ * @param page_size   Page size for alignment (0 = auto-detect via
+ * getpagesize())
  * @return Pointer to the allocated buffer, or nullptr on failure
  */
 void* allocate_buffer_numa_segments(size_t total_size,

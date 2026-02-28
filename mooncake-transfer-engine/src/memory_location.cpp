@@ -102,7 +102,8 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
 std::string buildSegmentsLocation(size_t page_size,
                                   const std::vector<int> &numa_nodes) {
-    std::string result = kSegmentsLocationPrefix + std::to_string(page_size) + ":";
+    std::string result =
+        kSegmentsLocationPrefix + std::to_string(page_size) + ":";
     for (size_t i = 0; i < numa_nodes.size(); ++i) {
         if (i > 0) result += ",";
         result += std::to_string(numa_nodes[i]);
@@ -110,7 +111,8 @@ std::string buildSegmentsLocation(size_t page_size,
     return result;
 }
 
-bool parseSegmentsLocation(const std::string &name, SegmentsLocationInfo &info) {
+bool parseSegmentsLocation(const std::string &name,
+                           SegmentsLocationInfo &info) {
     if (name.rfind(kSegmentsLocationPrefix, 0) != 0) return false;
 
     // "segments:<page_size>:<n0>,<n1>,..."
@@ -135,8 +137,7 @@ bool parseSegmentsLocation(const std::string &name, SegmentsLocationInfo &info) 
 }
 
 std::string resolveSegmentsLocation(const SegmentsLocationInfo &info,
-                                    uint64_t buffer_length,
-                                    uint64_t offset) {
+                                    uint64_t buffer_length, uint64_t offset) {
     size_t n = info.numa_nodes.size();
     if (n == 0) return kWildcardLocation;
     size_t region_size = buffer_length / n;
