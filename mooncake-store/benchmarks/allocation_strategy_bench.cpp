@@ -290,6 +290,11 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
 
     double final_stddev = computeUtilizationStdDev(manager);
 
+    // Only consider it converged if it REMAINED converged at the end
+    if (final_stddev >= convergence_threshold) {
+        converged_at = -1;
+    }
+
     if (!FLAGS_dump_distribution_file.empty()) {
         dumpDistribution(cfg, manager, FLAGS_dump_distribution_file);
     }
@@ -359,7 +364,7 @@ static void runAllBenchmarks() {
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
     printHeader();
 
-    // TODO：for循环收敛一点
+    // TODO：for循环收敛一点；一些配置数组直接放到cfg里，宁可搞cfg数组也不要搞那么多层for循环。
     for (auto skew : skewed_options) {
         for (auto strategy : strategies) {
             for (auto segs : segment_counts) {
