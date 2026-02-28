@@ -625,7 +625,7 @@ All random state uses a thread-local Mersenne Twister (`std::mt19937`), so no lo
 An improved strategy built on top of `RandomAllocationStrategy`. Instead of picking segments purely at random, it samples a small pool of candidates and selects the ones with the most free space. The allocation process for N replicas is:
 
 1. **Preferred segment phase**: Same as `random` — preferred segments are tried first in order.
-2. **Sampling phase**: Randomly picks a starting index and takes `min(6×remaining_replicas, total_segments)` consecutive segments as candidates. For each candidate, queries its free space ratio: `free_bytes / total_capacity`.
+2. **Sampling phase**: Randomly picks a starting index and takes `min(6*remaining_replicas, total_segments)` consecutive segments as candidates. For each candidate, queries its free space ratio: `free_bytes / total_capacity`.
 3. **Sorting phase**: Sorts the candidates in descending order by free space ratio (most free first).
 4. **Allocation phase**: Iterates through the sorted candidates from top to bottom, attempting to allocate from each. Excluded and already-used segments are skipped.
 5. **Fallback phase**: If insufficient replicas are allocated from the sorted candidates, falls back to the base `RandomAllocationStrategy` random iteration logic for the remaining replicas.
