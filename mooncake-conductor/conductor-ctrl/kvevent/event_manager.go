@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -136,31 +134,6 @@ func (m *EventManager) Stop() {
 	})
 }
 
-func parseEndpoint(ep string) (string, string, int, error) {
-	// Protocol parsing section
-	protocolEnd := strings.Index(ep, "://")
-	if protocolEnd == -1 {
-		return "", "", 0, fmt.Errorf("invalid endpoint format: %s", ep)
-	}
-	protocol := ep[:protocolEnd]
-
-	// Trim protocol header
-	trimmed := ep[protocolEnd+3:]
-	parts := strings.Split(trimmed, ":")
-	if len(parts) != 2 {
-		return "", "", 0, fmt.Errorf("invalid endpoint format: %s", ep)
-	}
-
-	ip := parts[0]
-	portStr := parts[1]
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("invalid port number: %w", err)
-	}
-
-	return protocol, ip, port, nil
-}
-
 func loraNameToID(name string) int64 {
 	if name == "" {
 		return 0
@@ -170,31 +143,28 @@ func loraNameToID(name string) int64 {
 	return int64(h.Sum64())
 }
 
+func makeServiceKey(instanceID, tenantID string) string {
+	return fmt.Sprintf("%s|%s", instanceID, tenantID)
+}
+
 func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
-	// Use InstanceID as the unique key (with Endpoint as a fallback).
-	svcKey := svc.InstanceID
-	if svcKey == "" {
-		svcKey = svc.Endpoint
+	// Use (instance_id, tenant_id) as composite key to support multi-tenant replicas
+	svcKey := makeServiceKey(svc.InstanceID, svc.TenantID)
+	if svc.InstanceID == "" {
+		svcKey = makeServiceKey(svc.Endpoint, svc.TenantID)
 	}
 
 	if _, exists := m.subscribers.Load(svcKey); exists {
 		return nil
 	}
 
-	// Parse the Endpoint to obtain the IP and Port
-	protocol, ip, port, err := parseEndpoint(svc.Endpoint)
-	if err != nil {
-		return fmt.Errorf("invalid endpoint format: %w", err)
+	// Validate endpoint
+	if svc.Endpoint == "" {
+		return fmt.Errorf("endpoint is required")
 	}
 
-	// Parse ReplayEndpoint
-	routerPort := port + 1 // Default degradation strategy
-	if svc.ReplayEndpoint != "" {
-		rProtocol, rIP, rPort, err := parseEndpoint(svc.ReplayEndpoint)
-		if err == nil {
-			routerPort = rPort
-		}
-	}
+	// Use ReplayEndpoint directly, fallback to empty if not provided
+	replayEndpoint := svc.ReplayEndpoint
 
 	// Construct an EventHandler to convert LoraName to LoraID to adapt to the old structure.
 	handler := &KVEventHandler{
@@ -207,13 +177,12 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	// Configure ZMQ Client
 	zmqConfig := &zmq.ZMQClientConfig{
 		CachePoolKey:   svcKey,
-		ServiceIP:      ip,
-		Port:           port,
+		Endpoint:       svc.Endpoint,
+		ReplayEndpoint: replayEndpoint,
 		ModelName:      svc.ModelName,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  5 * time.Second,
 		ReconnectDelay: 1 * time.Second,
-		RouterPort:     routerPort,
 	}
 
 	if err := zmq.ValidateConfig(zmqConfig); err != nil {
@@ -226,24 +195,31 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	}
 
 	m.subscribers.Store(svcKey, client)
-	m.activeConfigs.Store(svcKey, svc) // 记录 Config 用于反向查找
+	m.activeConfigs.Store(svcKey, svc)
 
 	slog.Info("Successfully subscribed to service",
 		"service_type", svc.Type,
-		"instance_id", svcKey,
-		"endpoint", svc.Endpoint,
+		"service_key", svcKey,
+		"instance_id", svc.InstanceID,
 		"tenant_id", svc.TenantID,
+		"endpoint", svc.Endpoint,
+		"replay_endpoint", replayEndpoint,
 	)
 
 	return nil
 }
 
-func (m *EventManager) unsubscribeFromService(instanceID string) {
-	if client, exists := m.subscribers.Load(instanceID); exists {
+func (m *EventManager) unsubscribeFromService(instanceID, tenantID string) {
+	svcKey := makeServiceKey(instanceID, tenantID)
+	if client, exists := m.subscribers.Load(svcKey); exists {
 		client.Stop()
-		m.subscribers.Delete(instanceID)
-		m.activeConfigs.Delete(instanceID)
-		slog.Info("Successfully unsubscribed from service", "instance_id", instanceID)
+		m.subscribers.Delete(svcKey)
+		m.activeConfigs.Delete(svcKey)
+		slog.Info("Successfully unsubscribed from service",
+			"service_key", svcKey,
+			"instance_id", instanceID,
+			"tenant_id", tenantID,
+		)
 	}
 }
 
@@ -398,8 +374,19 @@ func (m *EventManager) StartHTTPServer() error {
 			return true // Continue traversal
 		})
 
-		for _, instanceKey := range removedInstances {
-			m.unsubscribeFromService(instanceKey)
+		for _, svcKey := range removedInstances {
+			// Parse the composite key to get instance_id and tenant_id
+			var instanceID, tenantID string
+			parts := strings.SplitN(svcKey, "|", 2)
+			if len(parts) == 2 {
+				instanceID = parts[0]
+				tenantID = parts[1]
+			} else {
+				// Fallback for backward compatibility
+				instanceID = svcKey
+				tenantID = "default"
+			}
+			m.unsubscribeFromService(instanceID, tenantID)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
