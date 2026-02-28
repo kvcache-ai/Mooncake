@@ -212,6 +212,7 @@ struct BenchResult {
 
     double final_util_stddev;
     int convergence_alloc_count;  // -1 if not converged
+    bool converged_in_extra_run = false; // true if it converged in the lookahead loop
 };
 
 static BenchResult runBenchmark(const BenchConfig& cfg) {
@@ -329,7 +330,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     
     // Store extra convergence if it happened later
     if (converged_at == -1 && extra_converge_allocs > 0) {
-        res.convergence_alloc_count = -extra_converge_allocs; // Encode as negative to show it was an extended run
+        res.convergence_alloc_count = extra_converge_allocs;
+        res.converged_in_extra_run = true;
     }
     
     return res;
@@ -353,10 +355,11 @@ static void printHeader() {
 static void printResult(const BenchResult& r) {
     std::string converge_str = "N/A";
     if (r.convergence_alloc_count > 0) {
-        converge_str = std::to_string(r.convergence_alloc_count);
-    } else if (r.convergence_alloc_count < 0) {
-        // Did not converge in original run, but converged in extended run
-        converge_str = std::to_string(-r.convergence_alloc_count) + "*";
+        if (r.converged_in_extra_run) {
+            converge_str = std::to_string(r.convergence_alloc_count) + "*";
+        } else {
+            converge_str = std::to_string(r.convergence_alloc_count);
+        }
     }
 
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
