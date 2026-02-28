@@ -64,8 +64,7 @@ DEFINE_string(
     "File path to dump final segment utilization distribution (CSV format)");
 
 // Scale-Out workload flags
-DEFINE_string(workload, "fillup",
-              "Workload type: fillup (default), scaleout");
+DEFINE_string(workload, "fillup", "Workload type: fillup (default), scaleout");
 DEFINE_int32(scale_out_trigger_pct, 50,
              "Percentage of num_allocations after which new nodes are injected "
              "(scaleout mode only)");
@@ -109,7 +108,7 @@ struct BenchConfig {
 
     // Workload
     WorkloadType workload_type = WorkloadType::FILL_UP;
-    int scale_out_trigger_pct  = 50;
+    int scale_out_trigger_pct = 50;
     int scale_out_new_segments = 10;
 };
 
@@ -205,8 +204,8 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
         std::string name = "new_node_" + std::to_string(id_offset + i);
         uint64_t base_addr =
             0x800000000ULL + (static_cast<uint64_t>(id_offset + i) * capacity);
-        auto allocator =
-            std::make_shared<OffsetBufferAllocator>(name, base_addr, capacity, name);
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, base_addr, capacity, name);
         manager.addAllocator(name, allocator);
         new_allocs.push_back(allocator);
     }
@@ -371,8 +370,7 @@ class WorkloadRunner {
                      const BenchConfig& cfg, std::vector<double>& latencies,
                      std::vector<double>& stddev_over_time,
                      std::vector<double>& avg_util_over_time,
-                     double& out_final_avg_util,
-                     double& out_final_stddev) = 0;
+                     double& out_final_avg_util, double& out_final_stddev) = 0;
 };
 
 // ============================================================
@@ -390,8 +388,7 @@ class FillUpWorkloadRunner : public WorkloadRunner {
              const BenchConfig& cfg, std::vector<double>& latencies,
              std::vector<double>& stddev_over_time,
              std::vector<double>& avg_util_over_time,
-             double& out_final_avg_util,
-             double& out_final_stddev) override {
+             double& out_final_avg_util, double& out_final_stddev) override {
         const int sample_interval = FLAGS_convergence_sample_interval;
 
         // Hold allocated replicas to prevent immediate deallocation
@@ -419,7 +416,7 @@ class FillUpWorkloadRunner : public WorkloadRunner {
 
         // Compute final metrics while active_allocations is still alive
         out_final_avg_util = computeAverageUtilAll(manager);
-        out_final_stddev   = computeUtilizationStdDev(manager);
+        out_final_stddev = computeUtilizationStdDev(manager);
         // active_allocations destructs here → memory freed
     }
 };
@@ -453,8 +450,7 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
              const BenchConfig& cfg, std::vector<double>& latencies,
              std::vector<double>& stddev_over_time,
              std::vector<double>& avg_util_over_time,
-             double& out_final_avg_util,
-             double& out_final_stddev) override {
+             double& out_final_avg_util, double& out_final_stddev) override {
         const int sample_interval = FLAGS_convergence_sample_interval;
         const int trigger_at =
             cfg.num_allocations * cfg.scale_out_trigger_pct / 100;
@@ -520,7 +516,7 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
 
         // Compute final metrics while active_allocations is still alive
         out_final_avg_util = computeAverageUtilAll(manager);
-        out_final_stddev   = computeUtilizationStdDev(manager);
+        out_final_stddev = computeUtilizationStdDev(manager);
         // active_allocations destructs here → memory freed
     }
 
@@ -559,13 +555,11 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     latencies.reserve(cfg.num_allocations);
 
     std::vector<double> stddev_over_time;
-    stddev_over_time.reserve(cfg.num_allocations /
-                                 FLAGS_convergence_sample_interval +
-                             1);
+    stddev_over_time.reserve(
+        cfg.num_allocations / FLAGS_convergence_sample_interval + 1);
     std::vector<double> avg_util_over_time;
-    avg_util_over_time.reserve(cfg.num_allocations /
-                                   FLAGS_convergence_sample_interval +
-                               1);
+    avg_util_over_time.reserve(
+        cfg.num_allocations / FLAGS_convergence_sample_interval + 1);
 
     // --- Dispatch to WorkloadRunner ---
     std::unique_ptr<WorkloadRunner> runner;
@@ -595,11 +589,10 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
         return latencies[idx];
     };
 
-    double avg_ns =
-        latencies.empty()
-            ? 0.0
-            : std::accumulate(latencies.begin(), latencies.end(), 0.0) /
-                  latencies.size();
+    double avg_ns = latencies.empty() ? 0.0
+                                      : std::accumulate(latencies.begin(),
+                                                        latencies.end(), 0.0) /
+                                            latencies.size();
 
     // --- Find convergence point (fill-up semantics) ---
     // We track the START of the last stable convergence window:
@@ -638,14 +631,15 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
         }
     }
 
-    // final_stddev is captured inside the runner while allocations are still live
+    // final_stddev is captured inside the runner while allocations are still
+    // live
     double final_stddev = runner_final_stddev;
 
     // For fill-up mode: if still not converged, run a lookahead to see if it
     // ever converges
     // Lookahead logic is currently disabled (see commented block below).
-    // bool converged_in_extra_run = false; // TODO: disabled second conv change currently
-    // if (cfg.workload_type == WorkloadType::FILL_UP &&
+    // bool converged_in_extra_run = false; // TODO: disabled second conv change
+    // currently if (cfg.workload_type == WorkloadType::FILL_UP &&
     //     final_stddev >= convergence_threshold) {
     //     converged_at = -1;  // Reset false positive
 
@@ -653,7 +647,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     //     for (int i = 0; i < max_extra; ++i) {
     //         strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
     //         if (i > 0 && i % FLAGS_convergence_sample_interval == 0) {
-    //             if (computeUtilizationStdDev(manager) < convergence_threshold) {
+    //             if (computeUtilizationStdDev(manager) <
+    //             convergence_threshold) {
     //                 extra_converge_allocs = cfg.num_allocations + i;
     //                 converged_in_extra_run = true;
     //                 break;
@@ -679,7 +674,11 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     res.p50_ns = percentile(0.50);
     res.p90_ns = percentile(0.90);
     res.p99_ns = percentile(0.99);
-    res.final_util_stddev = converged_at == -1 ? final_stddev : first_converge_stddev; // TODO: would it be better to output both first_converge_stddev and final_stddev?
+    res.final_util_stddev =
+        converged_at == -1
+            ? final_stddev
+            : first_converge_stddev;  // TODO: would it be better to output both
+                                      // first_converge_stddev and final_stddev?
     // converge_avg_util: util at first-convergence point; fallback to final
     // util if the strategy never converged within this run
     res.converge_avg_util = (converged_at != -1 && first_converge_avg_util >= 0)
@@ -701,9 +700,10 @@ static void printHeader() {
               << "Replica" << std::setw(8) << "Skewed" << std::right
               << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
-              << std::setw(12) << "P99(ns)" << std::setw(12) << "UtilStdDev" // when first converged
-              << std::setw(10) << "ConvUtil%"
-              << std::setw(14) << "Converge@" << std::endl;
+              << std::setw(12) << "P99(ns)" << std::setw(12)
+              << "UtilStdDev"  // when first converged
+              << std::setw(10) << "ConvUtil%" << std::setw(14) << "Converge@"
+              << std::endl;
     std::cout << std::string(157, '-') << std::endl;
 }
 
@@ -711,7 +711,8 @@ static void printResult(const BenchResult& r) {
     std::string converge_str = "N/A";
     if (r.convergence_alloc_count > 0) {
         converge_str = std::to_string(r.convergence_alloc_count);
-        if (r.converged_in_extra_run) converge_str += "*";
+        // if (r.converged_in_extra_run) converge_str += "*"; // TODO: check
+        // later
     }
 
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
@@ -722,16 +723,16 @@ static void printResult(const BenchResult& r) {
               << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
-              << std::setw(12) << r.final_util_stddev
-              << std::setprecision(1) << std::setw(9) << (r.converge_avg_util * 100.0) << "%"
+              << std::setw(12) << r.final_util_stddev << std::setprecision(2)
+              << std::setw(9) << (r.converge_avg_util * 100.0) << "%"
               << std::setw(14) << converge_str << std::endl;
 }
 
 // Print two-section Scale-Out report for a list of results.
 // Section 1: Baseline perf (throughput/latency) — what the strategy costs.
 // Section 2: Adoption speed — how fast new nodes get utilized.
-static void printScaleOutReport(
-    const std::vector<ScaleOutResult>& results, const BenchConfig& cfg) {
+static void printScaleOutReport(const std::vector<ScaleOutResult>& results,
+                                const BenchConfig& cfg) {
     const std::string sep(100, '-');
     const std::string thin_sep(100, ' ');
 
@@ -778,8 +779,8 @@ static void printScaleOutReport(
         std::cout << std::left << std::setw(18) << r.base.strategy_name
                   << std::right << std::fixed << std::setprecision(4)
                   << std::setw(16) << r.stddev_before_scale << std::setw(16)
-                  << r.stddev_just_after_scale << std::setw(16) << reconverge_str
-                  << std::setprecision(1) << std::setw(15)
+                  << r.stddev_just_after_scale << std::setw(16)
+                  << reconverge_str << std::setprecision(1) << std::setw(15)
                   << (final_new_util * 100.0) << "%\n";
     }
     std::cout << "\n";
@@ -797,7 +798,8 @@ static void printScaleOutReport(
 //  Matrix benchmark (--run_all)
 // ============================================================
 
-// TODO: 加一个带deallocate的稳态运行case？但是我感觉deallocate只是在节点离开时才会出现？应该并不频繁吧？有必要吗？
+// TODO:
+// 加一个带deallocate的稳态运行case？但是我感觉deallocate只是在节点离开时才会出现？应该并不频繁吧？有必要吗？
 static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {
@@ -849,16 +851,17 @@ static void runAllBenchmarks() {
 // Each row is one logical "test case".  Add new rows here to extend coverage.
 // Fields: num_segments, alloc_size, replica_num, new_segments, trigger_pct
 struct ScaleOutScenario {
-    int    num_segments;
-    size_t alloc_size;       // bytes
-    int    replica_num;
-    int    new_segments;
-    int    trigger_pct;
-    std::string label;       // human-readable description
+    int num_segments;
+    size_t alloc_size;  // bytes
+    int replica_num;
+    int new_segments;
+    int trigger_pct;
+    std::string label;  // human-readable description
 };
 
 // Convenience macro-style helper to convert KB/MB inline
-static constexpr size_t kScenarioKiB = KiB; // TODO：要你麻痹的这个奇怪命名干什么？
+static constexpr size_t kScenarioKiB =
+    KiB;  // TODO：要你麻痹的这个奇怪命名干什么？
 static constexpr size_t kScenarioMiB = MiB;
 
 // clang-format off
@@ -892,13 +895,14 @@ static void runScaleOutBenchmark(
     for (const auto& scenario : kScaleOutScenarios) {
         // Build base config from scenario
         BenchConfig cfg;
-        cfg.num_segments          = scenario.num_segments;
-        cfg.segment_capacity      = static_cast<size_t>(FLAGS_segment_capacity) * MiB;
-        cfg.alloc_size            = scenario.alloc_size;
-        cfg.replica_num           = scenario.replica_num;
-        cfg.num_allocations       = FLAGS_num_allocations;
-        cfg.skewed                = FLAGS_skewed;
-        cfg.workload_type         = WorkloadType::SCALE_OUT;
+        cfg.num_segments = scenario.num_segments;
+        cfg.segment_capacity =
+            static_cast<size_t>(FLAGS_segment_capacity) * MiB;
+        cfg.alloc_size = scenario.alloc_size;
+        cfg.replica_num = scenario.replica_num;
+        cfg.num_allocations = FLAGS_num_allocations;
+        cfg.skewed = FLAGS_skewed;
+        cfg.workload_type = WorkloadType::SCALE_OUT;
         cfg.scale_out_trigger_pct = scenario.trigger_pct;
         cfg.scale_out_new_segments = scenario.new_segments;
 
@@ -906,9 +910,9 @@ static void runScaleOutBenchmark(
         if (scenario.replica_num > scenario.num_segments) continue;
 
         std::cout << "\n  Scenario: " << scenario.label << "\n";
-        std::cout << "    Segments " << scenario.num_segments
-                  << "  →  +" << scenario.new_segments
-                  << " new (at " << scenario.trigger_pct << "% = alloc #"
+        std::cout << "    Segments " << scenario.num_segments << "  →  +"
+                  << scenario.new_segments << " new (at "
+                  << scenario.trigger_pct << "% = alloc #"
                   << cfg.num_allocations * scenario.trigger_pct / 100 << ")"
                   << "  |  AllocSize " << scenario.alloc_size / KiB << " KB"
                   << "  |  Replica " << scenario.replica_num << "\n";
@@ -929,7 +933,6 @@ static void runScaleOutBenchmark(
         printScaleOutReport(all_results, cfg);
     }
 }
-
 
 // ============================================================
 //  main
@@ -957,7 +960,7 @@ int main(int argc, char* argv[]) {
 
     WorkloadType wl = parseWorkload(FLAGS_workload);
 
-    if (wl == WorkloadType::SCALE_OUT) { // TODO: 这里函数出口也太不统一了
+    if (wl == WorkloadType::SCALE_OUT) {  // TODO: 这里函数出口也太不统一了
         runScaleOutBenchmark(strategies_to_run);
         return 0;
     }
