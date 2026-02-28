@@ -355,6 +355,12 @@ static void dumpDistribution(const BenchConfig& cfg,
  * Each WorkloadRunner drives the allocation/deallocation loop and fills:
  *   - latencies: per-operation latency in nanoseconds
  *   - stddev_over_time: snapshot of utilization stddev every sample_interval ops
+ *   - out_final_avg_util: average utilization across all segments at run end
+ *   - out_final_stddev: utilization stddev across all segments at run end
+ *
+ * Both out_* values MUST be computed before active_allocations goes out of
+ * scope inside run(); the AllocatedBuffer destructors return memory to the
+ * allocators, so any metric computed after run() returns would read 0.
  */
 class WorkloadRunner {
    public:
@@ -362,7 +368,9 @@ class WorkloadRunner {
 
     virtual void run(AllocatorManager& manager, AllocationStrategy* strategy,
                      const BenchConfig& cfg, std::vector<double>& latencies,
-                     std::vector<double>& stddev_over_time) = 0;
+                     std::vector<double>& stddev_over_time,
+                     double& out_final_avg_util,
+                     double& out_final_stddev) = 0;
 };
 
 // ============================================================
@@ -378,7 +386,9 @@ class FillUpWorkloadRunner : public WorkloadRunner {
    public:
     void run(AllocatorManager& manager, AllocationStrategy* strategy,
              const BenchConfig& cfg, std::vector<double>& latencies,
-             std::vector<double>& stddev_over_time) override {
+             std::vector<double>& stddev_over_time,
+             double& out_final_avg_util,
+             double& out_final_stddev) override {
         const int sample_interval = FLAGS_convergence_sample_interval;
 
         // Hold allocated replicas to prevent immediate deallocation
@@ -402,6 +412,11 @@ class FillUpWorkloadRunner : public WorkloadRunner {
                 stddev_over_time.push_back(computeUtilizationStdDev(manager));
             }
         }
+
+        // Compute metrics while active_allocations is still alive
+        out_final_avg_util = computeAverageUtilAll(manager);
+        out_final_stddev   = computeUtilizationStdDev(manager);
+        // active_allocations destructs here → memory freed
     }
 };
 
@@ -432,7 +447,9 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
 
     void run(AllocatorManager& manager, AllocationStrategy* strategy,
              const BenchConfig& cfg, std::vector<double>& latencies,
-             std::vector<double>& stddev_over_time) override {
+             std::vector<double>& stddev_over_time,
+             double& out_final_avg_util,
+             double& out_final_stddev) override {
         const int sample_interval = FLAGS_convergence_sample_interval;
         const int trigger_at =
             cfg.num_allocations * cfg.scale_out_trigger_pct / 100;
@@ -495,6 +512,11 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
                 }
             }
         }
+
+        // Compute metrics while active_allocations is still alive
+        out_final_avg_util = computeAverageUtilAll(manager);
+        out_final_stddev   = computeUtilizationStdDev(manager);
+        // active_allocations destructs here → memory freed
     }
 
    private:
@@ -545,7 +567,10 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     }
 
     auto total_start = std::chrono::high_resolution_clock::now();
-    runner->run(manager, strategy.get(), cfg, latencies, stddev_over_time);
+    double runner_avg_util = 0.0;
+    double runner_final_stddev = 0.0;
+    runner->run(manager, strategy.get(), cfg, latencies, stddev_over_time,
+                runner_avg_util, runner_final_stddev);
     auto total_end = std::chrono::high_resolution_clock::now();
 
     double total_us =
@@ -598,7 +623,8 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
         }
     }
 
-    double final_stddev = computeUtilizationStdDev(manager);
+    // final_stddev is captured inside the runner while allocations are still live
+    double final_stddev = runner_final_stddev;
 
     // For fill-up mode: if still not converged, run a lookahead to see if it
     // ever converges
@@ -639,7 +665,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     res.p90_ns = percentile(0.90);
     res.p99_ns = percentile(0.99);
     res.final_util_stddev = converged_at == -1 ? final_stddev : first_converge_stddev; // TODO: would it be better to output both first_converge_stddev and final_stddev?
-    res.avg_util = computeAverageUtilAll(manager);
+    res.avg_util = runner_avg_util;
     res.convergence_alloc_count = converged_at;
     res.converged_in_extra_run = converged_in_extra_run;
 
