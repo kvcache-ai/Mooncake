@@ -101,4 +101,3 @@ if (USE_ASCEND_DIRECT)
 
     add_test(NAME ascend_direct_transport_test COMMAND ascend_direct_transport_test)
 endif()
-endif()
