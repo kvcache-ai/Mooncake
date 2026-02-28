@@ -596,14 +596,14 @@ Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive)
 | Strategy | Best For | Trade-off |
 |---|---|---|
 | `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
-| `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput (~18% overhead) due to sampling and sorting |
+| `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
 
 **Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
 
 **Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
 - Segments have different capacities and you want even utilization ratios.
-- New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence can take ~30 minutes in practice; `free_ratio_first` accelerates this by preferentially filling emptier segments — the probability of assigning to a newly joined segment increases from `1/n` to approximately `sample_count/n`.
+- New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
 
 **Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
 
