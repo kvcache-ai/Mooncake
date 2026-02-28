@@ -256,10 +256,10 @@ Status TransferEngineImpl::deconstruct() {
         }
         return Status::OK();
     });
-    for (auto& transport : transport_list_) transport.reset();
-    local_segment_tracker_.reset();
-    metadata_->segmentManager().deleteLocal();
-    metadata_.reset();
+
+    // Free all batches BEFORE destroying transports, so that
+    // freeSubBatch() can properly return SubBatch/Slice objects
+    // to each transport's Slab allocator.
     batch_set_.forEach([&](BatchSet& entry) {
         for (auto& batch : entry.active) {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -273,6 +273,12 @@ Status TransferEngineImpl::deconstruct() {
         entry.active.clear();
         entry.freelist.clear();
     });
+
+    // Now safe to destroy transports (workers join here)
+    for (auto& transport : transport_list_) transport.reset();
+    local_segment_tracker_.reset();
+    metadata_->segmentManager().deleteLocal();
+    metadata_.reset();
     return Status::OK();
 }
 
