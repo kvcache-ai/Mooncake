@@ -3,6 +3,7 @@
 
 #include <mutex>
 #include <shared_mutex>
+#include <atomic>
 
 // Enable thread safety attributes only with clang.
 // The attributes can be safely erased when compiling with other compilers.
@@ -56,6 +57,15 @@
 #define NO_THREAD_SAFETY_ANALYSIS \
     THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
 
+#if defined(__x86_64__) || defined(__i386__)
+#define MOONCAKE_CPU_RELAX() asm volatile("pause" ::: "memory")
+#elif defined(__aarch64__)
+#define MOONCAKE_CPU_RELAX() asm volatile("yield" ::: "memory")
+#else
+#include <thread>
+#define MOONCAKE_CPU_RELAX() std::this_thread::yield()
+#endif
+
 // Simple mutex implementation using std::mutex for exclusive locking only.
 class CAPABILITY("mutex") Mutex {
    private:
@@ -104,6 +114,84 @@ class CAPABILITY("shared_mutex") SharedMutex {
 
     // For negative capabilities.
     const SharedMutex& operator!() const { return *this; }
+};
+
+// Simple spinlock implementation using std::atomic<bool>.
+class CAPABILITY("mutex") SpinLock {
+   private:
+    std::atomic<bool> flag_{false};
+
+   public:
+    void lock() ACQUIRE() {
+        while (flag_.exchange(true, std::memory_order_acquire)) {
+            while (flag_.load(std::memory_order_relaxed)) {
+                MOONCAKE_CPU_RELAX();
+            }
+        }
+    }
+
+    void unlock() RELEASE() { flag_.store(false, std::memory_order_release); }
+
+    bool try_lock() TRY_ACQUIRE(true) {
+        return !flag_.exchange(true, std::memory_order_acquire);
+    }
+
+    const SpinLock& operator!() const { return *this; }
+};
+
+// Simple spin-read-write lock implementation.
+// state_ > 0: number of readers
+// state_ == -1: writer
+class CAPABILITY("shared_mutex") SpinRWLock {
+   public:
+    void lock() ACQUIRE() {
+        int32_t expected = 0;
+        while (!state_.compare_exchange_weak(expected, -1,
+                                             std::memory_order_acquire)) {
+            while (state_.load(std::memory_order_relaxed) != 0) {
+                MOONCAKE_CPU_RELAX();
+            }
+            expected = 0;
+        }
+    }
+
+    void lock_shared() ACQUIRE_SHARED() {
+        while (true) {
+            int32_t current = state_.load(std::memory_order_relaxed);
+            if (current >= 0) {
+                if (state_.compare_exchange_weak(current, current + 1,
+                                                 std::memory_order_acquire)) {
+                    break;
+                }
+            } else {
+                MOONCAKE_CPU_RELAX();
+            }
+        }
+    }
+
+    void unlock() RELEASE() { state_.store(0, std::memory_order_release); }
+
+    void unlock_shared() RELEASE_SHARED() {
+        state_.fetch_sub(1, std::memory_order_release);
+    }
+
+    bool try_lock() TRY_ACQUIRE(true) {
+        int32_t expected = 0;
+        return state_.compare_exchange_strong(expected, -1,
+                                              std::memory_order_acquire);
+    }
+
+    bool try_lock_shared() TRY_ACQUIRE_SHARED(true) {
+        int32_t current = state_.load(std::memory_order_relaxed);
+        if (current < 0) return false;
+        return state_.compare_exchange_strong(current, current + 1,
+                                              std::memory_order_acquire);
+    }
+
+    const SpinRWLock& operator!() const { return *this; }
+
+   private:
+    std::atomic<int32_t> state_{0};
 };
 
 // MutexLocker is an RAII class that acquires a mutex in its constructor, and
@@ -224,6 +312,63 @@ class SCOPED_CAPABILITY SharedMutexLocker {
         } else {
             mut->unlock_shared();
         }
+        locked = false;
+    }
+};
+
+// RAII class for SpinLock
+class SCOPED_CAPABILITY SpinLockLocker {
+   private:
+    SpinLock* mut;
+    bool locked;
+
+   public:
+    explicit SpinLockLocker(SpinLock* mu) ACQUIRE(mu) : mut(mu), locked(true) {
+        mu->lock();
+    }
+    ~SpinLockLocker() RELEASE() {
+        if (locked) mut->unlock();
+    }
+
+    // Prevent copying and assignment
+    SpinLockLocker(const SpinLockLocker&) = delete;
+    SpinLockLocker& operator=(const SpinLockLocker&) = delete;
+
+    void unlock() RELEASE() {
+        if (!locked) return;
+        mut->unlock();
+        locked = false;
+    }
+};
+
+// RAII class for SpinRWLock
+class SCOPED_CAPABILITY SpinRWLockLocker {
+   private:
+    SpinRWLock* mut;
+    bool is_exclusive;
+    bool locked;
+
+   public:
+    explicit SpinRWLockLocker(SpinRWLock* mu) ACQUIRE(mu)
+        : mut(mu), is_exclusive(true), locked(true) {
+        mu->lock();
+    }
+    SpinRWLockLocker(SpinRWLock* mu, const shared_lock_t&) ACQUIRE_SHARED(mu)
+        : mut(mu), is_exclusive(false), locked(true) {
+        mu->lock_shared();
+    }
+    ~SpinRWLockLocker() RELEASE() { unlock(); }
+
+    // Prevent copying and assignment
+    SpinRWLockLocker(const SpinRWLockLocker&) = delete;
+    SpinRWLockLocker& operator=(const SpinRWLockLocker&) = delete;
+
+    void unlock() RELEASE() {
+        if (!locked) return;
+        if (is_exclusive)
+            mut->unlock();
+        else
+            mut->unlock_shared();
         locked = false;
     }
 };

@@ -106,6 +106,8 @@ DEFINE_uint64(
 DEFINE_string(deployment_mode, "Centralization",
               "the deployment mode of mooncake-store, master and client must "
               "run in same mode");
+DEFINE_uint64(max_replicas_per_key, 1,
+              "Maximum number of replicas per key in P2P mode (0 = no limit)");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -183,6 +185,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetUInt64("max_replicas_per_key",
+                             &master_config.max_replicas_per_key,
+                             FLAGS_max_replicas_per_key);
     default_config.GetString("deployment_mode", &master_config.deployment_mode,
                              FLAGS_deployment_mode);
 }
@@ -379,6 +384,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.deployment_mode = FLAGS_deployment_mode;
     }
+    if ((google::GetCommandLineFlagInfo("max_replicas_per_key", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_replicas_per_key = FLAGS_max_replicas_per_key;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -510,6 +520,7 @@ int main(int argc, char* argv[]) {
               << master_config.put_start_discard_timeout_sec
               << ", put_start_release_timeout_sec="
               << master_config.put_start_release_timeout_sec
+              << ", max_replicas_per_key=" << master_config.max_replicas_per_key
               << ", deployment_mode=" << master_config.deployment_mode;
 
     if (master_config.deployment_mode != "Centralization" &&
@@ -565,16 +576,14 @@ int main(int argc, char* argv[]) {
                 server, static_cast<mooncake::WrappedCentralizedMasterService&>(
                             *master_service));
         } else {
-            // TODO: wanyue-wy
-            // enable the following code
-            // master_service =
-            //     std::make_unique<mooncake::WrappedP2PMasterService>(
-            //         mooncake::WrappedMasterServiceConfig(master_config,
-            //                                              version));
+            master_service =
+                std::make_unique<mooncake::WrappedP2PMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config,
+                                                         version));
 
-            // mooncake::RegisterCentralizedRpcService(
-            //     server, static_cast<mooncake::WrappedP2PMasterService&>(
-            //                 *master_service));
+            mooncake::RegisterP2PRpcService(
+                server, static_cast<mooncake::WrappedP2PMasterService&>(
+                            *master_service));
         }
         return server.start();
     }
