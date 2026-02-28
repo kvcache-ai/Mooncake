@@ -341,9 +341,9 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
  * @brief Allocate a contiguous buffer with per-NUMA-region binding.
  *
  * Reserves a single VMA via mmap, divides it into N equal regions,
- * binds each region to the corresponding NUMA node via mbind(MPOL_BIND),
- * then prefaults all pages with madvise(MADV_POPULATE_WRITE).
- * Pages are allocated directly on the target NUMA — no migration.
+ * binds each region to the corresponding NUMA node via mbind(MPOL_BIND).
+ * No explicit prefault — ibv_reg_mr() will fault and pin pages respecting
+ * the mbind policy, allocating directly on the target NUMA node.
  *
  * @param total_size  Total buffer size in bytes
  * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})

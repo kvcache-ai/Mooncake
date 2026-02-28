@@ -376,11 +376,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
-            } else if (!seg_numa_nodes.empty()) {
-                // NUMA-segmented: track as mmap allocation for munmap cleanup
-                hugepage_segment_ptrs_.emplace_back(
-                    ptr, HugepageSegmentDeleter{mapped_size});
-            } else if (should_use_hugepage) {
+            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+                // NUMA-segmented or hugepage: track as mmap allocation for
+                // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {
