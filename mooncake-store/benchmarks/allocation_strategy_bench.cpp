@@ -128,10 +128,10 @@ struct BenchResult {
     double p99_ns;
 
     double final_util_stddev;
-    double avg_util = 0.0;          // average utilization ratio across all segments
+    // avg utilization at first-convergence point; falls back to final avg if
+    // convergence was never reached
+    double converge_avg_util = 0.0;
     int convergence_alloc_count;  // -1 if not converged
-    bool converged_in_extra_run =
-        false;  // true if it converged in the lookahead loop
 };
 
 struct ScaleOutResult {
@@ -354,13 +354,14 @@ static void dumpDistribution(const BenchConfig& cfg,
  *
  * Each WorkloadRunner drives the allocation/deallocation loop and fills:
  *   - latencies: per-operation latency in nanoseconds
- *   - stddev_over_time: snapshot of utilization stddev every sample_interval ops
- *   - out_final_avg_util: average utilization across all segments at run end
+ *   - stddev_over_time: utilization stddev snapshot every sample_interval ops
+ *   - avg_util_over_time: avg utilization snapshot at the same intervals
+ *   - out_final_avg_util: avg utilization across all segments at run end
  *   - out_final_stddev: utilization stddev across all segments at run end
  *
- * Both out_* values MUST be computed before active_allocations goes out of
- * scope inside run(); the AllocatedBuffer destructors return memory to the
- * allocators, so any metric computed after run() returns would read 0.
+ * All out_* values and *_over_time vectors MUST be computed/populated before
+ * active_allocations goes out of scope; AllocatedBuffer destructors return
+ * memory to the allocators, so metrics computed after run() returns read 0.
  */
 class WorkloadRunner {
    public:
@@ -369,6 +370,7 @@ class WorkloadRunner {
     virtual void run(AllocatorManager& manager, AllocationStrategy* strategy,
                      const BenchConfig& cfg, std::vector<double>& latencies,
                      std::vector<double>& stddev_over_time,
+                     std::vector<double>& avg_util_over_time,
                      double& out_final_avg_util,
                      double& out_final_stddev) = 0;
 };
@@ -387,6 +389,7 @@ class FillUpWorkloadRunner : public WorkloadRunner {
     void run(AllocatorManager& manager, AllocationStrategy* strategy,
              const BenchConfig& cfg, std::vector<double>& latencies,
              std::vector<double>& stddev_over_time,
+             std::vector<double>& avg_util_over_time,
              double& out_final_avg_util,
              double& out_final_stddev) override {
         const int sample_interval = FLAGS_convergence_sample_interval;
@@ -410,10 +413,11 @@ class FillUpWorkloadRunner : public WorkloadRunner {
 
             if (i > 0 && i % sample_interval == 0) {
                 stddev_over_time.push_back(computeUtilizationStdDev(manager));
+                avg_util_over_time.push_back(computeAverageUtilAll(manager));
             }
         }
 
-        // Compute metrics while active_allocations is still alive
+        // Compute final metrics while active_allocations is still alive
         out_final_avg_util = computeAverageUtilAll(manager);
         out_final_stddev   = computeUtilizationStdDev(manager);
         // active_allocations destructs here → memory freed
@@ -448,6 +452,7 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
     void run(AllocatorManager& manager, AllocationStrategy* strategy,
              const BenchConfig& cfg, std::vector<double>& latencies,
              std::vector<double>& stddev_over_time,
+             std::vector<double>& avg_util_over_time,
              double& out_final_avg_util,
              double& out_final_stddev) override {
         const int sample_interval = FLAGS_convergence_sample_interval;
@@ -490,6 +495,7 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
             // --- Sample stddev & new-node utilization ---
             if (i > 0 && i % sample_interval == 0) {
                 stddev_over_time.push_back(computeUtilizationStdDev(manager));
+                avg_util_over_time.push_back(computeAverageUtilAll(manager));
 
                 if (injected && !new_node_allocs.empty()) {
                     out_->new_node_util_over_time.push_back(
@@ -501,7 +507,6 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
         // --- Find re-convergence point after injection ---
         out_->re_converge_allocs = -1;
         if (injected) {
-            // Walk the stddev_over_time samples recorded after the trigger
             int trigger_sample_idx = trigger_at / sample_interval;
             for (int idx = trigger_sample_idx;
                  idx < static_cast<int>(stddev_over_time.size()); ++idx) {
@@ -513,7 +518,7 @@ class ScaleOutWorkloadRunner : public WorkloadRunner {
             }
         }
 
-        // Compute metrics while active_allocations is still alive
+        // Compute final metrics while active_allocations is still alive
         out_final_avg_util = computeAverageUtilAll(manager);
         out_final_stddev   = computeUtilizationStdDev(manager);
         // active_allocations destructs here → memory freed
@@ -557,6 +562,10 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     stddev_over_time.reserve(cfg.num_allocations /
                                  FLAGS_convergence_sample_interval +
                              1);
+    std::vector<double> avg_util_over_time;
+    avg_util_over_time.reserve(cfg.num_allocations /
+                                   FLAGS_convergence_sample_interval +
+                               1);
 
     // --- Dispatch to WorkloadRunner ---
     std::unique_ptr<WorkloadRunner> runner;
@@ -570,7 +579,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     double runner_avg_util = 0.0;
     double runner_final_stddev = 0.0;
     runner->run(manager, strategy.get(), cfg, latencies, stddev_over_time,
-                runner_avg_util, runner_final_stddev);
+                avg_util_over_time, runner_avg_util, runner_final_stddev);
     auto total_end = std::chrono::high_resolution_clock::now();
 
     double total_us =
@@ -601,6 +610,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     // This way converged_at reflects when the strategy *finally* settled.
     const double convergence_threshold = 0.05;
     double first_converge_stddev = -1;
+    double first_converge_avg_util = -1.0;  // avg util AT first convergence
     int converged_at = -1;
     bool in_converged_window = false;
 
@@ -613,6 +623,10 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
                 converged_at = allocs_done;
                 in_converged_window = true;
                 first_converge_stddev = stddev_over_time[i];
+                // avg_util_over_time is sampled at the same indices
+                if (i < avg_util_over_time.size()) {
+                    first_converge_avg_util = avg_util_over_time[i];
+                }
             }
             // else: already in a stable window, keep the earlier start
         } else {
@@ -620,6 +634,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
             converged_at = -1;
             in_converged_window = false;
             first_converge_stddev = -1;
+            first_converge_avg_util = -1.0;
         }
     }
 
@@ -628,24 +643,24 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
 
     // For fill-up mode: if still not converged, run a lookahead to see if it
     // ever converges
-    int extra_converge_allocs = -1;
-    bool converged_in_extra_run = false;
-    if (cfg.workload_type == WorkloadType::FILL_UP &&
-        final_stddev >= convergence_threshold) {
-        converged_at = -1;  // Reset false positive
+    // Lookahead logic is currently disabled (see commented block below).
+    // bool converged_in_extra_run = false; // TODO: disabled second conv change currently
+    // if (cfg.workload_type == WorkloadType::FILL_UP &&
+    //     final_stddev >= convergence_threshold) {
+    //     converged_at = -1;  // Reset false positive
 
-        int max_extra = cfg.num_allocations * 10;
-        for (int i = 0; i < max_extra; ++i) {
-            strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
-            if (i > 0 && i % FLAGS_convergence_sample_interval == 0) {
-                if (computeUtilizationStdDev(manager) < convergence_threshold) {
-                    extra_converge_allocs = cfg.num_allocations + i;
-                    converged_in_extra_run = true;
-                    break;
-                }
-            }
-        }
-    }
+    //     int max_extra = cfg.num_allocations * 10;
+    //     for (int i = 0; i < max_extra; ++i) {
+    //         strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
+    //         if (i > 0 && i % FLAGS_convergence_sample_interval == 0) {
+    //             if (computeUtilizationStdDev(manager) < convergence_threshold) {
+    //                 extra_converge_allocs = cfg.num_allocations + i;
+    //                 converged_in_extra_run = true;
+    //                 break;
+    //             }
+    //         }
+    //     }
+    // }
 
     if (!FLAGS_dump_distribution_file.empty()) {
         dumpDistribution(cfg, manager, FLAGS_dump_distribution_file);
@@ -665,13 +680,12 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     res.p90_ns = percentile(0.90);
     res.p99_ns = percentile(0.99);
     res.final_util_stddev = converged_at == -1 ? final_stddev : first_converge_stddev; // TODO: would it be better to output both first_converge_stddev and final_stddev?
-    res.avg_util = runner_avg_util;
+    // converge_avg_util: util at first-convergence point; fallback to final
+    // util if the strategy never converged within this run
+    res.converge_avg_util = (converged_at != -1 && first_converge_avg_util >= 0)
+                                ? first_converge_avg_util
+                                : runner_avg_util;
     res.convergence_alloc_count = converged_at;
-    res.converged_in_extra_run = converged_in_extra_run;
-
-    if (converged_at == -1 && extra_converge_allocs > 0) {
-        res.convergence_alloc_count = extra_converge_allocs;
-    }
 
     return res;
 }
@@ -688,7 +702,7 @@ static void printHeader() {
               << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12) << "UtilStdDev" // when first converged
-              << std::setw(10) << "AvgUtil%"
+              << std::setw(10) << "ConvUtil%"
               << std::setw(14) << "Converge@" << std::endl;
     std::cout << std::string(157, '-') << std::endl;
 }
@@ -709,7 +723,7 @@ static void printResult(const BenchResult& r) {
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev
-              << std::setprecision(1) << std::setw(9) << (r.avg_util * 100.0) << "%"
+              << std::setprecision(1) << std::setw(9) << (r.converge_avg_util * 100.0) << "%"
               << std::setw(14) << converge_str << std::endl;
 }
 
