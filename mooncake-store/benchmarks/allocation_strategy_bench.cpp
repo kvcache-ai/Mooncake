@@ -38,7 +38,7 @@
 #include "types.h"
 
 // --- gflags definitions ---
-DEFINE_int32(num_segments, 100, "Number of segments to simulate");
+DEFINE_int32(num_segments, 10, "Number of segments to simulate");
 DEFINE_int64(segment_capacity, 64,
              "Per-segment capacity in MB (base capacity for skewed mode)");
 DEFINE_int64(alloc_size, 64, "Allocation size in KB");
@@ -214,7 +214,8 @@ struct BenchResult {
 
     double final_util_stddev;
     int convergence_alloc_count;  // -1 if not converged
-    bool converged_in_extra_run = false; // true if it converged in the lookahead loop
+    bool converged_in_extra_run =
+        false;  // true if it converged in the lookahead loop
 };
 
 static BenchResult runBenchmark(const BenchConfig& cfg) {
@@ -281,8 +282,10 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     int converged_at = -1;
     const double convergence_threshold = 0.05;
     int min_allocs_to_converge = std::max(1, cfg.num_allocations / 10);
+    // int min_allocs_to_converge = 100; // TODO: 临时看看最小稳态次数是多少；
 
-    for (size_t i = 0; i < stddev_over_time.size(); ++i) {
+    for (size_t i = 0; i < stddev_over_time.size();
+         ++i) {  // TODO：为什么不放在alloc的循环里？如果带break的话
         int allocs_done = static_cast<int>((i + 1) * sample_interval);
 
         if (allocs_done >= min_allocs_to_converge &&
@@ -295,7 +298,7 @@ static BenchResult runBenchmark(const BenchConfig& cfg) {
     double final_stddev = computeUtilizationStdDev(manager);
 
     // If it hasn't converged (or diverged), trace further allocations to see if
-    // it converges later
+    // it converges later // TODO：好像用处不大；考虑去掉
     int extra_converge_allocs = -1;
     if (final_stddev >= convergence_threshold) {
         converged_at = -1;  // Reset false positive
@@ -384,9 +387,13 @@ static void printResult(const BenchResult& r) {
 // ============================================================
 
 static void runAllBenchmarks() {
-    std::vector<int> segment_counts = {1, 10, 100, 512};
-    std::vector<size_t> alloc_sizes = {4 * KiB, 64 * KiB, 1 * MiB, 4 * MiB,
-                                       128 * MiB};  // Tested up to 128MB
+    std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
+    std::vector<size_t> alloc_sizes = {
+        64 * KiB, 1 * MiB, 4 * MiB, 32 * MiB
+        /*128 * MiB*/};  // Tested up to 128MB //
+                         // TODO：128MB需要分配更大的内存，现在还没有逻辑，默认64GB
+                         // segment size不够分配。用过大的seg
+                         // size会导致stddev偏差太小。
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
@@ -414,15 +421,18 @@ static void runAllBenchmarks() {
                         // 128MB. Since OffsetBufferAllocator only stores
                         // metadata, we can safely simulate realistic 80GB VRAM
                         // sizes.
-                        size_t required_capacity =
-                            (asize * rep * FLAGS_num_allocations) /
-                            std::max(1, segs);
+                        size_t required_capacity = 0;
+                        // (asize * rep * FLAGS_num_allocations) /
+                        // std::max(1, segs);
                         size_t configured_capacity =
                             FLAGS_segment_capacity * MiB;
-                        size_t realistic_capacity = 80ULL * 1024 * MiB;  // 80GB
+                        // size_t realistic_capacity = 80ULL * 1024 * MiB;  //
+                        // 80GB
+                        size_t realistic_capacity =
+                            0;  // TODO: 暂时先不用这个max 80GB
                         cfg.segment_capacity = std::max(
                             {configured_capacity, required_capacity * 2,
-                             realistic_capacity});  // TODO：直接默认80GB不行吗？
+                             realistic_capacity});  // TODO：直接默认80GB不行吗？那就不好对比偏差了；按默认64MB的来吧；不对啊，应该检测到128MB的再扩成80GB？或者其他建议的值；
 
                         cfg.alloc_size = asize;
                         cfg.replica_num = rep;
