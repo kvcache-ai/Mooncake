@@ -6,19 +6,23 @@ const (
 )
 
 type ServiceConfig struct {
-	Name      string // Unique identifier (e.g., "vllm-worker-0")
-	IP        string // Service IP address
-	Port      int    // ZMQ publisher port
-	Type      string // Service type (vLLM/Mooncake)
-	ModelName string // Model name hosted by the service
-	LoraID    int64  // LoRA ID (-1 if not applicable)
+	Endpoint       string // kv publisher endpoint address
+	ReplayEndpoint string // (optional)
+	Type           string // kv publisher type
+	ModelName      string // Model name hosted by the service
+	LoraName       string
+	TenantID       string // (optional), default use 'default'
+	InstanceID     string // required
+	BlockSize      int
+	DPRank         int
+	AdditionalSalt string // (optional), default use 'w8a8,etc..'
 }
 
 // TODO combine with /zmq/event_type
 type StoredEvent struct {
 	BlockHashes     []uint64
 	ModelName       string
-	LoraID          int64
+	LoraName        string
 	EngineIp        string
 	ParentBlockHash uint64
 	TokenIds        []int32
@@ -27,6 +31,6 @@ type StoredEvent struct {
 type RemovedEvent struct {
 	BlockHashes []uint64
 	ModelName   string
-	LoraID      int64
+	LoraName    string
 	SourcePod   string
 }

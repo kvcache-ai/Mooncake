@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -14,12 +15,40 @@ import (
 	"conductor/zmq"
 )
 
+// Define dynamic register structure to match the JSON request body
+type RegisterReq struct {
+	Endpoint       string  `json:"endpoint"`
+	ReplayEndpoint string  `json:"replay_endpoint"`
+	Type           string  `json:"type"`
+	ModelName      string  `json:"modelname"`
+	LoraName       *string `json:"lora_name"`
+	TenantID       *string `json:"tenant_id"`
+	InstanceID     string  `json:"instance_id"`
+	BlockSize      int     `json:"block_size"`
+	DPRank         int     `json:"dp_rank"`
+	AdditionalSalt string  `json:"additionalsalt"`
+}
+
+// Define dynamic unregister structure to match the JSON request body
+type UnregisterReq struct {
+	Type       string  `json:"type"`
+	ModelName  string  `json:"modelname"`
+	LoraName   *string `json:"lora_name"`
+	TenantID   *string `json:"tenant_id"`
+	InstanceID string  `json:"instance_id"`
+	BlockSize  int     `json:"block_size"`
+	DPRank     int     `json:"dp_rank"`
+}
+
 type EventManager struct {
 	indexer        *prefixindex.PrefixCacheTable
 	services       []common.ServiceConfig
 	httpserverport int
 
 	subscribers common.SyncMap[string, *zmq.ZMQClient]
+
+	// Map to store active configurations
+	activeConfigs common.SyncMap[string, common.ServiceConfig]
 
 	// Lifecycle management
 	ctx     context.Context
@@ -104,50 +133,84 @@ func (m *EventManager) Stop() {
 	})
 }
 
+func makeServiceKey(instanceID, tenantID string) string {
+	return fmt.Sprintf("%s|%s", instanceID, tenantID)
+}
+
 func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
-	if _, exists := m.subscribers.Load(svc.Name); exists {
+	// Use (instance_id, tenant_id) as composite key to support multi-tenant replicas
+	svcKey := makeServiceKey(svc.InstanceID, svc.TenantID)
+	if svc.InstanceID == "" {
+		svcKey = makeServiceKey(svc.Endpoint, svc.TenantID)
+	}
+
+	if _, exists := m.subscribers.Load(svcKey); exists {
 		return nil
 	}
 
+	// Validate endpoint
+	if svc.Endpoint == "" {
+		return fmt.Errorf("endpoint is required")
+	}
+
+	// Use ReplayEndpoint directly, fallback to empty if not provided
+	replayEndpoint := svc.ReplayEndpoint
+
+	// Construct an EventHandler to adapt to the old structure.
 	handler := &KVEventHandler{
 		manager:   m,
-		svcName:   svc.IP,
+		svcName:   svcKey,
 		modelName: svc.ModelName,
-		loraID:    svc.LoraID,
+		loraName:  svc.LoraName,
 	}
 
 	// Configure ZMQ Client
 	zmqConfig := &zmq.ZMQClientConfig{
-		CachePoolKey:   svc.Name,
-		ServiceIP:      svc.IP,
-		Port:           svc.Port,
+		CachePoolKey:   svcKey,
+		Endpoint:       svc.Endpoint,
+		ReplayEndpoint: replayEndpoint,
 		ModelName:      svc.ModelName,
 		PollTimeout:    100 * time.Millisecond,
 		ReplayTimeout:  5 * time.Second,
 		ReconnectDelay: 1 * time.Second,
-		RouterPort:     svc.Port + 1,
 	}
 
-	// Validate ZMQ config
 	if err := zmq.ValidateConfig(zmqConfig); err != nil {
 		return fmt.Errorf("invalid ZMQ config: %w", err)
 	}
 
-	// Create and start client
 	client := zmq.NewZMQClient(zmqConfig, handler)
 	if err := client.Start(); err != nil {
 		return fmt.Errorf("failed to start ZMQ client: %w", err)
 	}
 
-	m.subscribers.Store(svc.Name, client)
+	m.subscribers.Store(svcKey, client)
+	m.activeConfigs.Store(svcKey, svc)
+
 	slog.Info("Successfully subscribed to service",
 		"service_type", svc.Type,
-		"service_name", svc.Name,
-		"service_ip", svc.IP,
-		"service_port", svc.Port,
+		"service_key", svcKey,
+		"instance_id", svc.InstanceID,
+		"tenant_id", svc.TenantID,
+		"endpoint", svc.Endpoint,
+		"replay_endpoint", replayEndpoint,
 	)
 
 	return nil
+}
+
+func (m *EventManager) unsubscribeFromService(instanceID, tenantID string) {
+	svcKey := makeServiceKey(instanceID, tenantID)
+	if client, exists := m.subscribers.Load(svcKey); exists {
+		client.Stop()
+		m.subscribers.Delete(svcKey)
+		m.activeConfigs.Delete(svcKey)
+		slog.Info("Successfully unsubscribed from service",
+			"service_key", svcKey,
+			"instance_id", instanceID,
+			"tenant_id", tenantID,
+		)
+	}
 }
 
 func (m *EventManager) getIndexer() *prefixindex.PrefixCacheTable {
@@ -156,6 +219,8 @@ func (m *EventManager) getIndexer() *prefixindex.PrefixCacheTable {
 
 func (m *EventManager) StartHTTPServer() error {
 	mux := http.NewServeMux()
+
+	// Original /cache interface
 	mux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -190,14 +255,14 @@ func (m *EventManager) StartHTTPServer() error {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		loraID, err := common.ExtractIntFromRequest(jsonBody, "lora_id")
+		loraName, err := common.ExtractStringValueFromRequest(jsonBody, "lora_name")
 		if err != nil {
-			slog.Error("Failed to decode int", "err", err)
+			slog.Error("Failed to decode string", "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		cacheHitResult := m.indexer.CacheHitCompute(modelName, loraID, tokenIDs, candidates)
+		cacheHitResult := m.indexer.CacheHitCompute(modelName, loraName, tokenIDs, candidates)
 		slog.Debug("cache hit status", "hitresult", cacheHitResult)
 		response := map[string]interface{}{
 			"HitStatus": cacheHitResult,
@@ -211,15 +276,99 @@ func (m *EventManager) StartHTTPServer() error {
 		}
 	})
 
+	// Register interface
+	mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req RegisterReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			slog.Error("Failed to decode register JSON", "err", err)
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		// Handle Optional fields' default values
+		tenantID := "default"
+		if req.TenantID != nil && *req.TenantID != "" {
+			tenantID = *req.TenantID
+		}
+		loraName := ""
+		if req.LoraName != nil {
+			loraName = *req.LoraName
+		}
+
+		svc := common.ServiceConfig{
+			Endpoint:       req.Endpoint,
+			ReplayEndpoint: req.ReplayEndpoint,
+			Type:           req.Type,
+			ModelName:      req.ModelName,
+			LoraName:       loraName,
+			TenantID:       tenantID,
+			InstanceID:     req.InstanceID,
+			BlockSize:      req.BlockSize,
+			DPRank:         req.DPRank,
+			AdditionalSalt: req.AdditionalSalt,
+		}
+
+		// Use the existing subscribeToService method
+		if err := m.subscribeToService(svc); err != nil {
+			slog.Error("Dynamic register failed", "instance_id", req.InstanceID, "err", err)
+			http.Error(w, fmt.Sprintf("Failed to subscribe: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":      "registered successfully",
+			"instance_id": svc.InstanceID,
+		})
+	})
+
+	// Unregister interface
+	mux.HandleFunc("/unregister", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req UnregisterReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			slog.Error("Failed to decode unregister JSON", "err", err)
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		// Build target service key from instance_id and tenant_id
+		targetTenant := "default"
+		if req.TenantID != nil && *req.TenantID != "" {
+			targetTenant = *req.TenantID
+		}
+		targetKey := makeServiceKey(req.InstanceID, targetTenant)
+
+		// Direct lookup and removal
+		if _, exists := m.activeConfigs.Load(targetKey); !exists {
+			http.Error(w, fmt.Sprintf("service not found: %s", targetKey), http.StatusNotFound)
+			return
+		}
+
+		m.unsubscribeFromService(req.InstanceID, targetTenant)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":            "unregistered successfully",
+			"removed_instances": []string{targetKey},
+		})
+	})
+
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", m.httpserverport),
 		Handler: mux,
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		slog.Info("HTTP server listening", "port", m.httpserverport)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server failed", "err", err)
