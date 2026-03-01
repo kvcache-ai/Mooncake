@@ -870,7 +870,14 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                         break;
                     }
                 }
-                engine_.freeBatchID(batchID);
+                auto s = engine_.freeBatchID(batchID);
+                if (!s.ok()) {
+                    // This should not happen since getTransferStatus returns
+                    // COMPLETED/FAILED.
+                    LOG(ERROR) << "Unexpected BatchID leaked due to "
+                                  "freeBatchID failure: "
+                               << s.message();
+                }
             } else {
                 // Wait for the warmup signals
                 while (!warmup_recv_region_[pollingRank]) {

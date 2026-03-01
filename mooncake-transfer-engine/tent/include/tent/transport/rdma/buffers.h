@@ -104,6 +104,9 @@ class LocalBufferManager {
     Status clear();
 
    private:
+    Status addBufferInternal(BufferDesc &desc, const MemoryOptions &options,
+                             bool force_sequential);
+
     struct BufferEntryForRdma {
         MemoryOptions options;
         std::unordered_map<RdmaContext *, void *> mem_reg_map;
@@ -115,6 +118,14 @@ class LocalBufferManager {
     std::map<AddressRange, BufferEntryForRdma> buffer_list_;
     std::shared_ptr<Topology> topology_;
 };
+
+// Minimum buffer size to justify MR warm-up overhead.
+extern const size_t kMrWarmupMinBytes;
+
+// Parallel MR warm-up: split buffer into chunks, temp register/deregister
+// each chunk to trigger RDMA driver page pinning.
+int warmupMrRegistrationParallel(RdmaContext *context, void *addr,
+                                 size_t length);
 
 }  // namespace tent
 }  // namespace mooncake

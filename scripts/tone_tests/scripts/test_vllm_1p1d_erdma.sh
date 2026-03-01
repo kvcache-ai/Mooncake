@@ -36,7 +36,7 @@ start_server()
 
     local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
     
-    local env_vars="CUDA_VISIBLE_DEVICES=6,7"
+    local env_vars="CUDA_VISIBLE_DEVICES=0,1"
     
     if ! launch_vllm_server "$model_name" "$host" "$port" "$vllm_server_log_path" "$kv_role" "$extra_args" "$env_vars"; then
         return 1
@@ -45,30 +45,54 @@ start_server()
     return 0
 }
 
-run_nixl_proxy()
+run_proxy()
 {
     local model_name=$1
     local proxy_log_path="/test_run/run/logs/$test_case_name/$model_name/proxy.log"
 
     echo "===== Proxy Run ====="
-    lb_cmd="${docker_exec} \"python3 /test_run/python/toy_proxy_server.py --host 0.0.0.0 --port 8000 \
-    --prefiller-host $REMOTE_IP --prefiller-port 8010 \
-    --decoder-host $LOCAL_IP --decoder-port 8020 > $proxy_log_path 2>&1 &\""
+    
+    # Get vLLM version and decide which proxy to use
+    local vllm_version=$(${docker_exec} "python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null" || echo "0.15.0")
+    echo "Detected vLLM version: $vllm_version"
+    
+    # Determine proxy script and ready check strategy
+    local proxy_script
+    local ready_pattern
+    local use_health_check=0
+    if python3 -c "from packaging import version; import sys; sys.exit(0 if version.parse('$vllm_version') >= version.parse('0.16.0') else 1)" 2>/dev/null; then
+        echo "Using Mooncake Connector Proxy (vLLM >= 0.16.0)"
+        proxy_script="python3 -u /vllm-workspace/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py --prefill http://$REMOTE_IP:8010 --decode http://$LOCAL_IP:8020 --host 0.0.0.0 --port 8000"
+        ready_pattern="All prefiller instances are ready."
+    else
+        echo "Using NIXL Proxy (vLLM < 0.16.0)"
+        proxy_script="python3 -u /test_run/python/toy_proxy_server.py --host 0.0.0.0 --port 8000 --prefiller-host $REMOTE_IP --prefiller-port 8010 --decoder-host $LOCAL_IP --decoder-port 8020"
+        ready_pattern="Application startup complete."
+        use_health_check=1
+    fi
 
+    # Launch proxy
+    local lb_cmd="${docker_exec} \"$proxy_script > $proxy_log_path 2>&1 &\""
     local pid_file="${PID_DIR}/proxy.pid"
-    local grep_pattern="toy_proxy_server.py"
-    echo "Load balancer starting..."
+    # Extract Python script path (second word) and get filename
+    local grep_pattern=$(echo "$proxy_script" | grep -oE '[^/]+\.py')
+    
+    echo "Starting proxy server..."
     if ! launch_and_track_process "$lb_cmd" "$grep_pattern" "$pid_file"; then
         return 1
     fi
 
+    # Check proxy ready status
     exactly_proxy_log_path=$(convert_container_path_to_host "$proxy_log_path")
-    if ! check_vllm_server_ready "$exactly_proxy_log_path"; then
+    if ! check_vllm_proxy_ready "$exactly_proxy_log_path" "$ready_pattern"; then
         return 1
     fi
 
-    if ! wait_for_server_ready "$LOCAL_IP" "8000" "/healthcheck"; then
-        return 1
+    # Additional health check for toy_proxy_server
+    if [ "$use_health_check" -eq 1 ]; then
+        if ! wait_for_server_ready "$LOCAL_IP" "8000" "/health"; then
+            return 1
+        fi
     fi
 
     return 0
@@ -129,7 +153,7 @@ run_single_model()
             status=1
         else
             # Local run proxy
-            if ! run_nixl_proxy $model_name_clean; then
+            if ! run_proxy $model_name_clean; then
                 echo "ERROR: Failed to start local proxy for model $model_name"
                 status=1
             else

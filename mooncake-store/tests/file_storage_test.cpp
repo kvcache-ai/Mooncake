@@ -58,7 +58,7 @@ class FileStorageTest : public ::testing::Test {
 
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
         FileStorage& fileStorage,
-        const std::unordered_map<std::string, Slice>& batch_object) {
+        std::unordered_map<std::string, Slice>& batch_object) {
         return fileStorage.BatchLoad(batch_object);
     }
 

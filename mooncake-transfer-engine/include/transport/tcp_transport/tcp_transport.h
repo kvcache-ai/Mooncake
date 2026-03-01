@@ -18,7 +18,9 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,6 +30,8 @@
 #include <vector>
 #include <csignal>
 
+#include <asio/ip/tcp.hpp>
+
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 #include "ylt/coro_io/coro_io.hpp"
@@ -35,6 +39,24 @@
 namespace mooncake {
 class TransferMetadata;
 class TcpContext;
+class TcpTransport;
+
+// Pooled connection for reusing client-side connections
+struct PooledConnection {
+    std::shared_ptr<asio::ip::tcp::socket> socket;
+    std::string host;
+    uint16_t port;
+    std::chrono::steady_clock::time_point last_used;
+    bool in_use;
+
+    PooledConnection(std::shared_ptr<asio::ip::tcp::socket> s,
+                     const std::string &h, uint16_t p)
+        : socket(std::move(s)),
+          host(h),
+          port(p),
+          last_used(std::chrono::steady_clock::now()),
+          in_use(true) {}
+};
 
 class TcpTransport : public Transport {
    public:
@@ -88,6 +110,39 @@ class TcpTransport : public Transport {
     TcpContext *context_;
     std::atomic_bool running_;
     std::thread thread_;
+    bool enable_connection_pool_ =
+        false;  // Use MC_TCP_ENABLE_CONNECTION_POOL=1 to enable connection pool
+
+    // Client-side connection pool
+    struct ConnectionKey {
+        std::string host;
+        uint16_t port;
+
+        bool operator==(const ConnectionKey &other) const {
+            return host == other.host && port == other.port;
+        }
+    };
+
+    struct ConnectionKeyHash {
+        std::size_t operator()(const ConnectionKey &key) const {
+            return std::hash<std::string>()(key.host) ^
+                   (std::hash<uint16_t>()(key.port) << 1);
+        }
+    };
+
+    std::unordered_map<ConnectionKey,
+                       std::deque<std::shared_ptr<PooledConnection>>,
+                       ConnectionKeyHash>
+        connection_pool_;
+    std::mutex pool_mutex_;
+
+    std::shared_ptr<asio::ip::tcp::socket> getConnection(
+        const std::string &host, uint16_t port);
+    void returnConnection(const std::string &host, uint16_t port,
+                          std::shared_ptr<asio::ip::tcp::socket> socket);
+    void cleanupIdleConnections();
+
+    static constexpr std::chrono::seconds kConnectionIdleTimeout{60};
 };
 }  // namespace mooncake
 

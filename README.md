@@ -8,7 +8,7 @@
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
-  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3ig4fjai8-KH1zIm3x8Vm8WqyH0i_JaA" target="_blank"><strong>Slack</strong></a>
+  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA" target="_blank"><strong>Slack</strong></a>
   <br />
   <br />
 
@@ -193,6 +193,24 @@ pip install mooncake-transfer-engine-non-cuda
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html) in detail.
+
+To produce an image that compiles Mooncake from source, builds the wheel via `scripts/build_wheel.sh`, and installs that wheel inside the container, use `build-wheel.dockerfile`:
+
+```bash
+docker build -f docker/mooncake.Dockerfile \
+  --build-arg PYTHON_VERSION=3.10 \
+  --build-arg EP_TORCH_VERSIONS="2.9.1" \
+  -t mooncake:from-source .
+```
+
+The resulting image already has a virtual environment at `/opt/venv` with the freshly built wheel installed. Launch it with GPU/RDMA access as needed, for example:
+
+```bash
+docker run --gpus all --network host -it mooncake:from-source /bin/bash
+```
+
+> [!NOTE]
+> Make sure you build the image from the repository root so that Git metadata and submodules are available inside the build context.
 
 ### Build and use binaries
 The following are additional dependencies for building Mooncake:
