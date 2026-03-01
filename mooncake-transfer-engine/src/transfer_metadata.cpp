@@ -407,7 +407,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
-    } else if (desc->protocol == "nvmeof") {
+    } else if (desc->protocol == "nvmeof" || desc->protocol == "gds") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             NVMeoFBufferDesc buffer;
             buffer.file_path = bufferJSON["file_path"].asString();
@@ -712,6 +712,21 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
 #ifdef USE_CXL
                 ||
                 (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+                    } else if (segmentJSON["protocol"] == "nvmeof" ||
+                               segmentJSON["protocol"] == "gds") {
+                        Json::Value buffersJSON(Json::arrayValue);
+                        for (const auto &buffer : desc.nvmeof_buffers) {
+                            Json::Value bufferJSON;
+                            bufferJSON["file_path"] = buffer.file_path;
+                            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+                            Json::Value localPathMapJSON;
+                            for (const auto &entry : buffer.local_path_map) {
+                                localPathMapJSON[entry.first] = entry.second;
+                            }
+                            bufferJSON["local_path_map"] = localPathMapJSON;
+                            buffersJSON.append(bufferJSON);
+                        }
+                        segmentJSON["buffers"] = buffersJSON;
 #endif
             ) {
                 segment_desc->buffers.erase(iter);
