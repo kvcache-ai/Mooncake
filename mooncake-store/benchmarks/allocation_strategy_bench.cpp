@@ -508,8 +508,6 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
         cfg.num_segments + cfg.scale_out_new_segments, effective_capacity, cfg.skewed);
     // for backward compatibility with base struct, though we print the detailed ones
     res.cluster_capacity_gb = res.scaled_capacity_gb;
-    res.cluster_capacity_gb = computeClusterCapacityGB(
-        cfg.num_segments, effective_capacity, cfg.skewed);
 
     int success_count = 0;
     int total_count = 0;
@@ -517,11 +515,13 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs;
     bool injected = false;
 
+    double instrumentation_time_us = 0.0;
     auto total_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < cfg.num_allocations; ++i) {
         // --- Inject new nodes at the trigger point ---
         if (!injected && i >= trigger_at) {
+            auto i0 = std::chrono::high_resolution_clock::now();
             res.stddev_before_scale = computeUtilizationStdDev(manager);
             new_node_allocs = injectNewSegments(
                 manager, cfg.scale_out_new_segments, cfg.segment_capacity,
@@ -529,6 +529,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
             res.stddev_just_after_scale = computeUtilizationStdDev(manager);
             res.trigger_alloc_idx = i;
             injected = true;
+            auto i1 = std::chrono::high_resolution_clock::now();
+            instrumentation_time_us +=
+                std::chrono::duration<double, std::micro>(i1 - i0).count();
         }
 
         // --- Allocate ---
@@ -548,6 +551,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 
         // --- Sample stddev & new-node utilization ---
         if (i > 0 && i % sample_interval == 0) {
+            auto s0 = std::chrono::high_resolution_clock::now();
             stddev_over_time.push_back(computeUtilizationStdDev(manager));
             avg_util_over_time.push_back(computeAverageUtilAll(manager));
 
@@ -555,6 +559,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
                 res.new_node_util_over_time.push_back(
                     computeAverageUtil(new_node_allocs));
             }
+            auto s1 = std::chrono::high_resolution_clock::now();
+            instrumentation_time_us +=
+                std::chrono::duration<double, std::micro>(s1 - s0).count();
         }
     }
 
@@ -562,6 +569,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     double total_us =
         std::chrono::duration<double, std::micro>(total_end - total_start)
             .count();
+    total_us -= instrumentation_time_us;
 
     // --- Find re-convergence point after injection ---
     res.re_converge_allocs = -1;
