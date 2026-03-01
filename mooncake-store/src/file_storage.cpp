@@ -163,39 +163,22 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
     storage_backend_ = create_storage_backend_result.value();
 
-    // Register buffer with UringFile if using BucketStorageBackend
+    // Register the client buffer with the process-wide io_uring fixed-buffer
+    // mechanism. This must happen before any I/O threads start so that they
+    // can lazily pick up the registration on their first I/O call.
 #ifdef USE_URING
-    if (config.storage_backend_type == StorageBackendType::kBucket) {
-        auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
-        if (bucket_backend) {
-            auto file_result = bucket_backend->GetFileInstance();
-            if (file_result) {
-                auto file = file_result.value();
-                auto uring_file = std::dynamic_pointer_cast<UringFile>(file);
-                if (uring_file) {
-                    auto aligned_allocator =
-                        std::static_pointer_cast<AlignedClientBufferAllocator>(
-                            client_buffer_allocator_);
-                    if (aligned_allocator) {
-                        void* base_ptr = aligned_allocator->get_base_pointer();
-                        size_t size = aligned_allocator->get_total_size();
-
-                        if (uring_file->register_buffer(base_ptr, size)) {
-                            LOG(INFO)
-                                << "Successfully registered buffer with "
-                                   "UringFile: "
-                                << "base=" << base_ptr << ", size=" << size;
-                        } else {
-                            LOG(WARNING)
-                                << "Failed to register buffer with UringFile";
-                        }
-                    }
-                }
+    if (config.use_uring) {
+        auto aligned_allocator =
+            std::static_pointer_cast<AlignedClientBufferAllocator>(
+                client_buffer_allocator_);
+        if (aligned_allocator) {
+            void* base_ptr = aligned_allocator->get_base_pointer();
+            size_t size = aligned_allocator->get_total_size();
+            if (UringFile::register_global_buffer(base_ptr, size)) {
+                LOG(INFO) << "Successfully registered buffer with UringFile: "
+                          << "base=" << base_ptr << ", size=" << size;
             } else {
-                LOG(WARNING)
-                    << "Failed to get file instance for buffer registration: "
-                    << file_result.error();
+                LOG(WARNING) << "Failed to register buffer with UringFile";
             }
         }
     }
@@ -284,7 +267,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     return {};
 }
 
-tl::expected<std::vector<uint64_t>, ErrorCode> FileStorage::BatchGet(
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
@@ -310,15 +293,19 @@ tl::expected<std::vector<uint64_t>, ErrorCode> FileStorage::BatchGet(
         }
     }
 
+    uint64_t batch_id = allocated_batch->batch_id;
+    BatchGetResult batch_result{batch_id, allocated_batch->pointers};
+
     MutexLocker locker(&client_buffer_mutex_);
-    client_buffer_allocated_batches_.emplace_back(std::move(allocated_batch));
+    client_buffer_allocated_batches_.emplace(batch_id,
+                                             std::move(allocated_batch));
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
-            << "us, key size: " << keys.size();
-    return allocate_res.value<>()->pointers;
+            << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
+    return batch_result;
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -502,6 +489,7 @@ tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
     auto result = std::make_shared<AllocatedBatch>();
+    result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     auto lease_timeout =
@@ -527,9 +515,9 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             {
                 MutexLocker locker(&client_buffer_mutex_);
                 auto gc_now = std::chrono::steady_clock::now();
-                auto it = client_buffer_allocated_batches_.begin();
-                while (it != client_buffer_allocated_batches_.end()) {
-                    if (gc_now >= (*it)->lease_timeout) {
+                for (auto it = client_buffer_allocated_batches_.begin();
+                     it != client_buffer_allocated_batches_.end();) {
+                    if (gc_now >= it->second->lease_timeout) {
                         it = client_buffer_allocated_batches_.erase(it);
                     } else {
                         ++it;
@@ -572,20 +560,36 @@ void FileStorage::ClientBufferGCThreadFunc() {
             MutexLocker locker(&client_buffer_mutex_);
             if (!client_buffer_allocated_batches_.empty()) {
                 auto now = std::chrono::steady_clock::now();
-                client_buffer_allocated_batches_.erase(
-                    std::remove_if(
-                        client_buffer_allocated_batches_.begin(),
-                        client_buffer_allocated_batches_.end(),
-                        [&](const std::shared_ptr<AllocatedBatch>& batch) {
-                            return now >= batch->lease_timeout;
-                        }),
-                    client_buffer_allocated_batches_.end());
+                for (auto it = client_buffer_allocated_batches_.begin();
+                     it != client_buffer_allocated_batches_.end();) {
+                    if (now >= it->second->lease_timeout) {
+                        VLOG(1) << "GC releasing batch_id: " << it->first
+                                << " (lease expired)";
+                        it = client_buffer_allocated_batches_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
             }
         }
         std::this_thread::sleep_for(
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
+    MutexLocker locker(&client_buffer_mutex_);
+    auto it = client_buffer_allocated_batches_.find(batch_id);
+    if (it != client_buffer_allocated_batches_.end()) {
+        VLOG(1) << "Releasing buffer for batch_id: " << batch_id
+                << " (transfer completed)";
+        client_buffer_allocated_batches_.erase(it);
+        return true;
+    }
+    VLOG(1) << "batch_id " << batch_id
+            << " not found (may have been GC'd already)";
+    return false;
 }
 
 }  // namespace mooncake
