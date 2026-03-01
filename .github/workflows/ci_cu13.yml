@@ -85,7 +85,7 @@ jobs:
           -DBUILD_UNIT_TESTS=OFF \
           -DBUILD_EXAMPLES=OFF \
           -DENABLE_SCCACHE=ON \
-          -DBUILD_BENCHMARK=ON \
+          -DBUILD_BENCHMARK=OFF \
           -DUSE_CUDA=ON \
           -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
