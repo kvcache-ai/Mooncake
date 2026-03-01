@@ -120,6 +120,7 @@ ibv_devices  # List InfiniBand/RDMA devices
 **Performance Tips:**
 - Use multiple RDMA NICs for bandwidth aggregation
 - Enable GPUDirect RDMA for GPU memory transfers
+- **Enable PCIe relaxed ordering for optimal GPU RDMA performance** by setting `export MC_IB_PCI_RELAXED_ORDERING=1` (critical for achieving ~47 GB/s instead of ~15 GB/s with GPU memory)
 - Configure proper NUMA affinity for optimal performance
 - See [Transfer Engine Benchmark Tuning](../design/transfer-engine/transfer-engine-bench-tuning.md) for detailed optimization
 
