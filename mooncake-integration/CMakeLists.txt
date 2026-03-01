@@ -141,8 +141,8 @@ if (USE_UBSHMEM)
     )
 endif()
 
-if(USE_INTRA_NVLINK)
-    message(STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
+if(USE_INTRA_NODE_NVLINK)
+    message(STATUS "USE_INTRA_NODE_NVLINK is enabled, IntraNode nvlink is now activated")
 endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
