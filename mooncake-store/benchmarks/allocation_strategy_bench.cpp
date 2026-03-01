@@ -43,7 +43,7 @@ static constexpr double GiB = 1024.0 * 1024 * 1024;
 
 // Benchmark constants
 constexpr int kNumVirtualNodes = 10;
-constexpr int kSkewFactor = 10;
+constexpr double kSkewRatio = 0.5; // +/- 50% capacity for skewed clusters
 constexpr uint64_t kPrimaryBaseAddr = 0x100000000ULL;
 constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
 constexpr size_t kMaxExpectedAllocs = 600000;
@@ -127,9 +127,12 @@ static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
                                        bool skewed) {
     double total = 0.0;
     for (int i = 0; i < num_segments; ++i) {
-        size_t cap = skewed ? base_capacity * (1 + static_cast<size_t>(i % 10))
-                           : base_capacity;
-        total += static_cast<double>(cap);
+        double cap = static_cast<double>(base_capacity);
+        if (skewed) {
+            cap = (i % 2 == 0) ? cap * (1.0 + kSkewRatio)
+                               : cap * (1.0 - kSkewRatio);
+        }
+        total += cap;
     }
     return total / GiB;
 }
@@ -201,10 +204,13 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
         std::string name =
             "node_" + std::to_string(global_i / segments_per_node) + "_seg_" +
             std::to_string(global_i % segments_per_node);
-        // skew is based on capacity variation by index
-        size_t capacity =
-            skewed ? base_capacity * (1 + static_cast<size_t>(i % kSkewFactor))
-                   : base_capacity;
+        // Balanced skew: alternate between (1 + ratio) and (1 - ratio) 
+        // to keep total capacity constant for even segment counts.
+        size_t capacity = base_capacity;
+        if (skewed) {
+            capacity = (i % 2 == 0) ? base_capacity * (1.0 + kSkewRatio)
+                                    : base_capacity * (1.0 - kSkewRatio);
+        }
         uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
@@ -260,6 +266,18 @@ static double computeAverageUtilAll(const AllocatorManager& manager) {
         }
     }
     return count > 0 ? sum / count : 0.0;
+}
+
+static size_t computeTotalCapacity(const AllocatorManager& manager) {
+    size_t total = 0;
+    for (const auto& name : manager.getNames()) {
+        const auto* allocs = manager.getAllocators(name);
+        if (!allocs) continue;
+        for (const auto& alloc : *allocs) {
+            total += alloc->capacity();
+        }
+    }
+    return total;
 }
 
 /**
@@ -448,12 +466,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.alloc_size = cfg.alloc_size;
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
-    res.initial_capacity_gb = computeClusterCapacityGB(
-        cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    res.scaled_capacity_gb = computeClusterCapacityGB(
-        cfg.num_segments + cfg.scale_out_new_segments, cfg.segment_capacity, cfg.skewed);
-    // for backward compatibility with base struct, though we print the detailed ones
-    res.cluster_capacity_gb = res.scaled_capacity_gb;
+    res.initial_capacity_gb = (double)computeTotalCapacity(manager) / GiB;
+    res.scaled_capacity_gb = res.initial_capacity_gb; // Will be updated after injection
+    res.cluster_capacity_gb = res.initial_capacity_gb;
 
     std::vector<std::vector<Replica>> active_allocations;
     // Reserve enough to avoid frequent reallocations. 
@@ -490,9 +505,10 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     // --- Inject New Nodes ---
     res.stddev_before_scale = computeUtilizationStdDev(manager);
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs =
-        injectNewSegments(
-            manager, cfg.scale_out_new_segments, cfg.segment_capacity,
-            /*id_offset=*/cfg.num_segments);
+        injectNewSegments(manager, cfg.scale_out_new_segments, cfg.segment_capacity,
+                          cfg.num_segments);
+    res.scaled_capacity_gb = (double)computeTotalCapacity(manager) / GiB;
+    res.cluster_capacity_gb = res.scaled_capacity_gb;
     res.stddev_just_after_scale = computeUtilizationStdDev(manager);
     res.trigger_alloc_idx = 0;
 
@@ -724,6 +740,7 @@ static void runFillupBenchmakrs() {
               << " consecutive allocations fail.\n"
               << "Config: num_allocations=" << FLAGS_num_allocations
               << ", segment_capacity=" << FLAGS_segment_capacity << " MB\n"
+              << "Skewed setup: half nodes are (base + 50%) capacity, half are (base - 50%)\n"
               << std::endl;
 
     std::vector<BenchConfig> configs;
@@ -784,6 +801,7 @@ static void runScaleOutMatrix() {
               << "then measure " << FLAGS_alloc_percent_after_scale << "% of expanded capacity (Cap: 200k allocations).\n"
               << "Config: segment_capacity=" << FLAGS_segment_capacity << " MB, "
               << "convergence_threshold=" << FLAGS_convergence_threshold << "\n"
+              << "Skewed setup: half nodes are (base + 50%) capacity, half are (base - 50%)\n"
               << std::endl;
 
     std::vector<BenchConfig> configs;
