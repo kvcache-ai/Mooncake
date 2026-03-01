@@ -24,15 +24,17 @@ DEFINE_int64(segment_capacity, 1024,
 DEFINE_int32(num_allocations, 10000, "Number of allocations to benchmark");
 DEFINE_int32(convergence_sample_interval, 100,
              "Sample utilization stddev every N allocations (scaleout only)");
-DEFINE_bool(run_all, false,
-            "Also run the Scale-Out matrix in addition to the default Fillup matrix");
+DEFINE_bool(
+    run_all, false,
+    "Also run the Scale-Out matrix in addition to the default Fillup matrix");
 
 // Scale-Out workload flags
 DEFINE_string(workload, "fillup", "Workload type: fillup (default), scaleout");
 DEFINE_int32(scale_out_trigger_pct, 50,
              "Percentage of num_allocations after which new nodes are injected "
              "(scaleout mode only)");
-DEFINE_int32(alloc_percent_after_scale, 30, "Percentage of num_allocations to allocate after scaleout");
+DEFINE_int32(alloc_percent_after_scale, 30,
+             "Percentage of num_allocations to allocate after scaleout");
 DEFINE_double(convergence_threshold, 0.1, "Threshold for convergence");
 
 using namespace mooncake;
@@ -43,7 +45,7 @@ static constexpr double GiB = 1024.0 * 1024 * 1024;
 
 // Benchmark constants
 constexpr int kNumVirtualNodes = 10;
-constexpr double kSkewRatio = 0.5; // +/- 50% capacity for skewed clusters
+constexpr double kSkewRatio = 0.5;  // +/- 50% capacity for skewed clusters
 constexpr uint64_t kPrimaryBaseAddr = 0x100000000ULL;
 constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
 constexpr size_t kMaxExpectedAllocs = 600000;
@@ -95,8 +97,8 @@ struct BenchResultBase {
     double p90_ns;
     double p99_ns;
 
-    int success_count = 0;     // successful allocations
-    int total_count = 0;       // total attempted allocations
+    int success_count = 0;  // successful allocations
+    int total_count = 0;    // total attempted allocations
 
     double final_util_stddev;  // utilization stddev at run end
     double final_avg_util;     // average utilization at run end
@@ -140,7 +142,8 @@ static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
 static constexpr int64_t BENCHMARK_MEMORY_LIMIT = 16ULL * 1024 * 1024 * 1024;
 static void setupResourceLimits() {
     struct rlimit rl;
-    // Cap virtual address space (RLIMIT_AS) to 2TB (virtual space is cheap on 64-bit)
+    // Cap virtual address space (RLIMIT_AS) to 2TB (virtual space is cheap on
+    // 64-bit)
     rl.rlim_cur = 2048ULL * 1024 * 1024 * 1024;
     rl.rlim_max = 2048ULL * 1024 * 1024 * 1024;
     setrlimit(RLIMIT_AS, &rl);
@@ -154,10 +157,10 @@ static void setupResourceLimits() {
 namespace mooncake {
 /**
  * @brief Memory-safety hack for large cluster benchmarks.
- * 
- * To simulate 1024 segments within 16GB RAM while preserving the production 
- * 1KB metadata granularity, we manually downsize the internal node capacity 
- * of each allocator instance to 64K nodes. 
+ *
+ * To simulate 1024 segments within 16GB RAM while preserving the production
+ * 1KB metadata granularity, we manually downsize the internal node capacity
+ * of each allocator instance to 64K nodes.
  * This reduces metadata overhead per segment from ~36MB to ~2MB.
  */
 void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator) {
@@ -182,7 +185,7 @@ void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator) {
     allocator_impl->m_nodes.reserve(benchmark_max_cap);
     allocator_impl->m_freeNodes.reserve(benchmark_max_cap);
 }
-} // namespace mooncake
+}  // namespace mooncake
 
 /**
  * @brief Create an AllocatorManager populated with N OffsetBufferAllocators.
@@ -195,8 +198,8 @@ void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator) {
 static AllocatorManager createCluster(int num_segments, size_t base_capacity,
                                       bool skewed, int id_offset = 0) {
     AllocatorManager manager;
-    // Distribute segments evenly across kNumVirtualNodes virtual nodes if num_segments > kNumVirtualNodes,
-    // otherwise 1 segment per node.
+    // Distribute segments evenly across kNumVirtualNodes virtual nodes if
+    // num_segments > kNumVirtualNodes, otherwise 1 segment per node.
     int segments_per_node = std::max(1, num_segments / kNumVirtualNodes);
 
     for (int i = 0; i < num_segments; ++i) {
@@ -204,7 +207,7 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
         std::string name =
             "node_" + std::to_string(global_i / segments_per_node) + "_seg_" +
             std::to_string(global_i % segments_per_node);
-        // Balanced skew: alternate between (1 + ratio) and (1 - ratio) 
+        // Balanced skew: alternate between (1 + ratio) and (1 - ratio)
         // to keep total capacity constant for even segment counts.
         size_t capacity = base_capacity;
         if (skewed) {
@@ -236,8 +239,8 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
     constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
     for (int i = 0; i < count; ++i) {
         std::string name = "new_node_" + std::to_string(id_offset + i);
-        uint64_t base_addr =
-            kInjectedBaseAddr + (static_cast<uint64_t>(id_offset + i) * capacity);
+        uint64_t base_addr = kInjectedBaseAddr +
+                             (static_cast<uint64_t>(id_offset + i) * capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
         downsizeAllocator(allocator);
@@ -347,9 +350,8 @@ static std::string strategyName(AllocationStrategyType type) {
  * Shared between Fill-Up and Scale-Out benchmark runners.
  * Sorts latencies in-place.
  */
-static void computeLatencyStats(std::vector<double>& latencies,
-                                double total_us, int num_allocations,
-                                BenchResultBase& res) {
+static void computeLatencyStats(std::vector<double>& latencies, double total_us,
+                                int num_allocations, BenchResultBase& res) {
     std::sort(latencies.begin(), latencies.end());
     auto percentile = [&](double p) -> double {
         if (latencies.empty()) return 0.0;
@@ -361,11 +363,10 @@ static void computeLatencyStats(std::vector<double>& latencies,
     res.total_time_us = total_us;
     res.throughput =
         latencies.empty() ? 0.0 : num_allocations / (total_us / 1e6);
-    res.avg_ns = latencies.empty()
-                     ? 0.0
-                     : std::accumulate(latencies.begin(), latencies.end(),
-                                       0.0) /
-                           latencies.size();
+    res.avg_ns = latencies.empty() ? 0.0
+                                   : std::accumulate(latencies.begin(),
+                                                     latencies.end(), 0.0) /
+                                         latencies.size();
     res.p50_ns = percentile(0.50);
     res.p90_ns = percentile(0.90);
     res.p99_ns = percentile(0.99);
@@ -467,32 +468,39 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
     res.initial_capacity_gb = (double)computeTotalCapacity(manager) / GiB;
-    res.scaled_capacity_gb = res.initial_capacity_gb; // Will be updated after injection
+    res.scaled_capacity_gb =
+        res.initial_capacity_gb;  // Will be updated after injection
     res.cluster_capacity_gb = res.initial_capacity_gb;
 
     std::vector<std::vector<Replica>> active_allocations;
-    // Reserve enough to avoid frequent reallocations. 
-    active_allocations.reserve(kMaxExpectedAllocs); 
+    // Reserve enough to avoid frequent reallocations.
+    active_allocations.reserve(kMaxExpectedAllocs);
 
     int success_count = 0;
     int total_count = 0;
     int consec_failures = 0;
     const int kMaxConsecFailures = 10;
 
-    // Use larger blocks for pre-fill to reach target with less metadata overhead (avoiding OOM)
-    size_t pre_fill_alloc_size = std::max((size_t)cfg.alloc_size, (size_t)(8ULL * MiB));
+    // Use larger blocks for pre-fill to reach target with less metadata
+    // overhead (avoiding OOM)
+    size_t pre_fill_alloc_size =
+        std::max((size_t)cfg.alloc_size, (size_t)(8ULL * MiB));
     if (res.initial_capacity_gb > kLargeClusterThresholdGB) {
-        pre_fill_alloc_size = std::max(pre_fill_alloc_size, (size_t)(32ULL * MiB));
+        pre_fill_alloc_size =
+            std::max(pre_fill_alloc_size, (size_t)(32ULL * MiB));
     }
     int pre_alloc_count = 0;
     while (true) {
-        // Sample periodically to avoid O(N) evaluation on every pre-fill allocation
+        // Sample periodically to avoid O(N) evaluation on every pre-fill
+        // allocation
         if (pre_alloc_count % kPreFillSampleInterval == 0) {
-            if (computeAverageUtilAll(manager) * 100.0 >= cfg.scale_out_trigger_pct) {
+            if (computeAverageUtilAll(manager) * 100.0 >=
+                cfg.scale_out_trigger_pct) {
                 break;
             }
         }
-        auto result = strategy->Allocate(manager, pre_fill_alloc_size, cfg.replica_num);
+        auto result =
+            strategy->Allocate(manager, pre_fill_alloc_size, cfg.replica_num);
         if (result.has_value()) {
             active_allocations.push_back(std::move(result.value()));
             consec_failures = 0;
@@ -505,8 +513,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     // --- Inject New Nodes ---
     res.stddev_before_scale = computeUtilizationStdDev(manager);
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs =
-        injectNewSegments(manager, cfg.scale_out_new_segments, cfg.segment_capacity,
-                          cfg.num_segments);
+        injectNewSegments(manager, cfg.scale_out_new_segments,
+                          cfg.segment_capacity, cfg.num_segments);
     res.scaled_capacity_gb = (double)computeTotalCapacity(manager) / GiB;
     res.cluster_capacity_gb = res.scaled_capacity_gb;
     res.stddev_just_after_scale = computeUtilizationStdDev(manager);
@@ -514,13 +522,16 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 
     // Reset counters for the benchmarking phase
     consec_failures = 0;
-    
+
     // Calculate requested percentage of expanded capacity in bytes
     double pct = static_cast<double>(FLAGS_alloc_percent_after_scale) / 100.0;
     double bytes_to_allocate = res.scaled_capacity_gb * GiB * pct;
-    int measurement_allocs = static_cast<int>(std::round(
-        bytes_to_allocate / (static_cast<double>(cfg.alloc_size) * cfg.replica_num)));
-    measurement_allocs = std::max(kMinMeasurementAllocs, std::min(measurement_allocs, kMaxMeasurementAllocs));
+    int measurement_allocs = static_cast<int>(
+        std::round(bytes_to_allocate /
+                   (static_cast<double>(cfg.alloc_size) * cfg.replica_num)));
+    measurement_allocs =
+        std::max(kMinMeasurementAllocs,
+                 std::min(measurement_allocs, kMaxMeasurementAllocs));
     latencies.reserve(measurement_allocs);
 
     std::vector<int> sample_points;
@@ -528,16 +539,18 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     std::vector<double> avg_util_over_time;
 
     int sample_interval = FLAGS_convergence_sample_interval;
-    // dynamically adapt interval if measurement_allocs is too small to even hit enough samples
-    if (measurement_allocs > 0 && measurement_allocs < sample_interval * kMinSamplesForConvergence) {
-        sample_interval = std::max(1, measurement_allocs / kMinSamplesForConvergence);
+    // dynamically adapt interval if measurement_allocs is too small to even hit
+    // enough samples
+    if (measurement_allocs > 0 &&
+        measurement_allocs < sample_interval * kMinSamplesForConvergence) {
+        sample_interval =
+            std::max(1, measurement_allocs / kMinSamplesForConvergence);
     }
 
     double instrumentation_time_us = 0.0;
     auto total_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < measurement_allocs; ++i) {
-
         // --- Allocate ---
         auto t0 = std::chrono::high_resolution_clock::now();
         auto result =
@@ -559,7 +572,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
         // --- Sample stddev & new-node utilization ---
         if ((i + 1) % sample_interval == 0 || i == measurement_allocs - 1) {
             auto s0 = std::chrono::high_resolution_clock::now();
-            
+
             sample_points.push_back(i + 1);
             stddev_over_time.push_back(computeUtilizationStdDev(manager));
             avg_util_over_time.push_back(computeAverageUtilAll(manager));
@@ -584,7 +597,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.re_converge_allocs = -1;
     for (int idx = 0; idx < static_cast<int>(stddev_over_time.size()); ++idx) {
         if (stddev_over_time[idx] < convergence_threshold) {
-             // Since trigger is at 0, convergence offset is just exact alloc count
+            // Since trigger is at 0, convergence offset is just exact alloc
+            // count
             res.re_converge_allocs = sample_points[idx];
             break;
         }
@@ -602,9 +616,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
         int allocs_done = sample_points[i];
         // Only evaluate convergence once the cluster is at least 1% utilized.
         const double min_util_to_check = 0.01;
-        bool util_sufficient =
-            i < avg_util_over_time.size() &&
-            avg_util_over_time[i] >= min_util_to_check;
+        bool util_sufficient = i < avg_util_over_time.size() &&
+                               avg_util_over_time[i] >= min_util_to_check;
 
         if (!util_sufficient) {
             // Too early — don't count
@@ -626,10 +639,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     // Compute final metrics while active_allocations is still alive
     res.final_util_stddev = computeUtilizationStdDev(manager);
     res.final_avg_util = computeAverageUtilAll(manager);
-    res.converge_avg_util =
-        (converged_at != -1 && first_converge_avg_util >= 0)
-            ? first_converge_avg_util
-            : res.final_avg_util;
+    res.converge_avg_util = (converged_at != -1 && first_converge_avg_util >= 0)
+                                ? first_converge_avg_util
+                                : res.final_avg_util;
     res.convergence_alloc_count = converged_at;
     res.success_count = success_count;
     res.total_count = total_count;
@@ -642,90 +654,82 @@ static void printFillUpHeader() {
     std::cout << std::string(170, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
               << "Replica" << std::setw(10) << "Segments" << std::setw(12)
-              << "AllocSize" << std::setw(12) << "Cluster(GB)"
-              << std::setw(8) << "Skewed" << std::right
-              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
-              << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
-              << std::setw(12) << "P99(ns)" << std::setw(12)
-              << "UtilStdDev" << std::setw(10) << "AvgUtil%"
-              << std::setw(15) << "Succ/Total"
-              << std::endl;
+              << "AllocSize" << std::setw(12) << "Cluster(GB)" << std::setw(8)
+              << "Skewed" << std::right << std::setw(14) << "Throughput"
+              << std::setw(12) << "Avg(ns)" << std::setw(12) << "P50(ns)"
+              << std::setw(12) << "P90(ns)" << std::setw(12) << "P99(ns)"
+              << std::setw(12) << "UtilStdDev" << std::setw(10) << "AvgUtil%"
+              << std::setw(15) << "Succ/Total" << std::endl;
     std::cout << std::string(170, '-') << std::endl;
 }
 
 static void printFillUpResult(const FillUpResult& r) {
-    std::string alloc_ratio = std::to_string(r.success_count) + "/" +
-                              std::to_string(r.total_count);
+    std::string alloc_ratio =
+        std::to_string(r.success_count) + "/" + std::to_string(r.total_count);
     std::ostringstream cap_ss;
     cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
               << r.replica_num << std::setw(10) << r.num_segments
-              << std::setw(12)
-              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(12)
-              << cap_ss.str()
-              << std::setw(8) << (r.skewed ? "yes" : "no")
-              << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
-              << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
-              << std::setw(12) << r.p99_ns << std::setprecision(4)
-              << std::setw(12) << r.final_util_stddev << std::setprecision(2)
-              << std::setw(9) << (r.final_avg_util * 100.0) << "%"
-              << std::setw(15) << alloc_ratio
-              << std::endl;
+              << std::setw(12) << (std::to_string(r.alloc_size / KiB) + "KB")
+              << std::setw(12) << cap_ss.str() << std::setw(8)
+              << (r.skewed ? "yes" : "no") << std::right << std::fixed
+              << std::setprecision(0) << std::setw(14) << r.throughput
+              << std::setw(12) << r.avg_ns << std::setw(12) << r.p50_ns
+              << std::setw(12) << r.p90_ns << std::setw(12) << r.p99_ns
+              << std::setprecision(4) << std::setw(12) << r.final_util_stddev
+              << std::setprecision(2) << std::setw(9)
+              << (r.final_avg_util * 100.0) << "%" << std::setw(15)
+              << alloc_ratio << std::endl;
 }
 
 static void printScaleOutHeader() {
     std::cout << std::string(210, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
               << "Replica" << std::setw(10) << "Segments" << std::setw(12)
-              << "AllocSize" << std::setw(16) << "Cluster(GB)"
-              << std::setw(8) << "Skewed" << std::right
-              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
-              << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
-              << std::setw(12) << "P99(ns)" << std::setw(12)
-              << "UtilStdDev"
-              << std::setw(10) << "ConvUtil%" << std::setw(11) << "FinalUtil%"
-              << std::setw(14) << "Converge@"
-              << std::setw(15) << "Succ/Total"
-              << std::endl;
+              << "AllocSize" << std::setw(16) << "Cluster(GB)" << std::setw(8)
+              << "Skewed" << std::right << std::setw(14) << "Throughput"
+              << std::setw(12) << "Avg(ns)" << std::setw(12) << "P50(ns)"
+              << std::setw(12) << "P90(ns)" << std::setw(12) << "P99(ns)"
+              << std::setw(12) << "UtilStdDev" << std::setw(10) << "ConvUtil%"
+              << std::setw(11) << "FinalUtil%" << std::setw(14) << "Converge@"
+              << std::setw(15) << "Succ/Total" << std::endl;
     std::cout << std::string(210, '-') << std::endl;
 }
 
 static void printScaleOutResult(const ScaleOutResult& r) {
     std::string converge_str = "N/A";
     std::string conv_util_str = "N/A";
-    
+
     if (r.convergence_alloc_count > 0) {
         converge_str = std::to_string(r.convergence_alloc_count);
         std::ostringstream util_ss;
-        util_ss << std::fixed << std::setprecision(2) << (r.converge_avg_util * 100.0) << "%";
+        util_ss << std::fixed << std::setprecision(2)
+                << (r.converge_avg_util * 100.0) << "%";
         conv_util_str = util_ss.str();
     }
 
-    std::string alloc_ratio = std::to_string(r.success_count) + "/" +
-                              std::to_string(r.total_count);
+    std::string alloc_ratio =
+        std::to_string(r.success_count) + "/" + std::to_string(r.total_count);
     std::ostringstream cap_ss;
-    cap_ss << std::fixed << std::setprecision(1) << r.initial_capacity_gb 
+    cap_ss << std::fixed << std::setprecision(1) << r.initial_capacity_gb
            << "->" << r.scaled_capacity_gb;
 
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
               << r.replica_num << std::setw(10) << r.num_segments
-              << std::setw(12)
-              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(16)
-              << cap_ss.str()
-              << std::setw(8) << (r.skewed ? "yes" : "no")
-              << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
-              << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
-              << std::setw(12) << r.p99_ns << std::setprecision(4)
-              << std::setw(12) << r.final_util_stddev 
+              << std::setw(12) << (std::to_string(r.alloc_size / KiB) + "KB")
+              << std::setw(16) << cap_ss.str() << std::setw(8)
+              << (r.skewed ? "yes" : "no") << std::right << std::fixed
+              << std::setprecision(0) << std::setw(14) << r.throughput
+              << std::setw(12) << r.avg_ns << std::setw(12) << r.p50_ns
+              << std::setw(12) << r.p90_ns << std::setw(12) << r.p99_ns
+              << std::setprecision(4) << std::setw(12) << r.final_util_stddev
               << std::setw(10) << conv_util_str << std::setprecision(2)
               << std::setw(9) << (r.final_avg_util * 100.0) << "%"
-              << std::setw(14) << converge_str
-              << std::setw(15) << alloc_ratio << std::endl;
+              << std::setw(14) << converge_str << std::setw(15) << alloc_ratio
+              << std::endl;
 }
 
-static void runFillupBenchmakrs() {
+static void runFillupBenchmarks() {
     std::vector<bool> skewed_options = {false, true};
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {512 * KiB, 8 * MiB, 32 * MiB};
@@ -740,7 +744,8 @@ static void runFillupBenchmakrs() {
               << " consecutive allocations fail.\n"
               << "Config: num_allocations=" << FLAGS_num_allocations
               << ", segment_capacity=" << FLAGS_segment_capacity << " MB\n"
-              << "Skewed setup: half nodes are (base + 50%) capacity, half are (base - 50%)\n"
+              << "Skewed setup: half nodes are (base + 50%) capacity, half are "
+                 "(base - 50%)\n"
               << std::endl;
 
     std::vector<BenchConfig> configs;
@@ -784,7 +789,6 @@ static void runFillupBenchmakrs() {
     }
 }
 
-
 static void runScaleOutMatrix() {
     std::vector<bool> skewed_options = {false, true};
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
@@ -792,17 +796,20 @@ static void runScaleOutMatrix() {
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
-        AllocationStrategyType::FREE_RATIO_FIRST
-    };
+        AllocationStrategyType::FREE_RATIO_FIRST};
 
-    std::cout << "\n=== Scale-Out Workload Benchmark (Matrix) ===\n"
-              << "Note: Test will exit early if 10 consecutive allocations fail.\n"
-              << "Design: Pre-fill to " << FLAGS_scale_out_trigger_pct << "% capacity, "
-              << "then measure " << FLAGS_alloc_percent_after_scale << "% of expanded capacity (Cap: 200k allocations).\n"
-              << "Config: segment_capacity=" << FLAGS_segment_capacity << " MB, "
-              << "convergence_threshold=" << FLAGS_convergence_threshold << "\n"
-              << "Skewed setup: half nodes are (base + 50%) capacity, half are (base - 50%)\n"
-              << std::endl;
+    std::cout
+        << "\n=== Scale-Out Workload Benchmark (Matrix) ===\n"
+        << "Note: Test will exit early if 10 consecutive allocations fail.\n"
+        << "Design: Pre-fill to " << FLAGS_scale_out_trigger_pct
+        << "% capacity, "
+        << "then measure " << FLAGS_alloc_percent_after_scale
+        << "% of expanded capacity (Cap: 200k allocations).\n"
+        << "Config: segment_capacity=" << FLAGS_segment_capacity << " MB, "
+        << "convergence_threshold=" << FLAGS_convergence_threshold << "\n"
+        << "Skewed setup: half nodes are (base + 50%) capacity, half are (base "
+           "- 50%)\n"
+        << std::endl;
 
     std::vector<BenchConfig> configs;
     for (auto skew : skewed_options) {
@@ -822,7 +829,7 @@ static void runScaleOutMatrix() {
                         cfg.strategy_type = strategy;
                         cfg.strategy_name = strategyName(strategy);
                         cfg.workload_type = WorkloadType::SCALE_OUT;
-                        
+
                         cfg.scale_out_trigger_pct = FLAGS_scale_out_trigger_pct;
                         cfg.scale_out_new_segments = std::max(1, segs / 2);
                         configs.push_back(cfg);
@@ -846,7 +853,6 @@ static void runScaleOutMatrix() {
     }
 }
 
-
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
         "AllocationStrategy performance benchmark.\n"
@@ -855,10 +861,10 @@ int main(int argc, char* argv[]) {
     setupResourceLimits();
 
     if (FLAGS_run_all) {
-        runFillupBenchmakrs();
+        runFillupBenchmarks();
         runScaleOutMatrix();
     } else if (FLAGS_workload == "fillup") {
-        runFillupBenchmakrs();
+        runFillupBenchmarks();
     } else if (FLAGS_workload == "scaleout") {
         runScaleOutMatrix();
     }
