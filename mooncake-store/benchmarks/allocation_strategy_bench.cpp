@@ -512,6 +512,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     int success_count = 0;
     int total_count = 0;
 
+    const int kMaxConsecFailures = 10;
+    int consec_failures = 0;
+
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs;
     bool injected = false;
 
@@ -546,7 +549,10 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 
         if (result.has_value()) {
             active_allocations.push_back(std::move(result.value()));
+            consec_failures = 0;
             ++success_count;
+        } else {
+            if (++consec_failures >= kMaxConsecFailures) break;
         }
 
         // --- Sample stddev & new-node utilization ---
