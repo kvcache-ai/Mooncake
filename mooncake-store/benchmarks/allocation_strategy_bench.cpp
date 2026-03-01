@@ -588,8 +588,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     for (size_t i = 0; i < stddev_over_time.size(); ++i) {
         int allocs_done =
             static_cast<int>((i + 1) * sample_interval);
-        // Only evaluate convergence once the cluster is at least 10% utilized.
-        const double min_util_to_check = 0.10;
+        // Only evaluate convergence once the cluster is at least 1% utilized.
+        const double min_util_to_check = 0.01;
         bool util_sufficient =
             i < avg_util_over_time.size() &&
             avg_util_over_time[i] >= min_util_to_check;
