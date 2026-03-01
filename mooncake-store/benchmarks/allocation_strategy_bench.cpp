@@ -152,6 +152,10 @@ struct FillUpResult : BenchResultBase {};
  * @brief Scale-Out result: performance + convergence + adoption metrics.
  */
 struct ScaleOutResult : BenchResultBase {
+    // Capacity tracking
+    double initial_capacity_gb = 0.0;
+    double scaled_capacity_gb = 0.0;
+
     // Convergence (re-used from fill-up semantics for scale-out post-injection)
     double converge_avg_util = 0.0;
     int convergence_alloc_count = -1;  // -1 if not converged
@@ -498,6 +502,12 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.alloc_size = cfg.alloc_size;
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
+    res.initial_capacity_gb = computeClusterCapacityGB(
+        cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    res.scaled_capacity_gb = computeClusterCapacityGB(
+        cfg.num_segments + cfg.scale_out_new_segments, effective_capacity, cfg.skewed);
+    // for backward compatibility with base struct, though we print the detailed ones
+    res.cluster_capacity_gb = res.scaled_capacity_gb;
     res.cluster_capacity_gb = computeClusterCapacityGB(
         cfg.num_segments, effective_capacity, cfg.skewed);
 
@@ -662,10 +672,10 @@ static void printFillUpResult(const FillUpResult& r) {
 // ============================================================
 
 static void printScaleOutHeader() {
-    std::cout << std::string(200, '-') << std::endl;
+    std::cout << std::string(204, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
               << "Replica" << std::setw(10) << "Segments" << std::setw(12)
-              << "AllocSize" << std::setw(12) << "Cluster(GB)"
+              << "AllocSize" << std::setw(16) << "Cluster(GB)"
               << std::setw(8) << "Skewed" << std::right
               << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
@@ -674,7 +684,7 @@ static void printScaleOutHeader() {
               << std::setw(10) << "ConvUtil%" << std::setw(14) << "Converge@"
               << std::setw(15) << "Succ/Total"
               << std::endl;
-    std::cout << std::string(200, '-') << std::endl;
+    std::cout << std::string(204, '-') << std::endl;
 }
 
 static void printScaleOutResult(const ScaleOutResult& r) {
@@ -685,12 +695,13 @@ static void printScaleOutResult(const ScaleOutResult& r) {
     std::string alloc_ratio = std::to_string(r.success_count) + "/" +
                               std::to_string(r.total_count);
     std::ostringstream cap_ss;
-    cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
+    cap_ss << std::fixed << std::setprecision(1) << r.initial_capacity_gb 
+           << "->" << r.scaled_capacity_gb;
 
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
               << r.replica_num << std::setw(10) << r.num_segments
               << std::setw(12)
-              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(12)
+              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(16)
               << cap_ss.str()
               << std::setw(8) << (r.skewed ? "yes" : "no")
               << std::right << std::fixed << std::setprecision(0)
