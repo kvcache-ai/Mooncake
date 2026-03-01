@@ -481,8 +481,6 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     auto strategy = CreateAllocationStrategy(cfg.strategy_type);
 
     const int sample_interval = FLAGS_convergence_sample_interval;
-    const int trigger_at =
-        cfg.num_allocations * cfg.scale_out_trigger_pct / 100;
     const double convergence_threshold = 0.05;
 
     std::vector<double> latencies;
@@ -515,27 +513,41 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     const int kMaxConsecFailures = 10;
     int consec_failures = 0;
 
-    std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs;
-    bool injected = false;
+    // --- Pre-fill Phase ---
+    int pre_alloc_count = 0;
+    while (true) {
+        // Sample periodically to avoid O(N) evaluation on every pre-fill allocation
+        if (pre_alloc_count % 100 == 0) {
+            if (computeAverageUtilAll(manager) * 100.0 >= cfg.scale_out_trigger_pct) {
+                break;
+            }
+        }
+        auto result = strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
+        if (result.has_value()) {
+            active_allocations.push_back(std::move(result.value()));
+            consec_failures = 0;
+        } else {
+            if (++consec_failures >= kMaxConsecFailures) break;
+        }
+        pre_alloc_count++;
+    }
 
+    // --- Inject New Nodes ---
+    res.stddev_before_scale = computeUtilizationStdDev(manager);
+    std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs =
+        injectNewSegments(
+            manager, cfg.scale_out_new_segments, cfg.segment_capacity,
+            /*id_offset=*/cfg.num_segments);
+    res.stddev_just_after_scale = computeUtilizationStdDev(manager);
+    res.trigger_alloc_idx = 0;
+
+    // Reset counters for the benchmarking phase
+    consec_failures = 0;
+    
     double instrumentation_time_us = 0.0;
     auto total_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < cfg.num_allocations; ++i) {
-        // --- Inject new nodes at the trigger point ---
-        if (!injected && i >= trigger_at) {
-            auto i0 = std::chrono::high_resolution_clock::now();
-            res.stddev_before_scale = computeUtilizationStdDev(manager);
-            new_node_allocs = injectNewSegments(
-                manager, cfg.scale_out_new_segments, cfg.segment_capacity,
-                /*id_offset=*/cfg.num_segments);
-            res.stddev_just_after_scale = computeUtilizationStdDev(manager);
-            res.trigger_alloc_idx = i;
-            injected = true;
-            auto i1 = std::chrono::high_resolution_clock::now();
-            instrumentation_time_us +=
-                std::chrono::duration<double, std::micro>(i1 - i0).count();
-        }
 
         // --- Allocate ---
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -556,12 +568,13 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
         }
 
         // --- Sample stddev & new-node utilization ---
-        if (i > 0 && i % sample_interval == 0) {
+        if (i % sample_interval == 0) {
             auto s0 = std::chrono::high_resolution_clock::now();
+            
             stddev_over_time.push_back(computeUtilizationStdDev(manager));
             avg_util_over_time.push_back(computeAverageUtilAll(manager));
 
-            if (injected && !new_node_allocs.empty()) {
+            if (!new_node_allocs.empty()) {
                 res.new_node_util_over_time.push_back(
                     computeAverageUtil(new_node_allocs));
             }
@@ -579,15 +592,11 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 
     // --- Find re-convergence point after injection ---
     res.re_converge_allocs = -1;
-    if (injected) {
-        int trigger_sample_idx = trigger_at / sample_interval;
-        for (int idx = trigger_sample_idx;
-             idx < static_cast<int>(stddev_over_time.size()); ++idx) {
-            if (stddev_over_time[idx] < convergence_threshold) {
-                res.re_converge_allocs =
-                    (idx + 1) * sample_interval - trigger_at;
-                break;
-            }
+    for (int idx = 0; idx < static_cast<int>(stddev_over_time.size()); ++idx) {
+        if (stddev_over_time[idx] < convergence_threshold) {
+             // Since trigger is at 0, convergence offset is just idx+1 * interval
+            res.re_converge_allocs = (idx + 1) * sample_interval;
+            break;
         }
     }
 
@@ -704,9 +713,15 @@ static void printScaleOutHeader() {
 
 static void printScaleOutResult(const ScaleOutResult& r) {
     std::string converge_str = "N/A";
+    std::string conv_util_str = "N/A";
+    
     if (r.convergence_alloc_count > 0) {
         converge_str = std::to_string(r.convergence_alloc_count);
+        std::ostringstream util_ss;
+        util_ss << std::fixed << std::setprecision(2) << (r.converge_avg_util * 100.0) << "%";
+        conv_util_str = util_ss.str();
     }
+
     std::string alloc_ratio = std::to_string(r.success_count) + "/" +
                               std::to_string(r.total_count);
     std::ostringstream cap_ss;
@@ -723,9 +738,9 @@ static void printScaleOutResult(const ScaleOutResult& r) {
               << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
-              << std::setw(12) << r.final_util_stddev << std::setprecision(2)
-              << std::setw(9) << (r.converge_avg_util * 100.0) << "%"
-              << std::setw(10) << (r.final_avg_util * 100.0) << "%"
+              << std::setw(12) << r.final_util_stddev 
+              << std::setw(10) << conv_util_str
+              << std::setw(11) << (std::to_string(std::round(r.final_avg_util * 10000.0) / 100.0).substr(0, std::to_string(std::round(r.final_avg_util * 10000.0) / 100.0).find('.') + 3) + "%")
               << std::setw(14) << converge_str
               << std::setw(15) << alloc_ratio << std::endl;
 }
