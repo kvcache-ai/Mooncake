@@ -59,9 +59,6 @@ DEFINE_int32(convergence_sample_interval, 100,
              "Sample utilization stddev every N allocations");
 DEFINE_bool(run_all, false,
             "Run a standard matrix of configurations for comparison");
-DEFINE_string(
-    dump_distribution_file, "",
-    "File path to dump final segment utilization distribution (CSV format)");
 
 // Scale-Out workload flags
 DEFINE_string(workload, "fillup", "Workload type: fillup (default), scaleout");
@@ -303,44 +300,6 @@ static std::string strategyName(AllocationStrategyType type) {
             return "FreeRatioFirst";
         default:
             return "Unknown";
-    }
-}
-
-// ============================================================ // TODO: remove later
-//  CSV dump
-// ============================================================
-
-static void dumpDistribution(const BenchConfig& cfg,
-                             const AllocatorManager& manager,
-                             const std::string& filepath) {
-    if (filepath.empty()) return;
-
-    std::ofstream out(filepath, std::ios::app);
-    if (!out.is_open()) {
-        std::cerr << "Failed to open dump file: " << filepath << std::endl;
-        return;
-    }
-
-    out.seekp(0, std::ios::end);
-    if (out.tellp() == 0) {
-        out << "Strategy,NumSegments,AllocSize,ReplicaNum,Skewed,SegmentName,"
-               "Capacity,Used,Utilization\n";
-    }
-
-    for (const auto& name : manager.getNames()) {
-        const auto* allocators = manager.getAllocators(name);
-        if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
-            size_t cap = alloc->capacity();
-            size_t used = alloc->size();
-            double util = cap > 0 ? static_cast<double>(used) / cap : 0.0;
-
-            out << cfg.strategy_name << "," << cfg.num_segments << ","
-                << cfg.alloc_size << "," << cfg.replica_num << ","
-                << (cfg.skewed ? "true" : "false") << "," << name << "," << cap
-                << "," << used << "," << std::fixed << std::setprecision(4)
-                << util << "\n";
-        }
     }
 }
 
@@ -680,10 +639,6 @@ static BenchResult runBenchmark(const BenchConfig& cfg,
     //     }
     // }
 
-    if (!FLAGS_dump_distribution_file.empty()) {
-        dumpDistribution(cfg, manager, FLAGS_dump_distribution_file);
-    }
-
     BenchResult res;
     res.strategy_name = cfg.strategy_name;
     res.num_segments = cfg.num_segments;
@@ -838,6 +793,7 @@ static void runAllBenchmarks() {
     std::vector<bool> skewed_options = {false, true};
 
     std::cout << "\n=== AllocationStrategy Benchmark Matrix ===\n" << std::endl;
+    std::cout << "measure convergence after cluster total utility > 10%" << std::endl;
 
     for (auto skew : skewed_options) {
         for (auto strategy : strategies) {
