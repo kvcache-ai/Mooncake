@@ -672,7 +672,7 @@ static void printFillUpResult(const FillUpResult& r) {
 // ============================================================
 
 static void printScaleOutHeader() {
-    std::cout << std::string(204, '-') << std::endl;
+    std::cout << std::string(216, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
               << "Replica" << std::setw(10) << "Segments" << std::setw(12)
               << "AllocSize" << std::setw(16) << "Cluster(GB)"
@@ -681,10 +681,11 @@ static void printScaleOutHeader() {
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12)
               << "UtilStdDev"
-              << std::setw(10) << "ConvUtil%" << std::setw(14) << "Converge@"
+              << std::setw(10) << "ConvUtil%" << std::setw(11) << "FinalUtil%"
+              << std::setw(14) << "Converge@"
               << std::setw(15) << "Succ/Total"
               << std::endl;
-    std::cout << std::string(204, '-') << std::endl;
+    std::cout << std::string(216, '-') << std::endl;
 }
 
 static void printScaleOutResult(const ScaleOutResult& r) {
@@ -710,6 +711,7 @@ static void printScaleOutResult(const ScaleOutResult& r) {
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev << std::setprecision(2)
               << std::setw(9) << (r.converge_avg_util * 100.0) << "%"
+              << std::setw(10) << (r.final_avg_util * 100.0) << "%"
               << std::setw(14) << converge_str
               << std::setw(15) << alloc_ratio << std::endl;
 }
