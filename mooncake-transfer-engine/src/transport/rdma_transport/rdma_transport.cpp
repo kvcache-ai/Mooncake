@@ -691,10 +691,18 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
             continue;
         }
 
+        // Resolve NUMA-aware location for segmented buffers
+        std::string location = buffer.name;
+        SegmentsLocationInfo seg_info;
+        if (parseSegmentsLocation(buffer.name, seg_info)) {
+            location = resolveSegmentsLocation(seg_info, buffer.length,
+                                               offset - buffer.addr);
+        }
+
         device_id =
             hint.empty()
-                ? desc->topology.selectDevice(buffer.name, retry_count)
-                : desc->topology.selectDevice(buffer.name, hint, retry_count);
+                ? desc->topology.selectDevice(location, retry_count)
+                : desc->topology.selectDevice(location, hint, retry_count);
         if (device_id >= 0) return 0;
         device_id = hint.empty() ? desc->topology.selectDevice(
                                        kWildcardLocation, retry_count)

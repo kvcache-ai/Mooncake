@@ -16,6 +16,7 @@
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
+#include "topology.h"
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
@@ -1629,8 +1630,22 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+std::vector<int> Client::GetNicNumaNodes() const {
+    std::set<int> nodes;
+    if (!transfer_engine_) return {};
+    auto topo = transfer_engine_->getLocalTopology();
+    if (!topo) return {};
+    for (auto& [name, entry] : topo->getMatrix()) {
+        if (name.rfind("cpu:", 0) != 0 || entry.preferred_hca.empty()) continue;
+        int node = std::stoi(name.substr(4));
+        nodes.insert(node);
+    }
+    return {nodes.begin(), nodes.end()};
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
-    const void* buffer, size_t size, const std::string& protocol) {
+    const void* buffer, size_t size, const std::string& protocol,
+    const std::string& location) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -1653,8 +1668,8 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         }
     }
 
-    int rc = transfer_engine_->registerLocalMemory(
-        (void*)buffer, size, kWildcardLocation, true, true);
+    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+                                                   location, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
                    << " size=" << size << ", error=" << rc;

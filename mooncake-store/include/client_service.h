@@ -233,7 +233,8 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> MountSegment(
-        const void* buffer, size_t size, const std::string& protocol = "tcp");
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = "*");
 
     /**
      * @brief Unregisters a memory segment from master
@@ -409,6 +410,9 @@ class Client {
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
+
+    // Return sorted NUMA node IDs that have at least one RDMA NIC.
+    [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
