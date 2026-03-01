@@ -75,15 +75,15 @@ jobs:
         mkdir build
         cd build
         cmake .. \
-          -DUSE_ETCD=ON \
-          -DUSE_REDIS=ON \
+          -DUSE_ETCD=OFF \
+          -DUSE_REDIS=OFF \
           -DUSE_HTTP=ON \
           -DWITH_STORE=ON \
-          -DWITH_P2P_STORE=ON \
+          -DWITH_P2P_STORE=OFF \
           -DWITH_EP=ON \
           -DWITH_METRICS=ON \
           -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=ON \
+          -DBUILD_EXAMPLES=OFF \
           -DENABLE_SCCACHE=ON \
           -DBUILD_BENCHMARK=ON \
           -DUSE_CUDA=ON \
