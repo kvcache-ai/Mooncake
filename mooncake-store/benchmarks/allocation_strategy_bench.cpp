@@ -721,6 +721,10 @@ static void runAllBenchmarks() { // TODO：你这个也不是runall啊
     std::vector<bool> skewed_options = {false, true};
 
     std::cout << "\n=== AllocationStrategy Fill-Up Benchmark Matrix ===\n"
+              << "Note: Test will exit early if " << 10
+              << " consecutive allocations fail.\n"
+              << "Config: num_allocations=" << FLAGS_num_allocations
+              << ", segment_capacity=" << FLAGS_segment_capacity << " MB\n"
               << std::endl;
 
     for (auto skew : skewed_options) {
