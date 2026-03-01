@@ -46,7 +46,7 @@
 
 // --- gflags definitions ---
 DEFINE_int32(num_segments, 10, "Number of segments to simulate");
-DEFINE_int64(segment_capacity, 64,
+DEFINE_int64(segment_capacity, 1024,
              "Per-segment capacity in MB (base capacity for skewed mode)");
 DEFINE_int64(alloc_size, 64, "Allocation size in KB");
 DEFINE_int32(replica_num, 1, "Number of replicas per allocation");
@@ -58,7 +58,7 @@ DEFINE_string(strategy, "all",
 DEFINE_int32(convergence_sample_interval, 100,
              "Sample utilization stddev every N allocations");
 DEFINE_bool(run_all, false,
-            "Run a standard matrix of configurations for comparison");
+            "Run a standard matrix of configurations for comparison"); // TODO: 这个run all现在只是跑fill up模式的all；要改含义。
 
 // Scale-Out workload flags
 DEFINE_string(workload, "fillup", "Workload type: fillup (default), scaleout");
@@ -781,7 +781,7 @@ static void printScaleOutReport(const std::vector<ScaleOutResult>& results,
 static void runAllBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {
-        64 * KiB, 1 * MiB, 4 * MiB, 32 * MiB
+        512 * KiB, 8 * MiB, 32 * MiB
         /*128 * MiB*/};  // Tested up to 128MB
                          // TODO: 有几个case,副本总容量不够分配足够多的次数;
                          //       allocate应该是静默失败了; 是否要处理?
