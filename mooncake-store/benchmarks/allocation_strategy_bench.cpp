@@ -14,13 +14,9 @@
 #include <any>
 #include "types.h"
 
-#define private public
-#define protected public
 #include "offset_allocator/offset_allocator.hpp"
 #include "allocator.h"
 #include "allocation_strategy.h"
-#undef private
-#undef protected
 
 // --- gflags definitions ---
 DEFINE_int64(segment_capacity, 1024,
@@ -44,6 +40,18 @@ using namespace mooncake;
 static constexpr size_t MiB = 1024ULL * 1024;
 static constexpr size_t KiB = 1024ULL;
 static constexpr double GiB = 1024.0 * 1024 * 1024;
+
+// Benchmark constants
+constexpr int kNumVirtualNodes = 10;
+constexpr int kSkewFactor = 10;
+constexpr uint64_t kPrimaryBaseAddr = 0x100000000ULL;
+constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
+constexpr size_t kMaxExpectedAllocs = 600000;
+constexpr double kLargeClusterThresholdGB = 500.0;
+constexpr int kPreFillSampleInterval = 100;
+constexpr int kMinMeasurementAllocs = 100;
+constexpr int kMaxMeasurementAllocs = 200000;
+constexpr int kMinSamplesForConvergence = 10;
 
 enum class WorkloadType {
     FILL_UP,    // Only allocate, measure throughput/latency
@@ -140,6 +148,7 @@ static void setupResourceLimits() {
     setrlimit(RLIMIT_DATA, &rl);
 }
 
+namespace mooncake {
 /**
  * @brief Memory-safety hack for large cluster benchmarks.
  * 
@@ -148,10 +157,10 @@ static void setupResourceLimits() {
  * of each allocator instance to 64K nodes. 
  * This reduces metadata overhead per segment from ~36MB to ~2MB.
  */
-static void downsizeAllocator(std::shared_ptr<mooncake::OffsetBufferAllocator> allocator) {
+void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator) {
     if (!allocator) return;
 
-    // Use our 'private is public' hack to reach into the internal implementation
+    // Use friend-based access to reach into the internal implementation
     auto& shared_internal = allocator->offset_allocator_;
     if (!shared_internal) return;
 
@@ -170,6 +179,7 @@ static void downsizeAllocator(std::shared_ptr<mooncake::OffsetBufferAllocator> a
     allocator_impl->m_nodes.reserve(benchmark_max_cap);
     allocator_impl->m_freeNodes.reserve(benchmark_max_cap);
 }
+} // namespace mooncake
 
 /**
  * @brief Create an AllocatorManager populated with N OffsetBufferAllocators.
@@ -182,9 +192,9 @@ static void downsizeAllocator(std::shared_ptr<mooncake::OffsetBufferAllocator> a
 static AllocatorManager createCluster(int num_segments, size_t base_capacity,
                                       bool skewed, int id_offset = 0) {
     AllocatorManager manager;
-    // Distribute segments evenly across 10 virtual nodes if num_segments > 10,
+    // Distribute segments evenly across kNumVirtualNodes virtual nodes if num_segments > kNumVirtualNodes,
     // otherwise 1 segment per node.
-    int segments_per_node = std::max(1, num_segments / 10);
+    int segments_per_node = std::max(1, num_segments / kNumVirtualNodes);
 
     for (int i = 0; i < num_segments; ++i) {
         int global_i = i + id_offset;
@@ -193,9 +203,9 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
             std::to_string(global_i % segments_per_node);
         // skew is based on capacity variation by index
         size_t capacity =
-            skewed ? base_capacity * (1 + static_cast<size_t>(i % 10))
+            skewed ? base_capacity * (1 + static_cast<size_t>(i % kSkewFactor))
                    : base_capacity;
-        uint64_t base_addr = 0x100000000ULL + (global_i * base_capacity);
+        uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
         downsizeAllocator(allocator);
@@ -217,10 +227,11 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
     AllocatorManager& manager, int count, size_t capacity, int id_offset) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
     new_allocs.reserve(count);
+    constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
     for (int i = 0; i < count; ++i) {
         std::string name = "new_node_" + std::to_string(id_offset + i);
         uint64_t base_addr =
-            0x800000000ULL + (static_cast<uint64_t>(id_offset + i) * capacity);
+            kInjectedBaseAddr + (static_cast<uint64_t>(id_offset + i) * capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             name, base_addr, capacity, name);
         downsizeAllocator(allocator);
@@ -446,25 +457,22 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 
     std::vector<std::vector<Replica>> active_allocations;
     // Reserve enough to avoid frequent reallocations. 
-    // Measurement is 20% of expanded capacity. For 1TB cluster with 512KB blocks,
-    // that's around 400k allocs. Plus pre-fill might add another 100k-200k (with 8MB blocks).
-    active_allocations.reserve(600000); 
+    active_allocations.reserve(kMaxExpectedAllocs); 
 
     int success_count = 0;
     int total_count = 0;
     int consec_failures = 0;
     const int kMaxConsecFailures = 10;
 
-    // --- Pre-fill Phase ---
-    // Use larger blocks for pre-fill to reach 50% target with less metadata overhead (avoiding OOM)
+    // Use larger blocks for pre-fill to reach target with less metadata overhead (avoiding OOM)
     size_t pre_fill_alloc_size = std::max((size_t)cfg.alloc_size, (size_t)(8ULL * MiB));
-    if (res.initial_capacity_gb > 500.0) {
+    if (res.initial_capacity_gb > kLargeClusterThresholdGB) {
         pre_fill_alloc_size = std::max(pre_fill_alloc_size, (size_t)(32ULL * MiB));
     }
     int pre_alloc_count = 0;
     while (true) {
         // Sample periodically to avoid O(N) evaluation on every pre-fill allocation
-        if (pre_alloc_count % 100 == 0) {
+        if (pre_alloc_count % kPreFillSampleInterval == 0) {
             if (computeAverageUtilAll(manager) * 100.0 >= cfg.scale_out_trigger_pct) {
                 break;
             }
@@ -496,7 +504,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     double bytes_to_allocate = res.scaled_capacity_gb * GiB * pct;
     int measurement_allocs = static_cast<int>(std::round(
         bytes_to_allocate / (static_cast<double>(cfg.alloc_size) * cfg.replica_num)));
-    measurement_allocs = std::max(100, std::min(measurement_allocs, 200000));
+    measurement_allocs = std::max(kMinMeasurementAllocs, std::min(measurement_allocs, kMaxMeasurementAllocs));
     latencies.reserve(measurement_allocs);
 
     std::vector<int> sample_points;
@@ -504,9 +512,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     std::vector<double> avg_util_over_time;
 
     int sample_interval = FLAGS_convergence_sample_interval;
-    // dynamically adapt interval if measurement_allocs is too small to even hit 10 samples
-    if (measurement_allocs > 0 && measurement_allocs < sample_interval * 10) {
-        sample_interval = std::max(1, measurement_allocs / 10);
+    // dynamically adapt interval if measurement_allocs is too small to even hit enough samples
+    if (measurement_allocs > 0 && measurement_allocs < sample_interval * kMinSamplesForConvergence) {
+        sample_interval = std::max(1, measurement_allocs / kMinSamplesForConvergence);
     }
 
     double instrumentation_time_us = 0.0;

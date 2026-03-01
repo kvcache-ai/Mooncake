@@ -18,6 +18,14 @@ using NodeIndex = uint32;
 // Forward declarations
 class OffsetAllocator;
 class __Allocator;
+}  // namespace mooncake::offset_allocator
+
+namespace mooncake {
+class OffsetBufferAllocator;
+void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator);
+}
+
+namespace mooncake::offset_allocator {
 
 static constexpr uint32 NUM_TOP_BINS = 32;
 static constexpr uint32 BINS_PER_LEAF = 8;
@@ -197,6 +205,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     OffsetAllocator(T& serializer);
 
     friend class OffsetAllocatorTest;  // for unit tests
+    friend void ::mooncake::downsizeAllocator(std::shared_ptr<::mooncake::OffsetBufferAllocator> allocator);
 };
 
 class __Allocator {
@@ -249,6 +258,7 @@ class __Allocator {
     uint32 m_freeOffset;
 
     friend class OffsetAllocatorTest;  // for unit tests
+    friend void ::mooncake::downsizeAllocator(std::shared_ptr<::mooncake::OffsetBufferAllocator> allocator);
 };
 
 // Template method implementations
