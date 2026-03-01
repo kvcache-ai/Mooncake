@@ -36,6 +36,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,7 @@ struct BenchResultBase {
     size_t alloc_size;
     int replica_num;
     bool skewed;
+    double cluster_capacity_gb;  // total cluster capacity in GB
 
     double total_time_us;
     double throughput;  // allocs/sec
@@ -161,6 +163,24 @@ struct ScaleOutResult : BenchResultBase {
     int re_converge_allocs = -1;
     std::vector<double> new_node_util_over_time;
 };
+
+static constexpr double GiB = 1024.0 * 1024 * 1024;
+
+/**
+ * @brief Compute total cluster capacity in GB.
+ *
+ * For skewed clusters: capacity_i = base * (1 + i%10).
+ */
+static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
+                                       bool skewed) {
+    double total = 0.0;
+    for (int i = 0; i < num_segments; ++i) {
+        size_t cap = skewed ? base_capacity * (1 + static_cast<size_t>(i % 10))
+                           : base_capacity;
+        total += static_cast<double>(cap);
+    }
+    return total / GiB;
+}
 
 // ============================================================
 //  Helpers
@@ -412,6 +432,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     res.alloc_size = cfg.alloc_size;
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
+    res.cluster_capacity_gb = computeClusterCapacityGB(
+        cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     res.final_util_stddev = computeUtilizationStdDev(manager);
     res.final_avg_util = computeAverageUtilAll(manager);
     res.success_count = success_count;
@@ -476,6 +498,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.alloc_size = cfg.alloc_size;
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
+    res.cluster_capacity_gb = computeClusterCapacityGB(
+        cfg.num_segments, effective_capacity, cfg.skewed);
 
     int success_count = 0;
     int total_count = 0;
@@ -598,33 +622,38 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 // ============================================================
 
 static void printFillUpHeader() {
-    std::cout << std::string(152, '-') << std::endl;
-    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
-              << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
-              << "Replica" << std::setw(8) << "Skewed" << std::right
-              << std::setw(14) << "Throughput" << std::setw(15) << "Succ/Total"
-              << std::setw(12) << "Avg(ns)"
+    std::cout << std::string(170, '-') << std::endl;
+    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
+              << "Replica" << std::setw(10) << "Segments" << std::setw(12)
+              << "AllocSize" << std::setw(12) << "Cluster(GB)"
+              << std::setw(8) << "Skewed" << std::right
+              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12)
               << "UtilStdDev" << std::setw(10) << "AvgUtil%"
+              << std::setw(15) << "Succ/Total"
               << std::endl;
-    std::cout << std::string(152, '-') << std::endl;
+    std::cout << std::string(170, '-') << std::endl;
 }
 
 static void printFillUpResult(const FillUpResult& r) {
     std::string alloc_ratio = std::to_string(r.success_count) + "/" +
                               std::to_string(r.total_count);
-    std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
-              << r.num_segments << std::setw(12)
-              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(9)
-              << r.replica_num << std::setw(8) << (r.skewed ? "yes" : "no")
+    std::ostringstream cap_ss;
+    cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
+    std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
+              << r.replica_num << std::setw(10) << r.num_segments
+              << std::setw(12)
+              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(12)
+              << cap_ss.str()
+              << std::setw(8) << (r.skewed ? "yes" : "no")
               << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(15) << alloc_ratio
-              << std::setw(12) << r.avg_ns
+              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev << std::setprecision(2)
               << std::setw(9) << (r.final_avg_util * 100.0) << "%"
+              << std::setw(15) << alloc_ratio
               << std::endl;
 }
 
@@ -633,18 +662,19 @@ static void printFillUpResult(const FillUpResult& r) {
 // ============================================================
 
 static void printScaleOutHeader() {
-    std::cout << std::string(172, '-') << std::endl;
-    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
-              << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
-              << "Replica" << std::setw(8) << "Skewed" << std::right
-              << std::setw(14) << "Throughput" << std::setw(15) << "Succ/Total"
-              << std::setw(12) << "Avg(ns)"
+    std::cout << std::string(200, '-') << std::endl;
+    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
+              << "Replica" << std::setw(10) << "Segments" << std::setw(12)
+              << "AllocSize" << std::setw(12) << "Cluster(GB)"
+              << std::setw(8) << "Skewed" << std::right
+              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12)
               << "UtilStdDev"
               << std::setw(10) << "ConvUtil%" << std::setw(14) << "Converge@"
+              << std::setw(15) << "Succ/Total"
               << std::endl;
-    std::cout << std::string(172, '-') << std::endl;
+    std::cout << std::string(200, '-') << std::endl;
 }
 
 static void printScaleOutResult(const ScaleOutResult& r) {
@@ -654,19 +684,23 @@ static void printScaleOutResult(const ScaleOutResult& r) {
     }
     std::string alloc_ratio = std::to_string(r.success_count) + "/" +
                               std::to_string(r.total_count);
+    std::ostringstream cap_ss;
+    cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
 
-    std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
-              << r.num_segments << std::setw(12)
-              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(9)
-              << r.replica_num << std::setw(8) << (r.skewed ? "yes" : "no")
+    std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
+              << r.replica_num << std::setw(10) << r.num_segments
+              << std::setw(12)
+              << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(12)
+              << cap_ss.str()
+              << std::setw(8) << (r.skewed ? "yes" : "no")
               << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(15) << alloc_ratio
-              << std::setw(12) << r.avg_ns
+              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev << std::setprecision(2)
               << std::setw(9) << (r.converge_avg_util * 100.0) << "%"
-              << std::setw(14) << converge_str << std::endl;
+              << std::setw(14) << converge_str
+              << std::setw(15) << alloc_ratio << std::endl;
 }
 
 // ============================================================
