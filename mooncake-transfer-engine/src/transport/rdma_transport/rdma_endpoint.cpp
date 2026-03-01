@@ -275,9 +275,9 @@ int RdmaEndPoint::submitPostSend(
         std::min(int(globalConfig().max_cqe) - *cq_outstanding_, wr_count);
     if (wr_count <= 0) return 0;
 
-    ibv_send_wr wr_list[wr_count], *bad_wr = nullptr;
-    ibv_sge sge_list[wr_count];
-    memset(wr_list, 0, sizeof(ibv_send_wr) * wr_count);
+    std::vector<ibv_send_wr> wr_list(wr_count, ibv_send_wr{});
+    std::vector<ibv_sge> sge_list(wr_count);
+    ibv_send_wr *bad_wr = nullptr;
     for (int i = 0; i < wr_count; ++i) {
         auto slice = slice_list[i];
         auto &sge = sge_list[i];
@@ -303,11 +303,11 @@ int RdmaEndPoint::submitPostSend(
     }
     __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
     __sync_fetch_and_add(cq_outstanding_, wr_count);
-    int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
+    int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
     if (rc) {
         PLOG(ERROR) << "Failed to ibv_post_send";
         while (bad_wr) {
-            int i = bad_wr - wr_list;
+            int i = bad_wr - wr_list.data();
             failed_slice_list.push_back(slice_list[i]);
             __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
             __sync_fetch_and_sub(cq_outstanding_, 1);
