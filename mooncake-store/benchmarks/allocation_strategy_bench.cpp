@@ -132,6 +132,9 @@ struct BenchResultBase {
     double p90_ns;
     double p99_ns;
 
+    int success_count = 0;     // successful allocations
+    int total_count = 0;       // total attempted allocations
+
     double final_util_stddev;  // utilization stddev at run end
     double final_avg_util;     // average utilization at run end
 
@@ -373,6 +376,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
 
     const int kMaxConsecFailures = 10;
     int consec_failures = 0;
+    int success_count = 0;
+    int total_count = 0;
 
     auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -384,10 +389,12 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
 
         latencies.push_back(
             std::chrono::duration<double, std::nano>(t1 - t0).count());
+        ++total_count;
 
         if (result.has_value()) {
             active_allocations.push_back(std::move(result.value()));
             consec_failures = 0;
+            ++success_count;
         } else {
             if (++consec_failures >= kMaxConsecFailures) break;
         }
@@ -407,6 +414,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     res.skewed = cfg.skewed;
     res.final_util_stddev = computeUtilizationStdDev(manager);
     res.final_avg_util = computeAverageUtilAll(manager);
+    res.success_count = success_count;
+    res.total_count = total_count;
 
     computeLatencyStats(latencies, total_us, cfg.num_allocations, res);
     // active_allocations destructs here → memory freed
@@ -468,6 +477,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
 
+    int success_count = 0;
+    int total_count = 0;
+
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs;
     bool injected = false;
 
@@ -493,9 +505,11 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 
         latencies.push_back(
             std::chrono::duration<double, std::nano>(t1 - t0).count());
+        ++total_count;
 
         if (result.has_value()) {
             active_allocations.push_back(std::move(result.value()));
+            ++success_count;
         }
 
         // --- Sample stddev & new-node utilization ---
@@ -571,6 +585,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
             ? first_converge_avg_util
             : res.final_avg_util;
     res.convergence_alloc_count = converged_at;
+    res.success_count = success_count;
+    res.total_count = total_count;
 
     computeLatencyStats(latencies, total_us, cfg.num_allocations, res);
     // active_allocations destructs here → memory freed
@@ -582,25 +598,29 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
 // ============================================================
 
 static void printFillUpHeader() {
-    std::cout << std::string(137, '-') << std::endl;
+    std::cout << std::string(152, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
               << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
               << "Replica" << std::setw(8) << "Skewed" << std::right
-              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
+              << std::setw(14) << "Throughput" << std::setw(15) << "Succ/Total"
+              << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12)
               << "UtilStdDev" << std::setw(10) << "AvgUtil%"
               << std::endl;
-    std::cout << std::string(137, '-') << std::endl;
+    std::cout << std::string(152, '-') << std::endl;
 }
 
 static void printFillUpResult(const FillUpResult& r) {
+    std::string alloc_ratio = std::to_string(r.success_count) + "/" +
+                              std::to_string(r.total_count);
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
               << r.num_segments << std::setw(12)
               << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(9)
               << r.replica_num << std::setw(8) << (r.skewed ? "yes" : "no")
               << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
+              << std::setw(14) << r.throughput << std::setw(15) << alloc_ratio
+              << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev << std::setprecision(2)
@@ -613,17 +633,18 @@ static void printFillUpResult(const FillUpResult& r) {
 // ============================================================
 
 static void printScaleOutHeader() {
-    std::cout << std::string(157, '-') << std::endl;
+    std::cout << std::string(172, '-') << std::endl;
     std::cout << std::left << std::setw(18) << "Strategy" << std::setw(10)
               << "Segments" << std::setw(12) << "AllocSize" << std::setw(9)
               << "Replica" << std::setw(8) << "Skewed" << std::right
-              << std::setw(14) << "Throughput" << std::setw(12) << "Avg(ns)"
+              << std::setw(14) << "Throughput" << std::setw(15) << "Succ/Total"
+              << std::setw(12) << "Avg(ns)"
               << std::setw(12) << "P50(ns)" << std::setw(12) << "P90(ns)"
               << std::setw(12) << "P99(ns)" << std::setw(12)
               << "UtilStdDev"
               << std::setw(10) << "ConvUtil%" << std::setw(14) << "Converge@"
               << std::endl;
-    std::cout << std::string(157, '-') << std::endl;
+    std::cout << std::string(172, '-') << std::endl;
 }
 
 static void printScaleOutResult(const ScaleOutResult& r) {
@@ -631,13 +652,16 @@ static void printScaleOutResult(const ScaleOutResult& r) {
     if (r.convergence_alloc_count > 0) {
         converge_str = std::to_string(r.convergence_alloc_count);
     }
+    std::string alloc_ratio = std::to_string(r.success_count) + "/" +
+                              std::to_string(r.total_count);
 
     std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(10)
               << r.num_segments << std::setw(12)
               << (std::to_string(r.alloc_size / KiB) + "KB") << std::setw(9)
               << r.replica_num << std::setw(8) << (r.skewed ? "yes" : "no")
               << std::right << std::fixed << std::setprecision(0)
-              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
+              << std::setw(14) << r.throughput << std::setw(15) << alloc_ratio
+              << std::setw(12) << r.avg_ns
               << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
               << std::setw(12) << r.p99_ns << std::setprecision(4)
               << std::setw(12) << r.final_util_stddev << std::setprecision(2)
