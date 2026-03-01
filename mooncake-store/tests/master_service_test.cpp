@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "types.h"
+#include "rpc_types.h"
 
 namespace mooncake::test {
 
@@ -36,9 +37,9 @@ class MasterServiceTest : public ::testing::Test {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
-        segment.base = base;
+        segment.extra = CentralizedSegmentExtraData{
+            .base = static_cast<uintptr_t>(base), .te_endpoint = segment.name};
         segment.size = size;
-        segment.te_endpoint = segment.name;
         return segment;
     }
 
@@ -48,11 +49,51 @@ class MasterServiceTest : public ::testing::Test {
         size_t size = kDefaultSegmentSize) const {
         Segment segment = MakeSegment(std::move(name), base, size);
         UUID client_id = generate_uuid();
-        auto mount_result = service.MountSegment(segment, client_id);
-        EXPECT_TRUE(mount_result.has_value());
+        // Register client with its segment
+        RegisterClientRequest req;
+        req.client_id = client_id;
+        req.segments.push_back(segment);
+        auto reg_result = service.RegisterClient(req);
+        EXPECT_TRUE(reg_result.has_value());
         return {.segment_id = segment.id, .client_id = client_id};
     }
 
+    void TriggerOnClientDisconnected(CentralizedMasterService& service,
+                                     const UUID& client_id,
+                                     std::chrono::milliseconds wait_duration) {
+        auto client = service.client_manager_.GetClient(client_id);
+        if (client) {
+            // Wait for keep-alive timeout.
+            std::this_thread::sleep_for(wait_duration);
+            // Trigger health check to update status
+            auto [old_status, new_status] = client->CheckHealth();
+            if (new_status == ClientStatus::DISCONNECTION) {
+                client->OnDisconnected();
+            }
+        }
+    }
+
+    void TriggerOnClientRecovered(CentralizedMasterService& service,
+                                  const UUID& client_id) {
+        auto client = service.client_manager_.GetClient(client_id);
+        if (client) {
+            // Trigger heartbeat to recover status
+            auto [old_status, new_status] = client->Heartbeat();
+            if (new_status == ClientStatus::HEALTH) {
+                client->OnRecovered();
+            }
+        }
+    }
+
+    /// Helper: Register a client with no segments.
+    /// Tests that call MountSegment must register the client first.
+    void RegisterClient(CentralizedMasterService& service,
+                        const UUID& client_id) const {
+        RegisterClientRequest reg_req;
+        reg_req.client_id = client_id;
+        auto reg_result = service.RegisterClient(reg_req);
+        EXPECT_TRUE(reg_result.has_value());
+    }
     std::vector<Replica::Descriptor> replica_list;
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
@@ -118,40 +159,41 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
         new CentralizedMasterService(service_config));
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
-    const auto original_base = segment.base;
+    RegisterClient(*service_, client_id);
+    const auto original_base = segment.GetCentralizedExtra().base;
     const auto original_size = segment.size;
 
     // Test invalid parameters.
     // Invalid buffer address (0).
-    segment.base = 0;
+    segment.GetCentralizedExtra().base = 0;
     segment.size = original_size;
     auto mount_result1 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result1.error());
 
     // Invalid segment size (0).
-    segment.base = original_base;
+    segment.GetCentralizedExtra().base = original_base;
     segment.size = 0;
     auto mount_result2 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result2.error());
 
     // Base is not aligned
-    segment.base = original_base + 1;
+    segment.GetCentralizedExtra().base = original_base + 1;
     segment.size = original_size;
     auto mount_result3 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result3.error());
 
     // Size is not aligned
-    segment.base = original_base;
+    segment.GetCentralizedExtra().base = original_base;
     segment.size = original_size + 1;
     auto mount_result4 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result4.error());
 
     // Test normal mount operation.
-    segment.base = original_base;
+    segment.GetCentralizedExtra().base = original_base;
     segment.size = original_size;
     auto mount_result5 = service_->MountSegment(segment, client_id);
     EXPECT_TRUE(mount_result5.has_value());
@@ -191,26 +233,27 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
         new CentralizedMasterService(service_config));
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
-    const auto original_base = segment.base;
+    RegisterClient(*service_, client_id);
+    const auto original_base = segment.GetCentralizedExtra().base;
     const auto original_size = segment.size;
 
     // Test invalid parameters.
     // Invalid buffer address (0).
-    segment.base = 0;
+    segment.GetCentralizedExtra().base = 0;
     segment.size = original_size;
     auto mount_result1 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result1.error());
 
     // Invalid segment size (0).
-    segment.base = original_base;
+    segment.GetCentralizedExtra().base = original_base;
     segment.size = 0;
     auto mount_result2 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result2.error());
 
     // Test normal mount operation.
-    segment.base = original_base;
+    segment.GetCentralizedExtra().base = original_base;
     segment.size = original_size;
     auto mount_result5 = service_->MountSegment(segment, client_id);
     EXPECT_TRUE(mount_result5.has_value());
@@ -251,6 +294,7 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
     std::string segment_name = "test_random_segment";
     UUID segment_id = generate_uuid();
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     size_t times = 10;
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -286,6 +330,7 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
                 MakeSegment("segment_" + std::to_string(i),
                             0x300000000 + i * 0x10000000, 16 * 1024 * 1024);
             UUID client_id = generate_uuid();
+            RegisterClient(*service_, client_id);
 
             for (size_t j = 0; j < iterations; j++) {
                 auto mount_result = service_->MountSegment(segment, client_id);
@@ -1029,6 +1074,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     constexpr size_t size = 1024 * 1024 * 16;  // 16MB
     auto segment = MakeSegment("test_segment", buffer, size);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
 
     // Mount the segment
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -1097,6 +1143,7 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     auto mount_result_concurrent = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result_concurrent.has_value());
 
@@ -1177,6 +1224,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -1259,6 +1307,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     constexpr size_t size = 1024 * 1024 * 16 * 100;
     auto segment = MakeSegment("concurrent_segment", buffer, size);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -1319,6 +1368,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     auto segment1 = MakeSegment("segment1", buffer1, size);
     auto segment2 = MakeSegment("segment2", buffer2, size);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
     auto mount_result2 = service_->MountSegment(segment2, client_id);
@@ -1377,6 +1427,7 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto segment1 = MakeSegment("segment1", buffer1, segment_size);
     auto segment2 = MakeSegment("segment2", buffer2, segment_size);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
     auto mount_result2 = service_->MountSegment(segment2, client_id);
@@ -1427,6 +1478,7 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     std::string segment_name = "perf_test_segment";
     auto segment = MakeSegment(segment_name, kBufferAddress, kSegmentSize);
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
 
     // Mount a segment for testing
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -2127,12 +2179,14 @@ TEST_F(MasterServiceTest, BatchQueryIpTest) {
     std::unique_ptr<CentralizedMasterService> service_(
         new CentralizedMasterService());
     const UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
 
     // Mount a segment with a specific te_endpoint (IP:Port format)
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     Segment segment = MakeSegment("test_segment", buffer, size);
-    segment.te_endpoint = "127.0.0.1:12345";  // Set IP:Port format for testing
+    segment.GetCentralizedExtra().te_endpoint =
+        "127.0.0.1:12345";  // Set IP:Port format for testing
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -2175,6 +2229,7 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsTest) {
     std::unique_ptr<CentralizedMasterService> service_(
         new CentralizedMasterService());
     const UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
 
     // Mount multiple segments with different IPs for the same client
     constexpr size_t buffer1 = 0x300000000;
@@ -2182,17 +2237,19 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsTest) {
     constexpr size_t size = 1024 * 1024 * 16;
 
     Segment segment1 = MakeSegment("segment1", buffer1, size);
-    segment1.te_endpoint = "127.0.0.1:12345";
+    segment1.GetCentralizedExtra().te_endpoint = "127.0.0.1:12345";
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
 
     Segment segment2 = MakeSegment("segment2", buffer2, size);
-    segment2.te_endpoint = "127.0.0.1:12346";  // Same IP, different port
+    segment2.GetCentralizedExtra().te_endpoint =
+        "127.0.0.1:12346";  // Same IP, different port
     auto mount_result2 = service_->MountSegment(segment2, client_id);
     ASSERT_TRUE(mount_result2.has_value());
 
     Segment segment3 = MakeSegment("segment3", 0x500000000, size);
-    segment3.te_endpoint = "192.168.1.1:12345";  // Different IP
+    segment3.GetCentralizedExtra().te_endpoint =
+        "192.168.1.1:12345";  // Different IP
     auto mount_result3 = service_->MountSegment(segment3, client_id);
     ASSERT_TRUE(mount_result3.has_value());
 
@@ -2234,6 +2291,7 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
     std::unique_ptr<CentralizedMasterService> service_(
         new CentralizedMasterService());
     const UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
 
     // Mount multiple segments, all with empty te_endpoint
     constexpr size_t buffer1 = 0x300000000;
@@ -2241,12 +2299,12 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
     constexpr size_t size = 1024 * 1024 * 16;
 
     Segment segment1 = MakeSegment("segment1", buffer1, size);
-    segment1.te_endpoint = "";  // Empty te_endpoint
+    segment1.GetCentralizedExtra().te_endpoint = "";  // Empty te_endpoint
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
 
     Segment segment2 = MakeSegment("segment2", buffer2, size);
-    segment2.te_endpoint = "";  // Empty te_endpoint
+    segment2.GetCentralizedExtra().te_endpoint = "";  // Empty te_endpoint
     auto mount_result2 = service_->MountSegment(segment2, client_id);
     ASSERT_TRUE(mount_result2.has_value());
 
@@ -2321,7 +2379,9 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Wait for a while until the put-start expired.
     for (size_t i = 0; i <= master_config.put_start_discard_timeout_sec; i++) {
         for (auto& context : contexts) {
-            auto result = service_->Ping(context.client_id);
+            HeartbeatRequest hb_req;
+            hb_req.client_id = context.client_id;
+            auto result = service_->Heartbeat(hb_req);
             EXPECT_TRUE(result.has_value());
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2359,7 +2419,9 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
                                 master_config.put_start_discard_timeout_sec;
          i++) {
         for (auto& context : contexts) {
-            auto result = service_->Ping(context.client_id);
+            HeartbeatRequest hb_req;
+            hb_req.client_id = context.client_id;
+            auto result = service_->Heartbeat(hb_req);
             EXPECT_TRUE(result.has_value());
         }
         // Protect key_1 from eviction.
@@ -2382,7 +2444,9 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Wait for a while until key_2 can be discarded and released.
     for (size_t i = 0; i <= master_config.put_start_release_timeout_sec; i++) {
         for (auto& context : contexts) {
-            auto result = service_->Ping(context.client_id);
+            HeartbeatRequest hb_req;
+            hb_req.client_id = context.client_id;
+            auto result = service_->Heartbeat(hb_req);
             EXPECT_TRUE(result.has_value());
         }
         // Protect key_1 from eviction.
@@ -2431,10 +2495,13 @@ TEST_F(MasterServiceTest, ConcurrentMountLocalDiskSegment) {
     for (size_t i = 0; i < num_threads; i++) {
         threads.emplace_back([&service_, i, &success_count, this]() {
             UUID client_id = generate_uuid();
+            RegisterClient(*service_, client_id);
             auto mount_result =
                 service_->MountLocalDiskSegment(client_id, true);
             ASSERT_TRUE(mount_result.has_value());
-            ++success_count;
+            if (mount_result.has_value()) {
+                ++success_count;
+            }
         });
     }
 
@@ -2454,6 +2521,7 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     std::unique_ptr<CentralizedMasterService> service_(
         new CentralizedMasterService(config));
     UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     auto segment = MakeSegment("segment", buffer, size);
@@ -2569,6 +2637,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearSpecificSegment) {
     std::unique_ptr<CentralizedMasterService> service_(
         new CentralizedMasterService(service_config));
     const UUID client_id = generate_uuid();
+    RegisterClient(*service_, client_id);
 
     // 2. Setup: Mount segments
     Segment segment1 = MakeSegment("segment1", 0x300000000, 1024 * 1024 * 16);
@@ -2856,6 +2925,47 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
     ASSERT_TRUE(exist3.has_value());
     ASSERT_TRUE(exist3.value())
         << "key3 should still exist (different client_id)";
+}
+
+// --- Test Case: Client Disconnection and Recovery ---
+// Validate that client allocators are disabled during disconnection and
+// re-enabled after recovery.
+TEST_F(MasterServiceTest, DisconnectionAndRecovery) {
+    SCOPED_TRACE("Test Case: Client Disconnection and Recovery");
+    int64_t live_ttl = 1;
+    int64_t crashed_ttl = 5;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(live_ttl)
+                              .set_client_crashed_ttl_sec(crashed_ttl)
+                              .build();
+    std::unique_ptr<CentralizedMasterService> service_ =
+        std::make_unique<CentralizedMasterService>(service_config);
+
+    // Register client and segment
+    auto ctx = PrepareSimpleSegment(*service_, "test_segment_disconnect");
+
+    // Verify initial allocation success
+    auto put_result = service_->PutStart(ctx.client_id, "test_key_1", 1024,
+                                         {.replica_num = 1});
+    EXPECT_TRUE(put_result.has_value());
+
+    // Simulate Disconnection
+    TriggerOnClientDisconnected(*service_, ctx.client_id,
+                                std::chrono::milliseconds(2 * live_ttl * 1000));
+
+    // Verify allocation failure (allocators hidden)
+    auto put_result_fail = service_->PutStart(ctx.client_id, "test_key_2", 1024,
+                                              {.replica_num = 1});
+    EXPECT_FALSE(put_result_fail.has_value());
+    EXPECT_EQ(put_result_fail.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Simulate Recovery
+    TriggerOnClientRecovered(*service_, ctx.client_id);
+
+    // Verify allocation success (allocators restored)
+    auto put_result_recover = service_->PutStart(ctx.client_id, "test_key_3",
+                                                 1024, {.replica_num = 1});
+    EXPECT_TRUE(put_result_recover.has_value());
 }
 
 }  // namespace mooncake::test

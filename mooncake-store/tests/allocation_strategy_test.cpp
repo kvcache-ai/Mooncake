@@ -45,10 +45,10 @@ class AllocationStrategyParameterizedTest
         switch (allocator_type_) {
             case BufferAllocatorType::CACHELIB:
                 return std::make_shared<CachelibBufferAllocator>(
-                    segment_name, base, size, segment_name);
+                    segment_name, base, size, segment_name, generate_uuid());
             case BufferAllocatorType::OFFSET:
                 return std::make_shared<OffsetBufferAllocator>(
-                    segment_name, base, size, segment_name);
+                    segment_name, base, size, segment_name, generate_uuid());
             default:
                 throw std::invalid_argument("Invalid allocator type");
         }
@@ -314,7 +314,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
 // Test invalid replication count
 TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", generate_uuid());
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator);
@@ -331,9 +331,10 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 // count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", generate_uuid());
     auto allocator2 = std::make_shared<OffsetBufferAllocator>(
-        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2");
+        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2",
+        generate_uuid());
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -438,7 +439,7 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
 // Test allocation when all available segments are excluded
 TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", generate_uuid());
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -545,8 +546,8 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, generate_uuid()));
     }
 
     std::vector<std::vector<Replica>> replicas;

@@ -1,38 +1,52 @@
 #pragma once
 
 #include <boost/functional/hash.hpp>
-#include "mutex.h"
+#include "segment_manager.h"
 #include "types.h"
 
 namespace mooncake {
-// TODO: this class is a tmp placeholder. it will be implemented later
-class P2PSegmentManager {
+class P2PSegmentManager : public SegmentManager {
    public:
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id,
-                           std::function<ErrorCode()>& pre_func);
+    auto QuerySegments(const std::string& segment)
+        -> tl::expected<std::pair<size_t, size_t>, ErrorCode> override;
 
-    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id,
-                             std::function<ErrorCode()>& pre_func);
+    using OnSegmentAddedCallback = std::function<void(const Segment& segment)>;
+    using OnSegmentRemovedCallback =
+        std::function<void(const Segment& segment)>;
 
-    ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id);
+    void SetSegmentChangeCallbacks(OnSegmentAddedCallback on_add,
+                                   OnSegmentRemovedCallback on_remove) {
+        on_segment_added_ = std::move(on_add);
+        on_segment_removed_ = std::move(on_remove);
+    }
+    /**
+     * @brief update segment usage and return old usage
+     */
+    tl::expected<size_t, ErrorCode> UpdateSegmentUsage(const UUID& segment_id,
+                                                       size_t usage);
 
-    ErrorCode GetClientSegments(
-        const UUID& client_id,
-        std::vector<std::shared_ptr<Segment>>& segments) const;
+    /**
+     * @brief get segment usage
+     */
+    size_t GetSegmentUsage(const UUID& segment_id) const;
 
-    ErrorCode QuerySegments(const std::string& segment, size_t& used,
-                            size_t& capacity);
-    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
+    /**
+     * @brief Iterate over all mounted P2P segments under a single read lock.
+     *        Visitor returns true to stop early.
+     */
+    using SegmentVisitor = std::function<bool(const Segment& segment)>;
+    void ForEachSegment(const SegmentVisitor& visitor) const;
+
+   protected:
+    tl::expected<void, ErrorCode> InnerMountSegment(
+        const Segment& segment) override;
+
+    tl::expected<void, ErrorCode> OnUnmountSegment(
+        const std::shared_ptr<Segment>& segment) override;
 
    private:
-    mutable SharedMutex segment_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<Segment>, boost::hash<UUID>>
-        mounted_segments_
-            GUARDED_BY(segment_mutex_);  // segment_id -> mounted segment
-    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
-        client_segments_
-            GUARDED_BY(segment_mutex_);  // client_id -> segment_ids
+    OnSegmentAddedCallback on_segment_added_;
+    OnSegmentRemovedCallback on_segment_removed_;
 };
 
 }  // namespace mooncake

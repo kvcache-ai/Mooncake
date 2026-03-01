@@ -36,10 +36,10 @@ class BufferAllocatorTest : public ::testing::Test {
         switch (allocator_type) {
             case BufferAllocatorType::CACHELIB:
                 return std::make_shared<CachelibBufferAllocator>(
-                    segment_name, base, size, segment_name);
+                    segment_name, base, size, segment_name, generate_uuid());
             case BufferAllocatorType::OFFSET:
                 return std::make_shared<OffsetBufferAllocator>(
-                    segment_name, base, size, segment_name);
+                    segment_name, base, size, segment_name, generate_uuid());
             default:
                 throw std::invalid_argument("Invalid allocator type");
         }

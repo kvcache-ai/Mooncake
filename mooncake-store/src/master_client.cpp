@@ -34,13 +34,18 @@ struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
-    static constexpr const char* value = "BatchReplicaClear";
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
+    static constexpr const char* value = "GetReplicaListByRegex";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
-    static constexpr const char* value = "GetReplicaListByRegex";
+struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
+    static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
+    static constexpr const char* value = "BatchGetReplicaList";
 };
 
 template <>
@@ -59,13 +64,23 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MountSegment> {
+    static constexpr const char* value = "MountSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::UnmountSegment> {
     static constexpr const char* value = "UnmountSegment";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::Ping> {
-    static constexpr const char* value = "Ping";
+struct RpcNameTraits<&WrappedMasterService::Heartbeat> {
+    static constexpr const char* value = "Heartbeat";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterClient> {
+    static constexpr const char* value = "RegisterClient";
 };
 
 template <>
@@ -128,6 +143,37 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
+    const std::string& key, const GetReplicaListRequestConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
+    timer.LogRequest("object_key=", key);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
+                             GetReplicaListResponse>(key, config);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaList(const std::vector<std::string>& keys,
+                                  const GetReplicaListRequestConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
+    timer.LogRequest("requests_count=", keys.size());
+
+    if (keys.empty()) {
+        return {};
+    }
+
+    auto result = invoke_rpc<
+        &WrappedMasterService::BatchGetReplicaList,
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys,
+                                                                      config);
+    if (result.has_value()) {
+        timer.LogResponse("result=", result.value().size(), " requests");
+    }
+    return result.value();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 MasterClient::CalcCacheStats() {
     return invoke_rpc<&WrappedMasterService::CalcCacheStats,
@@ -146,21 +192,6 @@ MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
         client_ids);
 
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<std::vector<std::string>, ErrorCode>
-MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
-                                const UUID& client_id,
-                                const std::string& segment_name) {
-    ScopedVLogTimer timer(1, "MasterClient::BatchReplicaClear");
-    timer.LogRequest("object_keys_count=", object_keys.size(),
-                     ", client_id=", client_id,
-                     ", segment_name=", segment_name);
-    auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                             std::vector<std::string>>(object_keys, client_id,
-                                                       segment_name);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -218,12 +249,40 @@ tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     return result;
 }
 
-tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
-    ScopedVLogTimer timer(1, "MasterClient::Ping");
+tl::expected<HeartbeatResponse, ErrorCode> MasterClient::Heartbeat(
+    const HeartbeatRequest& req) {
+    ScopedVLogTimer timer(1, "MasterClient::Heartbeat");
     timer.LogRequest("client_id=", client_id_);
 
     auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
+        invoke_rpc<&WrappedMasterService::Heartbeat, HeartbeatResponse>(req);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MountSegment(
+    const Segment& segment) {
+    ScopedVLogTimer timer(1, "MasterClient::MountSegment");
+    timer.LogRequest("segment_name=", segment.name, ", client_id=", client_id_);
+
+    auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
+        segment, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<RegisterClientResponse, ErrorCode> MasterClient::RegisterClient(
+    const std::vector<Segment>& segments) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterClient");
+    timer.LogRequest("client_id=", client_id_,
+                     ", segments_count=", segments.size());
+
+    RegisterClientRequest req;
+    req.client_id = client_id_;
+    req.segments = segments;
+
+    auto result = invoke_rpc<&WrappedMasterService::RegisterClient,
+                             RegisterClientResponse>(req);
     timer.LogResponseExpected(result);
     return result;
 }

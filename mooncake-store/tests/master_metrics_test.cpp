@@ -115,7 +115,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     Segment segment;
     segment.id = segment_id;
     segment.name = segment_name;
-    segment.base = kBufferAddress;
+    segment.GetCentralizedExtra().base = kBufferAddress;
     segment.size = kSegmentSize;
     UUID client_id = generate_uuid();
 
@@ -125,6 +125,12 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     config.replica_num = 1;
 
     // Test MountSegment request
+    {
+        RegisterClientRequest req;
+        req.client_id = client_id;
+        auto reg_result = service_.RegisterClient(req);
+        ASSERT_TRUE(reg_result.has_value());
+    }
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
@@ -251,7 +257,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     Segment segment;
     segment.id = segment_id;
     segment.name = segment_name;
-    segment.base = kBufferAddress;
+    segment.GetCentralizedExtra().base = kBufferAddress;
     segment.size = kSegmentSize;
     UUID client_id = generate_uuid();
 
@@ -272,6 +278,12 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
               0.0);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 0);
 
+    {
+        RegisterClientRequest req;
+        req.client_id = client_id;
+        auto reg_result = service_.RegisterClient(req);
+        ASSERT_TRUE(reg_result.has_value());
+    }
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto put_start_result1 =
@@ -316,7 +328,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     Segment segment;
     segment.id = segment_id;
     segment.name = segment_name;
-    segment.base = kBufferAddress;
+    segment.GetCentralizedExtra().base = kBufferAddress;
     segment.size = kSegmentSize;
     UUID client_id = generate_uuid();
 
@@ -326,6 +338,12 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     config.replica_num = 1;
 
     // Mount segment
+    {
+        RegisterClientRequest req;
+        req.client_id = client_id;
+        auto reg_result = service_.RegisterClient(req);
+        ASSERT_TRUE(reg_result.has_value());
+    }
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 

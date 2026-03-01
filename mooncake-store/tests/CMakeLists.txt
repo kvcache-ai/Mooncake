@@ -43,6 +43,7 @@ endif()
 add_store_test(data_manager_test data_manager_test.cpp)
 add_store_test(client_rpc_service_test client_rpc_service_test.cpp)
 add_store_test(peer_client_test peer_client_test.cpp)
+add_store_test(client_meta_test client_meta_test.cpp)
 add_store_test(peer_client_perf_test peer_client_perf_test.cpp)
 
 add_subdirectory(e2e)
