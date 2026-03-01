@@ -39,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <sys/resource.h>
 
 #include <gflags/gflags.h>
 
@@ -184,6 +185,23 @@ static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
         total += static_cast<double>(cap);
     }
     return total / GiB;
+}
+
+// ============================================================
+//  Resource Limits & Helpers
+// ============================================================
+
+static void setupResourceLimits() {
+    struct rlimit rl;
+    // Cap virtual address space (RLIMIT_AS) to 2TB (virtual space is cheap on 64-bit)
+    rl.rlim_cur = 2048ULL * 1024 * 1024 * 1024;
+    rl.rlim_max = 2048ULL * 1024 * 1024 * 1024;
+    setrlimit(RLIMIT_AS, &rl);
+
+    // Cap Data segment (RLIMIT_DATA) to 16GB to prevent OOM freezing the OS
+    rl.rlim_cur = 16ULL * 1024 * 1024 * 1024;
+    rl.rlim_max = 16ULL * 1024 * 1024 * 1024;
+    setrlimit(RLIMIT_DATA, &rl);
 }
 
 // ============================================================
@@ -464,20 +482,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
  * Measures throughput/latency + convergence + new-node adoption speed.
  */
 static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
-    // Size down per-segment capacity so original cluster fills significantly
-    // by trigger point (~80% utilization).
-    size_t effective_capacity = cfg.segment_capacity;
-    {
-        int trigger_allocs =
-            cfg.num_allocations * cfg.scale_out_trigger_pct / 100;
-        size_t needed = static_cast<size_t>(cfg.alloc_size) * cfg.replica_num *
-                        trigger_allocs / std::max(1, cfg.num_segments);
-        size_t scaleout_cap = needed * 100 / 80;
-        effective_capacity = std::max(cfg.segment_capacity, scaleout_cap);
-    }
-
     AllocatorManager manager =
-        createCluster(cfg.num_segments, effective_capacity, cfg.skewed);
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     auto strategy = CreateAllocationStrategy(cfg.strategy_type);
 
     const int sample_interval = FLAGS_convergence_sample_interval;
@@ -500,7 +506,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.initial_capacity_gb = computeClusterCapacityGB(
         cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     res.scaled_capacity_gb = computeClusterCapacityGB(
-        cfg.num_segments + cfg.scale_out_new_segments, effective_capacity, cfg.skewed);
+        cfg.num_segments + cfg.scale_out_new_segments, cfg.segment_capacity, cfg.skewed);
     // for backward compatibility with base struct, though we print the detailed ones
     res.cluster_capacity_gb = res.scaled_capacity_gb;
 
@@ -555,8 +561,9 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     double bytes_to_allocate = res.scaled_capacity_gb * GiB * 0.20;
     int measurement_allocs = static_cast<int>(std::round(
         bytes_to_allocate / (static_cast<double>(cfg.alloc_size) * cfg.replica_num)));
-    // Safety check: ensure at least some allocations, but cap at 500,000 to avoid OOM
-    measurement_allocs = std::max(100, std::min(measurement_allocs, 500000));
+    // Safety check: ensure at least some allocations, but cap at 200,000 for large clusters to avoid OOM
+    int cap = (cfg.num_segments >= 512) ? 200000 : 500000;
+    measurement_allocs = std::max(100, std::min(measurement_allocs, cap));
     latencies.reserve(measurement_allocs);
 
     double instrumentation_time_us = 0.0;
@@ -874,6 +881,7 @@ int main(int argc, char* argv[]) {
         "AllocationStrategy performance benchmark.\n"
         "Usage: allocation_strategy_bench [flags]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    setupResourceLimits();
 
     if (FLAGS_run_all) {
         runAllBenchmarks();
