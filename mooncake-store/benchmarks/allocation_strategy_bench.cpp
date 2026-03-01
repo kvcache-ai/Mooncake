@@ -484,15 +484,12 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     const double convergence_threshold = 0.05;
 
     std::vector<double> latencies;
-    latencies.reserve(cfg.num_allocations);
+    // Don't reserve yet, we'll reserve after calculating measurement_allocs.
 
     std::vector<double> stddev_over_time;
     stddev_over_time.reserve(cfg.num_allocations / sample_interval + 1);
     std::vector<double> avg_util_over_time;
     avg_util_over_time.reserve(cfg.num_allocations / sample_interval + 1);
-
-    std::vector<std::vector<Replica>> active_allocations;
-    active_allocations.reserve(cfg.num_allocations);
 
     ScaleOutResult res;
     res.strategy_name = cfg.strategy_name;
@@ -507,13 +504,23 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     // for backward compatibility with base struct, though we print the detailed ones
     res.cluster_capacity_gb = res.scaled_capacity_gb;
 
+    std::vector<std::vector<Replica>> active_allocations;
+    // Reserve enough to avoid frequent reallocations. 
+    // Measurement is 20% of expanded capacity. For 1TB cluster with 512KB blocks,
+    // that's around 400k allocs. Plus pre-fill might add another 100k-200k (with 8MB blocks).
+    active_allocations.reserve(600000); 
+
     int success_count = 0;
     int total_count = 0;
-
-    const int kMaxConsecFailures = 10;
     int consec_failures = 0;
+    const int kMaxConsecFailures = 10;
 
     // --- Pre-fill Phase ---
+    // Use larger blocks for pre-fill to reach 50% target with less metadata overhead (avoiding OOM)
+    size_t pre_fill_alloc_size = std::max((size_t)cfg.alloc_size, (size_t)(8ULL * MiB));
+    if (res.initial_capacity_gb > 500.0) {
+        pre_fill_alloc_size = std::max(pre_fill_alloc_size, (size_t)(32ULL * MiB));
+    }
     int pre_alloc_count = 0;
     while (true) {
         // Sample periodically to avoid O(N) evaluation on every pre-fill allocation
@@ -522,7 +529,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
                 break;
             }
         }
-        auto result = strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
+        auto result = strategy->Allocate(manager, pre_fill_alloc_size, cfg.replica_num);
         if (result.has_value()) {
             active_allocations.push_back(std::move(result.value()));
             consec_failures = 0;
@@ -544,10 +551,18 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     // Reset counters for the benchmarking phase
     consec_failures = 0;
     
+    // Calculate 20% of expanded capacity in bytes
+    double bytes_to_allocate = res.scaled_capacity_gb * GiB * 0.20;
+    int measurement_allocs = static_cast<int>(std::round(
+        bytes_to_allocate / (static_cast<double>(cfg.alloc_size) * cfg.replica_num)));
+    // Safety check: ensure at least some allocations, but cap at 500,000 to avoid OOM
+    measurement_allocs = std::max(100, std::min(measurement_allocs, 500000));
+    latencies.reserve(measurement_allocs);
+
     double instrumentation_time_us = 0.0;
     auto total_start = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < cfg.num_allocations; ++i) {
+    for (int i = 0; i < measurement_allocs; ++i) {
 
         // --- Allocate ---
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -810,8 +825,9 @@ static void runScaleOutMatrix(
 
     std::cout << "\n=== Scale-Out Workload Benchmark (Matrix) ===\n"
               << "Note: Test will exit early if 10 consecutive allocations fail.\n"
-              << "Config: num_allocations=" << FLAGS_num_allocations
-              << ", segment_capacity=" << FLAGS_segment_capacity << " MB\n"
+              << "Design: Pre-fill to " << FLAGS_scale_out_trigger_pct << "% capacity, "
+              << "then measure 20% of expanded capacity (Cap: 500k allocations).\n"
+              << "Config: segment_capacity=" << FLAGS_segment_capacity << " MB\n"
               << std::endl;
 
     for (auto skew : skewed_options) {
