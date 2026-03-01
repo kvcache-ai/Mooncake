@@ -149,15 +149,24 @@ MooncakeBackend::MooncakeBackend(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
+    auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
+    int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
+
+    if (isCpu_) 
+        p2p_device_worker_ = dev_worker_mgr.GetCPUWorker();
+    else
+        p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
+
     p2p_proxy_ = std::make_unique<P2PProxy>(
         &engine_,
         P2PProxy::Options{
             .is_cpu = isCpu_,
             .rank = rank_,
             .size = size_,
-            .cuda_device_index = isCpu_ ? -1 : at::cuda::current_device(),
+            .cuda_device_index = cuda_device_index,
         });
     p2p_proxy_->AllocateResources();
+    p2p_device_worker_->registerProxy(p2p_proxy_.get());
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
@@ -245,9 +254,6 @@ MooncakeBackend::MooncakeBackend(
 
     // Increment backend index
     ++backendIndex_;
-
-    // Start P2P worker thread for async send/recv operations
-    startP2PWorker();
 }
 
 MooncakeBackend::~MooncakeBackend() { shutdown(); }
@@ -704,11 +710,11 @@ void MooncakeBackend::shutdown() {
         return;
     }
     isShutdown_ = true;
-    stopP2PWorker();
-    if (p2p_proxy_) {
-        p2p_proxy_->ReleaseResources();
-        p2p_proxy_.reset();
-    }
+
+    p2p_device_worker_->removeProxy(p2p_proxy_.get());
+    p2p_proxy_->ReleaseResources();
+    p2p_proxy_.reset();
+
     engine_.unregisterLocalMemory(warmup_send_region_);
     engine_.unregisterLocalMemory(warmup_recv_region_);
     delete[] warmup_send_region_;
@@ -890,17 +896,6 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-}
-
-void MooncakeBackend::startP2PWorker() {
-    TORCH_CHECK(p2p_proxy_, "P2P proxy is not initialized.");
-    p2p_proxy_->Start();
-}
-
-void MooncakeBackend::stopP2PWorker() {
-    if (p2p_proxy_) {
-        p2p_proxy_->Stop();
     }
 }
 }  // namespace mooncake

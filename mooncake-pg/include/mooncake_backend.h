@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <memory>
 #include <mooncake_worker.cuh>
 #include <p2p_proxy.hh>
 #include <torch/torch.h>
@@ -117,9 +118,6 @@ class MooncakeBackend final : public ::c10d::Backend {
     void recoverRanks(const std::vector<int>& ranks);
 
    private:
-    void startP2PWorker();
-    void stopP2PWorker();
-
     static TransferEngine engine_;
     static bool engineInitialized_;
     static int backendIndex_;
@@ -142,6 +140,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     // P2P async infrastructure
     std::unique_ptr<P2PProxy> p2p_proxy_;
+    std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
 };
 
 }  // namespace mooncake
