@@ -221,6 +221,9 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    friend void downsizeAllocator(
+        std::shared_ptr<OffsetBufferAllocator> allocator);
 };
 
 // The main difference is that it allocates real memory and returns it, while
