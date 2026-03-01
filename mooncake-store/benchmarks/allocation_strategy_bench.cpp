@@ -439,7 +439,7 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     res.success_count = success_count;
     res.total_count = total_count;
 
-    computeLatencyStats(latencies, total_us, cfg.num_allocations, res);
+    computeLatencyStats(latencies, total_us, total_count, res);
     // active_allocations destructs here → memory freed
     return res;
 }
@@ -612,7 +612,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.success_count = success_count;
     res.total_count = total_count;
 
-    computeLatencyStats(latencies, total_us, cfg.num_allocations, res);
+    computeLatencyStats(latencies, total_us, total_count, res);
     // active_allocations destructs here → memory freed
     return res;
 }
