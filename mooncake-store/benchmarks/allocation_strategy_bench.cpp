@@ -649,7 +649,9 @@ static void printScaleOutResult(const ScaleOutResult& r) {
 //  Matrix benchmark (--run_all)
 // ============================================================
 
-static void runAllBenchmarks() {
+// TODO:
+// 加一个带deallocate的稳态运行case？但是我感觉deallocate只是在节点离开时才会出现？应该并不频繁吧？有必要吗？
+static void runAllBenchmarks() { // TODO：你这个也不是runall啊
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {
         512 * KiB, 8 * MiB, 32 * MiB};
@@ -708,7 +710,7 @@ struct ScaleOutScenario {
 
 // clang-format off
 static const std::vector<ScaleOutScenario> kScaleOutScenarios = {
-    // {num_segs, alloc_size,        replica, new_segs, trigger%, label}
+    // {num_segs, alloc_size, replica, new_segs, trigger%, label}
     // Small cluster, small allocs — typical KV-cache shard
     { 10,  64*KiB, 1,  5, 50, "small-cluster / small-alloc" },
     { 10,  64*KiB, 1, 10, 50, "small-cluster / double scale-out" },
@@ -795,7 +797,7 @@ int main(int argc, char* argv[]) {
 
     WorkloadType wl = parseWorkload(FLAGS_workload);
 
-    if (wl == WorkloadType::SCALE_OUT) {
+    if (wl == WorkloadType::SCALE_OUT) { // TODO: 怎么还是不统一啊？
         runScaleOutMatrix(strategies_to_run);
         return 0;
     }
