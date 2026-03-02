@@ -44,7 +44,8 @@ struct alignas(64) AtomicHeadTail {
 //
 // State by (head, tail), modulo N:
 // - empty: head == tail
-// - full : (head + 1) % N == tail   (one slot reserved to distinguish full/empty)
+// - full : (head + 1) % N == tail   (one slot reserved to distinguish
+// full/empty)
 // - ready: head != tail
 //
 // Protocol:
@@ -55,6 +56,7 @@ struct P2PControlSlot {
     AtomicHeadTail tail;
 };
 
+class P2PDeviceWorker;
 class P2PProxy {
    public:
     friend class P2PDeviceWorker;
@@ -182,6 +184,9 @@ class P2PProxy {
     // For P2PDeviceWorker
     bool StepSend();
     bool StepRecv();
+    void SetDeviceWorker(P2PDeviceWorker*);
+    bool HasActiveSendWork() const;
+    bool HasActiveRecvWork() const;
 
     // Internal Steps
     bool TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity);
@@ -212,6 +217,8 @@ class P2PProxy {
         P2PControlSlot* ctrl_recv_region_ = nullptr;
     };
 
+    P2PDeviceWorker* device_worker_;
+
     TransferEngine* engine_ = nullptr;
     TransferGroupMeta* meta_ = nullptr;
     bool is_cpu_ = false;
@@ -226,27 +233,31 @@ class P2PProxy {
     std::queue<RecvOp> recv_queue_;
     std::mutex recv_queue_mutex_;
 
+    std::atomic<int> active_send_tasks_{0};
+    std::atomic<int> active_recv_tasks_{0};
+
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;
 };
 
-// P2PDeviceWorker instances are shared across multiple backends within the same process.
-// Therefore, they must not be instantiated directly. Instead, obtain an instance 
-// through P2PDeviceWorkerManager.
+// P2PDeviceWorker instances are shared across multiple backends within the same
+// process. Therefore, they must not be instantiated directly. Instead, obtain
+// an instance through P2PDeviceWorkerManager.
 class P2PDeviceWorker {
    public:
     friend class P2PDeviceWorkerManager;
     void registerProxy(P2PProxy*);
     void removeProxy(P2PProxy*);
 
-    ~P2PDeviceWorker() {
-        Stop();
-    }
-      
+    ~P2PDeviceWorker() { Stop(); }
+
+    void WakeUpSend();
+    void WakeUpRecv();
+
    private:
     // Only allow construction at P2PDeviceWorkerManager
-    P2PDeviceWorker(bool is_cpu, int cuda_device_index) 
-      : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
+    P2PDeviceWorker(bool is_cpu, int cuda_device_index)
+        : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
         Start();
     }
 
@@ -256,13 +267,20 @@ class P2PDeviceWorker {
     void SendWorkerThread();
     void RecvWorkerThread();
 
+    std::mutex send_wakeup_mutex_;
+    std::condition_variable send_wakeup_cv_;
+
+    std::mutex recv_wakeup_mutex_;
+    std::condition_variable recv_wakeup_cv_;
+
     std::atomic<bool> send_worker_running_{false};
     std::thread send_worker_thread_;
 
     std::atomic<bool> recv_worker_running_{false};
     std::thread recv_worker_thread_;
 
-    std::mutex proxy_register_mutex_;
+    std::mutex proxies_mutex_;
+    std::atomic<bool> proxies_dirty_;
     std::vector<P2PProxy*> proxies_;
 
     bool is_cpu_;
@@ -275,7 +293,7 @@ class P2PDeviceWorkerManager {
         static P2PDeviceWorkerManager manager;
         return manager;
     }
-    
+
     std::shared_ptr<P2PDeviceWorker> GetCPUWorker();
     std::shared_ptr<P2PDeviceWorker> GetCUDAWorker(int cuda_device_index);
 

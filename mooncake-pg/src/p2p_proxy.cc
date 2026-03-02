@@ -128,7 +128,7 @@ void P2PProxy::AllocateResources() {
                             "Failed to create pooled send copy-ready event: ",
                             cudaGetErrorString(create_error));
             }
-            
+
             for (auto& copy_ready_event :
                  recv_peer_lanes_[peer_rank].copy_ready_events_) {
                 if (copy_ready_event != nullptr) {
@@ -231,14 +231,24 @@ void P2PProxy::ReleaseResources() {
 void P2PProxy::EnqueueSend(SendOp op) {
     op.tensor_ =
         op.tensor_.is_contiguous() ? op.tensor_ : op.tensor_.contiguous();
-        
-    std::lock_guard<std::mutex> lock(send_queue_mutex_);
-    send_queue_.emplace(std::move(op));
+
+    {
+        std::lock_guard<std::mutex> lock(send_queue_mutex_);
+        send_queue_.emplace(std::move(op));
+    }
+
+    active_send_tasks_.fetch_add(1, std::memory_order_release);
+    if (device_worker_) device_worker_->WakeUpSend();
 }
 
 void P2PProxy::EnqueueRecv(RecvOp op) {
-    std::lock_guard<std::mutex> lock(recv_queue_mutex_);
-    recv_queue_.push(std::move(op));
+    {
+        std::lock_guard<std::mutex> lock(recv_queue_mutex_);
+        recv_queue_.push(std::move(op));
+    }
+
+    active_recv_tasks_.fetch_add(1, std::memory_order_release);
+    if (device_worker_) device_worker_->WakeUpRecv();
 }
 
 P2PProxy::SendTransferTask::SendTransferTask(uint64_t chunk_offset_in,
@@ -717,10 +727,11 @@ bool P2PProxy::StepSend() {
         if (IsSendOpCompleted(op_ctx)) {
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_send_op_.reset();
+            active_send_tasks_.fetch_sub(1, std::memory_order_release);
             did_work = true;
         }
     }
-    
+
     return did_work;
 }
 
@@ -746,9 +757,8 @@ bool P2PProxy::StepRecv() {
         }
         RecvOp recv_op = std::move(lane.pending_recv_ops_.front());
         lane.pending_recv_ops_.pop_front();
-        lane.local_tail_ =
-            resources_.ctrl_recv_region_[peer_rank].tail.load(
-                std::memory_order_acquire);
+        lane.local_tail_ = resources_.ctrl_recv_region_[peer_rank].tail.load(
+            std::memory_order_acquire);
         RecvOpContext op_ctx(std::move(recv_op));
         lane.active_recv_op_ = std::move(op_ctx);
         did_work = true;
@@ -787,6 +797,7 @@ bool P2PProxy::StepRecv() {
             }
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_recv_op_.reset();
+            active_recv_tasks_.fetch_sub(1, std::memory_order_release);
             did_work = true;
         }
     }
@@ -794,21 +805,36 @@ bool P2PProxy::StepRecv() {
     return did_work;
 }
 
+void P2PProxy::SetDeviceWorker(P2PDeviceWorker* worker) {
+    device_worker_ = worker;
+}
+
+bool P2PProxy::HasActiveSendWork() const {
+    return active_send_tasks_.load(std::memory_order_acquire) > 0;
+}
+
+bool P2PProxy::HasActiveRecvWork() const {
+    return active_recv_tasks_.load(std::memory_order_acquire) > 0;
+}
+
 void P2PDeviceWorker::Start() {
     bool expected_send = false;
     if (send_worker_running_.compare_exchange_strong(expected_send, true)) {
-        send_worker_thread_ = std::thread(&P2PDeviceWorker::SendWorkerThread, this);
+        send_worker_thread_ =
+            std::thread(&P2PDeviceWorker::SendWorkerThread, this);
     }
 
     bool expected_recv = false;
     if (recv_worker_running_.compare_exchange_strong(expected_recv, true)) {
-        recv_worker_thread_ = std::thread(&P2PDeviceWorker::RecvWorkerThread, this);
+        recv_worker_thread_ =
+            std::thread(&P2PDeviceWorker::RecvWorkerThread, this);
     }
 }
 
 void P2PDeviceWorker::Stop() {
     bool expected_send = true;
     if (send_worker_running_.compare_exchange_strong(expected_send, false)) {
+        send_wakeup_cv_.notify_all();
         if (send_worker_thread_.joinable()) {
             send_worker_thread_.join();
         }
@@ -817,72 +843,117 @@ void P2PDeviceWorker::Stop() {
     bool expected_recv = true;
     if (recv_worker_running_.compare_exchange_strong(expected_recv, false)) {
         if (recv_worker_thread_.joinable()) {
+            recv_wakeup_cv_.notify_all();
             recv_worker_thread_.join();
         }
     }
 }
 
 void P2PDeviceWorker::registerProxy(P2PProxy* proxy) {
-    std::lock_guard<std::mutex> lock(proxy_register_mutex_);
-    proxies_.emplace_back(proxy);
+    proxy->SetDeviceWorker(this);
+    {
+        std::lock_guard<std::mutex> lock(proxies_mutex_);
+        proxies_.emplace_back(proxy);
+    }
+    proxies_dirty_.store(true, std::memory_order_release);
+    send_wakeup_cv_.notify_one();
+    recv_wakeup_cv_.notify_one();
 }
 
 void P2PDeviceWorker::removeProxy(P2PProxy* proxy) {
-    std::lock_guard<std::mutex> lock(proxy_register_mutex_);
-    proxies_.erase(std::remove(proxies_.begin(), proxies_.end(), proxy), proxies_.end());
+    {
+        std::lock_guard<std::mutex> lock(proxies_mutex_);
+        proxies_.erase(std::remove(proxies_.begin(), proxies_.end(), proxy),
+                       proxies_.end());
+    }
+    proxies_dirty_.store(true, std::memory_order_release);
+    proxy->SetDeviceWorker(nullptr);
+}
+
+template <typename HasWorkFn, typename StepWorkFn>
+void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
+                      std::atomic<bool>& worker_running,
+                      std::atomic<bool>& proxies_dirty,
+                      std::mutex& proxies_mutex,
+                      std::vector<P2PProxy*>& proxies, std::mutex& wakeup_mutex,
+                      std::condition_variable& wakeup_cv, HasWorkFn has_work,
+                      StepWorkFn step_work) {
+    SetCudaDeviceIfNeeded(is_cpu, cuda_device_index,
+                          "P2PDeviceWorker::WorkerThread cudaSetDevice failed");
+
+    // A thread-local cache for proxies to avoid locking too frequently.
+    // This is efficient because proxy registration/removal is rare after
+    // backend initialization.
+    std::vector<P2PProxy*> local_proxies;
+
+    while (worker_running.load(std::memory_order_relaxed)) {
+        // Refresh the local cache if it's marked as dirty.
+        if (proxies_dirty.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(proxies_mutex);
+            local_proxies = proxies;
+            proxies_dirty.store(false, std::memory_order_release);
+        }
+
+        bool did_work = false;
+        bool has_active_work = false;
+
+        for (auto* proxy : local_proxies) {
+            if (has_work(*proxy)) {
+                did_work |= step_work(*proxy);
+                has_active_work = true;
+            }
+        }
+
+        // If we did work this iteration, just continue.
+        if (did_work) continue;
+        // Otherwise, if the queue has uncompleted tasks, pause.
+        if (has_active_work) {
+            PAUSE();
+        }
+        // The queue has no active work. Block on the condition variable.
+        else {
+            std::unique_lock<std::mutex> lock(wakeup_mutex);
+            wakeup_cv.wait(lock, [&]() {
+                if (!worker_running.load(std::memory_order_relaxed))
+                    return true;
+
+                if (proxies_dirty.load(std::memory_order_acquire)) return true;
+
+                for (auto* proxy : local_proxies) {
+                    if (has_work(*proxy)) return true;
+                }
+                return false;
+            });
+        }
+    }
 }
 
 void P2PDeviceWorker::SendWorkerThread() {
-    SetCudaDeviceIfNeeded(is_cpu_, cuda_device_index_,
-                          "P2PDeviceWorker::SendWorkerThread cudaSetDevice failed");
-
-    while (true) {
-        bool did_work = false;
-
-        {
-            std::lock_guard<std::mutex> lock(proxy_register_mutex_);
-            for (auto& proxy : proxies_) {
-                did_work |= proxy->StepSend();
-            }
-        }
-
-        if (!send_worker_running_.load())
-            return;
-
-        if (!did_work)
-            PAUSE();
-    }
+    WorkerThreadLoop(
+        is_cpu_, cuda_device_index_, send_worker_running_, proxies_dirty_,
+        proxies_mutex_, proxies_, send_wakeup_mutex_, send_wakeup_cv_,
+        [](P2PProxy& p) { return p.HasActiveSendWork(); },
+        [](P2PProxy& p) { return p.StepSend(); });
 }
 
 void P2PDeviceWorker::RecvWorkerThread() {
-    SetCudaDeviceIfNeeded(is_cpu_, cuda_device_index_,
-                          "P2PDeviceWorker::RecvWorkerThread cudaSetDevice failed");
-
-    while (true) {
-        bool did_work = false;
-
-        {
-            std::lock_guard<std::mutex> lock(proxy_register_mutex_);
-            for (auto& proxy : proxies_) {
-                did_work |= proxy->StepRecv();
-            }
-        }
-
-        if (!recv_worker_running_.load())
-            return;
-
-        if (!did_work)
-            PAUSE();
-    }
+    WorkerThreadLoop(
+        is_cpu_, cuda_device_index_, recv_worker_running_, proxies_dirty_,
+        proxies_mutex_, proxies_, recv_wakeup_mutex_, recv_wakeup_cv_,
+        [](P2PProxy& p) { return p.HasActiveRecvWork(); },
+        [](P2PProxy& p) { return p.StepRecv(); });
 }
+
+void P2PDeviceWorker::WakeUpSend() { send_wakeup_cv_.notify_one(); }
+
+void P2PDeviceWorker::WakeUpRecv() { recv_wakeup_cv_.notify_one(); }
 
 std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCPUWorker() {
     std::lock_guard<std::mutex> lock(manager_mutex_);
-    
+
     auto it = workers_.find(CPUWorkerID);
     if (it != workers_.end()) {
-        if (auto ptr = it->second.lock()) 
-            return ptr;
+        if (auto ptr = it->second.lock()) return ptr;
     }
 
     auto worker = std::shared_ptr<P2PDeviceWorker>(
@@ -891,13 +962,13 @@ std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCPUWorker() {
     return worker;
 }
 
-std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCUDAWorker(int cuda_device_index) {
+std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCUDAWorker(
+    int cuda_device_index) {
     std::lock_guard<std::mutex> lock(manager_mutex_);
-    
+
     auto it = workers_.find(cuda_device_index);
     if (it != workers_.end()) {
-        if (auto ptr = it->second.lock()) 
-            return ptr;
+        if (auto ptr = it->second.lock()) return ptr;
     }
 
     auto worker = std::shared_ptr<P2PDeviceWorker>(

@@ -152,19 +152,18 @@ MooncakeBackend::MooncakeBackend(
     auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
     int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
 
-    if (isCpu_) 
+    if (isCpu_)
         p2p_device_worker_ = dev_worker_mgr.GetCPUWorker();
     else
         p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
 
     p2p_proxy_ = std::make_unique<P2PProxy>(
-        &engine_,
-        P2PProxy::Options{
-            .is_cpu = isCpu_,
-            .rank = rank_,
-            .size = size_,
-            .cuda_device_index = cuda_device_index,
-        });
+        &engine_, P2PProxy::Options{
+                      .is_cpu = isCpu_,
+                      .rank = rank_,
+                      .size = size_,
+                      .cuda_device_index = cuda_device_index,
+                  });
     p2p_proxy_->AllocateResources();
     p2p_device_worker_->registerProxy(p2p_proxy_.get());
 
