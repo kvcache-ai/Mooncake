@@ -1188,7 +1188,52 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Allocate buffer using the new allocator
+    // Cache miss zero-copy write path: use a cache block as the transfer
+    // destination directly, avoiding an extra memcpy from caller buffer to
+    // cache block.
+    if (client_->IsHotCacheEnabled()) {
+        auto hot_cache = client_->GetHotCache();
+        HotMemBlock* block = hot_cache->GetFreeBlock();
+        if (block) {
+            // Use cache block as transfer destination (zero-copy write)
+            std::vector<Slice> slices;
+            allocateSlices(slices, replica, block->addr);
+
+            auto get_result = client_->Get(key, query_result.value(), slices,
+                                           /*skip_hot_cache=*/true);
+            if (!get_result) {
+                LOG(ERROR) << "Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                block->key_.clear();
+                hot_cache->PutHotKey(block);
+                return nullptr;
+            }
+
+            // Insert into LRU, then re-acquire ref for BufferHandle lifetime
+            block->key_ = key;
+            block->size = total_length;
+            hot_cache->PutHotKey(block);
+
+            HotMemBlock* blk = hot_cache->GetHotKey(key);
+            if (blk) {
+                return std::make_shared<BufferHandle>(
+                    blk->addr, blk->size,
+                    [blk, hot_cache]() {
+                        blk->ref_count.fetch_sub(1,
+                                                 std::memory_order_release);
+                    });
+            }
+            // PutHotKey race (extremely rare): another thread inserted the
+            // same key first, our block was recycled. Fall through to the
+            // normal allocation path.
+        } else {
+            LOG(WARNING)
+                << "Hot cache has no free block for key: " << key
+                << ", falling back to normal allocation path";
+        }
+    }
+
+    // Hot cache disabled or unavailable: normal allocation path
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;

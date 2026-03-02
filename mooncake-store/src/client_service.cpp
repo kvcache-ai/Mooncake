@@ -652,7 +652,8 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
-                                          std::vector<Slice>& slices) {
+                                          std::vector<Slice>& slices,
+                                          bool skip_hot_cache) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -665,7 +666,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
-    if (hot_cache_ && replica.is_memory_replica()) {
+    if (!skip_hot_cache && hot_cache_ && replica.is_memory_replica()) {
         cache_used = RedirectToHotCache(object_key, replica);
     }
 
@@ -673,12 +674,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     err = TransferRead(replica, slices);
 
     // Release the cache block after transfer completes (memcpy is done)
-    if (hot_cache_ && cache_used) {
+    if (!skip_hot_cache && hot_cache_ && cache_used) {
         hot_cache_->ReleaseHotKey(object_key);
     }
 
     // Asynchronously update local hot cache with TE transfer slices
-    if (hot_cache_) {
+    if (!skip_hot_cache && hot_cache_) {
         ProcessSlicesAsync(object_key, slices, replica);
     }
 

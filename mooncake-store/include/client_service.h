@@ -163,7 +163,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
-                                      std::vector<Slice>& slices);
+                                      std::vector<Slice>& slices,
+                                      bool skip_hot_cache = false);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects

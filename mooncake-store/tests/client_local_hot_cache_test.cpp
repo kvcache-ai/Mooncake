@@ -1092,6 +1092,57 @@ TEST_F(LocalHotCacheTest, GetBufferInternalHotCacheZeroCopy) {
     EXPECT_EQ(blk->ref_count.load(), 0);
 }
 
+// Test zero-copy write path: GetFreeBlock → direct write → PutHotKey →
+// GetHotKey → BufferHandle view mode
+TEST_F(LocalHotCacheTest, ZeroCopyWritePath) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    auto cache = std::make_shared<LocalHotCache>(cache_size);
+
+    // Step 1: Simulate cache miss — get a free block
+    HotMemBlock* block = cache->GetFreeBlock();
+    ASSERT_NE(block, nullptr);
+
+    // Step 2: Write data directly into the block (simulating TransferRead
+    // writing into cache block)
+    const size_t data_size = 4096;
+    std::memset(block->addr, 'Z', data_size);
+
+    // Step 3: Set metadata and insert into LRU
+    block->key_ = "zc_write_key";
+    block->size = data_size;
+    EXPECT_TRUE(cache->PutHotKey(block));
+
+    // Step 4: Re-acquire ref via GetHotKey (same as get_buffer_internal)
+    HotMemBlock* blk = cache->GetHotKey("zc_write_key");
+    ASSERT_NE(blk, nullptr);
+    EXPECT_EQ(blk->ref_count.load(), 1);
+    EXPECT_EQ(blk->size, data_size);
+
+    // Step 5: Create BufferHandle in view mode
+    {
+        auto handle = std::make_shared<BufferHandle>(
+            blk->addr, blk->size,
+            [blk, cache]() {
+                blk->ref_count.fetch_sub(1, std::memory_order_release);
+            });
+
+        EXPECT_NE(handle->ptr(), nullptr);
+        EXPECT_EQ(handle->size(), data_size);
+
+        // Verify data through the handle
+        const char* data = static_cast<const char*>(handle->ptr());
+        for (size_t i = 0; i < data_size; ++i) {
+            ASSERT_EQ(data[i], 'Z') << "Data mismatch at offset " << i;
+        }
+
+        // ref_count should still be 1 while handle is alive
+        EXPECT_EQ(blk->ref_count.load(), 1);
+    }
+
+    // After handle destruction, ref_count should be 0
+    EXPECT_EQ(blk->ref_count.load(), 0);
+}
+
 }  // namespace testing
 }  // namespace mooncake
 

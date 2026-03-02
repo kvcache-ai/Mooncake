@@ -163,22 +163,20 @@ class LocalHotCache {
 struct HotCachePutTask {
     std::string key;
     HotMemBlock* block;  // Pointer to the allocated block
-    const void* source_ptr;
     size_t size;
     std::shared_ptr<LocalHotCache> hot_cache;
 
     // Default constructor for empty task
     HotCachePutTask()
-        : block(nullptr), source_ptr(nullptr), size(0), hot_cache(nullptr) {}
+        : block(nullptr), size(0), hot_cache(nullptr) {}
 
     HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
                     std::shared_ptr<LocalHotCache> cache)
         : key(k),
           block(blk),
-          source_ptr(slice.ptr),
           size(slice.size),
           hot_cache(std::move(cache)) {
-        // No data copy here; memcpy is deferred to workerThread().
+        // No data copy here; memcpy is done by SubmitPutTask into block->addr.
     }
 };
 
