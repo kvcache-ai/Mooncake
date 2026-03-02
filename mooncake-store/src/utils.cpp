@@ -180,7 +180,7 @@ void *allocate_buffer_allocator_memory(size_t total_size,
             return va;
         }
 #endif
-        LOG(ERROR) << "Ascend runtime not supprot fabirc mem ";
+        LOG(ERROR) << "Ascend runtime not support fabirc mem ";
         return nullptr;
     }
 #endif
