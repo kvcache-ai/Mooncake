@@ -271,7 +271,7 @@ class MooncakeStorePyWrapper {
     }
 
     int health_check() {
-        if (!store_) return 1;
+        if (!store_) return HC_NOT_INITIALIZED;
         return store_->health_check();
     }
 

@@ -753,9 +753,9 @@ void DummyClient::ping_thread_main() {
 }
 
 int DummyClient::health_check() {
-    if (!connected_) return 1;
-    if (!last_ping_healthy_.load()) return 2;
-    return 0;
+    if (!connected_) return HC_NOT_INITIALIZED;
+    if (!last_ping_healthy_.load()) return HC_MASTER_UNREACHABLE;
+    return HC_HEALTHY;
 }
 
 int DummyClient::request_hot_cache_fd() {
