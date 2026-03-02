@@ -7,6 +7,9 @@
 #include <string>
 #include <thread>
 
+#include <csignal>
+#include <ylt/coro_http/coro_http_client.hpp>
+
 #include "client_service.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -14,6 +17,9 @@
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
+
+DECLARE_bool(enable_http_server);
+DECLARE_int32(http_port);
 
 namespace mooncake {
 namespace testing {
@@ -23,6 +29,7 @@ class HealthCheckTest : public ::testing::Test {
     static void SetUpTestSuite() {
         google::InitGoogleLogging("HealthCheckTest");
         FLAGS_logtostderr = 1;
+        FLAGS_enable_http_server = true;
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
     }
@@ -32,6 +39,19 @@ class HealthCheckTest : public ::testing::Test {
     std::shared_ptr<RealClient> py_client_;
     InProcMaster master_;
     std::string master_address_;
+
+    struct HealthResponse {
+        int http_status;
+        std::string body;
+    };
+
+    HealthResponse fetch_health(int port) {
+        coro_http::coro_http_client client;
+        std::string url =
+            "http://127.0.0.1:" + std::to_string(port) + "/health";
+        auto result = client.get(url);
+        return {result.status, std::string(result.resp_body)};
+    }
 
     void SetUp() override { py_client_ = RealClient::create(); }
 
@@ -91,6 +111,43 @@ TEST_F(HealthCheckTest, ReturnsTwoWhenMasterDown) {
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
     EXPECT_EQ(py_client_->health_check(), HC_MASTER_UNREACHABLE);
+
+    py_client_->tearDownAll();
+}
+
+// Test 5: HTTP /health returns 200 when healthy
+TEST_F(HealthCheckTest, HttpReturns200WhenHealthy) {
+    int http_port = getFreeTcpPort();
+    FLAGS_http_port = http_port;
+    ASSERT_EQ(StartMasterAndSetupClient(18910), 0) << "setup_real failed";
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    auto resp = fetch_health(http_port);
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"healthy\""), std::string::npos);
+    EXPECT_NE(resp.body.find("\"code\":0"), std::string::npos);
+
+    py_client_->tearDownAll();
+    master_.Stop();
+}
+
+// Test 6: HTTP /health returns 503 when master unreachable
+TEST_F(HealthCheckTest, HttpReturns503WhenMasterDown) {
+    int http_port = getFreeTcpPort();
+    FLAGS_http_port = http_port;
+    ASSERT_EQ(StartMasterAndSetupClient(18911), 0);
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    EXPECT_EQ(py_client_->health_check(), HC_HEALTHY);
+
+    master_.Stop();
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    auto resp = fetch_health(http_port);
+    EXPECT_EQ(resp.http_status, 503);
+    EXPECT_NE(resp.body.find("\"master_unreachable\""), std::string::npos);
+    EXPECT_NE(resp.body.find("\"code\":2"), std::string::npos);
 
     py_client_->tearDownAll();
 }
