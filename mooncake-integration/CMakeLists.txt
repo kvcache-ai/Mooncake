@@ -53,6 +53,9 @@ if (WITH_TE)
     if(USE_EFA)
         target_compile_definitions(engine PRIVATE USE_EFA)
     endif()
+    if(BUILD_ZMQ_COMMUNICATOR)
+        target_compile_definitions(engine PRIVATE BUILD_ZMQ_COMMUNICATOR)
+    endif()
 
     target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>

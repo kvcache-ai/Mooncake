@@ -15,41 +15,45 @@ This file demonstrates and tests all ZMQ Communicator features:
 API Compatibility with PyZMQ:
 =============================
 
-| Operation              | PyZMQ                          | Mooncake ZMQ Communicator           |
-|------------------------|--------------------------------|-------------------------------------|
-| Create context         | ctx = zmq.Context()            | zmq = ZmqInterface()                |
-|                        |                                | zmq.initialize(ZmqConfig())         |
-| Create socket          | sock = ctx.socket(zmq.PUB)     | sock = zmq.create_socket(PUB)       |
-| Bind                   | sock.bind("tcp://0.0.0.0:5556")| zmq.bind(sock, "0.0.0.0:5556")      |
-|                        |                                | zmq.start_server(sock)              |
-| Connect                | sock.connect("tcp://host:port")| zmq.connect(sock, "host:port")      |
-| Send data              | sock.send(b"data")             | zmq.publish(sock, "topic", b"data") |
-| Send Python obj        | sock.send_pyobj(obj)           | zmq.send_pyobj(sock, obj, "topic")  |
-| Send multipart         | sock.send_multipart(frames)    | zmq.send_multipart(sock, frames)    |
-| Send JSON              | sock.send_json(obj)            | zmq.send_json(sock, obj, "topic")   |
-| Send string            | sock.send_string("text")       | zmq.send_string(sock, "text", "t")  |
-| Blocking receive       | data = sock.recv()             | msg = zmq.recv(sock)                |
-|                        |                                | data = msg['data']                  |
-| Recv Python obj        | obj = sock.recv_pyobj()        | msg = zmq.recv_pyobj(sock)          |
-|                        |                                | obj = msg['obj']                    |
-| Recv multipart         | frames = sock.recv_multipart() | msg = zmq.recv_multipart(sock)      |
-|                        |                                | frames = msg['frames']              |
-| Recv JSON              | obj = sock.recv_json()         | msg = zmq.recv_json(sock)           |
-|                        |                                | obj = msg['obj']                    |
-| Recv string            | text = sock.recv_string()      | msg = zmq.recv_string(sock)         |
-|                        |                                | text = msg['string']                |
-| Non-blocking recv      | sock.recv(flags=zmq.DONTWAIT)  | zmq.recv(sock, flags=1)             |
-| Subscribe              | sock.subscribe("topic")        | zmq.subscribe(sock, "topic")        |
-| Set socket option      | sock.setsockopt(opt, val)      | zmq.set_socket_option(sock, opt, v) |
-| Close socket           | sock.close()                   | zmq.close_socket(sock)              |
-| Cleanup                | ctx.term()                     | zmq.shutdown()                      |
+| Operation              | PyZMQ                          | Mooncake ZMQ Communicator (compat)       |
+|------------------------|--------------------------------|------------------------------------------|
+| Create context         | ctx = zmq.Context()            | zmq = ZmqInterface()                     |
+|                        |                                | zmq.initialize(ZmqConfig())              |
+| Create socket          | sock = ctx.socket(zmq.PUB)     | sock = zmq.socket(ZmqSocketType.PUB)     |
+| Bind                   | sock.bind("tcp://0.0.0.0:5556")| sock.bind("0.0.0.0:5556")                |
+|                        |                                | sock.start_server()                      |
+| Connect                | sock.connect("tcp://host:port")| sock.connect("host:port")                |
+| Send data              | sock.send(b"data")             | sock.send(b"data")                        |
+| Send Python obj        | sock.send_pyobj(obj)           | sock.send_pyobj(obj)                      |
+| Send multipart         | sock.send_multipart(frames)    | sock.send_multipart(frames)              |
+| Send JSON              | sock.send_json(obj)            | sock.send_json(obj)                       |
+| Send string            | sock.send_string("text")       | sock.send_string("text")                  |
+| Enable blocking recv   | N/A (default blocking)         | sock.set_polling_mode(True)              |
+| Blocking receive       | data = sock.recv()             | msg = sock.recv()                        |
+|                        |                                | data = msg['data']                       |
+| Recv Python obj        | obj = sock.recv_pyobj()        | msg = sock.recv_pyobj()                  |
+|                        |                                | obj = msg['obj']                         |
+| Recv multipart         | frames = sock.recv_multipart() | msg = sock.recv_multipart()              |
+|                        |                                | frames = msg['frames']                   |
+| Recv JSON              | obj = sock.recv_json()         | msg = sock.recv_json()                   |
+|                        |                                | obj = msg['obj']                         |
+| Recv string            | text = sock.recv_string()      | msg = sock.recv_string()                 |
+|                        |                                | text = msg['string']                     |
+| Non-blocking recv      | sock.recv(flags=zmq.DONTWAIT)  | sock.recv(flags=1)                       |
+| Subscribe              | sock.subscribe("topic")        | sock.subscribe("topic")                  |
+| Set socket option      | sock.setsockopt(opt, val)      | sock.setsockopt(opt, val)                |
+| Close socket           | sock.close()                   | sock.close()                             |
+| Cleanup                | ctx.term()                     | zmq.term() / zmq.shutdown()              |
+
+Note: The right column shows a PyZMQ-style compatibility view. Mooncake native API
+still uses `socket_id` as the first argument internally.
 
 Key Differences:
-1. Mooncake uses socket_id (int) instead of socket objects
-2. Mooncake returns dict with metadata (source, topic) instead of just data
-3. Mooncake requires start_server() for bound sockets
-4. Mooncake requires set_polling_mode(True) to enable blocking recv
-5. Mooncake supports both callback mode (default) and polling mode (opt-in)
+1. Mooncake now supports PyZMQ-style `sock` objects via `zmq.socket(...)`, but native API still exposes `socket_id`-first methods.
+2. Mooncake returns dict with metadata (`source`, `topic`, etc.) instead of only payload.
+3. Mooncake requires `start_server()` for bound sockets.
+4. Mooncake polling receive APIs (`recv*`) require `sock.set_polling_mode(True)`.
+5. Mooncake supports both callback mode (default) and polling mode (opt-in).
 
 Usage:
 ------
@@ -118,17 +122,17 @@ def example_req_rep():
         log("REP", "Phase 1: create and bind REP socket")
         rep = ZmqInterface()
         rep.initialize(ZmqConfig())
-        socket_id = rep.create_socket(ZmqSocketType.REP)
-        rep.bind(socket_id, "0.0.0.0:5555")
-        rep.start_server(socket_id)
+        rep_sock = rep.socket(ZmqSocketType.REP)
+        rep_sock.bind("0.0.0.0:5555")
+        rep_sock.start_server()
         log("REP", "Phase 2: server started, signaling ready")
         server_ready.set()
 
         def handle_request(msg):
             print(f"[REP] Received: {msg['data']}")
-            rep.reply(socket_id, b"Response from server")
+            rep_sock.reply(b"Response from server")
 
-        rep.set_receive_callback(socket_id, handle_request)
+        rep_sock.set_receive_callback(handle_request)
         time.sleep(5)
 
     server = threading.Thread(target=server_thread, daemon=True)
@@ -141,13 +145,13 @@ def example_req_rep():
 
     req = ZmqInterface()
     req.initialize(ZmqConfig())
-    socket_id = req.create_socket(ZmqSocketType.REQ)
-    req.connect(socket_id, "127.0.0.1:5555")
+    req_sock = req.socket(ZmqSocketType.REQ)
+    req_sock.connect("127.0.0.1:5555")
     log("REQ", "Phase 4: sending request")
-    response = req.request(socket_id, b"Hello from client")
+    response = req_sock.request(b"Hello from client")
     print(f"[REQ] Got response: {response}")
 
-    req.close_socket(socket_id)
+    req_sock.close()
     print("REQ/REP example completed")
 
 
@@ -161,16 +165,16 @@ def example_pub_sub():
     log("SUB", "Phase 1: create SUB, bind, start_server")
     sub = ZmqInterface()
     sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.bind(socket_id, sub_endpoint)
-    sub.start_server(socket_id)
-    sub.subscribe(socket_id, "sensor.")
+    sub_sock = sub.socket(ZmqSocketType.SUB)
+    sub_sock.bind(sub_endpoint)
+    sub_sock.start_server()
+    sub_sock.subscribe("sensor.")
     sub_ready.set()
 
     def on_message(msg):
         print(f"[SUB] Topic: {msg['topic']}, Data: {msg['data']}")
 
-    sub.set_subscribe_callback(socket_id, on_message)
+    sub_sock.set_subscribe_callback(on_message)
     log("SUB", "Phase 2: SUB ready, starting PUB in background")
     time.sleep(0.5)
 
@@ -181,22 +185,22 @@ def example_pub_sub():
         log("PUB", "Phase 3: create PUB, bind, start_server, connect to SUB")
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        pub_socket = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(pub_socket, pub_endpoint)
-        pub.start_server(pub_socket)
-        pub.connect(pub_socket, "127.0.0.1:5656")
+        pub_sock = pub.socket(ZmqSocketType.PUB)
+        pub_sock.bind(pub_endpoint)
+        pub_sock.start_server()
+        pub_sock.connect("127.0.0.1:5656")
         time.sleep(0.5)
         log("PUB", "Phase 4: publishing messages")
-        pub.publish(pub_socket, "sensor.temp", b"25.3C")
-        pub.publish(pub_socket, "sensor.humidity", b"60%")
-        pub.publish(pub_socket, "other.data", b"ignored")
+        pub_sock.publish("sensor.temp", b"25.3C")
+        pub_sock.publish("sensor.humidity", b"60%")
+        pub_sock.publish("other.data", b"ignored")
         print("[PUB] Published messages")
         time.sleep(3)
 
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
     time.sleep(4)
-    sub.close_socket(socket_id)
+    sub_sock.close()
     print("PUB/SUB example completed")
 
 
@@ -209,14 +213,14 @@ def example_push_pull():
         log("PULL", "Phase 1: create PULL, bind, start_server")
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
-        socket_id = pull.create_socket(ZmqSocketType.PULL)
-        pull.bind(socket_id, "0.0.0.0:5557")
-        pull.start_server(socket_id)
+        pull_sock = pull.socket(ZmqSocketType.PULL)
+        pull_sock.bind("0.0.0.0:5557")
+        pull_sock.start_server()
 
         def process_task(msg):
             print(f"[PULL] Processing: {msg['data']}")
 
-        pull.set_pull_callback(socket_id, process_task)
+        pull_sock.set_pull_callback(process_task)
         log("PULL", "Phase 2: worker ready")
         pull_ready.set()
         time.sleep(5)
@@ -230,13 +234,13 @@ def example_push_pull():
 
     push = ZmqInterface()
     push.initialize(ZmqConfig())
-    socket_id = push.create_socket(ZmqSocketType.PUSH)
-    push.connect(socket_id, "127.0.0.1:5557")
+    push_sock = push.socket(ZmqSocketType.PUSH)
+    push_sock.connect("127.0.0.1:5557")
     for i in range(5):
-        push.push(socket_id, f"Task {i}".encode())
+        push_sock.push(f"Task {i}".encode())
         print(f"[PUSH] Sent task {i}")
     time.sleep(2)
-    push.close_socket(socket_id)
+    push_sock.close()
     print("PUSH/PULL example completed")
 
 
@@ -250,17 +254,17 @@ def example_pair():
         log("PAIR1", "Phase 1: bind and start_server (no connect)")
         pair1 = ZmqInterface()
         pair1.initialize(ZmqConfig())
-        socket_id = pair1.create_socket(ZmqSocketType.PAIR)
-        pair1.bind(socket_id, peer1_endpoint)
-        pair1.start_server(socket_id)
+        pair1_sock = pair1.socket(ZmqSocketType.PAIR)
+        pair1_sock.bind(peer1_endpoint)
+        pair1_sock.start_server()
 
         def on_message(msg):
             print(f"[PAIR1] Received: {msg['data']}")
 
-        pair1.set_receive_callback(socket_id, on_message)
+        pair1_sock.set_receive_callback(on_message)
         peer1_ready.set()
         time.sleep(2)
-        pair1.send(socket_id, b"Hello from peer1")
+        pair1_sock.send(b"Hello from peer1")
         time.sleep(5)
 
     peer1 = threading.Thread(target=peer1_thread, daemon=True)
@@ -272,16 +276,16 @@ def example_pair():
 
     pair2 = ZmqInterface()
     pair2.initialize(ZmqConfig())
-    socket_id = pair2.create_socket(ZmqSocketType.PAIR)
-    pair2.connect(socket_id, "127.0.0.1:5558")
+    pair2_sock = pair2.socket(ZmqSocketType.PAIR)
+    pair2_sock.connect("127.0.0.1:5558")
 
     def on_message(msg):
         print(f"[PAIR2] Received: {msg['data']}")
 
-    pair2.set_receive_callback(socket_id, on_message)
-    pair2.send(socket_id, b"Hello from peer2")
+    pair2_sock.set_receive_callback(on_message)
+    pair2_sock.send(b"Hello from peer2")
     time.sleep(3)
-    pair2.close_socket(socket_id)
+    pair2_sock.close()
     print("PAIR example completed")
 
 
@@ -295,15 +299,15 @@ def example_pyobj():
     log("SUB", "Phase 1: create SUB, bind, start_server, set pyobj callback")
     sub = ZmqInterface()
     sub.initialize(ZmqConfig())
-    sub_socket = sub.create_socket(ZmqSocketType.SUB)
-    sub.bind(sub_socket, sub_endpoint)
-    sub.start_server(sub_socket)
-    sub.subscribe(sub_socket, "")
+    sub_sock = sub.socket(ZmqSocketType.SUB)
+    sub_sock.bind(sub_endpoint)
+    sub_sock.start_server()
+    sub_sock.subscribe("")
 
     def on_pyobj(msg):
         print(f"[SUB] Received Python object: {msg['obj']}, Topic: {msg['topic']}")
 
-    sub.set_pyobj_receive_callback(sub_socket, on_pyobj)
+    sub_sock.set_pyobj_receive_callback(on_pyobj)
     sub_ready.set()
     time.sleep(0.5)
 
@@ -312,21 +316,21 @@ def example_pyobj():
         log("PUB", "Phase 2: create PUB, bind, start_server, connect to SUB")
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, pub_endpoint)
-        pub.start_server(socket_id)
-        pub.connect(socket_id, "127.0.0.1:5659")
+        pub_sock = pub.socket(ZmqSocketType.PUB)
+        pub_sock.bind(pub_endpoint)
+        pub_sock.start_server()
+        pub_sock.connect("127.0.0.1:5659")
         time.sleep(0.3)
-        pub.send_pyobj(socket_id, {"name": "Alice", "age": 30}, "user.info")
-        pub.send_pyobj(socket_id, [1, 2, 3, 4, 5], "data.list")
-        pub.send_pyobj(socket_id, {"status": "ok", "value": 42}, "system.status")
+        pub_sock.send_pyobj({"name": "Alice", "age": 30}, "user.info")
+        pub_sock.send_pyobj([1, 2, 3, 4, 5], "data.list")
+        pub_sock.send_pyobj({"status": "ok", "value": 42}, "system.status")
         print("[PUB] Published Python objects")
         time.sleep(3)
 
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
     time.sleep(4)
-    sub.close_socket(sub_socket)
+    sub_sock.close()
     print("Python object example completed")
 
 
@@ -339,9 +343,9 @@ def example_multipart():
         log("PULL", "Phase 1: bind, start_server, set multipart callback")
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
-        socket_id = pull.create_socket(ZmqSocketType.PULL)
-        pull.bind(socket_id, "0.0.0.0:5560")
-        pull.start_server(socket_id)
+        pull_sock = pull.socket(ZmqSocketType.PULL)
+        pull_sock.bind("0.0.0.0:5560")
+        pull_sock.start_server()
 
         def process_multipart(msg):
             frames = msg["frames"]
@@ -350,7 +354,7 @@ def example_multipart():
             task_data = frames[2]
             print(f"[PULL] Task {task_id}: type={task_type}, data_len={len(task_data)}")
 
-        pull.set_multipart_receive_callback(socket_id, process_multipart)
+        pull_sock.set_multipart_receive_callback(process_multipart)
         pull_ready.set()
         time.sleep(5)
 
@@ -362,18 +366,18 @@ def example_multipart():
     time.sleep(0.3)
     push = ZmqInterface()
     push.initialize(ZmqConfig())
-    socket_id = push.create_socket(ZmqSocketType.PUSH)
-    push.connect(socket_id, "127.0.0.1:5560")
+    push_sock = push.socket(ZmqSocketType.PUSH)
+    push_sock.connect("127.0.0.1:5560")
     for i in range(3):
         frames = [
             f"task-{i}".encode(),
             b"process_image",
             b"\x00\x01\x02\x03" * 10,
         ]
-        push.send_multipart(socket_id, frames)
+        push_sock.send_multipart(frames)
         print(f"[PUSH] Sent multipart task {i}")
     time.sleep(2)
-    push.close_socket(socket_id)
+    push_sock.close()
     print("Multipart messages example completed")
 
 
@@ -387,15 +391,15 @@ def example_json():
     log("SUB", "Phase 1: create SUB, bind, start_server, set JSON callback")
     sub = ZmqInterface()
     sub.initialize(ZmqConfig())
-    sub_socket = sub.create_socket(ZmqSocketType.SUB)
-    sub.bind(sub_socket, sub_endpoint)
-    sub.start_server(sub_socket)
-    sub.subscribe(sub_socket, "")
+    sub_sock = sub.socket(ZmqSocketType.SUB)
+    sub_sock.bind(sub_endpoint)
+    sub_sock.start_server()
+    sub_sock.subscribe("")
 
     def on_json(msg):
         print(f"[SUB] Received JSON: {msg['obj']}, Topic: {msg['topic']}")
 
-    sub.set_json_receive_callback(sub_socket, on_json)
+    sub_sock.set_json_receive_callback(on_json)
     sub_ready.set()
     time.sleep(0.5)
 
@@ -404,23 +408,21 @@ def example_json():
         log("PUB", "Phase 2: create PUB, bind, start_server, connect to SUB")
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, pub_endpoint)
-        pub.start_server(socket_id)
-        pub.connect(socket_id, "127.0.0.1:5664")
+        pub_sock = pub.socket(ZmqSocketType.PUB)
+        pub_sock.bind(pub_endpoint)
+        pub_sock.start_server()
+        pub_sock.connect("127.0.0.1:5664")
         time.sleep(0.3)
-        pub.send_json(
-            socket_id, {"name": "Alice", "age": 30, "role": "admin"}, "user.data"
-        )
-        pub.send_json(socket_id, {"temperature": 25.5, "humidity": 60}, "sensor.data")
-        pub.send_json(socket_id, [1, 2, 3, 4, 5], "list.data")
+        pub_sock.send_json({"name": "Alice", "age": 30, "role": "admin"}, "user.data")
+        pub_sock.send_json({"temperature": 25.5, "humidity": 60}, "sensor.data")
+        pub_sock.send_json([1, 2, 3, 4, 5], "list.data")
         print("[PUB] Published JSON messages")
         time.sleep(3)
 
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
     time.sleep(4)
-    sub.close_socket(sub_socket)
+    sub_sock.close()
     print("JSON messages example completed")
 
 
@@ -433,14 +435,14 @@ def example_string():
         log("PULL", "Phase 1: bind, start_server, set string callback")
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
-        socket_id = pull.create_socket(ZmqSocketType.PULL)
-        pull.bind(socket_id, "0.0.0.0:5565")
-        pull.start_server(socket_id)
+        pull_sock = pull.socket(ZmqSocketType.PULL)
+        pull_sock.bind("0.0.0.0:5565")
+        pull_sock.start_server()
 
         def process_string(msg):
             print(f"[PULL] Received string: '{msg['string']}'")
 
-        pull.set_string_receive_callback(socket_id, process_string)
+        pull_sock.set_string_receive_callback(process_string)
         pull_ready.set()
         time.sleep(5)
 
@@ -452,8 +454,8 @@ def example_string():
     time.sleep(0.3)
     push = ZmqInterface()
     push.initialize(ZmqConfig())
-    socket_id = push.create_socket(ZmqSocketType.PUSH)
-    push.connect(socket_id, "127.0.0.1:5565")
+    push_sock = push.socket(ZmqSocketType.PUSH)
+    push_sock.connect("127.0.0.1:5565")
     messages = [
         "Hello, World!",
         "ZMQ is awesome",
@@ -461,11 +463,11 @@ def example_string():
         "中文消息测试",
     ]
     for i, msg in enumerate(messages):
-        push.send_string(socket_id, msg)
+        push_sock.send_string(msg)
         print(f"[PUSH] Sent string {i}: '{msg}'")
         time.sleep(0.2)
     time.sleep(2)
-    push.close_socket(socket_id)
+    push_sock.close()
     print("String messages example completed")
 
 
@@ -479,11 +481,11 @@ def example_recv_json_polling():
     log("SUB", "Phase 1: create SUB, bind, start_server, set polling mode")
     sub = ZmqInterface()
     sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.bind(socket_id, sub_endpoint)
-    sub.start_server(socket_id)
-    sub.subscribe(socket_id, "status")
-    sub.set_polling_mode(socket_id, True)
+    sub_sock = sub.socket(ZmqSocketType.SUB)
+    sub_sock.bind(sub_endpoint)
+    sub_sock.start_server()
+    sub_sock.subscribe("status")
+    sub_sock.set_polling_mode(True)
     sub_ready.set()
     time.sleep(0.5)
 
@@ -492,10 +494,10 @@ def example_recv_json_polling():
         log("PUB", "Phase 2: create PUB, bind, start_server, connect to SUB")
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        pub_socket = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(pub_socket, pub_endpoint)
-        pub.start_server(pub_socket)
-        pub.connect(pub_socket, "127.0.0.1:5666")
+        pub_sock = pub.socket(ZmqSocketType.PUB)
+        pub_sock.bind(pub_endpoint)
+        pub_sock.start_server()
+        pub_sock.connect("127.0.0.1:5666")
         time.sleep(0.5)
         objects = [
             {"status": "running", "progress": 33},
@@ -503,7 +505,7 @@ def example_recv_json_polling():
             {"status": "completed", "progress": 100},
         ]
         for i, obj in enumerate(objects):
-            pub.send_json(pub_socket, obj, "status")
+            pub_sock.send_json(obj, "status")
             print(f"[PUB] Sent JSON {i}: {obj}")
             time.sleep(0.5)
         time.sleep(5)
@@ -513,12 +515,12 @@ def example_recv_json_polling():
     print("[SUB] Waiting for JSON messages with blocking recv_json()...")
     for i in range(3):
         try:
-            msg = sub.recv_json(socket_id)
+            msg = sub_sock.recv_json()
             print(f"[SUB] Received JSON: {msg['obj']}, topic: {msg['topic']}")
         except Exception as e:
             print(f"[SUB] Recv error: {e}")
             break
-    sub.close_socket(socket_id)
+    sub_sock.close()
     print("Recv JSON polling mode example completed")
 
 
@@ -531,9 +533,9 @@ def example_recv_string_polling():
         log("PULL(worker)", "Phase 1: bind, start_server (no callback, just hold port)")
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
-        socket_id = pull.create_socket(ZmqSocketType.PULL)
-        pull.bind(socket_id, "0.0.0.0:5567")
-        pull.start_server(socket_id)
+        pull_sock = pull.socket(ZmqSocketType.PULL)
+        pull_sock.bind("0.0.0.0:5567")
+        pull_sock.start_server()
         pull_ready.set()
         time.sleep(10)
 
@@ -547,12 +549,12 @@ def example_recv_string_polling():
         log("PUSH", "Phase 2: connect and send strings")
         push = ZmqInterface()
         push.initialize(ZmqConfig())
-        socket_id = push.create_socket(ZmqSocketType.PUSH)
-        push.connect(socket_id, "127.0.0.1:5567")
+        push_sock = push.socket(ZmqSocketType.PUSH)
+        push_sock.connect("127.0.0.1:5567")
         time.sleep(0.5)
         messages = ["First message", "Second message", "Third message"]
         for i, msg in enumerate(messages):
-            push.send_string(socket_id, msg)
+            push_sock.send_string(msg)
             print(f"[PUSH] Sent string {i}: '{msg}'")
             time.sleep(0.5)
         time.sleep(5)
@@ -564,19 +566,19 @@ def example_recv_string_polling():
     log("PULL(consumer)", "Phase 3: connect, set polling mode, recv_string")
     pull = ZmqInterface()
     pull.initialize(ZmqConfig())
-    socket_id = pull.create_socket(ZmqSocketType.PULL)
-    pull.connect(socket_id, "127.0.0.1:5567")
-    pull.set_polling_mode(socket_id, True)
+    pull_sock = pull.socket(ZmqSocketType.PULL)
+    pull_sock.connect("127.0.0.1:5567")
+    pull_sock.set_polling_mode(True)
     time.sleep(1)
     print("[PULL] Waiting for string messages with blocking recv_string()...")
     for i in range(3):
         try:
-            msg = pull.recv_string(socket_id)
+            msg = pull_sock.recv_string()
             print(f"[PULL] Received string: '{msg['string']}'")
         except Exception as e:
             print(f"[PULL] Recv error: {e}")
             break
-    pull.close_socket(socket_id)
+    pull_sock.close()
     print("Recv string polling mode example completed")
 
 
@@ -590,11 +592,11 @@ def example_recv_polling():
     log("SUB", "Phase 1: create SUB, bind, start_server, set polling mode")
     sub = ZmqInterface()
     sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.bind(socket_id, sub_endpoint)
-    sub.start_server(socket_id)
-    sub.subscribe(socket_id, "data")
-    sub.set_polling_mode(socket_id, True)
+    sub_sock = sub.socket(ZmqSocketType.SUB)
+    sub_sock.bind(sub_endpoint)
+    sub_sock.start_server()
+    sub_sock.subscribe("data")
+    sub_sock.set_polling_mode(True)
     sub_ready.set()
     time.sleep(0.5)
 
@@ -603,14 +605,14 @@ def example_recv_polling():
         log("PUB", "Phase 2: create PUB, bind, start_server, connect to SUB")
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        pub_socket = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(pub_socket, pub_endpoint)
-        pub.start_server(pub_socket)
-        pub.connect(pub_socket, "127.0.0.1:5661")
+        pub_sock = pub.socket(ZmqSocketType.PUB)
+        pub_sock.bind(pub_endpoint)
+        pub_sock.start_server()
+        pub_sock.connect("127.0.0.1:5661")
         time.sleep(0.5)
         log("PUB", "Phase 3: publishing messages")
         for i in range(3):
-            pub.publish(pub_socket, "data", f"Message {i}".encode())
+            pub_sock.publish("data", f"Message {i}".encode())
             print(f"[PUB] Published message {i}")
             time.sleep(0.5)
         time.sleep(5)
@@ -621,12 +623,12 @@ def example_recv_polling():
     for i in range(3):
         try:
             log("SUB", f"recv() call {i+1}/3 ...", force=True)
-            msg = sub.recv(socket_id)
+            msg = sub_sock.recv()
             print(f"[SUB] Received via recv(): {msg['data']}, topic: {msg['topic']}")
         except Exception as e:
             print(f"[SUB] Recv error: {e}")
             break
-    sub.close_socket(socket_id)
+    sub_sock.close()
     print("Recv polling mode example completed")
 
 
@@ -648,11 +650,11 @@ def example_recv_pyobj_polling():
     log("SUB", "Phase 1: create SUB, bind, start_server, set polling mode")
     sub = ZmqInterface()
     sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.bind(socket_id, sub_endpoint)
-    sub.start_server(socket_id)
-    sub.subscribe(socket_id, "objects")
-    sub.set_polling_mode(socket_id, True)
+    sub_sock = sub.socket(ZmqSocketType.SUB)
+    sub_sock.bind(sub_endpoint)
+    sub_sock.start_server()
+    sub_sock.subscribe("objects")
+    sub_sock.set_polling_mode(True)
     sub_ready.set()
     time.sleep(0.5)
 
@@ -661,10 +663,10 @@ def example_recv_pyobj_polling():
         log("PUB", "Phase 2: create PUB, bind, start_server, connect to SUB")
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        pub_socket = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(pub_socket, pub_endpoint)
-        pub.start_server(pub_socket)
-        pub.connect(pub_socket, "127.0.0.1:5662")
+        pub_sock = pub.socket(ZmqSocketType.PUB)
+        pub_sock.bind(pub_endpoint)
+        pub_sock.start_server()
+        pub_sock.connect("127.0.0.1:5662")
         time.sleep(0.5)
         objects = [
             {"name": "Alice", "age": 30},
@@ -673,7 +675,7 @@ def example_recv_pyobj_polling():
         ]
         log("PUB", "Phase 3: sending Python objects via send_pyobj")
         for i, obj in enumerate(objects):
-            pub.send_pyobj(pub_socket, obj, "objects")
+            pub_sock.send_pyobj(obj, "objects")
             print(f"[PUB] Sent object {i}: {obj}")
             time.sleep(0.5)
         time.sleep(5)
@@ -686,7 +688,7 @@ def example_recv_pyobj_polling():
     for i in range(3):
         try:
             log("SUB", f"recv_pyobj() call {i+1}/3 (before C++ call)...", force=True)
-            msg = sub.recv_pyobj(socket_id)
+            msg = sub_sock.recv_pyobj()
             log(
                 "SUB",
                 f"recv_pyobj() call {i+1}/3 returned (building result dict)...",
@@ -698,7 +700,7 @@ def example_recv_pyobj_polling():
             log("SUB", f"Exception type: {type(e).__name__}", force=True)
             break
     log("SUB", "Closing socket and exiting", force=True)
-    sub.close_socket(socket_id)
+    sub_sock.close()
     print("Recv pyobj polling mode example completed")
 
 
@@ -711,9 +713,9 @@ def example_recv_multipart_polling():
         log("PULL(worker)", "Phase 1: bind, start_server")
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
-        socket_id = pull.create_socket(ZmqSocketType.PULL)
-        pull.bind(socket_id, "0.0.0.0:5563")
-        pull.start_server(socket_id)
+        pull_sock = pull.socket(ZmqSocketType.PULL)
+        pull_sock.bind("0.0.0.0:5563")
+        pull_sock.start_server()
         pull_ready.set()
         time.sleep(10)
 
@@ -727,12 +729,12 @@ def example_recv_multipart_polling():
         log("PUSH", "Phase 2: connect and send multipart")
         push = ZmqInterface()
         push.initialize(ZmqConfig())
-        socket_id = push.create_socket(ZmqSocketType.PUSH)
-        push.connect(socket_id, "127.0.0.1:5563")
+        push_sock = push.socket(ZmqSocketType.PUSH)
+        push_sock.connect("127.0.0.1:5563")
         time.sleep(0.5)
         for i in range(3):
             frames = [f"task-{i}".encode(), b"process", b"data" * 10]
-            push.send_multipart(socket_id, frames)
+            push_sock.send_multipart(frames)
             print(f"[PUSH] Sent multipart message {i}")
             time.sleep(0.5)
         time.sleep(5)
@@ -744,14 +746,14 @@ def example_recv_multipart_polling():
     log("PULL(consumer)", "Phase 3: connect, set polling mode, recv_multipart")
     pull = ZmqInterface()
     pull.initialize(ZmqConfig())
-    socket_id = pull.create_socket(ZmqSocketType.PULL)
-    pull.connect(socket_id, "127.0.0.1:5563")
-    pull.set_polling_mode(socket_id, True)
+    pull_sock = pull.socket(ZmqSocketType.PULL)
+    pull_sock.connect("127.0.0.1:5563")
+    pull_sock.set_polling_mode(True)
     time.sleep(1)
     print("[PULL] Waiting for multipart messages with blocking recv_multipart()...")
     for i in range(3):
         try:
-            msg = pull.recv_multipart(socket_id)
+            msg = pull_sock.recv_multipart()
             frames = msg["frames"]
             print(
                 f"[PULL] Received {len(frames)} frames: "
@@ -760,7 +762,7 @@ def example_recv_multipart_polling():
         except Exception as e:
             print(f"[PULL] Recv error: {e}")
             break
-    pull.close_socket(socket_id)
+    pull_sock.close()
     print("Recv multipart polling mode example completed")
 
 

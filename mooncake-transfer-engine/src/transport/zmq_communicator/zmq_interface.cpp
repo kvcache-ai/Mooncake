@@ -2518,6 +2518,131 @@ pybind11::object ZmqInterface::recvStringAsync(int socket_id,
     return future_obj;
 }
 
+namespace {
+
+// PyZMQ-style socket proxy that keeps parent ZmqInterface alive.
+class ZmqCompatSocket {
+   public:
+    ZmqCompatSocket(pybind11::object owner, int socket_id)
+        : owner_(std::move(owner)), socket_id_(socket_id) {}
+
+    int socketId() const { return socket_id_; }
+
+    bool bind(const std::string& endpoint) {
+        return owner_.attr("bind")(socket_id_, endpoint).cast<bool>();
+    }
+    bool connect(const std::string& endpoint) {
+        return owner_.attr("connect")(socket_id_, endpoint).cast<bool>();
+    }
+    bool unbind(const std::string& endpoint) {
+        return owner_.attr("unbind")(socket_id_, endpoint).cast<bool>();
+    }
+    bool disconnect(const std::string& endpoint) {
+        return owner_.attr("disconnect")(socket_id_, endpoint).cast<bool>();
+    }
+    bool startServer() {
+        return owner_.attr("start_server")(socket_id_).cast<bool>();
+    }
+
+    int send(pybind11::handle data) {
+        return owner_.attr("send")(socket_id_, data).cast<int>();
+    }
+    int publish(const std::string& topic, pybind11::handle data) {
+        return owner_.attr("publish")(socket_id_, topic, data).cast<int>();
+    }
+    int push(pybind11::handle data) {
+        return owner_.attr("push")(socket_id_, data).cast<int>();
+    }
+    int sendPyobj(pybind11::handle obj, const std::string& topic = "") {
+        return owner_.attr("send_pyobj")(socket_id_, obj, topic).cast<int>();
+    }
+    int sendMultipart(pybind11::list frames, const std::string& topic = "") {
+        return owner_.attr("send_multipart")(socket_id_, frames, topic)
+            .cast<int>();
+    }
+    int sendJson(pybind11::handle obj, const std::string& topic = "") {
+        return owner_.attr("send_json")(socket_id_, obj, topic).cast<int>();
+    }
+    int sendString(const std::string& str, const std::string& topic = "",
+                   const std::string& encoding = "utf-8") {
+        return owner_.attr("send_string")(socket_id_, str, topic, encoding)
+            .cast<int>();
+    }
+
+    pybind11::dict recv(int flags = 0) {
+        return owner_.attr("recv")(socket_id_, flags).cast<pybind11::dict>();
+    }
+    pybind11::dict recvPyobj(int flags = 0) {
+        return owner_.attr("recv_pyobj")(socket_id_, flags)
+            .cast<pybind11::dict>();
+    }
+    pybind11::dict recvMultipart(int flags = 0) {
+        return owner_.attr("recv_multipart")(socket_id_, flags)
+            .cast<pybind11::dict>();
+    }
+    pybind11::dict recvJson(int flags = 0) {
+        return owner_.attr("recv_json")(socket_id_, flags).cast<pybind11::dict>();
+    }
+    pybind11::dict recvString(int flags = 0,
+                              const std::string& encoding = "utf-8") {
+        return owner_.attr("recv_string")(socket_id_, flags, encoding)
+            .cast<pybind11::dict>();
+    }
+
+    pybind11::object request(pybind11::handle data) {
+        return owner_.attr("request")(socket_id_, data);
+    }
+    void reply(pybind11::handle data) { owner_.attr("reply")(socket_id_, data); }
+    void setReceiveCallback(pybind11::function callback) {
+        owner_.attr("set_receive_callback")(socket_id_, callback);
+    }
+    void setSubscribeCallback(pybind11::function callback) {
+        owner_.attr("set_subscribe_callback")(socket_id_, callback);
+    }
+    void setPullCallback(pybind11::function callback) {
+        owner_.attr("set_pull_callback")(socket_id_, callback);
+    }
+    void setPyobjReceiveCallback(pybind11::function callback) {
+        owner_.attr("set_pyobj_receive_callback")(socket_id_, callback);
+    }
+    void setMultipartReceiveCallback(pybind11::function callback) {
+        owner_.attr("set_multipart_receive_callback")(socket_id_, callback);
+    }
+    void setJsonReceiveCallback(pybind11::function callback) {
+        owner_.attr("set_json_receive_callback")(socket_id_, callback);
+    }
+    void setStringReceiveCallback(pybind11::function callback,
+                                  const std::string& encoding = "utf-8") {
+        owner_.attr("set_string_receive_callback")(socket_id_, callback,
+                                                   encoding);
+    }
+
+    bool subscribe(const std::string& topic) {
+        return owner_.attr("subscribe")(socket_id_, topic).cast<bool>();
+    }
+    bool unsubscribe(const std::string& topic) {
+        return owner_.attr("unsubscribe")(socket_id_, topic).cast<bool>();
+    }
+    bool setSockOpt(ZmqSocketOption option, int64_t value) {
+        return owner_.attr("set_socket_option")(socket_id_, option, value)
+            .cast<bool>();
+    }
+    int64_t getSockOpt(ZmqSocketOption option) {
+        return owner_.attr("get_socket_option")(socket_id_, option)
+            .cast<int64_t>();
+    }
+    void setPollingMode(bool enable) {
+        owner_.attr("set_polling_mode")(socket_id_, enable);
+    }
+    bool close() { return owner_.attr("close_socket")(socket_id_).cast<bool>(); }
+
+   private:
+    pybind11::object owner_;
+    int socket_id_;
+};
+
+}  // namespace
+
 // Python binding
 void bind_zmq_interface(pybind11::module_& m) {
     namespace py = pybind11;
@@ -2562,11 +2687,67 @@ void bind_zmq_interface(pybind11::module_& m) {
         .def_readwrite("rcv_buffer_size", &ZmqConfig::rcv_buffer_size)
         .def_readwrite("snd_buffer_size", &ZmqConfig::snd_buffer_size);
 
+    py::class_<ZmqCompatSocket>(m, "ZmqSocket")
+        .def("bind", &ZmqCompatSocket::bind)
+        .def("connect", &ZmqCompatSocket::connect)
+        .def("unbind", &ZmqCompatSocket::unbind)
+        .def("disconnect", &ZmqCompatSocket::disconnect)
+        .def("start_server", &ZmqCompatSocket::startServer)
+        .def("send", &ZmqCompatSocket::send)
+        .def("publish", &ZmqCompatSocket::publish)
+        .def("push", &ZmqCompatSocket::push)
+        .def("send_pyobj", &ZmqCompatSocket::sendPyobj, py::arg("obj"),
+             py::arg("topic") = "")
+        .def("send_multipart", &ZmqCompatSocket::sendMultipart,
+             py::arg("frames"), py::arg("topic") = "")
+        .def("send_json", &ZmqCompatSocket::sendJson, py::arg("obj"),
+             py::arg("topic") = "")
+        .def("send_string", &ZmqCompatSocket::sendString, py::arg("str"),
+             py::arg("topic") = "", py::arg("encoding") = "utf-8")
+        .def("recv", &ZmqCompatSocket::recv, py::arg("flags") = 0)
+        .def("recv_pyobj", &ZmqCompatSocket::recvPyobj,
+             py::arg("flags") = 0)
+        .def("recv_multipart", &ZmqCompatSocket::recvMultipart,
+             py::arg("flags") = 0)
+        .def("recv_json", &ZmqCompatSocket::recvJson, py::arg("flags") = 0)
+        .def("recv_string", &ZmqCompatSocket::recvString, py::arg("flags") = 0,
+             py::arg("encoding") = "utf-8")
+        .def("request", &ZmqCompatSocket::request)
+        .def("reply", &ZmqCompatSocket::reply)
+        .def("set_receive_callback", &ZmqCompatSocket::setReceiveCallback)
+        .def("set_subscribe_callback", &ZmqCompatSocket::setSubscribeCallback)
+        .def("set_pull_callback", &ZmqCompatSocket::setPullCallback)
+        .def("set_pyobj_receive_callback",
+             &ZmqCompatSocket::setPyobjReceiveCallback)
+        .def("set_multipart_receive_callback",
+             &ZmqCompatSocket::setMultipartReceiveCallback)
+        .def("set_json_receive_callback",
+             &ZmqCompatSocket::setJsonReceiveCallback)
+        .def("set_string_receive_callback",
+             &ZmqCompatSocket::setStringReceiveCallback, py::arg("callback"),
+             py::arg("encoding") = "utf-8")
+        .def("subscribe", &ZmqCompatSocket::subscribe)
+        .def("unsubscribe", &ZmqCompatSocket::unsubscribe)
+        .def("setsockopt", &ZmqCompatSocket::setSockOpt)
+        .def("getsockopt", &ZmqCompatSocket::getSockOpt)
+        .def("set_polling_mode", &ZmqCompatSocket::setPollingMode)
+        .def("close", &ZmqCompatSocket::close)
+        .def_property_readonly("socket_id", &ZmqCompatSocket::socketId);
+
     // Bind ZmqInterface
     py::class_<ZmqInterface>(m, "ZmqInterface")
         .def(py::init<>())
         .def("initialize", &ZmqInterface::initialize)
         .def("shutdown", &ZmqInterface::shutdown)
+        .def("term", &ZmqInterface::shutdown)
+        .def("socket",
+             [](ZmqInterface& self, ZmqSocketType socket_type) {
+                 py::object owner =
+                     py::cast(&self, py::return_value_policy::reference);
+                 int socket_id = self.createSocket(socket_type);
+                 return ZmqCompatSocket(std::move(owner), socket_id);
+             },
+             py::arg("socket_type"))
         .def("create_socket", &ZmqInterface::createSocket)
         .def("close_socket", &ZmqInterface::closeSocket)
         .def("bind", &ZmqInterface::bind)
