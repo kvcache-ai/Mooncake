@@ -1285,8 +1285,7 @@ PYBIND11_MODULE(store, m) {
                  self.store_.reset();
                  return rc;
              })
-        .def("health_check",
-             &MooncakeStorePyWrapper::health_check,
+        .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")

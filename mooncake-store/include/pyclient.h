@@ -30,9 +30,10 @@ enum ShmSegmentType : uint32_t {
 
 // Return codes for health_check()
 enum HealthCheckStatus : int {
-    HC_HEALTHY = 0,             // Fully connected, all links up
-    HC_NOT_INITIALIZED = 1,     // Not initialized or already closed
-    HC_MASTER_UNREACHABLE = 2   // Master (or RealClient for DummyClient) unreachable
+    HC_HEALTHY = 0,          // Fully connected, all links up
+    HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
+    HC_MASTER_UNREACHABLE =
+        2  // Master (or RealClient for DummyClient) unreachable
 };
 
 // Payload for IPC_SHM_REGISTER (followed by fd via SCM_RIGHTS)

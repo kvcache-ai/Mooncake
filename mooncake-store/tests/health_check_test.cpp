@@ -63,10 +63,10 @@ class HealthCheckTest : public ::testing::Test {
 
         const std::string rdma_devices =
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
-        return py_client_->setup_real(
-            "localhost:" + std::to_string(port), "P2PHANDSHAKE",
-            16 * 1024 * 1024, 16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-            master_address_);
+        return py_client_->setup_real("localhost:" + std::to_string(port),
+                                      "P2PHANDSHAKE", 16 * 1024 * 1024,
+                                      16 * 1024 * 1024, FLAGS_protocol,
+                                      rdma_devices, master_address_);
     }
 };
 

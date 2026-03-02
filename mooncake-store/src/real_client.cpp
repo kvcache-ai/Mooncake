@@ -584,8 +584,7 @@ int RealClient::start_http_server() {
         std::make_unique<coro_http_server>(/*thread_num=*/1, FLAGS_http_port);
 
     http_server_->set_http_handler<GET>(
-        "/health",
-        [this](coro_http_request &req, coro_http_response &resp) {
+        "/health", [this](coro_http_request &req, coro_http_response &resp) {
             int code = health_check();
             std::string status_str;
             switch (code) {
@@ -605,9 +604,9 @@ int RealClient::start_http_server() {
             std::string body = "{\"status\":\"" + status_str +
                                "\",\"code\":" + std::to_string(code) + "}";
             resp.add_header("Content-Type", "application/json");
-            auto http_status =
-                (code == HC_HEALTHY) ? status_type::ok
-                                     : status_type::service_unavailable;
+            auto http_status = (code == HC_HEALTHY)
+                                   ? status_type::ok
+                                   : status_type::service_unavailable;
             resp.set_status_and_content(http_status, std::move(body));
         });
 
@@ -2307,9 +2306,8 @@ tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    ClientStatus client_status = client_->is_ping_healthy()
-                                     ? ClientStatus::OK
-                                     : ClientStatus::UNDEFINED;
+    ClientStatus client_status =
+        client_->is_ping_healthy() ? ClientStatus::OK : ClientStatus::UNDEFINED;
 
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!dummy_client_ping_queue_.push(pod_client_id)) {
