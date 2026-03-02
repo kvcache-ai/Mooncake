@@ -139,6 +139,15 @@ class ScopedTaskReadAccess {
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
+    using task_iterator =
+        std::unordered_map<UUID, Task, boost::hash<UUID>>::const_iterator;
+
+    task_iterator begin() const;
+
+    task_iterator end() const;
+
+    size_t size() const;
+
    private:
     const ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -164,6 +173,10 @@ class ScopedTaskWriteAccess {
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
+
+    void restore_task(Task&& task);
+
+    void clear_all();
 
     void prune_finished_tasks();
 
@@ -234,5 +247,24 @@ class ClientTaskManager {
     // Tracks the order of finished tasks (Oldest -> Newest)
     // Used to implement LRU eviction for completed tasks
     std::deque<UUID> finished_task_history_ GUARDED_BY(mutex_);
+};
+
+class TaskManagerSerializer {
+    static constexpr size_t kTaskSerializedFields = 8;
+    static constexpr size_t kMaxDecompressedSize = 1024 * 1024 * 1024;  // 1 GB
+
+   public:
+    explicit TaskManagerSerializer(ClientTaskManager* task_manager)
+        : task_manager_(task_manager) {}
+
+    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+
+    tl::expected<void, SerializationError> Deserialize(
+        const std::vector<uint8_t>& data);
+
+    void Reset();
+
+   private:
+    ClientTaskManager* task_manager_;
 };
 }  // namespace mooncake

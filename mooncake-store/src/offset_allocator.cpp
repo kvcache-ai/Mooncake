@@ -557,6 +557,14 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
                                                 init_capacity, max_capacity);
 }
 
+OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
+                                 uint64_t multiplier_bits,
+                                 std::unique_ptr<__Allocator> allocator)
+    : m_allocator(std::move(allocator)),
+      m_base(base),
+      m_multiplier_bits(multiplier_bits),
+      m_capacity(size) {}
+
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     if (size == 0) {
         return std::nullopt;

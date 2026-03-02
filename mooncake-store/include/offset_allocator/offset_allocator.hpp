@@ -8,6 +8,7 @@
 #include <glog/logging.h>
 
 #include "mutex.h"
+#include "serialize/serializer.hpp"
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
@@ -41,6 +42,7 @@ struct OffsetAllocation {
     bool isNoSpace() const { return offset == NO_SPACE; }
 
     friend class __Allocator;
+    friend class Serializer<OffsetAllocationHandle>;
 };
 
 struct OffsetAllocStorageReport {
@@ -104,6 +106,7 @@ class OffsetAllocationHandle {
     uint64_t requested_size;
 
     friend class OffsetAllocatorTest;  // for unit tests
+    friend class Serializer<OffsetAllocationHandle>;
 };
 
 struct OffsetAllocatorMetrics {
@@ -174,6 +177,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
    private:
     friend class OffsetAllocationHandle;
+    friend class Serializer<OffsetAllocator>;
 
     // Internal method for Handle to free allocation (thread-safe)
     void freeAllocation(const OffsetAllocation& allocation, uint64_t size);
@@ -197,6 +201,12 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
                     uint32 max_capacity);
+
+    // Private constructor for creating from saved state with pre-constructed
+    // allocator This constructor is used during deserialization when we already
+    // have a reconstructed
+    OffsetAllocator(uint64_t base, size_t size, uint64_t multiplier_bits,
+                    std::unique_ptr<__Allocator> allocator);
 
     // Private constructor - initialize from serialized data
     template <typename T>
@@ -255,6 +265,7 @@ class __Allocator {
     uint32 m_freeOffset;
 
     friend class OffsetAllocatorTest;  // for unit tests
+    friend class mooncake::Serializer<__Allocator>;
 };
 
 // Template method implementations

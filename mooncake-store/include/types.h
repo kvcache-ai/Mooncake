@@ -31,6 +31,13 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
+    60 * 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
+    60 * 5;  // in seconds
+static constexpr uint32_t DEFAULT_SNAPSHOT_RETENTION_COUNT =
+    2;  // Keep 2 recent snapshots by default
+static const std::string DEFAULT_SNAPSHOT_BACKUP_DIR = "";
 constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
 static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
@@ -118,6 +125,21 @@ inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
     return os;
 }
+
+/**
+ * @brief Convert UUID to string representation
+ * @param uuid The UUID to convert
+ * @return String representation of the UUID in format "first-second"
+ */
+std::string UuidToString(const UUID& uuid);
+
+/**
+ * @brief Convert string representation back to UUID
+ * @param str String representation of UUID in format "first-second"
+ * @param uuid Output parameter for the parsed UUID
+ * @return true if parsing succeeded, false otherwise
+ */
+bool StringToUuid(const std::string& str, UUID& uuid);
 
 UUID generate_uuid();
 
@@ -207,6 +229,10 @@ enum class ErrorCode : int32_t {
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
+    SERIALIZE_UNSUPPORTED = -1500,  ///< Serialization unsupported.
+    SERIALIZE_FAIL = -1501,         ///< Serialization failed.
+    DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
+    PERSISTENT_FAIL = -1503,        ///< Persistent failed.
     // Task errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
     TASK_PENDING_LIMIT_EXCEEDED =
@@ -222,6 +248,17 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ErrorCode& errorCode) noexcept {
     return os << toString(errorCode);
 }
+
+struct SerializationError {
+    ErrorCode code;
+    std::string message;
+
+    SerializationError(ErrorCode c, const std::string& msg)
+        : code(c), message(msg) {}
+
+    // Construct from ErrorCode
+    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
+};
 
 /**
  * @brief Represents a contiguous memory region
