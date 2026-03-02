@@ -15,7 +15,7 @@
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
-#include <queue>
+#include <functional>
 
 #include "rdma_context.h"
 
@@ -44,19 +44,33 @@ class RdmaEndPoint {
         CONNECTED,
     };
 
+    using OnDeleteCallback = std::function<void(
+        const std::string &peer_nic_path, uint64_t endpoint_id)>;
+
    public:
     RdmaEndPoint(RdmaContext &context);
 
     ~RdmaEndPoint();
 
     int construct(ibv_cq *cq, size_t num_qp_list = 2, size_t max_sge = 4,
-                  size_t max_wr = 256, size_t max_inline = 64);
+                  size_t max_wr = 256, size_t max_inline = 64,
+                  OnDeleteCallback on_delete_callback = nullptr);
 
    private:
     int deconstruct();
 
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
+
+    const std::string &peerNicPath() const { return peer_nic_path_; }
+
+    std::string localNicPath() const { return context_.nicPath(); }
+
+    uint64_t endpointId() const { return endpoint_id_; }
+
+    uint64_t peerEndpointId() const { return peer_endpoint_id_; }
+
+    void setPeerEndpointId(uint64_t id) { peer_endpoint_id_ = id; }
 
     int setupConnectionsByActive();
 
@@ -125,6 +139,8 @@ class RdmaEndPoint {
                           std::string *reply_msg = nullptr);
 
    private:
+    static std::atomic<uint64_t> next_endpoint_id_;
+
     RdmaContext &context_;
     std::atomic<Status> status_;
 
@@ -133,12 +149,17 @@ class RdmaEndPoint {
 
     std::string peer_nic_path_;
 
+    uint64_t endpoint_id_;
+    uint64_t peer_endpoint_id_ = 0;
+
     volatile int *wr_depth_list_;
     int max_wr_depth_;
 
     volatile bool active_;
     volatile int *cq_outstanding_;
     volatile uint64_t inactive_time_;
+
+    OnDeleteCallback on_delete_callback_;
 };
 
 }  // namespace mooncake
