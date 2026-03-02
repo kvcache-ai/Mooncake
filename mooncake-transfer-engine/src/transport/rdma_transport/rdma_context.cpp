@@ -447,13 +447,11 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
-            PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
-                        << "/" << port;
-            continue;  // if gid is invalid ibv_query_gid_ex() will return !0
+            // Reached end of valid GID indices
+            break;
         }
 
-        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
-             gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
+        if (gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2 ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
             // Check if this GID has an associated network device
             if (hasNetworkDevice(device_name, port, i)) {
@@ -584,16 +582,17 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             }
         } else {
             // Also check network state for user-specified GID
-            if (!hasNetworkDevice(device_name, port, gid_index)) {
+            bool has_ndev = hasNetworkDevice(device_name, port, gid_index);
+            if (!has_ndev) {
                 LOG(WARNING) << "User-specified GID index " << gid_index
                              << " on " << device_name << "/" << port
                              << " has no associated network device, "
                              << "may not be optimal for RDMA operations";
-                goto cleanup_context_and_devices;
             }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
-                      << " on " << device_name << "/" << port
-                      << " (with network device)";
+                      << " on " << device_name << "/" << port << " ("
+                      << (has_ndev ? "with" : "without")
+                      << " network device)";
         }
 
         // Continue with GID validation
