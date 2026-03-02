@@ -38,7 +38,6 @@ struct HixlTask {
     uint64_t batch_size = 0;
     std::string remote_hixl;
     uint64_t start_time = 0;
-    bool sync = false;
 };
 
 struct HixlSubBatch : public Transport::SubBatch {
@@ -87,7 +86,7 @@ class AscendDirectTransport : public Transport {
     void disconnect(const std::string &remote_hixl, int32_t timeout_in_millis);
 
     void startTransfer(SegmentID target_id, Request::OpCode opcode,
-                       const std::vector<HixlTask *> &tasks, bool sync = false);
+                       const std::vector<HixlTask *> &tasks);
 
     void localCopy(Request::OpCode opcode,
                    const std::vector<HixlTask *> &tasks);
@@ -115,7 +114,7 @@ class AscendDirectTransport : public Transport {
     aclrtContext rt_context_{nullptr};
     std::unique_ptr<hixl::Hixl> hixl_;
     bool use_buffer_pool_{false};
-    bool auto_connect_{false};
+    bool auto_connect_{true};
     uint64_t connect_timeout_;
     uint64_t transfer_timeout_;
     std::string local_hixl_name_{};

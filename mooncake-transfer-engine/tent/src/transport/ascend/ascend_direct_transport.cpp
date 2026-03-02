@@ -119,7 +119,7 @@ void AscendDirectTransport::workerThread() {
             continue;
         }
         startTransfer(task_list[0]->request.target_id,
-                      task_list[0]->request.opcode, task_list, true);
+                      task_list[0]->request.opcode, task_list);
     }
     LOG(INFO) << "AscendDirectTransport worker thread stopped";
 }
@@ -214,7 +214,11 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
     if (auto_connect_opt.has_value()) {
         auto_connect_ = (*auto_connect_opt == 1);
         options["AutoConnect"] = auto_connect_ ? "1" : "0";
-        LOG(INFO) << "Set AutoConnect to: " << auto_connect;
+        LOG(INFO) << "Set AutoConnect to: " << options["AutoConnect"];
+    } else {
+        options["AutoConnect"] = "1";
+        auto_connect_ = true;
+        LOG(INFO) << "Set AutoConnect to default: " << options["AutoConnect"];
     }
     std::string buffer_pool =
         conf->get("transports/ascend_direct/buffer_pool", "");
@@ -289,7 +293,6 @@ Status AscendDirectTransport::submitTransferTasks(
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        task.sync = use_buffer_pool_;
         task.transferred_bytes = 0;
         seg_to_tasks[task.request.target_id][task.request.opcode].push_back(
             &task);
@@ -337,10 +340,9 @@ Status AscendDirectTransport::checkAndConnect(const std::string &remote_hixl) {
     return Status::OK();
 }
 
-void AscendDirectTransport::startTransfer(SegmentID target_id,
-                                          Request::OpCode opcode,
-                                          const std::vector<HixlTask *> &tasks,
-                                          bool sync) {
+void AscendDirectTransport::startTransfer(
+    SegmentID target_id, Request::OpCode opcode,
+    const std::vector<HixlTask *> &tasks) {
     std::string rpc_server_addr;
     SegmentDesc *desc = nullptr;
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
@@ -354,9 +356,6 @@ void AscendDirectTransport::startTransfer(SegmentID target_id,
     auto remote_hixl = detail.device_attrs["hixl_name"];
     if (remote_hixl == local_hixl_name_) {
         VLOG(1) << "Target is local.";
-        for (auto &task : tasks) {
-            task->sync = true;
-        }
         auto start = std::chrono::steady_clock::now();
         localCopy(opcode, tasks);
         LOG(INFO) << "Local copy cost: "
@@ -386,15 +385,8 @@ void AscendDirectTransport::startTransfer(SegmentID target_id,
     }
     hixl::Status hixl_ret;
     hixl::TransferReq req_handle;
-    if (sync) {
-        hixl_ret = hixl_->TransferSync(
-            hixl::AscendString(remote_hixl.c_str()), op, op_descs,
-            static_cast<int32_t>(transfer_timeout_ / 1000));
-    } else {
-        hixl_ret =
-            hixl_->TransferAsync(hixl::AscendString(remote_hixl.c_str()), op,
-                                 op_descs, hixl::TransferArgs(), req_handle);
-    }
+    hixl_ret = hixl_->TransferAsync(hixl::AscendString(remote_hixl.c_str()), op,
+                                    op_descs, hixl::TransferArgs(), req_handle);
     if (hixl_ret != hixl::SUCCESS) {
         LOG(ERROR) << "Failed to transfer to: " << remote_hixl
                    << ", status: " << hixl_ret
@@ -411,8 +403,7 @@ void AscendDirectTransport::startTransfer(SegmentID target_id,
         task->req_handle = req_handle;
         task->batch_size = tasks.size();
         task->remote_hixl = remote_hixl;
-        task->status_word =
-            sync ? TransferStatusEnum::COMPLETED : TransferStatusEnum::PENDING;
+        task->status_word = TransferStatusEnum::PENDING;
     }
 }
 
@@ -424,10 +415,10 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
     }
     auto &task = hixl_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
-    if (task.sync) {
-        return Status::OK();
-    }
     if (task.status_word == TransferStatusEnum::PENDING) {
+        if (task.req_handle == nullptr) {
+            return Status::OK();
+        }
         std::lock_guard<std::mutex> lock(req_mutex_);
         auto it = req_map_.find(task.req_handle);
         if (it != req_map_.end()) {
