@@ -9,6 +9,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
+#include "environ.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
@@ -528,9 +529,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    std::string rpc_protocol = mooncake::Environ::Get().GetRpcProtocol();
     std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
+    if (rpc_protocol == "rdma") {
         protocol = "rdma";
     }
     LOG(INFO)
@@ -613,8 +614,8 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        std::string rpc_protocol = mooncake::Environ::Get().GetRpcProtocol();
+        if (rpc_protocol == "rdma") {
             server.init_ibv();
         }
         mooncake::WrappedMasterService wrapped_master_service(

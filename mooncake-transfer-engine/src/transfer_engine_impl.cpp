@@ -27,6 +27,7 @@
 #include <sstream>
 #endif
 
+#include "environ.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 #include "transport/barex_transport/barex_transport.h"
@@ -107,7 +108,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     local_server_name_ = local_server_name;
 #endif
 
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
+    auto& env = Environ::Get();
+    if (env.GetLegacyRpcPortBinding() ||
         metadata_conn_string == P2PHANDSHAKE) {
         rpc_binding_method = "legacy/P2P";
         desc.ip_or_host_name = host_name;
@@ -146,9 +148,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     } else {
         rpc_binding_method = "new RPC mapping";
         (void)(ip_or_host_name);
-        auto* ip_address = getenv("MC_TCP_BIND_ADDRESS");
-        if (ip_address)
-            desc.ip_or_host_name = ip_address;
+        std::string tcp_bind_address = env.GetTcpBindAddress();
+        if (!tcp_bind_address.empty())
+            desc.ip_or_host_name = tcp_bind_address;
         else {
             auto ip_list = findLocalIpAddresses();
             if (ip_list.empty()) {
@@ -213,7 +215,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
-    if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
+    if (!env.GetCxlDevPath().empty()) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
         if (!cxl_transport) {
@@ -225,14 +227,14 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
     if (auto_discover_) {
         LOG(INFO) << "Auto-discovering topology...";
-        if (getenv("MC_CUSTOM_TOPO_JSON")) {
-            auto path = getenv("MC_CUSTOM_TOPO_JSON");
-            LOG(INFO) << "Using custom topology from: " << path;
-            auto topo_json = loadTopologyJsonFile(path);
+        std::string custom_topo_json = env.GetCustomTopoJson();
+        if (!custom_topo_json.empty()) {
+            LOG(INFO) << "Using custom topology from: " << custom_topo_json;
+            auto topo_json = loadTopologyJsonFile(custom_topo_json);
             if (!topo_json.empty()) {
                 local_topology_->parse(topo_json);
             } else {
-                LOG(WARNING) << "Failed to load custom topology from " << path
+                LOG(WARNING) << "Failed to load custom topology from " << custom_topo_json
                              << ", falling back to auto-detect.";
                 local_topology_->discover(filter_);
             }
@@ -251,8 +253,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
-        const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
-        const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+        bool force_mnnvl = env.GetForceMnnvl();
+        bool intranode_nvlink = env.GetIntranodeNvlink();
         if (force_mnnvl || local_topology_->getHcaList().empty()) {
             Transport* t =
                 multi_transports_->installTransport("nvlink", nullptr);
@@ -262,7 +264,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using cross-node NVLink transport "
                       << "(MC_FORCE_MNNVL or no HCA detected)";
-        } else if (intra_env) {
+        } else if (intranode_nvlink) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
@@ -283,8 +285,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
 #else
         if (local_topology_->getHcaList().size() > 0 &&
-                !getenv("MC_FORCE_TCP") ||
-            getenv("MC_FORCE_HCA")) {
+                !env.GetForceTcp() ||
+            env.GetForceHca()) {
             // only install RDMA transport when there is at least one HCA
             Transport* rdma_transport = nullptr;
             if (use_barex_) {
@@ -559,34 +561,21 @@ static std::string toLower(const std::string& s) {
 }
 
 void TransferEngineImpl::InitializeMetricsConfig() {
+    auto& env = Environ::Get();
     // Check if metrics reporting is enabled via environment variable
-    const char* metric_env = getenv("MC_TE_METRIC");
-    if (metric_env) {
+    std::string metric_env = env.GetTeMetric();
+    if (!metric_env.empty()) {
         std::string value = toLower(metric_env);
         metrics_enabled_ = (value == "1" || value == "true" || value == "yes" ||
                             value == "on");
     }
 
     // Check for custom reporting interval
-    const char* interval_env = getenv("MC_TE_METRIC_INTERVAL_SECONDS");
-    if (interval_env) {
-        try {
-            int interval = std::stoi(interval_env);
-            if (interval > 0) {
-                metrics_interval_seconds_ = static_cast<uint64_t>(interval);
-                LOG(INFO) << "Metrics reporting interval set to "
-                          << metrics_interval_seconds_ << " seconds";
-            } else {
-                LOG(WARNING)
-                    << "Invalid MC_TE_METRIC_INTERVAL_SECONDS value: "
-                    << interval_env << ", must be positive. Using default: "
-                    << metrics_interval_seconds_;
-            }
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse MC_TE_METRIC_INTERVAL_SECONDS: "
-                         << interval_env
-                         << ", using default: " << metrics_interval_seconds_;
-        }
+    int interval = env.GetTeMetricIntervalSeconds();
+    if (interval > 0) {
+        metrics_interval_seconds_ = static_cast<uint64_t>(interval);
+        LOG(INFO) << "Metrics reporting interval set to "
+                  << metrics_interval_seconds_ << " seconds";
     }
 }
 

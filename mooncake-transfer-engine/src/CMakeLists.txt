@@ -55,6 +55,7 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
+         mooncake_common
          yalantinglibs::yalantinglibs)
 
 if(USE_BAREX)

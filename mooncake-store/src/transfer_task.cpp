@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include "environ.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -410,22 +411,21 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
-    const char* env_value = std::getenv("MC_STORE_MEMCPY");
-    if (env_value == nullptr) {
+    std::string env_value = Environ::Get().GetStoreMemcpy();
+    if (env_value.empty()) {
         memcpy_enabled_ = false;  // Default: disabled
     } else {
-        std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
-        std::transform(env_str.begin(), env_str.end(), env_str.begin(),
+        std::transform(env_value.begin(), env_value.end(), env_value.begin(),
                        ::tolower);
-        if (env_str == "false" || env_str == "0" || env_str == "no" ||
-            env_str == "off") {
+        if (env_value == "false" || env_value == "0" || env_value == "no" ||
+            env_value == "off") {
             memcpy_enabled_ = false;
-        } else if (env_str == "true" || env_str == "1" || env_str == "yes" ||
-                   env_str == "on") {
+        } else if (env_value == "true" || env_value == "1" || env_value == "yes" ||
+                   env_value == "on") {
             memcpy_enabled_ = true;
         } else {
-            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
+            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_value
                          << ", defaulting to enabled";
             memcpy_enabled_ = true;
         }

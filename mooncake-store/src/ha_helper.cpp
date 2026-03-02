@@ -1,4 +1,5 @@
 #include "ha_helper.h"
+#include "environ.h"
 #include "etcd_helper.h"
 #include "rpc_service.h"
 
@@ -6,8 +7,8 @@ namespace mooncake {
 
 MasterViewHelper::MasterViewHelper() {
     std::string cluster_id;
-    const char* cluster_id_env = std::getenv("MC_STORE_CLUSTER_ID");
-    if (cluster_id_env != nullptr && strlen(cluster_id_env) > 0) {
+    std::string cluster_id_env = Environ::Get().GetStoreClusterId();
+    if (!cluster_id_env.empty()) {
         cluster_id = cluster_id_env;
     } else {
         cluster_id = "mooncake";
