@@ -29,6 +29,7 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "transport/ascend_transport/ubshmem_transport/stream_pool.h"
 
 namespace mooncake {
 
@@ -52,6 +53,9 @@ class UBShmemTransport : public Transport {
     static void *allocatePinnedLocalMemory(size_t length);
 
     static void freePinnedLocalMemory(void *addr);
+
+   private:
+    void submitSlices(std::vector<Slice *> &slice_list);
 
    protected:
     int install(std::string &local_server_name,
@@ -82,9 +86,11 @@ class UBShmemTransport : public Transport {
         char *key;
     };
 
-    // Helper function to process a single transfer request
-    Status processTransferRequest(const TransferRequest &request,
-                                  TransferTask &task);
+    void workerThread();
+
+    void initializeThreadPool();
+
+    void stopThreadPool();
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
@@ -92,7 +98,22 @@ class UBShmemTransport : public Transport {
     bool use_fabric_mem_{true};
 
     std::mutex register_mutex_;
-    aclrtStream stream_{};
+    std::unique_ptr<StreamPool> stream_pool_;
+
+    bool running_{false};
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> task_queue_;
+    std::mutex task_queue_mutex_;
+    std::condition_variable task_queue_cv_;
+
+    int num_streams_per_transfer_;  // Number of streams per transfer (default:
+                                    // 4)
+    size_t thread_pool_size_;       // Thread pool size (default: 8)
+    uint64_t stream_pool_timeout_ms_;  // Get stream timeout in milliseconds
+                                       // (default: 3000)
+
+    std::shared_ptr<TransferMetadata> metadata_;
+    std::string local_server_name_;
 };
 
 }  // namespace mooncake
