@@ -178,7 +178,7 @@ The simplest way to use Mooncake Transfer Engine is using `pip`:
 
 **For CUDA-enabled systems:**
 
-- CUDA <= 12.9
+- CUDA < 13.0
 ```bash
 pip install mooncake-transfer-engine
 ```
