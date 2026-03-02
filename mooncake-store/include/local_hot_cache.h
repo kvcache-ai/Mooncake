@@ -134,10 +134,6 @@ class LocalHotCache {
     size_t GetBlockOffset(const void* addr) const;
 
    private:
-    // Touch LRU using iterator (avoids duplicate lookup)
-    void touchLRU(std::unordered_map<
-                  std::string, std::list<HotMemBlock*>::iterator>::iterator it);
-
     // Drain deferred LRU touches: splice accessed blocks to front
     void drainDeferredTouches();
 

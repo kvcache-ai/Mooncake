@@ -204,15 +204,6 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
     return victim;
 }
 
-void LocalHotCache::touchLRU(
-    std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator
-        it) {
-    HotMemBlock* blk = *(it->second);
-    lru_queue_.erase(it->second);
-    lru_queue_.push_front(blk);
-    it->second = lru_queue_.begin();
-}
-
 void LocalHotCache::drainDeferredTouches() {
     // Caller must hold exclusive lock on lru_mutex_.
     // Iterate the LRU list and splice any block with accessed=true to front.
