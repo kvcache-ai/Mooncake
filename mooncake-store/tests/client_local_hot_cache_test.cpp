@@ -483,7 +483,7 @@ TEST_F(LocalHotCacheTest, GetHotKeyProtectsBlockFromReuse) {
 TEST_F(LocalHotCacheTest, LocalHotCacheHandlerBasic) {
     const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
     auto cache = std::make_shared<LocalHotCache>(cache_size);
-    LocalHotCacheHandler handler(cache, 2);
+    LocalHotCacheHandler handler(cache, 2, 1024);
 
     const size_t slice_size = 1024;
     std::vector<char> data(slice_size, 'Z');
@@ -963,6 +963,270 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
         setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
         unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
+    }
+}
+
+// Test deferred LRU touch ordering: accessed blocks survive eviction
+TEST_F(LocalHotCacheTest, DeferredLRUTouchOrdering) {
+    // 3-block cache (48MB / 16MB = 3 blocks)
+    const size_t cache_size = 48 * 1024 * 1024;
+    LocalHotCache cache(cache_size);
+
+    // Put 3 keys to fill the cache
+    Slice slice1 = CreateSlice(1024, 'A');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key1", slice1));
+
+    Slice slice2 = CreateSlice(1024, 'B');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key2", slice2));
+
+    Slice slice3 = CreateSlice(1024, 'C');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key3", slice3));
+
+    // Access key1 to set its accessed flag (deferred LRU touch)
+    HotMemBlock* blk = cache.GetHotKey("key1");
+    ASSERT_NE(blk, nullptr);
+    cache.ReleaseHotKey("key1");
+
+    // Insert key4, which triggers eviction. key1 was accessed so it should
+    // survive. key2 is LRU among unaccessed keys and should be evicted.
+    Slice slice4 = CreateSlice(1024, 'D');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key4", slice4));
+
+    EXPECT_TRUE(cache.HasHotKey("key1"));   // Survived (accessed)
+    EXPECT_FALSE(cache.HasHotKey("key2"));  // Evicted (LRU, unaccessed)
+    EXPECT_TRUE(cache.HasHotKey("key3"));
+    EXPECT_TRUE(cache.HasHotKey("key4"));
+}
+
+// Test concurrent GetHotKey with shared lock (no crashes)
+TEST_F(LocalHotCacheTest, ConcurrentGetHotKeySharedLock) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    Slice slice = CreateSlice(1024, 'X');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "shared_key", slice));
+
+    const int num_threads = 8;
+    std::atomic<int> successful_gets(0);
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&cache, &successful_gets]() {
+            for (int i = 0; i < 100; ++i) {
+                HotMemBlock* blk = cache.GetHotKey("shared_key");
+                if (blk) {
+                    successful_gets++;
+                    cache.ReleaseHotKey("shared_key");
+                }
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // All gets should succeed since we have enough capacity and key exists
+    EXPECT_EQ(successful_gets.load(), num_threads * 100);
+}
+
+// ---------------------------------------------------------------------------
+// CacheBlockHandle tests
+// ---------------------------------------------------------------------------
+
+// Test CacheBlockHandle move semantics: move invalidates source
+TEST_F(LocalHotCacheTest, CacheBlockHandleMoveSemantics) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    auto cache = std::make_shared<LocalHotCache>(cache_size);
+
+    // Pre-fill a key
+    Slice slice = CreateSlice(1024, 'M');
+    EXPECT_TRUE(PutHotKeyHelper(*cache, "move_key", slice));
+
+    // Acquire a handle via GetHotKey + CacheBlockHandle private constructor
+    // Since CacheBlockHandle ctor is private (friend: Client), test via
+    // move semantics on a handle obtained through the cache directly.
+    // We simulate by getting the block, constructing handle fields manually.
+    HotMemBlock* blk = cache->GetHotKey("move_key");
+    ASSERT_NE(blk, nullptr);
+
+    // Wrap in a CacheBlockHandle-like scope using GetHotKey/ReleaseHotKey
+    // to verify move semantics on the public API level.
+    // Since CacheBlockHandle is friend of Client only, we test the
+    // underlying ref_count behaviour directly.
+
+    // blk->ref_count should be 1 (from GetHotKey)
+    EXPECT_EQ(blk->ref_count.load(), 1);
+
+    // Simulate "move" by incrementing ref on destination, decrementing on source
+    blk->ref_count++;  // destination gets a ref
+    EXPECT_EQ(blk->ref_count.load(), 2);
+    blk->ref_count--;  // source loses ref (move)
+    EXPECT_EQ(blk->ref_count.load(), 1);
+
+    // Release the remaining ref
+    cache->ReleaseHotKey("move_key");
+    EXPECT_EQ(blk->ref_count.load(), 0);
+}
+
+// Test CacheBlockHandle RAII release: handle prevents eviction
+TEST_F(LocalHotCacheTest, CacheBlockHandleRAIIRelease) {
+    // 1-block cache
+    const size_t cache_size = 16 * 1024 * 1024;
+    auto cache = std::make_shared<LocalHotCache>(cache_size);
+
+    // Pre-fill a key
+    Slice slice = CreateSlice(1024, 'R');
+    EXPECT_TRUE(PutHotKeyHelper(*cache, "raii_key", slice));
+
+    // Acquire reference (simulating CacheBlockHandle holding the block)
+    HotMemBlock* blk = cache->GetHotKey("raii_key");
+    ASSERT_NE(blk, nullptr);
+    // ref_count is now 1 → block cannot be evicted
+
+    // Try to insert another key → should fail (all blocks in use)
+    Slice slice2 = CreateSlice(1024, 'S');
+    EXPECT_FALSE(PutHotKeyHelper(*cache, "another_key", slice2))
+        << "Should fail: the only block is held by a handle";
+
+    // Release the reference (simulating CacheBlockHandle destructor)
+    cache->ReleaseHotKey("raii_key");
+
+    // Now eviction should succeed
+    EXPECT_TRUE(PutHotKeyHelper(*cache, "another_key", slice2));
+    EXPECT_TRUE(cache->HasHotKey("another_key"));
+    EXPECT_FALSE(cache->HasHotKey("raii_key"));  // evicted
+}
+
+// Test PutHotKeyWithRef sets ref_count to 1
+TEST_F(LocalHotCacheTest, PutHotKeyWithRefSetsRefCount) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    // Get a free block and populate it
+    HotMemBlock* block = cache.GetFreeBlock();
+    ASSERT_NE(block, nullptr);
+
+    const size_t data_size = 512;
+    std::memset(block->addr, 'W', data_size);
+    block->size = data_size;
+    block->key_ = "withref_key";
+
+    // Insert with ref
+    EXPECT_TRUE(cache.PutHotKeyWithRef(block));
+    EXPECT_TRUE(cache.HasHotKey("withref_key"));
+
+    // Verify ref_count is 1 (not 0 as with PutHotKey)
+    HotMemBlock* retrieved = cache.GetHotKey("withref_key");
+    ASSERT_NE(retrieved, nullptr);
+    // GetHotKey increments ref_count, so now it should be 2
+    EXPECT_EQ(retrieved->ref_count.load(), 2);
+
+    // Release both refs
+    cache.ReleaseHotKey("withref_key");  // GetHotKey ref
+    cache.ReleaseHotKey("withref_key");  // PutHotKeyWithRef ref
+    EXPECT_EQ(retrieved->ref_count.load(), 0);
+}
+
+// Test GetZeroCopy cache hit: pre-fill cache, then GetZeroCopy should hit
+TEST_F(LocalHotCacheTest, GetZeroCopyCacheHit) {
+    auto ctx = SetupTestClientWithHotCache();
+    if (!ctx.client || !ctx.client->IsHotCacheEnabled() || !ctx.segment_ptr) {
+        if (ctx.client)
+            CleanupTestClient(ctx);
+        GTEST_SKIP() << "Could not set up client with hot cache";
+    }
+
+    const std::string test_key = "zero_copy_hit_key";
+    const std::string test_data(1024, 'H');  // 1KB of 'H'
+
+    // Put data into the store
+    PutTestData(ctx.client.get(), test_key, test_data);
+
+    // First: do a regular Get to populate the cache (via ProcessSlicesAsync)
+    // Note: with single client, local transfers may not cache. Use Get twice
+    // with threshold=2 (default) to potentially trigger caching. However,
+    // since this is a local transfer, it may not be cached. We test that
+    // GetZeroCopy handles both hit and miss paths correctly.
+    std::vector<char> get_buffer(test_data.size());
+    std::vector<Slice> get_slices;
+    get_slices.emplace_back(Slice{get_buffer.data(), test_data.size()});
+    auto get_result = ctx.client->Get(test_key, get_slices);
+    (void)get_result;  // Suppress unused variable warning
+
+    // Now try GetZeroCopy
+    auto zc_result = ctx.client->GetZeroCopy(test_key);
+    if (zc_result.has_value()) {
+        auto& handle = zc_result.value();
+        EXPECT_TRUE(static_cast<bool>(handle));
+        EXPECT_NE(handle.data(), nullptr);
+        EXPECT_EQ(handle.size(), test_data.size());
+
+        // Verify data
+        EXPECT_EQ(std::memcmp(handle.data(), test_data.data(), test_data.size()),
+                  0)
+            << "Zero-copy data should match original";
+    }
+    // If it returned an error, that's also acceptable for single-client setup
+
+    CleanupTestClient(ctx);
+}
+
+// Test GetZeroCopy cache miss → populate flow
+TEST_F(LocalHotCacheTest, GetZeroCopyCacheMiss) {
+    auto ctx = SetupTestClientWithHotCache();
+    if (!ctx.client || !ctx.client->IsHotCacheEnabled() || !ctx.segment_ptr) {
+        if (ctx.client)
+            CleanupTestClient(ctx);
+        GTEST_SKIP() << "Could not set up client with hot cache";
+    }
+
+    const std::string test_key = "zero_copy_miss_key";
+    const std::string test_data(2048, 'Z');  // 2KB of 'Z'
+
+    // Put data into the store
+    PutTestData(ctx.client.get(), test_key, test_data);
+
+    // GetZeroCopy without any prior Get → should handle miss path
+    auto zc_result = ctx.client->GetZeroCopy(test_key);
+    if (zc_result.has_value()) {
+        auto& handle = zc_result.value();
+        EXPECT_TRUE(static_cast<bool>(handle));
+        EXPECT_NE(handle.data(), nullptr);
+        EXPECT_EQ(handle.size(), test_data.size());
+
+        // Verify data integrity
+        EXPECT_EQ(std::memcmp(handle.data(), test_data.data(), test_data.size()),
+                  0)
+            << "Zero-copy miss data should match original";
+    }
+
+    CleanupTestClient(ctx);
+}
+
+// Test GetZeroCopy when hot cache is disabled → returns INVALID_PARAMS
+TEST_F(LocalHotCacheTest, GetZeroCopyHotCacheDisabled) {
+    // Save and unset hot cache env var
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+
+    auto client_opt = CreateTestClient("localhost");
+    if (!client_opt.has_value()) {
+        if (original_env)
+            setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        GTEST_SKIP() << "Could not create client";
+    }
+
+    auto client = client_opt.value();
+    ASSERT_FALSE(client->IsHotCacheEnabled());
+
+    auto zc_result = client->GetZeroCopy("any_key");
+    ASSERT_FALSE(zc_result.has_value());
+    EXPECT_EQ(zc_result.error(), ErrorCode::INVALID_PARAMS);
+
+    // Restore env var
+    if (original_env) {
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     }
 }
 

@@ -12,6 +12,64 @@ namespace {
 constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024;  // 16MB default block
 }
 
+// ---------------------------------------------------------------------------
+// CacheBlockHandle
+// ---------------------------------------------------------------------------
+
+CacheBlockHandle::CacheBlockHandle() = default;
+
+CacheBlockHandle::CacheBlockHandle(std::shared_ptr<LocalHotCache> cache,
+                                   std::string key, HotMemBlock* block,
+                                   size_t object_size)
+    : cache_(std::move(cache)),
+      key_(std::move(key)),
+      block_(block),
+      object_size_(object_size) {}
+
+CacheBlockHandle::CacheBlockHandle(CacheBlockHandle&& other) noexcept
+    : cache_(std::move(other.cache_)),
+      key_(std::move(other.key_)),
+      block_(other.block_),
+      object_size_(other.object_size_) {
+    other.block_ = nullptr;
+    other.object_size_ = 0;
+}
+
+CacheBlockHandle& CacheBlockHandle::operator=(CacheBlockHandle&& other) noexcept {
+    if (this != &other) {
+        release();
+        cache_ = std::move(other.cache_);
+        key_ = std::move(other.key_);
+        block_ = other.block_;
+        object_size_ = other.object_size_;
+        other.block_ = nullptr;
+        other.object_size_ = 0;
+    }
+    return *this;
+}
+
+CacheBlockHandle::~CacheBlockHandle() { release(); }
+
+const void* CacheBlockHandle::data() const {
+    return block_ ? block_->addr : nullptr;
+}
+
+size_t CacheBlockHandle::size() const { return object_size_; }
+
+CacheBlockHandle::operator bool() const { return block_ != nullptr; }
+
+void CacheBlockHandle::release() {
+    if (block_ && cache_) {
+        cache_->ReleaseHotKey(key_);
+    }
+    block_ = nullptr;
+    object_size_ = 0;
+}
+
+// ---------------------------------------------------------------------------
+// LocalHotCache
+// ---------------------------------------------------------------------------
+
 LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes,
                              bool use_shm)
     : block_size_((block_size_bytes > 0) ? block_size_bytes
@@ -72,6 +130,9 @@ LocalHotCache::~LocalHotCache() {
 bool LocalHotCache::PutHotKey(HotMemBlock* block) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
 
+    // Drain deferred LRU touches
+    drainDeferredTouches();
+
     if (!block) return false;
 
     // Handle return-to-lru tail case (empty key or cancelled task)
@@ -100,13 +161,42 @@ bool LocalHotCache::PutHotKey(HotMemBlock* block) {
     return true;
 }
 
+bool LocalHotCache::PutHotKeyWithRef(HotMemBlock* block) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    drainDeferredTouches();
+
+    if (!block) return false;
+
+    if (block->key_.empty()) {
+        block->ref_count = 0;
+        lru_queue_.push_back(block);
+        return false;
+    }
+
+    const std::string& key = block->key_;
+
+    if (key_to_lru_it_.find(key) != key_to_lru_it_.end()) {
+        block->key_.clear();
+        block->ref_count = 0;
+        lru_queue_.push_back(block);
+        return false;
+    }
+
+    // Same as PutHotKey but ref_count = 1 so caller holds a reference
+    block->ref_count = 1;
+    lru_queue_.push_front(block);
+    key_to_lru_it_[key] = lru_queue_.begin();
+    return true;
+}
+
 bool LocalHotCache::HasHotKey(const std::string& key) const {
     std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     return key_to_lru_it_.find(key) != key_to_lru_it_.end();
 }
 
 HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return nullptr;
@@ -120,14 +210,14 @@ HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
     // Mark block as in use to prevent it from being reused during memcpy
     blk->ref_count++;
 
-    // update lru queue
-    touchLRU(it);
+    // Defer LRU reordering via atomic flag (drained before eviction)
+    blk->accessed.store(true, std::memory_order_relaxed);
 
     return blk;
 }
 
 void LocalHotCache::ReleaseHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return;
@@ -139,17 +229,23 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
 }
 
 bool LocalHotCache::TouchHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return false;
     }
-    touchLRU(it);
+    HotMemBlock* blk = *(it->second);
+    if (blk) {
+        blk->accessed.store(true, std::memory_order_relaxed);
+    }
     return true;
 }
 
 HotMemBlock* LocalHotCache::GetFreeBlock() {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    // Drain deferred LRU touches before scanning for victims
+    drainDeferredTouches();
 
     if (lru_queue_.empty()) {
         return nullptr;
@@ -198,6 +294,31 @@ void LocalHotCache::touchLRU(
     lru_queue_.erase(it->second);
     lru_queue_.push_front(blk);
     it->second = lru_queue_.begin();
+}
+
+void LocalHotCache::drainDeferredTouches() {
+    // Caller must hold exclusive lock on lru_mutex_.
+    // Iterate the LRU list and splice any block with accessed=true to front.
+    for (auto it = lru_queue_.begin(); it != lru_queue_.end(); ) {
+        HotMemBlock* blk = *it;
+        if (blk && blk->accessed.exchange(false, std::memory_order_relaxed)) {
+            if (it != lru_queue_.begin()) {
+                auto cur = it++;
+                lru_queue_.splice(lru_queue_.begin(), lru_queue_, cur);
+                // Update the map iterator
+                if (!blk->key_.empty()) {
+                    auto map_it = key_to_lru_it_.find(blk->key_);
+                    if (map_it != key_to_lru_it_.end()) {
+                        map_it->second = lru_queue_.begin();
+                    }
+                }
+            } else {
+                ++it;
+            }
+        } else {
+            ++it;
+        }
+    }
 }
 
 size_t LocalHotCache::GetCacheSize() const {
