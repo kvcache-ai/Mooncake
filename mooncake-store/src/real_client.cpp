@@ -2240,7 +2240,15 @@ RealClient::batch_get_into_multi_buffers_internal(
 
 tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-    ClientStatus client_status = ClientStatus::OK;
+
+    if (!client_) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=client_not_ready";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    ClientStatus client_status = client_->is_ping_healthy()
+                                     ? ClientStatus::OK
+                                     : ClientStatus::UNDEFINED;
 
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!dummy_client_ping_queue_.push(pod_client_id)) {

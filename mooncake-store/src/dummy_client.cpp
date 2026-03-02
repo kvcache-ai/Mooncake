@@ -30,7 +30,7 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
                       std::remove_reference_t<decltype(ServiceMethod)>,
                       std::remove_reference_t<
                           decltype(&RealClient::service_ready_internal)>>) {
-        if (!connected_) {
+        if (!connected_.load()) {
             LOG(ERROR) << "Dummy Client not connected";
             return tl::make_unexpected(ErrorCode::RPC_FAIL);
         }
@@ -61,7 +61,7 @@ template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
-    if (!connected_) {
+    if (!connected_.load()) {
         LOG(ERROR) << "Dummy Client not connected";
         std::vector<tl::expected<ResultType, ErrorCode>> error_results;
         error_results.reserve(input_size);
@@ -134,7 +134,7 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
         return result.error();
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
-    connected_ = true;
+    connected_.store(true);
     return ErrorCode::OK;
 }
 
@@ -284,6 +284,8 @@ int DummyClient::tearDownAll() {
             ping_thread_.join();
         }
     }
+    connected_.store(false);
+    last_ping_healthy_.store(false);
     return 0;
 }
 
@@ -702,7 +704,7 @@ void DummyClient::ping_thread_main() {
                      << max_ping_fail_count;
 
         if (ping_fail_count >= max_ping_fail_count) {
-            connected_ = false;
+            connected_.store(false);
             LOG(ERROR) << "RealClient lost, entering reconnection loop...";
 
             // Reconnection Loop
@@ -732,10 +734,11 @@ void DummyClient::ping_thread_main() {
                     // if RPC is responsive
                     auto check_rpc =
                         invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
-                    if (check_rpc.has_value()) {
+                    if (check_rpc.has_value() &&
+                        check_rpc.value().client_status == ClientStatus::OK) {
                         LOG(INFO) << "RPC connection restored";
                         ping_fail_count = 0;
-                        connected_ = true;
+                        connected_.store(true);
                         break;  // Exit reconnection loop
                     }
                 }
@@ -753,8 +756,9 @@ void DummyClient::ping_thread_main() {
 }
 
 int DummyClient::health_check() {
-    if (!connected_) return HC_NOT_INITIALIZED;
+    if (!ping_running_.load()) return HC_NOT_INITIALIZED;
     if (!last_ping_healthy_.load()) return HC_MASTER_UNREACHABLE;
+    if (!connected_.load()) return HC_NOT_INITIALIZED;
     return HC_HEALTHY;
 }
 

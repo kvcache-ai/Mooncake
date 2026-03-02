@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
@@ -215,7 +216,7 @@ class DummyClient : public PyClient {
     std::atomic<bool> ping_running_{false};
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
-    volatile bool connected_ = false;
+    std::atomic<bool> connected_{false};
 };
 
 }  // namespace mooncake
