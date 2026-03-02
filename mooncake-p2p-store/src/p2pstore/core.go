@@ -98,6 +98,14 @@ func (store *P2PStore) Close() error {
 	return retErr
 }
 
+// GetLocalServerName returns the local server name (ip:port) that this
+// P2PStore instance is registered under. In P2P handshake mode the RPC
+// port is allocated dynamically, so callers must use this method to
+// discover the actual address after initialization.
+func (store *P2PStore) GetLocalServerName() (string, error) {
+	return store.transfer.GetLocalIpAndPort()
+}
+
 type Buffer struct {
 	addr uintptr
 	size uint64
