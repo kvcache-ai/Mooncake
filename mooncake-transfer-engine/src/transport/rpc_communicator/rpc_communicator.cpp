@@ -161,41 +161,61 @@ void RpcCommunicator::stopServer() {
 
 int RpcCommunicator::sendData(const std::string& target_address,
                               const void* data, size_t data_size) {
-    auto result = async_simple::coro::syncAwait(
-        sendDataAsync(target_address, data, data_size));
-    return result.code;
+    try {
+        auto msg_buf = std::make_shared<std::vector<char>>(
+            static_cast<const char*>(data),
+            static_cast<const char*>(data) + data_size);
+        const size_t message_size = msg_buf->size();
+
+        auto op = [msg_buf = std::move(msg_buf), message_size](
+                      coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<std::string> {
+            std::string request_body(msg_buf->data(), message_size);
+            auto result =
+                co_await client.call<&RpcCommunicator::handleDataTransfer>(
+                    std::move(request_body));
+            if (!result.has_value()) {
+                LOG(ERROR) << "RPC call failed: " << result.error().msg;
+                co_return std::string();
+            }
+
+            std::string response;
+            response.assign(result.value().data(), result.value().size());
+            co_return response;
+        };
+
+        auto rpc_result = async_simple::coro::syncAwait(
+            client_pools_->send_request(target_address, std::move(op)));
+        return rpc_result.has_value() ? 0 : -1;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "sendData failed: " << e.what();
+        return -1;
+    }
 }
 
 async_simple::coro::Lazy<RpcResult> RpcCommunicator::sendDataAsync(
     const std::string& target_address, const void* data, size_t data_size) {
-    std::string_view data_view(static_cast<const char*>(data), data_size);
-
-    // For large data, use attachment to avoid copying
-    const size_t ATTACHMENT_THRESHOLD = 1024;  // Use attachment for data > 1KB
+    auto msg_buf = std::make_shared<std::vector<char>>(
+        static_cast<const char*>(data),
+        static_cast<const char*>(data) + data_size);
+    const size_t message_size = msg_buf->size();
 
     auto rpc_result = co_await client_pools_->send_request(
         target_address,
-        [data_view, data_size](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<void> {
-            if (data_size > ATTACHMENT_THRESHOLD) {
-                // Use attachment for large data - zero copy
-                client.set_req_attachment(data_view);
-                // Send empty data parameter, actual data in attachment
-                auto result =
-                    co_await client.call<&RpcCommunicator::handleDataTransfer>(
-                        std::string_view{});
-                if (!result.has_value()) {
-                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                }
-            } else {
-                // Use regular parameter for small data
-                auto result =
-                    co_await client.call<&RpcCommunicator::handleDataTransfer>(
-                        data_view);
-                if (!result.has_value()) {
-                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                }
+        [msg_buf = std::move(msg_buf), message_size](coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<std::string> {
+            std::string request_body(msg_buf->data(), message_size);
+            auto result =
+                co_await client.call<&RpcCommunicator::handleDataTransfer>(
+                    std::move(request_body));
+            if (!result.has_value()) {
+                LOG(ERROR) << "RPC call failed: " << result.error().msg;
+                co_return std::string();
             }
+
+            std::string response;
+            response.assign(result.value().data(), result.value().size());
+            co_return response;
         });
 
     if (!rpc_result.has_value()) {
@@ -326,41 +346,21 @@ async_simple::coro::Lazy<std::string> RpcCommunicator::receiveDataAsync(
     co_return std::string();
 }  // Data reception is handled via context and attachment in handlers
 
-void RpcCommunicator::handleDataTransfer(coro_rpc::context<void> context,
-                                         std::string_view data) {
-    // Check if there's an attachment for large data
-    auto ctx_info = context.get_context_info();
-    auto attachment = ctx_info->get_request_attachment();
-
+std::string RpcCommunicator::handleDataTransfer(std::string data) {
     LOG(INFO) << "Handling data transfer - Data: " << data.size()
-              << " bytes, Attachment: " << attachment.size() << " bytes";
+              << " bytes";
     // Call the data receive callback if set
     if (data_receive_callback_) {
         LOG(INFO) << "Calling data receive callback...";
         // Note: coro_rpc context doesn't provide get_remote_endpoint()
         // Using empty string as placeholder - can be enhanced if needed
         std::string_view source_address = "";
-
-        // Use attachment if available (for large data), otherwise use data
-        // parameter
-        if (!attachment.empty()) {
-            // Use attachment data directly without copying - zero copy approach
-            std::string_view attachment_view = attachment;
-            data_receive_callback_(source_address, attachment_view);
-        } else {
-            // For small data, use the regular data parameter
-            data_receive_callback_(source_address, data);
-        }
+        data_receive_callback_(source_address, std::string_view(data));
     } else {
         LOG(INFO) << "No data receive callback set!";
     }
 
-    // Echo back the attachment for response (zero-copy)
-    if (!attachment.empty()) {
-        ctx_info->set_response_attachment(std::string_view("ok"));
-    }
-
-    context.response_msg();
+    return "ok";
 }
 
 void RpcCommunicator::handleTensorTransfer(coro_rpc::context<void> context) {

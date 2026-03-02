@@ -61,8 +61,7 @@ class RpcCommunicator {
 
    private:
     // Handler methods for RPC calls
-    void handleDataTransfer(coro_rpc::context<void> context,
-                            std::string_view data);
+    std::string handleDataTransfer(std::string data);
     void handleTensorTransfer(coro_rpc::context<void> context);
     void handleDataTransferWithAttachment(coro_rpc::context<void> context,
                                           std::string_view data);
