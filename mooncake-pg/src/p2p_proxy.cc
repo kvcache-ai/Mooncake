@@ -837,7 +837,9 @@ void P2PDeviceWorker::Start() {
 
 void P2PDeviceWorker::Stop() {
     bool expected_send = true;
+    std::unique_lock<std::mutex> s_lock(send_wakeup_mutex_);
     if (send_worker_running_.compare_exchange_strong(expected_send, false)) {
+        s_lock.unlock();
         send_wakeup_cv_.notify_all();
         if (send_worker_thread_.joinable()) {
             send_worker_thread_.join();
@@ -845,9 +847,11 @@ void P2PDeviceWorker::Stop() {
     }
 
     bool expected_recv = true;
+    std::unique_lock<std::mutex> r_lock(recv_wakeup_mutex_);
     if (recv_worker_running_.compare_exchange_strong(expected_recv, false)) {
+        r_lock.unlock();
+        recv_wakeup_cv_.notify_all();
         if (recv_worker_thread_.joinable()) {
-            recv_wakeup_cv_.notify_all();
             recv_worker_thread_.join();
         }
     }
@@ -859,7 +863,13 @@ void P2PDeviceWorker::registerProxy(const std::shared_ptr<P2PProxy>& proxy) {
         std::lock_guard<std::mutex> lock(proxies_mutex_);
         proxies_.emplace_back(proxy);
     }
-    proxies_dirty_.store(true, std::memory_order_release);
+
+    {
+        std::lock_guard<std::mutex> s_lock(send_wakeup_mutex_);
+        std::lock_guard<std::mutex> r_lock(recv_wakeup_mutex_);
+        proxies_dirty_.store(true, std::memory_order_release);
+    }
+
     send_wakeup_cv_.notify_one();
     recv_wakeup_cv_.notify_one();
 }
@@ -988,11 +998,17 @@ void P2PDeviceWorker::RecvWorkerThread() {
         [](P2PProxy& p) { return p.StepRecv(); });
 }
 
+// Standard practice is to update states shared with condition_variables under
+// the lock, but locking right before the notify should be enough to prevent
+// lost wakeups.
+// (active_send/recv_tasks_ are modified in EnqueueSend/Recv, while the lock is
+//  acquired in WakeUpSend/Recv)
+//
+// Ref: https://stackoverflow.com/a/21439617
 void P2PDeviceWorker::WakeUpSend() {
     std::lock_guard<std::mutex> lock(send_wakeup_mutex_);
     send_wakeup_cv_.notify_one();
 }
-
 void P2PDeviceWorker::WakeUpRecv() {
     std::lock_guard<std::mutex> lock(recv_wakeup_mutex_);
     recv_wakeup_cv_.notify_one();
