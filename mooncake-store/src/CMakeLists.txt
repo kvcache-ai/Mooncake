@@ -106,6 +106,11 @@ add_executable(mooncake_master master.cpp)
 set(MASTER_EXTRA_INCS)
 set(MASTER_EXTRA_LIBS)
 
+# Use jemalloc for better memory management in mooncake_master
+# jemalloc provides:
+# - More aggressive memory return to OS (reduces OOM issues)
+# - Better performance for multi-threaded allocation patterns
+# - Reduced memory fragmentation with std::unordered_map in MetadataShard
 if (STORE_USE_JEMALLOC)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(JEMALLOC REQUIRED jemalloc)
