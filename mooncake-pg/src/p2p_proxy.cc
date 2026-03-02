@@ -48,7 +48,10 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
                     cudaGetErrorString(get_device_error));
         cuda_device_index_ = current_device;
     }
+    AllocateResources();
 }
+
+P2PProxy::~P2PProxy() { ReleaseResources(); }
 
 void P2PProxy::BindMeta(TransferGroupMeta* meta) { meta_ = meta; }
 
@@ -697,6 +700,7 @@ bool P2PProxy::StepSend() {
         lane.pending_send_ops_.pop_front();
         if (op_ctx.total_bytes_ == 0) {
             op_ctx.completed_->store(true, std::memory_order_release);
+            active_send_tasks_.fetch_sub(1, std::memory_order_release);
             did_work = true;
             continue;
         }
@@ -849,7 +853,7 @@ void P2PDeviceWorker::Stop() {
     }
 }
 
-void P2PDeviceWorker::registerProxy(P2PProxy* proxy) {
+void P2PDeviceWorker::registerProxy(const std::shared_ptr<P2PProxy>& proxy) {
     proxy->SetDeviceWorker(this);
     {
         std::lock_guard<std::mutex> lock(proxies_mutex_);
@@ -860,7 +864,7 @@ void P2PDeviceWorker::registerProxy(P2PProxy* proxy) {
     recv_wakeup_cv_.notify_one();
 }
 
-void P2PDeviceWorker::removeProxy(P2PProxy* proxy) {
+void P2PDeviceWorker::removeProxy(const std::shared_ptr<P2PProxy>& proxy) {
     {
         std::lock_guard<std::mutex> lock(proxies_mutex_);
         proxies_.erase(std::remove(proxies_.begin(), proxies_.end(), proxy),
@@ -875,7 +879,8 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
                       std::atomic<bool>& worker_running,
                       std::atomic<bool>& proxies_dirty,
                       std::mutex& proxies_mutex,
-                      std::vector<P2PProxy*>& proxies, std::mutex& wakeup_mutex,
+                      std::vector<std::shared_ptr<P2PProxy>>& proxies,
+                      std::mutex& wakeup_mutex,
                       std::condition_variable& wakeup_cv, HasWorkFn has_work,
                       StepWorkFn step_work) {
     SetCudaDeviceIfNeeded(is_cpu, cuda_device_index,
@@ -884,24 +889,60 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
     // A thread-local cache for proxies to avoid locking too frequently.
     // This is efficient because proxy registration/removal is rare after
     // backend initialization.
-    std::vector<P2PProxy*> local_proxies;
+    std::vector<std::shared_ptr<P2PProxy>> local_proxies;
 
-    while (worker_running.load(std::memory_order_relaxed)) {
+    // Some proxies might be removed (caused by backend shutdown) before
+    // all its transfers completed. We must keep them explicitly to avoid its
+    // resources released, and step their transfers till completion.
+    std::vector<std::shared_ptr<P2PProxy>> zombie_proxies;
+
+    while (true) {
         // Refresh the local cache if it's marked as dirty.
         if (proxies_dirty.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(proxies_mutex);
-            local_proxies = proxies;
+            std::vector<std::shared_ptr<P2PProxy>> new_proxies;
+            {
+                std::lock_guard<std::mutex> lock(proxies_mutex);
+                new_proxies = proxies;
+            }
             proxies_dirty.store(false, std::memory_order_release);
+
+            // Find zombie proxies.
+            for (const auto& old_p : local_proxies) {
+                auto it =
+                    std::find(new_proxies.begin(), new_proxies.end(), old_p);
+                if (it == new_proxies.end() && has_work(*old_p)) {
+                    zombie_proxies.push_back(old_p);
+                }
+            }
+
+            local_proxies = std::move(new_proxies);
         }
 
         bool did_work = false;
         bool has_active_work = false;
 
-        for (auto* proxy : local_proxies) {
+        for (const auto& proxy : local_proxies) {
             if (has_work(*proxy)) {
                 did_work |= step_work(*proxy);
                 has_active_work = true;
             }
+        }
+
+        for (auto it = zombie_proxies.begin(); it != zombie_proxies.end();) {
+            auto& proxy = *it;
+            if (has_work(*proxy)) {
+                did_work |= step_work(*proxy);
+                has_active_work = true;
+                ++it;
+            } else {
+                // Now all transfers in this proxy is completed, remove it.
+                it = zombie_proxies.erase(it);
+            }
+        }
+
+        bool running = worker_running.load(std::memory_order_relaxed);
+        if (!running && !has_active_work) {
+            break;
         }
 
         // If we did work this iteration, just continue.
@@ -919,7 +960,10 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
 
                 if (proxies_dirty.load(std::memory_order_acquire)) return true;
 
-                for (auto* proxy : local_proxies) {
+                for (const auto& proxy : local_proxies) {
+                    if (has_work(*proxy)) return true;
+                }
+                for (const auto& proxy : zombie_proxies) {
                     if (has_work(*proxy)) return true;
                 }
                 return false;
@@ -944,9 +988,15 @@ void P2PDeviceWorker::RecvWorkerThread() {
         [](P2PProxy& p) { return p.StepRecv(); });
 }
 
-void P2PDeviceWorker::WakeUpSend() { send_wakeup_cv_.notify_one(); }
+void P2PDeviceWorker::WakeUpSend() {
+    std::lock_guard<std::mutex> lock(send_wakeup_mutex_);
+    send_wakeup_cv_.notify_one();
+}
 
-void P2PDeviceWorker::WakeUpRecv() { recv_wakeup_cv_.notify_one(); }
+void P2PDeviceWorker::WakeUpRecv() {
+    std::lock_guard<std::mutex> lock(recv_wakeup_mutex_);
+    recv_wakeup_cv_.notify_one();
+}
 
 std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCPUWorker() {
     std::lock_guard<std::mutex> lock(manager_mutex_);

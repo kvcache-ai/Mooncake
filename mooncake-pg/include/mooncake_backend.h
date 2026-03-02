@@ -139,7 +139,13 @@ class MooncakeBackend final : public ::c10d::Backend {
                           int backendIndex);
 
     // P2P async infrastructure
-    std::unique_ptr<P2PProxy> p2p_proxy_;
+    // p2p_proxy_ is created in MooncakeBackend, but can live longer than
+    // MooncakeBackend. Becasue it is shared in P2PDeviceWorker, which must
+    // ensure P2PProxy's resources are not released until all transfers are
+    // completed.
+    std::shared_ptr<P2PProxy> p2p_proxy_;
+    // p2p_device_worker_ is created in P2PDeviceWorkerManager,
+    // and is shared between backends in the same device.
     std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
 };
 

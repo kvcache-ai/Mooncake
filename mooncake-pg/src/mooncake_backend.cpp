@@ -157,15 +157,14 @@ MooncakeBackend::MooncakeBackend(
     else
         p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
 
-    p2p_proxy_ = std::make_unique<P2PProxy>(
+    p2p_proxy_ = std::make_shared<P2PProxy>(
         &engine_, P2PProxy::Options{
                       .is_cpu = isCpu_,
                       .rank = rank_,
                       .size = size_,
                       .cuda_device_index = cuda_device_index,
                   });
-    p2p_proxy_->AllocateResources();
-    p2p_device_worker_->registerProxy(p2p_proxy_.get());
+    p2p_device_worker_->registerProxy(p2p_proxy_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
@@ -710,8 +709,7 @@ void MooncakeBackend::shutdown() {
     }
     isShutdown_ = true;
 
-    p2p_device_worker_->removeProxy(p2p_proxy_.get());
-    p2p_proxy_->ReleaseResources();
+    p2p_device_worker_->removeProxy(p2p_proxy_);
     p2p_proxy_.reset();
 
     engine_.unregisterLocalMemory(warmup_send_region_);

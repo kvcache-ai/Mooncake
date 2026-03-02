@@ -84,11 +84,9 @@ class P2PProxy {
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
+    ~P2PProxy();
 
     void BindMeta(TransferGroupMeta* meta);
-    void AllocateResources();
-    void ReleaseResources();
-
     void* send_buffer() const { return resources_.send_buffer_; }
     void* recv_buffer() const { return resources_.recv_buffer_; }
     P2PControlSlot* ctrl_send_region() const {
@@ -181,6 +179,10 @@ class P2PProxy {
         std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
     };
 
+    // Resources are allocated and released by constructor/destructor
+    void AllocateResources();
+    void ReleaseResources();
+
     // For P2PDeviceWorker
     bool StepSend();
     bool StepRecv();
@@ -246,8 +248,8 @@ class P2PProxy {
 class P2PDeviceWorker {
    public:
     friend class P2PDeviceWorkerManager;
-    void registerProxy(P2PProxy*);
-    void removeProxy(P2PProxy*);
+    void registerProxy(const std::shared_ptr<P2PProxy>&);
+    void removeProxy(const std::shared_ptr<P2PProxy>&);
 
     ~P2PDeviceWorker() { Stop(); }
 
@@ -281,7 +283,7 @@ class P2PDeviceWorker {
 
     std::mutex proxies_mutex_;
     std::atomic<bool> proxies_dirty_;
-    std::vector<P2PProxy*> proxies_;
+    std::vector<std::shared_ptr<P2PProxy>> proxies_;
 
     bool is_cpu_;
     int cuda_device_index_;
