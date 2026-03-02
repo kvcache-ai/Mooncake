@@ -19,9 +19,6 @@
 
 namespace mooncake {
 
-class Client;  // Forward declaration for CacheBlockHandle friendship
-class LocalHotCache;  // Forward declaration for CacheBlockHandle
-
 /**
  * @brief Memory block metadata for hot cache.
  */
@@ -32,53 +29,6 @@ struct HotMemBlock {
     std::string key_;
     std::atomic<bool> accessed{false};  // Deferred LRU touch flag
     HotMemBlock() : addr(nullptr), size(0), ref_count(0) {}
-};
-
-/**
- * @brief RAII handle for zero-copy access to a cache block.
- *
- * Holds a reference (ref_count) on the underlying HotMemBlock, preventing
- * eviction while the handle is alive.  Move-only; the destructor calls
- * ReleaseHotKey to drop the reference.
- */
-class CacheBlockHandle {
-   public:
-    /// Construct an empty (invalid) handle.
-    CacheBlockHandle();
-
-    /// Move constructor – source handle becomes invalid.
-    CacheBlockHandle(CacheBlockHandle&& other) noexcept;
-
-    /// Move assignment – releases current block first.
-    CacheBlockHandle& operator=(CacheBlockHandle&& other) noexcept;
-
-    /// Non-copyable.
-    CacheBlockHandle(const CacheBlockHandle&) = delete;
-    CacheBlockHandle& operator=(const CacheBlockHandle&) = delete;
-
-    /// Destructor – calls ReleaseHotKey if holding a block.
-    ~CacheBlockHandle();
-
-    /// Read-only pointer to cached data.
-    const void* data() const;
-
-    /// Actual object size stored in this block.
-    size_t size() const;
-
-    /// True if this handle is valid (holds a block).
-    explicit operator bool() const;
-
-   private:
-    friend class Client;
-
-    CacheBlockHandle(std::shared_ptr<LocalHotCache> cache,
-                     std::string key, HotMemBlock* block, size_t object_size);
-    void release();
-
-    std::shared_ptr<LocalHotCache> cache_;
-    std::string key_;
-    HotMemBlock* block_{nullptr};
-    size_t object_size_{0};
 };
 
 /**
@@ -110,16 +60,6 @@ class LocalHotCache {
      * @return true if inserted successfully, false if race condition or error.
      */
     bool PutHotKey(HotMemBlock* block);
-
-    /**
-     * @brief Insert a populated block and retain one reference.
-     * Identical to PutHotKey() except on success the block's ref_count is set
-     * to 1 instead of 0, so the caller already holds a reference (used by
-     * GetZeroCopy to avoid a TOCTOU gap between insert and GetHotKey).
-     * @param block The block containing the data and key.
-     * @return true if inserted successfully, false if race condition or error.
-     */
-    bool PutHotKeyWithRef(HotMemBlock* block);
 
     /**
      * @brief Check if the key exists in cache.

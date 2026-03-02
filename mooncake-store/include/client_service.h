@@ -92,33 +92,6 @@ class Client {
                                       std::vector<Slice>& slices);
 
     /**
-     * @brief Zero-copy get: returns an RAII handle to a cache block.
-     *
-     * On cache hit the caller reads directly from the cache block.
-     * On cache miss the data is transferred into a cache block first.
-     * The returned CacheBlockHandle prevents the block from being evicted
-     * until the handle is destroyed.
-     *
-     * Requirements: hot cache must be enabled, object must have a memory
-     * replica, and object size must fit in a single cache block.
-     *
-     * @param object_key Key to retrieve
-     * @return CacheBlockHandle on success, ErrorCode on failure
-     */
-    tl::expected<CacheBlockHandle, ErrorCode> GetZeroCopy(
-        const std::string& object_key);
-
-    /**
-     * @brief Zero-copy get with pre-queried metadata.
-     * @param object_key Key to retrieve
-     * @param query_result Previously queried object metadata
-     * @return CacheBlockHandle on success, ErrorCode on failure
-     */
-    tl::expected<CacheBlockHandle, ErrorCode> GetZeroCopy(
-        const std::string& object_key,
-        const QueryResult& query_result);
-
-    /**
      * @brief Batch retrieve data for multiple keys
      * @param object_keys Keys to query
      * @param slices Map of object keys to their data slices

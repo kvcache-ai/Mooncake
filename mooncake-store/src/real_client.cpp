@@ -1142,6 +1142,20 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
+    // Hot cache fast path: zero-copy read via BufferHandle view mode
+    if (client_->IsHotCacheEnabled()) {
+        auto hot_cache = client_->GetHotCache();
+        HotMemBlock* blk = hot_cache->GetHotKey(key);
+        if (blk != nullptr) {
+            auto handle = std::make_shared<BufferHandle>(
+                blk->addr, blk->size,
+                [blk, hot_cache]() {
+                    blk->ref_count.fetch_sub(1, std::memory_order_release);
+                });
+            return handle;
+        }
+    }
+
     // Query the object info
     auto query_result = client_->Query(key);
     if (!query_result) {

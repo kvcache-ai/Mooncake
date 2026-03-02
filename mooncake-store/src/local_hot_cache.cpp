@@ -13,60 +13,6 @@ constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024;  // 16MB default block
 }
 
 // ---------------------------------------------------------------------------
-// CacheBlockHandle
-// ---------------------------------------------------------------------------
-
-CacheBlockHandle::CacheBlockHandle() = default;
-
-CacheBlockHandle::CacheBlockHandle(std::shared_ptr<LocalHotCache> cache,
-                                   std::string key, HotMemBlock* block,
-                                   size_t object_size)
-    : cache_(std::move(cache)),
-      key_(std::move(key)),
-      block_(block),
-      object_size_(object_size) {}
-
-CacheBlockHandle::CacheBlockHandle(CacheBlockHandle&& other) noexcept
-    : cache_(std::move(other.cache_)),
-      key_(std::move(other.key_)),
-      block_(other.block_),
-      object_size_(other.object_size_) {
-    other.block_ = nullptr;
-    other.object_size_ = 0;
-}
-
-CacheBlockHandle& CacheBlockHandle::operator=(CacheBlockHandle&& other) noexcept {
-    if (this != &other) {
-        release();
-        cache_ = std::move(other.cache_);
-        key_ = std::move(other.key_);
-        block_ = other.block_;
-        object_size_ = other.object_size_;
-        other.block_ = nullptr;
-        other.object_size_ = 0;
-    }
-    return *this;
-}
-
-CacheBlockHandle::~CacheBlockHandle() { release(); }
-
-const void* CacheBlockHandle::data() const {
-    return block_ ? block_->addr : nullptr;
-}
-
-size_t CacheBlockHandle::size() const { return object_size_; }
-
-CacheBlockHandle::operator bool() const { return block_ != nullptr; }
-
-void CacheBlockHandle::release() {
-    if (block_ && cache_) {
-        cache_->ReleaseHotKey(key_);
-    }
-    block_ = nullptr;
-    object_size_ = 0;
-}
-
-// ---------------------------------------------------------------------------
 // LocalHotCache
 // ---------------------------------------------------------------------------
 
@@ -156,35 +102,6 @@ bool LocalHotCache::PutHotKey(HotMemBlock* block) {
 
     // Publish the new mapping
     block->ref_count = 0;
-    lru_queue_.push_front(block);
-    key_to_lru_it_[key] = lru_queue_.begin();
-    return true;
-}
-
-bool LocalHotCache::PutHotKeyWithRef(HotMemBlock* block) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
-
-    drainDeferredTouches();
-
-    if (!block) return false;
-
-    if (block->key_.empty()) {
-        block->ref_count = 0;
-        lru_queue_.push_back(block);
-        return false;
-    }
-
-    const std::string& key = block->key_;
-
-    if (key_to_lru_it_.find(key) != key_to_lru_it_.end()) {
-        block->key_.clear();
-        block->ref_count = 0;
-        lru_queue_.push_back(block);
-        return false;
-    }
-
-    // Same as PutHotKey but ref_count = 1 so caller holds a reference
-    block->ref_count = 1;
     lru_queue_.push_front(block);
     key_to_lru_it_[key] = lru_queue_.begin();
     return true;
