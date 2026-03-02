@@ -267,7 +267,7 @@ void free_memory(const std::string &protocol, void *ptr) {
             if (ret != ACL_ERROR_NONE) {
                 LOG(ERROR) << "Failed to unmap memory: " << ptr;
             }
-            aclrtReleaseMemAddress(ptr);
+            ret = aclrtReleaseMemAddress(ptr);
             if (ret != ACL_ERROR_NONE) {
                 LOG(ERROR) << "Failed to release mem address: " << ptr;
             }
@@ -278,7 +278,7 @@ void free_memory(const std::string &protocol, void *ptr) {
             return;
         }
 #endif
-        LOG(ERROR) << "Ascend runtime not supprot fabirc mem ";
+        LOG(ERROR) << "Ascend runtime not support fabirc mem ";
         return;
     }
 #endif

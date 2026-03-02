@@ -178,63 +178,66 @@ static bool supportFabricMem() {
 
 UBShmemTransport::UBShmemTransport()
     : use_fabric_mem_(supportFabricMem()),
-      num_streams_per_transfer_(kDefaultNumStreams),  // Default: 4 streams per transfer
-      thread_pool_size_(kDefaultThreadPool),          // Default: 8 threads
-      stream_pool_timeout_ms_(kGetStreamTimeoutMillis)  // Default: 3000 ms
-{
-    // Read configuration from environment variables
+      num_streams_per_transfer_(kDefaultNumStreams),
+      thread_pool_size_(kDefaultThreadPool),
+      stream_pool_timeout_ms_(kGetStreamTimeoutMillis) {
     const char *num_streams_per_transfer_env =
         getenv("MC_UBSHMEM_STREAMS_PER_TRANSFER");
     if (num_streams_per_transfer_env != nullptr) {
-        int env_value = atoi(num_streams_per_transfer_env);
-        if (env_value > 0) {
-            num_streams_per_transfer_ = env_value;
+        std::optional<int32_t> env_value =
+            parseFromString<int32_t>(num_streams_per_transfer_env);
+        if (env_value.has_value() && env_value.value() > 0) {
+            num_streams_per_transfer_ = env_value.value();
         }
     }
 
     const char *max_streams_env = getenv("MC_UBSHMEM_MAX_STREAMS");
     int max_streams = kDefaultNumStreams * kDefaultThreadPool;
     if (max_streams_env != nullptr) {
-        int env_value = atoi(max_streams_env);
-        if (env_value > 0) {
-            max_streams = env_value;
+        std::optional<int32_t> env_value =
+            parseFromString<int32_t>(max_streams_env);
+        if (env_value.has_value() && env_value.value() > 0) {
+            max_streams = env_value.value();
         }
     }
 
     const char *thread_pool_size_env = getenv("MC_UBSHMEM_THREAD_POOL_SIZE");
     if (thread_pool_size_env != nullptr) {
-        int env_value = atoi(thread_pool_size_env);
-        if (env_value > 0 && env_value <= 64) {  // Limit to reasonable range
-            thread_pool_size_ = static_cast<size_t>(env_value);
+        std::optional<int32_t> env_value =
+            parseFromString<int32_t>(thread_pool_size_env);
+        if (env_value.has_value() && env_value.value() > 0 &&
+            env_value.value() <= 64) {
+            thread_pool_size_ = static_cast<size_t>(env_value.value());
             LOG(INFO)
                 << "UBShmemTransport: Using thread pool size "
                 << thread_pool_size_
                 << " from environment variable MC_UBSHMEM_THREAD_POOL_SIZE";
         } else {
-            LOG(WARNING) << "UBShmemTransport: Invalid thrsead pool size "
-                         << env_value << " (must be 1-64), using default "
+            LOG(WARNING) << "UBShmemTransport: Invalid thread pool size "
+                         << thread_pool_size_env
+                         << " (must be 1-64), using default "
                          << thread_pool_size_;
         }
     }
 
-    // Read stream pool timeout configuration
     const char *stream_timeout_env = getenv("MC_UBSHMEM_GET_STREAM_TIMEOUT");
     if (stream_timeout_env != nullptr) {
-        int env_value = atoi(stream_timeout_env);
-        if (env_value > 0) {
-            stream_pool_timeout_ms_ = static_cast<uint64_t>(env_value);
+        std::optional<int32_t> env_value =
+            parseFromString<int32_t>(stream_timeout_env);
+        if (env_value.has_value() && env_value.value() > 0) {
+            stream_pool_timeout_ms_ = static_cast<uint64_t>(env_value.value());
             LOG(INFO)
                 << "UBShmemTransport: Using stream pool timeout "
                 << stream_pool_timeout_ms_
                 << "ms from environment variable MC_UBSHMEM_GET_STREAM_TIMEOUT";
         } else {
             LOG(WARNING) << "UBShmemTransport: Invalid stream pool timeout "
-                         << env_value << "ms (must be > 0), using default "
+                         << stream_timeout_env
+                         << "ms (must be > 0), using default "
                          << stream_pool_timeout_ms_ << "ms";
         }
     }
 
-    // Initialize stream pool
     stream_pool_ = std::make_unique<StreamPool>(max_streams);
 }
 
