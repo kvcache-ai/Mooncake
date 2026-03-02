@@ -2125,9 +2125,8 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         if (snapshot_backend_type_ == SnapshotBackendType::ETCD &&
             snapshot_daemon_pid_ != -1) {
             return PersistStateViaEtcdDaemon(
-                snapshot_id, path_prefix,
-                serialized_metadata, serialized_segment,
-                serializer_type_str);
+                snapshot_id, path_prefix, serialized_metadata,
+                serialized_segment, serializer_type_str);
         }
 
         // LOCAL/S3 backend: direct upload
@@ -2856,7 +2855,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
@@ -3728,8 +3728,8 @@ bool MasterService::StartSnapshotDaemon() {
     }
 
     // Create socket path
-    snapshot_daemon_socket_path_ =
-        snapshot_backup_dir_ + "/snapshot_daemon_" + std::to_string(getpid()) + ".sock";
+    snapshot_daemon_socket_path_ = snapshot_backup_dir_ + "/snapshot_daemon_" +
+                                   std::to_string(getpid()) + ".sock";
 
     // Ensure backup dir exists
     auto dir_result = FileUtil::EnsureDirExists(snapshot_backup_dir_);
@@ -3762,8 +3762,7 @@ bool MasterService::StartSnapshotDaemon() {
     if (pid == 0) {
         // Child process: exec daemon
         execl(daemon_path.c_str(), "snapshot_uploader_daemon",
-              etcd_endpoints_.c_str(),
-              snapshot_daemon_socket_path_.c_str(),
+              etcd_endpoints_.c_str(), snapshot_daemon_socket_path_.c_str(),
               nullptr);
         // If exec fails
         LOG(ERROR) << "[SnapshotDaemon] Exec failed: " << strerror(errno);
@@ -3798,7 +3797,8 @@ void MasterService::StopSnapshotDaemon() {
         return;
     }
 
-    LOG(INFO) << "[SnapshotDaemon] Stopping daemon, pid=" << snapshot_daemon_pid_;
+    LOG(INFO) << "[SnapshotDaemon] Stopping daemon, pid="
+              << snapshot_daemon_pid_;
 
     // Send SIGTERM first
     if (kill(snapshot_daemon_pid_, SIGTERM) == 0) {
@@ -3816,7 +3816,8 @@ void MasterService::StopSnapshotDaemon() {
         }
 
         // Force kill if still running
-        LOG(WARNING) << "[SnapshotDaemon] Daemon didn't stop gracefully, sending SIGKILL";
+        LOG(WARNING) << "[SnapshotDaemon] Daemon didn't stop gracefully, "
+                        "sending SIGKILL";
         kill(snapshot_daemon_pid_, SIGKILL);
     }
 
@@ -3827,12 +3828,10 @@ void MasterService::StopSnapshotDaemon() {
 }
 
 tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
-    const std::string& snapshot_id,
-    const std::string& path_prefix,
+    const std::string& snapshot_id, const std::string& path_prefix,
     const std::vector<uint8_t>& serialized_metadata,
     const std::vector<uint8_t>& serialized_segment,
     const std::string& serializer_type_str) {
-
     SNAP_LOG_INFO("[Snapshot] Using ETCD daemon for upload, snapshot_id={}",
                   snapshot_id);
 
@@ -3851,7 +3850,8 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
     std::string manifest_file = (staging_dir / SNAPSHOT_MANIFEST_FILE).string();
     std::string latest_file = (staging_dir / SNAPSHOT_LATEST_FILE).string();
 
-    auto save_result = FileUtil::SaveBinaryToFile(serialized_metadata, metadata_file);
+    auto save_result =
+        FileUtil::SaveBinaryToFile(serialized_metadata, metadata_file);
     if (!save_result) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::PERSISTENT_FAIL,
@@ -3865,9 +3865,11 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
             "Failed to save segments: " + save_result.error()));
     }
 
-    std::string manifest_content = fmt::format(
-        "{}|{}|{}", serializer_type_str, SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
-    auto save_str_result = FileUtil::SaveStringToFile(manifest_content, manifest_file);
+    std::string manifest_content =
+        fmt::format("{}|{}|{}", serializer_type_str,
+                    SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
+    auto save_str_result =
+        FileUtil::SaveStringToFile(manifest_content, manifest_file);
     if (!save_str_result) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::PERSISTENT_FAIL,
@@ -3881,7 +3883,8 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
             "Failed to save latest: " + save_str_result.error()));
     }
 
-    SNAP_LOG_INFO("[Snapshot] Staging files written, snapshot_id={}", snapshot_id);
+    SNAP_LOG_INFO("[Snapshot] Staging files written, snapshot_id={}",
+                  snapshot_id);
 
     // 2. Connect to daemon
     int client_socket = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -3909,23 +3912,23 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
         {path_prefix + SNAPSHOT_METADATA_FILE, metadata_file},
         {path_prefix + SNAPSHOT_SEGMENTS_FILE, segments_file},
         {path_prefix + SNAPSHOT_MANIFEST_FILE, manifest_file},
-        {SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE, latest_file}
-    };
+        {SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE, latest_file}};
 
     // Helper lambda for writing
     auto write_all = [&](const void* buf, size_t count) -> bool {
         size_t written = 0;
         while (written < count) {
-            ssize_t n = write(client_socket,
-                              static_cast<const char*>(buf) + written,
-                              count - written);
+            ssize_t n =
+                write(client_socket, static_cast<const char*>(buf) + written,
+                      count - written);
             if (n <= 0) return false;
             written += n;
         }
         return true;
     };
 
-    // 4. Send request: [num_files:4][key_len:4][key:N][payload_type:1][payload_len:4][payload:M]...
+    // 4. Send request:
+    // [num_files:4][key_len:4][key:N][payload_type:1][payload_len:4][payload:M]...
     uint32_t num_files = static_cast<uint32_t>(files.size());
     if (!write_all(&num_files, sizeof(num_files))) {
         close(client_socket);
@@ -3952,7 +3955,8 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
                 ErrorCode::PERSISTENT_FAIL, "Failed to send file path"));
         }
 
-        SNAP_LOG_INFO("[Snapshot] Sent to daemon: key={}, path={}", key, local_path);
+        SNAP_LOG_INFO("[Snapshot] Sent to daemon: key={}, path={}", key,
+                      local_path);
     }
 
     // 5. Read response: [status:4][error_len:4][error_msg:N]
@@ -3964,7 +3968,8 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
     }
 
     uint32_t error_len;
-    if (read(client_socket, &error_len, sizeof(error_len)) != sizeof(error_len)) {
+    if (read(client_socket, &error_len, sizeof(error_len)) !=
+        sizeof(error_len)) {
         close(client_socket);
         return tl::make_unexpected(SerializationError(
             ErrorCode::PERSISTENT_FAIL, "Failed to read error_len"));
@@ -3987,8 +3992,8 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
     std::error_code ec;
     fs::remove_all(staging_dir, ec);
     if (ec) {
-        SNAP_LOG_WARNING("[Snapshot] Failed to cleanup staging dir: {}",
-                         staging_dir.string());
+        SNAP_LOG_WARN("[Snapshot] Failed to cleanup staging dir: {}",
+                      staging_dir.string());
     }
 
     if (status != 0) {
@@ -4000,7 +4005,8 @@ tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
     // 7. Cleanup old snapshots
     CleanupOldSnapshot(10, snapshot_id);
 
-    SNAP_LOG_INFO("[Snapshot] ETCD upload completed, snapshot_id={}", snapshot_id);
+    SNAP_LOG_INFO("[Snapshot] ETCD upload completed, snapshot_id={}",
+                  snapshot_id);
     return {};
 }
 

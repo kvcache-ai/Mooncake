@@ -527,7 +527,7 @@ tl::expected<void, std::string> EtcdBackend::DownloadBuffer(
     const std::string& key, std::vector<uint8_t>& buffer) {
     char* value = nullptr;
     int value_size = 0;
-    int64_t revision_id = 0;
+    GoInt64 revision_id = 0;
     char* err_msg = nullptr;
 
     int ret = SnapshotStoreGetWrapper(

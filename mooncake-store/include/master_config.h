@@ -51,6 +51,7 @@ struct MasterConfig {
     uint64_t quota_bytes;
 
     bool enable_snapshot_restore;
+    bool enable_snapshot_restore_clean_metadata;
     bool enable_snapshot;
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;

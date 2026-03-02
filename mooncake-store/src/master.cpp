@@ -15,10 +15,29 @@
 #include "types.h"
 
 #include "master_config.h"
+#ifdef HAVE_AWS_SDK
+#include "utils/s3_helper.h"
+#endif
 
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
+
+#ifdef HAVE_AWS_SDK
+namespace {
+class S3ApiGuard {
+   public:
+    S3ApiGuard() { mooncake::S3Helper::InitAPI(); }
+    ~S3ApiGuard() { mooncake::S3Helper::ShutdownAPI(); }
+    S3ApiGuard(const S3ApiGuard&) = delete;
+    S3ApiGuard& operator=(const S3ApiGuard&) = delete;
+};
+
+bool IsS3Backend(const std::string& backend) {
+    return backend == "s3" || backend == "S3";
+}
+}  // namespace
+#endif
 
 DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
@@ -601,6 +620,13 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+
+#ifdef HAVE_AWS_SDK
+    std::unique_ptr<S3ApiGuard> s3_guard;
+    if (IsS3Backend(master_config.snapshot_backend_type)) {
+        s3_guard = std::make_unique<S3ApiGuard>();
+    }
+#endif
 
     if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
         LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";

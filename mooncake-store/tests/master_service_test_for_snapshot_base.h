@@ -818,15 +818,17 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
         // ========== Phase 3: Restart MasterService in Restore mode ==========
         // Inherit key configurations from original service (e.g., root_fs_dir
-        // for SSD support)
+        // for SSD support, snapshot_backend_type for ETCD backend)
+        // Note: MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP env var
+        // controls whether to skip metadata cleanup during restore
         ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
         auto restore_config =
             MasterServiceConfig::builder()
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
-                .set_snapshot_backend_type("local")
-                .set_enable_snapshot_restore_clean_metadata(false)
                 .set_root_fs_dir(service->root_fs_dir_)
+                .set_snapshot_backend_type(service->snapshot_backend_type_)
+                .set_etcd_endpoints(service->etcd_endpoints_)
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
