@@ -30,11 +30,21 @@ set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
+set(MOONCAKE_PROJECT_HOME "$ENV{PROJECT_HOME}")
+if("${MOONCAKE_PROJECT_HOME}" STREQUAL "")
+    set(MOONCAKE_PROJECT_HOME "${CMAKE_SOURCE_DIR}")
+endif()
 
+set(ENGINE_EXTRA_SOURCES transfer_engine/transfer_engine_py.cpp)
+set(ENGINE_EXTRA_INCLUDES "")
+set(ENGINE_EXTRA_LIBS "")
+if(BUILD_ZMQ_COMMUNICATOR)
+  list(APPEND ENGINE_EXTRA_SOURCES ../mooncake-transfer-engine/src/transport/zmq_communicator/zmq_interface.cpp)
+  list(APPEND ENGINE_EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include/zmq_communicator)
+  list(APPEND ENGINE_EXTRA_LIBS zmq_communicator_lib)
+endif()
 if (WITH_TE)
-    pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        transfer_engine/transfer_engine_py.cpp
-    )
+    pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} ${ENGINE_EXTRA_SOURCES})
     set_target_properties(engine PROPERTIES
         INSTALL_RPATH "$ORIGIN"
     )
@@ -49,17 +59,23 @@ if (WITH_TE)
     )
 
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
-    target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
+    target_include_directories(engine PRIVATE
+        ${Python3_INCLUDE_DIRS}
+        ${MOONCAKE_PROJECT_HOME}/mooncake-transfer-engine/src
+        ${ENGINE_EXTRA_INCLUDES}
+    )
     if (USE_ASCEND_DIRECT)
         target_link_libraries(engine PUBLIC
             ascendcl
             transfer_engine
+            ${ENGINE_EXTRA_LIBS}
             glog::glog
             gflags::gflags
         )
     else()
         target_link_libraries(engine PUBLIC
             transfer_engine
+            ${ENGINE_EXTRA_LIBS}
             glog::glog
             gflags::gflags
         )

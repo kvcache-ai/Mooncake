@@ -192,6 +192,45 @@ jobs:
         name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
+  zmq-communicator-test:
+    needs: build
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Generate Python version tag
+      id: tag
+      run: echo "tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+    - name: Download wheel from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: wheel-build-py${{ steps.tag.outputs.tag }}
+
+    - name: Run ZMQ Communicator Python test
+      continue-on-error: true
+      run: |
+        WHEEL_DIR="mooncake-wheel/dist-py${{ steps.tag.outputs.tag }}"
+        WHEEL_FILE=$(find "$WHEEL_DIR" -name '*.whl' -type f 2>/dev/null | head -1)
+        if [ -z "$WHEEL_FILE" ]; then
+          echo "No wheel found in $WHEEL_DIR"
+          ls -la "$WHEEL_DIR" || true
+          exit 1
+        fi
+        pip install "$WHEEL_FILE"
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        python mooncake-transfer-engine/tests/zmq_communicator_example.py
+      shell: bash
+
   build-musa:
     if: >-
       github.event_name == 'push' ||

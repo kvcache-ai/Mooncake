@@ -18,6 +18,18 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
+# ZMQ communicator: controlled by env MOONCAKE_BUILD_ZMQ_COMMUNICATOR (1/ON/YES/TRUE=build, 0/OFF/NO/FALSE=skip)
+if(DEFINED ENV{MOONCAKE_BUILD_ZMQ_COMMUNICATOR})
+  if("$ENV{MOONCAKE_BUILD_ZMQ_COMMUNICATOR}" MATCHES "^(0|OFF|NO|FALSE)$")
+    set(BUILD_ZMQ_COMMUNICATOR OFF)
+  else()
+    set(BUILD_ZMQ_COMMUNICATOR ON)
+  endif()
+else()
+  set(BUILD_ZMQ_COMMUNICATOR ON)
+endif()
+message(STATUS "BUILD_ZMQ_COMMUNICATOR: ${BUILD_ZMQ_COMMUNICATOR} (set MOONCAKE_BUILD_ZMQ_COMMUNICATOR=0 to disable)")
+
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
