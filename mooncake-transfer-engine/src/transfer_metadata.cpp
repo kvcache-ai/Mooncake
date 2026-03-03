@@ -660,13 +660,16 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
 }
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
-    RWSpinlock::ReadGuard guard(segment_lock_);
-    auto it = segment_id_to_desc_map_.find(segment_id);
-    if (it == segment_id_to_desc_map_.end() || !it->second) {
-        LOG(ERROR) << "Segment descriptor " << segment_id << " not found";
-        return ERR_METADATA;
+    std::shared_ptr<SegmentDesc> desc;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Segment descriptor " << segment_id << " not found";
+            return ERR_METADATA;
+        }
+        desc = it->second;
     }
-    auto desc = it->second;
     return this->updateSegmentDesc(desc->name, *desc);
 }
 
