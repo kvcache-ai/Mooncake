@@ -156,6 +156,9 @@ MooncakeBackend::MooncakeBackend(
                   });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
+    connection_ctx_ = std::make_shared<ConnectionContext>(
+        backendIndex_, rank, size, store, &meta_, &engine_);
+
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
     rank_info.recv_buffer[0] = (uint64_t)recv_buffer_[0];
@@ -164,8 +167,10 @@ MooncakeBackend::MooncakeBackend(
     rank_info.send_sync[1] = (uint64_t)cpu_sync_send_region_[1];
     rank_info.recv_sync[0] = (uint64_t)cpu_sync_recv_region_[0];
     rank_info.recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
-    rank_info.warmup_buffer[0] = (uint64_t)warmup_send_region_;
-    rank_info.warmup_buffer[1] = (uint64_t)warmup_recv_region_;
+    rank_info.warmup_buffer[0] =
+        (uint64_t)connection_ctx_->warmup_send_region();
+    rank_info.warmup_buffer[1] =
+        (uint64_t)connection_ctx_->warmup_recv_region();
     rank_info.p2p_send_buffer = (uint64_t)p2p_proxy_->send_buffer();
     rank_info.p2p_recv_buffer = (uint64_t)p2p_proxy_->recv_buffer();
     rank_info.p2p_ctrl_send = (uint64_t)p2p_proxy_->ctrl_send_region();
@@ -181,6 +186,9 @@ MooncakeBackend::MooncakeBackend(
     store->set("server_name_" + std::to_string(backendIndex_) + "_" +
                    std::to_string(rank_),
                localServerName);
+
+    // Start polling connction
+    ConnectionPoller::GetInstance().registerContext(connection_ctx_);
 
     meta_.rank = rank;
     meta_.size = size;
@@ -217,11 +225,6 @@ MooncakeBackend::MooncakeBackend(
     meta_.backendIndex = backendIndex_;
     meta_.bufferBaseIndex = backendIndex_ * 10;
     p2p_proxy_->BindMeta(&meta_);
-
-    connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, store, &meta_, &engine_);
-
-    ConnectionPoller::GetInstance().registerContext(connection_ctx_);
 
     while (!connection_ctx_->isAllPeerConnected()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));

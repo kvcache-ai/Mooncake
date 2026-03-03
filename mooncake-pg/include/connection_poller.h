@@ -73,6 +73,9 @@ class ConnectionContext {
                       TransferGroupMeta* meta, TransferEngine* engine);
     ~ConnectionContext();
 
+    int32_t* warmup_send_region() const { return warmup_send_region_; }
+    int32_t* warmup_recv_region() const { return warmup_recv_region_; }
+
     int getTotalConnnectedPeers() const {
         return totalConnnectedPeers_.load(std::memory_order_acquire);
     }
