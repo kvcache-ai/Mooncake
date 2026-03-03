@@ -303,6 +303,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
+        RWSpinlock::WriteGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
         if (iter != segment_name_to_id_map_.end()) {
             LOG(INFO) << "removeSegmentDesc " << segment_name << " finish";
@@ -660,7 +661,12 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
     RWSpinlock::ReadGuard guard(segment_lock_);
-    auto desc = segment_id_to_desc_map_[segment_id];
+    auto it = segment_id_to_desc_map_.find(segment_id);
+    if (it == segment_id_to_desc_map_.end() || !it->second) {
+        LOG(ERROR) << "Segment descriptor " << segment_id << " not found";
+        return ERR_METADATA;
+    }
+    auto desc = it->second;
     return this->updateSegmentDesc(desc->name, *desc);
 }
 
