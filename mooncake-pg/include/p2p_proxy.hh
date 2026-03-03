@@ -282,7 +282,7 @@ class P2PDeviceWorker {
     std::thread recv_worker_thread_;
 
     std::mutex proxies_mutex_;
-    std::atomic<bool> proxies_dirty_;
+    std::atomic<uint64_t> proxies_version_{0};
     std::vector<std::shared_ptr<P2PProxy>> proxies_;
 
     bool is_cpu_;

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <thread>
 
 namespace mooncake {
@@ -862,12 +863,10 @@ void P2PDeviceWorker::registerProxy(const std::shared_ptr<P2PProxy>& proxy) {
     {
         std::lock_guard<std::mutex> lock(proxies_mutex_);
         proxies_.emplace_back(proxy);
-    }
 
-    {
         std::lock_guard<std::mutex> s_lock(send_wakeup_mutex_);
         std::lock_guard<std::mutex> r_lock(recv_wakeup_mutex_);
-        proxies_dirty_.store(true, std::memory_order_release);
+        proxies_version_.fetch_add(1, std::memory_order_release);
     }
 
     send_wakeup_cv_.notify_one();
@@ -879,15 +878,20 @@ void P2PDeviceWorker::removeProxy(const std::shared_ptr<P2PProxy>& proxy) {
         std::lock_guard<std::mutex> lock(proxies_mutex_);
         proxies_.erase(std::remove(proxies_.begin(), proxies_.end(), proxy),
                        proxies_.end());
+
+        std::lock_guard<std::mutex> s_lock(send_wakeup_mutex_);
+        std::lock_guard<std::mutex> r_lock(recv_wakeup_mutex_);
+        proxies_version_.fetch_add(1, std::memory_order_release);
     }
-    proxies_dirty_.store(true, std::memory_order_release);
     proxy->SetDeviceWorker(nullptr);
+    send_wakeup_cv_.notify_one();
+    recv_wakeup_cv_.notify_one();
 }
 
 template <typename HasWorkFn, typename StepWorkFn>
 void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
                       std::atomic<bool>& worker_running,
-                      std::atomic<bool>& proxies_dirty,
+                      std::atomic<uint64_t>& proxies_version,
                       std::mutex& proxies_mutex,
                       std::vector<std::shared_ptr<P2PProxy>>& proxies,
                       std::mutex& wakeup_mutex,
@@ -900,6 +904,7 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
     // This is efficient because proxy registration/removal is rare after
     // backend initialization.
     std::vector<std::shared_ptr<P2PProxy>> local_proxies;
+    uint64_t local_version = std::numeric_limits<uint64_t>::max();
 
     // Some proxies might be removed (caused by backend shutdown) before
     // all its transfers completed. We must keep them explicitly to avoid its
@@ -907,14 +912,18 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
     std::vector<std::shared_ptr<P2PProxy>> zombie_proxies;
 
     while (true) {
-        // Refresh the local cache if it's marked as dirty.
-        if (proxies_dirty.load(std::memory_order_acquire)) {
+        // Refresh the local cache if proxy membership changed.
+        const auto current_version =
+            proxies_version.load(std::memory_order_acquire);
+        if (local_version != current_version) {
             std::vector<std::shared_ptr<P2PProxy>> new_proxies;
             {
                 std::lock_guard<std::mutex> lock(proxies_mutex);
                 new_proxies = proxies;
+                // Reload version under `proxies_mutex` to ensure version
+                // matches `new_proxies`.
+                local_version = proxies_version.load(std::memory_order_acquire);
             }
-            proxies_dirty.store(false, std::memory_order_release);
 
             // Find zombie proxies.
             for (const auto& old_p : local_proxies) {
@@ -968,7 +977,9 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
                 if (!worker_running.load(std::memory_order_relaxed))
                     return true;
 
-                if (proxies_dirty.load(std::memory_order_acquire)) return true;
+                const auto current_version =
+                    proxies_version.load(std::memory_order_acquire);
+                if (local_version != current_version) return true;
 
                 for (const auto& proxy : local_proxies) {
                     if (has_work(*proxy)) return true;
@@ -984,7 +995,7 @@ void WorkerThreadLoop(bool is_cpu, int cuda_device_index,
 
 void P2PDeviceWorker::SendWorkerThread() {
     WorkerThreadLoop(
-        is_cpu_, cuda_device_index_, send_worker_running_, proxies_dirty_,
+        is_cpu_, cuda_device_index_, send_worker_running_, proxies_version_,
         proxies_mutex_, proxies_, send_wakeup_mutex_, send_wakeup_cv_,
         [](P2PProxy& p) { return p.HasActiveSendWork(); },
         [](P2PProxy& p) { return p.StepSend(); });
@@ -992,7 +1003,7 @@ void P2PDeviceWorker::SendWorkerThread() {
 
 void P2PDeviceWorker::RecvWorkerThread() {
     WorkerThreadLoop(
-        is_cpu_, cuda_device_index_, recv_worker_running_, proxies_dirty_,
+        is_cpu_, cuda_device_index_, recv_worker_running_, proxies_version_,
         proxies_mutex_, proxies_, recv_wakeup_mutex_, recv_wakeup_cv_,
         [](P2PProxy& p) { return p.HasActiveRecvWork(); },
         [](P2PProxy& p) { return p.StepRecv(); });
