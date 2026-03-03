@@ -757,8 +757,8 @@ void DummyClient::ping_thread_main() {
 
 int DummyClient::health_check() {
     if (!ping_running_.load()) return HC_NOT_INITIALIZED;
+    if (!connected_.load()) return HC_MASTER_UNREACHABLE;
     if (!last_ping_healthy_.load()) return HC_MASTER_UNREACHABLE;
-    if (!connected_.load()) return HC_NOT_INITIALIZED;
     return HC_HEALTHY;
 }
 
