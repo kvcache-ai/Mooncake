@@ -177,8 +177,14 @@ The following need to be installed before running any component of Mooncake:
 The simplest way to use Mooncake Transfer Engine is using `pip`:
 
 **For CUDA-enabled systems:**
+
+- CUDA < 13.0
 ```bash
 pip install mooncake-transfer-engine
+```
+- CUDA >= 13.0
+```bash
+pip install mooncake-transfer-engine-cuda13
 ```
 
 **For non-CUDA systems:**
