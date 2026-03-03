@@ -137,11 +137,14 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to reserve memory: " << ret;
+            (void)aclrtFreePhysical(handle);
             return nullptr;
         }
         ret = aclrtMapMem(va, total_size, 0, handle, 0);
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to map memory: " << ret;
+            (void)aclrtReleaseMemAddress(va);
+            (void)aclrtFreePhysical(handle);
             return nullptr;
         }
         return va;
@@ -217,14 +220,17 @@ void free_memory(const std::string &protocol, void *ptr) {
         ret = aclrtUnmapMem(ptr);
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to unmap memory: " << ptr;
+            return;
         }
         ret = aclrtReleaseMemAddress(ptr);
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to release mem address: " << ptr;
+            return;
         }
         ret = aclrtFreePhysical(handle);
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to free physical handle: " << handle;
+            return;
         }
         return;
     }
