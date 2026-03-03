@@ -225,15 +225,34 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     uint64_t last_applied_seq_id = baseline_seq_id;
 
     // Start OpLogWatcher with a consistent "read then watch(from revision+1)"
-    // sequence.
-    if (!oplog_watcher_->StartFromSequenceId(last_applied_seq_id)) {
+    // sequence.  Retry with exponential backoff to avoid getting stuck in
+    // RECONNECTING state where nothing drives recovery.
+    static constexpr int kMaxStartRetries = 3;
+    static constexpr int kStartRetryBaseMs = 500;
+    bool watcher_started = false;
+    for (int attempt = 0; attempt < kMaxStartRetries; ++attempt) {
+        if (oplog_watcher_->StartFromSequenceId(last_applied_seq_id)) {
+            watcher_started = true;
+            break;
+        }
         LOG(WARNING) << "Failed to start OpLogWatcher from sequence_id="
-                     << last_applied_seq_id << ", continuing anyway";
-        state_machine_.ProcessEvent(StandbyEvent::SYNC_FAILED);
-    } else {
-        // Transition to WATCHING state after successful sync
-        state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+                     << last_applied_seq_id << " (attempt " << (attempt + 1)
+                     << "/" << kMaxStartRetries << ")";
+        if (attempt + 1 < kMaxStartRetries) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kStartRetryBaseMs * (1 << attempt)));
+        }
     }
+
+    if (!watcher_started) {
+        LOG(ERROR) << "Failed to start OpLogWatcher after " << kMaxStartRetries
+                   << " attempts, aborting Start()";
+        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // Transition to WATCHING state after successful sync
+    state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
 
     // Start background threads
     replication_thread_ =

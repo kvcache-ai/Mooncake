@@ -359,31 +359,43 @@ bool OpLogWatcher::SyncMissedEntries() {
 
     LOG(INFO) << "Syncing missed OpLog entries since sequence_id=" << last_seq;
 
-    std::vector<OpLogEntry> entries;
-    EtcdRevisionId rev = 0;
-    if (!ReadOpLogSince(last_seq, entries, rev)) {
-        LOG(ERROR) << "Failed to read missed OpLog entries";
-        return false;
-    }
-    if (rev > 0) {
-        next_watch_revision_.store(static_cast<int64_t>(rev + 1));
-    }
+    uint64_t read_seq_id = last_seq;
+    EtcdRevisionId last_read_rev = 0;
+    size_t total_applied = 0;
 
-    if (entries.empty()) {
-        LOG(INFO) << "No missed OpLog entries to sync";
-        return true;
-    }
-
-    LOG(INFO) << "Syncing " << entries.size() << " missed OpLog entries";
-
-    for (const auto& entry : entries) {
-        if (applier_->ApplyOpLogEntry(entry)) {
-            last_processed_sequence_id_.store(entry.sequence_id);
-        } else {
-            LOG(WARNING) << "Failed to apply missed OpLog entry, sequence_id="
-                         << entry.sequence_id;
+    for (;;) {
+        std::vector<OpLogEntry> batch;
+        EtcdRevisionId rev = 0;
+        if (!ReadOpLogSince(read_seq_id, batch, rev)) {
+            LOG(ERROR) << "Failed to read missed OpLog entries";
+            return false;
+        }
+        if (rev > 0) {
+            last_read_rev = rev;
+        }
+        if (!batch.empty()) {
+            for (const auto& entry : batch) {
+                if (applier_->ApplyOpLogEntry(entry)) {
+                    last_processed_sequence_id_.store(entry.sequence_id);
+                    read_seq_id = entry.sequence_id;
+                    total_applied++;
+                } else {
+                    LOG(WARNING)
+                        << "Failed to apply missed OpLog entry, sequence_id="
+                        << entry.sequence_id;
+                }
+            }
+        }
+        if (batch.size() < kSyncBatchSize) {
+            break;
         }
     }
+
+    if (last_read_rev > 0) {
+        next_watch_revision_.store(static_cast<int64_t>(last_read_rev + 1));
+    }
+
+    LOG(INFO) << "Synced " << total_applied << " missed OpLog entries";
 
     return true;
 #else
