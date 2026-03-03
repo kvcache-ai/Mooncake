@@ -154,38 +154,10 @@ static void setupResourceLimits() {
     setrlimit(RLIMIT_DATA, &rl);
 }
 
-namespace mooncake {
-/**
- * @brief Memory-safety hack for large cluster benchmarks.
- *
- * To simulate 1024 segments within 16GB RAM while preserving the production
- * 1KB metadata granularity, we manually downsize the internal node capacity
- * of each allocator instance to 64K nodes.
- * This reduces metadata overhead per segment from ~36MB to ~2MB.
- */
-void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator) {
-    if (!allocator) return;
-
-    // Use friend-based access to reach into the internal implementation
-    auto& shared_internal = allocator->offset_allocator_;
-    if (!shared_internal) return;
-
-    auto& allocator_impl = shared_internal->m_allocator;
-    if (!allocator_impl) return;
-
-    // Set a much smaller max_capacity for the benchmark only.
-    // 64K nodes * 32 bytes/node * 1024 segments = 2GB, well within 16GB.
-    uint32_t benchmark_max_cap = 64 * 1024;
-    allocator_impl->m_max_capacity = benchmark_max_cap;
-
-    // Re-reserve to the smaller capacity to free up virtual address space
-    // if it was previously reserve()'d to 64M or 1M.
-    allocator_impl->m_nodes.shrink_to_fit();
-    allocator_impl->m_freeNodes.shrink_to_fit();
-    allocator_impl->m_nodes.reserve(benchmark_max_cap);
-    allocator_impl->m_freeNodes.reserve(benchmark_max_cap);
-}
-}  // namespace mooncake
+// For large cluster benchmarks (>500GB), cap allocator metadata at 64K nodes
+// to keep total memory within 16GB RAM.
+// 64K nodes * 32 bytes/node * 1024 segments = 2GB, well within 16GB.
+static constexpr uint32_t kBenchmarkMaxCapacity = 64 * 1024;
 
 /**
  * @brief Create an AllocatorManager populated with N OffsetBufferAllocators.
@@ -196,7 +168,8 @@ void downsizeAllocator(std::shared_ptr<OffsetBufferAllocator> allocator) {
  * @param id_offset Starting index for segment naming (for Scale-Out additions)
  */
 static AllocatorManager createCluster(int num_segments, size_t base_capacity,
-                                      bool skewed, int id_offset = 0) {
+                                      bool skewed, int id_offset = 0,
+                                      uint32_t max_capacity = kBenchmarkMaxCapacity) {
     AllocatorManager manager;
     // Distribute segments evenly across kNumVirtualNodes virtual nodes if
     // num_segments > kNumVirtualNodes, otherwise 1 segment per node.
@@ -216,8 +189,7 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
         }
         uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            name, base_addr, capacity, name);
-        downsizeAllocator(allocator);
+            name, base_addr, capacity, name, max_capacity);
         manager.addAllocator(name, allocator);
     }
     return manager;
@@ -233,7 +205,8 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
  * @return The shared_ptrs of the newly added allocators (for tracking util)
  */
 static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
-    AllocatorManager& manager, int count, size_t capacity, int id_offset) {
+    AllocatorManager& manager, int count, size_t capacity, int id_offset,
+    uint32_t max_capacity = 0) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
     new_allocs.reserve(count);
     constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
@@ -242,8 +215,7 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
         uint64_t base_addr = kInjectedBaseAddr +
                              (static_cast<uint64_t>(id_offset + i) * capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            name, base_addr, capacity, name);
-        downsizeAllocator(allocator);
+            name, base_addr, capacity, name, max_capacity);
         manager.addAllocator(name, allocator);
         new_allocs.push_back(allocator);
     }

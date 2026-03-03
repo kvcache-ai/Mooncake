@@ -191,7 +191,8 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
-                          std::string transport_endpoint);
+                          std::string transport_endpoint,
+                          uint32_t max_node_capacity = 0);
 
     ~OffsetBufferAllocator() override;
 
@@ -221,9 +222,6 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
-
-    friend void downsizeAllocator(
-        std::shared_ptr<OffsetBufferAllocator> allocator);
 };
 
 // The main difference is that it allocates real memory and returns it, while
