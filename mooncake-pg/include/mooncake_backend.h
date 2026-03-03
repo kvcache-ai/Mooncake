@@ -3,9 +3,11 @@
 
 #include <memory>
 #include <mooncake_worker.cuh>
+#include <connection_poller.h>
 #include <p2p_proxy.hh>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include "connection_poller.h"
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -133,10 +135,6 @@ class MooncakeBackend final : public ::c10d::Backend {
     SegmentInfo rank_info;
     TransferGroupMeta meta_;
     bool isShutdown_{false};
-    int nextRankForConnection_ = 0;
-
-    void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
-                          int backendIndex);
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
@@ -147,6 +145,11 @@ class MooncakeBackend final : public ::c10d::Backend {
     // p2p_device_worker_ is created in P2PDeviceWorkerManager,
     // and is shared between backends in the same device.
     std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
+
+    // Connection Poller Context
+    // Similar to p2p_proxy_, connection_ctx_ is created in MooncakeBackend, but
+    // can live longer than MooncakeBackend.
+    std::shared_ptr<ConnectionContext> connection_ctx_;
 };
 
 }  // namespace mooncake

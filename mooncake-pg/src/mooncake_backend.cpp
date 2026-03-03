@@ -8,6 +8,7 @@
 #include <chrono>
 #include <atomic>
 #include <memory>
+#include "connection_poller.h"
 
 namespace mooncake {
 
@@ -138,17 +139,6 @@ MooncakeBackend::MooncakeBackend(
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
-    warmup_send_region_ = new int32_t[kMaxNumRanks];
-    warmup_send_region_[0] = 1;
-    int rc = engine_.registerLocalMemory(
-        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
-    TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
-
-    warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_.registerLocalMemory(
-        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
-    TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
-
     auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
     int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
 
@@ -192,12 +182,6 @@ MooncakeBackend::MooncakeBackend(
                    std::to_string(rank_),
                localServerName);
 
-    int backendIndex = backendIndex_;
-
-    std::thread([this, store, backendIndex] {
-        connectionPoller(store, backendIndex);
-    }).detach();
-
     meta_.rank = rank;
     meta_.size = size;
     meta_.taskCount = 0;
@@ -234,7 +218,12 @@ MooncakeBackend::MooncakeBackend(
     meta_.bufferBaseIndex = backendIndex_ * 10;
     p2p_proxy_->BindMeta(&meta_);
 
-    while (nextRankForConnection_ != size_) {
+    connection_ctx_ = std::make_shared<ConnectionContext>(
+        backendIndex_, rank, size, store, &meta_, &engine_);
+
+    ConnectionPoller::GetInstance().registerContext(connection_ctx_);
+
+    while (!connection_ctx_->isAllPeerConnected()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
@@ -712,10 +701,8 @@ void MooncakeBackend::shutdown() {
     p2p_device_worker_->removeProxy(p2p_proxy_);
     p2p_proxy_.reset();
 
-    engine_.unregisterLocalMemory(warmup_send_region_);
-    engine_.unregisterLocalMemory(warmup_recv_region_);
-    delete[] warmup_send_region_;
-    delete[] warmup_recv_region_;
+    ConnectionPoller::GetInstance().removeContext(connection_ctx_);
+
     for (size_t i = 0; i < 2; i++) {
         engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
@@ -736,7 +723,7 @@ void MooncakeBackend::shutdown() {
 int MooncakeBackend::getNumSyncedRanks() {
     std::vector<at::Tensor> tensors;
     tensors.emplace_back(torch::tensor(
-        nextRankForConnection_,
+        connection_ctx_->getTotalConnnectedPeers(),
         torch::dtype(torch::kInt).device(isCpu_ ? torch::kCPU : torch::kCUDA)));
     c10d::AllreduceOptions opts{
         .reduceOp = c10d::ReduceOp::MIN,
@@ -812,87 +799,6 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
                              std::to_string(meta_.backendIndex) + "_" +
                              std::to_string(rank),
                          std::to_string(meta_.taskCount));
-    }
-}
-
-void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
-                                       int backendIndex) {
-    while (!isShutdown_) {
-        for (int pollingRank = 0; pollingRank <= nextRankForConnection_;
-             ++pollingRank) {
-            if (meta_.peerConnected[pollingRank]) {
-                continue;
-            }
-            std::string serverNameKey = "server_name_" +
-                                        std::to_string(backendIndex) + "_" +
-                                        std::to_string(pollingRank);
-            try {
-                if (!store->check({serverNameKey})) {
-                    continue;
-                }
-            } catch (const std::exception& e) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                continue;
-            }
-            if (isShutdown_) {
-                break;
-            }
-            auto peerServerName = store->get_to_str(serverNameKey);
-            auto segment_id = engine_.openSegment(peerServerName);
-            meta_.segmentIDs[pollingRank] = segment_id;
-            std::string buffer_key = "buffer_" + std::to_string(backendIndex) +
-                                     "_" + std::to_string(pollingRank);
-            auto buffer_data = store->get(buffer_key);
-            memcpy(&meta_.segmentInfos[pollingRank], buffer_data.data(),
-                   sizeof(SegmentInfo));
-
-            if (pollingRank <= rank_) {
-                // Send a pre-flight request to establish connections
-                std::vector<TransferRequest> entries;
-                auto batchID = engine_.allocateBatchID(1);
-                engine_.submitTransfer(
-                    batchID,
-                    {TransferRequest{
-                        .opcode = TransferRequest::WRITE,
-                        .source = warmup_send_region_,
-                        .target_id = meta_.segmentIDs[pollingRank],
-                        .target_offset =
-                            meta_.segmentInfos[pollingRank].warmup_buffer[1] +
-                            rank_ * sizeof(int32_t),
-                        .length = sizeof(int32_t),
-                    }});
-
-                while (true) {
-                    TransferStatus status;
-                    engine_.getTransferStatus(batchID, 0, status);
-                    if (status.s == TransferStatusEnum::COMPLETED) {
-                        break;
-                    } else if (status.s == TransferStatusEnum::FAILED) {
-                        LOG(WARNING) << "Warmup request " << rank_ << " -> "
-                                     << pollingRank << " failed.";
-                        break;
-                    }
-                }
-                auto s = engine_.freeBatchID(batchID);
-                if (!s.ok()) {
-                    // This should not happen since getTransferStatus returns
-                    // COMPLETED/FAILED.
-                    LOG(ERROR) << "Unexpected BatchID leaked due to "
-                                  "freeBatchID failure: "
-                               << s.message();
-                }
-            } else {
-                // Wait for the warmup signals
-                while (!warmup_recv_region_[pollingRank]) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                }
-            }
-            meta_.peerConnected[pollingRank] = true;
-            if (pollingRank == nextRankForConnection_) {
-                ++nextRankForConnection_;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 }  // namespace mooncake
