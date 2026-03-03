@@ -36,6 +36,12 @@ DEFINE_int32(scale_out_trigger_pct, 50,
 DEFINE_int32(alloc_percent_after_scale, 30,
              "Percentage of num_allocations to allocate after scaleout");
 DEFINE_double(convergence_threshold, 0.1, "Threshold for convergence");
+DEFINE_int32(
+    prefill_pct, 0,
+    "Pre-fill the cluster to this utilization percentage before the "
+    "measured allocation loop (0 = disabled, original behavior). "
+    "When >0, early exit on consecutive failures is suppressed so that "
+    "all num_allocations are attempted under near-full conditions.");
 
 using namespace mooncake;
 
@@ -67,6 +73,10 @@ struct BenchConfig {
     int replica_num;
     int num_allocations;
     bool skewed;
+    // Pre-fill watermark: 0 = disabled (exit early on failure); >0 = pre-fill
+    // cluster to this % utilization before measuring, then run without early
+    // exit.
+    int prefill_pct = 0;
     std::string strategy_name;
     AllocationStrategyType strategy_type;
 
@@ -167,9 +177,9 @@ static constexpr uint32_t kBenchmarkMaxCapacity = 64 * 1024;
  *
  * @param id_offset Starting index for segment naming (for Scale-Out additions)
  */
-static AllocatorManager createCluster(int num_segments, size_t base_capacity,
-                                      bool skewed, int id_offset = 0,
-                                      uint32_t max_capacity = kBenchmarkMaxCapacity) {
+static AllocatorManager createCluster(
+    int num_segments, size_t base_capacity, bool skewed, int id_offset = 0,
+    uint32_t max_capacity = kBenchmarkMaxCapacity) {
     AllocatorManager manager;
     // Distribute segments evenly across kNumVirtualNodes virtual nodes if
     // num_segments > kNumVirtualNodes, otherwise 1 segment per node.
@@ -206,7 +216,7 @@ static AllocatorManager createCluster(int num_segments, size_t base_capacity,
  */
 static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
     AllocatorManager& manager, int count, size_t capacity, int id_offset,
-    uint32_t max_capacity = 0) {
+    uint32_t max_capacity = kBenchmarkMaxCapacity) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
     new_allocs.reserve(count);
     constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
@@ -368,6 +378,49 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     int success_count = 0;
     int total_count = 0;
 
+    // --- Pre-fill phase (only when prefill_pct > 0) ---
+    if (cfg.prefill_pct > 0) {
+        // Use large blocks to reach target utilization fast and avoid
+        // exhausting allocator metadata nodes (same strategy as ScaleOut
+        // pre-fill).
+        double total_cap_gb = computeClusterCapacityGB(
+            cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+        size_t pre_fill_alloc_size =
+            std::max(cfg.alloc_size, static_cast<size_t>(8ULL * MiB));
+        if (total_cap_gb > kLargeClusterThresholdGB) {
+            pre_fill_alloc_size =
+                std::max(pre_fill_alloc_size, static_cast<size_t>(32ULL * MiB));
+        }
+        // Estimate total pre-fill blocks to reach 100% so we can derive an
+        // adaptive sample interval. Checking every ~1% of capacity prevents
+        // overshooting the target on small clusters (e.g. 1-segment 1GB).
+        size_t total_cap_bytes = static_cast<size_t>(total_cap_gb * GiB);
+        int estimated_total_blocks = static_cast<int>(
+            total_cap_bytes / (pre_fill_alloc_size * cfg.replica_num));
+        int pre_fill_sample_interval = std::max(
+            1, estimated_total_blocks / 100);  // check ~every 1% of capacity
+
+        int pre_consec_failures = 0;
+        int pre_count = 0;
+        while (true) {
+            // Sample adaptively to avoid O(N) evaluation on every alloc,
+            // while still stopping close to the target utilization.
+            if (pre_count % pre_fill_sample_interval == 0) {
+                if (computeAverageUtilAll(manager) * 100.0 >= cfg.prefill_pct)
+                    break;
+            }
+            auto r = strategy->Allocate(manager, pre_fill_alloc_size,
+                                        cfg.replica_num);
+            if (r.has_value()) {
+                active_allocations.push_back(std::move(r.value()));
+                pre_consec_failures = 0;
+            } else {
+                if (++pre_consec_failures >= kMaxConsecFailures) break;
+            }
+            ++pre_count;
+        }
+    }
+
     auto total_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < cfg.num_allocations; ++i) {
@@ -385,7 +438,10 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
             consec_failures = 0;
             ++success_count;
         } else {
-            if (++consec_failures >= kMaxConsecFailures) break;
+            // When prefill_pct > 0 we are measuring near-full performance;
+            // do not exit early on consecutive failures.
+            if (++consec_failures >= kMaxConsecFailures && cfg.prefill_pct == 0)
+                break;
         }
     }
 
@@ -711,14 +767,17 @@ static void runFillupBenchmarks() {
         AllocationStrategyType::FREE_RATIO_FIRST,
     };
 
-    std::cout << "\n=== AllocationStrategy Fill-Up Benchmark Matrix ===\n"
-              << "Note: Test will exit early if " << 10
-              << " consecutive allocations fail.\n"
-              << "Config: num_allocations=" << FLAGS_num_allocations
-              << ", segment_capacity=" << FLAGS_segment_capacity << " MB\n"
-              << "Skewed setup: half nodes are (base + 50%) capacity, half are "
-                 "(base - 50%)\n"
-              << std::endl;
+    std::cout
+        << "\n=== AllocationStrategy Fill-Up Benchmark Matrix ===\n"
+        << (FLAGS_prefill_pct > 0
+                ? ("Mode: prefill_pct=" + std::to_string(FLAGS_prefill_pct) +
+                   "% (cluster pre-filled before measuring; no early exit)\n")
+                : "Mode: normal (exit early after 10 consecutive failures)\n")
+        << "Config: num_allocations=" << FLAGS_num_allocations
+        << ", segment_capacity=" << FLAGS_segment_capacity << " MB\n"
+        << "Skewed setup: half nodes are (base + 50%) capacity, half are "
+           "(base - 50%)\n"
+        << std::endl;
 
     std::vector<BenchConfig> configs;
     for (auto skew : skewed_options) {
@@ -737,6 +796,7 @@ static void runFillupBenchmarks() {
                         cfg.skewed = skew;
                         cfg.strategy_type = strategy;
                         cfg.strategy_name = strategyName(strategy);
+                        cfg.prefill_pct = FLAGS_prefill_pct;
                         cfg.workload_type = WorkloadType::FILL_UP;
                         configs.push_back(cfg);
                     }
