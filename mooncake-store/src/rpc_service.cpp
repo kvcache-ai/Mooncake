@@ -818,7 +818,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", replica_type=", replica_type);
         },
-        [] {}, [] {});
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_failures();
+        });
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
