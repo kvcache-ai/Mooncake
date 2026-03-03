@@ -29,6 +29,7 @@ setup(
                 "src/p2p_proxy.cc",
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_thread.cpp",
+                "src/connection_poller.cpp",
             ],
             extra_compile_args={
                 "cxx": [
