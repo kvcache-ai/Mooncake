@@ -325,10 +325,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            if (this->protocol == "ascend") {
-                ascend_segment_ptrs_.emplace_back(ptr);
-            } else if (this->protocol == "ubshmem") {
-                ubshmem_segment_ptrs_.emplace_back(ptr);
+            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+                ascend_segment_ptrs_.emplace_back(
+                    ptr, AscendSegmentDeleter{this->protocol});
             } else if (should_use_hugepage) {
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});

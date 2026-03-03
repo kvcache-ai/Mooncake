@@ -163,13 +163,6 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     }
 #endif
 
-#ifdef USE_UBSHMEM
-    if (protocol == "ubshmem" && total_size > 0) {
-        LOG(ERROR) << "Ascend runtime not support fabirc mem ";
-        return nullptr;
-    }
-#endif
-
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
@@ -239,13 +232,6 @@ void free_memory(const std::string &protocol, void *ptr) {
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend") {
         aclrtFreeHost(ptr);
-        return;
-    }
-#endif
-
-#ifdef USE_UBSHMEM
-    if (protocol == "ubshmem") {
-        LOG(ERROR) << "Ascend runtime not support fabirc mem ";
         return;
     }
 #endif
