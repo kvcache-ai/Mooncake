@@ -50,6 +50,21 @@ uint32_t MessageCodec::calculateChecksum(const void* data, size_t size) {
     return ~crc;
 }
 
+uint32_t MessageCodec::calculateChecksum2(const void* data1, size_t size1,
+                                          const void* data2, size_t size2) {
+    const uint8_t* bytes1 = static_cast<const uint8_t*>(data1);
+    const uint8_t* bytes2 = static_cast<const uint8_t*>(data2);
+    const uint32_t* table = getCRC32Table();
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < size1; i++) {
+        crc = table[(crc ^ bytes1[i]) & 0xFF] ^ (crc >> 8);
+    }
+    for (size_t i = 0; i < size2; i++) {
+        crc = table[(crc ^ bytes2[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
 bool MessageCodec::verifyChecksum(const ZmqMessageHeader& header,
                                   std::string_view data) {
     // Compute CRC32 checksum of the payload and compare with header
@@ -158,6 +173,35 @@ std::string MessageCodec::encodeDataMessage(
         header.topic_length + static_cast<size_t>(header.data_length));
     std::memcpy(message.data(), &header, sizeof(header));
 
+    return message;
+}
+
+std::string MessageCodec::encodeDataHeader(
+    ZmqSocketType socket_type, const void* data, size_t data_size,
+    const std::optional<std::string>& topic, uint64_t sequence_id) {
+    ZmqMessageHeader header;
+    header.socket_type = static_cast<uint8_t>(socket_type);
+    header.flags = topic.has_value() ? 0x02 : 0x00;
+    header.sequence_id = sequence_id;
+    header.topic_length = topic.has_value() ? topic->size() : 0;
+    header.data_length = data_size;
+
+    const size_t total_size = sizeof(header) + header.topic_length;
+    std::string message;
+    message.reserve(total_size);
+    message.append(reinterpret_cast<const char*>(&header), sizeof(header));
+    if (topic.has_value()) {
+        message.append(*topic);
+    }
+
+    // Checksum over (topic + payload) without copying
+    if (topic.has_value()) {
+        header.checksum =
+            calculateChecksum2(topic->data(), topic->size(), data, data_size);
+    } else {
+        header.checksum = calculateChecksum(data, data_size);
+    }
+    std::memcpy(message.data(), &header, sizeof(header));
     return message;
 }
 
@@ -280,6 +324,53 @@ std::optional<MessageCodec::DecodedMessage> MessageCodec::decodeMessage(
                         static_cast<size_t>(result.header.data_length));
     if (!verifyChecksum(result.header, payload)) {
         return std::nullopt;
+    }
+
+    return result;
+}
+
+std::optional<MessageCodec::DecodedMessage>
+MessageCodec::decodeMessageFromParts(std::string_view header_and_topic,
+                                     std::string_view payload) {
+    auto header_opt = decodeHeader(header_and_topic);
+    if (!header_opt) {
+        return std::nullopt;
+    }
+
+    DecodedMessage result;
+    result.header = *header_opt;
+
+    size_t offset = sizeof(ZmqMessageHeader);
+
+    if (result.header.flags & 0x02) {
+        if (header_and_topic.size() < offset + result.header.topic_length) {
+            LOG(ERROR) << "Header+topic too small for topic";
+            return std::nullopt;
+        }
+        result.topic =
+            header_and_topic.substr(offset, result.header.topic_length);
+        offset += result.header.topic_length;
+    }
+
+    if (payload.size() != result.header.data_length) {
+        LOG(ERROR) << "Payload size mismatch: expected "
+                   << result.header.data_length << ", got " << payload.size();
+        return std::nullopt;
+    }
+    result.data = payload;
+
+    if (result.header.flags & 0x02) {
+        uint32_t computed =
+            calculateChecksum2(result.topic.data(), result.topic.size(),
+                               payload.data(), payload.size());
+        if (computed != result.header.checksum) {
+            LOG(ERROR) << "Checksum verification failed";
+            return std::nullopt;
+        }
+    } else {
+        if (!verifyChecksum(result.header, payload)) {
+            return std::nullopt;
+        }
     }
 
     return result;
