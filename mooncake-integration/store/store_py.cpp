@@ -5,6 +5,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "types.h"
 
 #include <cstdlib>  // for atexit
 
@@ -253,6 +254,16 @@ class MooncakeStorePyWrapper {
 
     MooncakeStorePyWrapper() = default;
 
+    // Helper to initialize real client and register it
+    std::shared_ptr<RealClient> init_real_client() {
+        auto real_client = RealClient::create();
+        use_dummy_client_ = false;
+        store_ = real_client;
+        ResourceTracker::getInstance().registerInstance(
+            std::dynamic_pointer_cast<PyClient>(store_));
+        return real_client;
+    }
+
     bool is_client_initialized() const {
         // Check if the store and client are initialized
         // Dummy client does not use client_ instance
@@ -273,26 +284,15 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            if (use_dummy_client_) {
-                auto [buffer_base, buffer_size] = store_->get_buffer_info(key);
-                if (buffer_size == 0) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
+            auto buffer_handle = store_->get_buffer(key);
+            if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
-                                       buffer_size);
-            } else {
-                auto buffer_handle = store_->get_buffer(key);
-                if (!buffer_handle) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
-
-                py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes((char *)buffer_handle->ptr(),
-                                       buffer_handle->size());
+                return kNullString;
             }
+
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::bytes((char *)buffer_handle->ptr(),
+                                   buffer_handle->size());
         }
     }
 
@@ -322,7 +322,6 @@ class MooncakeStorePyWrapper {
                     data ? pybind11::bytes((char *)data->ptr(), data->size())
                          : kNullString);
             }
-
             return results;
         }
     }
@@ -347,9 +346,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::object get_tensor(const std::string &key) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return pybind11::none();
         }
 
@@ -363,9 +361,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             py::list empty;
             for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
             return empty;
@@ -866,6 +863,99 @@ class MooncakeStorePyWrapper {
         return batch_put_tensor_with_tp_impl(base_keys, tensors_list, config,
                                              tp_rank, tp_size, split_dim);
     }
+
+    int save_tensor_to_safetensor(const std::string &key,
+                                  py::object file_name_obj = py::none()) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "save_tensor_to_safetensor is not supported for "
+                       << "dummy client now";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        pybind11::object tensor = get_tensor(key);
+        if (tensor.is_none()) {
+            LOG(ERROR) << "Failed to fetch tensor for key: " << key;
+            return to_py_ret(ErrorCode::FILE_NOT_FOUND);
+        }
+
+        try {
+            std::string resolved_file_name =
+                file_name_obj.is_none() ? key
+                                        : file_name_obj.cast<std::string>();
+            auto safetensors_torch = py::module_::import("safetensors.torch");
+            py::dict payload;
+            payload[py::str(key)] = tensor;
+            safetensors_torch.attr("save_file")(payload, resolved_file_name);
+            return 0;
+        } catch (const pybind11::error_already_set &e) {
+            LOG(ERROR) << "Failed to save tensor to safetensor file: "
+                       << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    pybind11::object load_tensor_from_safetensor(py::object key_obj,
+                                                 const std::string &file_name) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return pybind11::none();
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "load_tensor_from_safetensor is not supported for "
+                       << "dummy client now";
+            return pybind11::none();
+        }
+
+        try {
+            auto safetensors_torch = py::module_::import("safetensors.torch");
+            py::dict loaded = safetensors_torch.attr("load_file")(file_name);
+            if (py::len(loaded) == 0) {
+                LOG(ERROR) << "No tensors found in safetensor file: "
+                           << file_name;
+                return pybind11::none();
+            }
+
+            std::string target_store_key =
+                key_obj.is_none() ? file_name : key_obj.cast<std::string>();
+
+            py::object selected_dict_key;
+            if (!key_obj.is_none()) {
+                py::str desired_key(target_store_key);
+                if (py::cast<bool>(loaded.attr("__contains__")(desired_key))) {
+                    selected_dict_key = desired_key;
+                } else {
+                    py::list dict_keys(loaded.attr("keys")());
+                    selected_dict_key = dict_keys[0];
+                    LOG(WARNING)
+                        << "Key " << target_store_key
+                        << " not found in safetensor file; using first entry";
+                }
+            } else {
+                py::list dict_keys(loaded.attr("keys")());
+                selected_dict_key = dict_keys[0];
+            }
+
+            py::object tensor = loaded[selected_dict_key];
+            int rc = put_tensor(target_store_key, tensor);
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to store tensor for key "
+                           << target_store_key << ", rc=" << rc;
+                return pybind11::none();
+            }
+
+            return tensor;
+        } catch (const pybind11::error_already_set &e) {
+            LOG(ERROR) << "Failed to load tensor from safetensor file: "
+                       << e.what();
+            return pybind11::none();
+        }
+    }
 };
 
 class MooncakeHostMemAllocatorPyWrapper {
@@ -977,7 +1067,10 @@ PYBIND11_MODULE(store, m) {
             oss << "QueryTaskResponse(id=" << self.id
                 << ", type=" << static_cast<int>(self.type)
                 << ", status=" << static_cast<int>(self.status)
-                << ", assigned_client=" << self.assigned_client << ")";
+                << ", created_at=" << self.created_at_ms_epoch
+                << ", last_updated_at=" << self.last_updated_at_ms_epoch
+                << ", assigned_client=" << self.assigned_client
+                << ", message=\"" << self.message << "\")";
             return oss.str();
         });
 
@@ -1047,17 +1140,14 @@ PYBIND11_MODULE(store, m) {
                const std::string &rdma_devices = "",
                const std::string &master_server_addr = "127.0.0.1:50051",
                const py::object &engine = py::none()) {
-                self.use_dummy_client_ = false;
-                self.store_ = std::make_shared<RealClient>();
-                ResourceTracker::getInstance().registerInstance(
-                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return self.store_->setup_real(
+                return real_client->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "");
@@ -1066,6 +1156,34 @@ PYBIND11_MODULE(store, m) {
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none())
+        .def(
+            "setup",
+            [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                auto real_client = self.init_real_client();
+
+                // Convert py::dict to ConfigDict (all values as strings)
+                ConfigDict config;
+                for (auto item : config_dict) {
+                    std::string key = py::str(item.first);
+                    std::string value = py::str(item.second);
+                    config[key] = value;
+                }
+
+                auto result = real_client->setup_internal(config);
+                return result.has_value() ? 0
+                                          : static_cast<int>(result.error());
+            },
+            py::arg("config"),
+            "Setup the store with a configuration dictionary.\n"
+            "Supported keys:\n"
+            "  local_hostname (required): Local hostname.\n"
+            "  metadata_server (required): Metadata server address.\n"
+            "  global_segment_size: Global segment size (default 16MB).\n"
+            "  local_buffer_size: Local buffer size (default 16MB).\n"
+            "  protocol: Transfer protocol (default 'tcp').\n"
+            "  rdma_devices: RDMA device list.\n"
+            "  master_server_addr: Master server address.\n"
+            "  ipc_socket_path: IPC socket path.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
@@ -1107,33 +1225,39 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR) << "batch_get_buffer is not supported for dummy "
-                                  "client now";
-                    return std::vector<std::shared_ptr<BufferHandle>>{};
-                }
                 return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
-        .def("remove",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                 py::gil_scoped_release release;
-                 return self.store_->remove(key);
-             })
+        .def(
+            "remove",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               bool force) {
+                py::gil_scoped_release release;
+                return self.store_->remove(key, force);
+            },
+            py::arg("key"), py::arg("force") = false,
+            "Remove an object from the store. If force=True, skip lease and "
+            "replication task checks.")
         .def(
             "remove_by_regex",
-            [](MooncakeStorePyWrapper &self, const std::string &str) {
+            [](MooncakeStorePyWrapper &self, const std::string &str,
+               bool force) {
                 py::gil_scoped_release release;
-                return self.store_->removeByRegex(str);
+                return self.store_->removeByRegex(str, force);
             },
-            py::arg("regex_pattern"),
+            py::arg("regex_pattern"), py::arg("force") = false,
             "Removes objects from the store whose keys match the given "
-            "regular expression.")
-        .def("remove_all",
-             [](MooncakeStorePyWrapper &self) {
-                 py::gil_scoped_release release;
-                 return self.store_->removeAll();
-             })
+            "regular expression. If force=True, skip lease and replication "
+            "task checks.")
+        .def(
+            "remove_all",
+            [](MooncakeStorePyWrapper &self, bool force) {
+                py::gil_scoped_release release;
+                return self.store_->removeAll(force);
+            },
+            py::arg("force") = false,
+            "Remove all objects from the store. If force=True, skip lease "
+            "and replication task checks.")
         .def("is_exist",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
@@ -1201,6 +1325,22 @@ PYBIND11_MODULE(store, m) {
         .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
              py::arg("keys"), py::arg("tensors_list"),
              "Put a batch of PyTorch tensors into the store")
+        .def("save_tensor_to_safetensor",
+             &MooncakeStorePyWrapper::save_tensor_to_safetensor, py::arg("key"),
+             py::arg("file_name") = py::none(),
+             "Export a tensor stored under the given key into a safetensors "
+             "file. "
+             "If file_name is not provided, the key will be used as the "
+             "filename.")
+        .def("load_tensor_from_safetensor",
+             &MooncakeStorePyWrapper::load_tensor_from_safetensor,
+             py::arg("key") = py::none(), py::arg("file_name"),
+             "Load a tensor from a safetensors file and store it back in "
+             "Mooncake.\n"
+             "If the 'key' parameter is not provided, the file_name is used as "
+             "the store key.\n"
+             "If the provided key is not found in the safetensor file, the "
+             "first tensor in the file is used and a warning is logged.")
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
              py::arg("tensor"), py::arg("config") = ReplicateConfig{},
              "Publish a PyTorch tensor with configurable replication settings")

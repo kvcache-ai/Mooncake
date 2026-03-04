@@ -179,11 +179,11 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             bool valid = false;
-            T acc = src[i];
+            T acc{};
             for (int64_t rank = 0; rank < numRanks; ++rank) {
                 if (activeRanks[rank]) {
                     if (!valid) {
-                        acc = src[i];
+                        acc = src[i + rank * numElements];
                         valid = true;
                     } else {
                         acc =
@@ -274,10 +274,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     auto state = std::make_shared<IterState>();
 
     auto processNextChunk = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weakProcessNextChunk =
+        processNextChunk;
 
-    *processNextChunk = [this, processNextChunk, state, opType, tensorSize,
+    *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
                          chunkSize, broadcastRoot, meta, tensorToBuffer,
                          bufferToTensor, future]() {
+        auto processNextChunk = weakProcessNextChunk.lock();
+
         if (state->currentPos >= tensorSize) {
             future->markCompleted(c10::IValue());
             return;

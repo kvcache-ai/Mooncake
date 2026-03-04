@@ -17,6 +17,7 @@ void MooncakeWorker::startWorker() {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
+        size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
         TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
             PAUSE();
@@ -30,6 +31,8 @@ void MooncakeWorker::startWorker() {
                 auto group = (TransferGroupMeta*)task.transferGroupMeta;
                 bool skipTransfer = (task.opType == c10d::OpType::BROADCAST &&
                                      group->rank != task.broadcastRoot) ||
+                                    (task.opType == c10d::OpType::SCATTER &&
+                                     group->rank != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     if (skipTransfer) {
@@ -42,6 +45,11 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
+                        if ((task.opType == c10d::OpType::GATHER ||
+                             task.opType == c10d::OpType::REDUCE) &&
+                            j != task.broadcastRoot) {
+                            continue;
+                        }
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
@@ -50,10 +58,13 @@ void MooncakeWorker::startWorker() {
                             case c10d::OpType::ALLREDUCE:
                             case c10d::OpType::ALLGATHER:
                             case c10d::OpType::_ALLGATHER_BASE:
+                            case c10d::OpType::REDUCE:
+                            case c10d::OpType::GATHER:
                                 break;
                             case c10d::OpType::ALLTOALL_BASE:
                             case c10d::OpType::ALLTOALL:
                             case c10d::OpType::_REDUCE_SCATTER_BASE:
+                            case c10d::OpType::SCATTER:
                                 source += j * task.tensorSize;
                                 break;
                             default:
@@ -65,6 +76,7 @@ void MooncakeWorker::startWorker() {
 
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
+                            case c10d::OpType::SCATTER:
                                 break;
                             case c10d::OpType::ALLREDUCE:
                             case c10d::OpType::ALLGATHER:
@@ -72,11 +84,15 @@ void MooncakeWorker::startWorker() {
                             case c10d::OpType::ALLTOALL_BASE:
                             case c10d::OpType::ALLTOALL:
                             case c10d::OpType::_REDUCE_SCATTER_BASE:
+                            case c10d::OpType::REDUCE:
+                            case c10d::OpType::GATHER:
                                 target_offset += group->rank * task.tensorSize;
                                 break;
+
                             default:
                                 break;
                         }
+                        rankToTaskId[i][j] = entries.size();
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void*)source,
@@ -100,16 +116,13 @@ void MooncakeWorker::startWorker() {
                         auto now = clock::now();
                         auto diff = std::chrono::duration_cast<
                             std::chrono::microseconds>(now - activeTime[i]);
-                        size_t task_id = 0;
                         for (int j = 0; j < group->size; ++j) {
                             if (!group->activeRanks[j]) {
                                 continue;
                             }
-                            group->engine->getTransferStatus(task.batchID,
-                                                             task_id, status);
-                            ++task_id;
-                            if (group->activeRanks[j] &&
-                                status.s != TransferStatusEnum::COMPLETED) {
+                            group->engine->getTransferStatus(
+                                task.batchID, rankToTaskId[i][j], status);
+                            if (status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (diff.count() > kPingTimeoutMicroseconds_ &&
                                      group->engine->sendNotifyByID(
@@ -140,9 +153,21 @@ void MooncakeWorker::startWorker() {
                             }
                         }
                     }
+
                     if (!batch_done) {
                         continue;
                     }
+
+                    if (!skipTransfer) {
+                        auto s = group->engine->freeBatchID(task.batchID);
+                        if (!s.ok()) {
+                            LOG(WARNING)
+                                << "BatchID leaked due to freeBatchID "
+                                   "failure (likely caused by a timeout): "
+                                << s.message();
+                        }
+                    }
+
                     auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
                                           .send_sync[task.bufferOffset];
 
@@ -152,6 +177,7 @@ void MooncakeWorker::startWorker() {
                             continue;
                         }
                         *source_ptr = 1;
+                        rankToTaskId[i][j] = entries.size();
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void*)source_ptr,
@@ -169,7 +195,7 @@ void MooncakeWorker::startWorker() {
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
-                    bool all_received = true;
+                    bool task_done = true;
                     auto signal_ptr = (int32_t*)group->segmentInfos[group->rank]
                                           .recv_sync[task.bufferOffset];
 
@@ -177,11 +203,20 @@ void MooncakeWorker::startWorker() {
                     auto diff =
                         std::chrono::duration_cast<std::chrono::microseconds>(
                             now - activeTime[i]);
+
+                    TransferStatus status;
                     for (int j = 0; j < group->size; ++j) {
-                        if (group->activeRanks[j] && signal_ptr[j] != 1) {
-                            if (diff.count() > kPingTimeoutMicroseconds_ &&
-                                group->engine->sendNotifyByID(
-                                    group->segmentIDs[j], msg)) {
+                        if (!group->activeRanks[j]) {
+                            continue;
+                        }
+                        group->engine->getTransferStatus(
+                            task.batchID, rankToTaskId[i][j], status);
+                        if (signal_ptr[j] != 1 ||
+                            status.s != TransferStatusEnum::COMPLETED) {
+                            if (status.s == TransferStatusEnum::FAILED ||
+                                (diff.count() > kPingTimeoutMicroseconds_ &&
+                                 group->engine->sendNotifyByID(
+                                     group->segmentIDs[j], msg))) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "
@@ -201,7 +236,7 @@ void MooncakeWorker::startWorker() {
                                 group->activeRanks[j] = false;
                                 group->peerConnected[j] = false;
                             } else {
-                                all_received = false;
+                                task_done = false;
                                 break;
                             }
                         }
@@ -210,14 +245,25 @@ void MooncakeWorker::startWorker() {
                         // reset timer
                         activeTime[i] = clock::now();
                     }
-                    if (all_received) {
+                    if (task_done) {
                         for (int j = 0; j < group->size; ++j) {
                             signal_ptr[j] = 0;
                         }
                         task_status[i].store(DONE, std::memory_order_release);
                         task.active = false;
                         if (hasCallback_[i]) {
-                            callbacks_[i]();
+                            // Move the callback to release the captured values
+                            // immediately after execution.
+                            auto callback = std::move(callbacks_[i]);
+                            hasCallback_[i] = false;
+                            callback();
+                        }
+                        auto s = group->engine->freeBatchID(task.batchID);
+                        if (!s.ok()) {
+                            LOG(WARNING)
+                                << "BatchID leaked due to freeBatchID "
+                                   "failure (likely caused by a timeout): "
+                                << s.message();
                         }
                     }
                 }

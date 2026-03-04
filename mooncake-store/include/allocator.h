@@ -66,17 +66,26 @@ class AllocatedBuffer {
     struct Descriptor {
         uint64_t size_;
         uintptr_t buffer_address_;
+        std::string protocol_;
         std::string transport_endpoint_;
-        YLT_REFL(Descriptor, size_, buffer_address_, transport_endpoint_);
+        YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
+                 transport_endpoint_);
     };
+
+    void change_to_cxl(std::string client_segment_name);
+    void* get_vaddr_from_cxl();
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
+    std::string protocol{"tcp"};
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
+
+    friend class Serializer<AllocatedBuffer>;
 };
 
 /**
@@ -204,6 +213,12 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
+    // Public method to get offset_allocator
+    std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
+        const {
+        return offset_allocator_;
+    }
+
    private:
     // metadata
     const std::string segment_name_;
@@ -214,6 +229,8 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    friend class Serializer<OffsetBufferAllocator>;
 };
 
 // The main difference is that it allocates real memory and returns it, while

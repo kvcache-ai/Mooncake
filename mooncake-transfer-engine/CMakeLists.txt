@@ -8,6 +8,11 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindJsonCpp.cmake)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
+
+  # Build asio_shared library for standalone build
+  # Set compile definitions before add_subdirectory to ensure proper compilation
+  add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
+  add_subdirectory(../mooncake-asio ${CMAKE_CURRENT_BINARY_DIR}/mooncake-asio)
 endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
@@ -58,6 +63,11 @@ endif()
 # Non-peermem requires cuMem allocated memory pointers
 if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
   add_subdirectory(nvlink-allocator)
+endif()
+
+# Build ubshmem allocator for Huawei NPU fabric memory
+if (USE_UBSHMEM)
+  add_subdirectory(ubshmem-allocator)
 endif()
 
 if (USE_TENT)

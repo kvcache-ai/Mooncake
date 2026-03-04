@@ -16,7 +16,6 @@
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
 #endif
-
 namespace mooncake {
 
 // Constants
@@ -32,13 +31,23 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
-static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
-static const std::string DEFAULT_ROOT_FS_DIR = "";
+static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
+    60 * 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
+    60 * 5;  // in seconds
+static constexpr uint32_t DEFAULT_SNAPSHOT_RETENTION_COUNT =
+    2;  // Keep 2 recent snapshots by default
+static const std::string DEFAULT_SNAPSHOT_BACKUP_DIR = "";
+constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
+static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
+static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
+static const size_t DEFAULT_CXL_SIZE = 8ULL * 1024 * 1024 * 1024;
+constexpr const char* DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
     std::numeric_limits<int64_t>::max();
-static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
+constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
@@ -53,6 +62,7 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
+static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 10;
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -88,10 +98,48 @@ using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");
 
+// Configuration dictionary type for setup_internal
+using ConfigDict = std::unordered_map<std::string, std::string>;
+
+// Store client configuration keys
+constexpr const char* CONFIG_KEY_LOCAL_HOSTNAME = "local_hostname";
+constexpr const char* CONFIG_KEY_METADATA_SERVER = "metadata_server";
+constexpr const char* CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
+constexpr const char* CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
+constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
+constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
+constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
+constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+
+// Store client configuration defaults
+static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
+static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
+constexpr const char* DEFAULT_PROTOCOL = "tcp";
+constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+
+// Store client configuration validation limits
+static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
+static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB
+
 inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
     return os;
 }
+
+/**
+ * @brief Convert UUID to string representation
+ * @param uuid The UUID to convert
+ * @return String representation of the UUID in format "first-second"
+ */
+std::string UuidToString(const UUID& uuid);
+
+/**
+ * @brief Convert string representation back to UUID
+ * @param str String representation of UUID in format "first-second"
+ * @param uuid Output parameter for the parsed UUID
+ * @return true if parsing succeeded, false otherwise
+ */
+bool StringToUuid(const std::string& str, UUID& uuid);
 
 UUID generate_uuid();
 
@@ -146,6 +194,8 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_FOUND = -710,       ///< Replica not found.
     REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
+    REPLICA_NOT_IN_LOCAL_MEMORY =
+        -713,  ///< Replica does not reside in current node memory.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -179,6 +229,10 @@ enum class ErrorCode : int32_t {
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
+    SERIALIZE_UNSUPPORTED = -1500,  ///< Serialization unsupported.
+    SERIALIZE_FAIL = -1501,         ///< Serialization failed.
+    DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
+    PERSISTENT_FAIL = -1503,        ///< Persistent failed.
     // Task errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
     TASK_PENDING_LIMIT_EXCEEDED =
@@ -194,6 +248,17 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ErrorCode& errorCode) noexcept {
     return os << toString(errorCode);
 }
+
+struct SerializationError {
+    ErrorCode code;
+    std::string message;
+
+    SerializationError(ErrorCode c, const std::string& msg)
+        : code(c), message(msg) {}
+
+    // Construct from ErrorCode
+    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
+};
 
 /**
  * @brief Represents a contiguous memory region
@@ -217,9 +282,19 @@ struct Segment {
     size_t size{0};
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
+    std::string protocol;
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+
+/**
+ * @brief Allocation strategy type for segment allocation
+ */
+enum class AllocationStrategyType {
+    RANDOM = 0,        // Pure random allocation
+    FREE_RATIO_FIRST,  // Free-ratio-first allocation
+    CXL,               // CXL-specific allocation
+};
 
 /**
  * @brief Client status from the master's perspective

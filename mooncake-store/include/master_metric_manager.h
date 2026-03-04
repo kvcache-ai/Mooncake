@@ -60,6 +60,8 @@ class MasterMetricManager {
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
     double get_segment_mem_used_ratio(const std::string& segment);
+    void reset_segment_allocated_mem_size(const std::string& segment);
+    void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
 
@@ -85,6 +87,11 @@ class MasterMetricManager {
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
+
+    // Snapshot Metrics
+    void set_snapshot_duration_ms(int64_t size);
+    void inc_snapshot_success();
+    void inc_snapshot_fail();
 
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
@@ -234,6 +241,8 @@ class MasterMetricManager {
     void inc_move_end_failures(int64_t val = 1);
     void inc_move_revoke_requests(int64_t val = 1);
     void inc_move_revoke_failures(int64_t val = 1);
+    void inc_evict_disk_replica_requests(int64_t val = 1);
+    void inc_evict_disk_replica_failures(int64_t val = 1);
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     // Getters
@@ -249,6 +258,8 @@ class MasterMetricManager {
     int64_t get_move_end_failures();
     int64_t get_move_revoke_requests();
     int64_t get_move_revoke_failures();
+    int64_t get_evict_disk_replica_requests();
+    int64_t get_evict_disk_replica_failures();
 
     // Copy, Move, QueryTask, FetchTasks, MarkTaskToComplete Metrics
     void inc_create_copy_task_requests(int64_t val = 1);
@@ -416,6 +427,10 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
 
+    // Snapshot Metrics
+    ylt::metric::histogram_t snapshot_duration_ms_;
+    ylt::metric::counter_t snapshot_success_;
+    ylt::metric::counter_t snapshot_fail_;
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
     ylt::metric::counter_t copy_start_failures_;
@@ -429,6 +444,8 @@ class MasterMetricManager {
     ylt::metric::counter_t move_end_failures_;
     ylt::metric::counter_t move_revoke_requests_;
     ylt::metric::counter_t move_revoke_failures_;
+    ylt::metric::counter_t evict_disk_replica_requests_;
+    ylt::metric::counter_t evict_disk_replica_failures_;
 
     // Copy and Move, FetchTasks, MarkTaskToComplete Metrics
     ylt::metric::counter_t create_copy_task_requests_;

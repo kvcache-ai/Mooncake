@@ -250,6 +250,16 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
+      // Snapshot Metrics
+      snapshot_duration_ms_(
+          "master_snapshot_duration_ms",
+          "Distribution of snapshot operation durations in milliseconds",
+          {0, 500, 1000, 5000, 10000, 30000, 60000, 120000, 180000, 240000,
+           300000}),
+      snapshot_success_("master_snapshot_success",
+                        "Total number of successful snapshot operations"),
+      snapshot_fail_("master_snapshot_fail",
+                     "Total number of failed snapshot operations"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -277,6 +287,12 @@ MasterMetricManager::MasterMetricManager()
                             "Total number of MoveRevoke requests received"),
       move_revoke_failures_("master_move_revoke_failures_total",
                             "Total number of failed MoveRevoke requests"),
+      evict_disk_replica_requests_(
+          "master_evict_disk_replica_requests_total",
+          "Total number of EvictDiskReplica requests received"),
+      evict_disk_replica_failures_(
+          "master_evict_disk_replica_failures_total",
+          "Total number of failed EvictDiskReplica requests"),
 
       /*
        * Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
@@ -375,6 +391,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     move_end_failures_.inc(0);
     move_revoke_requests_.inc(0);
     move_revoke_failures_.inc(0);
+    evict_disk_replica_requests_.inc(0);
+    evict_disk_replica_failures_.inc(0);
 
     // Update Batch Request Counters
     batch_exist_key_requests_.inc(0);
@@ -491,6 +509,16 @@ double MasterMetricManager::get_global_mem_used_ratio(void) {
 int64_t MasterMetricManager::get_segment_allocated_mem_size(
     const std::string& segment) {
     return mem_allocated_size_per_segment_.value({segment});
+}
+
+void MasterMetricManager::reset_segment_allocated_mem_size(
+    const std::string& segment) {
+    mem_allocated_size_per_segment_.update({segment}, 0);
+}
+
+void MasterMetricManager::reset_segment_total_mem_capacity(
+    const std::string& segment) {
+    mem_total_capacity_per_segment_.update({segment}, 0);
 }
 
 int64_t MasterMetricManager::get_segment_total_mem_capacity(
@@ -787,6 +815,14 @@ void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
     put_start_release_cnt_.inc(count);
     put_start_discarded_staging_size_.dec(size);
 }
+
+void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
+    snapshot_duration_ms_.observe(size);
+}
+
+void MasterMetricManager::inc_snapshot_success() { snapshot_success_.inc(); }
+
+void MasterMetricManager::inc_snapshot_fail() { snapshot_fail_.inc(); }
 
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
@@ -1109,6 +1145,12 @@ void MasterMetricManager::inc_move_revoke_requests(int64_t val) {
 void MasterMetricManager::inc_move_revoke_failures(int64_t val) {
     move_revoke_failures_.inc(val);
 }
+void MasterMetricManager::inc_evict_disk_replica_requests(int64_t val) {
+    evict_disk_replica_requests_.inc(val);
+}
+void MasterMetricManager::inc_evict_disk_replica_failures(int64_t val) {
+    evict_disk_replica_failures_.inc(val);
+}
 
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
 // Getters
@@ -1147,6 +1189,12 @@ int64_t MasterMetricManager::get_move_revoke_requests() {
 }
 int64_t MasterMetricManager::get_move_revoke_failures() {
     return move_revoke_failures_.value();
+}
+int64_t MasterMetricManager::get_evict_disk_replica_requests() {
+    return evict_disk_replica_requests_.value();
+}
+int64_t MasterMetricManager::get_evict_disk_replica_failures() {
+    return evict_disk_replica_failures_.value();
 }
 
 // Task create, query, fetch Metrics
@@ -1283,6 +1331,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(move_end_failures_);
     serialize_metric(move_revoke_requests_);
     serialize_metric(move_revoke_failures_);
+    serialize_metric(evict_disk_replica_requests_);
+    serialize_metric(evict_disk_replica_failures_);
 
     // Serialize CreateCopyTask, CreateMoveTask, MarkTaskToComplete, QueryTask,
     // FetchTasks Request Counters
@@ -1323,6 +1373,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_discard_cnt_);
     serialize_metric(put_start_release_cnt_);
     serialize_metric(put_start_discarded_staging_size_);
+
+    // Serialize Snapshot Metrics
+    serialize_metric(snapshot_duration_ms_);
+    serialize_metric(snapshot_success_);
+    serialize_metric(snapshot_fail_);
 
     return ss.str();
 }
@@ -1440,6 +1495,8 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t move_end_fails = move_end_failures_.value();
     int64_t move_revokes = move_revoke_requests_.value();
     int64_t move_revoke_fails = move_revoke_failures_.value();
+    int64_t evict_disk_replicas = evict_disk_replica_requests_.value();
+    int64_t evict_disk_replica_fails = evict_disk_replica_failures_.value();
 
     // Batch request counters
     int64_t batch_put_start_requests = batch_put_start_requests_.value();
@@ -1545,7 +1602,9 @@ std::string MasterMetricManager::get_summary_string() {
        << ", ";
     ss << "MoveEnd=" << move_ends - move_end_fails << "/" << move_ends << ", ";
     ss << "MoveRevoke=" << move_revokes - move_revoke_fails << "/"
-       << move_revokes;
+       << move_revokes << ", ";
+    ss << "EvictDiskReplica=" << evict_disk_replicas - evict_disk_replica_fails
+       << "/" << evict_disk_replicas;
 
     // Batch request summary
     ss << " | Batch Requests "
@@ -1613,14 +1672,22 @@ std::string MasterMetricManager::get_summary_string() {
               mark_task_to_complete_failures_.value()
        << "/" << mark_task_to_complete_requests_.value() << "), ";
     // Eviction summary
-    ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
-       << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
+    ss << " | Eviction: "
+       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
+       << ", "
+       << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
 
     // Discard summary
-    ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
+    ss << " | Discard: "
+       << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
+
+    // Snapshot summary
+    ss << " | Snapshots: "
+       << "Success=" << snapshot_success_.value() << ", "
+       << "Fail=" << snapshot_fail_.value();
 
     return ss.str();
 }

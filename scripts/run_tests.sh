@@ -40,8 +40,9 @@ DUMMY_TEST_PID_2=$!
 wait $DUMMY_TEST_PID_1 $DUMMY_TEST_PID_2
 kill $CLIENT_PID || true
 
-pip install torch numpy
+pip install torch numpy safetensors packaging
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 kill $MASTER_PID || true
 
 
@@ -62,6 +63,22 @@ if [ -n "$TEST_SSD_OFFLOAD_IN_EVICT" ]; then
 else
     echo "Skipping test: MOONCAKE_STORAGE_ROOT_DIR environment variable is not set"
 fi
+
+echo "Running CXL protocol test (test_distributed_object_store_cxl.py)..."
+killall mooncake_master || true
+sleep 2
+
+echo "Starting Mooncake Master with CXL enabled (--enable_cxl=true)..."
+mooncake_master \
+  --default_kv_lease_ttl=500 \
+  --enable_cxl=true \
+  &
+CXL_MASTER_PID=$!
+sleep 3
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
+kill $CXL_MASTER_PID || true
+sleep 2
+echo "CXL protocol test completed successfully!"
 
 echo "Running CLI entry point tests..."
 python test_cli.py

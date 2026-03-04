@@ -1,4 +1,5 @@
 #include "rpc_service.h"
+#include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -653,28 +654,31 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    const std::string& key) {
+    const std::string& key, bool force) {
     return execute_rpc(
-        "Remove", [&] { return master_service_.Remove(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "Remove", [&] { return master_service_.Remove(key, force); },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    const std::string& str) {
+    const std::string& str, bool force) {
     return execute_rpc(
-        "RemoveByRegex", [&] { return master_service_.RemoveByRegex(str); },
-        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        "RemoveByRegex",
+        [&] { return master_service_.RemoveByRegex(str, force); },
+        [&](auto& timer) {
+            timer.LogRequest("regex=", str, ", force=", force);
+        },
         [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll() {
+long WrappedMasterService::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = master_service_.RemoveAll();
+    long result = master_service_.RemoveAll(force);
     timer.LogResponse("items_removed=", result);
     return result;
 }
@@ -800,6 +804,26 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
         },
         [] { MasterMetricManager::instance().inc_move_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
+    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    return execute_rpc(
+        "EvictDiskReplica",
+        [&] {
+            return master_service_.EvictDiskReplica(client_id, key,
+                                                    replica_type);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_type=", replica_type);
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_evict_disk_replica_failures();
+        });
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
@@ -1011,6 +1035,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
         &wrapped_master_service);
