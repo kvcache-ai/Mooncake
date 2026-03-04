@@ -241,6 +241,9 @@ class Replica {
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
         const;
 
+    // only memory replica and p2p proxy replica have segment id
+    [[nodiscard]] std::optional<UUID> get_segment_id() const;
+
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
@@ -251,6 +254,7 @@ class Replica {
         }
     }
 
+   public:
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
     struct ReplicaTypeVisitor {
@@ -272,6 +276,19 @@ class Replica {
         YLT_REFL(Descriptor, descriptor_variant, status);
 
         // Helper functions
+        ReplicaType type() const {
+            return std::visit(
+                [](const auto& desc) -> ReplicaType {
+                    using T = std::decay_t<decltype(desc)>;
+                    if constexpr (std::is_same_v<T, MemoryDescriptor>)
+                        return ReplicaType::MEMORY;
+                    else if constexpr (std::is_same_v<T, DiskDescriptor>)
+                        return ReplicaType::DISK;
+                    else if constexpr (std::is_same_v<T, LocalDiskDescriptor>)
+                        return ReplicaType::LOCAL_DISK;
+                },
+                descriptor_variant);
+        }
         bool is_memory_replica() noexcept {
             return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
         }
@@ -398,6 +415,16 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
         return segment_names;
     }
     return std::vector<std::optional<std::string>>();
+}
+
+inline std::optional<UUID> Replica::get_segment_id() const {
+    if (is_memory_replica()) {
+        const auto& mem_data = std::get<MemoryReplicaData>(data_);
+        if (mem_data.buffer) {
+            return mem_data.buffer->getSegmentId();
+        }
+    }
+    return std::nullopt;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {

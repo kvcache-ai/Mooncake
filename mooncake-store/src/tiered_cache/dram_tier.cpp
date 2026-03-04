@@ -142,11 +142,11 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
     switch (allocator_type_) {
         case BufferAllocatorType::OFFSET:
             allocator_ = std::make_shared<OffsetBufferAllocator>(
-                segment_name, base_address, capacity_, segment_name);
+                segment_name, base_address, capacity_, segment_name, tier_id_);
             break;
         case BufferAllocatorType::CACHELIB:
             allocator_ = std::make_shared<CachelibBufferAllocator>(
-                segment_name, base_address, capacity_, segment_name);
+                segment_name, base_address, capacity_, segment_name, tier_id_);
             break;
         default:
             LOG(ERROR) << "Unsupported allocator type for DramCacheTier";

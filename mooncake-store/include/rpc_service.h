@@ -38,14 +38,19 @@ class WrappedMasterService {
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids);
 
-    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
-        const std::vector<std::string>& object_keys, const UUID& client_id,
-        const std::string& segment_name);
-
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+        const std::string& key, const GetReplicaListRequestConfig& config =
+                                    GetReplicaListRequestConfig());
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys,
+                        const GetReplicaListRequestConfig& config =
+                            GetReplicaListRequestConfig());
 
     tl::expected<void, ErrorCode> Remove(const std::string& key);
 
@@ -56,7 +61,14 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);
 
-    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
+    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
+                                               const UUID& client_id);
+
+    tl::expected<HeartbeatResponse, ErrorCode> Heartbeat(
+        const HeartbeatRequest& req);
+
+    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient(
+        const RegisterClientRequest& req);
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 

@@ -448,9 +448,10 @@ class Client {
 
     // For high availability
     MasterViewHelper master_view_helper_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
-    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    std::thread heartbeat_thread_;
+    std::atomic<bool> heartbeat_running_{false};
+    void HeartbeatThreadMain(bool is_ha_mode,
+                             std::string current_master_address);
 
     coro_rpc::coro_rpc_server rpc_server_;
     std::optional<DataManager>

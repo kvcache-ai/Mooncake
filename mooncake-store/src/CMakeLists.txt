@@ -17,10 +17,11 @@ set(MOONCAKE_STORE_SOURCES
     etcd_helper.cpp
     ha_helper.cpp
     centralized_segment_manager.cpp
+    segment_manager.cpp
+    client_meta.cpp
     client_manager.cpp
     centralized_client_manager.cpp
-    p2p_client_manager.cpp
-    p2p_segment_manager.cpp
+    centralized_client_meta.cpp
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp

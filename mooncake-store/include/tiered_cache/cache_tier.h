@@ -3,7 +3,6 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include <optional>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"

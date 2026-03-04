@@ -689,10 +689,10 @@ void DummyClient::ping_thread_main() {
 
     while (ping_running_) {
         auto ping_result =
-            invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+            invoke_rpc<&RealClient::ping, HeartbeatResponse>(client_id_);
 
         if (ping_result.has_value() &&
-            ping_result.value().client_status == ClientStatus::OK) {
+            ping_result.value().status == ClientStatus::HEALTH) {
             ping_fail_count = 0;
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
@@ -734,7 +734,8 @@ void DummyClient::ping_thread_main() {
                     // Even if register_shm_via_ipc succeeded, we should check
                     // if RPC is responsive
                     auto check_rpc =
-                        invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+                        invoke_rpc<&RealClient::ping, HeartbeatResponse>(
+                            client_id_);
                     if (check_rpc.has_value()) {
                         LOG(INFO) << "RPC connection restored";
                         ping_fail_count = 0;

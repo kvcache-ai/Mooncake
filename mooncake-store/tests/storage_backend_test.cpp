@@ -4,8 +4,6 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
-#include <iostream>
-#include <ranges>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
@@ -21,22 +19,14 @@ class StorageBackendTest : public ::testing::Test {
         google::InitGoogleLogging("StorageBackendTest");
         FLAGS_logtostderr = true;
         data_path = std::filesystem::current_path().string() + "/data";
+        fs::remove_all(data_path);
         fs::create_directories(data_path);
-        for (const auto& entry : fs::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) {
-                fs::remove(entry.path());
-            }
-        }
     }
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
         LOG(INFO) << "Clear test data...";
-        for (const auto& entry : fs::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) {
-                fs::remove(entry.path());
-            }
-        }
+        fs::remove_all(data_path);
     }
 };
 
@@ -55,8 +45,8 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
-    ASSERT_TRUE(
-        BatchOffloadUtil(storage_backend, keys, sizes, test_data, buckets));
+    ASSERT_TRUE(mooncake::BatchOffloadUtil(storage_backend, keys, sizes,
+                                           test_data, buckets));
 
     std::unordered_map<std::string, StorageObjectMetadata>
         batche_object_metadata;
@@ -109,8 +99,8 @@ TEST_F(StorageBackendTest, BucketScan) {
     std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
     std::unordered_map<std::string, std::string> batch_data;
-    ASSERT_TRUE(
-        BatchOffloadUtil(storage_backend, keys, sizes, batch_data, buckets));
+    ASSERT_TRUE(mooncake::BatchOffloadUtil(storage_backend, keys, sizes,
+                                           batch_data, buckets));
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metadatas;
     std::vector<int64_t> scan_buckets;

@@ -110,10 +110,10 @@ MasterMetricManager::MasterMetricManager()
       remount_segment_failures_(
           "master_remount_segment_failures_total",
           "Total number of failed RemountSegment requests"),
-      ping_requests_("master_ping_requests_total",
-                     "Total number of ping requests received"),
-      ping_failures_("master_ping_failures_total",
-                     "Total number of failed ping requests"),
+      heartbeat_requests_("master_heartbeat_requests_total",
+                          "Total number of heartbeat requests received"),
+      heartbeat_failures_("master_heartbeat_failures_total",
+                          "Total number of failed heartbeat requests"),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -299,8 +299,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     unmount_segment_failures_.inc(0);
     remount_segment_requests_.inc(0);
     remount_segment_failures_.inc(0);
-    ping_requests_.inc(0);
-    ping_failures_.inc(0);
+    heartbeat_requests_.inc(0);
+    heartbeat_failures_.inc(0);
 
     // Update Batch Request Counters
     batch_exist_key_requests_.inc(0);
@@ -599,11 +599,11 @@ void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
     remount_segment_failures_.inc(val);
 }
-void MasterMetricManager::inc_ping_requests(int64_t val) {
-    ping_requests_.inc(val);
+void MasterMetricManager::inc_heartbeat_requests(int64_t val) {
+    heartbeat_requests_.inc(val);
 }
-void MasterMetricManager::inc_ping_failures(int64_t val) {
-    ping_failures_.inc(val);
+void MasterMetricManager::inc_heartbeat_failures(int64_t val) {
+    heartbeat_failures_.inc(val);
 }
 
 // Batch Operation Statistics (Counters)
@@ -810,12 +810,12 @@ int64_t MasterMetricManager::get_remount_segment_failures() {
     return remount_segment_failures_.value();
 }
 
-int64_t MasterMetricManager::get_ping_requests() {
-    return ping_requests_.value();
+int64_t MasterMetricManager::get_heartbeat_requests() {
+    return heartbeat_requests_.value();
 }
 
-int64_t MasterMetricManager::get_ping_failures() {
-    return ping_failures_.value();
+int64_t MasterMetricManager::get_heartbeat_failures() {
+    return heartbeat_failures_.value();
 }
 
 int64_t MasterMetricManager::get_batch_exist_key_requests() {
@@ -1051,8 +1051,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
-    serialize_metric(ping_requests_);
-    serialize_metric(ping_failures_);
+    serialize_metric(heartbeat_requests_);
+    serialize_metric(heartbeat_failures_);
 
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
@@ -1063,6 +1063,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(batch_replica_clear_failures_);
     serialize_metric(batch_get_replica_list_requests_);
     serialize_metric(batch_get_replica_list_failures_);
+    serialize_metric(batch_get_replica_list_partial_successes_);
+    serialize_metric(batch_get_replica_list_items_);
+    serialize_metric(batch_get_replica_list_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
     serialize_metric(batch_put_end_requests_);
@@ -1235,9 +1238,9 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t evicted_key_count = evicted_key_count_.value();
     int64_t evicted_size = evicted_size_.value();
 
-    // Ping counters
-    int64_t ping = ping_requests_.value();
-    int64_t ping_fails = ping_failures_.value();
+    // Heartbeat counters
+    int64_t heartbeat = heartbeat_requests_.value();
+    int64_t heartbeat_fails = heartbeat_failures_.value();
 
     // Discard counters
     int64_t put_start_discard_cnt = put_start_discard_cnt_.value();
@@ -1270,7 +1273,8 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
        << ", ";
-    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
+    ss << "Heartbeat=" << heartbeat - heartbeat_fails << "/" << heartbeat
+       << ", ";
 
     // Batch request summary
     ss << " | Batch Requests "

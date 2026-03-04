@@ -68,8 +68,10 @@ DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "How long a client is considered alive after the last ping, only "
-             "used in HA mode");
+             "How long a client is considered alive after the last heartbeat");
+DEFINE_int64(
+    client_crashed_ttl, mooncake::DEFAULT_CLIENT_CRASHED_TTL_SEC,
+    "How long a client is considered crashed after the last heartbeat");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -142,6 +144,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
+    default_config.GetInt64("client_crashed_ttl_sec",
+                            &master_config.client_crashed_ttl_sec, -1);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
@@ -304,6 +308,10 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
     }
+    if (google::GetCommandLineFlagInfo("client_crashed_ttl", &info) &&
+        !info.is_default) {
+        master_config.client_crashed_ttl_sec = FLAGS_client_crashed_ttl;
+    }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -443,6 +451,24 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
+
+    // Process client_crashed_ttl_sec logic
+    if (master_config.client_crashed_ttl_sec == -1) {
+        // Not set by config file and not set by CLI -> Default to 3x live ttl
+        master_config.client_crashed_ttl_sec =
+            master_config.client_live_ttl_sec * 3;
+    } else {
+        // Explicitly set (by file or CLI) -> Validate
+        if (master_config.client_crashed_ttl_sec <
+            master_config.client_live_ttl_sec) {
+            LOG(FATAL) << "client_crashed_ttl ("
+                       << master_config.client_crashed_ttl_sec
+                       << ") must be >= client_ttl ("
+                       << master_config.client_live_ttl_sec << ")";
+            return 1;
+        }
+    }
+
     LOG(INFO) << "Master service started on port " << master_config.rpc_port
               << ", max_threads=" << master_config.rpc_thread_num
               << ", enable_metric_reporting="
@@ -460,6 +486,7 @@ int main(int argc, char* argv[]) {
               << ", enable_offload=" << master_config.enable_offload
               << ", etcd_endpoints=" << master_config.etcd_endpoints
               << ", client_ttl=" << master_config.client_live_ttl_sec
+              << ", client_crashed_ttl=" << master_config.client_crashed_ttl_sec
               << ", rpc_thread_num=" << master_config.rpc_thread_num
               << ", rpc_port=" << master_config.rpc_port
               << ", rpc_address=" << master_config.rpc_address

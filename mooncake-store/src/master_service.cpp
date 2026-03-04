@@ -15,10 +15,9 @@ MasterService::ObjectMetadata::~ObjectMetadata() {
     MasterMetricManager::instance().dec_key_count(1);
 }
 
-MasterService::ObjectMetadata::ObjectMetadata(const UUID& client_id,
-                                              size_t value_length,
+MasterService::ObjectMetadata::ObjectMetadata(size_t value_length,
                                               std::vector<Replica>&& reps)
-    : client_id_(client_id), replicas_(std::move(reps)), size_(value_length) {
+    : replicas_(std::move(reps)), size_(value_length) {
     MasterMetricManager::instance().inc_key_count(1);
     MasterMetricManager::instance().observe_value_size(value_length);
 }
@@ -26,10 +25,41 @@ MasterService::ObjectMetadata::ObjectMetadata(const UUID& client_id,
 MasterService::MasterService(const MasterServiceConfig& config)
     : enable_ha_(config.enable_ha), view_version_(config.view_version) {}
 
+void MasterService::InitializeClientManager() {
+    GetClientManager().SetSegmentRemovalCallback(
+        [this](const UUID& segment_id) { this->OnSegmentRemoved(segment_id); });
+}
+
+auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    auto client = GetClientManager().GetClient(client_id);
+    if (!client) {
+        LOG(ERROR) << "MountSegment: client not found"
+                   << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+
+    auto result = client->MountSegment(segment);
+    if (!result) {
+        LOG(ERROR) << "fail to mount segment"
+                   << ", segment=" << segment.name
+                   << ", client_id=" << client_id << ", ret=" << result.error();
+        return result;
+    }
+    return {};
+}
+
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    auto result = GetClientManager().UnmountSegment(segment_id, client_id);
+    auto client = GetClientManager().GetClient(client_id);
+    if (!client) {
+        LOG(ERROR) << "UnmountSegment: client not found"
+                   << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+
+    auto result = client->UnmountSegment(segment_id);
     if (!result) {
         LOG(ERROR) << "fail to unmount segment"
                    << ", segment_id=" << segment_id
@@ -37,6 +67,125 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         return result;
     }
     return {};
+}
+
+void MasterService::OnObjectRemoved(ObjectMetadata& metadata) {
+    for (auto& replica : metadata.replicas_) {
+        OnReplicaRemoved(replica);
+    }
+}
+
+// As a callback, called by SegmentManager when a segment is removed:
+// 1. remove reverse index of segment
+// 2. remove the replica in metadata about the segment
+void MasterService::OnSegmentRemoved(const UUID& segment_id) {
+    for (size_t i = 0; i < GetShardCount(); ++i) {
+        auto& shard = GetShard(i);
+        MutexLocker lock(&shard.mutex);
+
+        auto idx_it = shard.segment_key_index.find(segment_id);
+        if (idx_it == shard.segment_key_index.end()) {
+            continue;
+        }
+
+        // the reverse index using string_view acquired from metadata.
+        // before remove the reverse index, we should acquire the key copier.
+        std::vector<std::string> affected_keys;
+        affected_keys.reserve(idx_it->second.size());
+        for (const auto& item : idx_it->second) {
+            affected_keys.emplace_back(item.first);
+        }
+
+        // 1. Remove the segment from the reverse index
+        shard.segment_key_index.erase(idx_it);
+
+        // 2. Remove the replica in metadata about the segment
+        for (const auto& key : affected_keys) {
+            auto meta_it = shard.metadata.find(key);
+            if (meta_it == shard.metadata.end()) {
+                continue;
+            }
+
+            auto& metadata = *meta_it->second;
+            auto& replicas = metadata.replicas_;
+
+            for (int k = replicas.size() - 1; k >= 0; --k) {
+                auto id = replicas[k].get_segment_id();
+                if (id.has_value() && id.value() == segment_id) {
+                    OnReplicaRemoved(replicas[k]);
+                    replicas.erase(replicas.begin() + k);
+                    break;
+                }
+            }
+
+            if (replicas.empty()) {
+                OnObjectRemoved(metadata);
+                shard.metadata.erase(meta_it);
+            }
+        }
+    }  // end for
+}
+
+void MasterService::AddReplicaToSegmentIndex(MetadataShard& shard,
+                                             const std::string& key,
+                                             const Replica& replica) {
+    if (replica.status() != ReplicaStatus::COMPLETE) {
+        return;
+    }
+    auto seg_id = replica.get_segment_id();
+    if (seg_id.has_value()) {
+        shard.segment_key_index[seg_id.value()][std::string_view(key)]++;
+    }
+}
+
+void MasterService::RemoveReplicaFromSegmentIndex(
+    MetadataShard& shard, const std::string& key,
+    const std::vector<Replica>& replicas) {
+    for (const auto& replica : replicas) {
+        RemoveReplicaFromSegmentIndex(shard, key, replica);
+    }
+}
+
+void MasterService::RemoveReplicaFromSegmentIndex(MetadataShard& shard,
+                                                  const std::string& key,
+                                                  const Replica& replica) {
+    if (replica.status() != ReplicaStatus::COMPLETE) {
+        return;
+    }
+
+    auto seg_id = replica.get_segment_id();
+    if (seg_id.has_value()) {
+        auto seg_it = shard.segment_key_index.find(seg_id.value());
+        if (seg_it != shard.segment_key_index.end()) {
+            auto key_it = seg_it->second.find(key);
+            if (key_it != seg_it->second.end()) {
+                if (--key_it->second == 0) {
+                    seg_it->second.erase(key_it);
+                }
+                if (seg_it->second.empty()) {
+                    shard.segment_key_index.erase(seg_it);
+                }
+            } else {
+                LOG(WARNING)
+                    << "RemoveReplicaFromSegmentIndex: key not found"
+                    << ", segment_id=" << seg_id.value() << ", key=" << key;
+            }
+        } else {
+            LOG(WARNING) << "RemoveReplicaFromSegmentIndex: segment not found"
+                         << ", segment_id=" << seg_id.value()
+                         << ", key=" << key;
+        }
+    }
+}
+
+auto MasterService::RegisterClient(const RegisterClientRequest& req)
+    -> tl::expected<RegisterClientResponse, ErrorCode> {
+    return GetClientManager().RegisterClient(req);
+}
+
+auto MasterService::Heartbeat(const HeartbeatRequest& req)
+    -> tl::expected<HeartbeatResponse, ErrorCode> {
+    return GetClientManager().Heartbeat(req);
 }
 
 auto MasterService::ExistKey(const std::string& key)
@@ -129,105 +278,6 @@ auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
     return results;
 }
 
-auto MasterService::BatchReplicaClear(
-    const std::vector<std::string>& object_keys, const UUID& client_id,
-    const std::string& segment_name)
-    -> tl::expected<std::vector<std::string>, ErrorCode> {
-    std::vector<std::string> cleared_keys;
-    cleared_keys.reserve(object_keys.size());
-    const bool clear_all_segments = segment_name.empty();
-
-    for (const auto& key : object_keys) {
-        if (key.empty()) {
-            LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
-            continue;
-        }
-        auto accessor = GetMetadataAccessor(key);
-        if (!accessor->Exists()) {
-            LOG(WARNING) << "BatchReplicaClear: key=" << key
-                         << " not found, skipping";
-            continue;
-        }
-
-        auto& metadata = accessor->Get();
-
-        // Security check: Ensure the requesting client owns the object.
-        if (metadata.client_id_ != client_id) {
-            LOG(WARNING) << "BatchReplicaClear: key=" << key
-                         << " belongs to different client_id="
-                         << metadata.client_id_ << ", expected=" << client_id
-                         << ", skipping";
-            continue;
-        }
-
-        if (clear_all_segments) {
-            if (auto res = metadata.IsObjectRemovable(); !res) {
-                LOG(WARNING) << "BatchReplicaClear: key=" << key
-                             << " cannot be removed, reason=" << res.error();
-                continue;
-            }
-            OnObjectRemoved(metadata);
-
-            // Erase the entire metadata (all replicas will be deallocated)
-            accessor->Erase();
-            cleared_keys.emplace_back(key);
-            VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
-                       "for key="
-                    << key << " for client_id=" << client_id;
-        } else {
-            // Clear only replicas on the specified segment_name
-            bool has_replica_on_segment = false;
-            std::vector<size_t> replicas_to_remove;
-
-            for (size_t i = 0; i < metadata.replicas_.size(); ++i) {
-                const auto& replica = metadata.replicas_[i];
-                if (auto res = metadata.IsReplicaRemovable(replica); !res) {
-                    LOG(WARNING)
-                        << "BatchReplicaClear: key=" << key
-                        << " cannot be removed, reason=" << res.error();
-                    continue;
-                }
-                auto segment_names = replica.get_segment_names();
-                for (const auto& seg_name : segment_names) {
-                    if (seg_name.has_value() &&
-                        seg_name.value() == segment_name) {
-                        has_replica_on_segment = true;
-                        replicas_to_remove.emplace_back(i);
-                        break;
-                    }
-                }
-            }
-
-            if (!has_replica_on_segment) {
-                LOG(WARNING)
-                    << "BatchReplicaClear: key=" << key
-                    << " has no replica on segment_name=" << segment_name
-                    << ", skipping";
-                continue;
-            }
-
-            for (auto it = replicas_to_remove.rbegin();
-                 it != replicas_to_remove.rend(); ++it) {
-                size_t idx = *it;
-                const auto& replica = metadata.replicas_[idx];
-                OnReplicaRemoved(replica);
-                metadata.replicas_.erase(metadata.replicas_.begin() + idx);
-            }
-
-            if (metadata.replicas_.empty()) {
-                accessor->Erase();
-            }
-
-            cleared_keys.emplace_back(key);
-            VLOG(1) << "BatchReplicaClear: successfully cleared replicas on "
-                       "segment_name="
-                    << segment_name << " for key=" << key
-                    << " for client_id=" << client_id;
-        }
-    }
-    return cleared_keys;
-}
-
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     -> tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -273,8 +323,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     return results;
 }
 
-auto MasterService::GetReplicaList(std::string_view key)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+auto MasterService::GetReplicaList(const std::string& key,
+                                   const GetReplicaListRequestConfig& config)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
     auto accessor = GetMetadataAccessor(std::string(key));
 
     MasterMetricManager::instance().inc_total_get_nums();
@@ -285,23 +336,26 @@ auto MasterService::GetReplicaList(std::string_view key)
     }
     auto& metadata = accessor->Get();
 
-    std::vector<Replica::Descriptor> replica_list;
-    replica_list.reserve(metadata.replicas_.size());
-    for (const auto& replica : metadata.replicas_) {
-        if (metadata.IsReplicaAccessible(replica)) {
-            replica_list.emplace_back(replica.get_descriptor());
-        }
-    }
+    std::vector<Replica::Descriptor> replica_list =
+        FilterReplicas(config, metadata);
 
     if (replica_list.empty()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    // TODO: wanyue-wy
+    // Currently, the hit statistics is maintained in object level in master.
+    // If `max_candidates` of config is larger than 1, the statistics is not
+    // accurate. (Because we don't know which replica is chosen in client)
+    // For more accurate recording, we should maintain it in client in replica
+    // level and sync it to master.
     OnObjectHit(metadata);
     OnObjectAccessed(metadata);
 
-    return replica_list;
+    GetReplicaListResponse resp;
+    resp.replicas = std::move(replica_list);
+    return resp;
 }
 
 auto MasterService::Remove(const std::string& key)
@@ -354,6 +408,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 OnObjectRemoved(*it->second);
+                RemoveReplicaFromSegmentIndex(shard, it->first,
+                                              it->second->replicas_);
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -377,6 +433,8 @@ long MasterService::RemoveAll() {
         while (it != shard.metadata.end()) {
             if (it->second->IsObjectRemovable()) {
                 OnObjectRemoved(*it->second);
+                RemoveReplicaFromSegmentIndex(shard, it->first,
+                                              it->second->replicas_);
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -398,18 +456,6 @@ size_t MasterService::GetKeyCount() const {
         total += shard.metadata.size();
     }
     return total;
-}
-
-auto MasterService::Ping(const UUID& client_id)
-    -> tl::expected<PingResponse, ErrorCode> {
-    auto res = GetClientManager().Ping(client_id);
-    if (!res.has_value()) {
-        LOG(ERROR) << "fail to ping client"
-                   << ", client_id=" << client_id << ", ret=" << res.error();
-        return tl::make_unexpected(res.error());
-    }
-
-    return PingResponse(view_version_, res.value());
 }
 
 }  // namespace mooncake

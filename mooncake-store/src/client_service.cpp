@@ -73,8 +73,13 @@ Client::~Client() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        auto result =
-            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
+        if (!segment.IsCentralizedSegment()) {
+            LOG(ERROR) << "Segment " << segment.id << " is not centralized";
+            continue;
+        }
+        auto result = UnmountSegment(
+            reinterpret_cast<void*>(segment.GetCentralizedExtra().base),
+            segment.size);
         if (!result) {
             LOG(ERROR) << "Failed to unmount segment: "
                        << toString(result.error());
@@ -88,10 +93,10 @@ Client::~Client() {
     }
 
     // Stop ping thread only after no need to contact master anymore
-    if (ping_running_) {
-        ping_running_ = false;
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
+    if (heartbeat_running_) {
+        heartbeat_running_ = false;
+        if (heartbeat_thread_.joinable()) {
+            heartbeat_thread_.join();
         }
     }
 }
@@ -197,15 +202,16 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return err;
         }
 
-        // Start ping thread to monitor master health and trigger remount if
-        // needed.
-        ping_running_ = true;
+        // Start heartbeat thread to monitor master health and trigger register
+        // if needed.
+        heartbeat_running_ = true;
         bool is_ha_mode = true;
         std::string current_master_address = master_address;
-        ping_thread_ = std::thread([this, is_ha_mode,
-                                    current_master_address]() mutable {
-            this->PingThreadMain(is_ha_mode, std::move(current_master_address));
-        });
+        heartbeat_thread_ =
+            std::thread([this, is_ha_mode, current_master_address]() mutable {
+                this->HeartbeatThreadMain(is_ha_mode,
+                                          std::move(current_master_address));
+            });
 
         return ErrorCode::OK;
     } else {
@@ -213,14 +219,15 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         if (err != ErrorCode::OK) {
             return err;
         }
-        // Non-HA mode also enables heartbeat/ping
-        ping_running_ = true;
+        // Non-HA mode also enables heartbeat
+        heartbeat_running_ = true;
         bool is_ha_mode = false;
         std::string current_master_address = master_server_entry;
-        ping_thread_ = std::thread([this, is_ha_mode,
-                                    current_master_address]() mutable {
-            this->PingThreadMain(is_ha_mode, std::move(current_master_address));
-        });
+        heartbeat_thread_ =
+            std::thread([this, is_ha_mode, current_master_address]() mutable {
+                this->HeartbeatThreadMain(is_ha_mode,
+                                          std::move(current_master_address));
+            });
         return ErrorCode::OK;
     }
 }
@@ -524,9 +531,16 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(
-        std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+    uint64_t lease_ttl_ms = 0;
+    if (!result.value().centralized_extra) {
+        LOG(ERROR)
+            << "no_centralized_extra_found, lease_ttl_ms will be set to 0"
+            << ", key=" << object_key;
+    } else {
+        lease_ttl_ms = result.value().centralized_extra->lease_ttl_ms;
+    }
+    return QueryResult(std::move(result.value().replicas),
+                       start_time + std::chrono::milliseconds(lease_ttl_ms));
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -551,10 +565,18 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
+            uint64_t lease_ttl_ms = 0;
+            if (!response[i].value().centralized_extra) {
+                LOG(ERROR) << "no_centralized_extra_found, lease_ttl_ms will "
+                              "be set to 0"
+                           << ", key=" << object_keys[i];
+            } else {
+                lease_ttl_ms =
+                    response[i].value().centralized_extra->lease_ttl_ms;
+            }
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas),
-                start_time + std::chrono::milliseconds(
-                                 response[i].value().lease_ttl_ms)));
+                start_time + std::chrono::milliseconds(lease_ttl_ms)));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1436,12 +1458,16 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     // Check if the segment overlaps with any existing segment
     for (auto& it : mounted_segments_) {
         auto& mtseg = it.second;
-        uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
+        if (!mtseg.IsCentralizedSegment()) {
+            continue;
+        }
+        auto& extra = mtseg.GetCentralizedExtra();
+        uintptr_t l1 = extra.base;
         uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
         uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
         uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
         if (std::max(l1, l2) < std::min(r1, r2)) {
-            LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
+            LOG(ERROR) << "segment_overlaps base1=" << extra.base
                        << " size1=" << mtseg.size << " base2=" << buffer
                        << " size2=" << size;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1460,16 +1486,20 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     Segment segment;
     segment.id = generate_uuid();
     segment.name = local_hostname_;
-    segment.base = reinterpret_cast<uintptr_t>(buffer);
     segment.size = size;
+
+    CentralizedSegmentExtraData extra;
+    extra.base = reinterpret_cast<uintptr_t>(buffer);
+
     // For P2P handshake mode, publish the actual transport endpoint that was
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
+        extra.te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
-        segment.te_endpoint = local_hostname_;
+        extra.te_endpoint = local_hostname_;
     }
+    segment.extra = extra;
 
     auto mount_result = master_client_.MountSegment(segment);
     if (!mount_result) {
@@ -1490,7 +1520,13 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
+        if (!it->second.IsCentralizedSegment()) {
+            LOG(ERROR) << "segment_not_found base=" << buffer
+                       << " size=" << size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (it->second.GetCentralizedExtra().base ==
+                reinterpret_cast<uintptr_t>(buffer) &&
             it->second.size == size) {
             segment = it;
             break;
@@ -1510,7 +1546,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(segment->second.base));
+        reinterpret_cast<void*>(segment->second.GetCentralizedExtra().base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -1728,21 +1764,21 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
-void Client::PingThreadMain(bool is_ha_mode,
-                            std::string current_master_address) {
-    // How many failed pings before getting latest master view from etcd
-    const int max_ping_fail_count = 3;
-    // How long to wait for next ping after success
-    const int success_ping_interval_ms = 1000;
-    // How long to wait for next ping after failure
-    const int fail_ping_interval_ms = 1000;
-    // Increment after a ping failure, reset after a ping success
-    int ping_fail_count = 0;
+void Client::HeartbeatThreadMain(bool is_ha_mode,
+                                 std::string current_master_address) {
+    // How many failed heartbeats before getting latest master view from etcd
+    const int max_heartbeat_fail_count = 3;
+    // How long to wait for next heartbeat after success
+    const int success_heartbeat_interval_ms = 1000;
+    // How long to wait for next heartbeat after failure
+    const int fail_heartbeat_interval_ms = 1000;
+    // Increment after a heartbeat failure, reset after a heartbeat success
+    int heartbeat_fail_count = 0;
 
-    auto remount_segment = [this]() {
-        // This lock must be held until the remount rpc is finished,
+    auto register_client = [this]() {
+        // This lock must be held until the register rpc is finished,
         // otherwise there will be corner cases, e.g., a segment is
-        // unmounted successfully first, and then remounted again in
+        // unmounted successfully first, and then registered again in
         // this thread.
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         std::vector<Segment> segments;
@@ -1750,53 +1786,56 @@ void Client::PingThreadMain(bool is_ha_mode,
             auto& segment = it.second;
             segments.emplace_back(segment);
         }
-        auto remount_result = master_client_.ReMountSegment(segments);
-        if (!remount_result) {
-            ErrorCode err = remount_result.error();
-            LOG(ERROR) << "Failed to remount segments: " << err;
+        auto register_result = master_client_.RegisterClient(segments);
+        if (!register_result) {
+            ErrorCode err = register_result.error();
+            LOG(ERROR) << "Failed to register client: " << err;
         }
     };
-    // Use another thread to remount segments to avoid blocking the ping
+    // Use another thread to register client to avoid blocking the heartbeat
     // thread
-    std::future<void> remount_segment_future;
+    std::future<void> register_client_future;
 
-    while (ping_running_) {
-        // Join the remount segment thread if it is ready
-        if (remount_segment_future.valid() &&
-            remount_segment_future.wait_for(std::chrono::seconds(0)) ==
+    while (heartbeat_running_) {
+        // Join the register client thread if it is ready
+        if (register_client_future.valid() &&
+            register_client_future.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
-            remount_segment_future = std::future<void>();
+            register_client_future = std::future<void>();
         }
 
-        // Ping master
-        auto ping_result = master_client_.Ping();
-        if (ping_result) {
-            // Reset ping failure count
-            ping_fail_count = 0;
-            auto& ping_response = ping_result.value();
-            if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
-                !remount_segment_future.valid()) {
-                // Ensure at most one remount segment thread is running
-                remount_segment_future =
-                    std::async(std::launch::async, remount_segment);
+        // Send heartbeat to master
+        HeartbeatRequest req;
+        req.client_id = client_id_;
+        auto heartbeat_result = master_client_.Heartbeat(req);
+        if (heartbeat_result) {
+            // Reset heartbeat failure count
+            heartbeat_fail_count = 0;
+            auto& heartbeat_response = heartbeat_result.value();
+            if (heartbeat_response.status == ClientStatus::UNDEFINED &&
+                !register_client_future.valid()) {
+                // Ensure at most one register client thread is running
+                register_client_future =
+                    std::async(std::launch::async, register_client);
             }
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(success_ping_interval_ms));
+                std::chrono::milliseconds(success_heartbeat_interval_ms));
             continue;
         }
 
-        ping_fail_count++;
-        if (ping_fail_count < max_ping_fail_count) {
-            LOG(ERROR) << "Failed to ping master";
+        heartbeat_fail_count++;
+        if (heartbeat_fail_count < max_heartbeat_fail_count) {
+            LOG(ERROR) << "Failed to send heartbeat to master";
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(fail_ping_interval_ms));
+                std::chrono::milliseconds(fail_heartbeat_interval_ms));
             continue;
         }
 
-        // Exceeded ping failure threshold. Reconnect based on mode.
+        // Exceeded heartbeat failure threshold. Reconnect based on mode.
         if (is_ha_mode) {
             LOG(ERROR)
-                << "Failed to ping master for " << ping_fail_count
+                << "Failed to send heartbeat to master for "
+                << heartbeat_fail_count
                 << " times; fetching latest master view and reconnecting";
             std::string master_address;
             ViewVersionId next_version = 0;
@@ -1806,7 +1845,7 @@ void Client::PingThreadMain(bool is_ha_mode,
                 LOG(ERROR) << "Failed to get new master view: "
                            << toString(err);
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                    std::chrono::milliseconds(fail_heartbeat_interval_ms));
                 continue;
             }
 
@@ -1815,15 +1854,15 @@ void Client::PingThreadMain(bool is_ha_mode,
                 LOG(ERROR) << "Failed to connect to master " << master_address
                            << ": " << toString(err);
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                    std::chrono::milliseconds(fail_heartbeat_interval_ms));
                 continue;
             }
 
             current_master_address = master_address;
             LOG(INFO) << "Reconnected to master " << master_address;
-            ping_fail_count = 0;
+            heartbeat_fail_count = 0;
         } else {
-            LOG(ERROR) << "Failed to ping master for " << ping_fail_count
+            LOG(ERROR) << "Failed to ping master for " << heartbeat_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
             auto err = master_client_.Connect(current_master_address);
@@ -1831,16 +1870,16 @@ void Client::PingThreadMain(bool is_ha_mode,
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                    std::chrono::milliseconds(fail_heartbeat_interval_ms));
                 continue;
             }
             LOG(INFO) << "Reconnected to master " << current_master_address;
-            ping_fail_count = 0;
+            heartbeat_fail_count = 0;
         }
     }
     // Explicitly wait for the remount segment thread to finish
-    if (remount_segment_future.valid()) {
-        remount_segment_future.wait();
+    if (register_client_future.valid()) {
+        register_client_future.wait();
     }
 }
 

@@ -35,11 +35,9 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
 
-    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
-                                               const UUID& client_id);
-
-    tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id);
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
@@ -54,12 +52,6 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
-
-    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key);
-
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
 
    protected:
     virtual MasterService& GetMasterService() override {
