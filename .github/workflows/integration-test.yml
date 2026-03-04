@@ -3,10 +3,17 @@ name: 'Integration test (Linux)'
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'CMakeLists.txt'
   pull_request_target:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
-
+    paths:
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'CMakeLists.txt'
 
 jobs:
   test-sglang-integration:
