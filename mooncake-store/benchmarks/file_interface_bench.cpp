@@ -422,6 +422,7 @@ class FileInterfaceBenchmark {
     std::optional<std::pair<double, void*>> BenchmarkAlignedIO(void* write_data,
                                                                size_t size,
                                                                bool is_write) {
+#ifdef USE_URING
         std::cout << "=== Zero-Copy Aligned I/O "
                   << (is_write ? "Write" : "Read")
                   << " Benchmark ===" << std::endl;
@@ -539,6 +540,13 @@ class FileInterfaceBenchmark {
         std::cout << "Zero-copy: YES (no memory copy overhead)" << std::endl;
 
         return std::make_pair(bandwidth_mbps, buffer);
+#else
+        (void)write_data;
+        (void)size;
+        (void)is_write;
+        std::cerr << "io_uring support not compiled in" << std::endl;
+        return std::nullopt;
+#endif
     }
 
     // Direct I/O benchmark using raw syscalls (bypasses StorageFile interface)
@@ -795,8 +803,11 @@ int main(int argc, char* argv[]) {
 #ifdef USE_URING
             config.use_uring = true;
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --use-uring specified but io_uring support "
+                         "was not compiled in (USE_URING is not defined). "
+                         "Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--queue-depth" && i + 1 < argc) {
             config.uring_queue_depth = std::stoul(argv[++i]);
@@ -810,8 +821,11 @@ int main(int argc, char* argv[]) {
                 config.use_uring = true;
             }
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --uring-direct-io specified but io_uring "
+                         "support was not compiled in (USE_URING is not "
+                         "defined). Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--uring-direct-io-zerocopy") {
 #ifdef USE_URING
@@ -823,8 +837,11 @@ int main(int argc, char* argv[]) {
                 config.use_uring = true;
             }
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --uring-direct-io-zerocopy specified but "
+                         "io_uring support was not compiled in (USE_URING is "
+                         "not defined). Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--use-registered-buffers") {
 #ifdef USE_URING
@@ -841,8 +858,11 @@ int main(int argc, char* argv[]) {
                           << std::endl;
             }
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --use-registered-buffers specified but "
+                         "io_uring support was not compiled in (USE_URING is "
+                         "not defined). Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--direct-io") {
             config.use_direct_io = true;
