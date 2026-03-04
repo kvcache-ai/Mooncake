@@ -157,6 +157,7 @@ MooncakeBackend::MooncakeBackend(
                   });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
+    meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
         backendIndex_, rank, size, store, meta_, &engine_);
 
@@ -191,7 +192,6 @@ MooncakeBackend::MooncakeBackend(
     // Start polling connction
     ConnectionPoller::GetInstance().registerContext(connection_ctx_);
 
-    meta_ = std::make_shared<TransferGroupMeta>();
     meta_->rank = rank;
     meta_->size = size;
     meta_->taskCount = 0;
