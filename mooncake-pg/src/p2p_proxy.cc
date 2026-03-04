@@ -14,6 +14,8 @@ namespace {
 constexpr size_t kP2PBytesPerRank = kP2PBufferSize;
 constexpr size_t kP2PNumSlotsPerRank = kP2PNumSlots;
 
+constexpr int kP2PWorkerPollingSleepDuration = 50;
+
 static_assert(kP2PBufferSize % kP2PNumSlots == 0,
               "kP2PBufferSize must be divisible by kP2PNumSlots");
 static_assert(kP2PNumSlots > 1, "P2P ring requires at least 2 slots per rank");
@@ -768,7 +770,8 @@ void P2PProxy::SendWorkerThread() {
         }
 
         if (!did_work) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(kP2PWorkerPollingSleepDuration));
             PAUSE();
         }
     }
@@ -872,7 +875,8 @@ void P2PProxy::RecvWorkerThread() {
         }
 
         if (!did_work) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(kP2PWorkerPollingSleepDuration));
             PAUSE();
         }
     }
