@@ -422,6 +422,7 @@ class FileInterfaceBenchmark {
     std::optional<std::pair<double, void*>> BenchmarkAlignedIO(void* write_data,
                                                                size_t size,
                                                                bool is_write) {
+#ifdef USE_URING
         std::cout << "=== Zero-Copy Aligned I/O "
                   << (is_write ? "Write" : "Read")
                   << " Benchmark ===" << std::endl;
@@ -539,6 +540,13 @@ class FileInterfaceBenchmark {
         std::cout << "Zero-copy: YES (no memory copy overhead)" << std::endl;
 
         return std::make_pair(bandwidth_mbps, buffer);
+#else
+        (void)write_data;
+        (void)size;
+        (void)is_write;
+        std::cerr << "io_uring support not compiled in" << std::endl;
+        return std::nullopt;
+#endif
     }
 
     // Direct I/O benchmark using raw syscalls (bypasses StorageFile interface)
