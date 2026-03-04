@@ -104,12 +104,11 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
-// Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    /* TBD */
-    return Status::OK();
+    (void)task_list;
+    return Status::NotImplemented(
+        "NVMeoFTransport::submitTransferTask is not implemented");
 }
 
 Status NVMeoFTransport::submitTransfer(
