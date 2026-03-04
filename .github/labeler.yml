@@ -11,3 +11,14 @@ Transfer Engine:
   - changed-files:
     - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
 
+PyTorch Backend:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-pg/**/*'
+
+Mooncake EP:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-ep/**/*'
+
+Installation:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-wheel/**/*'

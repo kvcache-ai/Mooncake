@@ -28,6 +28,7 @@
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -248,19 +249,40 @@ Status TransferEngineImpl::construct() {
 Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
 
-    local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
-        for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-            if (transport_list_[type])
-                transport_list_[type]->removeMemoryBuffer(desc);
-        }
-        return Status::OK();
-    });
-    for (auto& transport : transport_list_) transport.reset();
-    local_segment_tracker_.reset();
-    metadata_->segmentManager().deleteLocal();
-    metadata_.reset();
+    // Destroy staging_proxy_ first: its destructor calls back into
+    // unregisterLocalMemory/freeLocalMemory, which require
+    // local_segment_tracker_ and metadata_ to be alive.
+    staging_proxy_.reset();
+
+    if (local_segment_tracker_) {
+        local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                if (transport_list_[type])
+                    transport_list_[type]->removeMemoryBuffer(desc);
+            }
+            return Status::OK();
+        });
+    }
+
+    // Free all batches BEFORE destroying transports, so that
+    // freeSubBatch() can properly return SubBatch/Slice objects
+    // to the global Slab/allocator instances used by the transports.
+    //
+    // Safety note: freeSubBatch() only performs Slab deallocation and
+    // does not access transport-internal state (workers, connections).
+    // Callers must ensure no transfers are in-flight before calling
+    // deconstruct().
     batch_set_.forEach([&](BatchSet& entry) {
         for (auto& batch : entry.active) {
+            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+                auto& transport = transport_list_[type];
+                auto& sub_batch = batch->sub_batch[type];
+                if (!transport || !sub_batch) continue;
+                transport->freeSubBatch(sub_batch);
+            }
+            Slab<Batch>::Get().deallocate(batch);
+        }
+        for (auto& batch : entry.freelist) {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
                 auto& transport = transport_list_[type];
                 auto& sub_batch = batch->sub_batch[type];
@@ -272,6 +294,14 @@ Status TransferEngineImpl::deconstruct() {
         entry.active.clear();
         entry.freelist.clear();
     });
+
+    // Now safe to destroy transports (workers join here)
+    for (auto& transport : transport_list_) transport.reset();
+    local_segment_tracker_.reset();
+    if (metadata_) {
+        metadata_->segmentManager().deleteLocal();
+        metadata_.reset();
+    }
     return Status::OK();
 }
 
@@ -444,17 +474,48 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
+    auto transports = getSupportedTransports(options.type);
+
+    // Build BufferDescs: warm-up → NUMA probe → fill location
+    std::vector<BufferDesc> desc_list;
+    desc_list.reserve(addr_list.size());
+    for (size_t i = 0; i < addr_list.size(); ++i) {
+        BufferDesc desc;
+        desc.addr = (uint64_t)addr_list[i];
+        desc.length = size_list[i];
+
+        // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
+        // subsequent RDMA registration and NUMA probing
+        bool pages_pinned = false;
+        for (auto type : transports) {
+            if (transport_list_[type]->warmupMemory(addr_list[i],
+                                                    size_list[i])) {
+                pages_pinned = true;
+                break;
+            }
+        }
+
+        // NUMA probe: skip prefault if warm-up already pinned pages
+        auto entries = Platform::getLoader().getLocation(
+            addr_list[i], size_list[i], pages_pinned);
+        if (entries.size() == 1) {
+            desc.location = entries[0].location;
+        } else {
+            desc.location = entries[0].location;
+            for (auto& entry : entries)
+                desc.regions.push_back(Region{entry.len, entry.location});
+        }
+        desc.ref_count = 1;
+        if (options.location != kWildcardLocation)
+            desc.location = options.location;
+        if (options.internal) desc.internal = options.internal;
+        desc_list.push_back(std::move(desc));
+    }
+
     auto status = local_segment_tracker_->addInBatch(
-        addr_list, size_list,
-        [&](std::vector<BufferDesc>& desc_list) -> Status {
-            if (options.location != kWildcardLocation)
-                for (auto& desc : desc_list) desc.location = options.location;
-            if (options.internal)
-                for (auto& desc : desc_list) desc.internal = options.internal;
-            auto transports = getSupportedTransports(options.type);
+        desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
             for (auto type : transports) {
-                auto s =
-                    transport_list_[type]->addMemoryBuffer(desc_list, options);
+                auto s = transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();
@@ -468,14 +529,19 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
 Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
-    return local_segment_tracker_->remove(
+    bool removed = false;
+    auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
+            removed = true;
             for (auto type : desc.transports) {
                 auto status = transport_list_[type]->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
             }
             return Status::OK();
         });
+    if (!status.ok()) return status;
+    if (!removed) return Status::OK();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 Status TransferEngineImpl::unregisterLocalMemory(
@@ -484,12 +550,24 @@ Status TransferEngineImpl::unregisterLocalMemory(
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
     }
+    bool removed_any = false;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        auto status = unregisterLocalMemory(
-            addr_list[i], size_list.empty() ? 0 : size_list[i]);
+        bool removed = false;
+        auto status = local_segment_tracker_->remove(
+            (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
+            [&](BufferDesc& desc) -> Status {
+                removed = true;
+                for (auto type : desc.transports) {
+                    auto s = transport_list_[type]->removeMemoryBuffer(desc);
+                    if (!s.ok()) LOG(WARNING) << s.ToString();
+                }
+                return Status::OK();
+            });
         if (!status.ok()) return status;
+        if (removed) removed_any = true;
     }
-    return Status::OK();
+    if (!removed_any) return Status::OK();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {

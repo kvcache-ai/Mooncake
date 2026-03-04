@@ -1,4 +1,5 @@
 // ThreadPool.h
+#pragma once
 
 #include <vector>
 #include <queue>

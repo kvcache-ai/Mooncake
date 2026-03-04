@@ -39,6 +39,11 @@ if (WITH_TE)
         INSTALL_RPATH "$ORIGIN"
     )
 
+    # Propagate EFA compile definition to engine target
+    if(USE_EFA)
+        target_compile_definitions(engine PRIVATE USE_EFA)
+    endif()
+
     target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
     )
@@ -59,14 +64,29 @@ if (WITH_TE)
             gflags::gflags
         )
     endif()
+
+    if (USE_CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(engine PRIVATE CUDA::cudart)
+    endif()
 endif()
 
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
+set(UBSHMEM_ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so")
+
 if(USE_MNNVL)
     message(STATUS "USE_MNNVL is enabled, nvlink_allocator.so will be installed in the Python package")
     install(FILES
         "${ALLOCATOR_SO_PATH}"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
+
+if(USE_UBSHMEM)
+    message(STATUS "USE_UBSHMEM is enabled, ubshmem_fabric_allocator.so will be installed in the Python package")
+    install(FILES
+        "${UBSHMEM_ALLOCATOR_SO_PATH}"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
 endif()
@@ -106,9 +126,17 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py
 )
 
 if (USE_MNNVL)
-    message(STATUS "USE_MNNVL is enabled, allocator.py will be installed in the Python package")
+    message(STATUS "allocator.py will be installed in the Python package")
     install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
+
+if (USE_UBSHMEM)
+    message(STATUS "allocator_ascend_npu.py will be installed in the Python package")
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/allocator_ascend_npu.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
 endif()
@@ -119,7 +147,7 @@ endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
-# Install Python scripts from mooncake-wheel/mooncake/ directory
+#Install Python scripts from mooncake - wheel / mooncake / directory
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
@@ -158,4 +186,5 @@ endif()
 
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+    install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()

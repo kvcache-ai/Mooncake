@@ -1,5 +1,6 @@
 #include "http_metadata_server.h"
 
+#include <csignal>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <glog/logging.h>
 

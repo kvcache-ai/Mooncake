@@ -62,6 +62,9 @@ struct TransferHandshakeUtil {
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
         root["reply_msg"] = desc.reply_msg;
+#ifdef USE_EFA
+        root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
+#endif
         return root;
     }
 
@@ -74,6 +77,9 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
+#ifdef USE_EFA
+        desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
+#endif
         return 0;
     }
 };
@@ -164,7 +170,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     if (segmentJSON["protocol"] == "rdma" ||
-        segmentJSON["protocol"] == "barex") {
+        segmentJSON["protocol"] == "barex" ||
+        segmentJSON["protocol"] == "efa") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -296,6 +303,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
+        RWSpinlock::WriteGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
         if (iter != segment_name_to_id_map_.end()) {
             LOG(INFO) << "removeSegmentDesc " << segment_name << " finish";
@@ -325,7 +333,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
-    if (desc->protocol == "rdma" || desc->protocol == "barex") {
+    if (desc->protocol == "rdma" || desc->protocol == "barex" ||
+        desc->protocol == "efa") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
@@ -651,8 +660,16 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
 }
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
-    RWSpinlock::ReadGuard guard(segment_lock_);
-    auto desc = segment_id_to_desc_map_[segment_id];
+    std::shared_ptr<SegmentDesc> desc;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Segment descriptor " << segment_id << " not found";
+            return ERR_METADATA;
+        }
+        desc = it->second;
+    }
     return this->updateSegmentDesc(desc->name, *desc);
 }
 

@@ -77,6 +77,11 @@ class RdmaContext {
 
     MemReg registerMemReg(void *addr, size_t length, int access);
 
+    // Warm up RDMA MR registration by temporarily registering/deregistering.
+    // This targets RDMA driver-side pinning/metadata and differs from CPU
+    // prefault (madvise/mlock/touch) used before NUMA probing.
+    int warmupMrRegistration(void *addr, size_t length);
+
     int unregisterMemReg(MemReg id);
 
     const std::pair<uint32_t, uint32_t> queryMemRegKey(MemReg id) const {
@@ -109,6 +114,9 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // Notification CQ (dedicated for notification QPs)
+    RdmaCQ *notifyCq() { return notify_cq_; }
+
    private:
     int openDevice(const std::string &device_name, uint8_t port);
 
@@ -137,6 +145,9 @@ class RdmaContext {
 
     std::shared_ptr<EndpointStore> endpoint_store_;
     std::vector<RdmaCQ *> cq_list_;
+
+    // Dedicated CQ for notification QPs (one per device)
+    RdmaCQ *notify_cq_ = nullptr;
 
     const IbvSymbols &verbs_;
 };

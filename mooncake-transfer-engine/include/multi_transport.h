@@ -51,6 +51,8 @@ class MultiTransport {
 
     std::vector<Transport *> listTransports();
 
+    void *getBaseAddr();
+
    private:
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
 

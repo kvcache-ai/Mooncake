@@ -69,7 +69,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 ### Get
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -112,6 +112,69 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
 
+### CreateCopyTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+![mooncake-store-create-copy-task](../image/mooncake-store-client-create-copy-task.png)
+
+`CreateCopyTask` creates an asynchronous copy task that will be executed by the client's task execution system. This is useful when you want to submit multiple copy operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the copy operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### CreateMoveTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+![mooncake-store-create-move-task](../image/mooncake-store-client-create-move-task.png)
+
+`CreateMoveTask` creates an asynchronous move task that will be executed by the client's task execution system. This is useful when you want to submit multiple move operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the move operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### QueryTask
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` queries the status of an asynchronous task (copy or move). This allows you to monitor the progress of task-based operations. The response includes task status, type, creation time, last update time, assigned client, and status message.
+
+The data structure details of `QueryTaskResponse` are as follows:
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // Task UUID
+    TaskType type;                              // Task type (REPLICA_COPY or REPLICA_MOVE)
+    TaskStatus status;                          // Task status (PENDING, PROCESSING, SUCCESS, or FAILED)
+    int64_t created_at_ms_epoch;                // Task creation timestamp in milliseconds
+    int64_t last_updated_at_ms_epoch;           // Last update timestamp in milliseconds
+    UUID assigned_client;                       // UUID of the client assigned to execute the task
+    std::string message;                        // Status message or error description
+};
+```
+
 ### BatchQueryIp
 
 ```C++
@@ -151,9 +214,25 @@ Used to delete all objects from the store whose keys match the specified regular
 
 ### Master Service
 
-The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication 
+The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
 
 **Note: The Master Service does not take over any data flow, only providing corresponding metadata information.**
+
+#### Snapshot & Restore
+
+To reduce cache warm-up time after a master restart, the Master Service supports periodic snapshots of its in-memory metadata and recovery from these snapshots.
+
+- Snapshot generation
+  - A background snapshot thread periodically takes a consistent copy of the in-memory KV metadata, segment information, and allocator state using fork-based copy-on-write, without blocking normal RPC handling.
+  - The child process serializes these structures into a compact binary format and writes them to the configured snapshot backend via the `SerializerBackend` abstraction.
+- Restore
+  - On startup, when snapshot restore is enabled, the master reads the latest snapshot from the backend and reconstructs the Master Service's metadata state in memory.
+- Notes
+  - Because snapshots are taken periodically rather than continuously, metadata changes after the last successful snapshot may be lost if the master fails before the next snapshot completes.
+
+> **Warning: Managed Storage**
+>
+> The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
 
 #### Master Service APIs
 
@@ -225,7 +304,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -310,7 +389,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
 };
 ```
@@ -323,7 +402,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -339,7 +418,7 @@ message PutEndResponse {
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -518,17 +597,68 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
   - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
   - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
 
-#### Implementation Strategies
+#### Allocation Strategies
 
-`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy` that provides intelligent allocation with the following features:
+Mooncake Store provides multiple built-in allocation strategies to control how storage space is distributed across segments. Users can select a strategy via the `--allocation_strategy` flag when starting the master service:
 
-1. **Preferred Segment Support**: If a preferred segment is specified in the `ReplicateConfig`, the strategy first attempts to allocate from that segment before falling back to random allocation.
+```bash
+./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
+```
 
-2. **Random Allocation with Retry Logic**: When multiple allocators are available, it uses a randomized approach with up to 10 retry attempts to find a suitable allocator.
+Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive).
 
-3. **Deterministic Randomization**: Uses a Mersenne Twister random number generator with proper seeding for consistent behavior.
+##### How to Choose
 
-The strategy automatically handles cases where the preferred segment is unavailable, full, or doesn't exist by gracefully falling back to random allocation among all available segments.
+| Strategy | Best For | Trade-off |
+|---|---|---|
+| `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
+| `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `cxl` | CXL memory hardware | CXL-specific; single-replica only |
+
+**Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
+
+**Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
+- Segments have different capacities and you want even utilization ratios.
+- New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
+
+**Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
+
+##### Strategy Details
+
+**`random` — RandomAllocationStrategy**
+
+Pure random allocation with preferred segment support. The allocation process for N replicas is:
+
+1. **Preferred segment phase**: If preferred segments are specified in the `ReplicateConfig`, they are tried first in order. Each successful allocation consumes one replica slot. If all replicas are satisfied, the process finishes early.
+2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. Segments already used for a previous replica of the same slice, as well as explicitly excluded segments, are skipped to guarantee that each replica resides on a different segment.
+3. **Retry limit**: The iteration is capped at `min(100, total_segments)` to avoid excessive scanning when most segments are full.
+4. **Best-effort result**: If fewer than N replicas are allocated but at least one succeeds, the partial result is returned. The call fails only if zero replicas can be allocated.
+
+All random state uses a thread-local Mersenne Twister (`std::mt19937`), so no locks or shared mutable data are involved.
+
+**`free_ratio_first` — FreeRatioFirstAllocationStrategy (Best-of-N)**
+
+An improved strategy built on top of `RandomAllocationStrategy`. Instead of picking segments purely at random, it samples a small pool of candidates and selects the ones with the most free space. The allocation process for N replicas is:
+
+1. **Preferred segment phase**: Same as `random` — preferred segments are tried first in order.
+2. **Sampling phase**: Randomly picks a starting index and takes `min(6*remaining_replicas, total_segments)` consecutive segments as candidates. For each candidate, queries its free space ratio: `free_bytes / total_capacity`.
+3. **Sorting phase**: Sorts the candidates in descending order by free space ratio (most free first).
+4. **Allocation phase**: Iterates through the sorted candidates from top to bottom, attempting to allocate from each. Excluded and already-used segments are skipped.
+5. **Fallback phase**: If insufficient replicas are allocated from the sorted candidates, falls back to the base `RandomAllocationStrategy` random iteration logic for the remaining replicas.
+
+The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
+
+The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`cxl` — CxlAllocationStrategy**
+
+Specialized for CXL (Compute Express Link) memory hardware. Unlike the other strategies, this one does not perform random or load-balanced selection — it always allocates from a specific CXL segment:
+
+1. Requires `preferred_segments` to be non-empty; the first element is used as the target CXL segment name.
+2. Allocates a single replica from the specified CXL segment's allocator.
+3. Marks the allocated buffer as CXL type via `change_to_cxl()`, so downstream components can distinguish CXL-backed data from regular DRAM.
+
+Limitations: This strategy only supports single-replica allocation (does not distribute across multiple segments) and does not support the `AllocateFrom()` interface.
 
 ### Eviction Policy
 
@@ -608,7 +738,7 @@ When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, a
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.  
+Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
 The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
 **Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
 **Notice** The capability for file eviction on DFS has not been provided yet
@@ -714,7 +844,7 @@ Mooncake Store provides various sample programs, including interface forms based
 `metadata_server`: the address of the Transfer Engine metadata service
 `master_server_address`: the address of the Master Service
 **Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
-For example: 
+For example:
 ```python
 import os
 import time

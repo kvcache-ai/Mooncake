@@ -161,6 +161,8 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
     impl_->setAutoDiscover(auto_discover);
 }
 
+void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
+
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
     impl_->setWhitelistFilters(std::move(filters));
 }
@@ -573,6 +575,14 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
         return std::make_shared<Topology>();
     } else
         return impl_->getLocalTopology();
+}
+
+void* TransferEngine::getBaseAddr() {
+    if (use_tent_) {
+        // TENT version does not support CXL base address
+        return nullptr;
+    } else
+        return impl_->getBaseAddr();
 }
 
 }  // namespace mooncake

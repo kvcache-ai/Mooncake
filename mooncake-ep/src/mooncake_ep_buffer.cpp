@@ -62,9 +62,6 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 
     int ret = init_ibgda();
     if (ret != 0) {
-        LOG(WARNING) << "Failed to initialize IBGDA. "
-                     << "Using fallback implementation. "
-                     << "Performance will be degraded.";
         ibgda_disabled_ = true;
     }
 
@@ -461,6 +458,12 @@ int MooncakeEpBuffer::init_ibgda() {
         fprintf(stderr,
                 "If the error is `Bad address`, probably because your GPU "
                 "does not support GPUDirect RDMA.\n");
+        // Keep internal state consistent: IBGDA init failed, so `mr` must not
+        // be treated as valid.
+        if (mr) {
+            ibv_dereg_mr(mr);
+            mr = nullptr;
+        }
         return -1;
     }
     ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
@@ -678,6 +681,12 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
             cudaError_t peer_err = cudaDeviceEnablePeerAccess(dst_device, 0);
             if (peer_err == cudaSuccess ||
                 peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                // Clear sticky error on re-init so CUDA graph capture /
+                // dispatch later does not see
+                // cudaErrorPeerAccessAlreadyEnabled.
+                if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                    cudaGetLastError();
+                }
                 nvlink_array[dst_rank] = 1;
 
                 // Open IPC handle for this peer
@@ -717,10 +726,27 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         }
     }
 
-    if (std::all_of(nvlink_array.begin(), nvlink_array.end(),
-                    [](int32_t v) { return v == 1; })) {
-        // We can mark it false,as we will use NVLink anyway.
-        ibgda_disabled_ = false;
+    // Check if P2P+IPC is available for ALL rank pairs.
+    // For P2P+IPC to be fully usable without IBGDA, every rank must be able to
+    // access every other rank via P2P+IPC. Since we only check within the same
+    // node group, all ranks must be in the same node group.
+    p2p_ipc_all_enabled_ = true;
+    for (int i = 0; i < num_ranks; ++i) {
+        // Must have P2P enabled and a valid peer pointer for every rank.
+        // Note: for local rank we set ipc_peer_ptrs_host[rank] = gdr_buffer.
+        if (nvlink_array[i] == 0 || ipc_peer_ptrs_host[i] == nullptr) {
+            p2p_ipc_all_enabled_ = false;
+            break;
+        }
+    }
+    // Verify all ranks are in the same node group (cross-node requires IBGDA)
+    if (p2p_ipc_all_enabled_ && num_ranks > 1) {
+        int first_node_id = 0 / device_count;
+        int last_node_id = (num_ranks - 1) / device_count;
+        if (first_node_id != last_node_id) {
+            // Ranks span multiple nodes, P2P only works within nodes
+            p2p_ipc_all_enabled_ = false;
+        }
     }
 
     // Copy NVLink availability to device memory
