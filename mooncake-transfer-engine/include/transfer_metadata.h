@@ -112,6 +112,7 @@ class TransferMetadata {
     struct HandShakeDesc {
         std::string local_nic_path;
         std::string peer_nic_path;
+        uint64_t endpoint_id = 0;
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
@@ -125,6 +126,13 @@ class TransferMetadata {
     struct NotifyDesc {
         std::string name;
         std::string notify_msg;
+    };
+
+    struct DeleteEndpointDesc {
+        std::string
+            deleted_nic_path;  // NIC path of the deleted endpoint (sender)
+        std::string target_nic_path;  // NIC path of the target (receiver)
+        uint64_t endpoint_id = 0;     // Sender's own endpoint_id
     };
 
    public:
@@ -166,7 +174,8 @@ class TransferMetadata {
 
     int removeRpcMetaEntry(const std::string &server_name);
 
-    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc,
+                        bool silent = false);
     int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
@@ -182,6 +191,14 @@ class TransferMetadata {
 
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+
+    using OnReceiveDeleteEndpoint =
+        std::function<int(const DeleteEndpointDesc &peer_desc)>;
+    void registerDeleteEndpointCallback(
+        OnReceiveDeleteEndpoint on_receive_delete_endpoint);
+
+    int sendDeleteEndpoint(const std::string &peer_server_name,
+                           const DeleteEndpointDesc &local_desc);
 
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);

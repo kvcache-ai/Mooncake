@@ -47,6 +47,7 @@ class RdmaTransport : public Transport {
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
+    using DeleteEndpointDesc = TransferMetadata::DeleteEndpointDesc;
 
    public:
     RdmaTransport();
@@ -107,11 +108,18 @@ class RdmaTransport : public Transport {
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                HandShakeDesc &local_desc);
 
+    int onDeleteEndpoint(const DeleteEndpointDesc &peer_desc);
+
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
+    }
+
+    int sendDeleteEndpoint(const std::string &peer_server_name,
+                           const DeleteEndpointDesc &local_desc) {
+        return metadata_->sendDeleteEndpoint(peer_server_name, local_desc);
     }
 
    private:
