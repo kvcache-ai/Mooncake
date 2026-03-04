@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <ratio>
 #include <thread>
 #include <vector>
 
@@ -28,6 +29,7 @@ struct PeerConnection {
 
     PeerConnectionState state{PeerConnectionState::WAITING_STORE};
     std::optional<BatchID> warmupBatchId{std::nullopt};
+    std::optional<TransferMetadata::SegmentID> segmentId{std::nullopt};
 
     // Back off to avoid frequently checking store.
     std::chrono::steady_clock::time_point last_check_store;
@@ -54,7 +56,8 @@ class ConnectionContext {
     // TODO: make it atomic and add `expandSize` to handle runtime scaling-up?
     int size_;
     c10::intrusive_ptr<::c10d::Store> store_;
-    TransferGroupMeta* meta_;
+
+    std::shared_ptr<TransferGroupMeta> meta_;
     TransferEngine* engine_;
 
     std::atomic<int> totalConnnectedPeers_{0};
@@ -67,10 +70,14 @@ class ConnectionContext {
     int32_t* warmup_send_region_;
     int32_t* warmup_recv_region_;
 
+    std::mutex backend_wakeup_mutex_;
+    std::condition_variable backend_wakeup_cv_;
+
    public:
     ConnectionContext(int backendIndex, int rank, int size,
                       c10::intrusive_ptr<::c10d::Store> store,
-                      TransferGroupMeta* meta, TransferEngine* engine);
+                      std::shared_ptr<TransferGroupMeta> meta,
+                      TransferEngine* engine);
     ~ConnectionContext();
 
     int32_t* warmup_send_region() const { return warmup_send_region_; }
@@ -80,6 +87,9 @@ class ConnectionContext {
         return totalConnnectedPeers_.load(std::memory_order_acquire);
     }
     bool isAllPeerConnected() const { return totalConnnectedPeers_ == size_; }
+
+    void waitUntilAllConnected();
+    void shutdown();
 
    private:
     // For ConnectionManager
@@ -92,7 +102,7 @@ class ConnectionContext {
     // Internal helpers
     bool pollPeer(int pollingRank);
 
-    std::atomic<size_t> inflight_transfers_;
+    std::atomic<size_t> inflight_transfers_{0};
 };
 
 class ConnectionPoller {
@@ -106,6 +116,11 @@ class ConnectionPoller {
     void removeContext(const std::shared_ptr<ConnectionContext>& ctx);
 
     ~ConnectionPoller();
+
+    void wakeup() {
+        std::lock_guard<std::mutex> lock(wakeup_mutex_);
+        wakeup_cv_.notify_all();
+    }
 
    private:
     ConnectionPoller();

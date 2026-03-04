@@ -109,7 +109,7 @@ class MooncakeBackend final : public ::c10d::Backend {
         return it->second.preferred_hca[0];
     }
 
-    at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
+    at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
     int getNumSyncedRanks();
 
@@ -131,7 +131,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     int32_t* cpu_sync_recv_region_[2];
     static MooncakeWorker worker_;
     SegmentInfo rank_info;
-    TransferGroupMeta meta_;
+    std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
 
     // P2P async infrastructure

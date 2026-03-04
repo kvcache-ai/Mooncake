@@ -259,7 +259,7 @@ MooncakeWorker::MooncakeWorker() {
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    TransferGroupMeta* meta,
+    const std::shared_ptr<TransferGroupMeta>& meta,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -297,7 +297,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].tensorSize = realSize;
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
-        tasks_[taskId].transferGroupMeta = meta;
+        tasks_[taskId].transferGroupMeta = meta.get();
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             state->currentPos, realSize);
@@ -331,7 +331,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
+    const std::shared_ptr<TransferGroupMeta>& meta,
+    const at::cuda::CUDAStream& stream,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -350,8 +351,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 
         hasCallback_[taskId] = false;
         enqueueTaskKernel<<<1, 1, 0, stream>>>(
-            opType, realSize, broadcastRoot, bufferOffset, meta, tasks_device_,
-            meta->size, meta->activeRanksDevice,
+            opType, realSize, broadcastRoot, bufferOffset, meta.get(),
+            tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId);
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],

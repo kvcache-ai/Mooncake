@@ -5,6 +5,7 @@
 #include <torch/torch.h>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <algorithm>
 #include <limits>
@@ -13,13 +14,13 @@
 namespace mooncake {
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      c10::intrusive_ptr<::c10d::Store> store,
-                                     TransferGroupMeta* meta,
+                                     std::shared_ptr<TransferGroupMeta> meta,
                                      TransferEngine* engine)
     : backendIndex_(backendIndex),
       rank_(rank),
       size_(size),
-      store_(store),
-      meta_(meta),
+      store_(std::move(store)),
+      meta_(std::move(meta)),
       engine_(engine) {
     warmup_send_region_ = new int32_t[kMaxNumRanks];
     warmup_send_region_[0] = 1;
@@ -35,8 +36,8 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
 
 ConnectionContext::~ConnectionContext() {
     for (int i = 0; i < size_; ++i) {
-        if (peerStates_[i].state != PeerConnectionState::WAITING_STORE) {
-            engine_->closeSegment(meta_->segmentIDs[i]);
+        if (peerStates_[i].segmentId.has_value()) {
+            engine_->closeSegment(peerStates_[i].segmentId.value());
         }
     }
 
@@ -46,7 +47,29 @@ ConnectionContext::~ConnectionContext() {
     delete[] warmup_recv_region_;
 }
 
+void ConnectionContext::waitUntilAllConnected() {
+    std::unique_lock<std::mutex> lock(backend_wakeup_mutex_);
+    backend_wakeup_cv_.wait(lock, [this]() {
+        return isAllPeerConnected() ||
+               isShutdown_.load(std::memory_order_acquire);
+    });
+}
+
+void ConnectionContext::shutdown() {
+    {
+        std::lock_guard<std::mutex> backend_lock(backend_wakeup_mutex_);
+        isShutdown_.store(true, std::memory_order_release);
+    }
+
+    backend_wakeup_cv_.notify_all();
+    ConnectionPoller::GetInstance().wakeup();
+}
+
 bool ConnectionContext::poll() {
+    if (isShutdown_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
     bool did_work = false;
 
     // Poll all peers in parallel
@@ -99,6 +122,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
             auto segment_id = engine_->openSegment(peerServerName);
             meta_->segmentIDs[pollingRank] = segment_id;
+            peerState.segmentId = segment_id;
             memcpy(&meta_->segmentInfos[pollingRank], buffer_data.data(),
                    sizeof(SegmentInfo));
 
@@ -136,7 +160,14 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.warmupBatchId = std::nullopt;
                 meta_->peerConnected[pollingRank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
-                totalConnnectedPeers_.fetch_add(1);
+
+                {
+                    std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+                    totalConnnectedPeers_.fetch_add(1,
+                                                    std::memory_order_release);
+                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                }
+
                 inflight_transfers_.fetch_sub(1);
                 state_changed = true;
             } else if (status.s == TransferStatusEnum::FAILED) {
@@ -144,8 +175,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                              << pollingRank << " failed.";
                 // Free resources and retry
                 engine_->freeBatchID(peerState.warmupBatchId.value());
-                engine_->closeSegment(meta_->segmentIDs[pollingRank]);
+                engine_->closeSegment(peerState.segmentId.value());
                 peerState.warmupBatchId = std::nullopt;
+                peerState.segmentId = std::nullopt;
                 peerState.state = PeerConnectionState::WAITING_STORE;
                 inflight_transfers_.fetch_sub(1);
                 state_changed = true;
@@ -158,7 +190,12 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     &warmup_recv_region_[pollingRank])) {
                 meta_->peerConnected[pollingRank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
-                totalConnnectedPeers_.fetch_add(1);
+                {
+                    std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+                    totalConnnectedPeers_.fetch_add(1,
+                                                    std::memory_order_release);
+                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                }
                 state_changed = true;
             }
             break;
@@ -172,6 +209,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // In that case, back to WAITING_STORE to reconnect it.
             totalConnnectedPeers_.fetch_sub(1);
             peerState.state = PeerConnectionState::WAITING_STORE;
+            engine_->closeSegment(peerState.segmentId.value());
+            peerState.segmentId = std::nullopt;
             state_changed = true;
             break;
         }
@@ -231,6 +270,7 @@ void ConnectionPoller::registerContext(
 
 void ConnectionPoller::removeContext(
     const std::shared_ptr<ConnectionContext>& ctx) {
+    TORCH_CHECK(ctx->isShutdown_, "connection context hasn't shutdown.");
     {
         std::lock_guard<std::mutex> lock(contexts_mutex_);
         contexts_.erase(std::remove(contexts_.begin(), contexts_.end(), ctx),
@@ -247,7 +287,7 @@ void ConnectionPoller::pollerLoop() {
     uint64_t local_version = std::numeric_limits<uint64_t>::max();
 
     // Keep track of removed contexts and free them properly to ensure
-    // gracefuly backend shutdown.
+    // graceful backend shutdown.
     std::vector<std::shared_ptr<ConnectionContext>> zombie_contexts;
 
     while (true) {
@@ -302,8 +342,6 @@ void ConnectionPoller::pollerLoop() {
         if (did_work) continue;
 
         if (!all_connected) {
-            PAUSE();
-        } else {
             std::unique_lock<std::mutex> lock(wakeup_mutex_);
             wakeup_cv_.wait_for(lock, std::chrono::milliseconds(50), [&]() {
                 if (isShutdown_.load(std::memory_order_relaxed)) return true;
@@ -312,6 +350,8 @@ void ConnectionPoller::pollerLoop() {
                     return true;
                 return false;
             });
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 }

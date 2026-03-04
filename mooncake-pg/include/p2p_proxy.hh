@@ -86,7 +86,7 @@ class P2PProxy {
     P2PProxy(TransferEngine* engine, const Options& options);
     ~P2PProxy();
 
-    void BindMeta(TransferGroupMeta* meta);
+    void BindMeta(const std::shared_ptr<TransferGroupMeta>& meta);
     void* send_buffer() const { return resources_.send_buffer_; }
     void* recv_buffer() const { return resources_.recv_buffer_; }
     P2PControlSlot* ctrl_send_region() const {
@@ -222,7 +222,7 @@ class P2PProxy {
     P2PDeviceWorker* device_worker_;
 
     TransferEngine* engine_ = nullptr;
-    TransferGroupMeta* meta_ = nullptr;
+    std::shared_ptr<TransferGroupMeta> meta_;
     bool is_cpu_ = false;
     int rank_ = 0;
     int size_ = 0;

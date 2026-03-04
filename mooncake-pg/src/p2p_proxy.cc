@@ -54,7 +54,9 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
 
 P2PProxy::~P2PProxy() { ReleaseResources(); }
 
-void P2PProxy::BindMeta(TransferGroupMeta* meta) { meta_ = meta; }
+void P2PProxy::BindMeta(const std::shared_ptr<TransferGroupMeta>& meta) {
+    meta_ = meta;
+}
 
 void P2PProxy::AllocateResources() {
     TORCH_CHECK(engine_, "P2PProxy engine is null.");
