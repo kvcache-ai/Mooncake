@@ -826,9 +826,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
 
-                // Frequency admission: only promote frequently accessed keys
+                // Frequency admission: only promote frequently accessed keys.
+                // Skip when cache was used (data served from local cache).
                 if (hot_cache_ && idx < op.replicas.size() &&
-                    idx < op.batched_slices.size()) {
+                    idx < op.batched_slices.size() &&
+                    !(idx < op.cache_used.size() && op.cache_used[idx])) {
                     bool should_admit = true;
                     if (admission_sketch_) {
                         uint8_t freq = admission_sketch_->increment(object_keys[index]);
@@ -959,8 +961,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};
 
-            // Frequency admission: only promote frequently accessed keys
-            if (hot_cache_) {
+            // Frequency admission: only promote frequently accessed keys.
+            // Skip when cache was used (data served from local cache).
+            if (hot_cache_ && !cache_used) {
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end()) {
                     bool should_admit = true;
