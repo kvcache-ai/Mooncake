@@ -339,6 +339,54 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
         torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
 }
 
+int MooncakeEpBuffer:: register_qp(int i, bool destroy_old = false) {
+    if (destroy_old && qps[i] != nullptr) {
+        // 保存旧的偏移量以便释放
+        size_t old_wq_offset = qps[i]->wq_offset;
+        size_t old_cq_offset = qps[i]->send_cq->cq_offset;
+        size_t old_dbr_offset = qps[i]->dbr_offset;
+        
+        // 销毁旧 QP
+        mlx5gda_destroy_qp(qps[i]);
+        qps[i] = nullptr;
+        
+        // 释放 heap 内存（如果 mlx5gda_destroy_qp 不自动释放）
+        if (ctrl_buf_heap) {
+            memheap_free(ctrl_buf_heap, old_wq_offset);
+            memheap_free(ctrl_buf_heap, old_cq_offset);
+            memheap_free(ctrl_buf_heap, old_dbr_offset);
+        }
+    }
+    mlx5gda_qp* qp =
+        mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
+                            pd, 16384, 1, comm_stream.stream());
+    if (!qp) {
+        perror("Failed to create QP");
+        return -1;
+    }
+    is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
+    if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
+        perror("Failed to mlx5gda_modify_rc_qp_rst2init");
+        return -1;
+    }
+    // Ensure all async memset operations are complete before accessing QP
+    // structures
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
+    mlx5gda_qp_devctx qp_devctx = {
+        .qpn = qp->qpn,
+        .wqeid_mask = qp->num_wqebb - 1,
+        .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
+        .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
+        .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
+        .bf = (char*)qp->uar->reg_addr,
+    };
+    cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
+                sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+    qps[i] = qp;
+    return 0;
+}
+
 int MooncakeEpBuffer::init_ibgda() {
     int num_devices;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
@@ -384,12 +432,12 @@ int MooncakeEpBuffer::init_ibgda() {
     }
     ibv_free_device_list(dev_list);
 
-    ibv_pd* pd = ibv_alloc_pd(ctx);
+    pd = ibv_alloc_pd(ctx);
     if (!pd) {
         perror("Failed to allocate protection domain");
         return -1;
     }
-    mlx5dv_pd mpd;
+    //mlx5dv_pd mpd;
     mlx5dv_obj dv_obj = {};
     dv_obj.pd.in = pd;
     dv_obj.pd.out = &mpd;
@@ -407,7 +455,7 @@ int MooncakeEpBuffer::init_ibgda() {
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
     // WQ doesn't need initialization as it's zeroed before each use.
     CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    mlx5dv_devx_umem* ctrl_buf_umem = mlx5dv_devx_umem_reg(
+    ctrl_buf_umem = mlx5dv_devx_umem_reg(
         ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
@@ -416,41 +464,17 @@ int MooncakeEpBuffer::init_ibgda() {
                 "does not support GPUDirect RDMA.\n");
         return -1;
     }
-    memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
+    ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
         return -1;
     }
     // Individual regions (CQ, DBR) will be initialized as needed via async
     // memset.
+    qps.resize(MAX_QP_COUNT);
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
-        mlx5gda_qp* qp =
-            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
-                                 pd, 16384, 1, comm_stream.stream());
-        if (!qp) {
-            perror("Failed to create QP");
+        if (register_qp(i))
             return -1;
-        }
-        is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
-        if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
-            perror("Failed to mlx5gda_modify_rc_qp_rst2init");
-            return -1;
-        }
-        // Ensure all async memset operations are complete before accessing QP
-        // structures
-        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
-
-        mlx5gda_qp_devctx qp_devctx = {
-            .qpn = qp->qpn,
-            .wqeid_mask = qp->num_wqebb - 1,
-            .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
-            .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
-            .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
-            .bf = (char*)qp->uar->reg_addr,
-        };
-        cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
-                   sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
-        qps.push_back(qp);
     }
     return 0;
 }
@@ -492,8 +516,12 @@ void MooncakeEpBuffer::sync_ib_update(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& rank_ids) {
     int rank_size = MAX_QP_COUNT / num_ranks;
     for (int id: rank_ids) {
-        int st = id * rank_size, ed = id * (rank_size + 1);                            
+        int st = id * rank_size, ed = (id + 1) * rank_size;                            
         for (int i = st; i < ed; ++i) {
+            if (register_qp(i)) {
+                perror("Failed to recreate QP");
+                exit(1);
+            }
             ibv_ah_attr ah_attr = {
                 .dlid = (uint16_t)remote_lids[i],
                 .port_num = 0,
@@ -569,8 +597,12 @@ void MooncakeEpBuffer::sync_roce_update(const std::vector<int64_t>& remote_addrs
                                  const std::vector<int32_t>& rank_ids) {
     int rank_size = MAX_QP_COUNT / num_ranks;
     for (int id: rank_ids) {
-        int st = id * rank_size, ed = id * (rank_size + 1);
+        int st = id * rank_size, ed = (id + 1) * rank_size;
         for (int i = st; i < ed; ++i) {
+            if (register_qp(i)) {
+                perror("Failed to recreate QP");
+                exit(1);
+            }
             ibv_gid remote_gid{};
             remote_gid.global.subnet_prefix =
                 subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
