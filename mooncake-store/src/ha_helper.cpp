@@ -158,12 +158,10 @@ int MasterServiceSupervisor::Start() {
                 WrappedMasterServiceConfig(config_, view_version));
             RegisterCentralizedRpcService(server, wrapped_master_service);
         } else {
-            // TODO: wanyue-wy
-            // enable the following code
-            // WrappedP2PMasterService wrapped_master_service(
-            //     WrappedMasterServiceConfig(config_, view_version));
+            WrappedP2PMasterService wrapped_master_service(
+                WrappedMasterServiceConfig(config_, view_version));
 
-            // RegisterP2PRpcService(server, wrapped_master_service);
+            RegisterP2PRpcService(server, wrapped_master_service);
         }
         // Metric reporting is now handled by WrappedMasterService.
 

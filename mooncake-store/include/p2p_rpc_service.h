@@ -1,18 +1,30 @@
 #pragma once
 
+#include "p2p_master_service.h"
 #include "rpc_service.h"
+
+#include "p2p_rpc_types.h"
 
 namespace mooncake {
 
-// TODO: wanyue-wy
 class WrappedP2PMasterService final : public WrappedMasterService {
    public:
     WrappedP2PMasterService(const WrappedMasterServiceConfig& config);
 
-    ~WrappedP2PMasterService();
+    ~WrappedP2PMasterService() override = default;
 
-    //    private:
-    //     P2PMasterService master_service_;
+    MasterService& GetMasterService() override { return master_service_; }
+
+    tl::expected<WriteRouteResponse, ErrorCode> GetWriteRoute(
+        const WriteRouteRequest& req);
+
+    tl::expected<void, ErrorCode> AddReplica(const AddReplicaRequest& req);
+
+    tl::expected<void, ErrorCode> RemoveReplica(
+        const RemoveReplicaRequest& req);
+
+   private:
+    P2PMasterService master_service_;
 };
 
 void RegisterP2PRpcService(

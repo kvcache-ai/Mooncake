@@ -122,17 +122,19 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
 
-    // Engine operation errors (Range: -700 to -799)
+    // Engine operation errors (Range: -700 to -710)
     INVALID_WRITE = -700,    ///< Invalid write operation.
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
-    // Object errors (Range: -703 to -707)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
     LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
+    REPLICA_ALREADY_EXISTS = -708,  ///< Replica already exists.
+    REPLICA_NOT_FOUND = -709,       ///< Replica not found.
+    REPLICA_NUM_EXCEEDED = -710,    ///< Replica number exceeded.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -204,6 +206,34 @@ struct CentralizedSegmentExtraData {
     std::string te_endpoint;
     YLT_REFL(CentralizedSegmentExtraData, base, te_endpoint);
 };
+
+/**
+ * @enum MemoryType
+ * @brief Defines the physical storage medium type for a cache tier.
+ */
+enum class MemoryType { DRAM, NVME, ASCEND_NPU, UNKNOWN };
+
+static inline std::string MemoryTypeToString(MemoryType type) {
+    switch (type) {
+        case MemoryType::DRAM:
+            return "DRAM";
+        case MemoryType::NVME:
+            return "NVME";
+        case MemoryType::ASCEND_NPU:
+            return "ASCEND_NPU";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+struct P2PSegmentExtraData {
+    int priority = 0;
+    std::vector<std::string> tags;
+    MemoryType memory_type = MemoryType::DRAM;
+    size_t usage = 0;
+    YLT_REFL(P2PSegmentExtraData, priority, tags, memory_type, usage);
+};
+
 /**
  * @brief Represents a contiguous storage region
  */
@@ -213,19 +243,41 @@ struct Segment {
     size_t size{0};
 
     // Polymorphic extra data
-    std::variant<CentralizedSegmentExtraData> extra;
+    std::variant<CentralizedSegmentExtraData, P2PSegmentExtraData> extra;
 
     // Helper to check type
+    bool IsP2PSegment() const {
+        return std::holds_alternative<P2PSegmentExtraData>(extra);
+    }
+
     bool IsCentralizedSegment() const {
         return std::holds_alternative<CentralizedSegmentExtraData>(extra);
     }
 
     CentralizedSegmentExtraData& GetCentralizedExtra() {
+        if (IsP2PSegment()) {
+            throw std::runtime_error(
+                "Segment already holds P2PSegmentExtraData; cannot assign "
+                "CentralizedSegmentExtraData");
+        }
         if (!IsCentralizedSegment()) extra = CentralizedSegmentExtraData{};
         return std::get<CentralizedSegmentExtraData>(extra);
     }
     const CentralizedSegmentExtraData& GetCentralizedExtra() const {
         return std::get<CentralizedSegmentExtraData>(extra);
+    }
+
+    P2PSegmentExtraData& GetP2PExtra() {
+        if (IsCentralizedSegment()) {
+            throw std::runtime_error(
+                "Segment already holds CentralizedSegmentExtraData; cannot "
+                "assign P2PSegmentExtraData");
+        }
+        if (!IsP2PSegment()) extra = P2PSegmentExtraData{};
+        return std::get<P2PSegmentExtraData>(extra);
+    }
+    const P2PSegmentExtraData& GetP2PExtra() const {
+        return std::get<P2PSegmentExtraData>(extra);
     }
 };
 YLT_REFL(Segment, id, name, size, extra);

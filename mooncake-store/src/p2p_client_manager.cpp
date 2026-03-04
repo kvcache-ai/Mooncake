@@ -1,62 +1,83 @@
 #include "p2p_client_manager.h"
+#include "p2p_client_meta.h"
 #include <glog/logging.h>
+#include <algorithm>
 
 namespace mooncake {
 
-P2PClientManager::P2PClientManager(const int64_t client_live_ttl_sec)
-    : ClientManager(client_live_ttl_sec) {}
+class CapacityPriorityIterator : public ClientIterator {
+   public:
+    CapacityPriorityIterator(
+        const std::unordered_map<UUID, std::shared_ptr<ClientMeta>,
+                                 boost::hash<UUID>>& client_metas) {
+        if (client_metas.empty()) return;
 
-auto P2PClientManager::UnmountSegment(const UUID& segment_id,
-                                      const UUID& client_id)
-    -> tl::expected<void, ErrorCode> {
-    // TODO
-    return {};
-}
+        clients_.reserve(client_metas.size());
+        for (auto& client : client_metas) {
+            if (auto p2p_meta =
+                    std::dynamic_pointer_cast<P2PClientMeta>(client.second)) {
+                clients_.emplace_back(p2p_meta);
+            }
+        }
 
-void P2PClientManager::ClientMonitorFunc() {
-    while (client_monitor_running_) {
-        // TODO
+        std::sort(clients_.begin(), clients_.end(),
+                  [](const auto& a, const auto& b) {
+                      return std::static_pointer_cast<P2PClientMeta>(a)
+                                 ->GetAvailableCapacity() >
+                             std::static_pointer_cast<P2PClientMeta>(b)
+                                 ->GetAvailableCapacity();
+                  });
+    }
+};
+
+P2PClientManager::P2PClientManager(const int64_t disconnect_timeout_sec,
+                                   const int64_t crash_timeout_sec,
+                                   const ViewVersionId view_version)
+    : ClientManager(disconnect_timeout_sec, crash_timeout_sec, view_version) {}
+
+std::unique_ptr<ClientIterator> P2PClientManager::InnerBuildClientIterator(
+    ObjectIterateStrategy strategy) {
+    auto iterator = ClientManager::InnerBuildClientIterator(strategy);
+    if (iterator) {
+        return iterator;
+    }
+    switch (strategy) {
+        case ObjectIterateStrategy::CAPACITY_PRIORITY:
+            return std::make_unique<CapacityPriorityIterator>(client_metas_);
+        default:
+            return nullptr;
     }
 }
 
-auto P2PClientManager::InnerMountSegment(const Segment& segment,
-                                         const UUID& client_id,
-                                         std::function<ErrorCode()>& pre_func)
-    -> tl::expected<void, ErrorCode> {
-    // TODO
-    return {};
+std::shared_ptr<ClientMeta> P2PClientManager::CreateClientMeta(
+    const RegisterClientRequest& req) {
+    auto meta = std::make_shared<P2PClientMeta>(
+        req.client_id, req.ip_address.value_or(""), req.rpc_port.value_or(0));
+    return meta;
 }
 
-auto P2PClientManager::InnerReMountSegment(const std::vector<Segment>& segments,
-                                           const UUID& client_id,
-                                           std::function<ErrorCode()>& pre_func)
-    -> tl::expected<void, ErrorCode> {
-    // TODO
-    return {};
-}
+HeartbeatTaskResult P2PClientManager::ProcessTask(const UUID& client_id,
+                                                  const HeartbeatTask& task) {
+    HeartbeatTaskResult result;
+    result.type = task.type_;
 
-auto P2PClientManager::GetAllSegments()
-    -> tl::expected<std::vector<std::string>, ErrorCode> {
-    // TODO
-    return {};
-}
-
-auto P2PClientManager::QuerySegments(const std::string& segment)
-    -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
-    // TODO
-    return {};
-}
-
-auto P2PClientManager::QueryIp(const UUID& client_id)
-    -> tl::expected<std::vector<std::string>, ErrorCode> {
-    // TODO
-    return {};
-}
-
-auto P2PClientManager::Ping(const UUID& client_id)
-    -> tl::expected<ClientStatus, ErrorCode> {
-    // TODO
-    return ClientStatus::OK;
+    switch (task.type_) {
+        case HeartbeatTaskType::SYNC_SEGMENT_META: {
+            if (auto p2p_meta = std::dynamic_pointer_cast<P2PClientMeta>(
+                    GetClient(client_id))) {
+                if (const auto* p =
+                        std::get_if<SyncSegmentMetaParam>(&task.param_)) {
+                    p2p_meta->UpdateSegmentUsages(p->tier_usages);
+                }
+            }
+            result.error = ErrorCode::OK;
+            break;
+        }
+        default:
+            result.error = ErrorCode::NOT_IMPLEMENTED;
+            break;
+    }
+    return result;
 }
 
 }  // namespace mooncake

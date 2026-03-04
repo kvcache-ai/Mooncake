@@ -111,6 +111,12 @@ class MasterMetricManager {
     void inc_remount_segment_failures(int64_t val = 1);
     void inc_heartbeat_requests(int64_t val = 1);
     void inc_heartbeat_failures(int64_t val = 1);
+    void inc_get_write_route_requests(int64_t val = 1);
+    void inc_get_write_route_failures(int64_t val = 1);
+    void inc_add_replica_requests(int64_t val = 1);
+    void inc_add_replica_failures(int64_t val = 1);
+    void inc_remove_replica_requests(int64_t val = 1);
+    void inc_remove_replica_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
@@ -162,6 +168,12 @@ class MasterMetricManager {
     int64_t get_remount_segment_failures();
     int64_t get_heartbeat_requests();
     int64_t get_heartbeat_failures();
+    int64_t get_get_write_route_requests();
+    int64_t get_get_write_route_failures();
+    int64_t get_add_replica_requests();
+    int64_t get_add_replica_failures();
+    int64_t get_remove_replica_requests();
+    int64_t get_remove_replica_failures();
 
     // Batch Operation Statistics Getters
     int64_t get_batch_exist_key_requests();
@@ -293,6 +305,12 @@ class MasterMetricManager {
     ylt::metric::counter_t remount_segment_failures_;
     ylt::metric::counter_t heartbeat_requests_;
     ylt::metric::counter_t heartbeat_failures_;
+    ylt::metric::counter_t get_write_route_requests_;
+    ylt::metric::counter_t get_write_route_failures_;
+    ylt::metric::counter_t add_replica_requests_;
+    ylt::metric::counter_t add_replica_failures_;
+    ylt::metric::counter_t remove_replica_requests_;
+    ylt::metric::counter_t remove_replica_failures_;
 
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;
