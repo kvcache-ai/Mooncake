@@ -768,6 +768,7 @@ void P2PProxy::SendWorkerThread() {
         }
 
         if (!did_work) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
             PAUSE();
         }
     }
@@ -871,6 +872,7 @@ void P2PProxy::RecvWorkerThread() {
         }
 
         if (!did_work) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
             PAUSE();
         }
     }
