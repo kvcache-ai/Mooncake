@@ -227,6 +227,14 @@ class Client {
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     */
+    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
+                                                   ReplicaType replica_type);
+
+    /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes

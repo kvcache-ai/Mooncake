@@ -1648,6 +1648,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+tl::expected<void, ErrorCode> Client::EvictDiskReplica(
+    const std::string& key, ReplicaType replica_type) {
+    return master_client_.EvictDiskReplica(key, replica_type);
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
@@ -2075,7 +2080,7 @@ void Client::PutToLocalFile(const std::string& key,
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object
-        auto store_result = backend->StoreObject(path, value);
+        auto store_result = backend->StoreObject(path, value, key);
         ReplicaType replica_type = ReplicaType::DISK;
 
         if (!store_result) {
@@ -2086,6 +2091,17 @@ void Client::PutToLocalFile(const std::string& key,
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
             return;
+        }
+
+        // Notify master about any evicted disk replicas
+        for (const auto& evicted_key : store_result.value()) {
+            auto evict_result =
+                master_client_.EvictDiskReplica(evicted_key, replica_type);
+            if (!evict_result) {
+                LOG(WARNING)
+                    << "Failed to notify master about evicted key: "
+                    << evicted_key << ", error: " << evict_result.error();
+            }
         }
 
         // If storage succeeded, end the put operation
