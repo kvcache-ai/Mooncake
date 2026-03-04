@@ -189,7 +189,7 @@ MooncakeBackend::MooncakeBackend(
                    std::to_string(rank_),
                localServerName);
 
-    // Start polling connction
+    // Start polling connection
     ConnectionPoller::GetInstance().registerContext(connection_ctx_);
 
     meta_->rank = rank;
@@ -728,7 +728,7 @@ void MooncakeBackend::shutdown() {
 int MooncakeBackend::getNumSyncedRanks() {
     std::vector<at::Tensor> tensors;
     tensors.emplace_back(torch::tensor(
-        connection_ctx_->getTotalConnnectedPeers(),
+        connection_ctx_->getTotalConnectedPeers(),
         torch::dtype(torch::kInt).device(isCpu_ ? torch::kCPU : torch::kCUDA)));
     c10d::AllreduceOptions opts{
         .reduceOp = c10d::ReduceOp::MIN,

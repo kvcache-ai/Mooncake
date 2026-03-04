@@ -164,8 +164,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                    totalConnnectedPeers_.fetch_add(1,
-                                                    std::memory_order_release);
+                    totalConnectedPeers_.fetch_add(1,
+                                                   std::memory_order_release);
                     if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
                 }
 
@@ -193,8 +193,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                    totalConnnectedPeers_.fetch_add(1,
-                                                    std::memory_order_release);
+                    totalConnectedPeers_.fetch_add(1,
+                                                   std::memory_order_release);
                     if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
                 }
                 state_changed = true;
@@ -208,7 +208,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // CONNECTED, the peer might be marked as broken for some reason
             // (e.g. timeout in backend worker thread).
             // In that case, back to WAITING_STORE to reconnect it.
-            totalConnnectedPeers_.fetch_sub(1);
+            totalConnectedPeers_.fetch_sub(1);
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());
             peerState.segmentId = std::nullopt;

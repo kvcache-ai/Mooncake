@@ -60,7 +60,7 @@ class ConnectionContext {
     std::shared_ptr<TransferGroupMeta> meta_;
     TransferEngine* engine_;
 
-    std::atomic<int> totalConnnectedPeers_{0};
+    std::atomic<int> totalConnectedPeers_{0};
     std::atomic<bool> isShutdown_{false};
 
     PeerConnection peerStates_[kMaxNumRanks];
@@ -83,10 +83,10 @@ class ConnectionContext {
     int32_t* warmup_send_region() const { return warmup_send_region_; }
     int32_t* warmup_recv_region() const { return warmup_recv_region_; }
 
-    int getTotalConnnectedPeers() const {
-        return totalConnnectedPeers_.load(std::memory_order_acquire);
+    int getTotalConnectedPeers() const {
+        return totalConnectedPeers_.load(std::memory_order_acquire);
     }
-    bool isAllPeerConnected() const { return totalConnnectedPeers_ == size_; }
+    bool isAllPeerConnected() const { return totalConnectedPeers_ == size_; }
 
     void waitUntilAllConnected();
     void shutdown();
