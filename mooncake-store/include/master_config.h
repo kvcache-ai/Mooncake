@@ -578,6 +578,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_snapshot_backend_type(
+        SnapshotBackendType type) {
+        snapshot_backend_type_ = type;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_etcd_endpoints(
         const std::string& endpoints) {
         etcd_endpoints_ = endpoints;

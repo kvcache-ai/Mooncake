@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <thread>
@@ -24,8 +26,57 @@
 
 #include "types.h"
 
+// Forward-declare gflags symbol used by ETCD parameterized tests.
+// Defined in the test .cpp that provides main().
+// Guarded so that test binaries without gflags/ETCD support still compile.
+#ifdef STORE_USE_ETCD
+#include <gflags/gflags.h>
+DECLARE_string(etcd_endpoints);
+#endif
+
 // TODO metrics consistency
 namespace mooncake::test {
+
+// ---------------------------------------------------------------------------
+// EnsureDaemonSymlink
+//
+// Creates ./snapshot_uploader_daemon -> actual built binary so that
+// MasterService::StartSnapshotDaemon() can find the executable.
+// Shared by parameterized tests and ETCD-only tests.
+// ---------------------------------------------------------------------------
+inline void EnsureDaemonSymlink() {
+    static bool done = false;
+    if (done) return;
+
+    const char* symlink_path = "./snapshot_uploader_daemon";
+    if (access(symlink_path, X_OK) == 0) {
+        done = true;
+        return;
+    }
+
+    const std::vector<std::string> search_paths = {
+        "./build/mooncake-store/src/snapshot_uploader_daemon",
+        "../build/mooncake-store/src/snapshot_uploader_daemon",
+        "../../build/mooncake-store/src/snapshot_uploader_daemon",
+    };
+
+    for (const auto& path : search_paths) {
+        if (access(path.c_str(), X_OK) == 0) {
+            char abs_path[PATH_MAX];
+            if (realpath(path.c_str(), abs_path) != nullptr) {
+                unlink(symlink_path);
+                if (symlink(abs_path, symlink_path) == 0) {
+                    LOG(INFO) << "Created daemon symlink: " << symlink_path
+                              << " -> " << abs_path;
+                    done = true;
+                    return;
+                }
+            }
+        }
+    }
+    LOG(WARNING) << "Could not find snapshot_uploader_daemon executable. "
+                 << "Tests will fall back to direct etcd upload path.";
+}
 
 /**
  * @brief Base class for MasterService snapshot testing.
@@ -188,7 +239,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     }
 
     std::string GetEtcdSnapshotPrefix(const std::string& snapshot_id) const {
-        return "master_snapshot/" + snapshot_id + "/";
+        return "mooncake_master_snapshot/" + snapshot_id + "/";
     }
 
     bool EnsureEtcdConnected() const {
@@ -213,8 +264,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     bool GetEtcdValue(const std::string& key, std::string& value) const {
         EtcdRevisionId revision;
-        auto result =
-            EtcdHelper::Get(key.c_str(), key.size(), value, revision);
+        auto result = EtcdHelper::Get(key.c_str(), key.size(), value, revision);
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Etcd get failed for key: " << key
                        << ", error=" << static_cast<int>(result);
@@ -231,12 +281,16 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return service_->StartSnapshotDaemon();
     }
 
+    std::shared_mutex& GetSnapshotMutex() const {
+        return service_->snapshot_mutex_;
+    }
+
     // Get msgpack snapshot directory path or etcd key prefix
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
         if (UseEtcdSnapshotBackend()) {
             return GetEtcdSnapshotPrefix(snapshot_id);
         }
-        return "/tmp/mooncake_snapshots/master_snapshot/" + snapshot_id + "/";
+        return tmp_dir() + "/mooncake_master_snapshot/" + snapshot_id + "/";
     }
 
     // Get backup directory path
@@ -250,7 +304,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                        << snapshot_id;
             return GetEtcdSnapshotPrefix(snapshot_id);
         }
-        return "/tmp/mooncake_snapshots/master_snapshot_backup/" + snapshot_id +
+        return tmp_dir() + "/mooncake_master_snapshot_backup/" + snapshot_id +
                "/";
     }
 
@@ -661,13 +715,14 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== File Operation Methods ====================
 
-    // Copy msgpack snapshot files to backup directory (or map backup id for etcd)
+    // Copy msgpack snapshot files to backup directory (or map backup id for
+    // etcd)
     void CopySnapshotToBackup(const std::string& snapshot_id,
                               const std::string& backup_id) const {
         if (UseEtcdSnapshotBackend()) {
             etcd_backup_id_map_[backup_id] = snapshot_id;
-            LOG(INFO) << "ETCD snapshot backup mapping: " << backup_id
-                      << " -> " << snapshot_id;
+            LOG(INFO) << "ETCD snapshot backup mapping: " << backup_id << " -> "
+                      << snapshot_id;
             return;
         }
         namespace fs = std::filesystem;
@@ -734,7 +789,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return is_equal;
     }
 
-    // Compare all msgpack files in two snapshot directories or etcd key prefixes
+    // Compare all msgpack files in two snapshot directories or etcd key
+    // prefixes
     bool CompareSnapshotDirectories(const std::string& dir1,
                                     const std::string& dir2) const {
         LOG(INFO) << "Comparing snapshot directories: " << dir1 << " vs "
@@ -761,21 +817,22 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 std::string value2;
                 if (!GetEtcdValue(key1, value1) ||
                     !GetEtcdValue(key2, value2)) {
-                    LOG(ERROR) << "Failed to read etcd keys for file: "
-                               << filename;
+                    LOG(ERROR)
+                        << "Failed to read etcd keys for file: " << filename;
                     all_match = false;
                     break;
                 }
                 if (value1.size() != value2.size()) {
-                    LOG(ERROR) << "Etcd value size differs for file: "
-                               << filename << ", size1=" << value1.size()
-                               << ", size2=" << value2.size();
+                    LOG(ERROR)
+                        << "Etcd value size differs for file: " << filename
+                        << ", size1=" << value1.size()
+                        << ", size2=" << value2.size();
                     all_match = false;
                     break;
                 }
                 if (value1 != value2) {
-                    LOG(ERROR) << "Etcd value content differs for file: "
-                               << filename;
+                    LOG(ERROR)
+                        << "Etcd value content differs for file: " << filename;
                     all_match = false;
                     break;
                 }
@@ -892,10 +949,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // Ensure snapshot_backend_ is initialized for PersistState
         // Some test configs may not enable snapshot/restore, so the backend
         // is not created in the constructor. We create it here for TearDown
-        // validation.
+        // validation.  Use the service's actual backend type (not hardcoded
+        // LOCAL_FILE) so that ETCD-parameterized tests restore correctly.
         if (!service_->snapshot_backend_) {
-            service_->snapshot_backend_ =
-                SerializerBackend::Create(SnapshotBackendType::LOCAL_FILE);
+            service_->snapshot_backend_ = SerializerBackend::Create(
+                service_->snapshot_backend_type_, service_->etcd_endpoints_);
         }
 
         // Test snapshot and restore functionality for all test cases
@@ -914,6 +972,74 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
    private:
     std::string tmp_dir_;
+};
+
+// ===========================================================================
+// MasterServiceSnapshotParamTestBase
+//
+// Value-parameterized fixture (SnapshotBackendType).  One set of TEST_P
+// definitions runs against LOCAL_FILE *and* ETCD backends.
+// ===========================================================================
+class MasterServiceSnapshotParamTestBase
+    : public MasterServiceSnapshotTestBase,
+      public ::testing::WithParamInterface<SnapshotBackendType> {
+   protected:
+    void SetUp() override {
+        MasterServiceSnapshotTestBase::SetUp();
+
+        backend_type_ = GetParam();
+#ifdef STORE_USE_ETCD
+        if (backend_type_ == SnapshotBackendType::ETCD) {
+            EnsureDaemonSymlink();
+            auto result =
+                EtcdHelper::ConnectToEtcdStoreClient(FLAGS_etcd_endpoints);
+            if (result != ErrorCode::OK) {
+                GTEST_SKIP()
+                    << "etcd not available at " << FLAGS_etcd_endpoints;
+            }
+        }
+#endif
+    }
+
+    // ----- Service creation helpers -----
+
+    // Create service with default config + backend overlay.
+    void CreateService() {
+        MasterServiceConfig config;
+        CreateServiceFromConfig(config);
+    }
+
+    // Create service from a pre-built config, overlaying backend settings.
+    void CreateServiceFromConfig(MasterServiceConfig config) {
+        ApplyBackendOverlay(config);
+        service_.reset(new MasterService(config));
+        PostCreateServiceSetup();
+    }
+
+   private:
+    // Overlay ETCD-specific settings onto a config struct.
+    void ApplyBackendOverlay(MasterServiceConfig& config) {
+#ifdef STORE_USE_ETCD
+        if (backend_type_ == SnapshotBackendType::ETCD) {
+            config.snapshot_backend_type = SnapshotBackendType::ETCD;
+            config.etcd_endpoints = FLAGS_etcd_endpoints;
+            config.enable_snapshot = false;
+        }
+#endif
+    }
+
+    // Post-creation setup (start daemon for ETCD backend).
+    void PostCreateServiceSetup() {
+        if (backend_type_ == SnapshotBackendType::ETCD) {
+            if (!StartSnapshotDaemonForTest()) {
+                LOG(WARNING) << "snapshot_uploader_daemon not found; "
+                             << "PersistState will use direct etcd upload path";
+            }
+        }
+    }
+
+   protected:
+    SnapshotBackendType backend_type_ = SnapshotBackendType::LOCAL_FILE;
 };
 
 }  // namespace mooncake::test
