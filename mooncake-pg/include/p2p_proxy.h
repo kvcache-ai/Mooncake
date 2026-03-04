@@ -251,18 +251,17 @@ class P2PDeviceWorker {
     void registerProxy(const std::shared_ptr<P2PProxy>&);
     void removeProxy(const std::shared_ptr<P2PProxy>&);
 
+    P2PDeviceWorker(bool is_cpu, int cuda_device_index)
+        : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
+        Start();
+    }
+
     ~P2PDeviceWorker() { Stop(); }
 
     void WakeUpSend();
     void WakeUpRecv();
 
    private:
-    // Only allow construction at P2PDeviceWorkerManager
-    P2PDeviceWorker(bool is_cpu, int cuda_device_index)
-        : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
-        Start();
-    }
-
     void Start();
     void Stop();
 
@@ -307,4 +306,4 @@ class P2PDeviceWorkerManager {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_P2P_PROXY_HH
+#endif  // MOONCAKE_P2P_PROXY_H

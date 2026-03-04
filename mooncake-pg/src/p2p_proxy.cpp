@@ -1035,8 +1035,8 @@ std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCPUWorker() {
         if (auto ptr = it->second.lock()) return ptr;
     }
 
-    auto worker = std::shared_ptr<P2PDeviceWorker>(
-        new P2PDeviceWorker(/* is_cpu */ true, CPUWorkerID));
+    auto worker =
+        std::make_shared<P2PDeviceWorker>(/* is_cpu */ true, CPUWorkerID);
     workers_[CPUWorkerID] = worker;
     return worker;
 }
@@ -1050,8 +1050,8 @@ std::shared_ptr<P2PDeviceWorker> P2PDeviceWorkerManager::GetCUDAWorker(
         if (auto ptr = it->second.lock()) return ptr;
     }
 
-    auto worker = std::shared_ptr<P2PDeviceWorker>(
-        new P2PDeviceWorker(/* is_cpu */ false, cuda_device_index));
+    auto worker = std::make_shared<P2PDeviceWorker>(/* is_cpu */ false,
+                                                    cuda_device_index);
     workers_[cuda_device_index] = worker;
     return worker;
 }
