@@ -287,6 +287,12 @@ MasterMetricManager::MasterMetricManager()
                             "Total number of MoveRevoke requests received"),
       move_revoke_failures_("master_move_revoke_failures_total",
                             "Total number of failed MoveRevoke requests"),
+      evict_disk_replica_requests_(
+          "master_evict_disk_replica_requests_total",
+          "Total number of EvictDiskReplica requests received"),
+      evict_disk_replica_failures_(
+          "master_evict_disk_replica_failures_total",
+          "Total number of failed EvictDiskReplica requests"),
 
       /*
        * Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
@@ -385,6 +391,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     move_end_failures_.inc(0);
     move_revoke_requests_.inc(0);
     move_revoke_failures_.inc(0);
+    evict_disk_replica_requests_.inc(0);
+    evict_disk_replica_failures_.inc(0);
 
     // Update Batch Request Counters
     batch_exist_key_requests_.inc(0);
@@ -1137,6 +1145,12 @@ void MasterMetricManager::inc_move_revoke_requests(int64_t val) {
 void MasterMetricManager::inc_move_revoke_failures(int64_t val) {
     move_revoke_failures_.inc(val);
 }
+void MasterMetricManager::inc_evict_disk_replica_requests(int64_t val) {
+    evict_disk_replica_requests_.inc(val);
+}
+void MasterMetricManager::inc_evict_disk_replica_failures(int64_t val) {
+    evict_disk_replica_failures_.inc(val);
+}
 
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
 // Getters
@@ -1175,6 +1189,12 @@ int64_t MasterMetricManager::get_move_revoke_requests() {
 }
 int64_t MasterMetricManager::get_move_revoke_failures() {
     return move_revoke_failures_.value();
+}
+int64_t MasterMetricManager::get_evict_disk_replica_requests() {
+    return evict_disk_replica_requests_.value();
+}
+int64_t MasterMetricManager::get_evict_disk_replica_failures() {
+    return evict_disk_replica_failures_.value();
 }
 
 // Task create, query, fetch Metrics
@@ -1311,6 +1331,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(move_end_failures_);
     serialize_metric(move_revoke_requests_);
     serialize_metric(move_revoke_failures_);
+    serialize_metric(evict_disk_replica_requests_);
+    serialize_metric(evict_disk_replica_failures_);
 
     // Serialize CreateCopyTask, CreateMoveTask, MarkTaskToComplete, QueryTask,
     // FetchTasks Request Counters
@@ -1473,6 +1495,8 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t move_end_fails = move_end_failures_.value();
     int64_t move_revokes = move_revoke_requests_.value();
     int64_t move_revoke_fails = move_revoke_failures_.value();
+    int64_t evict_disk_replicas = evict_disk_replica_requests_.value();
+    int64_t evict_disk_replica_fails = evict_disk_replica_failures_.value();
 
     // Batch request counters
     int64_t batch_put_start_requests = batch_put_start_requests_.value();
@@ -1578,7 +1602,9 @@ std::string MasterMetricManager::get_summary_string() {
        << ", ";
     ss << "MoveEnd=" << move_ends - move_end_fails << "/" << move_ends << ", ";
     ss << "MoveRevoke=" << move_revokes - move_revoke_fails << "/"
-       << move_revokes;
+       << move_revokes << ", ";
+    ss << "EvictDiskReplica=" << evict_disk_replicas - evict_disk_replica_fails
+       << "/" << evict_disk_replicas;
 
     // Batch request summary
     ss << " | Batch Requests "
