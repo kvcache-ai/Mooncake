@@ -144,7 +144,7 @@ class Buffer:
             rkeys = [torch.empty(1, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
-
+            from mooncake import ep
             all_to_all_size = ep.MAX_QP_COUNT // self.group_size
 
             local_qpns = self.runtime.get_local_qpns()
