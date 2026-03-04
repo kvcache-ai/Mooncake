@@ -219,7 +219,7 @@ class P2PProxy {
         P2PControlSlot* ctrl_recv_region_ = nullptr;
     };
 
-    P2PDeviceWorker* device_worker_;
+    P2PDeviceWorker* device_worker_ = nullptr;
 
     TransferEngine* engine_ = nullptr;
     std::shared_ptr<TransferGroupMeta> meta_;

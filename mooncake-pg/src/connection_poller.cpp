@@ -5,6 +5,7 @@
 #include <torch/torch.h>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <algorithm>
@@ -251,7 +252,10 @@ ConnectionPoller::ConnectionPoller() {
 }
 
 ConnectionPoller::~ConnectionPoller() {
-    isShutdown_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(wakeup_mutex_);
+        isShutdown_.store(true, std::memory_order_release);
+    }
     wakeup_cv_.notify_all();
     if (pollerThread_.joinable()) {
         pollerThread_.join();
@@ -341,18 +345,16 @@ void ConnectionPoller::pollerLoop() {
 
         if (did_work) continue;
 
-        if (!all_connected) {
-            std::unique_lock<std::mutex> lock(wakeup_mutex_);
-            wakeup_cv_.wait_for(lock, std::chrono::milliseconds(50), [&]() {
-                if (isShutdown_.load(std::memory_order_relaxed)) return true;
-                if (local_version !=
-                    contexts_version_.load(std::memory_order_acquire))
-                    return true;
-                return false;
-            });
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        std::unique_lock<std::mutex> lock(wakeup_mutex_);
+        auto sleep_ms = all_connected ? ALL_CONNECTED_IDLE_SLEEP_MS
+                                      : CONNECTING_IDLE_SLEEP_MS;
+        wakeup_cv_.wait_for(lock, std::chrono::milliseconds(sleep_ms), [&]() {
+            if (isShutdown_.load(std::memory_order_relaxed)) return true;
+            if (local_version !=
+                contexts_version_.load(std::memory_order_acquire))
+                return true;
+            return false;
+        });
     }
 }
 }  // namespace mooncake

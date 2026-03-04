@@ -1,6 +1,6 @@
 #include <memory>
 #include <mutex>
-#include <p2p_proxy.hh>
+#include <p2p_proxy.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <algorithm>

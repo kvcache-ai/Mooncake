@@ -106,6 +106,8 @@ class ConnectionContext {
 };
 
 class ConnectionPoller {
+    static constexpr size_t CONNECTING_IDLE_SLEEP_MS = 50;
+    static constexpr size_t ALL_CONNECTED_IDLE_SLEEP_MS = 200;
    public:
     static ConnectionPoller& GetInstance() {
         static ConnectionPoller instance;

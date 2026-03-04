@@ -4,7 +4,7 @@
 #include <memory>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
-#include <p2p_proxy.hh>
+#include <p2p_proxy.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include "connection_poller.h"
