@@ -81,6 +81,38 @@ Environ::Environ() {
     force_mnnvl_ = GetBool("MC_FORCE_MNNVL", false);
     intra_nvlink_ = GetBool("MC_INTRA_NVLINK", false);
     path_roundrobin_ = GetBool("MC_PATH_ROUNDROBIN", false);
+    custom_topo_json_ = GetString("MC_CUSTOM_TOPO_JSON", "");
+    cxl_dev_path_ = GetString("MC_CXL_DEV_PATH", "");
+    cxl_dev_size_ = GetString("MC_CXL_DEV_SIZE", "");
+    disable_gpu_direct_rdma_ = GetBool("MC_DISABLE_GPU_DIRECT_RDMA", false);
+    enable_mnnvl_ = GetBool("MC_ENABLE_MNNVL", false);
+    handshake_port_ = GetInt("MC_HANDSHAKE_PORT", 0);
+    hip_num_events_ = GetInt("MC_HIP_NUM_EVENTS", 0);
+    hip_num_streams_ = GetInt("MC_HIP_NUM_STREAMS", 0);
+    intranode_nvlink_ = GetBool("MC_INTRANODE_NVLINK", false);
+    legacy_rpc_port_binding_ = GetBool("MC_LEGACY_RPC_PORT_BINDING", false);
+    metadata_cluster_id_ = GetString("MC_METADATA_CLUSTER_ID", "");
+    min_reg_size_ = GetSizeT("MC_MIN_REG_SIZE", 0);
+    ms_auto_disc_ = GetString("MC_MS_AUTO_DISC", "");
+    ms_filters_ = GetString("MC_MS_FILTERS", "");
+    rpc_protocol_ = GetString("MC_RPC_PROTOCOL", "");
+    slice_timeout_ = GetInt("MC_SLICE_TIMEOUT", 0);
+    store_client_metric_ = GetString("MC_STORE_CLIENT_METRIC", "");
+    store_client_metric_interval_ = GetInt("MC_STORE_CLIENT_METRIC_INTERVAL", 0);
+    store_cluster_id_ = GetString("MC_STORE_CLUSTER_ID", "");
+    store_hugepage_size_ = GetString("MC_STORE_HUGEPAGE_SIZE", "");
+    store_memcpy_ = GetString("MC_STORE_MEMCPY", "");
+    store_use_hugepage_ = GetString("MC_STORE_USE_HUGEPAGE", "");
+    tcp_bind_address_ = GetString("MC_TCP_BIND_ADDRESS", "");
+    te_metric_ = GetString("MC_TE_METRIC", "");
+    te_metric_interval_seconds_ = GetInt("MC_TE_METRIC_INTERVAL_SECONDS", 0);
+    tent_conf_ = GetString("MC_TENT_CONF", "");
+    transfer_timeout_ = GetInt("MC_TRANSFER_TIMEOUT", 0);
+    use_hip_ipc_ = GetBool("MC_USE_HIP_IPC", true);
+    use_nvlink_ipc_ = GetBool("MC_USE_NVLINK_IPC", false);
+    use_tent_ = GetBool("MC_USE_TENT", false);
+    use_tev1_ = GetBool("MC_USE_TEV1", false);
+    ylt_log_level_ = GetString("MC_YLT_LOG_LEVEL", "");
 }
 
 }  // namespace mooncake

@@ -9,6 +9,10 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
+  # Build mooncake_common for standalone transfer engine build.
+  # transfer_engine links against the mooncake_common target.
+  add_subdirectory(../mooncake-common ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common)
+
   # Build asio_shared library for standalone build
   # Set compile definitions before add_subdirectory to ensure proper compilation
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)

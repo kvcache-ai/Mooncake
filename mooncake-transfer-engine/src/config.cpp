@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "config.h"
+#include "environ.h"
 
 #include <cstring>
 #include <cstdio>
@@ -22,226 +23,125 @@
 
 namespace mooncake {
 void loadGlobalConfig(GlobalConfig &config) {
-    const char *num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
-    if (num_cq_per_ctx_env) {
-        int val = atoi(num_cq_per_ctx_env);
-        if (val > 0 && val < 256)
-            config.num_cq_per_ctx = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_NUM_CQ_PER_CTX";
+    auto& env = Environ::Get();
+
+    int num_cq_per_ctx = env.GetNumCqPerCtx();
+    if (num_cq_per_ctx > 0 && num_cq_per_ctx < 256)
+        config.num_cq_per_ctx = num_cq_per_ctx;
+
+    int num_comp_channels_per_ctx = env.GetNumCompChannelsPerCtx();
+    if (num_comp_channels_per_ctx > 0 && num_comp_channels_per_ctx < 256)
+        config.num_comp_channels_per_ctx = num_comp_channels_per_ctx;
+
+    int port = env.GetIbPort();
+    if (port >= 0 && port < 256)
+        config.port = uint8_t(port);
+
+    int gid_index = env.GetGidIndex();
+    if (gid_index == 0) {
+        const char *nccl_gid = std::getenv("NCCL_IB_GID_INDEX");
+        if (nccl_gid) gid_index = atoi(nccl_gid);
+    }
+    if (gid_index >= 0 && gid_index < 256)
+        config.gid_index = gid_index;
+
+    int max_cqe_per_ctx = env.GetMaxCqePerCtx();
+    if (max_cqe_per_ctx > 0 && max_cqe_per_ctx <= UINT16_MAX)
+        config.max_cqe = max_cqe_per_ctx;
+
+    int max_ep_per_ctx = env.GetMaxEpPerCtx();
+    if (max_ep_per_ctx > 0 && max_ep_per_ctx <= UINT16_MAX)
+        config.max_ep_per_ctx = max_ep_per_ctx;
+
+    int num_qp_per_ep = env.GetNumQpPerEp();
+    if (num_qp_per_ep > 0 && num_qp_per_ep < 256)
+        config.num_qp_per_ep = num_qp_per_ep;
+
+    int max_sge = env.GetMaxSge();
+    if (max_sge > 0 && max_sge <= UINT16_MAX)
+        config.max_sge = max_sge;
+
+    int max_wr = env.GetMaxWr();
+    if (max_wr > 0 && max_wr <= UINT16_MAX)
+        config.max_wr = max_wr;
+
+    int max_inline = env.GetMaxInline();
+    if (max_inline >= 0 && max_inline <= UINT16_MAX)
+        config.max_inline = max_inline;
+
+    int mtu = env.GetMtu();
+    if (mtu == 512)
+        config.mtu_length = IBV_MTU_512;
+    else if (mtu == 1024)
+        config.mtu_length = IBV_MTU_1024;
+    else if (mtu == 2048)
+        config.mtu_length = IBV_MTU_2048;
+    else if (mtu == 4096)
+        config.mtu_length = IBV_MTU_4096;
+    else if (mtu != 0) {
+        LOG(ERROR) << "Ignore value from environment variable MC_MTU, it "
+                      "should be 512|1024|2048|4096";
+        exit(EXIT_FAILURE);
     }
 
-    const char *num_comp_channels_per_ctx_env =
-        std::getenv("MC_NUM_COMP_CHANNELS_PER_CTX");
-    if (num_comp_channels_per_ctx_env) {
-        int val = atoi(num_comp_channels_per_ctx_env);
-        if (val > 0 && val < 256)
-            config.num_comp_channels_per_ctx = val;
-        else
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_NUM_COMP_CHANNELS_PER_CTX";
+    int handshake_port = env.GetHandshakePort();
+    if (handshake_port > 0 && handshake_port < 65536)
+        config.handshake_port = handshake_port;
+
+    int workers_per_ctx = env.GetWorkersPerCtx();
+    if (workers_per_ctx > 0 && workers_per_ctx <= 8)
+        config.workers_per_ctx = workers_per_ctx;
+
+    size_t slice_size = env.GetSliceSize();
+    if (slice_size > 0)
+        config.slice_size = slice_size;
+
+    size_t min_reg_size = env.GetMinRegSize();
+    if (min_reg_size > 0) {
+        config.eic_max_block_size = min_reg_size;
+        LOG(INFO) << "Barex set MC_MIN_REG_SIZE=" << min_reg_size;
     }
 
-    const char *port_env = std::getenv("MC_IB_PORT");
-    if (port_env) {
-        int val = atoi(port_env);
-        if (val >= 0 && val < 256)
-            config.port = uint8_t(val);
-        else
-            LOG(WARNING) << "Ignore value from environment variable MC_IB_PORT";
-    }
+    int retry_cnt = env.GetRetryCnt();
+    if (retry_cnt > 0 && retry_cnt < 128)
+        config.retry_cnt = retry_cnt;
 
-    const char *gid_index_env = std::getenv("MC_GID_INDEX");
-    if (!gid_index_env) gid_index_env = std::getenv("NCCL_IB_GID_INDEX");
-
-    if (gid_index_env) {
-        int val = atoi(gid_index_env);
-        if (val >= 0 && val < 256)
-            config.gid_index = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_GID_INDEX";
-    }
-
-    const char *max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");
-    if (max_cqe_per_ctx_env) {
-        size_t val = atoi(max_cqe_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_cqe = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_MAX_CQE_PER_CTX";
-    }
-
-    const char *max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
-    if (max_ep_per_ctx_env) {
-        size_t val = atoi(max_ep_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_ep_per_ctx = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
-    }
-
-    const char *num_qp_per_ep_env = std::getenv("MC_NUM_QP_PER_EP");
-    if (num_qp_per_ep_env) {
-        int val = atoi(num_qp_per_ep_env);
-        if (val > 0 && val < 256)
-            config.num_qp_per_ep = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_NUM_QP_PER_EP";
-    }
-
-    const char *max_sge_env = std::getenv("MC_MAX_SGE");
-    if (max_sge_env) {
-        size_t val = atoi(max_sge_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_sge = val;
-        else
-            LOG(WARNING) << "Ignore value from environment variable MC_MAX_SGE";
-    }
-
-    const char *max_wr_env = std::getenv("MC_MAX_WR");
-    if (max_wr_env) {
-        size_t val = atoi(max_wr_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_wr = val;
-        else
-            LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
-    }
-
-    const char *max_inline_env = std::getenv("MC_MAX_INLINE");
-    if (max_inline_env) {
-        size_t val = atoi(max_inline_env);
-        if (val <= UINT16_MAX)
-            config.max_inline = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_MAX_INLINE";
-    }
-
-    const char *mtu_length_env = std::getenv("MC_MTU");
-    if (mtu_length_env) {
-        size_t val = atoi(mtu_length_env);
-        if (val == 512)
-            config.mtu_length = IBV_MTU_512;
-        else if (val == 1024)
-            config.mtu_length = IBV_MTU_1024;
-        else if (val == 2048)
-            config.mtu_length = IBV_MTU_2048;
-        else if (val == 4096)
-            config.mtu_length = IBV_MTU_4096;
-        else {
-            LOG(ERROR) << "Ignore value from environment variable MC_MTU, it "
-                          "should be 512|1024|2048|4096";
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    const char *handshake_port_env = std::getenv("MC_HANDSHAKE_PORT");
-    if (handshake_port_env) {
-        int val = atoi(handshake_port_env);
-        if (val > 0 && val < 65536)
-            config.handshake_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_HANDSHAKE_PORT";
-    }
-
-    const char *workers_per_ctx_env = std::getenv("MC_WORKERS_PER_CTX");
-    if (workers_per_ctx_env) {
-        size_t val = atoi(workers_per_ctx_env);
-        if (val > 0 && val <= 8)
-            config.workers_per_ctx = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_WORKERS_PER_CTX";
-    }
-
-    const char *slice_size_env = std::getenv("MC_SLICE_SIZE");
-    if (slice_size_env) {
-        size_t val = atoi(slice_size_env);
-        if (val > 0)
-            config.slice_size = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_SLICE_SIZE";
-    }
-
-    const char *min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
-    if (min_reg_size_env) {
-        size_t val = atoll(min_reg_size_env);
-        if (val > 0) {
-            config.eic_max_block_size = val;
-            LOG(INFO) << "Barex set MC_MIN_REG_SIZE=" << val;
-        } else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_MIN_REG_SIZE";
-    }
-
-    const char *retry_cnt_env = std::getenv("MC_RETRY_CNT");
-    if (retry_cnt_env) {
-        size_t val = atoi(retry_cnt_env);
-        if (val > 0 && val < 128)
-            config.retry_cnt = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_RETRY_CNT";
-    }
-
-    const char *disable_metacache = std::getenv("MC_DISABLE_METACACHE");
-    if (disable_metacache) {
+    if (env.GetDisableMetacache()) {
         config.metacache = false;
     }
 
-    const char *handshake_listen_backlog =
-        std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
-    if (handshake_listen_backlog) {
-        int val = std::stoi(handshake_listen_backlog);
-        if (val > 0) {
-            config.handshake_listen_backlog = val;
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_HANDSHAKE_LISTEN_BACKLOG";
-        }
+    int handshake_listen_backlog = env.GetHandshakeListenBacklog();
+    if (handshake_listen_backlog > 0) {
+        config.handshake_listen_backlog = handshake_listen_backlog;
     }
 
-    const char *log_level = std::getenv("MC_LOG_LEVEL");
+    std::string log_level = env.GetLogLevel();
     config.trace = false;
-    if (log_level) {
-        if (strcmp(log_level, "TRACE") == 0) {
+    if (!log_level.empty()) {
+        if (log_level == "TRACE") {
             config.log_level = google::INFO;
             config.trace = true;
-        }
-        if (strcmp(log_level, "INFO") == 0)
+        } else if (log_level == "INFO")
             config.log_level = google::INFO;
-        else if (strcmp(log_level, "WARNING") == 0)
+        else if (log_level == "WARNING")
             config.log_level = google::WARNING;
-        else if (strcmp(log_level, "ERROR") == 0)
+        else if (log_level == "ERROR")
             config.log_level = google::ERROR;
     }
     FLAGS_minloglevel = config.log_level;
 
-    const char *slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
-    if (slice_timeout_env) {
-        int val = atoi(slice_timeout_env);
-        if (val > 0 && val < 65536)
-            config.slice_timeout = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_SLICE_TIMEOUT";
-    }
+    int slice_timeout = env.GetSliceTimeout();
+    if (slice_timeout > 0 && slice_timeout < 65536)
+        config.slice_timeout = slice_timeout;
 
-    const char *log_dir_path = std::getenv("MC_LOG_DIR");
-    if (log_dir_path) {
+    std::string log_dir_path = env.GetLogDir();
+    if (!log_dir_path.empty()) {
         google::InitGoogleLogging("mooncake-transfer-engine");
-        if (opendir(log_dir_path) == NULL) {
+        if (opendir(log_dir_path.c_str()) == NULL) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a valid directory path. Still logging to stderr.";
-        } else if (access(log_dir_path, W_OK) != 0) {
+        } else if (access(log_dir_path.c_str(), W_OK) != 0) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a permitted directory path for the current user. \
@@ -253,98 +153,61 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char *min_port_env = std::getenv("MC_MIN_PRC_PORT");
-    if (min_port_env) {
-        int val = atoi(min_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_min_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MIN_PORT";
-    }
+    int min_prc_port = env.GetMinPrcPort();
+    if (min_prc_port > 0 && min_prc_port < 65536)
+        config.rpc_min_port = min_prc_port;
 
-    const char *max_port_env = std::getenv("MC_MAX_PRC_PORT");
-    if (max_port_env) {
-        int val = atoi(max_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_max_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MAX_PORT";
-    }
+    int max_prc_port = env.GetMaxPrcPort();
+    if (max_prc_port > 0 && max_prc_port < 65536)
+        config.rpc_max_port = max_prc_port;
 
-    if (std::getenv("MC_USE_IPV6")) {
+    if (env.GetUseIpv6()) {
         config.use_ipv6 = true;
     }
 
-    const char *fragment_ratio = std::getenv("MC_FRAGMENT_RATIO");
-    if (fragment_ratio) {
-        size_t val = atoi(fragment_ratio);
-        if (val > 0 && val < config.slice_size)
-            config.fragment_limit = config.slice_size / val;
-        else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_FRAGMENT_RATIO and set it to 4 as default";
-            config.fragment_limit = config.slice_size / 4;
-        }
+    int fragment_ratio = env.GetFragmentRatio();
+    if (fragment_ratio > 0 && fragment_ratio < (int)config.slice_size)
+        config.fragment_limit = config.slice_size / fragment_ratio;
+    else if (fragment_ratio != 0) {
+        LOG(WARNING) << "Ignore value from environment variable "
+                        "MC_FRAGMENT_RATIO and set it to 4 as default";
+        config.fragment_limit = config.slice_size / 4;
     }
 
-    if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
+    if (env.GetEnableDestDeviceAffinity()) {
         config.enable_dest_device_affinity = true;
     }
 
-    const char *enable_parallel_reg_mr =
-        std::getenv("MC_ENABLE_PARALLEL_REG_MR");
-    if (enable_parallel_reg_mr) {
-        int val = atoi(enable_parallel_reg_mr);
-        if (val >= -1 && val <= 1) {
-            config.parallel_reg_mr = val;
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_ENABLE_PARALLEL_REG_MR";
-        }
+    int enable_parallel_reg_mr = env.GetEnableParallelRegMr();
+    if (enable_parallel_reg_mr >= -1 && enable_parallel_reg_mr <= 1) {
+        config.parallel_reg_mr = enable_parallel_reg_mr;
     }
 
-    const char *endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
-    if (endpoint_store_type_env) {
-        if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
-            config.endpoint_store_type = EndpointStoreType::FIFO;
-        } else if (strcmp(endpoint_store_type_env, "SIEVE") == 0) {
-            config.endpoint_store_type = EndpointStoreType::SIEVE;
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
-        }
+    std::string endpoint_store_type = env.GetEndpointStoreType();
+    if (endpoint_store_type == "FIFO") {
+        config.endpoint_store_type = EndpointStoreType::FIFO;
+    } else if (endpoint_store_type == "SIEVE") {
+        config.endpoint_store_type = EndpointStoreType::SIEVE;
+    } else if (!endpoint_store_type.empty()) {
+        LOG(WARNING) << "Ignore value from environment variable "
+                        "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
     }
 
-    const char *traffic_class_env = std::getenv("MC_IB_TC");
-    if (traffic_class_env) {
-        try {
-            int val = std::stoi(traffic_class_env);
-            if (val >= 0 && val <= 255) {
-                config.ib_traffic_class = val;
-            } else {
-                LOG(WARNING)
-                    << "Ignore value from environment variable MC_IB_TC, "
-                    << "value " << traffic_class_env
-                    << " out of range (should be 0-255)";
-            }
-        } catch (const std::exception &e) {
-            LOG(WARNING) << "Invalid MC_IB_TC environment value: "
-                         << traffic_class_env << ". Error: " << e.what();
-        }
+    int ib_tc = env.GetIbTc();
+    if (ib_tc >= 0 && ib_tc <= 255) {
+        config.ib_traffic_class = ib_tc;
+    } else if (ib_tc < -1) {
+        LOG(WARNING)
+            << "Ignore value from environment variable MC_IB_TC, "
+            << "value out of range (should be 0-255)";
     }
 
-    const char *ib_relaxed_ordering_env =
-        std::getenv("MC_IB_PCI_RELAXED_ORDERING");
-    if (ib_relaxed_ordering_env) {
-        int val = atoi(ib_relaxed_ordering_env);
-        if (val >= 0 && val <= 2)
-            config.ib_pci_relaxed_ordering_mode = val;
-        else
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
-    }
+    int ib_pci_relaxed_ordering = env.GetIbPciRelaxedOrdering();
+    if (ib_pci_relaxed_ordering >= 0 && ib_pci_relaxed_ordering <= 2)
+        config.ib_pci_relaxed_ordering_mode = ib_pci_relaxed_ordering;
+    else if (ib_pci_relaxed_ordering != 0)
+        LOG(WARNING) << "Ignore value from environment variable "
+                        "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {

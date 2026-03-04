@@ -47,6 +47,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "environ.h"
 #include "error.h"
 
 // Helper function to parse JSON string using thread-safe CharReaderBuilder
@@ -542,25 +543,16 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
-        const char *password = std::getenv("MC_REDIS_PASSWORD");
-        std::string password_str = password ? password : "";
+        auto& env = Environ::Get();
+        std::string password_str = env.GetRedisPassword();
 
         uint8_t db_index = 0;
-        const char *db_index_str = std::getenv("MC_REDIS_DB_INDEX");
-        if (db_index_str) {
-            try {
-                int index = std::stoi(db_index_str);
-                if (index >= 0 && index <= 255) {
-                    db_index = static_cast<uint8_t>(index);
-                } else {
-                    LOG(WARNING) << "Invalid Redis DB index: " << index
-                                 << ", using default 0";
-                }
-            } catch (const std::exception &e) {
-                LOG(WARNING)
-                    << "Failed to parse MC_REDIS_DB_INDEX: " << e.what()
-                    << ", using default 0";
-            }
+        int db_index_val = env.GetRedisDbIndex();
+        if (db_index_val >= 0 && db_index_val <= 255) {
+            db_index = static_cast<uint8_t>(db_index_val);
+        } else if (db_index_val != 0) {
+            LOG(WARNING) << "Invalid Redis DB index: " << db_index_val
+                         << ", using default 0";
         }
 
         return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second,
