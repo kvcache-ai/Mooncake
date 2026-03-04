@@ -340,23 +340,22 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
 }
 
 int MooncakeEpBuffer:: register_qp(int i, bool destroy_old = false) {
+    /*
     if (destroy_old && qps[i] != nullptr) {
-        // 保存旧的偏移量以便释放
         size_t old_wq_offset = qps[i]->wq_offset;
         size_t old_cq_offset = qps[i]->send_cq->cq_offset;
         size_t old_dbr_offset = qps[i]->dbr_offset;
         
-        // 销毁旧 QP
         mlx5gda_destroy_qp(qps[i]);
         qps[i] = nullptr;
-        
-        // 释放 heap 内存（如果 mlx5gda_destroy_qp 不自动释放）
+
         if (ctrl_buf_heap) {
             memheap_free(ctrl_buf_heap, old_wq_offset);
             memheap_free(ctrl_buf_heap, old_cq_offset);
             memheap_free(ctrl_buf_heap, old_dbr_offset);
         }
     }
+    */
     mlx5gda_qp* qp =
         mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
                             pd, 16384, 1, comm_stream.stream());
@@ -518,7 +517,7 @@ void MooncakeEpBuffer::sync_ib_update(const std::vector<int64_t>& remote_addrs,
     for (int id: rank_ids) {
         int st = id * rank_size, ed = (id + 1) * rank_size;                            
         for (int i = st; i < ed; ++i) {
-            if (register_qp(i)) {
+            if (register_qp(i, 1)) {
                 perror("Failed to recreate QP");
                 exit(1);
             }
@@ -599,7 +598,7 @@ void MooncakeEpBuffer::sync_roce_update(const std::vector<int64_t>& remote_addrs
     for (int id: rank_ids) {
         int st = id * rank_size, ed = (id + 1) * rank_size;
         for (int i = st; i < ed; ++i) {
-            if (register_qp(i)) {
+            if (register_qp(i, 1)) {
                 perror("Failed to recreate QP");
                 exit(1);
             }

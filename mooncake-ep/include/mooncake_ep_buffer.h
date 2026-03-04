@@ -132,6 +132,8 @@ struct MooncakeEpBuffer {
 
     bool is_roce() { return is_roce_; }
 
+    int register_qp(int i, bool destroy_old);
+
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,
                  const std::vector<int32_t>& remote_qpns,

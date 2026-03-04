@@ -155,7 +155,10 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if local_rank == 0:
         print(f'Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...', flush=True)
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
-
+    if local_rank == 0:
+        buffer.update_ep_member([1])
+    else:
+        buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=1)
 
     do_pressure_test = False
