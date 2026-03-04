@@ -689,8 +689,10 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(err);
     }
 
-    // Frequency admission: only promote frequently accessed keys to hot cache
-    if (hot_cache_) {
+    // Frequency admission: only promote frequently accessed keys to hot cache.
+    // Skip when cache_used — data was already served from local cache, no need
+    // to re-promote or increment the CMS counter.
+    if (hot_cache_ && !cache_used) {
         bool should_admit = true;
         if (admission_sketch_) {
             uint8_t freq = admission_sketch_->increment(object_key);
@@ -2573,6 +2575,7 @@ ErrorCode Client::InitLocalHotCache() {
                 << "total_cache=" << total_cache;
             hot_cache_.reset();
             hot_cache_handler_.reset();
+            admission_sketch_.reset();
             return ErrorCode::INVALID_PARAMS;
         }
         LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache

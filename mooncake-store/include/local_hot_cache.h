@@ -208,8 +208,8 @@ class LocalHotCacheHandler {
     /**
      * @brief Submit an async task to put a slice into the hot cache.
      *
-     * The data copy to hot cache is performed asynchronously by worker threads.
-     * The caller should keep slice memory valid until the task is consumed.
+     * Data is copied into the cache block synchronously within this call.
+     * The caller may free the source slice memory after this function returns.
      * @param key Cache key: {object key}
      * @param slice Source slice to cache.
      * @return true if task was successfully submitted, false otherwise (e.g.,
