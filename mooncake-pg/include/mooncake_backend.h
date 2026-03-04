@@ -91,17 +91,19 @@ class MooncakeBackend final : public ::c10d::Backend {
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
     static void setDeviceFilter(std::vector<std::string> filters) {
-        engine_.setWhitelistFilters(std::move(filters));
+        engine_->setWhitelistFilters(std::move(filters));
     }
 
     std::string getPreferredHca(std::string location) {
-        auto matrix = engine_.getLocalTopology()->getMatrix();
+        auto matrix = engine_->getLocalTopology()->getMatrix();
         auto it = matrix.find(location);
         if (it == matrix.end()) {
-            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is "
+                      << engine_->getLocalTopology()->toJson();
             LOG(ERROR) << "Topology entry not found for location: " << location;
         } else if (it->second.preferred_hca.empty()) {
-            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is "
+                      << engine_->getLocalTopology()->toJson();
             LOG(ERROR) << "Preferred HCA list is empty for location: "
                        << location;
         }
@@ -119,7 +121,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     void recoverRanks(const std::vector<int>& ranks);
 
    private:
-    static TransferEngine engine_;
+    static TransferEngine* engine_;
     static bool engineInitialized_;
     static int backendIndex_;
     bool isCpu_{false};

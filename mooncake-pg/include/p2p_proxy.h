@@ -291,8 +291,9 @@ class P2PDeviceWorker {
 class P2PDeviceWorkerManager {
    public:
     static P2PDeviceWorkerManager& GetInstance() {
-        static P2PDeviceWorkerManager manager;
-        return manager;
+        // leaky singleton to avoid destructor fiasco problem
+        static P2PDeviceWorkerManager* manager = new P2PDeviceWorkerManager;
+        return *manager;
     }
 
     std::shared_ptr<P2PDeviceWorker> GetCPUWorker();

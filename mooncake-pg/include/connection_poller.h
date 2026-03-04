@@ -95,14 +95,9 @@ class ConnectionContext {
     // For ConnectionManager
     bool poll();
     bool tryStop();
-    bool hasInflightTransfers() const {
-        return inflight_transfers_.load(std::memory_order_acquire);
-    }
 
     // Internal helpers
     bool pollPeer(int pollingRank);
-
-    std::atomic<size_t> inflight_transfers_{0};
 };
 
 class ConnectionPoller {
@@ -111,14 +106,13 @@ class ConnectionPoller {
 
    public:
     static ConnectionPoller& GetInstance() {
-        static ConnectionPoller instance;
-        return instance;
+        // leaky singleton to avoid destructor fiasco problem
+        static ConnectionPoller* instance = new ConnectionPoller;
+        return *instance;
     }
 
     void registerContext(const std::shared_ptr<ConnectionContext>& ctx);
     void removeContext(const std::shared_ptr<ConnectionContext>& ctx);
-
-    ~ConnectionPoller();
 
     void wakeup() {
         std::lock_guard<std::mutex> lock(wakeup_mutex_);
@@ -134,7 +128,6 @@ class ConnectionPoller {
 
     std::mutex wakeup_mutex_;
     std::condition_variable wakeup_cv_;
-    std::atomic<bool> isShutdown_{false};
     std::thread pollerThread_;
 
     std::mutex contexts_mutex_;

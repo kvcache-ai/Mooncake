@@ -1,4 +1,5 @@
 #include <mooncake_backend.h>
+#include <memory>
 #include <mooncake_worker.cuh>
 
 namespace mooncake {
@@ -6,8 +7,11 @@ namespace mooncake {
 class MooncakeWorkCpu : public ::c10d::Work {
    public:
     MooncakeWorkCpu(c10d::OpType opType,
-                    c10::intrusive_ptr<c10::ivalue::Future> future)
-        : Work(-1, opType), future_(future) {}
+                    c10::intrusive_ptr<c10::ivalue::Future> future,
+                    std::shared_ptr<TransferGroupMeta> meta)
+        : Work(-1, opType),
+          future_(std::move(future)),
+          meta_(std::move(meta)) {}
 
     bool isCompleted() override { return future_->completed(); }
 
@@ -18,12 +22,14 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
    private:
     c10::intrusive_ptr<c10::ivalue::Future> future_;
+    std::shared_ptr<TransferGroupMeta> meta_;
 };
 
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
-    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event)
-        : Work(-1, opType), event_(event) {}
+    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
+                     std::shared_ptr<TransferGroupMeta> meta)
+        : Work(-1, opType), event_(std::move(event)), meta_(std::move(meta)) {}
 
     bool isCompleted() override { return event_->query(); }
 
@@ -33,6 +39,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
    private:
     std::shared_ptr<torch::Event> event_;
+    std::shared_ptr<TransferGroupMeta> meta_;
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
@@ -326,7 +333,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
     (*processNextChunk)();
 
-    return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
+    return c10::make_intrusive<MooncakeWorkCpu>(opType, future, meta);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
@@ -364,7 +371,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
-    return c10::make_intrusive<MooncakeWorkCuda>(opType, event);
+    return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta);
 }
 
 }  // namespace mooncake

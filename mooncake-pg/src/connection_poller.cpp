@@ -57,13 +57,12 @@ void ConnectionContext::waitUntilAllConnected() {
 }
 
 void ConnectionContext::shutdown() {
+    // Wake up backend if they block at waitUntilAllConnected.
     {
         std::lock_guard<std::mutex> backend_lock(backend_wakeup_mutex_);
         isShutdown_.store(true, std::memory_order_release);
     }
-
     backend_wakeup_cv_.notify_all();
-    ConnectionPoller::GetInstance().wakeup();
 }
 
 bool ConnectionContext::poll() {
@@ -146,7 +145,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                             rank_ * sizeof(int32_t),
                         .length = sizeof(int32_t),
                     }});
-                inflight_transfers_.fetch_add(1);
                 peerState.warmupBatchId = batchID;
                 peerState.state = PeerConnectionState::WAITING_WARMUP_TRANSFER;
             } else {
@@ -174,7 +172,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
                 }
 
-                inflight_transfers_.fetch_sub(1);
                 state_changed = true;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 LOG(WARNING) << "Warmup request " << rank_ << " -> "
@@ -185,7 +182,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.warmupBatchId = std::nullopt;
                 peerState.segmentId = std::nullopt;
                 peerState.state = PeerConnectionState::WAITING_STORE;
-                inflight_transfers_.fetch_sub(1);
                 state_changed = true;
             }
             break;
@@ -242,7 +238,6 @@ bool ConnectionContext::tryStop() {
                 status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(peerState.warmupBatchId.value());
                 peerState.warmupBatchId = std::nullopt;
-                inflight_transfers_.fetch_sub(1);
                 peerState.state = PeerConnectionState::EXPIRING;
             } else {
                 stopped = false;
@@ -254,17 +249,6 @@ bool ConnectionContext::tryStop() {
 
 ConnectionPoller::ConnectionPoller() {
     pollerThread_ = std::thread([this] { pollerLoop(); });
-}
-
-ConnectionPoller::~ConnectionPoller() {
-    {
-        std::lock_guard<std::mutex> lock(wakeup_mutex_);
-        isShutdown_.store(true, std::memory_order_release);
-    }
-    wakeup_cv_.notify_all();
-    if (pollerThread_.joinable()) {
-        pollerThread_.join();
-    }
 }
 
 void ConnectionPoller::registerContext(
@@ -324,12 +308,10 @@ void ConnectionPoller::pollerLoop() {
         }
 
         bool did_work = false;
-        bool has_inflight_transfer = false;
         bool all_connected = true;
 
         for (const auto& ctx : local_contexts) {
             did_work |= ctx->poll();
-            has_inflight_transfer |= ctx->hasInflightTransfers();
             all_connected &= ctx->isAllPeerConnected();
         }
 
@@ -339,13 +321,7 @@ void ConnectionPoller::pollerLoop() {
                 it = zombie_contexts.erase(it);
             else {
                 ++it;
-                has_inflight_transfer = true;
             }
-        }
-
-        bool shutdown = isShutdown_.load(std::memory_order_relaxed);
-        if (shutdown && !has_inflight_transfer) {
-            break;
         }
 
         if (did_work) continue;
@@ -354,7 +330,6 @@ void ConnectionPoller::pollerLoop() {
         auto sleep_ms = all_connected ? ALL_CONNECTED_IDLE_SLEEP_MS
                                       : CONNECTING_IDLE_SLEEP_MS;
         wakeup_cv_.wait_for(lock, std::chrono::milliseconds(sleep_ms), [&]() {
-            if (isShutdown_.load(std::memory_order_relaxed)) return true;
             if (local_version !=
                 contexts_version_.load(std::memory_order_acquire))
                 return true;
