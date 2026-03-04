@@ -22,6 +22,7 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "count_min_sketch.h"
 #include "local_hot_cache.h"
 
 namespace mooncake {
@@ -163,8 +164,7 @@ class Client {
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
-                                      std::vector<Slice>& slices,
-                                      bool skip_hot_cache = false);
+                                      std::vector<Slice>& slices);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -645,6 +645,10 @@ class Client {
     // Local hot cache and async handler
     std::shared_ptr<LocalHotCache> hot_cache_;
     std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
+
+    // Frequency admission: only cache keys whose CMS count >= threshold
+    std::unique_ptr<CountMinSketch> admission_sketch_;
+    static constexpr uint8_t kAdmissionThreshold = 2;
 };
 
 }  // namespace mooncake

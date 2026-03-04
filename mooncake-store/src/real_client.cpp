@@ -381,11 +381,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    // Initialize frequency admission sketch when hot cache is enabled
-    if (client_->IsHotCacheEnabled()) {
-        admission_sketch_ = std::make_unique<CountMinSketch>();
-    }
-
     return {};
 }
 
@@ -541,7 +536,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
     }
     // Reset all resources
-    admission_sketch_.reset();
     client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
@@ -1149,13 +1143,6 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Frequency admission: only populate the hot cache for frequently accessed keys
-    bool should_cache = false;
-    if (client_->IsHotCacheEnabled() && admission_sketch_) {
-        uint8_t freq = admission_sketch_->increment(key);
-        should_cache = (freq >= admission_threshold_);
-    }
-
     // Query the object info
     auto query_result = client_->Query(key);
     if (!query_result) {
@@ -1202,8 +1189,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     allocateSlices(slices, replica, buffer_handle.ptr());
 
     // Get the object data
-    auto get_result = client_->Get(key, query_result.value(), slices,
-                                   /*skip_hot_cache=*/!should_cache);
+    auto get_result = client_->Get(key, query_result.value(), slices);
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());

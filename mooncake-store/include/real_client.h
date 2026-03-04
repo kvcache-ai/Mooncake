@@ -12,7 +12,6 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.hpp"
-#include "count_min_sketch.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -577,10 +576,6 @@ class RealClient : public PyClient {
         kDummyClientPingQueueSize};
     const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t view_version_ = 0;
-
-    // Frequency admission: only cache keys whose CMS count >= threshold
-    std::unique_ptr<CountMinSketch> admission_sketch_;
-    int admission_threshold_ = 2;
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;

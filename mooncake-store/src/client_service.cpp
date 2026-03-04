@@ -652,8 +652,7 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
-                                          std::vector<Slice>& slices,
-                                          bool skip_hot_cache) {
+                                          std::vector<Slice>& slices) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -666,7 +665,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
-    if (!skip_hot_cache && hot_cache_ && replica.is_memory_replica()) {
+    if (hot_cache_ && replica.is_memory_replica()) {
         cache_used = RedirectToHotCache(object_key, replica);
     }
 
@@ -674,13 +673,20 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     err = TransferRead(replica, slices);
 
     // Release the cache block after transfer completes (memcpy is done)
-    if (!skip_hot_cache && hot_cache_ && cache_used) {
+    if (hot_cache_ && cache_used) {
         hot_cache_->ReleaseHotKey(object_key);
     }
 
-    // Asynchronously update local hot cache with TE transfer slices
-    if (!skip_hot_cache && hot_cache_) {
-        ProcessSlicesAsync(object_key, slices, replica);
+    // Frequency admission: only promote frequently accessed keys to hot cache
+    if (hot_cache_) {
+        bool should_admit = true;
+        if (admission_sketch_) {
+            uint8_t freq = admission_sketch_->increment(object_key);
+            should_admit = (freq >= kAdmissionThreshold);
+        }
+        if (should_admit) {
+            ProcessSlicesAsync(object_key, slices, replica);
+        }
     }
 
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -813,12 +819,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
 
-                // Asynchronously update local hot cache with TE transfer slices
+                // Frequency admission: only promote frequently accessed keys
                 if (hot_cache_ && idx < op.replicas.size() &&
                     idx < op.batched_slices.size()) {
-                    ProcessSlicesAsync(object_keys[index],
-                                       op.batched_slices[idx],
-                                       op.replicas[idx]);
+                    bool should_admit = true;
+                    if (admission_sketch_) {
+                        uint8_t freq = admission_sketch_->increment(object_keys[index]);
+                        should_admit = (freq >= kAdmissionThreshold);
+                    }
+                    if (should_admit) {
+                        ProcessSlicesAsync(object_keys[index],
+                                           op.batched_slices[idx],
+                                           op.replicas[idx]);
+                    }
                 }
             }
         }
@@ -939,11 +952,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};
 
-            // asynchronously update local hot cache with TE transfer slices
+            // Frequency admission: only promote frequently accessed keys
             if (hot_cache_) {
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end()) {
-                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                    bool should_admit = true;
+                    if (admission_sketch_) {
+                        uint8_t freq = admission_sketch_->increment(key);
+                        should_admit = (freq >= kAdmissionThreshold);
+                    }
+                    if (should_admit) {
+                        ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                    }
                 }
             }
         }
@@ -2523,6 +2543,7 @@ ErrorCode Client::InitLocalHotCache() {
         // Environment variable not set or invalid, disable cache
         hot_cache_.reset();
         hot_cache_handler_.reset();
+        admission_sketch_.reset();
         return ErrorCode::OK;
     }
 
@@ -2556,6 +2577,7 @@ ErrorCode Client::InitLocalHotCache() {
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
+        admission_sketch_ = std::make_unique<CountMinSketch>();
     }
     return ErrorCode::OK;
 }
