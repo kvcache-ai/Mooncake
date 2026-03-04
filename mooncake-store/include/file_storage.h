@@ -15,29 +15,47 @@ class FileStorage {
     tl::expected<void, ErrorCode> Init();
 
     /**
+     * @brief Result of BatchGet operation containing batch_id and buffer
+     * pointers.
+     */
+    struct BatchGetResult {
+        uint64_t batch_id;
+        std::vector<uint64_t> pointers;
+    };
+
+    /**
      * @brief Reads multiple key-value (KV) entries from local storage and
      * forwards them to a remote node.
      * @param keys                 List of keys to read from the local KV store
      * @param sizes                Expected size in bytes for each value
-     * @return tl::expected<std::vector<uint64_t>, ErrorCode> indicating
-     * operation status.
+     * @return tl::expected<BatchGetResult, ErrorCode> containing batch_id and
+     * buffer pointers.
      */
-    tl::expected<std::vector<uint64_t>, ErrorCode> BatchGet(
+    tl::expected<BatchGetResult, ErrorCode> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
     FileStorageConfig config_;
 
+    /**
+     * @brief Releases buffer associated with a specific batch_id.
+     * Called by remote client after transfer completion.
+     * @param batch_id The unique identifier of the batch to release
+     * @return true if batch was found and released, false otherwise
+     */
+    bool ReleaseBuffer(uint64_t batch_id);
+
    private:
     friend class FileStorageTest;
     struct AllocatedBatch {
+        uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
         std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
 
-        AllocatedBatch() = default;
+        AllocatedBatch() : batch_id(0), total_size(0) {}
         AllocatedBatch(AllocatedBatch&&) = default;
         AllocatedBatch& operator=(AllocatedBatch&&) = default;
 
@@ -86,8 +104,9 @@ class FileStorage {
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
-    std::vector<std::shared_ptr<AllocatedBatch>> GUARDED_BY(
+    std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
+    std::atomic<uint64_t> next_batch_id_{1};
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
