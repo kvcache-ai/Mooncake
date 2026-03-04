@@ -677,18 +677,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         hot_cache_->ReleaseHotKey(object_key);
     }
 
-    // Frequency admission: only promote frequently accessed keys to hot cache
-    if (hot_cache_) {
-        bool should_admit = true;
-        if (admission_sketch_) {
-            uint8_t freq = admission_sketch_->increment(object_key);
-            should_admit = (freq >= kAdmissionThreshold);
-        }
-        if (should_admit) {
-            ProcessSlicesAsync(object_key, slices, replica);
-        }
-    }
-
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -699,6 +687,18 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
+    }
+
+    // Frequency admission: only promote frequently accessed keys to hot cache
+    if (hot_cache_) {
+        bool should_admit = true;
+        if (admission_sketch_) {
+            uint8_t freq = admission_sketch_->increment(object_key);
+            should_admit = (freq >= kAdmissionThreshold);
+        }
+        if (should_admit) {
+            ProcessSlicesAsync(object_key, slices, replica);
+        }
     }
 
     if (query_result.IsLeaseExpired()) {
@@ -778,7 +778,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         auto future = transfer_submitter_->submit_batch(
             op.replicas, op.batched_slices, TransferRequest::READ);
         if (!future) {
-            for (auto index : op.key_indexes) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                auto index = op.key_indexes[idx];
+                if (hot_cache_ && idx < op.cache_used.size() &&
+                    op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotKey(object_keys[index]);
+                }
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << object_keys[index];
