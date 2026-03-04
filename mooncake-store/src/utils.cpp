@@ -362,4 +362,39 @@ std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     return env_val ? std::string(env_val) : default_value;
 }
 
+static std::string SanitizeKey(const std::string& key) {
+    // Set of invalid filesystem characters to be replaced
+    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
+    std::string sanitized_key;
+    sanitized_key.reserve(key.size());
+
+    for (char c : key) {
+        // Replace invalid characters with underscore
+        sanitized_key.push_back(
+            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+    }
+    return sanitized_key;
+}
+
+std::string ResolvePathFromKey(const std::string& key, const std::string& root_dir, const std::string& fsdir) {
+    // Compute hash of the key
+    size_t hash = std::hash<std::string>{}(key);
+
+    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
+    char dir1 =
+        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
+    char dir2 = static_cast<char>(
+        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
+
+    // Safely construct path using std::filesystem
+    namespace fs = std::filesystem;
+    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
+
+    // Combine directory path with sanitized filename
+    fs::path full_path = fs::path(root_dir) /
+                         fsdir / dir_path /
+                         SanitizeKey(key);
+
+    return full_path.lexically_normal().string();
+}
 }  // namespace mooncake

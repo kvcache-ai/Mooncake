@@ -661,10 +661,6 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     std::unique_ptr<StorageBackend> storage_backend_;
 
-    std::string SanitizeKey(const std::string& key) const;
-
-    std::string ResolvePath(const std::string& key) const;
-
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
 
     mutable Mutex mutex_;

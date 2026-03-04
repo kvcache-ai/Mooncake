@@ -957,42 +957,6 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
     return {};
 }
 
-std::string StorageBackendAdaptor::SanitizeKey(const std::string& key) const {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
-    // Safely construct path using std::filesystem
-    namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
-
-    // Combine directory path with sanitized filename
-    fs::path full_path = fs::path(file_storage_config_.storage_filepath) /
-                         file_per_key_config_.fsdir / dir_path /
-                         SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
-}
-
 std::string StorageBackendAdaptor::ConcatSlicesToString(
     const std::vector<Slice>& slices) {
     size_t total = 0;
@@ -1046,7 +1010,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path = ResolvePath(kv.key);
+        auto path = ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
@@ -1097,7 +1061,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePath(key);
+    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
@@ -1107,7 +1071,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path = ResolvePath(kv.key);
+        auto path = ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
