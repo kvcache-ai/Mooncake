@@ -22,15 +22,52 @@ set(MOONCAKE_STORE_SOURCES
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
+    aligned_client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
+    shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    serialize/serializer.cpp
+    serialize/serializer_backend.cpp
+    utils/type_util.cpp
+    utils/file_util.cpp
     task_manager.cpp
     engram/engram.cpp
+    local_hot_cache.cpp
 )
 
 set(EXTRA_LIBS "")
+
+# Find AWS SDK
+find_package(AWSSDK QUIET COMPONENTS s3)
+if(AWSSDK_FOUND)
+    message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
+    set(HAVE_AWS_SDK TRUE)
+    # Add S3 related source files
+    list(APPEND MOONCAKE_STORE_SOURCES utils/s3_helper.cpp)
+else()
+    message(STATUS "AWS SDK not found, S3 functionality will be disabled")
+    set(HAVE_AWS_SDK FALSE)
+endif()
+
+# Find zstd library
+find_library(ZSTD_LIBRARY NAMES zstd)
+if(NOT ZSTD_LIBRARY)
+    message(FATAL_ERROR "zstd library not found")
+endif()
+
+set(EXTRA_LIBS ${ZSTD_LIBRARY})
+
+# If AWS SDK is found, add it to EXTRA_LIBS
+if(HAVE_AWS_SDK)
+    list(APPEND EXTRA_LIBS ${AWSSDK_LINK_LIBRARIES})
+    add_definitions(-DHAVE_AWS_SDK)
+    if(AWS_S3_LIB AND AWS_CORE_LIB)
+        list(APPEND EXTRA_LIBS ${AWS_S3_LIB} ${AWS_CORE_LIB})
+        add_definitions(-DHAVE_AWS_SDK)
+    endif()
+endif()
 
 if(USE_3FS)
   add_subdirectory(hf3fs)
@@ -40,6 +77,17 @@ if(USE_3FS)
     message(FATAL_ERROR "hf3fs_api_shared library not found in /usr/lib")
   endif()
   set(EXTRA_LIBS ${HF3FS_API_LIB})
+endif()
+
+# io_uring support (auto-detected)
+find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
+find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
+if(URING_LIB AND URING_INCLUDE)
+  message(STATUS "io_uring: Enabled for mooncake_store")
+  list(APPEND MOONCAKE_STORE_SOURCES uring_file.cpp)
+  list(APPEND EXTRA_LIBS ${URING_LIB})
+else()
+  message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
 
 # The cache_allocator library
@@ -55,6 +103,7 @@ target_link_libraries(mooncake_store
         glog::glog
         gflags::gflags
         ${EXTRA_LIBS}
+        asio_shared
     PRIVATE
         transfer_engine
 )
@@ -62,7 +111,12 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
-if (USE_ASCEND_DIRECT)
+if(URING_LIB AND URING_INCLUDE)
+    target_compile_definitions(mooncake_store PUBLIC USE_URING)
+    target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
+endif()
+
+if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
     if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
         file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
@@ -103,6 +157,7 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_common
     ${ETCD_WRAPPER_LIB}
     ${MASTER_EXTRA_LIBS}
+    asio_shared
 )
 
 if (STORE_USE_ETCD)
@@ -115,7 +170,7 @@ target_link_options(mooncake_master PRIVATE -Os -s)
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine)
+target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 

@@ -577,5 +577,13 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
         return impl_->getLocalTopology();
 }
 
+void* TransferEngine::getBaseAddr() {
+    if (use_tent_) {
+        // TENT version does not support CXL base address
+        return nullptr;
+    } else
+        return impl_->getBaseAddr();
+}
+
 }  // namespace mooncake
 #endif

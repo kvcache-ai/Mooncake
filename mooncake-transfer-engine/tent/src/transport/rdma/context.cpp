@@ -486,6 +486,28 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     return entry;
 }
 
+int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        return -1;
+    }
+    ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length,
+                                              IBV_ACCESS_LOCAL_WRITE);
+    if (!entry) {
+        PLOG(WARNING) << "ibv_reg_mr warm-up failed on " << device_name_
+                      << " for [" << addr << ", " << length << " bytes]";
+        return -1;
+    }
+
+    int deregister_rc = verbs_.ibv_dereg_mr(entry);
+    if (deregister_rc != 0) {
+        LOG(WARNING) << "Failed to deregister warm-up MR (rc=" << deregister_rc
+                     << "), may cause resource leak";
+        return -1;
+    }
+    return 0;
+}
+
 int RdmaContext::unregisterMemReg(MemReg id) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";

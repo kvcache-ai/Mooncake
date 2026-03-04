@@ -274,10 +274,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     auto state = std::make_shared<IterState>();
 
     auto processNextChunk = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weakProcessNextChunk =
+        processNextChunk;
 
-    *processNextChunk = [this, processNextChunk, state, opType, tensorSize,
+    *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
                          chunkSize, broadcastRoot, meta, tensorToBuffer,
                          bufferToTensor, future]() {
+        auto processNextChunk = weakProcessNextChunk.lock();
+
         if (state->currentPos >= tensorSize) {
             future->markCompleted(c10::IValue());
             return;

@@ -3,6 +3,8 @@
 #include <optional>
 #include <stdexcept>
 
+#include <glog/logging.h>
+
 #include "config_helper.h"
 #include "types.h"
 
@@ -33,6 +35,7 @@ struct MasterConfig {
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
+    std::string allocation_strategy;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -46,12 +49,24 @@ struct MasterConfig {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
 
+    bool enable_snapshot_restore;
+    bool enable_snapshot;
+    std::string snapshot_backup_dir;
+    uint64_t snapshot_interval_seconds;
+    uint64_t snapshot_child_timeout_seconds;
+    uint32_t snapshot_retention_count;
+
+    // Snapshot storage backend type: "local" or "s3", required when snapshot
+    // or restore is enabled
+    std::string snapshot_backend_type;
+
     // Task manager configuration
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    uint32_t max_retry_attempts;
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
@@ -96,6 +111,16 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_backend_type;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -141,11 +166,19 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
 
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_backend_type = config.snapshot_backend_type;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
@@ -215,11 +248,21 @@ class WrappedMasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_backend_type;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -227,6 +270,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -264,14 +308,38 @@ class WrappedMasterServiceConfig {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
 
+        // Convert string allocation_strategy to AllocationStrategyType enum
+        if (config.allocation_strategy == "free_ratio_first") {
+            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "cxl") {
+            allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else {
+            LOG(WARNING) << "Unrecognized allocation_strategy value: '"
+                         << config.allocation_strategy
+                         << "'. Defaulting to 'random'. "
+                         << "Valid options are: random, free_ratio_first, cxl "
+                            "(case-sensitive)";
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        }
+
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_backend_type = config.snapshot_backend_type;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
@@ -305,11 +373,20 @@ class WrappedMasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot = config.enable_snapshot;
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_backend_type = config.snapshot_backend_type;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
@@ -338,15 +415,26 @@ class MasterServiceConfigBuilder {
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type_ =
+        AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_ = false;
+    std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds_ =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_backend_type_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
     uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
+    uint32_t max_retry_attempts_ = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
@@ -424,6 +512,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_allocation_strategy_type(
+        AllocationStrategyType type) {
+        allocation_strategy_type_ = type;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_put_start_discard_timeout_sec(
         uint64_t put_start_discard_timeout_sec) {
         put_start_discard_timeout_sec_ = put_start_discard_timeout_sec;
@@ -436,6 +530,44 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_snapshot_restore(bool enable) {
+        enable_snapshot_restore_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
+        enable_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_backup_dir(
+        const std::string& dir) {
+        snapshot_backup_dir_ = dir;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_interval_seconds(
+        uint64_t seconds) {
+        snapshot_interval_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_child_timeout_seconds(
+        uint64_t seconds) {
+        snapshot_child_timeout_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_retention_count(uint32_t count) {
+        snapshot_retention_count_ = count;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_backend_type(
+        const std::string& type) {
+        snapshot_backend_type_ = type;
+        return *this;
+    }
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
         uint32_t max_total_finished_tasks) {
         max_total_finished_tasks_ = max_total_finished_tasks;
@@ -464,6 +596,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_retry_attempts(
+        uint32_t max_retry_attempts) {
+        max_retry_attempts_ = max_retry_attempts;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_cxl_path(const std::string& path) {
         cxl_path_ = path;
         return *this;
@@ -489,6 +627,7 @@ struct TaskManagerConfig {
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    uint32_t max_retry_attempts;
 };
 
 class MasterServiceConfig {
@@ -508,17 +647,28 @@ class MasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_backend_type;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
         .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
         .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
         .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
+        .max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS,
     };
 
     std::string cxl_path = DEFAULT_CXL_PATH;
@@ -545,10 +695,20 @@ class MasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
+        allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_backend_type = config.snapshot_backend_type;
+
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
         task_manager_config.max_total_pending_tasks =
@@ -559,6 +719,7 @@ class MasterServiceConfig {
             config.pending_task_timeout_sec;
         task_manager_config.processing_task_timeout_sec =
             config.processing_task_timeout_sec;
+        task_manager_config.max_retry_attempts = config.max_retry_attempts;
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
@@ -584,10 +745,18 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
+    config.allocation_strategy_type = allocation_strategy_type_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_snapshot_restore = enable_snapshot_restore_;
+    config.enable_snapshot = enable_snapshot_;
+    config.snapshot_backup_dir = snapshot_backup_dir_;
+    config.snapshot_interval_seconds = snapshot_interval_seconds_;
+    config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
+    config.snapshot_retention_count = snapshot_retention_count_;
+    config.snapshot_backend_type = snapshot_backend_type_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =
@@ -598,6 +767,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         pending_task_timeout_sec_;
     config.task_manager_config.processing_task_timeout_sec =
         processing_task_timeout_sec_;
+    config.task_manager_config.max_retry_attempts = max_retry_attempts_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
@@ -618,6 +788,7 @@ struct InProcMasterConfig {
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
+    std::optional<double> eviction_high_watermark_ratio;
 };
 
 // Builder class for InProcMasterConfig
@@ -630,6 +801,7 @@ class InProcMasterConfigBuilder {
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
+    std::optional<double> eviction_high_watermark_ratio_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -669,6 +841,15 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "eviction_high_watermark_ratio must be between 0.0 and 1.0");
+        }
+        eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -682,6 +863,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
+    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     return config;
 }
 

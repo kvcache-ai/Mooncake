@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <memory>
 #include <string>
 #include <vector>
@@ -126,8 +127,7 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]]
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**

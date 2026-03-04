@@ -42,12 +42,16 @@ struct BootstrapDesc {
     std::string local_nic_path;
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
+    // RDMA address of local_nic_path.
+    uint16_t local_lid = 0;
+    std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, reply_msg, notify_qp_num);
+                                   qp_num, local_lid, local_gid, reply_msg,
+                                   notify_qp_num);
 };
 
 struct XferDataDesc {

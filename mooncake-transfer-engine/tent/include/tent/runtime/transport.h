@@ -98,6 +98,11 @@ class Transport {
         return Platform::getLoader().free(addr, size);
     }
 
+    // Pre-registration warm-up that pins pages before NUMA probing.
+    // Returns true if pages were successfully pinned (caller may skip
+    // prefault). Default: no-op, returns false.
+    virtual bool warmupMemory(void *addr, size_t length) { return false; }
+
     virtual Status addMemoryBuffer(BufferDesc &desc,
                                    const MemoryOptions &options) {
         return Status::NotImplemented(

@@ -2,7 +2,9 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -30,8 +32,111 @@ struct BucketMetadata {
     int64_t data_size;
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
+
+    // Runtime-only fields (not serialized) for safe deletion support
+    // Tracks number of in-flight reads to enable safe bucket deletion
+    mutable std::atomic<int32_t> inflight_reads_{0};
+
+    // Default constructor
+    BucketMetadata() = default;
+
+    // Copy constructor (atomic not copyable, so reset to 0)
+    BucketMetadata(const BucketMetadata& other)
+        : meta_size(other.meta_size),
+          data_size(other.data_size),
+          keys(other.keys),
+          metadatas(other.metadatas),
+          inflight_reads_(0) {}
+
+    // Move constructor
+    BucketMetadata(BucketMetadata&& other) noexcept
+        : meta_size(other.meta_size),
+          data_size(other.data_size),
+          keys(std::move(other.keys)),
+          metadatas(std::move(other.metadatas)),
+          inflight_reads_(0) {}
+
+    // Copy assignment
+    BucketMetadata& operator=(const BucketMetadata& other) {
+        if (this != &other) {
+            meta_size = other.meta_size;
+            data_size = other.data_size;
+            keys = other.keys;
+            metadatas = other.metadatas;
+            // Don't copy inflight_reads_ - it's runtime state
+        }
+        return *this;
+    }
+
+    // Move assignment
+    BucketMetadata& operator=(BucketMetadata&& other) noexcept {
+        if (this != &other) {
+            meta_size = other.meta_size;
+            data_size = other.data_size;
+            keys = std::move(other.keys);
+            metadatas = std::move(other.metadatas);
+            // Don't move inflight_reads_ - it's runtime state
+        }
+        return *this;
+    }
 };
 YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+
+/**
+ * @brief RAII guard for tracking in-flight bucket reads.
+ *
+ * Increments inflight_reads_ on construction, decrements on destruction.
+ * This enables safe bucket deletion by waiting for all in-flight reads
+ * to complete before deleting bucket files.
+ *
+ * Usage:
+ *   auto guard = BucketReadGuard(bucket_metadata_ptr);
+ *   // ... perform IO ...
+ *   // guard destructor decrements counter
+ */
+class BucketReadGuard {
+   public:
+    explicit BucketReadGuard(std::shared_ptr<BucketMetadata> bucket)
+        : bucket_(std::move(bucket)) {
+        if (bucket_) {
+            bucket_->inflight_reads_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    ~BucketReadGuard() {
+        if (bucket_) {
+            bucket_->inflight_reads_.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    // Non-copyable
+    BucketReadGuard(const BucketReadGuard&) = delete;
+    BucketReadGuard& operator=(const BucketReadGuard&) = delete;
+
+    // Movable
+    BucketReadGuard(BucketReadGuard&& other) noexcept
+        : bucket_(std::move(other.bucket_)) {
+        other.bucket_ = nullptr;
+    }
+
+    BucketReadGuard& operator=(BucketReadGuard&& other) noexcept {
+        if (this != &other) {
+            // Release current bucket if any
+            if (bucket_) {
+                bucket_->inflight_reads_.fetch_sub(1,
+                                                   std::memory_order_release);
+            }
+            bucket_ = std::move(other.bucket_);
+            other.bucket_ = nullptr;
+        }
+        return *this;
+    }
+
+    const std::shared_ptr<BucketMetadata>& get() const { return bucket_; }
+
+   private:
+    std::shared_ptr<BucketMetadata> bucket_;
+};
 
 struct OffloadMetadata {
     int64_t total_keys;
@@ -95,6 +200,9 @@ struct FileStorageConfig {
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
+    // Use io_uring for file I/O instead of POSIX pread/pwrite
+    bool use_uring = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -125,7 +233,7 @@ class StorageBackendInterface {
             complete_handler) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) = 0;
+        std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
@@ -333,6 +441,7 @@ class StorageBackend {
     std::string fsdir_;
     bool enable_eviction_{
         true};  // User-configurable flag to enable/disable eviction
+    bool use_uring_{false};  // Use io_uring for file I/O
 
 #ifdef USE_3FS
     bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
@@ -509,7 +618,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
             complete_handler) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
@@ -569,6 +678,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
+    ~BucketStorageBackend();
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be
@@ -603,7 +714,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
@@ -689,6 +800,24 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
 
+    /**
+     * @brief Delete a bucket and all its associated keys.
+     *
+     * This method safely deletes a bucket by:
+     * 1. Removing the bucket and its keys from metadata maps (under lock)
+     * 2. Waiting for all in-flight reads to complete (via inflight_reads_)
+     * 3. Deleting the bucket data and metadata files
+     *
+     * Thread-safe: Can be called concurrently with BatchLoad operations.
+     * The method blocks until all in-flight reads complete.
+     *
+     * @param bucket_id The bucket ID to delete.
+     * @return tl::expected<void, ErrorCode>
+     *         - OK on success
+     *         - BUCKET_NOT_FOUND if bucket doesn't exist
+     */
+    tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -705,11 +834,6 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
-
-    tl::expected<void, ErrorCode> BatchLoadBucket(
-        int64_t bucket_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas,
-        const std::unordered_map<std::string, Slice>& batched_slices);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -732,11 +856,45 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> HasNext();
 
+    /**
+     * @brief Cleanup orphaned bucket files (data + metadata) for a given bucket
+     * ID. Called when BatchOffload fails due to duplicate keys after files were
+     * written.
+     * @param bucket_id The bucket ID whose files should be deleted.
+     */
+    void CleanupOrphanedBucket(int64_t bucket_id);
+
+   public:
+    /**
+     * @brief Get a file instance for external buffer registration
+     * Opens a temporary file to get access to the UringFile instance
+     * @return Shared pointer to StorageFile or error
+     */
+    tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
+        const;
+
    private:
+    // Alignment helper functions for O_DIRECT I/O
+    static constexpr size_t kDirectIOAlignment = 4096;
+
+    static inline size_t align_up(size_t size, size_t alignment) {
+        return (size + alignment - 1) & ~(alignment - 1);
+    }
+
+    static inline int64_t align_down(int64_t offset, int64_t alignment) {
+        return offset & ~(alignment - 1);
+    }
+
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+
+    // Aligned buffer for O_DIRECT I/O operations
+    // We use a fixed-size buffer to avoid frequent allocations
+    static constexpr size_t kAlignedBufferSize = 16 * 1024 * 1024;  // 16MB
+    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
+                                                              [](void*) {}};
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
@@ -760,6 +918,18 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+
+    // File handle cache for UringFile to avoid repeated open/close overhead
+    mutable Mutex file_cache_mutex_;
+    mutable std::unordered_map<std::string, std::shared_ptr<StorageFile>>
+        file_cache_ GUARDED_BY(file_cache_mutex_);
+
+    // Get or open a file with caching support
+    tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetOrOpenFile(
+        const std::string& path, FileMode mode) const;
+
+    // Clear file cache (called on destruction or when needed)
+    void ClearFileCache();
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
@@ -796,7 +966,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Checks whether an object with the specified key exists in the

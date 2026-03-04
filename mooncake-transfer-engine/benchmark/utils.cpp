@@ -35,12 +35,15 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
-DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used");
-DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used");
+DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
+DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",
               "List of metadata service URLs, comma-separated.");
+DEFINE_int32(
+    rpc_server_port, 0,
+    "RPC server port used for p2p metadata service (0 = auto-select).");
 DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
@@ -65,6 +68,7 @@ int XferBenchConfig::start_num_threads = 0;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
+int XferBenchConfig::rpc_server_port = 0;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
@@ -90,6 +94,7 @@ void XferBenchConfig::loadFromFlags() {
 
     metadata_type = FLAGS_metadata_type;
     metadata_url_list = FLAGS_metadata_url_list;
+    rpc_server_port = FLAGS_rpc_server_port;
 
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;

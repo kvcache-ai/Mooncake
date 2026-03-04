@@ -20,6 +20,11 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--http_metadata_server_host` (str, default `0.0.0.0`): Metadata bind host.
   - `--http_metadata_server_port` (int, default `8080`): Metadata TCP port.
 
+- Allocation Strategy
+  - `--allocation_strategy` (str, default `random`): Memory allocation strategy for replica placement. Available options:
+    - `random`: Pure random selection across segments (baseline, fastest).
+    - `free_ratio_first`: Free-ratio-first strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
+
 - Eviction and TTLs
   - `--default_kv_lease_ttl` (uint64, default `5000` ms): Default lease TTL for KV objects.
   - `--default_kv_soft_pin_ttl` (uint64, default `1800000` ms): Soft pin TTL (30 minutes).
@@ -33,9 +38,29 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
+- Task Manager (optional)
+  - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
+  - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.
+  - `--max_total_processing_tasks` (uint32, default `10000`): Maximum number of tasks that can be processing simultaneously. When this limit is reached, no new tasks will be popped from the pending queue until some processing tasks complete.
+  - `--max_retry_attempts` (uint32, default `10`): Maximum number of retry attempts for failed tasks. Tasks that fail with `NO_AVAILABLE_HANDLE` error will be retried up to this many times before being marked as failed.
+
 - DFS Storage (optional)
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
   - `--global_file_segment_size` (int64, default `int64_max`): Maximum available space for DFS segments.
+
+- Snapshot / Restore (optional)
+  - `--enable_snapshot` (bool, default `false`): Enable periodic snapshot of master metadata data (effective when using the `offset` memory allocator).
+  - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
+  - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
+  - `--snapshot_retention_count` (uint32, default `2`): Number of recent snapshots to keep. Older snapshots beyond this limit will be automatically deleted.
+  - `--snapshot_backend_type` (str, required when snapshot enabled): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
+  - `--snapshot_backup_dir` (str, default empty): Optional local directory for snapshot backup. If empty (default), local backup is disabled. When set, it serves two purposes: (1) during snapshot persistence, data will be saved locally as a fallback if uploading to the backend fails; (2) during restore, downloaded metadata will also be saved to this directory as a local backup.
+  - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
+  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_backend_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
+
+  > **Warning: Managed Directory**
+  >
+  > The snapshot storage path (`MOONCAKE_SNAPSHOT_LOCAL_PATH` for local backend, or S3 bucket for S3 backend) is a **managed directory** exclusively controlled by the Mooncake snapshot system. **DO NOT store other files or data in this directory.** Old snapshots exceeding `--snapshot_retention_count` will be automatically and permanently deleted during cleanup. Use a dedicated, isolated directory for snapshot storage to avoid accidental data loss.
 
 Example (enable embedded HTTP metadata and metrics):
 
@@ -49,13 +74,22 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
+Example (use free-ratio-first allocation strategy for better load balancing):
+
+```bash
+mooncake_master \
+  --allocation_strategy=free_ratio_first \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_port=8080
+```
+
 **Tips:**
 
 In addition to command-line flags, the Master also supports configuration via JSON and YAML files. For example:
 
 ```bash
 mooncake_master \
-  --config_path=mooncake-store/conf/master.yaml 
+  --config_path=mooncake-store/conf/master.yaml
 ```
 
 ## Metrics Endpoints

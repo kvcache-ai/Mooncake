@@ -5,19 +5,10 @@ TEST_TYPE="double"
 SUPPORT_MODELS=("Qwen/Qwen3-8B" "deepseek-ai/DeepSeek-V2-Lite")
 
 PID_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}/run/pids/${test_case_name}
-
-if [ -z "${ISREMOTE}" ]; then
-    if [ -n "${REMOTE_IP}" ] && [ -n "${REMOTE_TEST_DIR}" ] && [[ "$PWD" == "${REMOTE_TEST_DIR}"* ]]; then
-        ISREMOTE=1
-    else
-        ISREMOTE=0
-    fi
-    export ISREMOTE
-fi
-
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
 . ${BASE_DIR}/scripts/common.sh
 
+detect_remote_mode
 mkdir -p "$PID_DIR"
 
 start_server()
@@ -26,6 +17,7 @@ start_server()
     local model_name=$1
     local model_name_clean=$2
     local sglang_server_log_path
+    local mode_name
     if [ "$ISREMOTE" == "0" ]; then 
         host=$LOCAL_IP
         sglang_server_log_path=/test_run/run/logs/$test_case_name/$model_name_clean/sglang_server_local.log
@@ -36,21 +28,8 @@ start_server()
         mode_name=decode
     fi
 
-    sglang_start_server_cmd="
-    ${docker_exec} \
-    \"python -m sglang.launch_server --model-path ${model_name} \
-    --disaggregation-mode $mode_name --port 30001 --host ${host} --tp-size 2 --base-gpu-id=0 > ${sglang_server_log_path} 2>&1 &\""
-
-    local pid_file="${PID_DIR}/server_${mode_name}.pid"
-    local grep_pattern="python -m sglang.launch_server.*${model_name}"
-
-    echo "Starting SGLang Server..."
-    if ! launch_and_track_process "$sglang_start_server_cmd" "$grep_pattern" "$pid_file"; then
-        return 1
-    fi
-
-    exactly_sglang_server_log_path=$(echo "$sglang_server_log_path" | sed "s|/test_run/|$BASE_DIR/|")
-    if ! check_server_ready "$exactly_sglang_server_log_path"; then
+    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=6"
+    if ! launch_sglang_server "$model_name" "$host" "30001" "$sglang_server_log_path" "$mode_name" "$extra_args"; then
         return 1
     fi
 
@@ -61,23 +40,11 @@ run_proxy(){
     local model_name=$1
     local proxy_log_path="/test_run/run/logs/$test_case_name/$model_name/load_balancer.log"
 
-    echo "===== Proxy Run ====="
-    lb_cmd="${docker_exec} \"python3 -m sglang_router.launch_router --pd-disaggregation \
-    --prefill http://${LOCAL_IP}:30001 --decode http://${REMOTE_IP}:30001 --host 0.0.0.0 \
-    --port 8000 > $proxy_log_path 2>&1 &\""
-
-    local pid_file="${PID_DIR}/proxy.pid"
-    local grep_pattern="sglang::router"
-    echo "Load balancer starting..."
-    if ! launch_and_track_process "$lb_cmd" "$grep_pattern" "$pid_file"; then
+    if ! launch_sglang_router "http://${LOCAL_IP}:30001" "http://${REMOTE_IP}:30001" "0.0.0.0" "8000" "$proxy_log_path"; then
+        echo "ERROR: Failed to start SGLang Router"
         return 1
     fi
-
-    exactly_proxy_log_path=$(echo "$proxy_log_path" | sed "s|/test_run/|$BASE_DIR/|")
-    if ! check_proxy_ready "$exactly_proxy_log_path"; then
-        return 1
-    fi
-
+    
     return 0
 }
 
@@ -98,45 +65,27 @@ run_request(){
 
     echo "$response_body" > $BASE_DIR/run/logs/$test_case_name/$model_name/curl_response.log
 
-    if [ $status_code -eq 200 ]; then
+    if validate_api_response "$response_body" "$status_code"; then
         echo "Test request successful!"
         return 0
     else
-        echo "Test request failed with status code $status_code"
+        echo "Test request failed"
         return 1
     fi
 }
 
 kill_model_processes() {
-    echo "===== Killing model processes ====="
-    
-    if [ -d "$PID_DIR" ]; then
-        echo "Cleaning up by PID files in $PID_DIR..."
-        for pid_file in "${PID_DIR}"/*.pid; do
-            if [ -f "$pid_file" ]; then
-                local service_name=$(basename "$pid_file" .pid)
-                kill_process "$pid_file" "$service_name"
-            fi
-        done
-    fi
-    
-    if [ "$ISREMOTE" == "0" ] && [ -n "$REMOTE_IP" ]; then
-        echo "===== Killing model processes (remote: $REMOTE_IP) ====="
-        ${SSH_CMD} "$REMOTE_IP" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server" 2>/dev/null || true
-    fi
-    
-    echo "Process cleanup completed."
+    cleanup_model_processes "$PID_DIR" "$test_case_name"
 }
 
 run_single_model()
 {
     local model_name=$1
-    local model_name_clean=$(echo "$model_name" | sed 's/\//__/g')
+    local model_name_clean=$(sanitize_model_name "$model_name")
     local status=0
 
-    setup_log_directory "$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean"
-    ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && source ./common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
-    
+    setup_log_directory_dual "$test_case_name" "$model_name_clean"   
+
     echo "===== Run MODEL NAME: $model_name ====="    
     # Local start server
     if ! start_server $model_name $model_name_clean; then
@@ -196,61 +145,8 @@ run_test()
 parse()
 {
     echo "===== Parsing test results ====="
-    local all_passed=true
-
-    if [ -n "$REMOTE_IP" ]; then
-        echo "Getting remote results from remote server..."
-        for model in "${SUPPORT_MODELS[@]}"; do
-            local model_name_clean=$(echo "$model" | sed 's/\//__/g')
-            
-            local remote_log_dir="${REMOTE_TEST_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
-            local local_log_dir="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
-            
-            echo "Processing model: $model_name_clean"
-            echo "  Remote log dir: $remote_log_dir"
-            echo "  Local log dir: $local_log_dir"
-            
-            echo "  Copying remote sglang_server_remote.log..."
-            scp ${REMOTE_IP}:${remote_log_dir}/sglang_server_remote.log \
-                ${local_log_dir}/ 2>/dev/null
-            
-            if [ $? -eq 0 ]; then
-                echo "  ✓ Successfully copied sglang_server_remote.log for $model_name_clean"
-            else
-                echo "  ✗ Failed to copy sglang_server_remote.log for $model_name_clean (file may not exist)"
-            fi
-
-            local log_file="${local_log_dir}/curl_response.log"
-            
-            echo "  Checking results for model: $model"
-            
-            if [ -f "$log_file" ]; then
-                curl_response=$(cat "$log_file")
-                
-                if echo "$curl_response" | grep -q "\"object\":\"error\""; then
-                    error_message=$(echo "$curl_response" | grep -o '"message":"[^"]*"' | sed 's/"message":"//' | sed 's/"$//')
-                    echo "  ERROR: $error_message"
-                    echo "  $model: Fail"
-                    all_passed=false
-                else
-                    echo "  $model:Pass"
-                fi
-            else
-                echo "  ERROR: Curl response log not found at $log_file"
-                echo "  $model:Fail"
-                all_passed=false
-            fi
-            
-            echo ""
-        done
-        
-        echo "Remote log collection completed"
-    else
-        echo "No client specified, skipping result parsing"
-        all_passed=false
-    fi
-
-    if [ "$all_passed" = true ]; then
+    
+    if collect_and_validate_model_results "SUPPORT_MODELS" "sglang_server_remote.log" "$test_case_name"; then
         save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
         echo "✓ Test PASSED"
         return 0

@@ -124,6 +124,9 @@ SYSTEM_PACKAGES="build-essential \
                   libhiredis-dev \
                   liburing-dev \
                   libjemalloc-dev \
+                  libmsgpack-dev \
+                  libzstd-dev \
+                  libasio-dev \
                   pkg-config \
                   patchelf \
                   libc6-dev \
