@@ -124,6 +124,11 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             auto segment_id = engine_->openSegment(peerServerName);
             meta_->segmentIDs[pollingRank] = segment_id;
             peerState.segmentId = segment_id;
+
+            if (buffer_data.size() < sizeof(SegmentInfo)) {
+                peerState.increaseCheckStoreBackoff();
+                return false;
+            }
             memcpy(&meta_->segmentInfos[pollingRank], buffer_data.data(),
                    sizeof(SegmentInfo));
 

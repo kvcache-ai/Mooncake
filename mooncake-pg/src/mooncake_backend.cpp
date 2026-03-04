@@ -236,7 +236,9 @@ MooncakeBackend::MooncakeBackend(
                    "_" + std::to_string(rank_);
         while (true) {
             if (store->check({key})) {
-                meta_->taskCount = std::atoi((char*)store->get(key).data());
+                auto data = store->get(key);
+                std::string val(data.begin(), data.end());
+                meta_->taskCount = std::stoi(val);
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -758,6 +760,8 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
     while (true) {
         std::vector<int> input;
         for (const int rank : ranks) {
+            TORCH_CHECK(rank >= 0 && static_cast<size_t>(rank) < kMaxNumRanks,
+                        "Rank out of range");
             input.push_back(meta_->peerConnected[rank]);
         }
         for (int i = 0; i < meta_->size; i++) {
@@ -798,6 +802,8 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
 
 void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
     for (const int rank : ranks) {
+        TORCH_CHECK(rank >= 0 && static_cast<size_t>(rank) < kMaxNumRanks,
+                    "Rank out of range");
         TORCH_CHECK(meta_->peerConnected[rank]);
         meta_->activeRanks[rank] = true;
         meta_->store->set("extension_task_count_" +
