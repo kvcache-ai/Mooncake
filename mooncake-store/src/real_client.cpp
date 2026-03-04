@@ -541,6 +541,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
     }
     // Reset all resources
+    admission_sketch_.reset();
     client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();

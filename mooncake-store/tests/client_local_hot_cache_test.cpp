@@ -1045,7 +1045,6 @@ TEST_F(LocalHotCacheTest, HotCacheRefCountViewMode) {
     Slice slice = CreateSlice(1024, 'V');
     EXPECT_TRUE(PutHotKeyHelper(*cache, "view_key", slice));
 
-    // Simulate the get_buffer_internal hot cache fast path:
     // GetHotKey increments ref_count, then we create a BufferHandle in view
     // mode whose release_fn decrements ref_count.
     HotMemBlock* blk = cache->GetHotKey("view_key");
@@ -1053,7 +1052,7 @@ TEST_F(LocalHotCacheTest, HotCacheRefCountViewMode) {
     EXPECT_EQ(blk->ref_count.load(), 1);
 
     {
-        // Create a BufferHandle in view mode (same as get_buffer_internal)
+        // Create a BufferHandle in view mode
         auto handle = std::make_shared<BufferHandle>(
             blk->addr, blk->size,
             [blk, cache]() {
@@ -1112,7 +1111,7 @@ TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
     block->size = data_size;
     EXPECT_TRUE(cache->PutHotKey(block));
 
-    // Step 4: Re-acquire ref via GetHotKey (same as get_buffer_internal)
+    // Step 4: Re-acquire ref via GetHotKey
     HotMemBlock* blk = cache->GetHotKey("zc_write_key");
     ASSERT_NE(blk, nullptr);
     EXPECT_EQ(blk->ref_count.load(), 1);
