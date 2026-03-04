@@ -27,7 +27,7 @@
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
-DEFINE_int32(http_port, 9100,
+DEFINE_int32(http_port, 9300,
              "Port for client HTTP server "
              "(only effective when --enable_http_server=true).");
 
