@@ -1,6 +1,7 @@
 // client_local_hot_cache_test.cpp
 #include "client_service.h"
 #include "client_buffer.hpp"
+#include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "replica.h"
 #include "test_server_helpers.h"
@@ -1032,12 +1033,11 @@ TEST_F(LocalHotCacheTest, ConcurrentGetHotKeySharedLock) {
 }
 
 // ---------------------------------------------------------------------------
-// BufferHandle view mode with hot cache test
+// HotMemBlock ref_count and BufferHandle view mode test
 // ---------------------------------------------------------------------------
 
-// Test that get_buffer_internal hot cache path works with BufferHandle view mode
-// and ref_count lifecycle.
-TEST_F(LocalHotCacheTest, GetBufferInternalHotCacheZeroCopy) {
+// Test that GetHotKey + BufferHandle view mode ref_count lifecycle works correctly.
+TEST_F(LocalHotCacheTest, HotCacheRefCountViewMode) {
     const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
     auto cache = std::make_shared<LocalHotCache>(cache_size);
 
@@ -1092,9 +1092,9 @@ TEST_F(LocalHotCacheTest, GetBufferInternalHotCacheZeroCopy) {
     EXPECT_EQ(blk->ref_count.load(), 0);
 }
 
-// Test zero-copy write path: GetFreeBlock → direct write → PutHotKey →
-// GetHotKey → BufferHandle view mode
-TEST_F(LocalHotCacheTest, ZeroCopyWritePath) {
+// Test GetFreeBlock → direct write → PutHotKey → GetHotKey → BufferHandle
+// view mode (exercises the low-level cache block lifecycle).
+TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
     const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
     auto cache = std::make_shared<LocalHotCache>(cache_size);
 
@@ -1141,6 +1141,52 @@ TEST_F(LocalHotCacheTest, ZeroCopyWritePath) {
 
     // After handle destruction, ref_count should be 0
     EXPECT_EQ(blk->ref_count.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// CountMinSketch basic tests
+// ---------------------------------------------------------------------------
+
+TEST_F(LocalHotCacheTest, CountMinSketchBasic) {
+    CountMinSketch sketch(64, 4);
+
+    // First increment returns 1
+    EXPECT_EQ(sketch.increment("key_a"), 1);
+    // Second increment returns 2
+    EXPECT_EQ(sketch.increment("key_a"), 2);
+    // Third increment returns 3
+    EXPECT_EQ(sketch.increment("key_a"), 3);
+
+    // A different key starts at 1
+    EXPECT_EQ(sketch.increment("key_b"), 1);
+
+    // Read-only count matches
+    EXPECT_EQ(sketch.count("key_a"), 3);
+    EXPECT_EQ(sketch.count("key_b"), 1);
+    // Never-seen key has count 0
+    EXPECT_EQ(sketch.count("key_c"), 0);
+
+    // Decay halves all counters
+    sketch.decay();
+    EXPECT_EQ(sketch.count("key_a"), 1);  // 3 >> 1 = 1
+    EXPECT_EQ(sketch.count("key_b"), 0);  // 1 >> 1 = 0
+}
+
+TEST_F(LocalHotCacheTest, CountMinSketchAutoDecay) {
+    // Small sketch: width=8, depth=2 → auto-decay threshold = 16
+    CountMinSketch sketch(8, 2);
+
+    // Increment one key 15 times (below threshold)
+    for (int i = 0; i < 15; ++i) {
+        sketch.increment("hot_key");
+    }
+    EXPECT_EQ(sketch.count("hot_key"), 15);
+
+    // The 16th increment triggers auto-decay: increment returns the
+    // pre-decay count (16), but afterwards counters are halved.
+    uint8_t ret = sketch.increment("hot_key");
+    EXPECT_EQ(ret, 16);
+    EXPECT_EQ(sketch.count("hot_key"), 8);  // 16 >> 1 = 8
 }
 
 }  // namespace testing
