@@ -803,8 +803,11 @@ int main(int argc, char* argv[]) {
 #ifdef USE_URING
             config.use_uring = true;
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --use-uring specified but io_uring support "
+                         "was not compiled in (USE_URING is not defined). "
+                         "Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--queue-depth" && i + 1 < argc) {
             config.uring_queue_depth = std::stoul(argv[++i]);
@@ -818,8 +821,11 @@ int main(int argc, char* argv[]) {
                 config.use_uring = true;
             }
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --uring-direct-io specified but io_uring "
+                         "support was not compiled in (USE_URING is not "
+                         "defined). Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--uring-direct-io-zerocopy") {
 #ifdef USE_URING
@@ -831,8 +837,11 @@ int main(int argc, char* argv[]) {
                 config.use_uring = true;
             }
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --uring-direct-io-zerocopy specified but "
+                         "io_uring support was not compiled in (USE_URING is "
+                         "not defined). Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--use-registered-buffers") {
 #ifdef USE_URING
@@ -849,8 +858,11 @@ int main(int argc, char* argv[]) {
                           << std::endl;
             }
 #else
-            std::cerr << "Warning: io_uring support not compiled in"
+            std::cerr << "Error: --use-registered-buffers specified but "
+                         "io_uring support was not compiled in (USE_URING is "
+                         "not defined). Cannot benchmark UringFile performance."
                       << std::endl;
+            return 1;
 #endif
         } else if (arg == "--direct-io") {
             config.use_direct_io = true;
