@@ -19,6 +19,7 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils/snapshot_logger.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -747,7 +748,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     // If disk replica is enabled, allocate a disk replica
     if (use_disk_replica_) {
         // Allocate a file path for the disk replica
-        std::string file_path = ResolvePath(key);
+        std::string file_path =
+            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
         replicas.emplace_back(file_path, total_length,
                               ReplicaStatus::PROCESSING);
     }
@@ -3109,41 +3111,6 @@ void MasterService::ClientMonitorFunc() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }
-}
-
-std::string MasterService::SanitizeKey(const std::string& key) const {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string MasterService::ResolvePath(const std::string& key) const {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
-    // Safely construct path using std::filesystem
-    namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
-
-    // Combine directory path with sanitized filename
-    fs::path full_path =
-        fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>

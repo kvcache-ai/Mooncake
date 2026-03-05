@@ -417,10 +417,6 @@ class MasterService {
         const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
-    // Resolve the key to a sanitized format for storage
-    std::string SanitizeKey(const std::string& key) const;
-    std::string ResolvePath(const std::string& key) const;
-
     void SnapshotThreadFunc();
 
     // Persist master state
