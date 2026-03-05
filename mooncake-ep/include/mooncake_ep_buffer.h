@@ -161,6 +161,8 @@ struct MooncakeEpBuffer {
         return p2p_ipc_all_enabled_;
     }
 
+    void update_local_qpns();
+
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,
                  const std::vector<int32_t>& remote_qpns,
