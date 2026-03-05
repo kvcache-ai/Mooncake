@@ -5,22 +5,25 @@ import (
 	"fmt"
 	"time"
 
-	"log/slog"
-
 	"conductor/common"
 	"conductor/zmq"
+	"log/slog"
 )
 
 // KVEventHandler adapts the generic EventHandler interface for EventManager.
 // It is instantiated in event_manager.go but implemented here to keep files clean.
 type KVEventHandler struct {
 	manager   *EventManager
-	svcName   string
-	modelName string
-	loraID    int64
+	tenant_id string
+	// svcName   string
+	modelName      string
+	loraName       string
+	instanceID     string
+	blockSize      int64
+	additionalSalt string
 }
 
-func (h *KVEventHandler) HandleEvent(event zmq.KVEvent) error {
+func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 	h.manager.mu.RLock()
 	if h.manager.stopped {
 		h.manager.mu.RUnlock()
@@ -36,16 +39,18 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent) error {
 	switch e := event.(type) {
 	case *zmq.BlockStoredEvent:
 		slog.Debug("BlockStored",
-			"service", h.svcName,
+			"instance_id", h.instanceID,
+			"dpRank", dpRank,
 			"blocks", len(e.BlockHashes),
 		)
-		return h.handleBlockStored(ctx, e)
+		return h.handleBlockStored(ctx, e, dpRank)
 	case *zmq.BlockRemovedEvent:
 		slog.Debug("BlockRemoved",
-			"service", h.svcName,
+			"instance_id", h.instanceID,
+			"dpRank", dpRank,
 			"blocks", len(e.BlockHashes),
 		)
-		return h.handleBlockRemoved(ctx, e)
+		return h.handleBlockRemoved(ctx, e, dpRank)
 
 	default:
 		slog.Warn("Unknown event type",
@@ -55,49 +60,47 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent) error {
 	}
 }
 
-func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.BlockStoredEvent) error {
+func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.BlockStoredEvent, dpRank int64) error {
 
-	// Convert to conductor event
+	// Convert to kvindexer event
 	conductorEvent := common.StoredEvent{
 		BlockHashes:     event.BlockHashes,
+		BlockSize:       event.BlockSize,
 		ModelName:       h.modelName,
-		LoraID:          h.loraID,
-		EngineIp:        h.svcName,
+		LoraName:        h.loraName,
+		InstanceID:      h.instanceID,
 		ParentBlockHash: event.ParentBlockHash,
 		TokenIds:        event.TokenIDs,
+		Medium:          event.Medium,
 	}
+
 	indexer := h.manager.getIndexer()
-	er := indexer.ProcessStoreEvent(conductorEvent)
+	er := indexer.ProcessStoreEvent(conductorEvent, dpRank, h.instanceID)
 	// TODO support mooncake_key map
 	if er != nil {
 		slog.Error("process store event failed.", "error", er)
 	}
 
-	slog.Debug("event generated",
-		"model", conductorEvent.ModelName,
-		"lora_id", conductorEvent.LoraID,
-	)
+	slog.Debug("in handleBlockStored", "conductorEvent", conductorEvent)
 
 	return nil
 }
 
-func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.BlockRemovedEvent) error {
+func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.BlockRemovedEvent, dpRank int64) error {
 	// Convert to conductor event
 	conductorEvent := common.RemovedEvent{
 		BlockHashes: event.BlockHashes,
 		ModelName:   h.modelName,
-		LoraID:      h.loraID,
-		SourcePod:   h.svcName,
+		LoraName:    h.loraName,
+		InstanceID:  h.instanceID,
+		BlockSize:   h.blockSize,
 	}
 	indexer := h.manager.getIndexer()
-	er := indexer.ProcessRemoveEvent(conductorEvent)
+	er := indexer.ProcessRemoveEvent(conductorEvent, dpRank, h.instanceID)
 	if er != nil {
 		slog.Error("process store event failed.")
 	}
-	slog.Debug("event generated",
-		"model", conductorEvent.ModelName,
-		"lora_id", conductorEvent.LoraID,
-	)
+	slog.Debug("in handleBlockRemoved", "conductorEvent", conductorEvent)
 
 	return nil
 }

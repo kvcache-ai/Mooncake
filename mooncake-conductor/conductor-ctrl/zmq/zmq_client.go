@@ -282,7 +282,7 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
 			e.PodName = c.config.CachePoolKey
 		}
 
-		if err := c.eventHandler.HandleEvent(event); err != nil {
+		if err := c.eventHandler.HandleEvent(event, batch.DataParallelRank); err != nil {
 			slog.Error("Handler error", "service", c.config.CachePoolKey, "error", err)
 		}
 	}
