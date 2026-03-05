@@ -16,6 +16,8 @@ on:
       - 'mooncake-*/**'
       - 'extern/**'
       - 'CMakeLists.txt'
+      - 'scripts/**'
+      - '.github/workflows/**'
 
 jobs:
   test-sglang-integration:
