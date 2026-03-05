@@ -121,10 +121,14 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
         persisted_size_.fetch_sub(size, std::memory_order_acq_rel);
         VLOG(1) << "Freed persisted data for key " << key << ", size=" << size;
 
-        // TODO: Physical file deletion not implemented yet.
-        // StorageBackendInterface lacks a RemoveKey() method.
-        // Currently only metadata is freed; disk files remain until manual
-        // cleanup.
+        // Mark key as deleted for fragmentation tracking
+        if (storage_backend_) {
+            auto mark_res = storage_backend_->MarkKeyDeleted(key);
+            if (!mark_res) {
+                LOG(WARNING) << "Failed to mark key " << key
+                             << " as deleted: " << mark_res.error();
+            }
+        }
     }
 
     return {};
@@ -246,6 +250,43 @@ size_t StorageTier::GetCapacity() const {
 size_t StorageTier::GetUsage() const {
     // Total usage = pending (staging) + persisted (on disk)
     return pending_batch_size_.load() + persisted_size_.load();
+}
+
+tl::expected<void, ErrorCode> StorageTier::TriggerBucketEviction() {
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Try to cast to BucketStorageBackend
+    auto* bucket_backend =
+        dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
+    if (!bucket_backend) {
+        LOG(WARNING) << "Storage backend is not BucketStorageBackend, "
+                        "bucket eviction not supported";
+        return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+    }
+
+    // Select bucket to evict
+    auto select_res = bucket_backend->SelectBucketForEviction();
+    if (!select_res) {
+        LOG(ERROR) << "Failed to select bucket for eviction: "
+                   << select_res.error();
+        return tl::make_unexpected(select_res.error());
+    }
+
+    int64_t bucket_id = select_res.value();
+
+    // Evict the bucket
+    auto evict_res = bucket_backend->EvictBucket(bucket_id);
+    if (!evict_res) {
+        LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
+                   << evict_res.error();
+        return tl::make_unexpected(evict_res.error());
+    }
+
+    LOG(INFO) << "Successfully evicted bucket " << bucket_id;
+    return {};
 }
 
 // Static registration of copy functions for NVME tier (Staging Buffer)

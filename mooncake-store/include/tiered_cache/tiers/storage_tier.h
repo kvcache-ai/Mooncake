@@ -149,6 +149,12 @@ class StorageTier : public CacheTier {
     MemoryType GetMemoryType() const override { return MemoryType::NVME; }
     const std::vector<std::string>& GetTags() const override { return tags_; }
 
+    /**
+     * @brief Trigger bucket eviction to free up space.
+     * @return tl::expected<void, ErrorCode> indicating operation status
+     */
+    tl::expected<void, ErrorCode> TriggerBucketEviction();
+
    private:
     // Internal flush logic that triggers BatchOffload
     tl::expected<void, ErrorCode> FlushInternal();
