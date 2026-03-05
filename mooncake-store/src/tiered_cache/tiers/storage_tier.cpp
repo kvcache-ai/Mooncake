@@ -68,9 +68,32 @@ tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
     // Check capacity before allocation (pending + persisted)
     size_t current_usage = GetUsage();
     if (capacity_ > 0 && current_usage + size > capacity_) {
+        size_t needed = (current_usage + size) - capacity_;
         VLOG(1) << "StorageTier capacity exceeded: usage=" << current_usage
-                << ", requested=" << size << ", capacity=" << capacity_;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                << ", requested=" << size << ", capacity=" << capacity_
+                << ", need to free=" << needed;
+
+        // Try to evict buckets to free up enough space
+        auto evict_res = TriggerBucketEviction(needed);
+        if (evict_res.has_value()) {
+            size_t freed = evict_res.value();
+            // Recheck capacity after eviction
+            current_usage = GetUsage();
+            if (current_usage + size <= capacity_) {
+                LOG(INFO) << "Successfully freed " << freed
+                          << " bytes via bucket eviction, new usage="
+                          << current_usage;
+            } else {
+                LOG(WARNING) << "Freed " << freed
+                             << " bytes but still insufficient space (usage="
+                             << current_usage << ", requested=" << size
+                             << ", capacity=" << capacity_ << ")";
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+        } else {
+            LOG(WARNING) << "Failed to evict buckets: " << evict_res.error();
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
     }
 
     try {
@@ -252,7 +275,8 @@ size_t StorageTier::GetUsage() const {
     return pending_batch_size_.load() + persisted_size_.load();
 }
 
-tl::expected<void, ErrorCode> StorageTier::TriggerBucketEviction() {
+tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
+    size_t target_free_size) {
     if (!storage_backend_) {
         LOG(ERROR) << "Storage backend not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -267,26 +291,85 @@ tl::expected<void, ErrorCode> StorageTier::TriggerBucketEviction() {
         return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
     }
 
-    // Select bucket to evict
-    auto select_res = bucket_backend->SelectBucketForEviction();
-    if (!select_res) {
-        LOG(ERROR) << "Failed to select bucket for eviction: "
-                   << select_res.error();
-        return tl::make_unexpected(select_res.error());
+    size_t total_freed = 0;
+    constexpr int MAX_EVICTION_ATTEMPTS = 10;  // Prevent infinite loop
+    int attempts = 0;
+
+    // If target_free_size is 0, evict just one bucket
+    if (target_free_size == 0) {
+        auto select_res = bucket_backend->SelectBucketForEviction();
+        if (!select_res) {
+            LOG(ERROR) << "Failed to select bucket for eviction: "
+                       << select_res.error();
+            return tl::make_unexpected(select_res.error());
+        }
+
+        int64_t bucket_id = select_res.value();
+        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        if (!evict_res) {
+            LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
+                       << evict_res.error();
+            return tl::make_unexpected(evict_res.error());
+        }
+
+        total_freed = evict_res.value();
+
+        // Update persisted_size_ to reflect the freed space
+        persisted_size_.fetch_sub(total_freed, std::memory_order_acq_rel);
+
+        LOG(INFO) << "Evicted 1 bucket, freed " << total_freed << " bytes";
+        return total_freed;
     }
 
-    int64_t bucket_id = select_res.value();
+    // Loop until we free enough space or run out of buckets
+    while (total_freed < target_free_size && attempts < MAX_EVICTION_ATTEMPTS) {
+        auto select_res = bucket_backend->SelectBucketForEviction();
+        if (!select_res) {
+            // No more buckets to evict
+            if (total_freed > 0) {
+                LOG(WARNING)
+                    << "Freed " << total_freed << " bytes but target was "
+                    << target_free_size << " bytes (no more buckets)";
+                return total_freed;
+            }
+            LOG(ERROR) << "Failed to select bucket for eviction: "
+                       << select_res.error();
+            return tl::make_unexpected(select_res.error());
+        }
 
-    // Evict the bucket
-    auto evict_res = bucket_backend->EvictBucket(bucket_id);
-    if (!evict_res) {
-        LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
-                   << evict_res.error();
-        return tl::make_unexpected(evict_res.error());
+        int64_t bucket_id = select_res.value();
+        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        if (!evict_res) {
+            LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
+                       << evict_res.error();
+            // Continue trying other buckets
+            attempts++;
+            continue;
+        }
+
+        size_t freed = evict_res.value();
+        total_freed += freed;
+        attempts++;
+
+        // Update persisted_size_ to reflect the freed space
+        persisted_size_.fetch_sub(freed, std::memory_order_acq_rel);
+
+        LOG(INFO) << "Evicted bucket " << bucket_id << ", freed " << freed
+                  << " bytes (total: " << total_freed << "/" << target_free_size
+                  << ")";
     }
 
-    LOG(INFO) << "Successfully evicted bucket " << bucket_id;
-    return {};
+    if (total_freed >= target_free_size) {
+        LOG(INFO) << "Successfully freed " << total_freed
+                  << " bytes (target: " << target_free_size << ") in "
+                  << attempts << " evictions";
+    } else {
+        LOG(WARNING) << "Only freed " << total_freed << " bytes out of target "
+                     << target_free_size << " bytes after " << attempts
+                     << " attempts";
+    }
+
+    return total_freed;
 }
 
 // Static registration of copy functions for NVME tier (Staging Buffer)

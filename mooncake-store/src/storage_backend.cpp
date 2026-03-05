@@ -1644,7 +1644,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::SelectBucketForEviction()
     return oldest_bucket;
 }
 
-tl::expected<void, ErrorCode> BucketStorageBackend::EvictBucket(
+tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
     int64_t bucket_id) {
     SharedMutexLocker lock(&mutex_);
 
@@ -1656,11 +1656,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::EvictBucket(
     }
 
     auto bucket_meta = bucket_it->second;
+    size_t freed_size = 0;
 
-    // Remove all keys from object_bucket_map_
+    // Remove all keys from object_bucket_map_ and calculate freed size
     for (const auto& key : bucket_meta->keys) {
         auto obj_it = object_bucket_map_.find(key);
         if (obj_it != object_bucket_map_.end()) {
+            freed_size += obj_it->second.data_size;
             total_size_ -= obj_it->second.data_size;
             object_bucket_map_.erase(obj_it);
         }
@@ -1697,9 +1699,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::EvictBucket(
     }
 
     LOG(INFO) << "Evicted bucket " << bucket_id << " with "
-              << bucket_meta->keys.size() << " keys";
+              << bucket_meta->keys.size() << " keys, freed " << freed_size
+              << " bytes";
 
-    return {};
+    return freed_size;
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(

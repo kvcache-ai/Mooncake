@@ -253,8 +253,11 @@ TEST_F(StorageTierTest, BucketEviction) {
     // Evict the bucket
     auto evict_res = backend.EvictBucket(bucket_id);
     ASSERT_TRUE(evict_res.has_value());
+    size_t freed_size = evict_res.value();
+    EXPECT_GT(freed_size, 0) << "Should have freed some space";
 
-    LOG(INFO) << "Successfully evicted bucket";
+    LOG(INFO) << "Successfully evicted bucket, freed " << freed_size
+              << " bytes";
 
     // Verify all keys are gone
     exist_res = backend.IsExist("key1");
@@ -282,6 +285,100 @@ TEST_F(StorageTierTest, BucketEviction) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_bucket_eviction");
+}
+
+// Test automatic bucket eviction when capacity is exceeded
+TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
+    namespace fs = std::filesystem;
+    fs::remove_all("/tmp/mooncake_test_auto_eviction");
+    fs::create_directories("/tmp/mooncake_test_auto_eviction");
+
+    // Setup environment for Bucket Backend
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_auto_eviction", 1);
+
+    // Create a TieredBackend with small capacity (20KB)
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 20480,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value());
+
+    // Fill up the tier with data (~20KB)
+    std::vector<std::string> keys;
+    for (int i = 0; i < 20; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        keys.push_back(key);
+
+        auto alloc_result = backend.Allocate(1024);  // 1KB each
+        ASSERT_TRUE(alloc_result.has_value())
+            << "Failed to allocate for " << key;
+        AllocationHandle handle = alloc_result.value();
+
+        auto test_buffer = CreateTestBuffer(1024);
+        DataSource source;
+        source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(test_buffer), 1024);
+        source.type = MemoryType::DRAM;
+
+        auto write_result = backend.Write(source, handle);
+        ASSERT_TRUE(write_result.has_value());
+
+        auto commit_result = backend.Commit(key, handle);
+        ASSERT_TRUE(commit_result.has_value());
+    }
+
+    // Flush to persist to disk
+    auto tier_views = backend.GetTierViews();
+    ASSERT_FALSE(tier_views.empty());
+    auto tier = backend.GetTier(tier_views[0].id);
+    const_cast<CacheTier*>(tier)->Flush();
+
+    LOG(INFO) << "Filled tier with 20 keys, usage=" << tier_views[0].usage
+              << ", capacity=" << tier_views[0].capacity;
+
+    // Now try to allocate more data that exceeds capacity
+    // This should trigger automatic bucket eviction
+    auto alloc_result = backend.Allocate(5 * 1024);  // 5KB
+    ASSERT_TRUE(alloc_result.has_value())
+        << "Should succeed after automatic eviction";
+
+    LOG(INFO) << "Successfully allocated after auto-eviction";
+
+    // The evicted keys should no longer be in the storage backend
+    // (they were removed from the bucket that was evicted)
+    // Note: We can't use backend.Get() because it might return from
+    // pending_batch Instead, verify that bucket files were deleted
+    int bucket_files_count = 0;
+    for (const auto& entry :
+         fs::recursive_directory_iterator("/tmp/mooncake_test_auto_eviction")) {
+        if (entry.path().extension() == ".bucket") {
+            bucket_files_count++;
+        }
+    }
+
+    // After eviction, there should be fewer bucket files
+    // (originally had 2 buckets with 10 keys each, evicted 1)
+    EXPECT_EQ(bucket_files_count, 0)
+        << "All buckets should have been evicted, found " << bucket_files_count;
+    LOG(INFO) << "After eviction, " << bucket_files_count
+              << " bucket files remain";
+
+    // Cleanup
+    fs::remove_all("/tmp/mooncake_test_auto_eviction");
 }
 
 }  // namespace mooncake::test

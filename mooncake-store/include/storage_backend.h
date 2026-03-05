@@ -686,9 +686,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     /**
      * @brief Evict an entire bucket by removing its data and metadata files.
      * @param bucket_id The ID of the bucket to evict
-     * @return tl::expected<void, ErrorCode> indicating operation status
+     * @return tl::expected<size_t, ErrorCode>
+     * - On success: the amount of space freed (in bytes)
+     * - On failure: error code
      */
-    tl::expected<void, ErrorCode> EvictBucket(int64_t bucket_id);
+    tl::expected<size_t, ErrorCode> EvictBucket(int64_t bucket_id);
 
     /**
      * @brief Mark a key as deleted (for fragmentation tracking).

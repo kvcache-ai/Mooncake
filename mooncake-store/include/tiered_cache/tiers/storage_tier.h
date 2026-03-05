@@ -151,9 +151,14 @@ class StorageTier : public CacheTier {
 
     /**
      * @brief Trigger bucket eviction to free up space.
-     * @return tl::expected<void, ErrorCode> indicating operation status
+     * @param target_free_size Target amount of space to free (in bytes).
+     *                         If 0, evicts one bucket.
+     * @return tl::expected<size_t, ErrorCode>
+     * - On success: total amount of space freed (in bytes)
+     * - On failure: error code
      */
-    tl::expected<void, ErrorCode> TriggerBucketEviction();
+    tl::expected<size_t, ErrorCode> TriggerBucketEviction(
+        size_t target_free_size = 0);
 
    private:
     // Internal flush logic that triggers BatchOffload
