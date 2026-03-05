@@ -71,7 +71,7 @@ struct MooncakeEpBuffer {
     void* gdr_buffer = nullptr;
 
     // IBGDA
-    static constexpr size_t CTRL_BUF_SIZE = 1024 * 1024 * 1024 * 2;  // 1024 MiB
+    static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024 * 2;  // 1024 MiB
     void* ctrl_buf = nullptr;
     // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
     // fails.
