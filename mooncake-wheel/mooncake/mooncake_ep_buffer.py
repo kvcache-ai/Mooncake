@@ -65,7 +65,7 @@ class Buffer:
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
-
+        print("Init", self.rank)
         # Get the index of the closest NIC
         self.backend = self.group._get_backend(torch.device('cuda'))
         preferred_hca = pg.get_preferred_hca(self.backend, f'cuda:{torch.cuda.current_device()}')
@@ -75,7 +75,7 @@ class Buffer:
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
         self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
-
+        print("Start", self.rank)
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
@@ -96,6 +96,7 @@ class Buffer:
             remote_qpns = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
             dist.all_to_all(remote_qpns, local_qpns, group)
             remote_qpns = torch.cat(remote_qpns).tolist()
+            print("Ready", self.rank)
 
             if self.runtime.is_roce():
                 (subnet_prefix, interface_id) = self.runtime.get_gid()
