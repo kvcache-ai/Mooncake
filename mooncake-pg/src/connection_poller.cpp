@@ -13,7 +13,8 @@
 #include "mooncake_worker.cuh"
 
 namespace mooncake {
-ConnectionContext::ConnectionContext(int backendIndex, int rank, int size, uint64_t* local2global_rank_map,
+ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
+                                     uint64_t* local2global_rank_map,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
                                      TransferEngine* engine)
@@ -85,10 +86,10 @@ bool ConnectionContext::poll() {
 
 bool ConnectionContext::pollPeer(int pollingRank) {
     auto global_rank = local2global_rank_map_[pollingRank];
-    auto& global_peerConnected_ = ConnectionPoller::GetInstance().global_peerConnected_;
+    auto& global_peerConnected_ =
+        ConnectionPoller::GetInstance().global_peerConnected_;
     auto& peerState = peerStates_[pollingRank];
     bool state_changed = false;
-
 
     switch (peerState.state) {
         case PeerConnectionState::WAITING_STORE: {
@@ -209,7 +210,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         }
 
         case PeerConnectionState::CONNECTED: {
-            if (meta_->peerConnected[pollingRank] && global_peerConnected_[global_rank]) break;
+            if (meta_->peerConnected[pollingRank] &&
+                global_peerConnected_[global_rank])
+                break;
             // If meta_->peerConnected is false but PeerConnectionState is
             // CONNECTED, the peer might be marked as broken for some reason
             // (e.g. timeout in backend worker thread).

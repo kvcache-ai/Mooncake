@@ -76,7 +76,8 @@ class ConnectionContext {
     std::condition_variable backend_wakeup_cv_;
 
    public:
-    ConnectionContext(int backendIndex, int rank, int size, uint64_t* local2global_rank_map,
+    ConnectionContext(int backendIndex, int rank, int size,
+                      uint64_t* local2global_rank_map,
                       c10::intrusive_ptr<::c10d::Store> store,
                       std::shared_ptr<TransferGroupMeta> meta,
                       TransferEngine* engine);
@@ -120,7 +121,7 @@ class ConnectionPoller {
         std::lock_guard<std::mutex> lock(wakeup_mutex_);
         wakeup_cv_.notify_all();
     }
-    // the global ranks 
+    // the global ranks
     bool global_peerConnected_[kMaxNumRanks]{};
 
    private:

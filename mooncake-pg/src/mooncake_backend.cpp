@@ -81,7 +81,7 @@ MooncakeBackend::MooncakeBackend(
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
                                   std::to_string(localRpcMeta.rpc_port);
     // construct local to global rank map
-    if(options && (int)options->global_ranks_in_group.size() == size) {
+    if (options && (int)options->global_ranks_in_group.size() == size) {
         for (int i = 0; i < size; ++i) {
             local2global_rank_map_[i] = options->global_ranks_in_group[i];
         }
@@ -90,7 +90,6 @@ MooncakeBackend::MooncakeBackend(
             local2global_rank_map_[i] = i;
         }
     }
-
 
     // Register buffers
     if (isCpu) {
@@ -171,7 +170,8 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size,local2global_rank_map_, store, meta_, engine_);
+        backendIndex_, rank, size, local2global_rank_map_, store, meta_,
+        engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
