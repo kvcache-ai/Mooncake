@@ -210,22 +210,22 @@ class Buffer:
                 remote_lids = torch.cat(remote_lids).tolist()
 
                 self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
-
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
-            local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
-            handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
-            self.runtime.sync_nvlink_ipc_handles(remote_handles)
-        except Exception as e:
-            import warnings
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        
+        #try:
+        #    local_handle_ints = self.runtime.get_ipc_handle()
+        #    # pybind11 converts std::vector<int32_t> to a list of integers
+        #    local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
+        #    handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
+        #    dist.all_gather(handles, local_handle_tensor, self.group)
+        #    remote_handles = [h.tolist() for h in handles]
+        #    self.runtime.sync_nvlink_ipc_handles(remote_handles)
+        #except Exception as e:
+        #    import warnings
+        #    warnings.warn(
+        #        f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+        #        RuntimeWarning,
+        #        stacklevel=2,
+        #    )
 
         use_fast_path = False
         try:
