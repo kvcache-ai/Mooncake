@@ -13,13 +13,14 @@
 #include "mooncake_worker.cuh"
 
 namespace mooncake {
-ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
+ConnectionContext::ConnectionContext(int backendIndex, int rank, int size, uint64_t* local2global_rank_map,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
                                      TransferEngine* engine)
     : backendIndex_(backendIndex),
       rank_(rank),
       size_(size),
+      local2global_rank_map_(local2global_rank_map),
       store_(std::move(store)),
       meta_(std::move(meta)),
       engine_(engine) {
@@ -83,8 +84,11 @@ bool ConnectionContext::poll() {
 }
 
 bool ConnectionContext::pollPeer(int pollingRank) {
+    auto global_rank = local2global_rank_map_[pollingRank];
+    auto& global_peerConnected_ = ConnectionPoller::GetInstance().global_peerConnected_;
     auto& peerState = peerStates_[pollingRank];
     bool state_changed = false;
+
 
     switch (peerState.state) {
         case PeerConnectionState::WAITING_STORE: {
@@ -163,6 +167,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 engine_->freeBatchID(peerState.warmupBatchId.value());
                 peerState.warmupBatchId = std::nullopt;
                 meta_->peerConnected[pollingRank] = true;
+                global_peerConnected_[global_rank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
 
                 {
@@ -204,11 +209,14 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         }
 
         case PeerConnectionState::CONNECTED: {
-            if (meta_->peerConnected[pollingRank]) break;
+            if (meta_->peerConnected[pollingRank] && global_peerConnected_[global_rank]) break;
             // If meta_->peerConnected is false but PeerConnectionState is
             // CONNECTED, the peer might be marked as broken for some reason
             // (e.g. timeout in backend worker thread).
             // In that case, back to WAITING_STORE to reconnect it.
+
+            // we also need to broadcast the info to the process level
+            global_peerConnected_[global_rank] = false;
             totalConnectedPeers_.fetch_sub(1);
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());

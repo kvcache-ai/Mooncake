@@ -80,6 +80,17 @@ MooncakeBackend::MooncakeBackend(
     auto localRpcMeta = engine_->getMetadata()->localRpcMeta();
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
                                   std::to_string(localRpcMeta.rpc_port);
+    // construct local to global rank map
+    if(options && (int)options->global_ranks_in_group.size() == size) {
+        for (int i = 0; i < size; ++i) {
+            local2global_rank_map_[i] = options->global_ranks_in_group[i];
+        }
+    } else {
+        for (int i = 0; i < size; ++i) {
+            local2global_rank_map_[i] = i;
+        }
+    }
+
 
     // Register buffers
     if (isCpu) {
@@ -160,7 +171,7 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, store, meta_, engine_);
+        backendIndex_, rank, size,local2global_rank_map_, store, meta_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
@@ -517,7 +528,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
-                    memcpy(dst + j * realSize,
+                    memcpy((char*)dst + j * realSize,
                            (char*)inputTensors[j].data_ptr() + pos, realSize);
                 }
             },
@@ -534,7 +545,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
-                    cudaMemcpyAsync(dst + j * realSize,
+                    cudaMemcpyAsync((char*)dst + j * realSize,
                                     (char*)inputTensors[j].data_ptr() + pos,
                                     realSize, cudaMemcpyDeviceToDevice, stream);
                 }

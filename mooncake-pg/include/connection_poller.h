@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <ratio>
@@ -55,6 +56,7 @@ class ConnectionContext {
 
     // TODO: make it atomic and add `expandSize` to handle runtime scaling-up?
     int size_;
+    uint64_t* local2global_rank_map_;
     c10::intrusive_ptr<::c10d::Store> store_;
 
     std::shared_ptr<TransferGroupMeta> meta_;
@@ -74,7 +76,7 @@ class ConnectionContext {
     std::condition_variable backend_wakeup_cv_;
 
    public:
-    ConnectionContext(int backendIndex, int rank, int size,
+    ConnectionContext(int backendIndex, int rank, int size, uint64_t* local2global_rank_map,
                       c10::intrusive_ptr<::c10d::Store> store,
                       std::shared_ptr<TransferGroupMeta> meta,
                       TransferEngine* engine);
@@ -118,6 +120,8 @@ class ConnectionPoller {
         std::lock_guard<std::mutex> lock(wakeup_mutex_);
         wakeup_cv_.notify_all();
     }
+    // the global ranks 
+    bool global_peerConnected_[kMaxNumRanks]{};
 
    private:
     ConnectionPoller();

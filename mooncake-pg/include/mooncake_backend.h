@@ -1,10 +1,12 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <cstdint>
 #include <memory>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
 #include <p2p_proxy.h>
+#include <sys/types.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
@@ -134,6 +136,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     SegmentInfo rank_info;
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
+    uint64_t local2global_rank_map_[kMaxNumRanks];
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
