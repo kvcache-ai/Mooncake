@@ -457,6 +457,40 @@ int MooncakeEpBuffer::init_ibgda() {
     return 0;
 }
 
+void MooncakeEpBuffer::update_local_qpns() {
+    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        mlx5gda_qp* qp =
+            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
+                                 pd, 16384, 1, comm_stream.stream());
+        if (!qp) {
+            perror("Failed to recreate QP");
+            ibgda_disabled_ = true;
+            return;
+        }
+        is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
+        if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
+            perror("Failed to mlx5gda_modify_rc_qp_rst2init");
+            ibgda_disabled_ = true;
+            return;
+        }
+        // Ensure all async memset operations are complete before accessing QP
+        // structures
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
+        mlx5gda_qp_devctx qp_devctx = {
+            .qpn = qp->qpn,
+            .wqeid_mask = qp->num_wqebb - 1,
+            .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
+            .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
+            .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
+            .bf = (char*)qp->uar->reg_addr,
+        };
+        cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
+                   sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+        qps[i] = qp;
+    }
+}
+
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& remote_keys,
                                const std::vector<int32_t>& remote_qpns,
