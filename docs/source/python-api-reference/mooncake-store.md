@@ -1583,6 +1583,83 @@ def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[
 
   - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
 
+#### put_tensor_from()
+
+Put a PyTorch tensor into the store directly from a pre-allocated buffer (zero-copy). The buffer must contain data in the same layout as produced by `get_tensor_into`: **\[TensorMetadata\]\[tensor data\]**. The buffer is only read during this call; no Python object references it.
+
+```python
+def put_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Object identifier for the tensor.
+  - `buffer_ptr` (int): The buffer pointer; the buffer should be registered. Layout must be \[TensorMetadata\]\[tensor data\].
+  - `size` (int): **Actual serialized byte length** of the data in the buffer (metadata + tensor bytes), not the buffer capacity.
+
+**Returns:**
+
+  - `int`: Status code (0 = success, non-zero = error code).
+
+#### batch_put_tensor_from()
+
+Put a batch of PyTorch tensors into the store directly from pre-allocated buffers (zero-copy). Each buffer must contain data in the layout **\[TensorMetadata\]\[tensor data\]**, same as `get_tensor_into`.
+
+```python
+def batch_put_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]
+```
+
+**Parameters:**
+
+  - `keys` (List[str]): List of object identifiers.
+  - `buffer_ptrs` (List[int]): List of buffer pointers; buffers should be registered.
+  - `sizes` (List[int]): List of **actual serialized byte lengths** for each buffer (metadata + tensor bytes), not buffer capacities.
+
+**Returns:**
+
+  - `List[int]`: List of status codes for each tensor operation (0 = success, non-zero = error code).
+
+#### put_tensor_with_tp_from()
+
+Put a tensor shard into the store directly from a pre-allocated buffer (zero-copy), for use with Tensor Parallelism. The data is stored under the key for the given `tp_rank` (e.g., `key_tp_0`). Buffer layout must be **\[TensorMetadata\]\[tensor data\]**.
+
+```python
+def put_tensor_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier for the tensor.
+  - `buffer_ptr` (int): The buffer pointer; the buffer should be registered.
+  - `size` (int): **Actual serialized byte length** of the shard data in the buffer.
+  - `tp_rank` (int): Tensor parallel rank for this shard (default: 0). Data is stored under `key_tp_{tp_rank}`.
+  - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `put_tensor_from(key, buffer_ptr, size)`.
+  - `split_dim` (int): Present for API consistency with other tensor-parallel methods but currently ignored; this API assumes `buffer_ptr` already points to a single pre-split shard.
+
+**Returns:**
+
+  - `int`: Status code (0 = success, non-zero = error code).
+
+#### batch_put_tensor_with_tp_from()
+
+Put a batch of tensor shards into the store directly from pre-allocated buffers (zero-copy), for a given Tensor Parallel rank. Each buffer must contain one shard in layout **\[TensorMetadata\]\[tensor data\]**.
+
+```python
+def batch_put_tensor_with_tp_from(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[int]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): List of base identifiers.
+  - `buffer_ptrs` (List[int]): List of buffer pointers; buffers should be registered.
+  - `sizes` (List[int]): List of **actual serialized byte lengths** for each shard buffer.
+  - `tp_rank` (int): Tensor parallel rank for these shards (default: 0).
+  - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `batch_put_tensor_from(base_keys, buffer_ptrs, sizes)`.
+
+**Returns:**
+
+  - `List[int]`: List of status codes for each tensor operation (0 = success, non-zero = error code).
+
 ---
 
 ### Batch Zero-Copy Operations
