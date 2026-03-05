@@ -748,7 +748,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     // If disk replica is enabled, allocate a disk replica
     if (use_disk_replica_) {
         // Allocate a file path for the disk replica
-        std::string file_path = ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
+        std::string file_path =
+            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
         replicas.emplace_back(file_path, total_length,
                               ReplicaStatus::PROCESSING);
     }

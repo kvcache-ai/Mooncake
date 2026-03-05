@@ -362,7 +362,7 @@ std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     return env_val ? std::string(env_val) : default_value;
 }
 
-static std::string SanitizeKey(const std::string& key) {
+static std::string SanitizeKey(const std::string &key) {
     // Set of invalid filesystem characters to be replaced
     constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
     std::string sanitized_key;
@@ -376,7 +376,9 @@ static std::string SanitizeKey(const std::string& key) {
     return sanitized_key;
 }
 
-std::string ResolvePathFromKey(const std::string& key, const std::string& root_dir, const std::string& fsdir) {
+std::string ResolvePathFromKey(const std::string &key,
+                               const std::string &root_dir,
+                               const std::string &fsdir) {
     // Compute hash of the key
     size_t hash = std::hash<std::string>{}(key);
 
@@ -391,9 +393,8 @@ std::string ResolvePathFromKey(const std::string& key, const std::string& root_d
     fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
 
     // Combine directory path with sanitized filename
-    fs::path full_path = fs::path(root_dir) /
-                         fsdir / dir_path /
-                         SanitizeKey(key);
+    fs::path full_path =
+        fs::path(root_dir) / fsdir / dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
 }

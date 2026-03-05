@@ -1010,7 +1010,9 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path = ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+        auto path =
+            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
+                               file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
@@ -1061,7 +1063,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
+                                   file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
@@ -1071,7 +1074,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path = ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
+        auto path =
+            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
+                               file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
