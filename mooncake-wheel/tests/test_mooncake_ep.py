@@ -170,7 +170,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
 
     if local_rank == 0:
-        buffer.update_ep_member([1])
+        buffer.update_ep_member()
     else:
         buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
 
