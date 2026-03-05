@@ -512,17 +512,10 @@ class RealClient : public PyClient {
     };
 
     struct AscendSegmentDeleter {
+        std::string protocol = "ascend";
         void operator()(void *ptr) {
             if (ptr) {
-                free_memory("ascend", ptr);
-            }
-        }
-    };
-
-    struct UbshmemSegmentDeleter {
-        void operator()(void *ptr) {
-            if (ptr) {
-                free_memory("ubshmem", ptr);
+                free_memory(protocol.c_str(), ptr);
             }
         }
     };
@@ -532,8 +525,6 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
-    std::vector<std::unique_ptr<void, UbshmemSegmentDeleter>>
-        ubshmem_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
