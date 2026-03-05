@@ -24,11 +24,16 @@ type configStruct struct {
 }
 
 type serviceRaw struct {
-	IP        string `json:"ip"`
-	Port      int    `json:"port"`
-	TypeStr   string `json:"type"`
-	ModelName string `json:"modelname"`
-	LoraID    int64  `json:"lora_id"`
+	Endpoint       string `json:"endpoint"`
+	ReplayEndpoint string `json:"replay_endpoint"`
+	TypeStr        string `json:"type"`
+	ModelName      string `json:"modelname"`
+	LoraName       string `json:"lora_name"`
+	TenantID       string `json:"tenant_id"`
+	InstanceID     string `json:"instance_id"`
+	BlockSize      int64  `json:"block_size"`
+	DPRank         int    `json:"dp_rank"`
+	AdditionalSalt string `json:"additionalsalt"`
 }
 
 func mapServiceType(s string) (string, bool) {
@@ -44,11 +49,13 @@ func mapServiceType(s string) (string, bool) {
 
 func parseConfig() []common.ServiceConfig {
 	if _, err := os.Stat(conductorConfigPath); errors.Is(err, os.ErrNotExist) {
-		slog.Error("Config file does not exist, exiting.", "path", conductorConfigPath)
-		os.Exit(1)
+		slog.Warn("Config file does not exist, exiting.", "path", conductorConfigPath)
+		// os.Exit(1)
+		return []common.ServiceConfig{}
 	} else if err != nil {
-		slog.Error("Error accessing config file", "path", conductorConfigPath, "error", err)
-		os.Exit(1)
+		slog.Warn("Error accessing config file", "path", conductorConfigPath, "error", err)
+		// os.Exit(1)
+		return []common.ServiceConfig{}
 	}
 
 	data, err := os.ReadFile(conductorConfigPath)
@@ -72,13 +79,18 @@ func parseConfig() []common.ServiceConfig {
 			slog.Error("Unknown service type", "type", raw.TypeStr)
 			continue
 		}
+
 		services = append(services, common.ServiceConfig{
-			Name:      name,
-			IP:        raw.IP,
-			Port:      raw.Port,
-			Type:      serviceType,
-			ModelName: raw.ModelName,
-			LoraID:    raw.LoraID,
+			Endpoint:       raw.Endpoint,
+			ReplayEndpoint: raw.ReplayEndpoint,
+			Type:           serviceType,
+			ModelName:      raw.ModelName,
+			LoraName:       raw.LoraName,
+			TenantID:       raw.TenantID,
+			InstanceID:     name,
+			BlockSize:      raw.BlockSize,
+			DPRank:         raw.DPRank,
+			AdditionalSalt: raw.AdditionalSalt,
 		})
 	}
 

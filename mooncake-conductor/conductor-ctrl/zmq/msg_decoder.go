@@ -76,9 +76,18 @@ func decodeCommonEventBatch(
 		slog.Warn("Received empty event list")
 	}
 
+	var dpRank int64 = -1
+	if expectedLength == 3 {
+		dpRank, err = parseInt64(arr[2])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse dpRank: %w", err)
+		}
+	}
+
 	batch := &EventBatch{
-		Source: parser.Source(),
-		Events: make([]KVEvent, 0, len(events)),
+		Source:           parser.Source(),
+		Events:           make([]KVEvent, 0, len(events)),
+		DataParallelRank: dpRank,
 	}
 
 	for i, rawEvent := range events {
@@ -224,15 +233,13 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		Type: EventTypeBlockStored,
 	}
 
-	slog.Debug("success parseBlockStoredEvent")
 	for i, elem := range data {
-		slog.Debug("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
+		slog.Debug("in parseVllmBlockStored:", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
 	}
 
-	slog.Debug("Raw eventType bytes:", "timestamp", timestamp)
+	slog.Debug("in parseVllmBlockStored:", "timestamp", timestamp)
 	// Parse timestamp
 	if ts, err := parseTimestamp(timestamp); err == nil {
-		slog.Debug("timestamp:", "timestamp", ts)
 		event.Timestamp = ts
 	} else {
 		return nil, fmt.Errorf("failed to parse timestamp: %w", err)
@@ -240,7 +247,6 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 
 	// // Parse block hashes
 	if hashes, err := parseUint64Array(data[1]); err == nil {
-		slog.Debug("BlockHashes:", "BlockHashes", hashes)
 		event.BlockHashes = hashes
 	} else {
 		return nil, fmt.Errorf("failed to parse block_hashes: %w", err)
@@ -253,7 +259,6 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 			return nil, fmt.Errorf("failed to parse token_ids at index %w", err)
 		}
 		event.TokenIDs = tokens
-		slog.Debug("TokenIDs:", "TokenIDs", event.TokenIDs)
 	} else {
 		return nil, fmt.Errorf("missing or invalid token_ids")
 	}
@@ -275,7 +280,13 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 	if blocksize, err := parseInt64(data[4]); err == nil {
 		event.BlockSize = blocksize
 	} else {
-		return nil, fmt.Errorf("failed to parse field at index 4 as integer: %w", err)
+		return nil, fmt.Errorf("failed to parse field at index 4 as 'block_size': %w", err)
+	}
+
+	if medium, err := safeGetString(data[6]); err == nil {
+		event.Medium = medium
+	} else {
+		return nil, fmt.Errorf("failed to parse 'medium' from field at index 6: %w", err)
 	}
 
 	return event, nil
