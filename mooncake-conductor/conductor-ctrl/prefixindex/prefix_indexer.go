@@ -10,24 +10,30 @@ import (
 	"time"
 
 	"conductor/common"
-	"github.com/cespare/xxhash/v2"
-)
 
-var (
-	conductorBlockSize = common.LoadIntEnv("CONDUCTOR_BLOCK_SIZE", 128)
+	"github.com/cespare/xxhash/v2"
 )
 
 type ModelContext struct {
 	ModelName string
-	LoraID    int64 // -1 represents no LoRA adapter
+	LoraName  string // None represents no LoRA adapter
+	BlockSize int64
+	// TODO @yejj710
+	// Confirm the difference between the previously discussed cache_salt and additionalSalt.
+	//The current understanding is that cache_salt is used to ensure data isolation between different customers,
+	// and it seems it can be directly added to additionalSalt.
+	AdditionalSalt string
+	TenantID       string
 }
 
 type CacheStoreInfo struct {
-	// Currently, the KV cache at different levels is not distinguished.
+	// TODO  Currently, the KV cache at different levels is not distinguished.
 	// In the future, the caches of Mooncake and inference engines (vLLM, SGLang)
-	// should be handled separately. TODO
+	// should be handled separately.
 	engineLastAccessTime map[string]*atomic.Int64
 	TotalReplicaNums     atomic.Int64
+	mediumSet            map[string]struct{}
+	dpRankSet            map[int64]struct{} // indicate the dp_rank that the block is cached on
 }
 
 type HashMapStore struct {
@@ -43,17 +49,42 @@ type ContextData struct {
 	prefixMu  sync.RWMutex
 	hashmapMu sync.RWMutex
 
-	prefixStore      *HashMapStore
+	prefixStore *HashMapStore
+	seed        uint64
+	instanceID  string // unique identifier for each API server
+
+	DpSize map[int64]struct{}
+
 	proxyHashMapping map[uint64]uint64 // engine block hash -> conductor prefix hash
 }
 
 type PrefixCacheTable struct {
+	// TODO use instance_id to distinguish different engine instances
 	contextMap sync.Map // ModelContext → *ContextData
 
-	seed      uint64
-	blockSize int // TODO move it to contextData
-
 	contextCount atomic.Int32
+}
+
+type CacheHitResult struct {
+	LongestMatchTokens int64           `json:"longest_matched"`
+	DP                 map[int64]int64 `json:"DP"`
+	GPU                int64           `json:"GPU"`
+	CPU                int64           `json:"CPU"`
+	DISK               int64           `json:"DISK"`
+}
+
+type ModelContextView struct {
+	ModelName      string `json:"model_name"`
+	LoraName       string `json:"lora_name"`
+	BlockSize      int64  `json:"block_size"`
+	AdditionalSalt string `json:"additional_salt"`
+	TenantID       string `json:"tenant_id"`
+}
+
+type GlobalView struct {
+	ContextCount  int32               `json:"context_count"`
+	ModelContexts []ModelContextView  `json:"model_contexts"`
+	ProxyHashMap  []map[uint64]uint64 `json:"hashmap"`
 }
 
 func GenerateSeedFromEnv() uint64 {
@@ -70,30 +101,17 @@ func GenerateSeedFromEnv() uint64 {
 }
 
 func NewPrefixCacheTable() *PrefixCacheTable {
-	// init conductor first blockhash root
-	seed := GenerateSeedFromEnv()
-
-	slog.Info("mooncake-conductor prefix_hash_table_configurations",
-		"block_size", conductorBlockSize,
-		"seed", seed)
-
-	p := &PrefixCacheTable{
-		seed:      seed,
-		blockSize: conductorBlockSize,
-	}
-
+	p := &PrefixCacheTable{}
 	return p
 }
 
-func (p *PrefixCacheTable) getContextData(modelName string, loraID int64) *ContextData {
-	ctx := ModelContext{
-		ModelName: modelName,
-		LoraID:    loraID,
-	}
-	value, exists := p.contextMap.Load(ctx)
+func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext, instanceID string) *ContextData {
+	ctx_value := *modelcontext
+	value, exists := p.contextMap.Load(ctx_value)
 	if exists {
 		return value.(*ContextData)
 	}
+	seedValue := xxhash.Sum64String(modelcontext.AdditionalSalt)
 	newContextData := &ContextData{
 		prefixStore: &HashMapStore{
 			prefixMap:     make(map[uint64]*CacheStoreInfo),
@@ -101,22 +119,33 @@ func (p *PrefixCacheTable) getContextData(modelName string, loraID int64) *Conte
 			totalPrefixes: 0,
 		},
 		proxyHashMapping: make(map[uint64]uint64),
+		seed:             seedValue,
+		DpSize:           make(map[int64]struct{}),
+		instanceID:       instanceID,
 	}
 	newContextData.prefixStore.lastAccess.Store(time.Now().Unix())
-	p.contextMap.Store(ctx, newContextData)
-	slog.Debug("in func getContextData", "newContextData", newContextData)
+	p.contextMap.Store(ctx_value, newContextData)
+	slog.Debug("in getContextData", "modelcontext", modelcontext)
 	p.contextCount.Add(1)
 	return newContextData
 }
 
-func (p *PrefixCacheTable) ComputePrefixHash(tokenIds []int32) []uint64 {
-	numBlocks := len(tokenIds) / p.blockSize
+func (p *PrefixCacheTable) AddDpSize(modelcontext *ModelContext, instanceID string, dpRank int64) {
+	// value, exists := p.contextMap.Load(modelcontext)
+	contextData := p.getContextData(modelcontext, instanceID)
+	contextData.DpSize[dpRank] = struct{}{}
+}
+
+func (p *PrefixCacheTable) ComputePrefixHash(modelcontext *ModelContext, tokenIds []int32, cacheSalt uint64) []uint64 {
+	// cacheSalt is used to seperate hash from different customers
+	numBlocks := len(tokenIds) / int(modelcontext.BlockSize)
 	prefixHashes := make([]uint64, 0, numBlocks)
-	var parentHash uint64 = p.seed
+
+	var parentHash uint64 = cacheSalt
 
 	for i := 0; i < numBlocks; i++ {
-		start := i * p.blockSize
-		end := start + p.blockSize
+		start := i * int(modelcontext.BlockSize)
+		end := start + int(modelcontext.BlockSize)
 		if end > len(tokenIds) {
 			break
 		}
@@ -127,83 +156,114 @@ func (p *PrefixCacheTable) ComputePrefixHash(tokenIds []int32) []uint64 {
 	return prefixHashes
 }
 
-func (p *PrefixCacheTable) CacheHitCompute(modelName string, loraID int64, tokenIds []int32, candidateEngine map[string]struct{}) map[string]int {
-	ctx := ModelContext{
-		ModelName: modelName,
-		LoraID:    loraID,
-	}
-	slog.Debug("In CacheHitCompute", "ModelName", modelName, "LoraID", loraID)
-	value, exists := p.contextMap.Load(ctx)
-	if !exists {
-		return map[string]int{}
+func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds []int32, instanceID string) *CacheHitResult {
+	// slog.Debug("In CacheHitCompute", "modelName", modelcontext.ModelName, "loraName", modelcontext.LoraName)
+	value, exists := p.contextMap.Load(*modelcontext)
+	prefixMatchResult := &CacheHitResult{
+		LongestMatchTokens: 0,
+		DP:                 map[int64]int64{},
+		GPU:                0,
+		CPU:                0,
+		DISK:               0,
 	}
 
-	prefixHashes := p.ComputePrefixHash(tokenIds)
+	if !exists {
+		slog.Error("In CacheHitCompute, contextData not found")
+		return prefixMatchResult
+	}
+	contextData := value.(*ContextData)
+	cacheSalt := xxhash.Sum64String(modelcontext.AdditionalSalt)
+
+	prefixHashes := p.ComputePrefixHash(modelcontext, tokenIds, cacheSalt)
+
+	// TODO @yejj710
+	// When there is no data in contextData, what information should be returned for the matched modelcontext
+	// This is related to function `AddDpSize`
+
 	slog.Debug("In CacheHitCompute", "prefixHashes", prefixHashes)
 
-	contextData := value.(*ContextData)
 	contextData.prefixMu.RLock()
 	defer contextData.prefixMu.RUnlock()
 	prefixStore := contextData.prefixStore
-	prefixMatchEngines := map[string]int{}
 
-	for i, prefixHash := range prefixHashes {
+	// reserve prefixHashes and then compute cache hit
+	for _, prefixHash := range prefixHashes {
 		cacheStoreInfo, exists := prefixStore.prefixMap[prefixHash]
 		slog.Debug("In CacheHitCompute", "cacheStoreInfo", cacheStoreInfo)
 		if !exists || cacheStoreInfo.TotalReplicaNums.Load() == 0 {
 			break
 		}
 
-		prefixMatchPercent := (i + 1) * 100 / len(prefixHashes)
+		cacheHit := false
 
-		hasOneEngineMatch := false
-		for engineIp := range cacheStoreInfo.engineLastAccessTime {
-			if _, inCandidate := candidateEngine[engineIp]; inCandidate {
-				prefixMatchEngines[engineIp] = prefixMatchPercent
-				hasOneEngineMatch = true
+		for key := range cacheStoreInfo.mediumSet {
+			slog.Debug("In CacheHitCompute", "medium", key)
+			if key == "cpu" {
+				prefixMatchResult.CPU += modelcontext.BlockSize
+				cacheHit = true
+			} else if key == "GPU" {
+				prefixMatchResult.GPU += modelcontext.BlockSize
+				cacheHit = true
+			} else {
+				slog.Warn("In CacheHitCompute, unknown medium type", "medium", key)
 			}
+
 		}
-		if !hasOneEngineMatch {
-			break
+		if cacheHit {
+			prefixMatchResult.LongestMatchTokens += modelcontext.BlockSize
+			for dpRank := range cacheStoreInfo.dpRankSet {
+				prefixMatchResult.DP[dpRank] += modelcontext.BlockSize
+			}
 		}
 	}
 
 	prefixStore.lastAccess.Store(time.Now().Unix())
 
-	return prefixMatchEngines
+	return prefixMatchResult
 }
 
-func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
+func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank int64, instanceID string) error {
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
-	slog.Debug("In ProcessStoreEvent", "event.ModelName", event.ModelName, "event.LoraID", event.LoraID)
-	contextData := p.getContextData(event.ModelName, event.LoraID)
+	tenantID := "default"
+
+	slog.Debug("In ProcessStoreEvent", "modelName", event.ModelName, "instanceID", instanceID, "dpRank", dpRank)
+	contextData := p.getContextData(&ModelContext{
+		ModelName:      event.ModelName,
+		LoraName:       event.LoraName,
+		BlockSize:      event.BlockSize,
+		TenantID:       tenantID,
+		AdditionalSalt: "",
+	}, instanceID)
 
 	contextData.hashmapMu.Lock()
 	defer contextData.hashmapMu.Unlock()
 	proxyHashMap := contextData.proxyHashMapping
 
-	if len(event.BlockHashes)*p.blockSize != len(event.TokenIds) {
+	if len(event.BlockHashes)*int(event.BlockSize) != len(event.TokenIds) {
 		if len(event.BlockHashes) != 1 {
 			return fmt.Errorf("block hashes and tokens length mismatch")
 		}
-		// mooncake event, only one block hash
-		prefixStore := contextData.prefixStore
-		for _, blockHash := range event.BlockHashes {
-			if existingHash, exists := proxyHashMap[blockHash]; exists {
-				p.addNewPrefixStore(prefixStore, existingHash, event.EngineIp)
-			}
-		}
-		return nil
+		// TOOO mooncake event, only one block hash, in the furture, remove it
+		// prefixStore := contextData.prefixStore
+		// for _, blockHash := range event.BlockHashes {
+		// 	if existingHash, exists := proxyHashMap[blockHash]; exists {
+		// 		p.addNewPrefixStore(prefixStore, existingHash, instanceID, event.Medium)
+		// 	}
+		// }
+		// return nil
 	}
 
 	newPrefixStore := make([]struct {
 		hashValue uint64
-		engineIp  string
+		engineID  string
 	}, 0)
 
-	var parentHash uint64 = p.seed
+	var parentHash uint64 = contextData.seed
+	slog.Debug("In ProcessStoreEvent", "seed", parentHash)
+
+	// TODO If the ParentBlockHash happens to be 0, a bug will occur here, because 0 is a valid hash value.
 	if event.ParentBlockHash != 0 {
 		slog.Debug("parent Block HASH is not None.")
 		if pbh, exists := proxyHashMap[event.ParentBlockHash]; exists {
@@ -211,29 +271,27 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 		}
 	}
 
-	// TODO currently, mooncake kv-event does not contained token_ids,
-	// so you must enable vllm prefix_cache to get it.
 	for i, blockHash := range event.BlockHashes {
 		// cache already exists, add engine info and continue
 		if existingHash, exists := proxyHashMap[blockHash]; exists {
 			newPrefixStore = append(newPrefixStore, struct {
 				hashValue uint64
-				engineIp  string
-			}{existingHash, event.EngineIp})
+				engineID  string
+			}{existingHash, event.InstanceID})
 			continue
 		}
 		// if not exists, compute hash
-		hashValue := p.computeHash(parentHash, event.TokenIds[i*p.blockSize:(i+1)*p.blockSize])
+		hashValue := p.computeHash(parentHash, event.TokenIds[i*int(event.BlockSize):(i+1)*int(event.BlockSize)])
 		parentHash = hashValue
 
 		proxyHashMap[blockHash] = hashValue
 
 		newPrefixStore = append(newPrefixStore, struct {
 			hashValue uint64
-			engineIp  string
+			engineID  string
 		}{
 			hashValue: hashValue,
-			engineIp:  event.EngineIp,
+			engineID:  event.InstanceID,
 		})
 
 	}
@@ -244,28 +302,27 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 		prefixStore := contextData.prefixStore
 		for _, newPrefix := range newPrefixStore {
 			slog.Debug("show new prefix data", "newPrefix", newPrefix)
-			p.addNewPrefixStore(prefixStore, newPrefix.hashValue, newPrefix.engineIp)
+			p.addNewPrefixStore(prefixStore, newPrefix.hashValue, newPrefix.engineID, event.Medium, dpRank)
 		}
 	}
-	p.debugPrefixCacheTable()
-	p.debugStoreEvent(event)
+
 	return nil
 }
 
-func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent) error {
+func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank int64, instanceID string) error {
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
+	// TODO @yejj710  Debug remove_event
 
-	ctx := ModelContext{
-		ModelName: event.ModelName,
-		LoraID:    event.LoraID,
-	}
-	value, exists := p.contextMap.Load(ctx)
-	if !exists {
-		return nil
-	}
-	contextData := value.(*ContextData)
+	contextData := p.getContextData(&ModelContext{
+		ModelName:      event.ModelName,
+		LoraName:       event.LoraName,
+		BlockSize:      event.BlockSize,
+		TenantID:       "default",
+		AdditionalSalt: "",
+	}, instanceID)
+
 	contextData.hashmapMu.Lock()
 	defer contextData.hashmapMu.Unlock()
 	proxyHashMap := contextData.proxyHashMapping
@@ -287,12 +344,12 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent) error {
 		contextData.prefixStore.totalPrefixes--
 	}
 
-	p.debugPrefixCacheTable()
 	return nil
 }
 
 func (p *PrefixCacheTable) computeHash(parentHash uint64, blockTokenIDs []int32) uint64 {
-	digest := xxhash.NewWithSeed(p.seed)
+	// digest := xxhash.NewWithSeed()
+	digest := xxhash.New()
 	var parentHashBytes [8]byte
 	binary.LittleEndian.PutUint64(parentHashBytes[:], parentHash)
 	_, _ = digest.Write(parentHashBytes[:])
@@ -305,52 +362,62 @@ func (p *PrefixCacheTable) computeHash(parentHash uint64, blockTokenIDs []int32)
 	return digest.Sum64()
 }
 
-// only kv event can flush prefixMap
-func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValue uint64, engineIp string) {
+func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValue uint64, instanceID string, medium string, dpRank int64) {
 	now := time.Now().Unix()
 	if prefixStore.prefixMap[hashValue] == nil {
+		slog.Debug("in addNewPrefixStore, prefixStore.prefixMap[hashValue] is nil", "hashValue", hashValue)
 		prefixStore.prefixMap[hashValue] = &CacheStoreInfo{
 			engineLastAccessTime: make(map[string]*atomic.Int64),
+			mediumSet:            make(map[string]struct{}),
+			dpRankSet:            make(map[int64]struct{}),
 		}
 		prefixStore.totalPrefixes++
 	}
 	cacheStoreInfo := prefixStore.prefixMap[hashValue]
 
-	if _, exists := cacheStoreInfo.engineLastAccessTime[engineIp]; !exists {
+	if _, exists := cacheStoreInfo.engineLastAccessTime[instanceID]; !exists {
 		var newTime atomic.Int64
 		newTime.Store(now)
-		cacheStoreInfo.engineLastAccessTime[engineIp] = &newTime
+		cacheStoreInfo.engineLastAccessTime[instanceID] = &newTime
 	} else {
-		cacheStoreInfo.engineLastAccessTime[engineIp].Store(now)
+		cacheStoreInfo.engineLastAccessTime[instanceID].Store(now)
 	}
 	cacheStoreInfo.TotalReplicaNums.Add(1)
-	slog.Debug("new prefixstore", "conductor_hash", hashValue, "AccessTime", cacheStoreInfo.engineLastAccessTime)
+	cacheStoreInfo.mediumSet[medium] = struct{}{}
+	cacheStoreInfo.dpRankSet[dpRank] = struct{}{}
+	slog.Debug("in addNewPrefixStore", "conductor_hash", hashValue, "current_mediumset", cacheStoreInfo.mediumSet[medium])
 }
 
-func (p *PrefixCacheTable) debugPrefixCacheTable() {
-	slog.Debug("global configuration", "seed: ", p.seed, "blockSize:", p.blockSize)
-	slog.Debug("show PrefixCacheTable", "contextCount: ", p.contextCount.Load())
+func (p *PrefixCacheTable) GetGlobalView() *GlobalView {
+	view := &GlobalView{
+		ContextCount:  p.contextCount.Load(),
+		ModelContexts: make([]ModelContextView, 0),
+		ProxyHashMap:  make([]map[uint64]uint64, 0),
+	}
+
 	p.contextMap.Range(func(key, value interface{}) bool {
 		ctx := key.(ModelContext)
-		ctxdata := p.getContextData(ctx.ModelName, ctx.LoraID)
-		slog.Debug("modelcontext", "ModelName: ", ctx.ModelName, "LoraID:", ctx.LoraID)
-		slog.Debug("show proxyHashMapping", "proxyHashMapping: ", ctxdata.proxyHashMapping)
-		prefixstore := ctxdata.prefixStore
-		slog.Debug("prfixstore", "totalPrefixes: ", prefixstore.totalPrefixes, "lastAccess:", prefixstore.lastAccess)
-		for engip := range prefixstore.prefixMap {
-			slog.Debug("prefixMap", "EngineIp", engip)
+		contextData := value.(*ContextData)
+
+		ctxView := ModelContextView{
+			ModelName:      ctx.ModelName,
+			LoraName:       ctx.LoraName,
+			BlockSize:      ctx.BlockSize,
+			AdditionalSalt: ctx.AdditionalSalt,
+			TenantID:       ctx.TenantID,
 		}
+
+		contextData.prefixMu.RLock()
+		defer contextData.prefixMu.RUnlock()
+
+		contextData.hashmapMu.RLock()
+		defer contextData.hashmapMu.RUnlock()
+
+		view.ProxyHashMap = append(view.ProxyHashMap, contextData.proxyHashMapping)
+		view.ModelContexts = append(view.ModelContexts, ctxView)
+
 		return true
 	})
-}
 
-func (p *PrefixCacheTable) debugStoreEvent(storeEvent common.StoredEvent) {
-	slog.Debug("StoredEvent debug information",
-		"model_name", storeEvent.ModelName,
-		"lora_id", storeEvent.LoraID,
-		"engine_ip", storeEvent.EngineIp,
-		"parent_block_hash", storeEvent.ParentBlockHash,
-		"block_hashes", storeEvent.BlockHashes,
-		"token_ids", storeEvent.TokenIds,
-	)
+	return view
 }

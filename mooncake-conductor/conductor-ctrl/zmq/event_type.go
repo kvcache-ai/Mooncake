@@ -28,7 +28,10 @@ type BlockStoredEvent struct {
 	MooncakeKey     string
 	ReplicaList     [][]string
 	ModelName       string
+	LoraID          int64
+	LoraName        string
 	PodName         string
+	Medium          string
 }
 
 func (e *BlockStoredEvent) GetType() EventType {
@@ -96,6 +99,7 @@ const (
 )
 
 type EventBatch struct {
-	Source string // indicates the origin of the event batch
-	Events []KVEvent
+	Source           string // indicates the origin of the event batch
+	Events           []KVEvent
+	DataParallelRank int64
 }

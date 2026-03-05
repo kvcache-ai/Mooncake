@@ -7,7 +7,7 @@ import (
 
 // EventHandler processes received KV events
 type EventHandler interface {
-	HandleEvent(event KVEvent) error
+	HandleEvent(event KVEvent, dpRank int64) error
 }
 
 // ZMQClientConfig contains configuration for the ZMQ client
