@@ -86,6 +86,11 @@ struct MooncakeEpBuffer {
     bool ibgda_disabled_ = false;
     int gid_index_ = -1;  // Dynamically discovered GID index
 
+    mlx5dv_devx_umem* ctrl_buf_umem;
+    ibv_pd* pd;
+    mlx5dv_pd mpd;
+    memheap* ctrl_buf_heap;
+
     // NVLink P2P
     int32_t* nvlink_available = nullptr;
     void** ipc_peer_ptrs_host = nullptr;

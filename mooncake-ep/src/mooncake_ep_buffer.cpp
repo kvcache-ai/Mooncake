@@ -381,12 +381,11 @@ int MooncakeEpBuffer::init_ibgda() {
     }
     ibv_free_device_list(dev_list);
 
-    ibv_pd* pd = ibv_alloc_pd(ctx);
+    pd = ibv_alloc_pd(ctx);
     if (!pd) {
         perror("Failed to allocate protection domain");
         return -1;
     }
-    mlx5dv_pd mpd;
     mlx5dv_obj dv_obj = {};
     dv_obj.pd.in = pd;
     dv_obj.pd.out = &mpd;
@@ -404,7 +403,7 @@ int MooncakeEpBuffer::init_ibgda() {
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
     // WQ doesn't need initialization as it's zeroed before each use.
     CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    mlx5dv_devx_umem* ctrl_buf_umem = mlx5dv_devx_umem_reg(
+    ctrl_buf_umem = mlx5dv_devx_umem_reg(
         ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
@@ -419,7 +418,7 @@ int MooncakeEpBuffer::init_ibgda() {
         }
         return -1;
     }
-    memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
+    ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
         return -1;
