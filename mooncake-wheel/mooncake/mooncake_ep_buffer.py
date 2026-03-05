@@ -65,7 +65,6 @@ class Buffer:
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
-        print("Init", self.rank)
         # Get the index of the closest NIC
         self.backend = self.group._get_backend(torch.device('cuda'))
         preferred_hca = pg.get_preferred_hca(self.backend, f'cuda:{torch.cuda.current_device()}')
@@ -75,7 +74,6 @@ class Buffer:
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
         self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
-        print("Start", self.rank)
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
@@ -96,7 +94,6 @@ class Buffer:
             remote_qpns = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
             dist.all_to_all(remote_qpns, local_qpns, group)
             remote_qpns = torch.cat(remote_qpns).tolist()
-            print("Ready", self.rank)
 
             if self.runtime.is_roce():
                 (subnet_prefix, interface_id) = self.runtime.get_gid()
@@ -130,7 +127,7 @@ class Buffer:
         #   enable the fast-path in that case.
         # - If this fails (no NVLink / CUDA IPC unavailable / platform restrictions), we swallow the
         #   error and keep going in fallback mode.
-        """ try:
+        try:
             local_handle_ints = self.runtime.get_ipc_handle()
             # pybind11 converts std::vector<int32_t> to a list of integers
             local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
@@ -144,7 +141,7 @@ class Buffer:
                 f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
                 RuntimeWarning,
                 stacklevel=2,
-            ) """
+            )
 
         # Final decision: Use fast-path (CUDA kernel + IBGDA/NVLink) only if it's safe.
         # The runtime checks:
@@ -212,7 +209,7 @@ class Buffer:
 
                 self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
         
-        """ try:
+        try:
             local_handle_ints = self.runtime.get_ipc_handle()
             # pybind11 converts std::vector<int32_t> to a list of integers
             local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
@@ -226,7 +223,7 @@ class Buffer:
                 f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
                 RuntimeWarning,
                 stacklevel=2,
-            ) """
+            )
 
         use_fast_path = False
         try:
