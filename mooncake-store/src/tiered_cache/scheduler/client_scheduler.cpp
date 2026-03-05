@@ -5,6 +5,7 @@
 #include "tiered_cache/scheduler/lru_stats_collector.h"
 #include "tiered_cache/scheduler/simple_policy.h"
 #include <chrono>
+#include <unordered_set>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -16,6 +17,19 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
     if (config.isMember("scheduler") &&
         config["scheduler"].isMember("policy")) {
         policy_type = config["scheduler"]["policy"].asString();
+    }
+
+    // Read eviction mode configuration
+    if (config.isMember("scheduler") &&
+        config["scheduler"].isMember("eviction_mode")) {
+        std::string mode = config["scheduler"]["eviction_mode"].asString();
+        if (mode == "sync") {
+            eviction_mode_ = EvictionMode::SYNC;
+            LOG(INFO) << "Eviction mode: SYNC (immediate)";
+        } else {
+            eviction_mode_ = EvictionMode::ASYNC;
+            LOG(INFO) << "Eviction mode: ASYNC (periodic)";
+        }
     }
 
     if (policy_type == "LRU") {
@@ -102,6 +116,19 @@ void ClientScheduler::OnDelete(const std::string& key) {
     }
 }
 
+bool ClientScheduler::OnAllocationFailure(UUID tier_id) {
+    if (eviction_mode_ == EvictionMode::SYNC) {
+        LOG(INFO) << "Allocation failed on tier " << tier_id
+                  << ", triggering SYNC eviction";
+        TriggerSyncEviction(tier_id);
+        return true;
+    } else {
+        VLOG(2) << "Allocation failed on tier " << tier_id
+                << ", ASYNC mode - will handle in next cycle";
+        return false;
+    }
+}
+
 void ClientScheduler::WorkerLoop() {
     while (running_) {
         std::this_thread::sleep_for(
@@ -175,6 +202,8 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
     }
 
     // Phase 2: Execute all MIGRATE actions
+    std::unordered_set<UUID> tiers_needing_eviction;
+
     for (const auto& action : actions) {
         if (action.type == SchedAction::Type::MIGRATE) {
             // Check validity
@@ -195,10 +224,12 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                                  "modification (CAS Failed) for key: "
                               << action.key;
                 } else if (res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
-                    // Insufficient space is a normal condition during high load
+                    // Insufficient space - mark tier for eviction
                     VLOG(2) << "Transfer skipped due to insufficient space for "
                                "key: "
-                            << action.key;
+                            << action.key << ", will trigger eviction";
+                    tiers_needing_eviction.insert(
+                        action.target_tier_id.value());
                 } else {
                     LOG(ERROR) << "Transfer failed for key: " << action.key
                                << ", error: " << res.error();
@@ -211,6 +242,121 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                 if (!del_res) {
                     // Log warning: Failed to clean up source
                 }
+            }
+        }
+    }
+
+    // Phase 3: If any tier ran out of space, handle based on eviction mode
+    if (!tiers_needing_eviction.empty()) {
+        if (eviction_mode_ == EvictionMode::SYNC) {
+            // Sync mode: trigger immediate eviction
+            VLOG(1) << "Triggering SYNC eviction for "
+                    << tiers_needing_eviction.size() << " tier(s)";
+            for (const auto& tier_id : tiers_needing_eviction) {
+                TriggerSyncEviction(tier_id);
+            }
+        } else {
+            // Async mode: rely on next scheduling cycle
+            VLOG(1) << "ASYNC eviction mode: will handle in next cycle for "
+                    << tiers_needing_eviction.size() << " tier(s)";
+        }
+    }
+}
+
+void ClientScheduler::TriggerSyncEviction(UUID tier_id) {
+    // Collect current stats
+    std::unordered_map<UUID, TierStats> tier_stats;
+    for (const auto& [tid, tier] : tiers_) {
+        TierStats stats;
+        stats.total_capacity_bytes = tier->GetCapacity();
+        stats.used_capacity_bytes = tier->GetUsage();
+        tier_stats[tid] = stats;
+    }
+
+    // Get active keys from stats collector
+    auto access_stats = stats_collector_->GetSnapshot();
+
+    if (access_stats.hot_keys.empty()) {
+        LOG(WARNING) << "No active keys for sync eviction";
+        return;
+    }
+
+    // Build KeyContext list
+    std::vector<KeyContext> active_keys;
+    active_keys.reserve(access_stats.hot_keys.size());
+
+    for (const auto& [key, score] : access_stats.hot_keys) {
+        KeyContext ctx;
+        ctx.key = key;
+        ctx.heat_score = score;
+
+        ctx.current_locations = backend_->GetReplicaTierIds(key);
+        if (ctx.current_locations.empty()) {
+            continue;  // Key deleted
+        }
+
+        auto handle = backend_->Get(key, std::nullopt, false);
+        if (handle.has_value() && handle.value()->loc.data.buffer) {
+            ctx.size_bytes = handle.value()->loc.data.buffer->size();
+        }
+
+        active_keys.push_back(ctx);
+    }
+
+    // Force policy to generate eviction actions
+    auto evict_actions = policy_->Decide(tier_stats, active_keys);
+
+    // Filter to EVICT or MIGRATE-away actions for the target tier
+    std::vector<SchedAction> filtered_actions;
+    for (const auto& action : evict_actions) {
+        bool is_eviction_from_target = false;
+
+        if (action.type == SchedAction::Type::EVICT &&
+            action.source_tier_id.has_value() &&
+            action.source_tier_id.value() == tier_id) {
+            is_eviction_from_target = true;
+        } else if (action.type == SchedAction::Type::MIGRATE &&
+                   action.source_tier_id.has_value() &&
+                   action.source_tier_id.value() == tier_id &&
+                   action.target_tier_id.has_value() &&
+                   action.target_tier_id.value() != tier_id) {
+            // MIGRATE away from target tier also frees space
+            is_eviction_from_target = true;
+        }
+
+        if (is_eviction_from_target) {
+            filtered_actions.push_back(action);
+        }
+    }
+
+    if (filtered_actions.empty()) {
+        LOG(WARNING) << "No eviction candidates found for tier " << tier_id;
+        return;
+    }
+
+    // Execute evictions
+    for (const auto& action : filtered_actions) {
+        if (action.type == SchedAction::Type::EVICT) {
+            // Direct eviction
+            auto del_res = backend_->Delete(action.key, tier_id);
+            if (!del_res) {
+                LOG(WARNING) << "Failed to evict key: " << action.key;
+            }
+        } else if (action.type == SchedAction::Type::MIGRATE) {
+            // Migrate to another tier (also frees space)
+            auto transfer_res =
+                backend_->Transfer(action.key, action.source_tier_id.value(),
+                                   action.target_tier_id.value());
+            if (transfer_res) {
+                // Transfer succeeded - delete from source to free space
+                auto del_res =
+                    backend_->Delete(action.key, action.source_tier_id.value());
+                if (!del_res) {
+                    LOG(WARNING) << "Failed to delete source after migration: "
+                                 << action.key;
+                }
+            } else {
+                LOG(WARNING) << "Failed to migrate key: " << action.key;
             }
         }
     }

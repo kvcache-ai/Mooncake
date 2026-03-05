@@ -247,14 +247,76 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
-    size_t size, std::optional<UUID> preferred_tier) {
+    size_t size, std::optional<UUID> preferred_tier, bool strict) {
     TieredLocation loc;
+
+    // Strict mode: must allocate on preferred tier
+    if (strict && preferred_tier.has_value()) {
+        auto it = tiers_.find(*preferred_tier);
+        if (it == tiers_.end()) {
+            LOG(ERROR) << "Strict allocation failed: tier not found";
+            return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+        }
+
+        // Try allocation
+        auto alloc_result = it->second->Allocate(size, loc.data);
+        if (alloc_result) {
+            loc.tier = it->second.get();
+            return std::make_shared<AllocationEntry>(this, std::move(loc));
+        }
+
+        // Failed - try sync eviction if available
+        if (scheduler_) {
+            bool evicted = scheduler_->OnAllocationFailure(*preferred_tier);
+            if (evicted) {
+                // Retry after eviction
+                alloc_result = it->second->Allocate(size, loc.data);
+                if (alloc_result) {
+                    LOG(INFO)
+                        << "Strict allocation succeeded after sync eviction";
+                    loc.tier = it->second.get();
+                    return std::make_shared<AllocationEntry>(this,
+                                                             std::move(loc));
+                }
+            }
+        }
+
+        LOG(ERROR) << "Strict allocation failed on tier " << *preferred_tier;
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    // Non-strict mode: try preferred tier + fallback (fast path)
     if (AllocateInternalRaw(size, preferred_tier, &loc)) {
-        // Create the handle (Ref count = 1).
-        // If this handle dies without being committed, AllocationEntry
-        // destructor triggers Free.
         return std::make_shared<AllocationEntry>(this, std::move(loc));
     }
+
+    // All tiers failed - try sync eviction if enabled
+    if (scheduler_) {
+        // Determine which tier to evict from
+        UUID evict_tier_id;
+        if (preferred_tier.has_value()) {
+            evict_tier_id = *preferred_tier;
+        } else {
+            // No preference - evict from highest priority tier (usually DRAM)
+            auto sorted = GetSortedTiers();
+            if (sorted.empty()) {
+                LOG(ERROR) << "Failed to allocate " << size
+                           << " bytes: no tiers";
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            evict_tier_id = sorted[0];
+        }
+
+        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id);
+        if (evicted) {
+            // Retry allocation after eviction
+            if (AllocateInternalRaw(size, preferred_tier, &loc)) {
+                LOG(INFO) << "Allocation succeeded after sync eviction";
+                return std::make_shared<AllocationEntry>(this, std::move(loc));
+            }
+        }
+    }
+
     LOG(ERROR) << "Failed to allocate " << size << " bytes";
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }

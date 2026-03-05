@@ -115,7 +115,11 @@ class LRUPolicy : public SchedulerPolicy {
                     action.source_tier_id = fast_id;
                     action.target_tier_id = slow_id.value();
                 } else {
-                    continue;
+                    // Single-tier configuration: no slow tier available
+                    // Must evict (delete) to free space
+                    action.type = SchedAction::Type::EVICT;
+                    action.key = key_ctx.key;
+                    action.source_tier_id = fast_id;
                 }
                 actions.push_back(action);
             } else if (!is_in_fast && should_be &&

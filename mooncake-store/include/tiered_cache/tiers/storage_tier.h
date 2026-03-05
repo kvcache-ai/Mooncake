@@ -153,6 +153,9 @@ class StorageTier : public CacheTier {
     // Internal flush logic that triggers BatchOffload
     tl::expected<void, ErrorCode> FlushInternal();
 
+    // Background flush thread worker
+    void FlushWorker();
+
     UUID tier_id_;
     std::vector<std::string> tags_;
 
@@ -163,6 +166,13 @@ class StorageTier : public CacheTier {
     std::condition_variable flush_cv_;  // Signaled when flush completes
     std::unordered_map<std::string, StorageBuffer*> pending_batch_;
     std::atomic<size_t> pending_batch_size_{0};
+
+    // Async flush thread
+    std::thread flush_thread_;
+    std::atomic<bool> stop_flush_thread_{false};
+    std::condition_variable flush_trigger_cv_;
+    std::mutex flush_trigger_mutex_;
+    std::atomic<bool> flush_requested_{false};
 
     // Configurable thresholds
     size_t batch_size_threshold_ = 64 * 1024 * 1024;  // 64MB

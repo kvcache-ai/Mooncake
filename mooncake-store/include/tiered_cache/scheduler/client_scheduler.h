@@ -39,12 +39,19 @@ class ClientScheduler {
     // Called when a key is deleted
     void OnDelete(const std::string& key);
 
+    // Called when allocation fails due to insufficient space
+    // Returns true if eviction was triggered (sync mode), false otherwise
+    bool OnAllocationFailure(UUID tier_id);
+
    private:
     // Background worker loop
     void WorkerLoop();
 
     // Execute generated actions
     void ExecuteActions(const std::vector<SchedAction>& actions);
+
+    // Trigger immediate eviction for a tier (sync mode)
+    void TriggerSyncEviction(UUID tier_id);
 
    private:
     TieredBackend* backend_;
@@ -59,6 +66,8 @@ class ClientScheduler {
 
     // Configuration
     int loop_interval_ms_ = 1000;
+    enum class EvictionMode { SYNC, ASYNC };
+    EvictionMode eviction_mode_ = EvictionMode::ASYNC;
 };
 
 }  // namespace mooncake

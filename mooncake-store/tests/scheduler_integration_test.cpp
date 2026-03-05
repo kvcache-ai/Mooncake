@@ -738,4 +738,271 @@ TEST_F(SchedulerIntegrationTest, ConcurrentFlushDeleteStress) {
               << flush_count.load() << " flushes. No UAF.";
 }
 
+// Test StorageTier capacity enforcement
+TEST_F(SchedulerIntegrationTest, StorageTierCapacityLimit) {
+    // Create small storage tier (5MB capacity)
+    Json::Value tiers(Json::arrayValue);
+    Json::Value storage;
+    storage["type"] = "STORAGE";
+    storage["capacity"] = (Json::UInt64)(5 * 1024 * 1024);  // 5MB
+    storage["priority"] = 10;
+    tiers.append(storage);
+
+    Json::Value config;
+    config["tiers"] = tiers;
+
+    TieredBackend backend;
+    auto res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(res.has_value());
+
+    auto views = backend.GetTierViews();
+    UUID storage_id = views[0].id;
+
+    const size_t item_size = 1024 * 1024;  // 1MB
+    std::vector<std::string> keys;
+
+    // Allocate 5 items (5MB total, should fill capacity)
+    for (int i = 0; i < 5; i++) {
+        std::string key = "cap_key_" + std::to_string(i);
+        auto handle = backend.Allocate(item_size, storage_id);
+        ASSERT_TRUE(handle.has_value()) << "Failed to allocate item " << i;
+
+        auto buf = std::make_unique<char[]>(item_size);
+        std::memset(buf.get(), 0xCC, item_size);
+        DataSource src{
+            std::make_unique<TempDRAMBuffer>(std::move(buf), item_size),
+            MemoryType::DRAM};
+
+        ASSERT_TRUE(backend.Write(src, handle.value()).has_value());
+        ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+        keys.push_back(key);
+    }
+
+    // 6th allocation should fail (capacity exceeded)
+    auto handle = backend.Allocate(item_size, storage_id);
+    EXPECT_FALSE(handle.has_value());
+    EXPECT_EQ(handle.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    LOG(INFO) << "Capacity limit enforced: 6th allocation rejected";
+
+    // Delete one item to free space
+    backend.Delete(keys[0]);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Now allocation should succeed
+    auto handle2 = backend.Allocate(item_size, storage_id);
+    EXPECT_TRUE(handle2.has_value())
+        << "Allocation should succeed after delete";
+}
+
+// Test sync eviction mode: verify that allocation triggers immediate eviction
+TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
+    // Create config with DRAM tier (small capacity) and LRU policy
+    Json::Value tiers(Json::arrayValue);
+    Json::Value dram;
+    dram["type"] = "DRAM";
+    dram["capacity"] = (Json::UInt64)(5 * 1024 * 1024);  // 5MB
+    dram["priority"] = 100;
+    dram["allocator_type"] = "OFFSET";
+    tiers.append(dram);
+
+    Json::Value storage;
+    storage["type"] = "STORAGE";
+    storage["capacity"] = (Json::UInt64)(50 * 1024 * 1024);  // 50MB
+    storage["priority"] = 10;
+    tiers.append(storage);
+
+    Json::Value config;
+    config["tiers"] = tiers;
+
+    // Configure LRU with sync eviction
+    Json::Value scheduler;
+    scheduler["policy"] = "LRU";
+    scheduler["eviction_mode"] = "sync";
+    scheduler["high_watermark"] = 0.9;
+    scheduler["low_watermark"] = 0.7;
+    config["scheduler"] = scheduler;
+
+    TieredBackend backend;
+    auto res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(res.has_value());
+
+    auto views = backend.GetTierViews();
+    UUID dram_id, storage_id;
+    for (const auto& v : views) {
+        if (v.type == MemoryType::DRAM) dram_id = v.id;
+        if (v.type == MemoryType::NVME) storage_id = v.id;
+    }
+
+    const size_t item_size = 1024 * 1024;  // 1MB
+
+    // Fill DRAM to capacity (5 items)
+    std::vector<std::string> keys;
+    for (int i = 0; i < 5; i++) {
+        std::string key = "sync_key_" + std::to_string(i);
+        auto handle = backend.Allocate(item_size, dram_id);
+        ASSERT_TRUE(handle.has_value());
+
+        auto buf = std::make_unique<char[]>(item_size);
+        std::memset(buf.get(), 0xDD, item_size);
+        DataSource src{
+            std::make_unique<TempDRAMBuffer>(std::move(buf), item_size),
+            MemoryType::DRAM};
+
+        ASSERT_TRUE(backend.Write(src, handle.value()).has_value());
+        ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+        keys.push_back(key);
+    }
+
+    // Create clear hot/cold pattern: access first 2 keys many times
+    for (int round = 0; round < 10; round++) {
+        for (int i = 0; i < 2; i++) {
+            backend.Get("sync_key_" + std::to_string(i));
+        }
+    }
+
+    // Wait for scheduler to collect stats
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Try to allocate 6th item in DRAM with strict=true
+    // Should trigger sync eviction and succeed
+    auto handle6 = backend.Allocate(item_size, dram_id, true /* strict */);
+    ASSERT_TRUE(handle6.has_value())
+        << "Strict allocation should succeed after sync eviction";
+
+    // Verify it's actually in DRAM (not fallback to Storage)
+    EXPECT_EQ(handle6.value()->loc.tier->GetTierId(), dram_id)
+        << "Strict allocation should succeed in DRAM after sync eviction";
+
+    // Commit the 6th item
+    std::string key6 = "sync_key_6";
+    auto buf6 = std::make_unique<char[]>(item_size);
+    std::memset(buf6.get(), 0xEE, item_size);
+    DataSource src6{
+        std::make_unique<TempDRAMBuffer>(std::move(buf6), item_size),
+        MemoryType::DRAM};
+    ASSERT_TRUE(backend.Write(src6, handle6.value()).has_value());
+    ASSERT_TRUE(backend.Commit(key6, handle6.value()).has_value());
+
+    // Verify: at least one key should have been evicted from DRAM
+    int keys_in_dram = 0;
+    for (int i = 0; i < 5; i++) {
+        std::string key = "sync_key_" + std::to_string(i);
+        auto replicas = backend.GetReplicaTierIds(key);
+        for (auto tid : replicas) {
+            if (tid == dram_id) {
+                keys_in_dram++;
+                break;
+            }
+        }
+    }
+    LOG(INFO) << "Original keys in DRAM after sync eviction: " << keys_in_dram
+              << "/5";
+    EXPECT_LT(keys_in_dram, 5)
+        << "At least one key should have been evicted from DRAM";
+
+    LOG(INFO) << "Sync eviction mode test completed";
+}
+
+// Test single-tier eviction: verify that keys are deleted when no other tier
+// exists
+TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
+    // Create config with only DRAM tier and LRU policy
+    Json::Value tiers(Json::arrayValue);
+    Json::Value dram;
+    dram["type"] = "DRAM";
+    dram["capacity"] = (Json::UInt64)(5 * 1024 * 1024);  // 5MB
+    dram["priority"] = 100;
+    dram["allocator_type"] = "OFFSET";
+    tiers.append(dram);
+
+    Json::Value config;
+    config["tiers"] = tiers;
+
+    // Configure LRU with sync eviction
+    Json::Value scheduler;
+    scheduler["policy"] = "LRU";
+    scheduler["eviction_mode"] = "sync";
+    scheduler["high_watermark"] = 0.9;
+    scheduler["low_watermark"] = 0.7;
+    config["scheduler"] = scheduler;
+
+    TieredBackend backend;
+    auto res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(res.has_value());
+
+    auto views = backend.GetTierViews();
+    UUID dram_id = views[0].id;
+
+    const size_t item_size = 1024 * 1024;  // 1MB
+
+    // Fill DRAM to capacity (5 items)
+    std::vector<std::string> keys;
+    for (int i = 0; i < 5; i++) {
+        std::string key = "single_key_" + std::to_string(i);
+        auto handle = backend.Allocate(item_size, dram_id);
+        ASSERT_TRUE(handle.has_value());
+
+        auto buf = std::make_unique<char[]>(item_size);
+        std::memset(buf.get(), 0xAA, item_size);
+        DataSource src{
+            std::make_unique<TempDRAMBuffer>(std::move(buf), item_size),
+            MemoryType::DRAM};
+
+        ASSERT_TRUE(backend.Write(src, handle.value()).has_value());
+        ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+        keys.push_back(key);
+    }
+
+    // Create hot/cold pattern
+    for (int round = 0; round < 10; round++) {
+        for (int i = 0; i < 2; i++) {
+            backend.Get("single_key_" + std::to_string(i));
+        }
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Try to allocate 6th item with strict=true
+    // Should trigger sync eviction and DELETE cold keys
+    auto handle6 = backend.Allocate(item_size, dram_id, true /* strict */);
+    ASSERT_TRUE(handle6.has_value())
+        << "Single-tier eviction should succeed by deleting cold keys";
+
+    // Commit the 6th item
+    std::string key6 = "single_key_6";
+    auto buf6 = std::make_unique<char[]>(item_size);
+    std::memset(buf6.get(), 0xBB, item_size);
+    DataSource src6{
+        std::make_unique<TempDRAMBuffer>(std::move(buf6), item_size),
+        MemoryType::DRAM};
+    ASSERT_TRUE(backend.Write(src6, handle6.value()).has_value());
+    ASSERT_TRUE(backend.Commit(key6, handle6.value()).has_value());
+
+    // Verify: some keys should have been completely deleted
+    int total_keys = 0;
+    for (int i = 0; i < 5; i++) {
+        std::string key = "single_key_" + std::to_string(i);
+        auto replicas = backend.GetReplicaTierIds(key);
+        if (!replicas.empty()) {
+            total_keys++;
+        }
+    }
+
+    EXPECT_LT(total_keys, 5)
+        << "Some keys should have been deleted in single-tier eviction";
+
+    // Verify hot keys are more likely to survive
+    int hot_survived = 0;
+    for (int i = 0; i < 2; i++) {
+        std::string key = "single_key_" + std::to_string(i);
+        auto replicas = backend.GetReplicaTierIds(key);
+        if (!replicas.empty()) {
+            hot_survived++;
+        }
+    }
+
+    LOG(INFO) << "Single-tier eviction test completed";
+}
+
 }  // namespace mooncake

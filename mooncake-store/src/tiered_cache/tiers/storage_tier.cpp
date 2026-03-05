@@ -11,6 +11,13 @@ StorageTier::StorageTier(UUID tier_id, const std::vector<std::string>& tags,
     : tier_id_(tier_id), tags_(tags), capacity_(capacity) {}
 
 StorageTier::~StorageTier() {
+    // Stop flush thread
+    stop_flush_thread_.store(true);
+    flush_trigger_cv_.notify_all();
+    if (flush_thread_.joinable()) {
+        flush_thread_.join();
+    }
+
     // Flush any pending data on destruction
     if (pending_batch_size_.load() > 0) {
         LOG(INFO) << "StorageTier dtor: Flushing " << pending_batch_.size()
@@ -24,7 +31,6 @@ tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
     backend_ = backend;
     try {
         auto config = FileStorageConfig::FromEnvironment();
-        // Validate config or set defaults if needed
         if (!config.Validate()) {
             LOG(ERROR) << "Invalid FileStorageConfig for StorageTier";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -45,6 +51,9 @@ tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
             return init_res;
         }
 
+        // Start background flush thread
+        flush_thread_ = std::thread(&StorageTier::FlushWorker, this);
+
     } catch (const std::exception& e) {
         LOG(ERROR) << "Exception during StorageTier init: " << e.what();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -56,17 +65,21 @@ tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
 
 tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
                                                     DataSource& data) {
+    // Check capacity before allocation (pending + persisted)
+    size_t current_usage = GetUsage();
+    if (capacity_ > 0 && current_usage + size > capacity_) {
+        VLOG(1) << "StorageTier capacity exceeded: usage=" << current_usage
+                << ", requested=" << size << ", capacity=" << capacity_;
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
     try {
-        // Create a Staging Buffer in DRAM.
-        // This does not consume disk space yet.
-        // Create a Storage Buffer (Staging mode).
-        // This does not consume disk space yet.
+        // Dynamic allocation (simple and safe)
         auto staging_buffer =
             std::make_unique<StorageBuffer>(size, storage_backend_.get());
 
         data.buffer = std::move(staging_buffer);
-        data.type = MemoryType::NVME;  // Staging buffer, but logically part of
-                                       // StorageTier
+        data.type = MemoryType::NVME;
 
         return {};
     } catch (const std::bad_alloc& e) {
@@ -107,6 +120,11 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
     if (staging->IsPersisted()) {
         persisted_size_.fetch_sub(size, std::memory_order_acq_rel);
         VLOG(1) << "Freed persisted data for key " << key << ", size=" << size;
+
+        // TODO: Physical file deletion not implemented yet.
+        // StorageBackendInterface lacks a RemoveKey() method.
+        // Currently only metadata is freed; disk files remain until manual
+        // cleanup.
     }
 
     return {};
@@ -120,7 +138,6 @@ tl::expected<void, ErrorCode> StorageTier::Commit(const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    bool trigger_flush = false;
     {
         std::unique_lock<std::mutex> lock(batch_mutex_);
 
@@ -129,23 +146,39 @@ tl::expected<void, ErrorCode> StorageTier::Commit(const std::string& key,
         pending_batch_[key] = staging;
         pending_batch_size_.fetch_add(staging->size());
 
-        // Check thresholds
+        // Check thresholds for async flush trigger
         const size_t batch_size = pending_batch_.size();
         if (batch_size >= batch_count_threshold_ ||
             pending_batch_size_.load() >= batch_size_threshold_) {
-            trigger_flush = true;
+            flush_requested_.store(true);
+            flush_trigger_cv_.notify_one();
         }
-    }
-
-    if (trigger_flush) {
-        VLOG(1) << "Auto-flushing StorageTier batch.";
-        return FlushInternal();
     }
 
     return {};
 }
 
 tl::expected<void, ErrorCode> StorageTier::Flush() { return FlushInternal(); }
+
+void StorageTier::FlushWorker() {
+    while (!stop_flush_thread_.load()) {
+        std::unique_lock<std::mutex> lock(flush_trigger_mutex_);
+        flush_trigger_cv_.wait(lock, [this] {
+            return flush_requested_.load() || stop_flush_thread_.load();
+        });
+
+        if (stop_flush_thread_.load()) break;
+
+        flush_requested_.store(false);
+        lock.unlock();
+
+        // Execute flush
+        auto result = FlushInternal();
+        if (!result.has_value()) {
+            LOG(ERROR) << "Background flush failed: " << result.error();
+        }
+    }
+}
 
 tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
     std::unordered_map<std::string, StorageBuffer*> snapshot;
@@ -188,7 +221,7 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
         }
 
         for (auto& kv : snapshot) {
-            kv.second->Persist();
+            kv.second->Persist();  // Releases staging memory
             kv.second->SetFlushing(false);
         }
         persisted_size_.fetch_add(batch_total_size);

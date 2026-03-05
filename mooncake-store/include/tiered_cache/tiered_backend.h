@@ -106,9 +106,15 @@ class TieredBackend {
      * reserves storage space. Returns a handle.
      * If the handle goes out of scope without being committed, the space is
      * auto-freed.
+     * @param size: Size in bytes to allocate
+     * @param preferred_tier: Preferred tier ID (optional)
+     * @param strict: If true, allocation MUST succeed on preferred_tier.
+     *                Will trigger sync eviction if needed, no fallback.
+     *                If false (default), will fallback to other tiers.
      */
     tl::expected<AllocationHandle, ErrorCode> Allocate(
-        size_t size, std::optional<UUID> preferred_tier = std::nullopt);
+        size_t size, std::optional<UUID> preferred_tier = std::nullopt,
+        bool strict = false);
 
     /**
      * @brief Execution (Write)
