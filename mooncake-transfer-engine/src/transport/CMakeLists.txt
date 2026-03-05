@@ -47,7 +47,7 @@ if (USE_MNNVL)
   endif()
 endif()
 
-if (USE_INTRA_NVLINK)
+if (USE_INTRA_NODE_NVLINK)
       add_subdirectory(intranode_nvlink_transport)
       target_sources(transport PUBLIC $<TARGET_OBJECTS:intranode_nvlink_transport>)
 endif()

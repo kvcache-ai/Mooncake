@@ -210,7 +210,7 @@ export MC_FORCE_MNNVL=true
 
 **Requirements:**
 - NVIDIA NVLink hardware
-- Compiled with `USE_INTRA_NVLINK=ON`
+- Compiled with `USE_INTRA_NODE_NVLINK=ON`
 
 ### HIP Transport (hip)
 
