@@ -659,7 +659,7 @@ class MasterService {
 
     struct OffloadingTask {
         ReplicaID source_id;
-        std::chrono::steady_clock::time_point start_time;
+        std::chrono::system_clock::time_point start_time;
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards

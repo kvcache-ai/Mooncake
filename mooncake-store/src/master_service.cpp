@@ -729,7 +729,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                     replica.inc_refcnt();
                     shard->offloading_tasks.emplace(
                         key, OffloadingTask{replica.id(),
-                                            std::chrono::steady_clock::now()});
+                                            std::chrono::system_clock::now()});
                 }
             });
     }
