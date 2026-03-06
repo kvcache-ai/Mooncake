@@ -326,24 +326,41 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
         return -1;
     }
 
-    registered_base_addrs_.insert((uint64_t)base_ptr);
-
     (void)remote_accessible;
     BufferDesc desc;
     desc.addr = (uint64_t)base_ptr;
     desc.length = alloc_size;
     desc.name = location;
     desc.shm_name = serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-    return metadata_->addLocalMemoryBuffer(desc, true);
+    int rc = metadata_->addLocalMemoryBuffer(desc, true);
+    if (rc == 0) {
+        registered_base_addrs_.insert((uint64_t)base_ptr);
+    }
+    return rc;
 }
 
 int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
                                                     bool update_metadata) {
+    CUdeviceptr base_ptr = 0;
+    size_t alloc_size = 0;
+    CUresult cu_err =
+        cuMemGetAddressRange(&base_ptr, &alloc_size, (CUdeviceptr)addr);
+
+    void *key_ptr = addr;
+    if (cu_err == CUDA_SUCCESS) {
+        key_ptr = (void *)base_ptr;
+    } else {
+        LOG(WARNING)
+            << "IntraNodeNvlinkTransport: cuMemGetAddressRange failed for "
+            << "addr " << addr << " during unregister (error " << cu_err
+            << "). Memory may already be freed, using provided address.";
+    }
+
     {
         std::lock_guard<std::mutex> lock(register_mutex_);
-        registered_base_addrs_.erase((uint64_t)addr);
+        registered_base_addrs_.erase((uint64_t)key_ptr);
     }
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
 }
 
 int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
