@@ -446,6 +446,31 @@ class Client {
 
     bool is_ping_healthy() const { return last_ping_success_.load(); }
 
+    /**
+     * @brief Get current frequency admission count for a key.
+     * @return estimated count, or 0 if admission sketch is disabled.
+     */
+    uint8_t GetAdmissionCount(const std::string& key) const {
+        if (admission_sketch_ == nullptr) {
+            return 0;
+        }
+        return admission_sketch_->count(key);
+    }
+
+    /**
+     * @brief Decide whether a key should be admitted to local hot cache.
+     * Updates admission sketch only when cache was not used.
+     */
+    bool ShouldAdmitToHotCache(const std::string& key, bool cache_used) {
+        if (!(hot_cache_ && !cache_used)) {
+            return false;
+        }
+        if (admission_sketch_ == nullptr) {
+            return true;
+        }
+        return admission_sketch_->increment(key) >= kAdmissionThreshold;
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method

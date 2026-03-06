@@ -14,9 +14,9 @@ namespace mooncake {
 class CountMinSketch {
    public:
     explicit CountMinSketch(size_t width = 4096, size_t depth = 4)
-        : width_(width),
-          depth_(depth),
-          table_(depth, std::vector<uint8_t>(width, 0)),
+        : width_(width > 0 ? width : kDefaultWidth),
+          depth_(depth > 0 ? depth : kDefaultDepth),
+          table_(depth_, std::vector<uint8_t>(width_, 0)),
           total_increments_(0) {}
 
     // Increment the count for |key| and return the estimated min-count.
@@ -56,6 +56,9 @@ class CountMinSketch {
     }
 
    private:
+    static constexpr size_t kDefaultWidth = 4096;
+    static constexpr size_t kDefaultDepth = 4;
+
     size_t hash(const std::string &key, size_t seed) const {
         // Combine std::hash with a per-row seed to get independent hashes.
         size_t h = std::hash<std::string>{}(key);
