@@ -20,7 +20,6 @@ jobs:
     env:
       BUILD_WITH_EP: "1"
       CU13_BUILD: "1"
-      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
 
@@ -81,6 +80,7 @@ jobs:
           -DWITH_STORE=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_EP=ON \
+          -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0" \
           -DWITH_METRICS=ON \
           -DBUILD_UNIT_TESTS=OFF \
           -DBUILD_EXAMPLES=ON \

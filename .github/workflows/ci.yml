@@ -377,7 +377,6 @@ jobs:
     env:
       CI: "true"
       BUILD_WITH_EP: "1"
-      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
 
@@ -478,7 +477,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON
+        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
       shell: bash
 
     - name: Build project
