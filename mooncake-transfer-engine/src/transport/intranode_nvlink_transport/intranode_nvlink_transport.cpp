@@ -15,6 +15,7 @@
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 
 #include <bits/stdint-uintn.h>
+#include <cuda.h>
 #include "cuda_alike.h"
 #include <glog/logging.h>
 
@@ -299,17 +300,38 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
         return -1;
     }
 
+    // Resolve the true cudaMalloc base address. Framework caching allocators
+    // (PyTorch, etc.) sub-allocate tensors within larger cudaMalloc segments.
+    // cudaIpcGetMemHandle always returns a handle for the entire segment, so
+    // we must register at segment granularity for correct IPC relocation.
+    CUdeviceptr base_ptr = 0;
+    size_t alloc_size = 0;
+    CUresult cu_err =
+        cuMemGetAddressRange(&base_ptr, &alloc_size, (CUdeviceptr)addr);
+    if (cu_err != CUDA_SUCCESS) {
+        LOG(ERROR) << "IntraNodeNvlinkTransport: cuMemGetAddressRange failed "
+                   << "for addr " << addr << " (error " << cu_err << ")";
+        return -1;
+    }
+
+    // Skip if this cudaMalloc block is already registered
+    if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+        return 0;
+    }
+
     cudaIpcMemHandle_t handle;
-    err = cudaIpcGetMemHandle(&handle, addr);
+    err = cudaIpcGetMemHandle(&handle, (void *)base_ptr);
     if (err != cudaSuccess) {
         LOG(ERROR) << "IntraNodeNvlinkTransport: cudaIpcGetMemHandle failed";
         return -1;
     }
 
+    registered_base_addrs_.insert((uint64_t)base_ptr);
+
     (void)remote_accessible;
     BufferDesc desc;
-    desc.addr = (uint64_t)addr;
-    desc.length = length;
+    desc.addr = (uint64_t)base_ptr;
+    desc.length = alloc_size;
     desc.name = location;
     desc.shm_name = serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
     return metadata_->addLocalMemoryBuffer(desc, true);
@@ -317,6 +339,10 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
 
 int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
                                                     bool update_metadata) {
+    {
+        std::lock_guard<std::mutex> lock(register_mutex_);
+        registered_base_addrs_.erase((uint64_t)addr);
+    }
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
