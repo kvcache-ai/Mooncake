@@ -132,19 +132,10 @@ void MooncakeWorker::startWorker() {
                                         << " marking peer " << j
                                         << " as broken during transferring op "
                                         << (int)task.opType;
-                                    group->store->deleteKey(
-                                        "buffer_" +
-                                        std::to_string(group->backendIndex) +
-                                        "_" + std::to_string(j));
-                                    group->store->deleteKey(
-                                        "server_name_" +
-                                        std::to_string(group->backendIndex) +
-                                        "_" + std::to_string(j));
-                                    group->store->deleteKey(
-                                        "extension_task_count_" +
-                                        std::to_string(group->backendIndex) +
-                                        "_" + std::to_string(j));
                                     group->activeRanks[j] = false;
+
+                                    // Set peerConnected to notify the
+                                    // connection poller to reconnect it.
                                     group->peerConnected[j] = false;
                                 } else {
                                     batch_done = false;

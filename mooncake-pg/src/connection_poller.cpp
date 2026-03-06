@@ -59,7 +59,7 @@ void ConnectionContext::waitUntilAllConnected() {
 }
 
 void ConnectionContext::shutdown() {
-    // Wake up backend if they block at waitUntilAllConnected.
+    // Notify backends that may be blocked in waitUntilAllConnected.
     {
         std::lock_guard<std::mutex> backend_lock(backend_wakeup_mutex_);
         isShutdown_.store(true, std::memory_order_release);
@@ -74,7 +74,7 @@ bool ConnectionContext::poll() {
 
     bool did_work = false;
 
-    // Poll all peers in parallel
+    // Poll all peers sequentially.
     for (int pollingRank = 0; pollingRank < size_; ++pollingRank) {
         did_work |= pollPeer(pollingRank);
     }
@@ -103,11 +103,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
             peerState.last_check_store = now;
 
-            std::string serverNameKey = "server_name_" +
-                                        std::to_string(backendIndex_) + "_" +
-                                        std::to_string(pollingRank);
-            std::string bufferKey = "buffer_" + std::to_string(backendIndex_) +
-                                    "_" + std::to_string(pollingRank);
+            auto serverNameKey =
+                getServerNameStoreKey(backendIndex_, pollingRank);
+            auto bufferKey = getBufferStoreKey(backendIndex_, pollingRank);
 
             std::string peerServerName;
             std::vector<uint8_t> buffer_data;
@@ -118,6 +116,14 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 }
                 peerServerName = store_->get_to_str(serverNameKey);
                 buffer_data = store_->get(bufferKey);
+
+                if (buffer_data.size() < sizeof(SegmentInfo)) {
+                    LOG(WARNING)
+                        << "Rank " << rank_ << " got invalid buffer data from "
+                        << pollingRank << ".";
+                    peerState.increaseCheckStoreBackoff();
+                    return false;
+                }
             } catch (const std::exception& e) {
                 peerState.increaseCheckStoreBackoff();
                 return false;
@@ -127,15 +133,11 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             meta_->segmentIDs[pollingRank] = segment_id;
             peerState.segmentId = segment_id;
 
-            if (buffer_data.size() < sizeof(SegmentInfo)) {
-                peerState.increaseCheckStoreBackoff();
-                return false;
-            }
             memcpy(&meta_->segmentInfos[pollingRank], buffer_data.data(),
                    sizeof(SegmentInfo));
 
             if (pollingRank <= rank_) {
-                // Send a pre-flight request to establish connections
+                // Send a warmup request to establish connections
                 auto batchID = engine_->allocateBatchID(1);
                 engine_->submitTransfer(
                     batchID,
@@ -151,6 +153,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.warmupBatchId = batchID;
                 peerState.state = PeerConnectionState::WAITING_WARMUP_TRANSFER;
             } else {
+                // For pollingRank > rank_, wait for the peer's warmup write to
+                // arrive.
                 peerState.state = PeerConnectionState::WAITING_PEER_WARMUP;
             }
             peerState.resetCheckStoreBackoff();
@@ -209,24 +213,67 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         }
 
         case PeerConnectionState::CONNECTED: {
-            if (meta_->peerConnected[pollingRank] &&
-                global_peerConnected_[global_rank])
-                break;
-            // If meta_->peerConnected is false but PeerConnectionState is
-            // CONNECTED, the peer might be marked as broken for some reason
-            // (e.g. timeout in backend worker thread).
-            // In that case, back to WAITING_STORE to reconnect it.
+            // ATTENTION: Ensure consistency of local (meta_->peerConnected)
+            //            and global (global_peerConnected_).
+            //
+            // Assuming there are two backends, and Backend A detects a failure.
+            // (by setting meta_->peerConnected[pollingRank] to false)
+            //
+            // For Backend A:
+            //   Observes `Local=false, Global=true` and updates `Global=false`.
+            //
+            // For Backend B:
+            //   Observes `Local=true, Global=false` and updates `Local=false`.
+            //
+            // Because ConnectionPoller runs as a single thread and processes
+            // contexts sequentially, no race conditions occur. Besides, the
+            // failure signal is guaranteed to propagate to all other contexts
+            // (e.g., Backend B) before the initiator (e.g., Backend A) is
+            // processed again.
+            //
+            // Thus, we ensure that if one backend disconnects, all backends
+            // disconnect.
 
-            // we also need to broadcast the info to the process level
+            if (meta_->peerConnected[pollingRank] &&
+                global_peerConnected_[global_rank]) {
+                // happy path: both are connected.
+                break;
+            }
+
+            // If we reach here, at least one peer connected (local or global)
+            // reports a failure. We must set both to false here.
             global_peerConnected_[global_rank] = false;
             meta_->peerConnected[pollingRank] = false;
+
+            // Reset store
+            store_->deleteKey(
+                getServerNameStoreKey(backendIndex_, pollingRank));
+            store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
+            store_->deleteKey(
+                getExtensionTaskCountStoreKey(backendIndex_, pollingRank));
+
+            // Reset warmup region
             *reinterpret_cast<volatile int32_t*>(
                 &warmup_recv_region_[pollingRank]) = 0;
-            totalConnectedPeers_.fetch_sub(1);
+
+            // Back to WAITING_STORE to reconnect it.
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());
             peerState.segmentId = std::nullopt;
+            totalConnectedPeers_.fetch_sub(1);
             state_changed = true;
+
+            // Log
+            if (!meta_->peerConnected[pollingRank]) {
+                LOG(WARNING) << "Backend " << backendIndex_
+                             << " detects broken peer " << pollingRank
+                             << ". (meta_->peerConnected[pollingRank]=false)";
+            } else {
+                TORCH_CHECK(!global_peerConnected_[global_rank]);
+                LOG(WARNING) << "Backend " << backendIndex_
+                             << " detects broken peer " << pollingRank
+                             << ". (global_peerConnected_[global_rank]=false)";
+            }
             break;
         }
 

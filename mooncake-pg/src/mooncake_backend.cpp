@@ -197,9 +197,9 @@ MooncakeBackend::MooncakeBackend(
     store->set(buffer_key, rank_info_bytes);
 
     // Sync metadata
-    store->set("server_name_" + std::to_string(backendIndex_) + "_" +
-                   std::to_string(rank_),
-               localServerName);
+    auto serverNameKey =
+        ConnectionContext::getServerNameStoreKey(backendIndex_, rank_);
+    store->set(serverNameKey, localServerName);
 
     // Start polling connection
     ConnectionPoller::GetInstance().registerContext(connection_ctx_);
@@ -244,8 +244,8 @@ MooncakeBackend::MooncakeBackend(
     connection_ctx_->waitUntilAllConnected();
 
     if (options && options->isExtension_) {
-        auto key = "extension_task_count_" + std::to_string(backendIndex_) +
-                   "_" + std::to_string(rank_);
+        auto key = ConnectionContext::getExtensionTaskCountStoreKey(
+            backendIndex_, rank_);
         while (true) {
             if (store->check({key})) {
                 auto data = store->get(key);

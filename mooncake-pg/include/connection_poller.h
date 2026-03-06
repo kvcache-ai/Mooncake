@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <ratio>
 #include <thread>
 #include <vector>
 
@@ -93,6 +92,20 @@ class ConnectionContext {
 
     void waitUntilAllConnected();
     void shutdown();
+
+    static std::string getServerNameStoreKey(int backendIndex, int rank) {
+        return "server_name_" + std::to_string(backendIndex) + "_" +
+               std::to_string(rank);
+    }
+    static std::string getBufferStoreKey(int backendIndex, int rank) {
+        return "buffer_" + std::to_string(backendIndex) + "_" +
+               std::to_string(rank);
+    }
+    static std::string getExtensionTaskCountStoreKey(int backendIndex,
+                                                     int rank) {
+        return "extension_task_count_" + std::to_string(backendIndex) + "_" +
+               std::to_string(rank);
+    }
 
    private:
     // For ConnectionManager
