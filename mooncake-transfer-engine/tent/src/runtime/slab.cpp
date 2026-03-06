@@ -33,19 +33,20 @@ void *SlabBase::allocate() {
         return nullptr;
     }
 
-    // Try to get from thread-local cache first
+    // Try thread-local cache first (lock-free fast path)
     auto &tl_slice = tl_slice_set[slab_index_];
     void *object = nullptr;
+    if (tl_slice.dequeue(object)) return object;
 
-    // Need to hold lock for all operations to prevent race with destructor
+    // Slow path: cache is empty, need to acquire lock for refill
     std::lock_guard<std::mutex> global_lock(mutex_);
 
-    // Check again after acquiring lock
+    // Check again after acquiring lock (destructor might have run)
     if (destroyed_.load(std::memory_order_relaxed)) {
         return nullptr;
     }
 
-    // Try thread-local cache first
+    // Try thread-local cache again (another thread might have refilled)
     if (tl_slice.dequeue(object)) return object;
 
     // Refill from global free list
@@ -75,7 +76,15 @@ void SlabBase::deallocate(void *object) {
         return;
     }
 
-    // Need to hold lock for all operations to prevent race with destructor
+    auto &tl_slice = tl_slice_set[slab_index_];
+
+    // Lock-free fast path: try to return to thread-local cache if not full
+    if (!tl_slice.full()) {
+        tl_slice.enqueue(object);
+        return;
+    }
+
+    // Slow path: cache is full, need to flush to global list
     std::lock_guard<std::mutex> global_lock(mutex_);
 
     // Check again after acquiring lock
@@ -83,14 +92,11 @@ void SlabBase::deallocate(void *object) {
         return;
     }
 
-    auto &tl_slice = tl_slice_set[slab_index_];
-    if (tl_slice.full()) {
-        // Flush thread-local cache to global free list
-        while (!tl_slice.empty()) {
-            void *obj = nullptr;
-            tl_slice.dequeue(obj);
-            free_list_.push_back(obj);
-        }
+    // Flush thread-local cache to global free list
+    while (!tl_slice.empty()) {
+        void *obj = nullptr;
+        tl_slice.dequeue(obj);
+        free_list_.push_back(obj);
     }
     tl_slice.enqueue(object);
 }

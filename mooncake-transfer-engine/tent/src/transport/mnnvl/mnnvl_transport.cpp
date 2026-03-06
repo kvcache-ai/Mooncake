@@ -491,12 +491,23 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         tl_epoch = current_epoch;
     }
 
-    for (auto &entry : tl_relocate_map[target_id]) {
-        if (entry.first <= dest_addr &&
-            dest_addr + length <= entry.first + entry.second.length) {
-            auto mnnvl_addr = entry.second.mnnvl_addr;
-            dest_addr = dest_addr - entry.first + ((uint64_t)mnnvl_addr);
-            return Status::OK();
+    // Use cached addresses with read lock protection to prevent UAF
+    // if uninstall() runs concurrently
+    {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        // Verify transport is still installed before using cached addresses
+        if (!installed_) {
+            return Status::InternalError(
+                "MNNVL transport is being uninstalled, operation not allowed");
+        }
+
+        for (auto &entry : tl_relocate_map[target_id]) {
+            if (entry.first <= dest_addr &&
+                dest_addr + length <= entry.first + entry.second.length) {
+                auto mnnvl_addr = entry.second.mnnvl_addr;
+                dest_addr = dest_addr - entry.first + ((uint64_t)mnnvl_addr);
+                return Status::OK();
+            }
         }
     }
 
