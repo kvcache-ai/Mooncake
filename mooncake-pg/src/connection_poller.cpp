@@ -76,9 +76,7 @@ bool ConnectionContext::poll() {
 
     // Poll all peers in parallel
     for (int pollingRank = 0; pollingRank < size_; ++pollingRank) {
-        if (!meta_->peerConnected[pollingRank]) {
-            did_work |= pollPeer(pollingRank);
-        }
+        did_work |= pollPeer(pollingRank);
     }
 
     return did_work;
@@ -197,6 +195,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             if (*reinterpret_cast<volatile int32_t*>(
                     &warmup_recv_region_[pollingRank])) {
                 meta_->peerConnected[pollingRank] = true;
+                global_peerConnected_[global_rank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
@@ -220,6 +219,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
             // we also need to broadcast the info to the process level
             global_peerConnected_[global_rank] = false;
+            meta_->peerConnected[pollingRank] = false;
+            *reinterpret_cast<volatile int32_t*>(
+                &warmup_recv_region_[pollingRank]) = 0;
             totalConnectedPeers_.fetch_sub(1);
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());
