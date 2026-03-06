@@ -116,6 +116,7 @@ void P2PProxy::AllocateResources() {
         send_peer_lanes_[i].pending_send_ops_.clear();
         send_peer_lanes_[i].active_send_op_.reset();
         send_peer_lanes_[i].copy_ready_events_.fill(nullptr);
+        recv_peer_lanes_[i].local_tail_ = 0;
         recv_peer_lanes_[i].pending_recv_ops_.clear();
         recv_peer_lanes_[i].active_recv_op_.reset();
         recv_peer_lanes_[i].copy_ready_events_.fill(nullptr);
@@ -158,6 +159,46 @@ void P2PProxy::AllocateResources() {
                                       kMaxNumRanks * sizeof(P2PControlSlot),
                                       kWildcardLocation);
     TORCH_CHECK(rc == 0, "Failed to register P2P ctrl recv region");
+}
+
+void P2PProxy::ResetPeerState(int peer_rank) {
+    TORCH_CHECK(peer_rank >= 0 && peer_rank < size_,
+                "ResetPeerState: peer_rank out of range: ", peer_rank,
+                " size: ", size_);
+    reset_send_req_[peer_rank].store(true, std::memory_order_release);
+    reset_recv_req_[peer_rank].store(true, std::memory_order_release);
+    if (device_worker_) {
+        device_worker_->WakeUpSend();
+        device_worker_->WakeUpRecv();
+    }
+}
+
+void P2PProxy::PerformSendReset(int peer_rank) {
+    auto& lane = send_peer_lanes_[peer_rank];
+    lane.pending_send_ops_.clear();
+    lane.active_send_op_.reset();
+    lane.local_head_ = 0;
+
+    if (resources_.ctrl_send_region_) {
+        resources_.ctrl_send_region_[peer_rank].head.store(
+            0, std::memory_order_relaxed);
+        resources_.ctrl_send_region_[peer_rank].tail.store(
+            0, std::memory_order_relaxed);
+    }
+}
+
+void P2PProxy::PerformRecvReset(int peer_rank) {
+    auto& lane = recv_peer_lanes_[peer_rank];
+    lane.pending_recv_ops_.clear();
+    lane.active_recv_op_.reset();
+    lane.local_tail_ = 0;
+
+    if (resources_.ctrl_recv_region_) {
+        resources_.ctrl_recv_region_[peer_rank].head.store(
+            0, std::memory_order_relaxed);
+        resources_.ctrl_recv_region_[peer_rank].tail.store(
+            0, std::memory_order_relaxed);
+    }
 }
 
 void P2PProxy::ReleaseResources() {
@@ -243,6 +284,8 @@ void P2PProxy::EnqueueSend(SendOp op) {
         send_queue_.emplace(std::move(op));
     }
 
+    LOG(INFO) << "P2PSendWork: " << rank_ << " -> " << op.peer_rank_ << " enqueued.";
+
     active_send_tasks_.fetch_add(1, std::memory_order_release);
     if (device_worker_) device_worker_->WakeUpSend();
 }
@@ -252,6 +295,8 @@ void P2PProxy::EnqueueRecv(RecvOp op) {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
         recv_queue_.push(std::move(op));
     }
+
+    LOG(INFO) << "P2PRecvWork: " << rank_ << " <- " << op.peer_rank_ << " enqueued.";
 
     active_recv_tasks_.fetch_add(1, std::memory_order_release);
     if (device_worker_) device_worker_->WakeUpRecv();
@@ -682,6 +727,15 @@ bool P2PProxy::IsRecvDataPathCompleted(const RecvOpContext& op_ctx) const {
 bool P2PProxy::StepSend() {
     const uint32_t capacity = static_cast<uint32_t>(kP2PNumSlotsPerRank);
     bool did_work = false;
+
+    for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
+        if (reset_send_req_[peer_rank].exchange(false,
+                                                std::memory_order_acquire)) {
+            PerformSendReset(peer_rank);
+            did_work = true;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
         while (!send_queue_.empty()) {
@@ -704,6 +758,9 @@ bool P2PProxy::StepSend() {
         if (op_ctx.total_bytes_ == 0) {
             op_ctx.completed_->store(true, std::memory_order_release);
             active_send_tasks_.fetch_sub(1, std::memory_order_release);
+
+            LOG(INFO) << "P2PSendWork: " << rank_ << " -> " << op_ctx.peer_rank_ << " done.";
+
             did_work = true;
             continue;
         }
@@ -735,6 +792,9 @@ bool P2PProxy::StepSend() {
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_send_op_.reset();
             active_send_tasks_.fetch_sub(1, std::memory_order_release);
+
+            LOG(INFO) << "P2PSendWork: " << rank_ << " -> " << op_ctx.peer_rank_ << " done.";
+
             did_work = true;
         }
     }
@@ -745,6 +805,15 @@ bool P2PProxy::StepSend() {
 bool P2PProxy::StepRecv() {
     const uint32_t capacity = static_cast<uint32_t>(kP2PNumSlotsPerRank);
     bool did_work = false;
+
+    for (int peer_rank = 0; peer_rank < size_; ++peer_rank) {
+        if (reset_recv_req_[peer_rank].exchange(false,
+                                                std::memory_order_acquire)) {
+            PerformRecvReset(peer_rank);
+            did_work = true;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
         while (!recv_queue_.empty()) {
@@ -805,6 +874,9 @@ bool P2PProxy::StepRecv() {
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_recv_op_.reset();
             active_recv_tasks_.fetch_sub(1, std::memory_order_release);
+
+            LOG(INFO) << "P2PRecvWork: " << rank_ << " <- " << op_ctx.peer_rank_ << " done.";
+
             did_work = true;
         }
     }
@@ -817,10 +889,16 @@ void P2PProxy::SetDeviceWorker(P2PDeviceWorker* worker) {
 }
 
 bool P2PProxy::HasActiveSendWork() const {
+    for (int i = 0; i < size_; ++i) {
+        if (reset_send_req_[i].load(std::memory_order_acquire)) return true;
+    }
     return active_send_tasks_.load(std::memory_order_acquire) > 0;
 }
 
 bool P2PProxy::HasActiveRecvWork() const {
+    for (int i = 0; i < size_; ++i) {
+        if (reset_recv_req_[i].load(std::memory_order_acquire)) return true;
+    }
     return active_recv_tasks_.load(std::memory_order_acquire) > 0;
 }
 

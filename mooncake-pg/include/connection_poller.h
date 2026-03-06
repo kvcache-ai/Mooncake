@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <mooncake_worker.cuh>
+#include <p2p_proxy.h>
 #include <torch/torch.h>
 #include <transfer_engine.h>
 
@@ -25,7 +26,7 @@ enum class PeerConnectionState {
 
 struct PeerConnection {
     static constexpr size_t CHECK_STORE_INITIAL_BACKOFF_MS = 8;
-    static constexpr size_t CHECK_STORE_MAX_BACKOFF_MS = 4096;
+    static constexpr size_t CHECK_STORE_MAX_BACKOFF_MS = 1024;
 
     PeerConnectionState state{PeerConnectionState::WAITING_STORE};
     std::optional<BatchID> warmupBatchId{std::nullopt};
@@ -59,6 +60,7 @@ class ConnectionContext {
     c10::intrusive_ptr<::c10d::Store> store_;
 
     std::shared_ptr<TransferGroupMeta> meta_;
+    std::shared_ptr<P2PProxy> p2p_proxy_;
     TransferEngine* engine_;
 
     std::atomic<int> totalConnectedPeers_{0};
@@ -79,6 +81,7 @@ class ConnectionContext {
                       uint64_t* local2global_rank_map,
                       c10::intrusive_ptr<::c10d::Store> store,
                       std::shared_ptr<TransferGroupMeta> meta,
+                      std::shared_ptr<P2PProxy> p2p_proxy,
                       TransferEngine* engine);
     ~ConnectionContext();
 

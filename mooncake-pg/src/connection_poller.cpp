@@ -17,6 +17,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      uint64_t* local2global_rank_map,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
+                                     std::shared_ptr<P2PProxy> p2p_proxy,
                                      TransferEngine* engine)
     : backendIndex_(backendIndex),
       rank_(rank),
@@ -24,6 +25,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
       local2global_rank_map_(local2global_rank_map),
       store_(std::move(store)),
       meta_(std::move(meta)),
+      p2p_proxy_(std::move(p2p_proxy)),
       engine_(engine) {
     warmup_send_region_ = new int32_t[kMaxNumRanks];
     warmup_send_region_[0] = 1;
@@ -83,7 +85,7 @@ bool ConnectionContext::poll() {
 }
 
 bool ConnectionContext::pollPeer(int pollingRank) {
-    auto global_rank = local2global_rank_map_[pollingRank];
+    auto globalPollingRank = local2global_rank_map_[pollingRank];
     auto& global_peerConnected_ =
         ConnectionPoller::GetInstance().global_peerConnected_;
     auto& peerState = peerStates_[pollingRank];
@@ -170,7 +172,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 engine_->freeBatchID(peerState.warmupBatchId.value());
                 peerState.warmupBatchId = std::nullopt;
                 meta_->peerConnected[pollingRank] = true;
-                global_peerConnected_[global_rank] = true;
+                global_peerConnected_[globalPollingRank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
 
                 {
@@ -179,7 +181,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                                                    std::memory_order_release);
                     if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
                 }
-
                 state_changed = true;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 LOG(WARNING) << "Warmup request " << rank_ << " -> "
@@ -199,7 +200,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             if (*reinterpret_cast<volatile int32_t*>(
                     &warmup_recv_region_[pollingRank])) {
                 meta_->peerConnected[pollingRank] = true;
-                global_peerConnected_[global_rank] = true;
+                global_peerConnected_[globalPollingRank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
@@ -235,14 +236,31 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // disconnect.
 
             if (meta_->peerConnected[pollingRank] &&
-                global_peerConnected_[global_rank]) {
+                global_peerConnected_[globalPollingRank]) {
                 // happy path: both are connected.
                 break;
             }
 
+            // Log before we change them
+            auto globalRank = local2global_rank_map_[rank_];
+            if (!meta_->peerConnected[pollingRank]) {
+                LOG(WARNING)
+                    << "Global rank " << globalRank << " Backend "
+                    << backendIndex_ << " detects broken peer (global rank "
+                    << globalPollingRank << ", local rank " << pollingRank
+                    << "). (meta_->peerConnected[pollingRank]=false)";
+            } else {
+                TORCH_CHECK(!global_peerConnected_[globalPollingRank]);
+                LOG(WARNING)
+                    << "Global rank " << globalRank << " Backend "
+                    << backendIndex_ << " detects broken peer (global rank "
+                    << globalPollingRank << ", local rank " << pollingRank
+                    << "). (global_peerConnected_[global_rank]=false)";
+            }
+
             // If we reach here, at least one peer connected (local or global)
             // reports a failure. We must set both to false here.
-            global_peerConnected_[global_rank] = false;
+            global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
 
             // Reset store
@@ -256,24 +274,15 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             *reinterpret_cast<volatile int32_t*>(
                 &warmup_recv_region_[pollingRank]) = 0;
 
+            // Reset P2PProxy states
+            p2p_proxy_->ResetPeerState(pollingRank);
+
             // Back to WAITING_STORE to reconnect it.
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());
             peerState.segmentId = std::nullopt;
             totalConnectedPeers_.fetch_sub(1);
             state_changed = true;
-
-            // Log
-            if (!meta_->peerConnected[pollingRank]) {
-                LOG(WARNING) << "Backend " << backendIndex_
-                             << " detects broken peer " << pollingRank
-                             << ". (meta_->peerConnected[pollingRank]=false)";
-            } else {
-                TORCH_CHECK(!global_peerConnected_[global_rank]);
-                LOG(WARNING) << "Backend " << backendIndex_
-                             << " detects broken peer " << pollingRank
-                             << ". (global_peerConnected_[global_rank]=false)";
-            }
             break;
         }
 

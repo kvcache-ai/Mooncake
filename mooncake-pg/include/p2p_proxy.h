@@ -99,6 +99,7 @@ class P2PProxy {
     void EnqueueSend(SendOp op);
     void EnqueueRecv(RecvOp op);
 
+    void ResetPeerState(int peer_rank);
    private:
     enum class TransferState {
         kDataCopy,
@@ -198,13 +199,15 @@ class P2PProxy {
     bool StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity);
     bool IsSendDataPathCompleted(const SendOpContext& op_ctx) const;
     bool IsSendOpCompleted(const SendOpContext& op_ctx) const;
+    void PerformSendReset(int peer_rank);
 
     bool TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity);
     bool StepRecvTransferTask(RecvTransferTask& task);
     bool StepRecvDataCopy(RecvTransferTask& task);
     bool StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity);
     bool IsRecvDataPathCompleted(const RecvOpContext& op_ctx) const;
-
+    void PerformRecvReset(int peer_rank);
+    
     uint64_t GetLocalSendSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetLocalRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetRemoteRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
@@ -234,6 +237,9 @@ class P2PProxy {
 
     std::queue<RecvOp> recv_queue_;
     std::mutex recv_queue_mutex_;
+
+    std::array<std::atomic<bool>, kMaxNumRanks> reset_send_req_;
+    std::array<std::atomic<bool>, kMaxNumRanks> reset_recv_req_;
 
     std::atomic<int> active_send_tasks_{0};
     std::atomic<int> active_recv_tasks_{0};
