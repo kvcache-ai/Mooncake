@@ -18,6 +18,8 @@ DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DECLARE_bool(enable_http_server);
+DECLARE_int32(http_port);
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,

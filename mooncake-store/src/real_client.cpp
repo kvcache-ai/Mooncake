@@ -25,6 +25,12 @@
 #include "default_config.h"
 #include "shm_helper.h"
 
+DEFINE_bool(enable_http_server, false,
+            "Enable embedded HTTP server for health check and metrics.");
+DEFINE_int32(http_port, 9300,
+             "Port for client HTTP server "
+             "(only effective when --enable_http_server=true).");
+
 namespace mooncake {
 
 PyClient::~PyClient() {}
@@ -152,6 +158,7 @@ RealClient::RealClient() {
 
 RealClient::~RealClient() {
     // Ensure resources are cleaned even if not explicitly closed
+    stop_http_server();
     tearDownAll_internal();
 }
 
@@ -367,6 +374,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
+    if (FLAGS_enable_http_server) {
+        if (start_http_server() != 0) {
+            LOG(ERROR) << "Failed to start HTTP server on port "
+                       << FLAGS_http_port;
+        }
+    }
     return {};
 }
 
@@ -505,6 +518,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_http_server();
 
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
@@ -554,6 +568,64 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 }
 
 int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
+
+int RealClient::health_check() {
+    if (closed_.load()) return HC_NOT_INITIALIZED;
+    if (!client_) return HC_NOT_INITIALIZED;
+    if (!client_->is_ping_healthy()) return HC_MASTER_UNREACHABLE;
+    return HC_HEALTHY;
+}
+
+int RealClient::start_http_server() {
+    using namespace coro_http;
+
+    http_server_ =
+        std::make_unique<coro_http_server>(/*thread_num=*/1, FLAGS_http_port);
+
+    http_server_->set_http_handler<GET>(
+        "/health", [this](coro_http_request &req, coro_http_response &resp) {
+            int code = health_check();
+            std::string status_str;
+            switch (code) {
+                case HC_HEALTHY:
+                    status_str = "healthy";
+                    break;
+                case HC_NOT_INITIALIZED:
+                    status_str = "not_initialized";
+                    break;
+                case HC_MASTER_UNREACHABLE:
+                    status_str = "master_unreachable";
+                    break;
+                default:
+                    status_str = "unknown";
+                    break;
+            }
+            std::string body = "{\"status\":\"" + status_str +
+                               "\",\"code\":" + std::to_string(code) + "}";
+            resp.add_header("Content-Type", "application/json");
+            auto http_status = (code == HC_HEALTHY)
+                                   ? status_type::ok
+                                   : status_type::service_unavailable;
+            resp.set_status_and_content(http_status, std::move(body));
+        });
+
+    auto ec = http_server_->async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP server on port " << FLAGS_http_port;
+        http_server_.reset();
+        return -1;
+    }
+    LOG(INFO) << "Client HTTP server started on port " << FLAGS_http_port;
+    return 0;
+}
+
+void RealClient::stop_http_server() {
+    if (http_server_) {
+        http_server_->stop();
+        http_server_.reset();
+        LOG(INFO) << "Client HTTP server stopped";
+    }
+}
 
 tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
@@ -2232,7 +2304,14 @@ RealClient::batch_get_into_multi_buffers_internal(
 
 tl::expected<PingResponse, ErrorCode> RealClient::ping(const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
-    ClientStatus client_status = ClientStatus::OK;
+
+    if (!client_) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=client_not_ready";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    ClientStatus client_status =
+        client_->is_ping_healthy() ? ClientStatus::OK : ClientStatus::UNDEFINED;
 
     PodUUID pod_client_id = {client_id.first, client_id.second};
     if (!dummy_client_ping_queue_.push(pod_client_id)) {

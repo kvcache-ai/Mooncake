@@ -2332,6 +2332,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
+            last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
@@ -2349,6 +2350,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         ping_fail_count++;
+        last_ping_success_.store(false);
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
             std::this_thread::sleep_for(

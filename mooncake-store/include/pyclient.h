@@ -28,6 +28,14 @@ enum ShmSegmentType : uint32_t {
     SHM_SEG_HOT_CACHE = 0,  // local hot cache backing memory
 };
 
+// Return codes for health_check()
+enum HealthCheckStatus : int {
+    HC_HEALTHY = 0,          // Fully connected, all links up
+    HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
+    HC_MASTER_UNREACHABLE =
+        2  // Master (or RealClient for DummyClient) unreachable
+};
+
 // Payload for IPC_SHM_REGISTER (followed by fd via SCM_RIGHTS)
 struct ShmRegisterRequest {
     uint64_t client_id_first;
@@ -207,6 +215,8 @@ class PyClient {
         const std::string &key) = 0;
 
     virtual int tearDownAll() = 0;
+
+    virtual int health_check() = 0;
 
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;

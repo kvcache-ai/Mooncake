@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
@@ -119,6 +120,8 @@ class DummyClient : public PyClient {
 
     int tearDownAll();
 
+    int health_check() override;
+
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
 
@@ -211,8 +214,9 @@ class DummyClient : public PyClient {
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
-    volatile bool connected_ = false;
+    std::atomic<bool> connected_{false};
 };
 
 }  // namespace mooncake

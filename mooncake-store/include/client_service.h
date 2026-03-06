@@ -443,6 +443,8 @@ class Client {
         return 0;
     }
 
+    bool is_ping_healthy() const { return last_ping_success_.load(); }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -582,6 +584,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_success_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
