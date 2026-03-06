@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Mooncake KVCache Storage Benchmark Tool
-
-Based on industry-standard architectures:
-- Mooncake OffsetAllocator backend architecture
-- vLLM PagedAttention paged block mechanism
-- Single file + Offset managed high-performance storage
-
-Author: Mooncake Team
-License: MIT
-Documentation: tools/STORAGE_BENCHMARK_README.md
 """
 
 import argparse
@@ -28,6 +21,35 @@ from dataclasses import dataclass
 BLOCK_SIZE_TOKENS = 512  # Number of tokens per block
 DEFAULT_BYTES_PER_TOKEN = 2048  # 7B model FP16 (2KB per token)
 BLOCK_SIZE_BYTES = BLOCK_SIZE_TOKENS * DEFAULT_BYTES_PER_TOKEN  # 1MB per block
+MIN_LATENCY_MS = 0.001  # Minimum latency in milliseconds (1 microsecond)
+
+# Model KVCache sizes (bytes per token, based on LMCache calculator)
+# Source: https://lmcache.ai/kv_cache_calculator.html
+MODEL_BYTES_PER_TOKEN = {
+    # Small models (7B-13B)
+    "llama-2-7b": 512,
+    "llama-2-13b": 800,
+    "llama-3-8b": 128,
+    "mistral-7b": 128,
+    "qwen-14b": 40,
+    "gemma-7b": 224,
+
+    # Large models (70B-405B)
+    "llama-2-70b": 320,
+    "llama-3-70b": 320,
+    "llama-3.1-405b": 516018,  # ~504 KB/token
+    "mixtral-8x7b": 128,
+    "mixtral-8x22b": 224,
+    "qwen-72b": 320,
+    "qwen-110b": 320,
+
+    # Extra large models
+    "deepseek-v3": 1749384,  # ~1.67 MB/token
+    "glm-4.6": 156991,  # ~153 KB/token
+
+    # Legacy/default
+    "default": DEFAULT_BYTES_PER_TOKEN,
+}
 
 # ============================================================================
 # Data Structures
@@ -204,7 +226,7 @@ class OffsetAllocatorStorage:
             float: Read latency in milliseconds
         """
         if hash_id not in self.hash_id_to_offset:
-            return 0.001
+            return MIN_LATENCY_MS
 
         offset = self.hash_id_to_offset[hash_id]
         file_offset = offset * self.block_size_bytes
@@ -222,7 +244,7 @@ class OffsetAllocatorStorage:
             return latency_ms
         except OSError as e:
             print(f"Error reading block {hash_id} at offset {file_offset}: {e}")
-            return 0.001
+            return MIN_LATENCY_MS
 
     def write_block(self, hash_id: int) -> float:
         """Write block using pwrite
@@ -260,17 +282,13 @@ class OffsetAllocatorStorage:
             return latency_ms
         except OSError as e:
             print(f"Error writing block {hash_id} at offset {file_offset}: {e}")
-            return 0.001
+            return MIN_LATENCY_MS
 
     def close(self):
         """Close file"""
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
-
-    def __del__(self):
-        """Destructor"""
-        self.close()
 
     def get_stats(self) -> Dict:
         """Get statistics
@@ -279,14 +297,12 @@ class OffsetAllocatorStorage:
             Dict: Dictionary containing read/write statistics
         """
         def calc_stats(latencies):
-            """Calculate latency percentiles"""
+            """Calculate latency statistics"""
             if not latencies:
                 return {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
             return {
                 'avg_ms': statistics.mean(latencies),
-                'p50_ms': statistics.quantiles(latencies, n=2)[0],
-                'p95_ms': statistics.quantiles(latencies, n=20)[18] if len(latencies) > 20 else latencies[-1],
-                'p99_ms': statistics.quantiles(latencies, n=100)[98] if len(latencies) > 100 else latencies[-1],
+                **calc_percentiles(latencies),
             }
 
         return {
@@ -376,19 +392,18 @@ class StorageBenchmark:
         total_latency = 0.0
 
         # Process each hash_id (in order)
-        for position, hash_id in enumerate(req.hash_ids):
+        for hash_id in req.hash_ids:
             if self.storage.block_exists(hash_id):
                 # Block exists, read (reuse cached block)
                 total_latency += self.storage.read_block(hash_id)
                 self.stats['read_blocks'] += 1
-                if position > 0:  # Count as prefix reuse if not first block
-                    self.stats['prefix_hit_blocks'] += 1
+                self.stats['prefix_hit_blocks'] += 1  # Count all cache hits as prefix reuse
             else:
                 # Block doesn't exist, write (new block)
                 total_latency += self.storage.write_block(hash_id)
                 self.stats['write_blocks'] += 1
 
-        latency_ms = total_latency if total_latency > 0 else 0.001
+        latency_ms = total_latency if total_latency > 0 else MIN_LATENCY_MS
         self.stats['request_latencies_ms'].append(latency_ms)
 
         return latency_ms
@@ -406,9 +421,7 @@ class StorageBenchmark:
         if request_latencies:
             latency_stats = {
                 'avg_ms': statistics.mean(request_latencies),
-                'p50_ms': statistics.quantiles(request_latencies, n=2)[0],
-                'p95_ms': statistics.quantiles(request_latencies, n=20)[18] if len(request_latencies) > 20 else request_latencies[-1],
-                'p99_ms': statistics.quantiles(request_latencies, n=100)[98] if len(request_latencies) > 100 else request_latencies[-1],
+                **calc_percentiles(request_latencies),
             }
         else:
             latency_stats = {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
@@ -425,7 +438,7 @@ class StorageBenchmark:
             'prefix_hit_blocks': self.stats['prefix_hit_blocks'],
             'block_hit_rate': read_blocks / total_blocks if total_blocks > 0 else 0,
             'write_ratio': write_blocks / total_blocks if total_blocks > 0 else 0,
-            'avg_tokens_per_block': (total_blocks * BLOCK_SIZE_TOKENS) / total_blocks if total_blocks > 0 else 0,
+            'tokens_per_block': BLOCK_SIZE_TOKENS,  # Fixed block size in tokens
             'latency': latency_stats,
             'storage': storage_stats,
         }
@@ -433,6 +446,56 @@ class StorageBenchmark:
     def close(self):
         """Close storage"""
         self.storage.close()
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def calc_percentiles(data: List[float]) -> Dict[str, float]:
+    """Calculate latency percentiles
+
+    Uses linear interpolation for accurate percentile calculation.
+    This is more accurate than statistics.quantiles() for small datasets.
+
+    Args:
+        data: List of latency values in milliseconds
+
+    Returns:
+        Dict containing p50, p95, p99 percentiles
+    """
+    if not data:
+        return {'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+
+    # Sort data for percentile calculation
+    sorted_data = sorted(data)
+    n = len(sorted_data)
+
+    def get_percentile(p: float) -> float:
+        """Get percentile using linear interpolation
+
+        Args:
+            p: Percentile (0-100)
+
+        Returns:
+            Value at percentile
+        """
+        index = (n - 1) * p / 100
+        lower = int(index)
+        upper = min(lower + 1, n - 1)
+
+        if lower == upper:
+            return sorted_data[lower]
+
+        # Linear interpolation
+        weight = index - lower
+        return sorted_data[lower] * (1 - weight) + sorted_data[upper] * weight
+
+    return {
+        'p50_ms': get_percentile(50),
+        'p95_ms': get_percentile(95),
+        'p99_ms': get_percentile(99),
+    }
 
 
 # ============================================================================
@@ -592,43 +655,52 @@ def print_results(results: List[Dict]):
     Args:
         results: List of benchmark results
     """
-    print(f"\n{'='*100}")
-    print(f"{'Mooncake KVCache Storage Benchmark':^100}")
-    print(f"{'='*100}")
+    for i, r in enumerate(results, 1):
+        print(f"\n{'='*80}")
+        print(f"  [{i}/{len(results)}] {r['trace_file']}")
+        print(f"{'='*80}")
 
-    print(f"\nPerformance Summary:")
-    print(f"{'Scenario':<25} {'Reqs':<8} {'QPS':<8} {'P50 Latency':<12} {'P95 Latency':<12} {'P99 Latency':<12} {'Hit Rate':<10}")
-    print("-" * 100)
+        print(f"\n[Performance Overview]")
+        print(f"  Total Requests:           {r['total_requests']:,}")
+        print(f"  Queries Per Second (QPS): {r['requests_per_second']:.2f}")
+        print(f"  Cache Hit Rate:           {r['block_hit_rate']:.2%}")
+        print(f"  Write Ratio:              {r['write_ratio']:.2%}")
+        print(f"  Total Blocks:             {r['total_blocks']:,}")
+        print(f"    Read Blocks:            {r['read_blocks']:,}")
+        print(f"    Write Blocks:           {r['write_blocks']:,}")
+        print(f"    Prefix Hits:            {r['prefix_hit_blocks']:,}")
 
-    for r in results:
-        lat = r['latency']
-        print(f"{r['trace_file']:<25} {r['total_requests']:<8} {r['requests_per_second']:<8.1f} "
-              f"{lat['p50_ms']:<12.2f} {lat['p95_ms']:<12.2f} {lat['p99_ms']:<12.2f} "
-              f"{r['block_hit_rate']:<10.2%}")
+        print(f"\n[Latency Analysis]")
+        req_lat = r['latency']
+        print(f"  Request Latency (End-to-End): Avg={req_lat['avg_ms']:.2f}ms, P50={req_lat['p50_ms']:.2f}ms, P95={req_lat['p95_ms']:.2f}ms, P99={req_lat['p99_ms']:.2f}ms")
+        read_lat = r['storage']['read']
+        write_lat = r['storage']['write']
+        print(f"  Single I/O Operation (Per Block):")
+        print(f"    Read:  Avg={read_lat.get('avg_ms', 0):.3f}ms, P50={read_lat.get('p50_ms', 0):.3f}ms, P95={read_lat.get('p95_ms', 0):.3f}ms, P99={read_lat.get('p99_ms', 0):.3f}ms")
+        print(f"    Write: Avg={write_lat.get('avg_ms', 0):.3f}ms, P50={write_lat.get('p50_ms', 0):.3f}ms, P95={write_lat.get('p95_ms', 0):.3f}ms, P99={write_lat.get('p99_ms', 0):.3f}ms")
 
-    print(f"\nDetailed Statistics:")
-    for r in results:
-        print(f"\n{r['trace_file']}:")
-        print(f"  Block Stats: Total={r['total_blocks']:,}, Read={r['read_blocks']:,}, Write={r['write_blocks']:,}")
-        print(f"  Prefix Hits: {r['prefix_hit_blocks']:,}")
-        print(f"  Cache Hit Rate: {r['block_hit_rate']:.2%}")
-        print(f"  Write Ratio: {r['write_ratio']:.2%}")
-        print(f"  Storage Blocks: {r['storage']['total_blocks']:,}, Free Blocks: {r['storage']['free_blocks']:,}")
-
-        # Time statistics
-        if r.get('timestamp_replay_enabled'):
-            print(f"  Time: Wall={r['wall_time_s']:.1f}s, I/O={r['io_time_s']:.1f}s, Sleep={r['wall_time_s'] - r['io_time_s']:.1f}s")
-        else:
-            print(f"  Time: Total={r['wall_time_s']:.1f}s")
-
-        print(f"  I/O: Read={r['storage']['read']['mb']:.1f}MB, Write={r['storage']['write']['mb']:.1f}MB")
-        print(f"  Latency: Read P99={r['storage']['read'].get('p99_ms', 0):.2f}ms, "
-              f"Write P99={r['storage']['write'].get('p99_ms', 0):.2f}ms")
-
-        # Calculate bandwidth based on I/O time
+        print(f"\n[I/O & Bandwidth]")
+        print(f"  Total Read I/O:      {r['storage']['read']['mb']:>10.1f} MB  ({r['storage']['read']['count']:,} ops)")
+        print(f"  Total Write I/O:     {r['storage']['write']['mb']:>10.1f} MB  ({r['storage']['write']['count']:,} ops)")
         io_time = r['io_time_s']
         bandwidth = (r['storage']['read']['mb'] + r['storage']['write']['mb']) / io_time
-        print(f"  Bandwidth: {bandwidth:.1f} MB/s (based on I/O time)")
+        print(f"  Effective Bandwidth:   {bandwidth:>10.1f} MB/s")
+
+        print(f"\n[Storage Details]")
+        print(f"  Blocks in Use:       {r['storage']['total_blocks']:>10,}")
+        print(f"  Free Blocks:         {r['storage']['free_blocks']:>10,}")
+        print(f"  Tokens per Block:    {r['tokens_per_block']:>10,}")
+        print(f"  Block Size:          {r['tokens_per_block'] * 2048 / 1024 / 1024:>10.2f} MB")
+
+        print(f"\n[Execution Time]")
+        if r.get('timestamp_replay_enabled'):
+            print(f"  Wall Time (Total):     {r['wall_time_s']:>10.2f} s")
+            print(f"  I/O Time (Actual):     {r['io_time_s']:>10.2f} s")
+            print(f"  Sleep Time (Replay):   {r['wall_time_s'] - r['io_time_s']:>10.2f} s")
+        else:
+            print(f"  Total Execution Time: {r['wall_time_s']:>10.2f} s")
+
+    print(f"\n{'='*80}\n")
 
 
 # ============================================================================
@@ -645,25 +717,39 @@ Examples:
   # Quick test (100 requests)
   python storage_benchmark.py --scenario=toolagent --max-requests=100
 
+  # Test with large model preset (Llama-3.1-405B)
+  python storage_benchmark.py --scenario=toolagent --model=llama-3.1-405b --max-requests=100
+
+  # Test with Deepseek V3 (extra large model)
+  python storage_benchmark.py --scenario=toolagent --model=deepseek-v3 --max-requests=100
+
   # Realistic replay (with timestamps, 10x speed)
   python storage_benchmark.py --scenario=toolagent --max-requests=1000 \\
       --replay-timestamps --time-scale=0.1
 
-  # All scenarios
-  python storage_benchmark.py --scenario=all
+  # All scenarios with custom bytes_per_token
+  python storage_benchmark.py --scenario=all --bytes-per-token=512
+
+Available model presets:
+  Small models (7B-13B): llama-2-7b, llama-2-13b, llama-3-8b, mistral-7b, qwen-14b, gemma-7b
+  Large models (70B-405B): llama-2-70b, llama-3-70b, llama-3.1-405b, mixtral-8x7b, mixtral-8x22b, qwen-72b, qwen-110b
+  Extra large models: deepseek-v3, glm-4.6
 
 For more information: tools/STORAGE_BENCHMARK_README.md
         """
     )
 
-    parser.add_argument('--trace-dir', type=str, default='../FAST25-release/traces',
+    parser.add_argument('--trace-dir', type=str, default='../../FAST25-release/traces',
                        help='Trace files directory')
     parser.add_argument('--scenario', type=str, choices=['conversation', 'synthetic', 'toolagent', 'all'],
                        default='toolagent', help='Test scenario')
     parser.add_argument('--storage-dir', type=str, default='/tmp/mooncake_bench',
                        help='Storage directory')
-    parser.add_argument('--bytes-per-token', type=int, default=2048,
-                       help='Bytes per token (default 2048 = 7B FP16)')
+    parser.add_argument('--model', type=str, choices=list(MODEL_BYTES_PER_TOKEN.keys()),
+                       default='default',
+                       help=f'Model preset (overrides --bytes-per-token). Available: {", ".join(MODEL_BYTES_PER_TOKEN.keys())}')
+    parser.add_argument('--bytes-per-token', type=int, default=DEFAULT_BYTES_PER_TOKEN,
+                       help='Bytes per token (default %d, overridden by --model if specified)' % DEFAULT_BYTES_PER_TOKEN)
     parser.add_argument('--max-requests', type=int, default=None,
                        help='Maximum number of requests (default: unlimited)')
     parser.add_argument('--max-blocks', type=int, default=100000,
@@ -674,6 +760,18 @@ For more information: tools/STORAGE_BENCHMARK_README.md
                        help='Time scaling factor (1.0=real-time, 0.1=10x speed, 10.0=0.1x speed)')
 
     args = parser.parse_args()
+
+    # Print benchmark header
+    print(f"\n{'='*80}")
+    print(f"{'Mooncake KVCache Storage Benchmark':^80}")
+    print(f"{'='*80}")
+
+    # Determine bytes_per_token (model preset takes precedence)
+    bytes_per_token = MODEL_BYTES_PER_TOKEN.get(args.model, args.bytes_per_token)
+    if args.model != 'default':
+        print(f"Using model preset: {args.model} ({bytes_per_token} bytes/token, ~{bytes_per_token/1024:.1f} KB/token)")
+    else:
+        print(f"Using custom bytes_per_token: {bytes_per_token}")
 
     # Determine test scenarios
     scenarios = ['conversation', 'synthetic', 'toolagent'] if args.scenario == 'all' else [args.scenario]
@@ -691,7 +789,7 @@ For more information: tools/STORAGE_BENCHMARK_README.md
             result = run_benchmark(
                 str(trace_path),
                 str(Path(args.storage_dir) / scenario),
-                args.bytes_per_token,
+                bytes_per_token,
                 args.max_requests,
                 args.max_blocks,
                 args.replay_timestamps,
