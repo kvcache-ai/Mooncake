@@ -73,7 +73,8 @@ def _recovery_worker(rank, num_processes, signals):
         if rank == broken_rank:
             return  # Simulate broken rank
 
-        tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
+        logical_rank = dist.get_rank()
+        tensor = torch.tensor([logical_rank], dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         assert tensor.item() == sum(range(0, num_processes)) - broken_rank
 
@@ -85,14 +86,6 @@ def _recovery_worker(rank, num_processes, signals):
             if peer_state:
                 break
         pg.recover_ranks(backend, [broken_rank])
-
-        # Ensure correct operation after recovery
-        tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        assert tensor.item() == sum(range(0, num_processes)), (
-            f"Rank {rank} expected {sum(range(0, num_processes))}, "
-            f"get {tensor.item()}"
-        )
     else:
         while "recover" not in signals:
             time.sleep(1)
@@ -106,13 +99,42 @@ def _recovery_worker(rank, num_processes, signals):
             ),
         )
 
-        # Ensure correct operation after recovery
-        tensor = torch.tensor([broken_rank], dtype=torch.int32, device="cpu")
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        assert tensor.item() == sum(range(0, num_processes)), (
-            f"Rank {rank} expected {sum(range(0, num_processes))}, "
-            f"get {tensor.item()}"
+    # From here on, all active ranks (including the recovered one) are part
+    # of the same process group, so we can validate collective and P2P ops.
+    logical_rank = dist.get_rank()
+
+    # Ensure correct operation after recovery
+    tensor = torch.tensor([logical_rank], dtype=torch.int32, device="cpu")
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    assert tensor.item() == sum(range(0, num_processes)), (
+        f"Rank {rank} expected {sum(range(0, num_processes))}, "
+        f"get {tensor.item()}"
+    )
+
+    # Test point-to-point send/recv correctness after recovery.
+    world_size = dist.get_world_size()
+    if logical_rank == 0:
+        # Rank 0 sends to every other rank.
+        for dst in range(1, world_size):
+            send_tensor = torch.tensor([dst], dtype=torch.int32, device="cpu")
+            dist.send(send_tensor, dst=dst)
+
+        # Rank 0 receives replies from every other rank.
+        for src in range(1, world_size):
+            recv_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
+            dist.recv(recv_tensor, src=src)
+            assert recv_tensor.item() == src + 100
+            print(f"Receiving {recv_tensor.item()}")
+    else:
+        # Non-zero ranks receive from rank 0 and send a response back.
+        recv_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
+        dist.recv(recv_tensor, src=0)
+        assert recv_tensor.item() == logical_rank
+
+        response = torch.tensor(
+            [logical_rank + 100], dtype=torch.int32, device="cpu"
         )
+        dist.send(response, dst=0)
 
 
 class TestMooncakeBackend(unittest.TestCase):
