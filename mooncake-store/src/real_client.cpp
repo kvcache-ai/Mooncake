@@ -44,10 +44,7 @@ ResourceTracker::ResourceTracker() {
     // startSignalThread) would prevent Python from raising KeyboardInterrupt,
     // causing the process to hang on Ctrl-C.  Detect Python at runtime via
     // dlsym so we don't need to include <Python.h> or change any public API.
-    using PyIsInit_t = int (*)();
-    auto py_is_initialized =
-        reinterpret_cast<PyIsInit_t>(dlsym(RTLD_DEFAULT, "Py_IsInitialized"));
-    if (!py_is_initialized || !py_is_initialized()) {
+    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
         // Standalone C/C++ process – install our own signal handling.
         startSignalThread();
     }
@@ -155,7 +152,14 @@ void ResourceTracker::startSignalThread() {
                     sigset_t unblock;
                     sigemptyset(&unblock);
                     sigaddset(&unblock, sig);
-                    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+                    int ret =
+                        pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+                    if (ret != 0) {
+                        LOG(ERROR)
+                            << "Failed to unblock signal " << sig
+                            << " before raising: " << strerror(ret);
+                        _exit(EXIT_FAILURE);
+                    }
                     raise(sig);
 
                     break;  // Should not reach due to process termination
