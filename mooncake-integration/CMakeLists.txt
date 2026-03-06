@@ -188,3 +188,11 @@ if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
     install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
+
+if (WITH_EP)
+    install(
+        DIRECTORY "${EP_PG_STAGING_DIR}/"
+        DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"
+        FILES_MATCHING PATTERN "*.so"
+    )
+endif()
