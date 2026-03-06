@@ -610,7 +610,12 @@ int RealClient::start_http_server() {
             resp.set_status_and_content(http_status, std::move(body));
         });
 
-    http_server_->async_start();
+    auto ec = http_server_->async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP server on port " << FLAGS_http_port;
+        http_server_.reset();
+        return -1;
+    }
     LOG(INFO) << "Client HTTP server started on port " << FLAGS_http_port;
     return 0;
 }
