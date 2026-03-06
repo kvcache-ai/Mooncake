@@ -21,8 +21,14 @@ if(TORCH_CUDA_ARCH_LIST)
 endif()
 
 # ---------------------------------------------------------------------------
-# 1. Forward TORCH_CUDA_ARCH_LIST to the extension build.
+# 1. Set up the build environment.
 # ---------------------------------------------------------------------------
+# Clear jobserver variables so that sub-processes started by setup.py do not
+# try to connect to the parent ninja's jobserver pipe FDs, which are not
+# inherited and cause: "ninja: error: Could not initialize jobserver: Invalid
+# file descriptors".
+set(ENV{MAKEFLAGS} "")
+set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 
 # ---------------------------------------------------------------------------
