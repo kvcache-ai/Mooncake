@@ -100,10 +100,47 @@ def _recovery_worker(rank, num_processes, signals):
         )
 
     # From here on, all active ranks (including the recovered one) are part
-    # of the same process group, so we can validate collective and P2P ops.
+    # of the same process group.
     logical_rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
-    # Ensure correct operation after recovery
+    # First, validate correctness within a subgroup that includes the
+    # recovered rank to mimic real-world setups with multiple groups.
+    subgroup_ranks = list(range(max(world_size // 2, 1)))
+    if logical_rank in subgroup_ranks:
+        subgroup = dist.new_group(ranks=subgroup_ranks)
+
+        # Ensure correct collective behavior within the subgroup.
+        sub_tensor = torch.tensor([logical_rank], dtype=torch.int32, device="cpu")
+        dist.all_reduce(sub_tensor, op=dist.ReduceOp.SUM, group=subgroup)
+        expected_sub_sum = sum(subgroup_ranks)
+        assert sub_tensor.item() == expected_sub_sum, (
+            f"Rank {rank} in subgroup expected {expected_sub_sum}, "
+            f"got {sub_tensor.item()}"
+        )
+
+        # Test point-to-point send/recv restricted to the subgroup.
+        root_rank = subgroup_ranks[0]
+        if logical_rank == root_rank:
+            for dst in subgroup_ranks[1:]:
+                send_tensor = torch.tensor([dst], dtype=torch.int32, device="cpu")
+                dist.send(send_tensor, dst=dst)
+
+            for src in subgroup_ranks[1:]:
+                recv_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
+                dist.recv(recv_tensor, src=src)
+                assert recv_tensor.item() == src + 100
+        else:
+            recv_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
+            dist.recv(recv_tensor, src=root_rank)
+            assert recv_tensor.item() == logical_rank
+
+            response = torch.tensor(
+                [logical_rank + 100], dtype=torch.int32, device="cpu"
+            )
+            dist.send(response, dst=root_rank)
+
+    # Ensure correct operation after recovery on the full group.
     tensor = torch.tensor([logical_rank], dtype=torch.int32, device="cpu")
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     assert tensor.item() == sum(range(0, num_processes)), (
@@ -111,8 +148,7 @@ def _recovery_worker(rank, num_processes, signals):
         f"get {tensor.item()}"
     )
 
-    # Test point-to-point send/recv correctness after recovery.
-    world_size = dist.get_world_size()
+    # Test point-to-point send/recv correctness after recovery on the full group.
     if logical_rank == 0:
         # Rank 0 sends to every other rank.
         for dst in range(1, world_size):
@@ -124,7 +160,6 @@ def _recovery_worker(rank, num_processes, signals):
             recv_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
             dist.recv(recv_tensor, src=src)
             assert recv_tensor.item() == src + 100
-            print(f"Receiving {recv_tensor.item()}")
     else:
         # Non-zero ranks receive from rank 0 and send a response back.
         recv_tensor = torch.empty(1, dtype=torch.int32, device="cpu")
