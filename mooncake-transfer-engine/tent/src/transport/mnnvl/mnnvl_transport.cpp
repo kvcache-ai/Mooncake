@@ -481,6 +481,12 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     uint64_t current_epoch = relocate_epoch_.load(std::memory_order_acquire);
     if (tl_epoch != current_epoch || tl_relocate_map.empty()) {
         RWSpinlock::ReadGuard guard(relocate_lock_);
+        // Check if transport is still installed after acquiring lock
+        // to prevent TOCTOU race between epoch check and actual cache usage
+        if (!installed_) {
+            return Status::InternalError(
+                "MNNVL transport is being uninstalled, operation not allowed");
+        }
         tl_relocate_map = relocate_map_;
         tl_epoch = current_epoch;
     }
