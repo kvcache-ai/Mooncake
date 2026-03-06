@@ -9,6 +9,7 @@
 #                         (empty = use the currently-installed torch)
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
 #   STAGING_DIR         - destination directory for the built .so files
+#   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -30,6 +31,21 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+
+# ---------------------------------------------------------------------------
+# 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.
+# ---------------------------------------------------------------------------
+# setup.py links against -l:engine.so in ../mooncake-wheel/mooncake/.
+# During the make phase only the versioned engine.cpython-XYZ.so exists in
+# the build tree; create a bare engine.so symlink so the linker can find it.
+set(_wheel_mooncake_dir "${SOURCE_DIR}/../mooncake-wheel/mooncake")
+set(_engine_symlink "${_wheel_mooncake_dir}/engine.so")
+if(ENGINE_SO_PATH AND NOT EXISTS "${_engine_symlink}")
+  message(STATUS "[PG] Creating engine.so symlink -> ${ENGINE_SO_PATH}")
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${ENGINE_SO_PATH}" "${_engine_symlink}"
+  )
+endif()
 
 # ---------------------------------------------------------------------------
 # 3. Build the PG Python extension.
