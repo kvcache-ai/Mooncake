@@ -207,7 +207,7 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
 void LocalHotCache::drainDeferredTouches() {
     // Caller must hold exclusive lock on lru_mutex_.
     // Iterate the LRU list and splice any block with accessed=true to front.
-    for (auto it = lru_queue_.begin(); it != lru_queue_.end(); ) {
+    for (auto it = lru_queue_.begin(); it != lru_queue_.end();) {
         HotMemBlock* blk = *it;
         if (blk && blk->accessed.exchange(false, std::memory_order_relaxed)) {
             if (it != lru_queue_.begin()) {
