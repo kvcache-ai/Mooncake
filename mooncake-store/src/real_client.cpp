@@ -8,7 +8,7 @@
 #include <thread>
 #include <stop_token>
 
-#include <dlfcn.h>   // for dlsym (Python detection)
+#include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
@@ -152,12 +152,10 @@ void ResourceTracker::startSignalThread() {
                     sigset_t unblock;
                     sigemptyset(&unblock);
                     sigaddset(&unblock, sig);
-                    int ret =
-                        pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
+                    int ret = pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
                     if (ret != 0) {
-                        LOG(ERROR)
-                            << "Failed to unblock signal " << sig
-                            << " before raising: " << strerror(ret);
+                        LOG(ERROR) << "Failed to unblock signal " << sig
+                                   << " before raising: " << strerror(ret);
                         _exit(EXIT_FAILURE);
                     }
                     raise(sig);
