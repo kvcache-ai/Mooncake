@@ -8,6 +8,7 @@
 #include <thread>
 #include <stop_token>
 
+#include <dlfcn.h>   // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
@@ -44,9 +45,21 @@ ResourceTracker &ResourceTracker::getInstance() {
 }
 
 ResourceTracker::ResourceTracker() {
-    // Start dedicated signal handling thread (best-effort)
-    startSignalThread();
-    // Register exit handler as a backstop
+    // In embedded environments (e.g. Python), the host runtime owns signal
+    // handling.  Blocking SIGINT with pthread_sigmask (done inside
+    // startSignalThread) would prevent Python from raising KeyboardInterrupt,
+    // causing the process to hang on Ctrl-C.  Detect Python at runtime via
+    // dlsym so we don't need to include <Python.h> or change any public API.
+    using PyIsInit_t = int (*)();
+    auto py_is_initialized =
+        reinterpret_cast<PyIsInit_t>(dlsym(RTLD_DEFAULT, "Py_IsInitialized"));
+    if (!py_is_initialized || !py_is_initialized()) {
+        // Standalone C/C++ process – install our own signal handling.
+        startSignalThread();
+    }
+
+    // Register exit handler as a backstop (works in both standalone and
+    // embedded modes).
     std::atexit(exitHandler);
 }
 
@@ -141,13 +154,14 @@ void ResourceTracker::startSignalThread() {
                     sa.sa_flags = 0;
                     sigaction(sig, &sa, nullptr);
 
-                    // Unblock the signal before raising it so it can be
-                    // delivered immediately
-                    sigset_t unblock_set;
-                    sigemptyset(&unblock_set);
-                    sigaddset(&unblock_set, sig);
-                    pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
-
+                    // Unblock the signal before raising, otherwise raise()
+                    // sends a thread-directed signal that stays pending
+                    // (blocked by pthread_sigmask) and is lost when this
+                    // thread exits, leaving the process alive.
+                    sigset_t unblock;
+                    sigemptyset(&unblock);
+                    sigaddset(&unblock, sig);
+                    pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
                     raise(sig);
 
                     break;  // Should not reach due to process termination
