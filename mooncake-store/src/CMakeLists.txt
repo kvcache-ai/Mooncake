@@ -33,6 +33,7 @@ set(MOONCAKE_STORE_SOURCES
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
+    engram/engram.cpp
     local_hot_cache.cpp
 )
 
