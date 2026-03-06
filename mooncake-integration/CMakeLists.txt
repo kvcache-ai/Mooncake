@@ -195,4 +195,10 @@ if (WITH_EP)
         DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"
         FILES_MATCHING PATTERN "*.so"
     )
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
 endif()
