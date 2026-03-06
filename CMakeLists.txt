@@ -121,7 +121,7 @@ if (WITH_EP)
       "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
     COMMENT "Building Mooncake PG Python extension(s)"
-    DEPENDS engine
+    DEPENDS engine mooncake_ep_ext
     VERBATIM
   )
 endif()
