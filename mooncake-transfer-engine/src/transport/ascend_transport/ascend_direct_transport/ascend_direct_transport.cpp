@@ -575,6 +575,7 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
               << ", deviceLogicId=" << device_logic_id_;
+    // ensure segment_name parameter of addLocalSegment equal to desc.name, which is local_server_name_
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -728,6 +729,7 @@ void AscendDirectTransport::queryThread() {
                     slice->markFailed();
                 }
                 it = pending_batches.erase(it);
+                metadata_->removeSegmentDesc(target_segment_desc->name);
                 disconnect(target_adxl_engine_name, connect_timeout_);
             } else if (task_status == adxl::TransferStatus::COMPLETED) {
                 auto now = getCurrentTimeInNano();
@@ -750,6 +752,7 @@ void AscendDirectTransport::queryThread() {
                     for (auto &slice : slice_list) {
                         slice->markFailed();
                     }
+                    metadata_->removeSegmentDesc(target_segment_desc->name);
                     disconnect(target_adxl_engine_name, connect_timeout_);
                     it = pending_batches.erase(it);
                 } else {
@@ -815,16 +818,18 @@ void AscendDirectTransport::processSliceList(
                 << "us";
         return;
     }
-    return connectAndTransfer(target_adxl_engine_name, operation, slice_list);
+    return connectAndTransfer(target_segment_desc->name,
+                              target_adxl_engine_name, operation, slice_list);
 }
 
 void AscendDirectTransport::connectAndTransfer(
-    const std::string &target_adxl_engine_name, adxl::TransferOp operation,
-    const std::vector<Slice *> &slice_list, int32_t times) {
+    const std::string &target_seg_name,
+    const std::string &target_adxl_engine_name,
+    adxl::TransferOp operation, const std::vector<Slice*>& slice_list) {
     if (!auto_connect_) {
         int ret = checkAndConnect(target_adxl_engine_name);
         if (ret != 0) {
-            for (auto &slice : slice_list) {
+            for (auto& slice : slice_list) {
                 slice->markFailed();
             }
             return;
@@ -842,7 +847,7 @@ void AscendDirectTransport::connectAndTransfer(
         op_descs.emplace_back(op_desc);
     }
     if (use_async_transfer_) {
-        return TransferWithAsync(target_adxl_engine_name, operation, slice_list,
+        return TransferWithAsync(target_seg_name, target_adxl_engine_name, operation, slice_list,
                                  op_descs);
     }
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
@@ -854,6 +859,7 @@ void AscendDirectTransport::connectAndTransfer(
                        .count()
                 << " us";
         if (use_short_connection_) {
+            metadata_->removeSegmentDesc(target_seg_name);
             disconnect(target_adxl_engine_name, connect_timeout_);
         }
         for (auto &slice : slice_list) {
@@ -877,11 +883,13 @@ void AscendDirectTransport::connectAndTransfer(
         // set small timeout to just release local res.
         LOG(INFO) << "transfer failed and disconnect to:"
                   << target_adxl_engine_name;
+        metadata_->removeSegmentDesc(target_seg_name);
         disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
     }
 }
 
 void AscendDirectTransport::TransferWithAsync(
+    const std::string &target_seg_name,
     const std::string &target_adxl_engine_name, adxl::TransferOp operation,
     const std::vector<Slice *> &slice_list,
     const std::vector<adxl::TransferOpDesc> &op_descs) {
@@ -933,6 +941,7 @@ void AscendDirectTransport::TransferWithAsync(
         }
         // the connection is probably broken.
         // set small timeout to just release local res.
+        metadata_->removeSegmentDesc(target_seg_name);
         disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
     }
 #endif
@@ -1166,8 +1175,7 @@ int AscendDirectTransport::checkAndConnect(
 }
 
 int AscendDirectTransport::disconnect(
-    const std::string &target_adxl_engine_name, int32_t timeout_in_millis,
-    bool force) {
+    const std::string &target_adxl_engine_name, int32_t timeout_in_millis) {
     if (auto_connect_) {
         auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
                                         timeout_in_millis);
@@ -1183,19 +1191,17 @@ int AscendDirectTransport::disconnect(
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it == connected_segments_.end()) {
         LOG(INFO) << "Target adxl engine: " << target_adxl_engine_name
-                  << " is not connected.";
+            << " is not connected.";
         return 0;
     }
-    if (!force) {
-        auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
-                                        timeout_in_millis);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
-                       << ", status: " << status
-                       << ", errmsg: " << aclGetRecentErrMsg();
-            connected_segments_.erase(it);
-            return -1;
-        }
+    auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
+                                    timeout_in_millis);
+    if (status != adxl::SUCCESS) {
+        LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+            << ", status: " << status
+            << ", errmsg: " << aclGetRecentErrMsg();
+        connected_segments_.erase(it);
+        return -1;
     }
     connected_segments_.erase(it);
     return 0;
