@@ -100,7 +100,7 @@ file(GLOB _so_files "${SOURCE_DIR}/mooncake/*.so")
 foreach(_so IN LISTS _so_files)
   get_filename_component(_fname "${_so}" NAME)
   message(STATUS "[PG] Staging ${_fname} -> ${STAGING_DIR}")
-  file(COPY "${_so}" DESTINATION "${STAGING_DIR}")
+  file(COPY "${_so}" DESTINATION "${STAGING_DIR}" NO_SOURCE_PERMISSIONS)
 endforeach()
 
 message(STATUS "[PG] Mooncake PG extension build complete")
