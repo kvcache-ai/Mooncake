@@ -111,7 +111,9 @@ fi
 # project is configured with -DWITH_EP=ON.  The resulting .so files land in
 # ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel
 # so that patchelf never touches CUDA fatbins (see injection step below).
-CUDA_EP_STAGING_DIR="${BUILD_DIR}/ep_pg_staging"
+# Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
+# relative path would silently point to the wrong location.
+CUDA_EP_STAGING_DIR="$(pwd)/${BUILD_DIR}/ep_pg_staging"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a

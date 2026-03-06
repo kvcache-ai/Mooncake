@@ -4,7 +4,6 @@
 # WITH_EP=ON.  Variables are passed with -D from the custom target:
 #
 #   SOURCE_DIR          - mooncake-ep source directory
-#   BUILD_DIR           - cmake binary / build directory
 #   EP_CUDA_MAJOR       - CUDA major version (integer)
 #   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
 #                         (empty = use the currently-installed torch)
@@ -22,28 +21,7 @@ if(TORCH_CUDA_ARCH_LIST)
 endif()
 
 # ---------------------------------------------------------------------------
-# 1. Stage engine.so so setup.py can link against it.
-#    setup.py uses:  -L<SOURCE_DIR>/../mooncake-wheel/mooncake  -l:engine.so
-# ---------------------------------------------------------------------------
-set(_engine_staging "${SOURCE_DIR}/../mooncake-wheel/mooncake")
-file(GLOB _engine_so "${BUILD_DIR}/mooncake-integration/engine.*.so")
-if(_engine_so)
-  list(GET _engine_so 0 _engine_so_path)
-  message(STATUS "[EP] Staging engine.so from ${_engine_so_path}")
-  file(COPY "${_engine_so_path}" DESTINATION "${_engine_staging}")
-  get_filename_component(_engine_so_name "${_engine_so_path}" NAME)
-  if(NOT _engine_so_name STREQUAL "engine.so")
-    file(RENAME
-      "${_engine_staging}/${_engine_so_name}"
-      "${_engine_staging}/engine.so"
-    )
-  endif()
-else()
-  message(WARNING "[EP] engine.so not found in ${BUILD_DIR}/mooncake-integration/ — EP build may fail")
-endif()
-
-# ---------------------------------------------------------------------------
-# 2. Forward TORCH_CUDA_ARCH_LIST to the extension build.
+# 1. Forward TORCH_CUDA_ARCH_LIST to the extension build.
 # ---------------------------------------------------------------------------
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 

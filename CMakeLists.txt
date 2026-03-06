@@ -99,7 +99,6 @@ if (WITH_EP)
     COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
     COMMAND ${CMAKE_COMMAND}
       "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
-      "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
       "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
       "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
       "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
@@ -114,7 +113,6 @@ if (WITH_EP)
     COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
     COMMAND ${CMAKE_COMMAND}
       "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
-      "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
       "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
       "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
       "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
