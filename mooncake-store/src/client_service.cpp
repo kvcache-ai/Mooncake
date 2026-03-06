@@ -692,15 +692,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Frequency admission: only promote frequently accessed keys to hot cache.
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
-    if (hot_cache_ && !cache_used) {
-        bool should_admit = true;
-        if (admission_sketch_) {
-            uint8_t freq = admission_sketch_->increment(object_key);
-            should_admit = (freq >= kAdmissionThreshold);
-        }
-        if (should_admit) {
-            ProcessSlicesAsync(object_key, slices, replica);
-        }
+    if (ShouldAdmitToHotCache(object_key, cache_used)) {
+        ProcessSlicesAsync(object_key, slices, replica);
     }
 
     if (query_result.IsLeaseExpired()) {
@@ -828,19 +821,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
 
                 // Frequency admission: only promote frequently accessed keys.
                 // Skip when cache was used (data served from local cache).
-                if (hot_cache_ && idx < op.replicas.size() &&
+                if (idx < op.replicas.size() &&
                     idx < op.batched_slices.size() &&
-                    !(idx < op.cache_used.size() && op.cache_used[idx])) {
-                    bool should_admit = true;
-                    if (admission_sketch_) {
-                        uint8_t freq = admission_sketch_->increment(object_keys[index]);
-                        should_admit = (freq >= kAdmissionThreshold);
-                    }
-                    if (should_admit) {
-                        ProcessSlicesAsync(object_keys[index],
-                                           op.batched_slices[idx],
-                                           op.replicas[idx]);
-                    }
+                    ShouldAdmitToHotCache(
+                        object_keys[index],
+                        idx < op.cache_used.size() && op.cache_used[idx])) {
+                    ProcessSlicesAsync(object_keys[index],
+                                       op.batched_slices[idx],
+                                       op.replicas[idx]);
                 }
             }
         }
@@ -963,17 +951,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
             // Frequency admission: only promote frequently accessed keys.
             // Skip when cache was used (data served from local cache).
-            if (hot_cache_ && !cache_used) {
+            if (hot_cache_) {
                 auto slices_it = slices.find(key);
-                if (slices_it != slices.end()) {
-                    bool should_admit = true;
-                    if (admission_sketch_) {
-                        uint8_t freq = admission_sketch_->increment(key);
-                        should_admit = (freq >= kAdmissionThreshold);
-                    }
-                    if (should_admit) {
-                        ProcessSlicesAsync(key, slices_it->second, stored_replica);
-                    }
+                if (slices_it != slices.end() &&
+                    ShouldAdmitToHotCache(key, cache_used)) {
+                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
                 }
             }
         }

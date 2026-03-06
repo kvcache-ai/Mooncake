@@ -1036,7 +1036,8 @@ TEST_F(LocalHotCacheTest, ConcurrentGetHotKeySharedLock) {
 // HotMemBlock ref_count and BufferHandle view mode test
 // ---------------------------------------------------------------------------
 
-// Test that GetHotKey + BufferHandle view mode ref_count lifecycle works correctly.
+// Test that GetHotKey + BufferHandle view mode ref_count lifecycle works
+// correctly.
 TEST_F(LocalHotCacheTest, HotCacheRefCountViewMode) {
     const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
     auto cache = std::make_shared<LocalHotCache>(cache_size);
@@ -1054,8 +1055,7 @@ TEST_F(LocalHotCacheTest, HotCacheRefCountViewMode) {
     {
         // Create a BufferHandle in view mode
         auto handle = std::make_shared<BufferHandle>(
-            blk->addr, blk->size,
-            [blk, cache]() {
+            blk->addr, blk->size, [blk, cache]() {
                 blk->ref_count.fetch_sub(1, std::memory_order_release);
             });
 
@@ -1120,8 +1120,7 @@ TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
     // Step 5: Create BufferHandle in view mode
     {
         auto handle = std::make_shared<BufferHandle>(
-            blk->addr, blk->size,
-            [blk, cache]() {
+            blk->addr, blk->size, [blk, cache]() {
                 blk->ref_count.fetch_sub(1, std::memory_order_release);
             });
 
@@ -1140,6 +1139,86 @@ TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
 
     // After handle destruction, ref_count should be 0
     EXPECT_EQ(blk->ref_count.load(), 0);
+}
+
+TEST_F(LocalHotCacheTest, AdmissionSketchNotIncrementedOnCacheHit) {
+    class EnvGuard {
+       public:
+        explicit EnvGuard(const char* key) : key_(key) {
+            if (const char* value = std::getenv(key_)) {
+                old_value_ = value;
+            }
+        }
+
+        ~EnvGuard() {
+            if (old_value_.has_value()) {
+                setenv(key_, old_value_->c_str(), 1);
+            } else {
+                unsetenv(key_);
+            }
+        }
+
+       private:
+        const char* key_;
+        std::optional<std::string> old_value_;
+    };
+
+    EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    EnvGuard memcpy_guard("MC_STORE_MEMCPY");
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
+    setenv("MC_STORE_MEMCPY", "1", 1);
+
+    auto client_opt = CreateTestClient("localhost");
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+    ASSERT_TRUE(client->IsHotCacheEnabled());
+
+    const std::string key = "admission_skip_on_cache_hit_key";
+    const std::string cached_data = "cache-hit-data";
+
+    // Pre-fill local hot cache entry.
+    Slice cache_slice{const_cast<char*>(cached_data.data()),
+                      cached_data.size()};
+    ASSERT_TRUE(PutHotKeyHelper(*client->GetHotCache(), key, cache_slice));
+    ASSERT_TRUE(client->GetHotCache()->HasHotKey(key));
+
+    // Build a synthetic COMPLETE memory replica.
+    // RedirectToHotCache() should rewrite this descriptor to local hot cache.
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.transport_endpoint_ = "remote:9999";
+    mem_desc.buffer_descriptor.buffer_address_ = 0;
+    mem_desc.buffer_descriptor.size_ = cached_data.size();
+    replica.descriptor_variant = mem_desc;
+
+    std::vector<Replica::Descriptor> replicas;
+    replicas.emplace_back(replica);
+    QueryResult query_result(
+        std::move(replicas),
+        std::chrono::steady_clock::now() + std::chrono::seconds(60));
+
+    const uint8_t count_before = client->GetAdmissionCount(key);
+    EXPECT_EQ(count_before, 0);
+
+    auto do_cache_hit_get = [&]() {
+        std::vector<char> out(cached_data.size(), '\0');
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{out.data(), out.size()});
+        auto get_result = client->Get(key, query_result, slices);
+        EXPECT_TRUE(get_result.has_value());
+        EXPECT_EQ(
+            std::memcmp(out.data(), cached_data.data(), cached_data.size()), 0);
+    };
+
+    // Execute cache-hit Get path multiple times.
+    do_cache_hit_get();
+    do_cache_hit_get();
+    do_cache_hit_get();
+
+    // Admission sketch must not be incremented on cache hits.
+    EXPECT_EQ(client->GetAdmissionCount(key), count_before);
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1265,14 @@ TEST_F(LocalHotCacheTest, CountMinSketchAutoDecay) {
     uint8_t ret = sketch.increment("hot_key");
     EXPECT_EQ(ret, 16);
     EXPECT_EQ(sketch.count("hot_key"), 8);  // 16 >> 1 = 8
+}
+
+TEST_F(LocalHotCacheTest, CountMinSketchZeroDimensions) {
+    CountMinSketch sketch(0, 0);
+
+    EXPECT_EQ(sketch.count("zero_key"), 0);
+    EXPECT_EQ(sketch.increment("zero_key"), 1);
+    EXPECT_EQ(sketch.count("zero_key"), 1);
 }
 
 }  // namespace testing
