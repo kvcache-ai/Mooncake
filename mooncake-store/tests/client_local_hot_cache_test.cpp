@@ -1275,6 +1275,35 @@ TEST_F(LocalHotCacheTest, CountMinSketchZeroDimensions) {
     EXPECT_EQ(sketch.count("zero_key"), 1);
 }
 
+// ---------------------------------------------------------------------------
+// Admission helpers when hot cache / sketch is disabled
+// ---------------------------------------------------------------------------
+
+TEST_F(LocalHotCacheTest, AdmissionHelpersWithoutHotCache) {
+    // Create a client without hot cache (no MC_STORE_LOCAL_HOT_CACHE_SIZE)
+    const char* prev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+
+    auto result = CreateTestClient("no_hot_cache_host:9999");
+    ASSERT_TRUE(result.has_value());
+    auto client = result.value();
+
+    // Hot cache should be disabled
+    EXPECT_FALSE(client->IsHotCacheEnabled());
+
+    // GetAdmissionCount returns 0 when sketch is null
+    EXPECT_EQ(client->GetAdmissionCount("any_key"), 0);
+
+    // ShouldAdmitToHotCache returns false when hot_cache_ is null
+    EXPECT_FALSE(client->ShouldAdmitToHotCache("any_key", false));
+    EXPECT_FALSE(client->ShouldAdmitToHotCache("any_key", true));
+
+    // Restore env
+    if (prev) {
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", prev, 1);
+    }
+}
+
 }  // namespace testing
 }  // namespace mooncake
 
