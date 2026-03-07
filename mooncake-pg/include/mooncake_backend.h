@@ -1,8 +1,12 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <cstdint>
+#include <memory>
 #include <mooncake_worker.cuh>
-#include <p2p_proxy.hh>
+#include <connection_poller.h>
+#include <p2p_proxy.h>
+#include <sys/types.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
@@ -89,24 +93,26 @@ class MooncakeBackend final : public ::c10d::Backend {
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
     static void setDeviceFilter(std::vector<std::string> filters) {
-        engine_.setWhitelistFilters(std::move(filters));
+        engine_->setWhitelistFilters(std::move(filters));
     }
 
     std::string getPreferredHca(std::string location) {
-        auto matrix = engine_.getLocalTopology()->getMatrix();
+        auto matrix = engine_->getLocalTopology()->getMatrix();
         auto it = matrix.find(location);
         if (it == matrix.end()) {
-            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is "
+                      << engine_->getLocalTopology()->toJson();
             LOG(ERROR) << "Topology entry not found for location: " << location;
         } else if (it->second.preferred_hca.empty()) {
-            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is "
+                      << engine_->getLocalTopology()->toJson();
             LOG(ERROR) << "Preferred HCA list is empty for location: "
                        << location;
         }
         return it->second.preferred_hca[0];
     }
 
-    at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
+    at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
     int getNumSyncedRanks();
 
@@ -117,10 +123,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     void recoverRanks(const std::vector<int>& ranks);
 
    private:
-    void startP2PWorker();
-    void stopP2PWorker();
-
-    static TransferEngine engine_;
+    static TransferEngine* engine_;
+    static MooncakeWorker* worker_;
     static bool engineInitialized_;
     static int backendIndex_;
     bool isCpu_{false};
@@ -129,19 +133,25 @@ class MooncakeBackend final : public ::c10d::Backend {
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
-    int32_t* warmup_send_region_;
-    int32_t* warmup_recv_region_;
-    static MooncakeWorker worker_;
     SegmentInfo rank_info;
-    TransferGroupMeta meta_;
+    std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
-    int nextRankForConnection_ = 0;
-
-    void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
-                          int backendIndex);
+    uint64_t local2global_rank_map_[kMaxNumRanks];
 
     // P2P async infrastructure
-    std::unique_ptr<P2PProxy> p2p_proxy_;
+    // p2p_proxy_ is created in MooncakeBackend, but can live longer than
+    // MooncakeBackend. Because it is shared in P2PDeviceWorker, which must
+    // ensure P2PProxy's resources are not released until all transfers are
+    // completed.
+    std::shared_ptr<P2PProxy> p2p_proxy_;
+    // p2p_device_worker_ is created in P2PDeviceWorkerManager,
+    // and is shared between backends in the same device.
+    std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
+
+    // Connection Poller Context
+    // Similar to p2p_proxy_, connection_ctx_ is created in MooncakeBackend, but
+    // can live longer than MooncakeBackend.
+    std::shared_ptr<ConnectionContext> connection_ctx_;
 };
 
 }  // namespace mooncake
