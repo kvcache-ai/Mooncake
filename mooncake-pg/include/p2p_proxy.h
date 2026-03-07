@@ -100,6 +100,7 @@ class P2PProxy {
     void EnqueueRecv(RecvOp op);
 
     void ResetPeerState(int peer_rank);
+
    private:
     enum class TransferState {
         kDataCopy,
@@ -207,7 +208,7 @@ class P2PProxy {
     bool StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity);
     bool IsRecvDataPathCompleted(const RecvOpContext& op_ctx) const;
     void PerformRecvReset(int peer_rank);
-    
+
     uint64_t GetLocalSendSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetLocalRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetRemoteRecvSlotAddress(int peer_rank, uint32_t slot_index) const;

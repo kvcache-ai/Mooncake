@@ -283,9 +283,6 @@ void P2PProxy::EnqueueSend(SendOp op) {
         std::lock_guard<std::mutex> lock(send_queue_mutex_);
         send_queue_.emplace(std::move(op));
     }
-
-    LOG(INFO) << "P2PSendWork: " << rank_ << " -> " << op.peer_rank_ << " enqueued.";
-
     active_send_tasks_.fetch_add(1, std::memory_order_release);
     if (device_worker_) device_worker_->WakeUpSend();
 }
@@ -295,9 +292,6 @@ void P2PProxy::EnqueueRecv(RecvOp op) {
         std::lock_guard<std::mutex> lock(recv_queue_mutex_);
         recv_queue_.push(std::move(op));
     }
-
-    LOG(INFO) << "P2PRecvWork: " << rank_ << " <- " << op.peer_rank_ << " enqueued.";
-
     active_recv_tasks_.fetch_add(1, std::memory_order_release);
     if (device_worker_) device_worker_->WakeUpRecv();
 }
@@ -758,9 +752,6 @@ bool P2PProxy::StepSend() {
         if (op_ctx.total_bytes_ == 0) {
             op_ctx.completed_->store(true, std::memory_order_release);
             active_send_tasks_.fetch_sub(1, std::memory_order_release);
-
-            LOG(INFO) << "P2PSendWork: " << rank_ << " -> " << op_ctx.peer_rank_ << " done.";
-
             did_work = true;
             continue;
         }
@@ -792,9 +783,6 @@ bool P2PProxy::StepSend() {
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_send_op_.reset();
             active_send_tasks_.fetch_sub(1, std::memory_order_release);
-
-            LOG(INFO) << "P2PSendWork: " << rank_ << " -> " << op_ctx.peer_rank_ << " done.";
-
             did_work = true;
         }
     }
@@ -874,9 +862,6 @@ bool P2PProxy::StepRecv() {
             op_ctx.completed_->store(true, std::memory_order_release);
             lane.active_recv_op_.reset();
             active_recv_tasks_.fetch_sub(1, std::memory_order_release);
-
-            LOG(INFO) << "P2PRecvWork: " << rank_ << " <- " << op_ctx.peer_rank_ << " done.";
-
             did_work = true;
         }
     }

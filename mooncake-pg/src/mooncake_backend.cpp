@@ -170,8 +170,8 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, store,
-        meta_, p2p_proxy_, engine_);
+        backendIndex_, rank, size, local2global_rank_map_, store, meta_,
+        p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
@@ -816,6 +816,7 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
         TORCH_CHECK(rank >= 0 && static_cast<size_t>(rank) < kMaxNumRanks,
                     "Rank out of range");
         TORCH_CHECK(meta_->peerConnected[rank]);
+        meta_->activeRanks[rank] = true;
         meta_->store->set("extension_task_count_" +
                               std::to_string(meta_->backendIndex) + "_" +
                               std::to_string(rank),
