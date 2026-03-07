@@ -27,6 +27,7 @@ struct HotMemBlock {
     size_t size;
     std::atomic<int> ref_count;
     std::string key_;
+    std::atomic<bool> accessed{false};  // Deferred LRU touch flag
     HotMemBlock() : addr(nullptr), size(0), ref_count(0) {}
 };
 
@@ -133,9 +134,8 @@ class LocalHotCache {
     size_t GetBlockOffset(const void* addr) const;
 
    private:
-    // Touch LRU using iterator (avoids duplicate lookup)
-    void touchLRU(std::unordered_map<
-                  std::string, std::list<HotMemBlock*>::iterator>::iterator it);
+    // Drain deferred LRU touches: splice accessed blocks to front
+    void drainDeferredTouches();
 
     size_t block_size_;  // Actual block size used by this cache
 
@@ -172,7 +172,7 @@ struct HotCachePutTask {
     HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
                     std::shared_ptr<LocalHotCache> cache)
         : key(k), block(blk), size(slice.size), hot_cache(std::move(cache)) {
-        // No data copy here; memcpy is done by the caller into block->addr
+        // No data copy here; memcpy is done by SubmitPutTask into block->addr.
     }
 };
 
@@ -187,6 +187,7 @@ class LocalHotCacheHandler {
      * disabled).
      * @param num_worker_threads Number of worker threads for async processing
      * (default: 2).
+     * @param max_queue_capacity Maximum task queue capacity (default: 1024).
      */
     LocalHotCacheHandler(std::shared_ptr<LocalHotCache> hot_cache,
                          size_t num_worker_threads = 2,
@@ -203,8 +204,8 @@ class LocalHotCacheHandler {
     /**
      * @brief Submit an async task to put a slice into the hot cache.
      *
-     * The slice data will be deep copied, so the original slice data can be
-     * safely freed after this function returns.
+     * Data is copied into the cache block synchronously within this call.
+     * The caller may free the source slice memory after this function returns.
      * @param key Cache key: {object key}
      * @param slice Source slice to cache.
      * @return true if task was successfully submitted, false otherwise (e.g.,

@@ -380,6 +380,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << FLAGS_http_port;
         }
     }
+
     return {};
 }
 
@@ -1174,7 +1175,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Allocate buffer using the new allocator
+    // Normal allocation path
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
