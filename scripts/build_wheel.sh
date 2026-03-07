@@ -10,14 +10,10 @@ set -x
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
-# Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
-CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
-if [ -z "$CUDA_VERSION" ] && [ -f /usr/local/cuda/version.txt ]; then
-    CUDA_VERSION=$(grep -Eo "[0-9]+\.[0-9]+" /usr/local/cuda/version.txt | head -n1)
-fi
-CUDA_VERSION=${CUDA_VERSION:-"0.0"}
+# CMake build directory (default: build).  EP/PG extensions are staged under
+# ${BUILD_DIR}/ep_pg_staging when the project was built with -DWITH_EP=ON.
+BUILD_DIR="${BUILD_DIR:-build}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
-echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-asio:/usr/local/lib
@@ -111,56 +107,30 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-# Build EP/PG CUDA extensions and stage them; they are injected into the wheel
-# AFTER auditwheel so that patchelf never touches CUDA fatbins (see below).
-CUDA_EP_STAGING_DIR=$(mktemp -d)
-
-if [ "$BUILD_WITH_EP" = "1" ]; then
-    echo "Building Mooncake EP"
-    cd mooncake-ep
-    if [ -z "$EP_TORCH_VERSIONS" ]; then
-        python setup.py build_ext --build-lib .
-    else
-        for version in ${EP_TORCH_VERSIONS//;/ }; do
-            cuda_major=${CUDA_VERSION%%.*}
-            if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
-            else
-                pip install torch==$version
-            fi
-            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
-        done
-    fi
-    cp mooncake/*.so "$CUDA_EP_STAGING_DIR/"
-    cd ..
-fi
-
-if [ "$BUILD_WITH_EP" = "1" ]; then
-    echo "Building Mooncake PG"
-    cd mooncake-pg
-    if [ -z "$EP_TORCH_VERSIONS" ]; then
-        python setup.py build_ext --build-lib .
-    else
-        for version in ${EP_TORCH_VERSIONS//;/ }; do
-            cuda_major=${CUDA_VERSION%%.*}
-            if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
-            else
-                pip install torch==$version
-            fi
-            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
-        done
-    fi
-    cp mooncake/*.so "$CUDA_EP_STAGING_DIR/"
-    cd ..
-fi
+# EP/PG CUDA extensions are built during the cmake/make process when the
+# project is configured with -DWITH_EP=ON.  The resulting .so files land in
+# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel
+# so that patchelf never touches CUDA fatbins (see injection step below).
+# Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
+# relative path would silently point to the wrong location.
+CUDA_EP_STAGING_DIR="$(pwd)/${BUILD_DIR}/ep_pg_staging"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
+# If EP/PG .so files were staged inside the build directory, preserve them in a
+# temporary location so they survive the cleanup.
+CUDA_EP_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+        CUDA_EP_STAGING_TEMP=$(mktemp -d)
+        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
+        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+    fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
-    rm -rf build/
+    rm -rf "${BUILD_DIR}/"
+    # Point the injection step to the preserved copy (if any).
+    if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+        CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
+    fi
 fi
 
 echo "Building wheel package..."
@@ -350,7 +320,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
 # can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
 # files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
-if [ "$BUILD_WITH_EP" = "1" ]; then
+if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
         echo "Injecting CUDA extension .so files into repaired wheel..."
@@ -367,7 +337,13 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         python -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
-    rm -rf "$CUDA_EP_STAGING_DIR"
+else
+    echo "No EP/PG staging directory found (${CUDA_EP_STAGING_DIR}); skipping CUDA extension injection"
+fi
+
+# Clean up the temporary EP/PG staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
+if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+    rm -rf "$CUDA_EP_STAGING_TEMP"
 fi
 
 # Replace original wheel with repaired wheel
