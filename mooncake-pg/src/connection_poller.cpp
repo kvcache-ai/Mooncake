@@ -241,23 +241,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 break;
             }
 
-            // Log before we change them
-            auto globalRank = local2global_rank_map_[rank_];
-            if (!meta_->peerConnected[pollingRank]) {
-                LOG(WARNING)
-                    << "Global rank " << globalRank << " Backend "
-                    << backendIndex_ << " detects broken peer (global rank "
-                    << globalPollingRank << ", local rank " << pollingRank
-                    << "). (meta_->peerConnected[pollingRank]=false)";
-            } else {
-                TORCH_CHECK(!global_peerConnected_[globalPollingRank]);
-                LOG(WARNING)
-                    << "Global rank " << globalRank << " Backend "
-                    << backendIndex_ << " detects broken peer (global rank "
-                    << globalPollingRank << ", local rank " << pollingRank
-                    << "). (global_peerConnected_[global_rank]=false)";
-            }
-
             // If we reach here, at least one peer connected (local or global)
             // reports a failure. We must set both to false here.
             global_peerConnected_[globalPollingRank] = false;
