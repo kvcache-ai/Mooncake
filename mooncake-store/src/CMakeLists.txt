@@ -34,6 +34,7 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
+    ascend_utils.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -119,14 +120,24 @@ if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
     set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
     if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
         file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
-        if("${ACL_RUNTIME_CONTENT}" MATCHES "ACL_MEM_P2P_HUGE1G")
-            message(STATUS "ACL_MEM_P2P_HUGE1G exist.")
+        if("${ACL_RUNTIME_CONTENT}" MATCHES "aclrtMemRetainAllocationHandle")
+            message(STATUS "Ascend support fabric mem.")
             add_compile_definitions(ASCEND_SUPPORT_FABRIC_MEM)
         else()
-            message(STATUS "ACL_MEM_P2P_HUGE1G is not exist.")
+            message(STATUS "Ascend do not support fabric mem.")
         endif()
     else()
         message(WARNING "Acl runtime header file is not exist")
+    endif()
+    set(ADXL_ENGINE_HEADER_PATH "${ASCEND_INCLUDE_DIR}/adxl/adxl_engine.h")
+    if(EXISTS "${ADXL_ENGINE_HEADER_PATH}")
+        file(READ "${ADXL_ENGINE_HEADER_PATH}" ADXL_HEADER_CONTENT)
+        if("${ADXL_HEADER_CONTENT}" MATCHES "MallocMem")
+            message(STATUS "Ascend support adxl MallocMem.")
+            add_compile_definitions(ASCEND_SUPPORT_ADXL_MALLOC_MEM)
+        endif()
+    else()
+        message(WARNING "adxl header file is not exist")
     endif()
 endif()
 

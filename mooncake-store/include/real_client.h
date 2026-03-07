@@ -518,6 +518,7 @@ class RealClient : public PyClient {
         std::string protocol = "ascend";
         void operator()(void *ptr) {
             if (ptr) {
+                LOG(INFO) << "Start free segment mem";
                 free_memory(protocol.c_str(), ptr);
             }
         }
