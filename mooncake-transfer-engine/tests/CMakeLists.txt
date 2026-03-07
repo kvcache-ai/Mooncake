@@ -76,6 +76,12 @@ add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
+if(BUILD_ZMQ_COMMUNICATOR)
+add_executable(zmq_communicator_test zmq_communicator_test.cpp)
+target_link_libraries(zmq_communicator_test PUBLIC transfer_engine zmq_communicator_lib gtest gtest_main)
+target_include_directories(zmq_communicator_test PRIVATE ../src ../include)
+add_test(NAME zmq_communicator_test COMMAND zmq_communicator_test)
+endif()
 if (USE_ASCEND_DIRECT)
     # AscendDirectTransport unit test with mock implementations
     # Mock implementations are included in the test file via anonymous namespace

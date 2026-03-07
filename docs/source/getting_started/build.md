@@ -167,3 +167,4 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
+- **Environment variable `MOONCAKE_BUILD_ZMQ_COMMUNICATOR`**: Control whether the ZMQ Communicator component is built. Set to `0`, `OFF`, `NO`, or `FALSE` to disable building ZMQ Communicator (e.g. when libzmq is not available or ZMQ support is not needed). When unset or set to `1`, `ON`, `YES`, or `TRUE`, ZMQ Communicator is built by default. This affects the Transfer Engine transport library and the Python `engine` module bindings.
