@@ -712,6 +712,11 @@ class MasterService {
         std::vector<ReplicaID> replica_ids;
     };
 
+    struct OffloadingTask {
+        ReplicaID source_id;
+        std::chrono::system_clock::time_point start_time;
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
@@ -721,6 +726,8 @@ class MasterService {
             GUARDED_BY(mutex);
         std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
         std::unordered_map<std::string, const ReplicationTask> replication_tasks
+            GUARDED_BY(mutex);
+        std::unordered_map<std::string, const OffloadingTask> offloading_tasks
             GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
@@ -783,7 +790,7 @@ class MasterService {
     void EvictionThreadFunc();
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
-                                                      const Replica& replica);
+                                                      Replica& replica);
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
