@@ -1,29 +1,33 @@
 #include "master_service_test_for_snapshot_base.h"
 
+#include <gflags/gflags.h>
 #include <atomic>
 #include <random>
 #include <unordered_set>
 #include <utility>
 
+DEFINE_string(etcd_endpoints, "127.0.0.1:12379",
+              "Etcd endpoints for snapshot testing");
+
 namespace mooncake::test {
 
-class MasterServiceSnapshotTest : public MasterServiceSnapshotTestBase {
+class MasterServiceSnapshotParamTest
+    : public MasterServiceSnapshotParamTestBase {
    protected:
     static bool glog_initialized_;
 
     void SetUp() override {
-        // Call base class SetUp first to reset MasterMetricManager state
-        MasterServiceSnapshotTestBase::SetUp();
-
         if (!glog_initialized_) {
-            google::InitGoogleLogging("MasterServiceSnapshotTest");
+            google::InitGoogleLogging("MasterServiceSnapshotParamTest");
             FLAGS_logtostderr = true;
             glog_initialized_ = true;
         }
+        // Call parameterized base SetUp (handles etcd connection + GTEST_SKIP)
+        MasterServiceSnapshotParamTestBase::SetUp();
     }
 };
 
-bool MasterServiceSnapshotTest::glog_initialized_ = false;
+bool MasterServiceSnapshotParamTest::glog_initialized_ = false;
 
 std::string GenerateKeyForSegment(const UUID& client_id,
                                   const std::unique_ptr<MasterService>& service,
@@ -74,11 +78,11 @@ std::string GenerateKeyForSegment(const UUID& client_id,
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, MountUnmountSegmentWithOffsetAllocator) {
+TEST_P(MasterServiceSnapshotParamTest, MountUnmountSegmentWithOffsetAllocator) {
     auto service_config = MasterServiceConfig::builder()
                               .set_memory_allocator(BufferAllocatorType::OFFSET)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
     const auto original_base = segment.base;
@@ -131,8 +135,8 @@ TEST_F(MasterServiceSnapshotTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, RandomMountUnmountSegment) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, RandomMountUnmountSegment) {
+    CreateService();
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
     // Define the name of the test segment.
@@ -159,8 +163,8 @@ TEST_F(MasterServiceSnapshotTest, RandomMountUnmountSegment) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, ConcurrentMountUnmount) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, ConcurrentMountUnmount) {
+    CreateService();
     constexpr size_t num_threads = 4;
     constexpr size_t iterations = 100;
     std::vector<std::thread> threads;
@@ -195,8 +199,8 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentMountUnmount) {
     EXPECT_GT(success_count, 0);
 }
 
-TEST_F(MasterServiceSnapshotTest, PutStartInvalidParams) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, PutStartInvalidParams) {
+    CreateService();
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -216,8 +220,8 @@ TEST_F(MasterServiceSnapshotTest, PutStartInvalidParams) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, PutStartEndFlow) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, PutStartEndFlow) {
+    CreateService();
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     const UUID invalid_client_id = generate_uuid();
@@ -268,8 +272,8 @@ TEST_F(MasterServiceSnapshotTest, PutStartEndFlow) {
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
 
-TEST_F(MasterServiceSnapshotTest, RandomPutStartEndFlow) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, RandomPutStartEndFlow) {
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount 5 segments, each 16MB
@@ -316,12 +320,12 @@ TEST_F(MasterServiceSnapshotTest, RandomPutStartEndFlow) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, GetReplicaListByRegex) {
+TEST_P(MasterServiceSnapshotParamTest, GetReplicaListByRegex) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
     auto get_result = service_->GetReplicaList(".*non_existent.*");
@@ -373,12 +377,12 @@ void put_object(MasterService& service, const UUID& client_id,
         << "Key does not exist after put: " << key;
 }
 
-TEST_F(MasterServiceSnapshotTest, GetReplicaListByRegexComplex) {
+TEST_P(MasterServiceSnapshotParamTest, GetReplicaListByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_ = std::make_unique<MasterService>(service_config);
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // 1. Mount segment
@@ -492,8 +496,8 @@ TEST_F(MasterServiceSnapshotTest, GetReplicaListByRegexComplex) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, GetReplicaList) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, GetReplicaList) {
+    CreateService();
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
     auto get_result = service_->GetReplicaList("non_existent");
@@ -519,8 +523,8 @@ TEST_F(MasterServiceSnapshotTest, GetReplicaList) {
     EXPECT_FALSE(replica_list_local.empty());
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveObject) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, RemoveObject) {
+    CreateService();
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -549,8 +553,8 @@ TEST_F(MasterServiceSnapshotTest, RemoveObject) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result2.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, RandomRemoveObject) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, RandomRemoveObject) {
+    CreateService();
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -580,12 +584,12 @@ TEST_F(MasterServiceSnapshotTest, RandomRemoveObject) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveByRegex) {
+TEST_P(MasterServiceSnapshotParamTest, RemoveByRegex) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -617,12 +621,12 @@ TEST_F(MasterServiceSnapshotTest, RemoveByRegex) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveByRegexComplex) {
+TEST_P(MasterServiceSnapshotParamTest, RemoveByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_ = std::make_unique<MasterService>(service_config);
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // 1. Mount segment
@@ -690,7 +694,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<MasterService>(service_config);
+        CreateServiceFromConfig(service_config);
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -714,8 +718,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<MasterService>(
-            service_config);  // Reset the service
+        CreateServiceFromConfig(service_config);  // Reset the service
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -740,7 +743,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<MasterService>(service_config);  // Reset
+        CreateServiceFromConfig(service_config);  // Reset
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -765,7 +768,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<MasterService>(service_config);  // Reset
+        CreateServiceFromConfig(service_config);  // Reset
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -793,12 +796,12 @@ TEST_F(MasterServiceSnapshotTest, RemoveByRegexComplex) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveAll) {
+TEST_P(MasterServiceSnapshotParamTest, RemoveAll) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -828,12 +831,12 @@ TEST_F(MasterServiceSnapshotTest, RemoveAll) {
     // }
 }
 
-TEST_F(MasterServiceSnapshotTest, SingleSliceMultiReplicaFlow) {
+TEST_P(MasterServiceSnapshotParamTest, SingleSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // Mount 3 segments, each 64MB
@@ -895,8 +898,8 @@ TEST_F(MasterServiceSnapshotTest, SingleSliceMultiReplicaFlow) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, CleanupStaleHandlesTest) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, CleanupStaleHandlesTest) {
+    CreateService();
 
     // Mount a segment for testing
     constexpr size_t buffer = 0x300000000;
@@ -964,8 +967,8 @@ TEST_F(MasterServiceSnapshotTest, CleanupStaleHandlesTest) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, ConcurrentWriteAndRemoveAll) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, ConcurrentWriteAndRemoveAll) {
+    CreateService();
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
@@ -1039,13 +1042,13 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentWriteAndRemoveAll) {
     // ASSERT_EQ(total_removed, num_threads * objects_per_thread);
 }
 
-TEST_F(MasterServiceSnapshotTest, ConcurrentReadAndRemoveAll) {
+TEST_P(MasterServiceSnapshotParamTest, ConcurrentReadAndRemoveAll) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 200;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
@@ -1129,8 +1132,8 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentReadAndRemoveAll) {
     // }
 }
 
-TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, ConcurrentRemoveAllOperations) {
+    CreateService();
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16 * 100;
     auto segment = MakeSegment("concurrent_segment", buffer, size);
@@ -1184,8 +1187,8 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
     // }
 }
 
-TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, UnmountSegmentImmediateCleanup) {
+    CreateService();
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -1240,8 +1243,8 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
               segment2.name);
 }
 
-TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, ReadableAfterPartialUnmountWithReplication) {
+    CreateService();
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
@@ -1294,8 +1297,8 @@ TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
         << "Object should remain accessible with surviving replica";
 }
 
-TEST_F(MasterServiceSnapshotTest, UnmountSegmentPerformance) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, UnmountSegmentPerformance) {
+    CreateService();
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
@@ -1354,12 +1357,12 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentPerformance) {
               << "Unmount time: " << unmount_duration.count() << "ms\n";
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveLeasedObject) {
+TEST_P(MasterServiceSnapshotParamTest, RemoveLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -1443,12 +1446,12 @@ TEST_F(MasterServiceSnapshotTest, RemoveLeasedObject) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result4.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveAllLeasedObject) {
+TEST_P(MasterServiceSnapshotParamTest, RemoveAllLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     for (int i = 0; i < 10; ++i) {
@@ -1484,13 +1487,13 @@ TEST_F(MasterServiceSnapshotTest, RemoveAllLeasedObject) {
     // }
 }
 
-TEST_F(MasterServiceSnapshotTest, EvictObject) {
+TEST_P(MasterServiceSnapshotParamTest, EvictObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 2000;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
     // Mount a segment that can hold about 1024 * 16 objects.
     // As the eviction is processed separately for each shard,
@@ -1531,13 +1534,13 @@ TEST_F(MasterServiceSnapshotTest, EvictObject) {
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
 }
 
-TEST_F(MasterServiceSnapshotTest, TryEvictLeasedObject) {
+TEST_P(MasterServiceSnapshotParamTest, TryEvictLeasedObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 500;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -1584,7 +1587,7 @@ TEST_F(MasterServiceSnapshotTest, TryEvictLeasedObject) {
     // service_->RemoveAll();
 }
 
-TEST_F(MasterServiceSnapshotTest, RemoveSoftPinObject) {
+TEST_P(MasterServiceSnapshotParamTest, RemoveSoftPinObject) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
@@ -1595,7 +1598,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveSoftPinObject) {
                               .set_allow_evict_soft_pinned_objects(
                                   allow_evict_soft_pinned_objects)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -1627,7 +1630,7 @@ TEST_F(MasterServiceSnapshotTest, RemoveSoftPinObject) {
     // EXPECT_EQ(1, service_->RemoveAll());
 }
 
-TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
+TEST_P(MasterServiceSnapshotParamTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
@@ -1640,7 +1643,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
                                   allow_evict_soft_pinned_objects)
                               .set_eviction_ratio(eviction_ratio)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -1706,7 +1709,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, SoftPinObjectsCanBeEvicted) {
+TEST_P(MasterServiceSnapshotParamTest, SoftPinObjectsCanBeEvicted) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
@@ -1717,7 +1720,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsCanBeEvicted) {
                               .set_allow_evict_soft_pinned_objects(
                                   allow_evict_soft_pinned_objects)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -1758,7 +1761,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsCanBeEvicted) {
     // service_->RemoveAll();
 }
 
-TEST_F(MasterServiceSnapshotTest, SoftPinExtendedOnGet) {
+TEST_P(MasterServiceSnapshotParamTest, SoftPinExtendedOnGet) {
     const uint64_t kv_lease_ttl = 200;
     // The soft pin ttl shall not be too large, otherwise the test will take too
     // long
@@ -1775,7 +1778,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinExtendedOnGet) {
                                   allow_evict_soft_pinned_objects)
                               .set_eviction_ratio(eviction_ratio)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -1848,7 +1851,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinExtendedOnGet) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotAllowEvict) {
+TEST_P(MasterServiceSnapshotParamTest, SoftPinObjectsNotAllowEvict) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
@@ -1861,7 +1864,7 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotAllowEvict) {
                               .set_allow_evict_soft_pinned_objects(
                                   allow_evict_soft_pinned_objects)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -1900,8 +1903,8 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotAllowEvict) {
     // service_->RemoveAll();
 }
 
-TEST_F(MasterServiceSnapshotTest, ReplicaSegmentsAreUnique) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, ReplicaSegmentsAreUnique) {
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount 20 segments, each 16MB and slab-aligned
@@ -1940,8 +1943,8 @@ TEST_F(MasterServiceSnapshotTest, ReplicaSegmentsAreUnique) {
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, ReplicationFactorTwoWithSingleSegment) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, ReplicationFactorTwoWithSingleSegment) {
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount a single 16MB segment
@@ -1972,8 +1975,8 @@ TEST_F(MasterServiceSnapshotTest, ReplicationFactorTwoWithSingleSegment) {
     EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchExistKeyTest) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, BatchExistKeyTest) {
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount a segment
@@ -2013,8 +2016,8 @@ TEST_F(MasterServiceSnapshotTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchQueryIpTest) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, BatchQueryIpTest) {
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount a segment with a specific te_endpoint (IP:Port format)
@@ -2060,8 +2063,8 @@ TEST_F(MasterServiceSnapshotTest, BatchQueryIpTest) {
         << "Invalid client_id should not be in results";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchQueryIpMultipleSegmentsTest) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, BatchQueryIpMultipleSegmentsTest) {
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount multiple segments with different IPs for the same client
@@ -2104,8 +2107,8 @@ TEST_F(MasterServiceSnapshotTest, BatchQueryIpMultipleSegmentsTest) {
     EXPECT_NE(ip_set.find("192.168.1.1"), ip_set.end());
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchQueryIpEmptyClientIdTest) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, BatchQueryIpEmptyClientIdTest) {
+    CreateService();
 
     // Test with empty client_ids list
     std::vector<UUID> empty_client_ids;
@@ -2117,9 +2120,9 @@ TEST_F(MasterServiceSnapshotTest, BatchQueryIpEmptyClientIdTest) {
         << "Empty client_ids should return empty results";
 }
 
-TEST_F(MasterServiceSnapshotTest,
+TEST_P(MasterServiceSnapshotParamTest,
        BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
-    service_.reset(new MasterService());
+    CreateService();
     const UUID client_id = generate_uuid();
 
     // Mount multiple segments, all with empty te_endpoint
@@ -2156,7 +2159,7 @@ TEST_F(MasterServiceSnapshotTest,
         << "Client with all empty te_endpoints should have empty IP vector";
 }
 
-TEST_F(MasterServiceSnapshotTest, PutStartExpiringTest) {
+TEST_P(MasterServiceSnapshotParamTest, PutStartExpiringTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
@@ -2164,7 +2167,7 @@ TEST_F(MasterServiceSnapshotTest, PutStartExpiringTest) {
     MasterServiceConfig master_config;
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
-    service_.reset(new MasterService(master_config));
+    CreateServiceFromConfig(master_config);
 
     constexpr size_t kReplicaCnt = 3;
     constexpr size_t kBaseAddr = 0x300000000;
@@ -2303,10 +2306,10 @@ TEST_F(MasterServiceSnapshotTest, PutStartExpiringTest) {
     EXPECT_TRUE(put_end_result.has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, ConcurrentMountLocalDiskSegment) {
+TEST_P(MasterServiceSnapshotParamTest, ConcurrentMountLocalDiskSegment) {
     MasterServiceConfig config;
     config.enable_offload = true;
-    service_.reset(new MasterService(config));
+    CreateServiceFromConfig(config);
 
     constexpr size_t num_threads = 100;
     std::vector<std::thread> threads;
@@ -2332,11 +2335,11 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentMountLocalDiskSegment) {
     EXPECT_GT(success_count, 0);
 }
 
-TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
+TEST_P(MasterServiceSnapshotParamTest, OffloadObjectHeartbeat) {
     constexpr size_t key_cnt = 3000;
     MasterServiceConfig config;
     config.enable_offload = true;
-    service_.reset(new MasterService(config));
+    CreateServiceFromConfig(config);
     UUID client_id = generate_uuid();
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -2391,12 +2394,12 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearAllSegments) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearAllSegments) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -2443,13 +2446,13 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearAllSegments) {
     }
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearSpecificSegment) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearSpecificSegment) {
     // 1. Setup: Control the lease time
     const uint64_t kv_lease_ttl = 200;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     const UUID client_id = generate_uuid();
 
     // 2. Setup: Mount segments
@@ -2513,12 +2516,12 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearSpecificSegment) {
         << "Key should be removed after being cleared.";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithLeaseActive) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearWithLeaseActive) {
     const uint64_t kv_lease_ttl = 2000;  // Long lease
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -2553,12 +2556,12 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithLeaseActive) {
     ASSERT_TRUE(exist_result.value()) << "Key should still exist";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithDifferentClientId) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearWithDifferentClientId) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id1 = generate_uuid();
     const UUID client_id2 = generate_uuid();
@@ -2594,12 +2597,12 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithDifferentClientId) {
     ASSERT_TRUE(exist_result.value()) << "Key should still exist";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithNonExistentKeys) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearWithNonExistentKeys) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -2614,8 +2617,8 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithNonExistentKeys) {
         << "No keys should be cleared for non-existent keys";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithEmptyKeys) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearWithEmptyKeys) {
+    CreateService();
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -2630,12 +2633,12 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithEmptyKeys) {
         << "Empty keys list should return empty result";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithEmptyStringKeys) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearWithEmptyStringKeys) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -2665,12 +2668,12 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearWithEmptyStringKeys) {
     EXPECT_EQ(valid_key, cleared_keys[0]);
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchReplicaClearMixedScenario) {
+TEST_P(MasterServiceSnapshotParamTest, BatchReplicaClearMixedScenario) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id1 = generate_uuid();
     const UUID client_id2 = generate_uuid();
@@ -2734,13 +2737,13 @@ TEST_F(MasterServiceSnapshotTest, BatchReplicaClearMixedScenario) {
         << "key3 should still exist (different client_id)";
 }
 
-TEST_F(MasterServiceSnapshotTest, CreateCopyTaskTest) {
+TEST_P(MasterServiceSnapshotParamTest, CreateCopyTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
 
     // Create MasterService
-    service_.reset(new MasterService());
+    CreateService();
 
     // Mount 3 segments.
     constexpr size_t kReplicaCnt = 3;
@@ -2799,13 +2802,13 @@ TEST_F(MasterServiceSnapshotTest, CreateCopyTaskTest) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result3.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, CreateMoveTaskTest) {
+TEST_P(MasterServiceSnapshotParamTest, CreateMoveTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
 
     // Create MasterService
-    service_.reset(new MasterService());
+    CreateService();
 
     // Mount 3 segments.
     constexpr size_t kReplicaCnt = 3;
@@ -2877,13 +2880,13 @@ TEST_F(MasterServiceSnapshotTest, CreateMoveTaskTest) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, QueryTaskTest) {
+TEST_P(MasterServiceSnapshotParamTest, QueryTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
 
     // Create MasterService
-    service_.reset(new MasterService());
+    CreateService();
 
     // Mount 3 segments.
     constexpr size_t kReplicaCnt = 3;
@@ -2929,8 +2932,8 @@ TEST_F(MasterServiceSnapshotTest, QueryTaskTest) {
     EXPECT_EQ(contexts[0].client_id, query_result_move.value().assigned_client);
 }
 
-TEST_F(MasterServiceSnapshotTest, FetchTasksEmptyWhenNoTasks) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, FetchTasksEmptyWhenNoTasks) {
+    CreateService();
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
 
@@ -2939,9 +2942,9 @@ TEST_F(MasterServiceSnapshotTest, FetchTasksEmptyWhenNoTasks) {
     EXPECT_TRUE(fetch->empty());
 }
 
-TEST_F(MasterServiceSnapshotTest,
+TEST_P(MasterServiceSnapshotParamTest,
        FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
-    service_.reset(new MasterService());
+    CreateService();
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
     const auto ctx1 = PrepareSimpleSegment(*service_, "segment_1", 0x400000000,
@@ -3000,8 +3003,8 @@ TEST_F(MasterServiceSnapshotTest,
     EXPECT_TRUE(fetch0_again->empty());
 }
 
-TEST_F(MasterServiceSnapshotTest, FetchTasksRespectsBatchSize) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, FetchTasksRespectsBatchSize) {
+    CreateService();
 
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
@@ -3047,8 +3050,8 @@ TEST_F(MasterServiceSnapshotTest, FetchTasksRespectsBatchSize) {
     EXPECT_TRUE(fetch_third->empty());
 }
 
-TEST_F(MasterServiceSnapshotTest, UpdateTaskSuccessFlow) {
-    service_ = std::make_unique<MasterService>();
+TEST_P(MasterServiceSnapshotParamTest, UpdateTaskSuccessFlow) {
+    CreateService();
 
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
@@ -3105,8 +3108,8 @@ TEST_F(MasterServiceSnapshotTest, UpdateTaskSuccessFlow) {
     EXPECT_TRUE(fetched_again->empty());
 }
 
-TEST_F(MasterServiceSnapshotTest, UpdateTaskRejectsWrongClient) {
-    service_ = std::make_unique<MasterService>();
+TEST_P(MasterServiceSnapshotParamTest, UpdateTaskRejectsWrongClient) {
+    CreateService();
 
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
@@ -3147,8 +3150,8 @@ TEST_F(MasterServiceSnapshotTest, UpdateTaskRejectsWrongClient) {
     EXPECT_EQ(update_res.error(), ErrorCode::ILLEGAL_CLIENT);
 }
 
-TEST_F(MasterServiceSnapshotTest, UpdateTaskNotFound) {
-    service_ = std::make_unique<MasterService>();
+TEST_P(MasterServiceSnapshotParamTest, UpdateTaskNotFound) {
+    CreateService();
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
 
@@ -3162,12 +3165,12 @@ TEST_F(MasterServiceSnapshotTest, UpdateTaskNotFound) {
     EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
 }
 
-TEST_F(MasterServiceSnapshotTest, CopyStart) {
+TEST_P(MasterServiceSnapshotParamTest, CopyStart) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_ = std::make_unique<MasterService>(service_config);
+    CreateServiceFromConfig(service_config);
 
     // Mount 4 segments (segment_1, segment_2, segment_3, segment_4) with
     // PrepareSimpleSegment
@@ -3305,8 +3308,8 @@ TEST_F(MasterServiceSnapshotTest, CopyStart) {
     // EXPECT_TRUE(remove_result.has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, CopyEnd) {
-    service_ = std::make_unique<MasterService>();
+TEST_P(MasterServiceSnapshotParamTest, CopyEnd) {
+    CreateService();
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
@@ -3416,8 +3419,8 @@ TEST_F(MasterServiceSnapshotTest, CopyEnd) {
                                .buffer_descriptor.transport_endpoint_);
 }
 
-TEST_F(MasterServiceSnapshotTest, CopyRevoke) {
-    service_ = std::make_unique<MasterService>();
+TEST_P(MasterServiceSnapshotParamTest, CopyRevoke) {
+    CreateService();
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
@@ -3501,8 +3504,8 @@ TEST_F(MasterServiceSnapshotTest, CopyRevoke) {
     EXPECT_FALSE(get_result.has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, MoveEnd) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, MoveEnd) {
+    CreateService();
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
@@ -3580,8 +3583,8 @@ TEST_F(MasterServiceSnapshotTest, MoveEnd) {
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
 }
 
-TEST_F(MasterServiceSnapshotTest, MoveRevoke) {
-    service_.reset(new MasterService());
+TEST_P(MasterServiceSnapshotParamTest, MoveRevoke) {
+    CreateService();
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment
     [[maybe_unused]] const auto context1 =
@@ -3667,12 +3670,12 @@ TEST_F(MasterServiceSnapshotTest, MoveRevoke) {
     EXPECT_FALSE(get_result.has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, MoveStart) {
+TEST_P(MasterServiceSnapshotParamTest, MoveStart) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
@@ -3802,14 +3805,14 @@ TEST_F(MasterServiceSnapshotTest, MoveStart) {
     EXPECT_TRUE(remove_result.has_value());
 }
 
-TEST_F(MasterServiceSnapshotTest, ProtectCopyMoveSourceFromEviction) {
+TEST_P(MasterServiceSnapshotParamTest, ProtectCopyMoveSourceFromEviction) {
     const uint64_t kv_lease_ttl = 100;
     const uint64_t client_live_ttl = 600;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .set_client_live_ttl_sec(client_live_ttl)
                               .build();
-    service_.reset(new MasterService(service_config));
+    CreateServiceFromConfig(service_config);
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment, each
     // 16 MB
@@ -3881,9 +3884,27 @@ TEST_F(MasterServiceSnapshotTest, ProtectCopyMoveSourceFromEviction) {
     EXPECT_TRUE(move_end_result.has_value());
 }
 
+// ===========================================================================
+// Parameter instantiation
+// ===========================================================================
+INSTANTIATE_TEST_SUITE_P(LocalFile, MasterServiceSnapshotParamTest,
+                         ::testing::Values(SnapshotBackendType::LOCAL_FILE),
+                         [](const auto& /*info*/) -> std::string {
+                             return "LocalFile";
+                         });
+
+#ifdef STORE_USE_ETCD
+INSTANTIATE_TEST_SUITE_P(Etcd, MasterServiceSnapshotParamTest,
+                         ::testing::Values(SnapshotBackendType::ETCD),
+                         [](const auto& /*info*/) -> std::string {
+                             return "Etcd";
+                         });
+#endif
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    gflags::ParseCommandLineFlags(&argc, &argv, true);
     return RUN_ALL_TESTS();
 }

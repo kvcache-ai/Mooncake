@@ -14,13 +14,25 @@ namespace fs = std::filesystem;
 
 // Snapshot storage backend type enumeration
 enum class SnapshotBackendType {
-    LOCAL_FILE = 0,  // Local file system
-    S3 = 1           // S3 storage
+    LOCAL_FILE = 0,  // Local file system (default)
+    S3 = 1,          // S3 storage
+    ETCD = 2         // Etcd storage
 };
 
 // Convert string to SnapshotBackendType
 inline SnapshotBackendType ParseSnapshotBackendType(
     const std::string& type_str) {
+#ifdef STORE_USE_ETCD
+    if (type_str == "etcd" || type_str == "ETCD") {
+        return SnapshotBackendType::ETCD;
+    }
+#else
+    if (type_str == "etcd" || type_str == "ETCD") {
+        throw std::invalid_argument(
+            "ETCD backend requested but STORE_USE_ETCD is not enabled. "
+            "Please rebuild with STORE_USE_ETCD or use 'local' backend.");
+    }
+#endif
 #ifdef HAVE_AWS_SDK
     if (type_str == "s3" || type_str == "S3") {
         return SnapshotBackendType::S3;
@@ -44,6 +56,8 @@ inline SnapshotBackendType ParseSnapshotBackendType(
 // Convert SnapshotBackendType to string
 inline std::string SnapshotBackendTypeToString(SnapshotBackendType type) {
     switch (type) {
+        case SnapshotBackendType::ETCD:
+            return "etcd";
         case SnapshotBackendType::S3:
             return "s3";
         case SnapshotBackendType::LOCAL_FILE:
@@ -126,9 +140,11 @@ class SerializerBackend {
     /**
      * @brief Factory method: create backend instance by type
      * @param type Backend type
+     * @param etcd_endpoints Etcd endpoints (for ETCD backend)
      * @return Smart pointer to backend instance
      */
-    static std::unique_ptr<SerializerBackend> Create(SnapshotBackendType type);
+    static std::unique_ptr<SerializerBackend> Create(
+        SnapshotBackendType type, const std::string& etcd_endpoints = "");
 };
 
 #ifdef HAVE_AWS_SDK
@@ -169,6 +185,44 @@ class S3Backend : public SerializerBackend {
     std::unique_ptr<Impl> impl_;
 };
 #endif  // HAVE_AWS_SDK
+
+#ifdef STORE_USE_ETCD
+/**
+ * @brief Etcd storage backend implementation
+ *
+ * Stores snapshot data to etcd cluster.
+ * Note: This backend is used for restore only. Upload is handled by daemon.
+ */
+class EtcdBackend : public SerializerBackend {
+   public:
+    explicit EtcdBackend(const std::string& endpoints);
+    ~EtcdBackend() override = default;
+
+    tl::expected<void, std::string> UploadBuffer(
+        const std::string& key, const std::vector<uint8_t>& buffer) override;
+
+    tl::expected<void, std::string> DownloadBuffer(
+        const std::string& key, std::vector<uint8_t>& buffer) override;
+
+    tl::expected<void, std::string> UploadString(
+        const std::string& key, const std::string& data) override;
+
+    tl::expected<void, std::string> DownloadString(const std::string& key,
+                                                   std::string& data) override;
+
+    tl::expected<void, std::string> DeleteObjectsWithPrefix(
+        const std::string& prefix) override;
+
+    tl::expected<void, std::string> ListObjectsWithPrefix(
+        const std::string& prefix,
+        std::vector<std::string>& object_keys) override;
+
+    std::string GetConnectionInfo() const override;
+
+   private:
+    std::string endpoints_;
+};
+#endif  // STORE_USE_ETCD
 
 /**
  * @brief Local file storage backend implementation

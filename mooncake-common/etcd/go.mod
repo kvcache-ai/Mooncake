@@ -2,7 +2,7 @@ module github.com/kvcache-ai/Mooncake/mooncake-common/etcd
 
 go 1.23.0
 
-toolchain go1.23.7
+toolchain go1.24.11
 
 require go.etcd.io/etcd/client/v3 v3.5.21
 

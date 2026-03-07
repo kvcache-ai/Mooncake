@@ -11,6 +11,10 @@
 #include "utils/s3_helper.h"
 #endif
 
+#ifdef STORE_USE_ETCD
+#include "libetcd_wrapper.h"
+#endif
+
 namespace fs = std::filesystem;
 
 namespace mooncake {
@@ -20,8 +24,17 @@ namespace mooncake {
 // ============================================================================
 
 std::unique_ptr<SerializerBackend> SerializerBackend::Create(
-    SnapshotBackendType type) {
+    SnapshotBackendType type, const std::string& etcd_endpoints) {
     switch (type) {
+#ifdef STORE_USE_ETCD
+        case SnapshotBackendType::ETCD:
+            return std::make_unique<EtcdBackend>(etcd_endpoints);
+#else
+        case SnapshotBackendType::ETCD:
+            throw std::runtime_error(
+                "ETCD backend requested but STORE_USE_ETCD not enabled. "
+                "Please rebuild with STORE_USE_ETCD or use 'local' backend.");
+#endif
 #ifdef HAVE_AWS_SDK
         case SnapshotBackendType::S3:
             return std::make_unique<S3Backend>();
@@ -468,5 +481,125 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
 std::string LocalFileBackend::GetConnectionInfo() const {
     return fmt::format("LocalFileBackend: base_path={}", base_path_.string());
 }
+
+// ============================================================================
+// EtcdBackend implementation (compiled only when STORE_USE_ETCD is defined)
+// ============================================================================
+
+#ifdef STORE_USE_ETCD
+
+EtcdBackend::EtcdBackend(const std::string& endpoints) : endpoints_(endpoints) {
+    LOG(INFO) << "EtcdBackend initialized with endpoints: " << endpoints_;
+
+    // Initialize snapshot etcd client
+    char* err_msg = nullptr;
+    int ret = NewSnapshotEtcdClient(const_cast<char*>(endpoints_.c_str()), &err_msg);
+    if (ret != 0 && ret != -2) {  // -2 means already initialized
+        std::string error = err_msg ? err_msg : "unknown error";
+        if (err_msg) free(err_msg);
+        LOG(ERROR) << "Failed to initialize snapshot etcd client: " << error;
+        throw std::runtime_error("Failed to initialize snapshot etcd client: " + error);
+    }
+    if (err_msg) free(err_msg);
+}
+
+tl::expected<void, std::string> EtcdBackend::UploadBuffer(
+    const std::string& key, const std::vector<uint8_t>& buffer) {
+    char* err_msg = nullptr;
+    int ret = SnapshotStorePutWrapper(
+        const_cast<char*>(key.c_str()), static_cast<int>(key.size()),
+        const_cast<char*>(reinterpret_cast<const char*>(buffer.data())),
+        static_cast<int>(buffer.size()), &err_msg);
+
+    if (ret != 0) {
+        std::string error = err_msg ? err_msg : "unknown error";
+        if (err_msg) free(err_msg);
+        return tl::make_unexpected(
+            fmt::format("Failed to upload buffer to etcd: {}", error));
+    }
+
+    VLOG(1) << "Successfully uploaded buffer to etcd: " << key
+            << ", size: " << buffer.size();
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DownloadBuffer(
+    const std::string& key, std::vector<uint8_t>& buffer) {
+    char* value = nullptr;
+    int value_size = 0;
+    GoInt64 revision_id = 0;
+    char* err_msg = nullptr;
+
+    int ret = SnapshotStoreGetWrapper(
+        const_cast<char*>(key.c_str()), static_cast<int>(key.size()),
+        &value, &value_size, &revision_id, &err_msg);
+
+    if (ret != 0) {
+        std::string error = err_msg ? err_msg : "unknown error";
+        if (err_msg) free(err_msg);
+        return tl::make_unexpected(
+            fmt::format("Failed to download buffer from etcd: {}", error));
+    }
+
+    buffer.assign(reinterpret_cast<uint8_t*>(value),
+                  reinterpret_cast<uint8_t*>(value) + value_size);
+    free(value);
+
+    VLOG(1) << "Successfully downloaded buffer from etcd: " << key
+            << ", size: " << buffer.size();
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::UploadString(
+    const std::string& key, const std::string& data) {
+    std::vector<uint8_t> buffer(data.begin(), data.end());
+    return UploadBuffer(key, buffer);
+}
+
+tl::expected<void, std::string> EtcdBackend::DownloadString(
+    const std::string& key, std::string& data) {
+    std::vector<uint8_t> buffer;
+    auto result = DownloadBuffer(key, buffer);
+    if (!result) {
+        return result;
+    }
+    data.assign(reinterpret_cast<char*>(buffer.data()), buffer.size());
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DeleteObjectsWithPrefix(
+    const std::string& prefix) {
+    char* err_msg = nullptr;
+    // usePrefix=1 to delete all keys with the given prefix
+    int ret = SnapshotStoreDeleteWrapper(
+        const_cast<char*>(prefix.c_str()), static_cast<int>(prefix.size()),
+        1,  // usePrefix = true
+        &err_msg);
+
+    if (ret != 0) {
+        std::string error = err_msg ? err_msg : "unknown error";
+        if (err_msg) free(err_msg);
+        return tl::make_unexpected(
+            fmt::format("Failed to delete objects with prefix from etcd: {}", error));
+    }
+
+    VLOG(1) << "Successfully deleted objects with prefix from etcd: " << prefix;
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::ListObjectsWithPrefix(
+    const std::string& prefix, std::vector<std::string>& object_keys) {
+    // Note: ETCD doesn't have native prefix listing like S3
+    // This is a simplified implementation that may not work for all cases
+    LOG(WARNING) << "EtcdBackend::ListObjectsWithPrefix is not fully implemented";
+    object_keys.clear();
+    return {};
+}
+
+std::string EtcdBackend::GetConnectionInfo() const {
+    return fmt::format("EtcdBackend: endpoints={}", endpoints_);
+}
+
+#endif  // STORE_USE_ETCD
 
 }  // namespace mooncake

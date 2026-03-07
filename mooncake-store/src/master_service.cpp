@@ -8,6 +8,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <signal.h>
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
@@ -27,6 +30,7 @@ namespace mooncake {
 static const std::string SNAPSHOT_METADATA_FILE = "metadata";
 static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
+// Persistent metadata info, data format: protocol|version|snapshot_id
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
 static const std::string SNAPSHOT_ROOT = "mooncake_master_snapshot";
@@ -63,25 +67,22 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       snapshot_retention_count_(config.snapshot_retention_count),
+      snapshot_backend_(
+          (config.enable_snapshot || config.enable_snapshot_restore)
+              ? SerializerBackend::Create(config.snapshot_backend_type,
+                                          config.etcd_endpoints)
+              : nullptr),
+      snapshot_backend_type_(config.snapshot_backend_type),
+      etcd_endpoints_(config.etcd_endpoints),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
-    if (enable_snapshot_ || enable_snapshot_restore_) {
-        try {
-            auto backend_type =
-                ParseSnapshotBackendType(config.snapshot_backend_type);
-            snapshot_backend_ = SerializerBackend::Create(backend_type);
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to create snapshot backend: " << e.what();
-            throw std::runtime_error(
-                fmt::format("Failed to create snapshot backend: {}", e.what()));
-        }
-        if (!snapshot_backup_dir_.empty()) {
-            use_snapshot_backup_dir_ = true;
-        }
+    if ((enable_snapshot_ || enable_snapshot_restore_) &&
+        !snapshot_backup_dir_.empty()) {
+        use_snapshot_backup_dir_ = true;
     }
 
     if (enable_snapshot_restore_) {
@@ -138,6 +139,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (enable_snapshot_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
+            // Start snapshot daemon for ETCD backend
+            if (snapshot_backend_type_ == SnapshotBackendType::ETCD) {
+                if (!StartSnapshotDaemon()) {
+                    LOG(ERROR) << "Failed to start snapshot daemon, "
+                                  "ETCD snapshot will not work";
+                }
+            }
             snapshot_running_ = true;
             snapshot_thread_ =
                 std::thread(&MasterService::SnapshotThreadFunc, this);
@@ -173,6 +181,9 @@ MasterService::~MasterService() {
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
     }
+
+    // Stop snapshot daemon
+    StopSnapshotDaemon();
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
@@ -2110,20 +2121,20 @@ void MasterService::HandleChildExit(pid_t pid, int status,
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
+        auto serializer_type_str = "messagepack";
         SNAP_LOG_INFO(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
-            snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
+            snapshot_id, serializer_type_str, SNAPSHOT_SERIALIZER_VERSION);
         MetadataSerializer metadata_serializer(this);
         SegmentSerializer segment_serializer(&segment_manager_);
-        TaskManagerSerializer task_manager_serializer(&task_manager_);
 
         auto metadata_result = metadata_serializer.Serialize();
         if (!metadata_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] metadata serialization failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, toString(metadata_result.error().code),
+                snapshot_id, static_cast<int>(metadata_result.error().code),
                 metadata_result.error().message);
 
             return tl::make_unexpected(metadata_result.error());
@@ -2137,7 +2148,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] segment serialization failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, toString(segment_result.error().code),
+                snapshot_id, static_cast<int>(segment_result.error().code),
                 segment_result.error().message);
             return tl::make_unexpected(segment_result.error());
         }
@@ -2145,109 +2156,99 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             "[Snapshot] segment serialization_successful, snapshot_id={}",
             snapshot_id);
 
-        auto task_manager_result = task_manager_serializer.Serialize();
-        if (!task_manager_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task manager serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(task_manager_result.error().code),
-                task_manager_result.error().message);
-            return tl::make_unexpected(task_manager_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] task manager serialization_successful, snapshot_id={}",
-            snapshot_id);
-
         // Create storage path prefix
         std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
         const auto& serialized_metadata = metadata_result.value();
         const auto& serialized_segment = segment_result.value();
-        const auto& serialized_task_manager = task_manager_result.value();
 
-        // When backup_dir is enabled, try all uploads to ensure complete backup
-        // When backup_dir is disabled, use fail-fast mode
-        bool upload_success = true;
-        std::string error_msg;
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
                       snapshot_backend_->GetConnectionInfo());
 
-        // Upload metadata
+        // ETCD backend: use daemon for upload
+        if (snapshot_backend_type_ == SnapshotBackendType::ETCD &&
+            snapshot_daemon_pid_ != -1) {
+            return PersistStateViaEtcdDaemon(
+                snapshot_id, path_prefix, serialized_metadata,
+                serialized_segment, serializer_type_str);
+        }
+
+        // LOCAL/S3 backend: direct upload
+        bool upload_success = true;
+        std::string error_msg;
+
+        // upload metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         auto upload_result =
             UploadSnapshotFile(serialized_metadata, metadata_path,
                                SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] metadata upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, metadata_path,
-                toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
             error_msg.append(upload_result.error().message + "\n");
             upload_success = false;
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
+            }
         }
 
-        // Upload segment
+        // upload segment
         std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         upload_result = UploadSnapshotFile(serialized_segment, segment_path,
                                            SNAPSHOT_SEGMENTS_FILE, snapshot_id);
         if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, segment_path, toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
             error_msg.append(upload_result.error().message + "\n");
             upload_success = false;
-        }
-
-        // Upload task manager
-        std::string task_manager_path =
-            path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
-        upload_result =
-            UploadSnapshotFile(serialized_task_manager, task_manager_path,
-                               SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
-        if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task_manager upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, task_manager_path,
-                toString(upload_result.error().code),
-                upload_result.error().message);
             if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
             }
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
         }
 
-        // Upload manifest
+        // upload task_manager
+        TaskManagerSerializer task_manager_serializer(&task_manager_);
+        auto task_manager_result = task_manager_serializer.Serialize();
+        if (!task_manager_result) {
+            SNAP_LOG_ERROR(
+                "[Snapshot] task_manager serialization failed, "
+                "snapshot_id={}, code={}, msg={}",
+                snapshot_id, static_cast<int>(task_manager_result.error().code),
+                task_manager_result.error().message);
+            error_msg.append(task_manager_result.error().message + "\n");
+            upload_success = false;
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
+            }
+        } else {
+            std::string task_manager_path =
+                path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
+            upload_result = UploadSnapshotFile(
+                task_manager_result.value(), task_manager_path,
+                SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
+            if (!upload_result) {
+                error_msg.append(upload_result.error().message + "\n");
+                upload_success = false;
+                if (!use_snapshot_backup_dir_) {
+                    return tl::make_unexpected(SerializationError(
+                        ErrorCode::PERSISTENT_FAIL, error_msg));
+                }
+            }
+        }
+
         std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
-            fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
+            fmt::format("{}|{}|{}", serializer_type_str,
                         SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
                                             manifest_content.end());
         upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
                                            SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] manifest upload failed, snapshot_id={}, "
-                "path={}, code={}, msg={}",
-                snapshot_id, manifest_path,
-                toString(upload_result.error().code),
-                upload_result.error().message);
-            if (!use_snapshot_backup_dir_) {
-                return tl::make_unexpected(upload_result.error());
-            }
             error_msg.append(upload_result.error().message + "\n");
             upload_success = false;
+            if (!use_snapshot_backup_dir_) {
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
+            }
         }
 
         if (!upload_success) {
@@ -2266,19 +2267,15 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             SNAP_LOG_ERROR(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}",
                 snapshot_id, latest_path);
-            if (use_snapshot_backup_dir_) {
-                auto save_path = fs::path(snapshot_backup_dir_) /
-                                 SNAPSHOT_BACKUP_SAVE_DIR /
-                                 SNAPSHOT_LATEST_FILE;
-                auto save_result =
-                    FileUtil::SaveStringToFile(latest_content, save_path);
-                if (!save_result) {
-                    SNAP_LOG_ERROR(
-                        "[Snapshot] save latest to disk failed, "
-                        "snapshot_id={}, "
-                        "content={}, file={}",
-                        snapshot_id, latest_content, save_path.string());
-                }
+            auto save_path =
+                fs::path(snapshot_backup_dir_) / "save" / SNAPSHOT_LATEST_FILE;
+            auto save_result =
+                FileUtil::SaveStringToFile(latest_content, save_path);
+            if (!save_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] save latest to disk failed, snapshot_id={}, "
+                    "content={}, file={}",
+                    snapshot_id, latest_content, save_path.string());
             }
 
             return tl::make_unexpected(SerializationError(
@@ -2450,14 +2447,6 @@ void MasterService::RestoreState() {
             return;
         }
 
-        // Validate snapshot ID format
-        static const std::regex snapshot_id_regex(R"(^\d{8}_\d{6}_\d{3}$)");
-        if (!std::regex_match(latest_content, snapshot_id_regex)) {
-            LOG(ERROR) << "[Restore] Invalid snapshot ID format: "
-                       << latest_content << ", starting fresh";
-            return;
-        }
-
         std::string state_id = latest_content;
         std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
 
@@ -2471,15 +2460,13 @@ void MasterService::RestoreState() {
             return;
         }
 
-        if (use_snapshot_backup_dir_) {
-            auto save_result = FileUtil::SaveStringToFile(
-                manifest_content, fs::path(snapshot_backup_dir_) /
-                                      SNAPSHOT_BACKUP_RESTORE_DIR /
-                                      SNAPSHOT_MANIFEST_FILE);
-            if (!save_result) {
-                LOG(ERROR) << "[Restore] Failed to save manifest to file: "
-                           << save_result.error();
-            }
+        auto save_result = FileUtil::SaveStringToFile(
+            manifest_content, fs::path(snapshot_backup_dir_) /
+                                  SNAPSHOT_BACKUP_RESTORE_DIR /
+                                  SNAPSHOT_MANIFEST_FILE);
+        if (!save_result) {
+            LOG(ERROR) << "[Restore] Failed to save manifest to file: "
+                       << save_result.error();
         }
 
         // Format: protocol_type|version|20230801_123456_000
@@ -2502,21 +2489,6 @@ void MasterService::RestoreState() {
         LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
 
-        // Strict compatibility check: fail fast on version/protocol mismatch
-        if (protocol_type != SNAPSHOT_SERIALIZER_TYPE) {
-            LOG(ERROR) << "[Restore] Unsupported protocol type: "
-                       << protocol_type
-                       << ", expected: " << SNAPSHOT_SERIALIZER_TYPE
-                       << ", starting fresh";
-            return;
-        }
-        if (version != SNAPSHOT_SERIALIZER_VERSION) {
-            LOG(ERROR) << "[Restore] Incompatible snapshot version: " << version
-                       << ", expected: " << SNAPSHOT_SERIALIZER_VERSION
-                       << ", starting fresh";
-            return;
-        }
-
         // 3. Download metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
@@ -2528,15 +2500,13 @@ void MasterService::RestoreState() {
             return;
         }
 
-        if (use_snapshot_backup_dir_) {
-            auto save_result = FileUtil::SaveBinaryToFile(
-                metadata_content, fs::path(snapshot_backup_dir_) /
-                                      SNAPSHOT_BACKUP_RESTORE_DIR /
-                                      SNAPSHOT_METADATA_FILE);
-            if (!save_result) {
-                LOG(ERROR) << "[Restore] Failed to save metadata to file: "
-                           << save_result.error();
-            }
+        save_result = FileUtil::SaveBinaryToFile(
+            metadata_content, fs::path(snapshot_backup_dir_) /
+                                  SNAPSHOT_BACKUP_RESTORE_DIR /
+                                  SNAPSHOT_METADATA_FILE);
+        if (!save_result) {
+            LOG(ERROR) << "[Restore] Failed to save metadata to file: "
+                       << save_result.error();
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
@@ -2550,46 +2520,47 @@ void MasterService::RestoreState() {
                        << " error=" << download_result.error();
             return;
         }
-        if (use_snapshot_backup_dir_) {
-            auto save_result = FileUtil::SaveBinaryToFile(
-                segments_content, fs::path(snapshot_backup_dir_) /
-                                      SNAPSHOT_BACKUP_RESTORE_DIR /
-                                      SNAPSHOT_SEGMENTS_FILE);
-            if (!save_result) {
-                LOG(ERROR) << "[Restore] Failed to save segments to file: "
-                           << save_result.error();
-            }
+        save_result = FileUtil::SaveBinaryToFile(
+            segments_content, fs::path(snapshot_backup_dir_) /
+                                  SNAPSHOT_BACKUP_RESTORE_DIR /
+                                  SNAPSHOT_SEGMENTS_FILE);
+        if (!save_result) {
+            LOG(ERROR) << "[Restore] Failed to save segments to file: "
+                       << save_result.error();
         }
         LOG(INFO) << "[Restore] Download segments file success";
 
-        // 5. Download task manager state
+        // 4.5. Download task_manager (optional, best-effort)
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
         std::vector<uint8_t> task_manager_content;
-        download_result = snapshot_backend_->DownloadBuffer(
-            task_manager_path, task_manager_content);
-        if (!download_result) {
-            LOG(ERROR) << "Failed to download task manager file: "
-                       << task_manager_path
-                       << " error=" << download_result.error();
-            return;
-        }
-        if (use_snapshot_backup_dir_) {
-            auto save_result = FileUtil::SaveBinaryToFile(
-                task_manager_content, fs::path(snapshot_backup_dir_) /
-                                          SNAPSHOT_BACKUP_RESTORE_DIR /
-                                          SNAPSHOT_TASK_MANAGER_FILE);
-            if (!save_result) {
-                LOG(ERROR) << "[Restore] Failed to save task manager to file: "
-                           << save_result.error();
+        bool task_manager_downloaded = false;
+        {
+            auto tm_download_result = snapshot_backend_->DownloadBuffer(
+                task_manager_path, task_manager_content);
+            if (tm_download_result) {
+                task_manager_downloaded = true;
+                save_result = FileUtil::SaveBinaryToFile(
+                    task_manager_content, fs::path(snapshot_backup_dir_) /
+                                              SNAPSHOT_BACKUP_RESTORE_DIR /
+                                              SNAPSHOT_TASK_MANAGER_FILE);
+                if (!save_result) {
+                    LOG(ERROR)
+                        << "[Restore] Failed to save task_manager to file: "
+                        << save_result.error();
+                }
+                LOG(INFO) << "[Restore] Download task_manager file success";
+            } else {
+                LOG(WARNING)
+                    << "[Restore] Failed to download task_manager file: "
+                    << tm_download_result.error()
+                    << ", continuing restore without task_manager";
             }
         }
-        LOG(INFO) << "[Restore] Download task manager file success";
 
-        // 6. Deserialize state
+        // 5. Deserialize state
         SegmentSerializer segment_serializer(&segment_manager_);
         MetadataSerializer metadata_serializer(this);
-        TaskManagerSerializer task_manager_serializer(&task_manager_);
 
         auto segments_result = segment_serializer.Deserialize(segments_content);
         if (!segments_result) {
@@ -2613,19 +2584,18 @@ void MasterService::RestoreState() {
 
         LOG(INFO) << "[Restore] Deserialize metadata success";
 
-        auto task_manager_result =
-            task_manager_serializer.Deserialize(task_manager_content);
-        if (!task_manager_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize task manager: "
-                       << task_manager_result.error().code << " - "
-                       << task_manager_result.error().message;
-            task_manager_serializer.Reset();
-            metadata_serializer.Reset();
-            segment_serializer.Reset();
-            return;
+        if (task_manager_downloaded) {
+            TaskManagerSerializer task_manager_serializer(&task_manager_);
+            auto tm_deser_result =
+                task_manager_serializer.Deserialize(task_manager_content);
+            if (!tm_deser_result) {
+                LOG(WARNING) << "[Restore] Failed to deserialize task_manager: "
+                             << tm_deser_result.error().message;
+                task_manager_serializer.Reset();
+            } else {
+                LOG(INFO) << "[Restore] Deserialize task_manager success";
+            }
         }
-
-        LOG(INFO) << "[Restore] Deserialize task manager success";
 
         std::vector<std::string> segment_names;
         {
@@ -3015,7 +2985,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
@@ -3835,6 +3806,324 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
         service_->discarded_replicas_ = std::move(temp_list);
     }
 
+    return {};
+}
+
+// ============================================================================
+// ETCD Daemon functions
+// ============================================================================
+
+bool MasterService::StartSnapshotDaemon() {
+    std::lock_guard<std::mutex> lock(snapshot_daemon_mutex_);
+
+    if (snapshot_daemon_pid_ != -1) {
+        LOG(WARNING) << "[SnapshotDaemon] Daemon already running, pid="
+                     << snapshot_daemon_pid_;
+        return true;
+    }
+
+    // Create socket path (use /tmp as fallback when backup_dir is not set)
+    std::string socket_base_dir =
+        snapshot_backup_dir_.empty() ? "/tmp" : snapshot_backup_dir_;
+    snapshot_daemon_socket_path_ = socket_base_dir + "/snapshot_daemon_" +
+                                   std::to_string(getpid()) + ".sock";
+
+    // Ensure backup dir exists
+    auto dir_result = FileUtil::EnsureDirExists(snapshot_backup_dir_);
+    if (!dir_result) {
+        LOG(ERROR) << "[SnapshotDaemon] Failed to create backup dir: "
+                   << snapshot_backup_dir_;
+        return false;
+    }
+
+    // Remove existing socket file
+    unlink(snapshot_daemon_socket_path_.c_str());
+
+    // Find daemon executable
+    std::string daemon_path = "./snapshot_uploader_daemon";
+    if (access(daemon_path.c_str(), X_OK) != 0) {
+        // Try relative to executable
+        daemon_path = "../bin/snapshot_uploader_daemon";
+        if (access(daemon_path.c_str(), X_OK) != 0) {
+            LOG(ERROR) << "[SnapshotDaemon] Daemon executable not found";
+            return false;
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        LOG(ERROR) << "[SnapshotDaemon] Fork failed: " << strerror(errno);
+        return false;
+    }
+
+    if (pid == 0) {
+        // Child process: exec daemon
+        execl(daemon_path.c_str(), "snapshot_uploader_daemon",
+              etcd_endpoints_.c_str(), snapshot_daemon_socket_path_.c_str(),
+              nullptr);
+        // If exec fails
+        LOG(ERROR) << "[SnapshotDaemon] Exec failed: " << strerror(errno);
+        _exit(1);
+    }
+
+    // Parent process
+    snapshot_daemon_pid_ = pid;
+    LOG(INFO) << "[SnapshotDaemon] Started daemon, pid=" << pid
+              << ", socket=" << snapshot_daemon_socket_path_;
+
+    // Wait for daemon to be ready (socket file exists)
+    for (int i = 0; i < 50; i++) {  // Wait up to 5 seconds
+        if (access(snapshot_daemon_socket_path_.c_str(), F_OK) == 0) {
+            LOG(INFO) << "[SnapshotDaemon] Daemon is ready";
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    LOG(ERROR) << "[SnapshotDaemon] Daemon failed to start in time";
+    kill(snapshot_daemon_pid_, SIGKILL);
+    waitpid(snapshot_daemon_pid_, nullptr, 0);
+    snapshot_daemon_pid_ = -1;
+    return false;
+}
+
+void MasterService::StopSnapshotDaemon() {
+    std::lock_guard<std::mutex> lock(snapshot_daemon_mutex_);
+
+    if (snapshot_daemon_pid_ == -1) {
+        return;
+    }
+
+    LOG(INFO) << "[SnapshotDaemon] Stopping daemon, pid="
+              << snapshot_daemon_pid_;
+
+    // Send SIGTERM first
+    if (kill(snapshot_daemon_pid_, SIGTERM) == 0) {
+        // Wait up to 5 seconds for graceful shutdown
+        for (int i = 0; i < 50; i++) {
+            int status;
+            pid_t result = waitpid(snapshot_daemon_pid_, &status, WNOHANG);
+            if (result == snapshot_daemon_pid_) {
+                LOG(INFO) << "[SnapshotDaemon] Daemon stopped gracefully";
+                snapshot_daemon_pid_ = -1;
+                unlink(snapshot_daemon_socket_path_.c_str());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // Force kill if still running
+        LOG(WARNING) << "[SnapshotDaemon] Daemon didn't stop gracefully, "
+                        "sending SIGKILL";
+        kill(snapshot_daemon_pid_, SIGKILL);
+    }
+
+    waitpid(snapshot_daemon_pid_, nullptr, 0);
+    snapshot_daemon_pid_ = -1;
+    unlink(snapshot_daemon_socket_path_.c_str());
+    LOG(INFO) << "[SnapshotDaemon] Daemon stopped";
+}
+
+tl::expected<void, SerializationError> MasterService::PersistStateViaEtcdDaemon(
+    const std::string& snapshot_id, const std::string& path_prefix,
+    const std::vector<uint8_t>& serialized_metadata,
+    const std::vector<uint8_t>& serialized_segment,
+    const std::string& serializer_type_str) {
+    SNAP_LOG_INFO("[Snapshot] Using ETCD daemon for upload, snapshot_id={}",
+                  snapshot_id);
+
+    // 1. Write to staging files
+    fs::path staging_dir =
+        fs::path(snapshot_backup_dir_) / "staging" / snapshot_id;
+    auto dir_result = FileUtil::EnsureDirExists(staging_dir.string());
+    if (!dir_result) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to create staging dir: " + dir_result.error()));
+    }
+
+    std::string metadata_file = (staging_dir / SNAPSHOT_METADATA_FILE).string();
+    std::string segments_file = (staging_dir / SNAPSHOT_SEGMENTS_FILE).string();
+    std::string task_manager_file =
+        (staging_dir / SNAPSHOT_TASK_MANAGER_FILE).string();
+    std::string manifest_file = (staging_dir / SNAPSHOT_MANIFEST_FILE).string();
+    std::string latest_file = (staging_dir / SNAPSHOT_LATEST_FILE).string();
+
+    auto save_result =
+        FileUtil::SaveBinaryToFile(serialized_metadata, metadata_file);
+    if (!save_result) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to save metadata: " + save_result.error()));
+    }
+
+    save_result = FileUtil::SaveBinaryToFile(serialized_segment, segments_file);
+    if (!save_result) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to save segments: " + save_result.error()));
+    }
+
+    // Serialize and save task_manager to staging
+    TaskManagerSerializer task_manager_serializer(&task_manager_);
+    auto task_manager_result = task_manager_serializer.Serialize();
+    if (!task_manager_result) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::PERSISTENT_FAIL,
+                               "Failed to serialize task_manager: " +
+                                   task_manager_result.error().message));
+    }
+    save_result = FileUtil::SaveBinaryToFile(task_manager_result.value(),
+                                             task_manager_file);
+    if (!save_result) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to save task_manager: " + save_result.error()));
+    }
+
+    std::string manifest_content =
+        fmt::format("{}|{}|{}", serializer_type_str,
+                    SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
+    auto save_str_result =
+        FileUtil::SaveStringToFile(manifest_content, manifest_file);
+    if (!save_str_result) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to save manifest: " + save_str_result.error()));
+    }
+
+    save_str_result = FileUtil::SaveStringToFile(snapshot_id, latest_file);
+    if (!save_str_result) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to save latest: " + save_str_result.error()));
+    }
+
+    SNAP_LOG_INFO("[Snapshot] Staging files written, snapshot_id={}",
+                  snapshot_id);
+
+    // 2. Connect to daemon
+    int client_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (client_socket == -1) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to create socket: " + std::string(strerror(errno))));
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, snapshot_daemon_socket_path_.c_str(),
+            sizeof(addr.sun_path) - 1);
+
+    if (connect(client_socket, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to connect to daemon: " + std::string(strerror(errno))));
+    }
+
+    // 3. Prepare file list
+    std::vector<std::pair<std::string, std::string>> files = {
+        {path_prefix + SNAPSHOT_METADATA_FILE, metadata_file},
+        {path_prefix + SNAPSHOT_SEGMENTS_FILE, segments_file},
+        {path_prefix + SNAPSHOT_TASK_MANAGER_FILE, task_manager_file},
+        {path_prefix + SNAPSHOT_MANIFEST_FILE, manifest_file},
+        {SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE, latest_file}};
+
+    // Helper lambda for writing
+    auto write_all = [&](const void* buf, size_t count) -> bool {
+        size_t written = 0;
+        while (written < count) {
+            ssize_t n =
+                write(client_socket, static_cast<const char*>(buf) + written,
+                      count - written);
+            if (n <= 0) return false;
+            written += n;
+        }
+        return true;
+    };
+
+    // 4. Send request:
+    // [num_files:4][key_len:4][key:N][payload_type:1][payload_len:4][payload:M]...
+    uint32_t num_files = static_cast<uint32_t>(files.size());
+    if (!write_all(&num_files, sizeof(num_files))) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL, "Failed to send num_files"));
+    }
+
+    for (const auto& [key, local_path] : files) {
+        uint32_t key_len = static_cast<uint32_t>(key.size());
+        if (!write_all(&key_len, sizeof(key_len)) ||
+            !write_all(key.data(), key_len)) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "Failed to send key"));
+        }
+
+        uint8_t payload_type = 1;  // file path
+        uint32_t payload_len = static_cast<uint32_t>(local_path.size());
+        if (!write_all(&payload_type, sizeof(payload_type)) ||
+            !write_all(&payload_len, sizeof(payload_len)) ||
+            !write_all(local_path.data(), payload_len)) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "Failed to send file path"));
+        }
+
+        SNAP_LOG_INFO("[Snapshot] Sent to daemon: key={}, path={}", key,
+                      local_path);
+    }
+
+    // 5. Read response: [status:4][error_len:4][error_msg:N]
+    uint32_t status;
+    if (read(client_socket, &status, sizeof(status)) != sizeof(status)) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL, "Failed to read status"));
+    }
+
+    uint32_t error_len;
+    if (read(client_socket, &error_len, sizeof(error_len)) !=
+        sizeof(error_len)) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL, "Failed to read error_len"));
+    }
+
+    std::string error_msg;
+    if (error_len > 0 && error_len < 10 * 1024 * 1024) {
+        error_msg.resize(error_len);
+        if (read(client_socket, error_msg.data(), error_len) !=
+            static_cast<ssize_t>(error_len)) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "Failed to read error message"));
+        }
+    }
+
+    close(client_socket);
+
+    // 6. Cleanup staging files
+    std::error_code ec;
+    fs::remove_all(staging_dir, ec);
+    if (ec) {
+        SNAP_LOG_WARN("[Snapshot] Failed to cleanup staging dir: {}",
+                      staging_dir.string());
+    }
+
+    if (status != 0) {
+        SNAP_LOG_ERROR("[Snapshot] Daemon upload failed: {}", error_msg);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL, "Daemon upload failed: " + error_msg));
+    }
+
+    // 7. Cleanup old snapshots
+    CleanupOldSnapshot(10, snapshot_id);
+
+    SNAP_LOG_INFO("[Snapshot] ETCD upload completed, snapshot_id={}",
+                  snapshot_id);
     return {};
 }
 

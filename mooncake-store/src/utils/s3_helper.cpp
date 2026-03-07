@@ -48,6 +48,8 @@ struct S3Env {
 
     std::string secret_key;
 
+    bool use_https = false;
+
     bool use_virtual_addressing = true;
 
     int64_t connect_timeout_ms = kDefaultS3ConnectTimeoutMs;
@@ -110,6 +112,7 @@ void S3Helper::InitAPI() {
     AssignStringFromEnv("MOONCAKE_AWS_ACCESS_KEY_ID", s3_env.access_key);
     AssignStringFromEnv("MOONCAKE_AWS_SECRET_ACCESS_KEY", s3_env.secret_key);
 
+    AssignBoolFromEnv("MOONCAKE_AWS_USE_HTTPS", s3_env.use_https);
     AssignBoolFromEnv("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING",
                       s3_env.use_virtual_addressing);
 
@@ -132,7 +135,8 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
 
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
     config.requestTimeoutMs = s3_env.request_timeout_ms;
-    config.scheme = Aws::Http::Scheme::HTTPS;
+    config.scheme =
+        s3_env.use_https ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
 
     if (!region.empty()) {
         config.region = region;

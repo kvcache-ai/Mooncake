@@ -6,6 +6,7 @@
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "serialize/serializer_backend.h"
 #include "types.h"
 
 namespace mooncake {
@@ -50,6 +51,7 @@ struct MasterConfig {
     uint64_t quota_bytes;
 
     bool enable_snapshot_restore;
+    bool enable_snapshot_restore_clean_metadata;
     bool enable_snapshot;
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
@@ -262,7 +264,8 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints = "0.0.0.0:2379";
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -333,7 +336,9 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_backend_type =
+            ParseSnapshotBackendType(config.snapshot_backend_type);
+        etcd_endpoints = config.etcd_endpoints;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -380,7 +385,9 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_backend_type =
+            ParseSnapshotBackendType(config.snapshot_backend_type);
+        etcd_endpoints = config.etcd_endpoints;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -428,7 +435,9 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type_;
+    SnapshotBackendType snapshot_backend_type_ =
+        SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints_ = "0.0.0.0:2379";
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -565,9 +574,22 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_snapshot_backend_type(
         const std::string& type) {
+        snapshot_backend_type_ = ParseSnapshotBackendType(type);
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_backend_type(
+        SnapshotBackendType type) {
         snapshot_backend_type_ = type;
         return *this;
     }
+
+    MasterServiceConfigBuilder& set_etcd_endpoints(
+        const std::string& endpoints) {
+        etcd_endpoints_ = endpoints;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
         uint32_t max_total_finished_tasks) {
         max_total_finished_tasks_ = max_total_finished_tasks;
@@ -661,7 +683,8 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints = "0.0.0.0:2379";
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -708,6 +731,7 @@ class MasterServiceConfig {
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
         snapshot_backend_type = config.snapshot_backend_type;
+        etcd_endpoints = config.etcd_endpoints;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -757,6 +781,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_retention_count = snapshot_retention_count_;
     config.snapshot_backend_type = snapshot_backend_type_;
+    config.etcd_endpoints = etcd_endpoints_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =

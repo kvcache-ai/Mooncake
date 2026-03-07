@@ -15,10 +15,29 @@
 #include "types.h"
 
 #include "master_config.h"
+#ifdef HAVE_AWS_SDK
+#include "utils/s3_helper.h"
+#endif
 
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
+
+#ifdef HAVE_AWS_SDK
+namespace {
+class S3ApiGuard {
+   public:
+    S3ApiGuard() { mooncake::S3Helper::InitAPI(); }
+    ~S3ApiGuard() { mooncake::S3Helper::ShutdownAPI(); }
+    S3ApiGuard(const S3ApiGuard&) = delete;
+    S3ApiGuard& operator=(const S3ApiGuard&) = delete;
+};
+
+bool IsS3Backend(const std::string& backend) {
+    return backend == "s3" || backend == "S3";
+}
+}  // namespace
+#endif
 
 DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
@@ -110,6 +129,8 @@ DEFINE_string(snapshot_backup_dir, "",
               "Optional local directory for snapshot and restore backup. "
               "If empty, local backup is disabled");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
+DEFINE_bool(enable_snapshot_restore_clean_metadata, true,
+            "Clean incomplete/expired metadata after snapshot restore");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
 DEFINE_uint64(snapshot_interval_seconds,
               mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
@@ -123,7 +144,7 @@ DEFINE_uint32(snapshot_retention_count,
               "automatically deleted)");
 DEFINE_string(snapshot_backend_type, "",
               "Snapshot storage backend type: 'local' for local filesystem, "
-              "'s3' for S3 storage");
+              "'s3' for S3 storage, 'etcd' for ETCD storage");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -232,6 +253,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_snapshot_restore",
                            &master_config.enable_snapshot_restore,
                            FLAGS_enable_snapshot_restore);
+    default_config.GetBool("enable_snapshot_restore_clean_metadata",
+                           &master_config.enable_snapshot_restore_clean_metadata,
+                           FLAGS_enable_snapshot_restore_clean_metadata);
     default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
                            FLAGS_enable_snapshot);
     default_config.GetUInt64("snapshot_interval_seconds",
@@ -511,6 +535,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
     }
+    if ((google::GetCommandLineFlagInfo(
+             "enable_snapshot_restore_clean_metadata", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot_restore_clean_metadata =
+            FLAGS_enable_snapshot_restore_clean_metadata;
+    }
     if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -589,6 +620,13 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+
+#ifdef HAVE_AWS_SDK
+    std::unique_ptr<S3ApiGuard> s3_guard;
+    if (IsS3Backend(master_config.snapshot_backend_type)) {
+        s3_guard = std::make_unique<S3ApiGuard>();
+    }
+#endif
 
     if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
         LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";

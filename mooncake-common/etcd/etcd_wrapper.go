@@ -57,7 +57,7 @@ var (
 	globalClient   *clientv3.Client
 	globalMutex    sync.Mutex
 	globalRefCount int
-	// etcd client for store
+	// etcd client for store (HA)
 	storeClient *clientv3.Client
 	storeMutex  sync.Mutex
 	// keep alive contexts for store

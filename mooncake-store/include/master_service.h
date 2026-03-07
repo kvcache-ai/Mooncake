@@ -427,6 +427,18 @@ class MasterService {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
+    // ETCD backend: persist state via daemon (child process calls this)
+    tl::expected<void, SerializationError> PersistStateViaEtcdDaemon(
+        const std::string& snapshot_id,
+        const std::string& path_prefix,
+        const std::vector<uint8_t>& serialized_metadata,
+        const std::vector<uint8_t>& serialized_segment,
+        const std::string& serializer_type_str);
+
+    // Daemon management for ETCD backend
+    bool StartSnapshotDaemon();
+    void StopSnapshotDaemon();
+
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
 
     // Restore master state
@@ -1038,6 +1050,14 @@ class MasterService {
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::unique_ptr<SerializerBackend> snapshot_backend_;
     mutable std::shared_mutex snapshot_mutex_;
+    SnapshotBackendType snapshot_backend_type_ =
+        SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints_;
+
+    // Snapshot daemon (for ETCD backend)
+    pid_t snapshot_daemon_pid_ = -1;
+    std::string snapshot_daemon_socket_path_;
+    std::mutex snapshot_daemon_mutex_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
