@@ -172,10 +172,14 @@ class DummyClientGetBufferTest : public ::testing::Test {
         ASSERT_EQ(real_client_->put(key, span, config), 0);
     }
 
-    // Read via RealClient to populate hot cache, then wait for async fill
+    // Read via RealClient to populate hot cache, then wait for async fill.
+    // CMS frequency admission requires kAdmissionThreshold (2) reads before
+    // a key is admitted, so we read multiple times.
     void WarmHotCache(const std::string &key) {
-        auto buf = real_client_->get_buffer(key);
-        ASSERT_NE(buf, nullptr);
+        for (int i = 0; i < 3; ++i) {
+            auto buf = real_client_->get_buffer(key);
+            ASSERT_NE(buf, nullptr);
+        }
         // Async hot cache fill — larger payloads need more time
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
