@@ -124,6 +124,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     static TransferEngine* engine_;
+    static MooncakeWorker* worker_;
     static bool engineInitialized_;
     static int backendIndex_;
     bool isCpu_{false};
@@ -132,7 +133,6 @@ class MooncakeBackend final : public ::c10d::Backend {
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
-    static MooncakeWorker worker_;
     SegmentInfo rank_info;
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};

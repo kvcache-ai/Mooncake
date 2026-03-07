@@ -26,9 +26,9 @@ constexpr int kBarrierDummyTensorSize = 1;
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 // leaky singleton to avoid destructor fiasco problem
 TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
+MooncakeWorker* MooncakeBackend::worker_ = new MooncakeWorker();
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
-MooncakeWorker MooncakeBackend::worker_;
 
 namespace {
 
@@ -333,7 +333,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     int64_t root = opts.rootRank + opts.rootTensor;
     bool isRoot = (root == rank_);
     if (isCpu_) {
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::BROADCAST, tensorSize, root, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
@@ -346,7 +346,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     } else {
         at::cuda::CUDAStream stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::BROADCAST, tensorSize, root, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
@@ -369,7 +369,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     size_t tensorSize = tensor.numel() * tensor.element_size();
     if (isCpu_) {
         auto numRanks = meta_->size;
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::ALLREDUCE, tensorSize, 0, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
@@ -381,7 +381,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             });
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::ALLREDUCE, tensorSize, 0, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
@@ -406,7 +406,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     auto outputTensors_ = outputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::ALLGATHER, tensorSize, 0, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
@@ -420,7 +420,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::ALLGATHER, tensorSize, 0, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputTensor.data_ptr() + pos,
@@ -442,7 +442,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
     if (isCpu_) {
         auto numRanks = meta_->size;
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputBuffer.data_ptr() + pos, realSize);
@@ -457,7 +457,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputBuffer.data_ptr() + pos,
@@ -480,7 +480,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
     if (isCpu_) {
         auto numRanks = meta_->size;
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(numRanks)) {
@@ -497,7 +497,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_, stream,
             [=, this](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(meta_->size)) {
@@ -523,7 +523,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     size_t tensorSize =
         inputTensors[0].numel() * inputTensors[0].element_size();
     if (isCpu_) {
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
@@ -540,7 +540,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensors[0].device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
@@ -561,7 +561,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
-    return worker_.putTaskCpu(
+    return worker_->putTaskCpu(
         // a non-zero tensorSize is required to ensure the worker task for the
         // barrier is created
         c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
@@ -577,7 +577,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     bool isRoot = (root == rank_);
     if (isCpu_) {
         auto numRanks = meta_->size;
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::REDUCE, tensorSize, root, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
@@ -591,7 +591,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
             });
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::REDUCE, tensorSize, root, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
@@ -621,7 +621,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     auto inputTensor = inputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::GATHER, tensorSize, root, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
@@ -638,7 +638,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::GATHER, tensorSize, root, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputTensor.data_ptr() + pos,
@@ -671,7 +671,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     auto outputTensor = outputTensors.back();
     size_t tensorSize = outputTensor.numel() * outputTensor.element_size();
     if (isCpu_) {
-        return worker_.putTaskCpu(
+        return worker_->putTaskCpu(
             c10d::OpType::SCATTER, tensorSize, root, meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
@@ -689,7 +689,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(outputTensor.device().index());
-        return worker_.putTaskCuda(
+        return worker_->putTaskCuda(
             c10d::OpType::SCATTER, tensorSize, root, meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
