@@ -1007,7 +1007,9 @@ bool Client::RedirectToHotCache(const std::string& key,
         return false;
     }
 
-    mem_desc.buffer_descriptor.transport_endpoint_ = local_hostname_;
+    mem_desc.buffer_descriptor.transport_endpoint_ =
+        (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
+                                               : local_hostname_;
     mem_desc.buffer_descriptor.buffer_address_ =
         reinterpret_cast<uintptr_t>(blk->addr);
     return true;
