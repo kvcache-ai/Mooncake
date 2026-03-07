@@ -2199,6 +2199,13 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
 
     SharedMutexLocker lock(&mutex_);
 
+    if (!buckets_.empty() &&
+        total_size_ + required_size > bucket_backend_config_.max_total_size) {
+        LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"
+                  << bucket_backend_config_.max_total_size
+                  << " required=" << required_size;
+    }
+
     while (!buckets_.empty() &&
            total_size_ + required_size >
                bucket_backend_config_.max_total_size) {
@@ -2227,15 +2234,12 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
             result.keys.push_back(key);
         }
         result.buckets.emplace_back(evict_id, std::move(evict_meta));
-
-        LOG(INFO) << "PrepareEviction: scheduled bucket_id=" << evict_id
-                  << " for eviction, keys=" << result.buckets.back().second->keys.size();
     }
 
     if (!result.buckets.empty()) {
-        LOG(INFO) << "PrepareEviction: total evicted_buckets="
-                  << result.buckets.size()
-                  << ", evicted_keys=" << result.keys.size();
+        LOG(INFO) << "[Evict] prepared: buckets=" << result.buckets.size()
+                  << " keys=" << result.keys.size()
+                  << " total_after=" << total_size_;
     }
 
     return result;
@@ -2303,7 +2307,10 @@ void BucketStorageBackend::FinalizeEviction(const PendingEviction& pending) {
             }
         }
 
-        LOG(INFO) << "FinalizeEviction: deleted bucket_id=" << bucket_id;
+    }
+    if (!pending.buckets.empty()) {
+        LOG(INFO) << "[Evict] finalized: deleted " << pending.buckets.size()
+                  << " bucket(s)";
     }
 }
 
