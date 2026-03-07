@@ -149,25 +149,17 @@ static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
     return total / GiB;
 }
 
-static constexpr int64_t BENCHMARK_MEMORY_LIMIT = 16ULL * 1024 * 1024 * 1024;
 static void setupResourceLimits() {
     struct rlimit rl;
-    // Cap virtual address space (RLIMIT_AS) to 2TB (virtual space is cheap on
-    // 64-bit)
-    rl.rlim_cur = 2048ULL * 1024 * 1024 * 1024;
-    rl.rlim_max = 2048ULL * 1024 * 1024 * 1024;
+    // Cap virtual address space (RLIMIT_AS) to 4TB
+    rl.rlim_cur = 4048ULL * 1024 * 1024 * 1024;
+    rl.rlim_max = 4048ULL * 1024 * 1024 * 1024;
     setrlimit(RLIMIT_AS, &rl);
 
-    // Cap Data segment (RLIMIT_DATA) to 16GB to prevent OOM freezing the OS
-    rl.rlim_cur = BENCHMARK_MEMORY_LIMIT;
-    rl.rlim_max = BENCHMARK_MEMORY_LIMIT;
+    rl.rlim_cur = RLIM_INFINITY;
+    rl.rlim_max = RLIM_INFINITY;
     setrlimit(RLIMIT_DATA, &rl);
 }
-
-// For large cluster benchmarks (>500GB), cap allocator metadata at 64K nodes
-// to keep total memory within 16GB RAM.
-// 64K nodes * 32 bytes/node * 1024 segments = 2GB, well within 16GB.
-static constexpr uint32_t kBenchmarkMaxCapacity = 64 * 1024;
 
 /**
  * @brief Create an AllocatorManager populated with N OffsetBufferAllocators.
@@ -177,9 +169,8 @@ static constexpr uint32_t kBenchmarkMaxCapacity = 64 * 1024;
  *
  * @param id_offset Starting index for segment naming (for Scale-Out additions)
  */
-static AllocatorManager createCluster(
-    int num_segments, size_t base_capacity, bool skewed, int id_offset = 0,
-    uint32_t max_capacity = kBenchmarkMaxCapacity) {
+static AllocatorManager createCluster(int num_segments, size_t base_capacity,
+                                      bool skewed, int id_offset = 0) {
     AllocatorManager manager;
     // Distribute segments evenly across kNumVirtualNodes virtual nodes if
     // num_segments > kNumVirtualNodes, otherwise 1 segment per node.
@@ -199,7 +190,7 @@ static AllocatorManager createCluster(
         }
         uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            name, base_addr, capacity, name, max_capacity);
+            name, base_addr, capacity, name);
         manager.addAllocator(name, allocator);
     }
     return manager;
@@ -215,8 +206,7 @@ static AllocatorManager createCluster(
  * @return The shared_ptrs of the newly added allocators (for tracking util)
  */
 static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
-    AllocatorManager& manager, int count, size_t capacity, int id_offset,
-    uint32_t max_capacity = kBenchmarkMaxCapacity) {
+    AllocatorManager& manager, int count, size_t capacity, int id_offset) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
     new_allocs.reserve(count);
     constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
@@ -225,7 +215,7 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
         uint64_t base_addr = kInjectedBaseAddr +
                              (static_cast<uint64_t>(id_offset + i) * capacity);
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            name, base_addr, capacity, name, max_capacity);
+            name, base_addr, capacity, name);
         manager.addAllocator(name, allocator);
         new_allocs.push_back(allocator);
     }

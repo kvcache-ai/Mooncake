@@ -191,8 +191,7 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
-                          std::string transport_endpoint,
-                          uint32_t max_node_capacity = 0);
+                          std::string transport_endpoint);
 
     ~OffsetBufferAllocator() override;
 

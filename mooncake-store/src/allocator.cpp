@@ -165,8 +165,7 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
-                                             std::string transport_endpoint,
-                                             uint32_t max_node_capacity)
+                                             std::string transport_endpoint)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
@@ -188,10 +187,6 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
             std::max(max_capacity, static_cast<uint64_t>(1024 * 1024));
         max_capacity =
             std::min(max_capacity, static_cast<uint64_t>(64 * 1024 * 1024));
-        if (max_node_capacity > 0) {
-            max_capacity = std::min(max_capacity,
-                                    static_cast<uint64_t>(max_node_capacity));
-        }
         // Create the offset allocator
         offset_allocator_ = offset_allocator::OffsetAllocator::create(
             base, size, static_cast<uint32_t>(init_capacity),
