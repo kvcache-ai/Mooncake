@@ -347,6 +347,27 @@ fail:
     return NULL;
 }
 
+void mlx5gda_destroy_qp(struct memheap *ctrl_buf_heap, struct mlx5gda_qp *qp) {
+    if (qp->mqp) {
+        mlx5dv_devx_obj_destroy(qp->mqp);
+    }
+    if (qp->uar) {
+        destroy_uar(qp->uar);
+    }
+    if (qp->send_cq) {
+        mlx5gda_destroy_cq(ctrl_buf_heap, qp->send_cq);
+    }
+    if (qp->wq_offset != -1) {
+        memheap_free(ctrl_buf_heap, qp->wq_offset);
+    }
+    if (qp->dbr_offset != -1) {
+        memheap_free(ctrl_buf_heap, qp->dbr_offset);
+    }
+    if (qp) {
+        free(qp);
+    }
+}
+
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index) {
     if (!qp || !qp->mqp) {
         errno = EINVAL;

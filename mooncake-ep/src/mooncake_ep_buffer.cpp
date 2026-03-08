@@ -459,6 +459,13 @@ int MooncakeEpBuffer::init_ibgda() {
 
 void MooncakeEpBuffer::update_local_qpns() {
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        if (qps[i]) {
+            mlx5gda_destroy_qp(ctrl_buf_heap, qps[i]);
+            qps[i] = nullptr;
+        }
+    }
+
+    for (int i = 0; i < MAX_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
             mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
                                  pd, 16384, 1, comm_stream.stream());
