@@ -58,6 +58,12 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
 }  // namespace mooncake
 
 int main(int argc, char *argv[]) {
+    // Attention !!!
+    // Initialization of ResourceTracker must be the most earliest.
+    // Otherwise, the main thread will not apply signal mask before other
+    // spawning threads, leading to missing signal processing.
+    mooncake::ResourceTracker::getInstance();
+
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
 

@@ -134,6 +134,14 @@ void ResourceTracker::startSignalThread() {
                     sigemptyset(&sa.sa_mask);
                     sa.sa_flags = 0;
                     sigaction(sig, &sa, nullptr);
+
+                    // Unblock the signal before raising it so it can be
+                    // delivered immediately
+                    sigset_t unblock_set;
+                    sigemptyset(&unblock_set);
+                    sigaddset(&unblock_set, sig);
+                    pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+
                     raise(sig);
 
                     break;  // Should not reach due to process termination

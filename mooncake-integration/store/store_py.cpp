@@ -256,11 +256,12 @@ class MooncakeStorePyWrapper {
 
     // Helper to initialize real client and register it
     std::shared_ptr<RealClient> init_real_client() {
+        auto &resource_tracker = ResourceTracker::getInstance();
         auto real_client = RealClient::create();
         use_dummy_client_ = false;
         store_ = real_client;
-        ResourceTracker::getInstance().registerInstance(
-            std::dynamic_pointer_cast<PyClient>(store_));
+        resource_tracker.registerInstance(
+            std::static_pointer_cast<PyClient>(store_));
         return real_client;
     }
 
@@ -1188,10 +1189,11 @@ PYBIND11_MODULE(store, m) {
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
                size_t local_buffer_size, const std::string &server_address) {
+                auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
-                ResourceTracker::getInstance().registerInstance(
-                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                resource_tracker.registerInstance(
+                    std::static_pointer_cast<PyClient>(self.store_));
                 auto [ip, port] = parseHostNameWithPort(server_address);
                 return self.store_->setup_dummy(
                     mem_pool_size, local_buffer_size, server_address,
