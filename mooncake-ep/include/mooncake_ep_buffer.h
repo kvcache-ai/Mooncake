@@ -3,6 +3,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <mooncake_ibgda/memheap.h>
@@ -85,6 +86,11 @@ struct MooncakeEpBuffer {
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
     int gid_index_ = -1;  // Dynamically discovered GID index
+
+    // Fabric memory (MNNVL)
+    bool use_fabric_mem_ = false;
+    CUmemGenericAllocationHandle fabric_mem_handle_{};
+    size_t fabric_alloc_size_ = 0;
 
     // NVLink P2P
     int32_t* nvlink_available = nullptr;
