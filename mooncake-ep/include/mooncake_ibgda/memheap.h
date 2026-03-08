@@ -7,26 +7,24 @@
 #include <stdalign.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <string.h>
 
 #include "os.h"
 
-#define MEMHEAP_MAX_BLOCKS 1024  /* 最大块数量 */
+#define MEMHEAP_MAX_ALLOCATIONS 1024  /* 最大分配数 */
 
-/* 内存块记录 */
-struct memheap_block_record {
-    size_t offset;  /* 块起始偏移 */
-    size_t size;    /* 块大小 */
-    bool used;      /* 是否已使用 */
+/* 分配记录 */
+struct memheap_allocation {
+    size_t offset;
+    size_t size;
+    bool used;
 };
 
-/* 内存堆结构 */
 struct memheap {
-    size_t size;                          /* 总大小 */
-    pthread_mutex_t lock;                  /* 互斥锁 */
-    size_t allocated;                      /* 已分配大小（统计用） */
-    struct memheap_block_record blocks[MEMHEAP_MAX_BLOCKS];  /* 块记录数组 */
-    int block_count;                        /* 当前块数量 */
+    size_t size;
+    pthread_mutex_t lock;
+    size_t allocated;
+    struct memheap_allocation allocs[MEMHEAP_MAX_ALLOCATIONS];
+    int alloc_count;
 };
 
 static inline struct memheap *memheap_create(size_t size) {
@@ -34,14 +32,9 @@ static inline struct memheap *memheap_create(size_t size) {
     if (!heap) {
         return NULL;
     }
-    
     heap->size = size;
     heap->allocated = 0;
-    heap->block_count = 1;  /* 初始一个空闲块 */
-    heap->blocks[0].offset = 0;
-    heap->blocks[0].size = size;
-    heap->blocks[0].used = false;
-    
+    heap->alloc_count = 0;
     mutex_init(&heap->lock);
     return heap;
 }
@@ -53,146 +46,118 @@ static inline void memheap_destroy(struct memheap *heap) {
     }
 }
 
-/* 查找合适的空闲块（首次适应） */
-static inline int memheap_find_free_block(struct memheap *heap, size_t size, 
-                                          size_t align, size_t *offset) {
-    for (int i = 0; i < heap->block_count; i++) {
-        if (!heap->blocks[i].used) {
-            size_t block_offset = heap->blocks[i].offset;
-            size_t block_size = heap->blocks[i].size;
-            
-            /* 计算对齐后的偏移 */
-            size_t aligned_offset = block_offset;
-            if (aligned_offset & (align - 1)) {
-                aligned_offset = (aligned_offset | (align - 1)) + 1;
-            }
-            
-            /* 计算对齐需要的额外空间 */
-            size_t padding = aligned_offset - block_offset;
-            
-            /* 检查是否足够 */
-            if (padding + size <= block_size) {
-                *offset = aligned_offset;
-                return i;
-            }
-        }
-    }
-    return -1;
-}
-
-/* 插入新的块记录 */
-static inline void memheap_insert_block(struct memheap *heap, int index,
-                                        size_t offset, size_t size, bool used) {
-    if (heap->block_count >= MEMHEAP_MAX_BLOCKS) {
-        return;  /* 超过最大块数，忽略 */
-    }
-    
-    /* 向后移动元素 */
-    for (int i = heap->block_count; i > index; i--) {
-        heap->blocks[i] = heap->blocks[i - 1];
-    }
-    
-    /* 插入新块 */
-    heap->blocks[index].offset = offset;
-    heap->blocks[index].size = size;
-    heap->blocks[index].used = used;
-    heap->block_count++;
-}
-
-/* 删除块记录 */
-static inline void memheap_remove_block(struct memheap *heap, int index) {
-    /* 向前移动元素 */
-    for (int i = index; i < heap->block_count - 1; i++) {
-        heap->blocks[i] = heap->blocks[i + 1];
-    }
-    heap->block_count--;
-}
-
-/* 合并相邻的空闲块 */
-static inline void memheap_merge_blocks(struct memheap *heap) {
-    for (int i = 0; i < heap->block_count - 1; i++) {
-        if (!heap->blocks[i].used && !heap->blocks[i + 1].used) {
-            /* 检查是否相邻 */
-            if (heap->blocks[i].offset + heap->blocks[i].size == 
-                heap->blocks[i + 1].offset) {
-                /* 合并 */
-                heap->blocks[i].size += heap->blocks[i + 1].size;
-                memheap_remove_block(heap, i + 1);
-                i--;  /* 重新检查这个位置 */
-            }
-        }
-    }
-}
-
 static inline size_t memheap_aligned_alloc(struct memheap *heap, size_t size,
                                            size_t align) {
     if (size == 0) {
-        return (size_t)-1;  /* 使用-1表示无效偏移 */
+        return (size_t)-1;  // No allocation for zero size
     }
-    
     if (align == 0 || (align & (align - 1)) != 0) {
-        errno = EINVAL;
+        errno = EINVAL;  // Invalid alignment
         return (size_t)-1;
     }
     
     mutex_lock(&heap->lock);
     
-    size_t offset = (size_t)-1;
-    int block_index = memheap_find_free_block(heap, size, align, &offset);
+    size_t ret = (size_t)-1;
     
-    if (block_index >= 0) {
-        size_t block_offset = heap->blocks[block_index].offset;
-        size_t block_size = heap->blocks[block_index].size;
-        size_t padding = offset - block_offset;
-        
-        if (padding > 0) {
-            /* 有对齐填充，在分配块前插入一个填充块 */
-            memheap_insert_block(heap, block_index, block_offset, padding, false);
-            block_index++;  /* 分配块索引后移 */
+    // 首先尝试在已释放的块中查找合适的空间
+    for (int i = 0; i < heap->alloc_count; i++) {
+        if (!heap->allocs[i].used) {
+            size_t offset = heap->allocs[i].offset;
+            size_t block_size = heap->allocs[i].size;
+            
+            // 对齐调整
+            size_t aligned_offset = offset;
+            if (aligned_offset & (align - 1)) {
+                aligned_offset = (aligned_offset | (align - 1)) + 1;
+            }
+            
+            // 检查是否足够大
+            if (aligned_offset + size <= offset + block_size) {
+                // 如果对齐后有剩余空间在前，创建新的空闲记录
+                if (aligned_offset > offset) {
+                    int new_idx = heap->alloc_count;
+                    if (new_idx < MEMHEAP_MAX_ALLOCATIONS) {
+                        heap->allocs[new_idx].offset = offset;
+                        heap->allocs[new_idx].size = aligned_offset - offset;
+                        heap->allocs[new_idx].used = false;
+                        heap->alloc_count++;
+                    }
+                }
+                
+                // 如果分配后有剩余空间在后，创建新的空闲记录
+                if (aligned_offset + size < offset + block_size) {
+                    int new_idx = heap->alloc_count;
+                    if (new_idx < MEMHEAP_MAX_ALLOCATIONS) {
+                        heap->allocs[new_idx].offset = aligned_offset + size;
+                        heap->allocs[new_idx].size = offset + block_size - (aligned_offset + size);
+                        heap->allocs[new_idx].used = false;
+                        heap->alloc_count++;
+                    }
+                }
+                
+                // 更新当前记录为已使用
+                heap->allocs[i].offset = aligned_offset;
+                heap->allocs[i].size = size;
+                heap->allocs[i].used = true;
+                
+                ret = aligned_offset;
+                heap->allocated += size;
+                break;
+            }
         }
-        
-        if (padding + size < block_size) {
-            /* 分配后还有剩余空间，在分配块后插入剩余块 */
-            size_t remaining_offset = offset + size;
-            size_t remaining_size = block_size - padding - size;
-            memheap_insert_block(heap, block_index + 1, remaining_offset, 
-                                 remaining_size, false);
+    }
+    
+    // 如果没有找到合适的已释放块，使用线性分配
+    if (ret == (size_t)-1) {
+        size_t offset = heap->allocated;
+        if (offset & (align - 1)) {
+            offset = (offset | (align - 1)) + 1;
         }
-        
-        /* 标记分配块为已使用 */
-        heap->blocks[block_index].offset = offset;
-        heap->blocks[block_index].size = size;
-        heap->blocks[block_index].used = true;
-        
-        heap->allocated += size;
-    } else {
-        errno = ENOMEM;
+        if (offset + size <= heap->size) {
+            ret = offset;
+            
+            // 记录这个分配
+            if (heap->alloc_count < MEMHEAP_MAX_ALLOCATIONS) {
+                heap->allocs[heap->alloc_count].offset = offset;
+                heap->allocs[heap->alloc_count].size = size;
+                heap->allocs[heap->alloc_count].used = true;
+                heap->alloc_count++;
+            }
+            
+            heap->allocated = offset + size;
+        } else {
+            errno = ENOMEM;  // Not enough memory
+        }
     }
     
     mutex_unlock(&heap->lock);
-    return offset;
+    return ret;
 }
 
 static inline size_t memheap_alloc(struct memheap *heap, size_t size) {
-    /* 简单的对齐策略：使用默认对齐 */
-    return memheap_aligned_alloc(heap, size, alignof(max_align_t));
+    // 保持原有的对齐策略不变
+    size_t align = size & -size;
+    if (align > alignof(max_align_t)) {
+        align = alignof(max_align_t);
+    }
+    // 确保最小对齐
+    if (align < 8) align = 8;
+    return memheap_aligned_alloc(heap, size, align);
 }
 
 static inline void memheap_free(struct memheap *heap, size_t offset) {
-    if (!heap || offset == (size_t)-1 || offset >= heap->size) {
+    if (!heap || offset == (size_t)-1) {
         return;
     }
     
     mutex_lock(&heap->lock);
     
-    /* 查找对应的块 */
-    for (int i = 0; i < heap->block_count; i++) {
-        if (heap->blocks[i].used && heap->blocks[i].offset == offset) {
-            heap->blocks[i].used = false;
-            heap->allocated -= heap->blocks[i].size;
-            
-            /* 合并相邻的空闲块 */
-            memheap_merge_blocks(heap);
+    // 查找并标记为未使用
+    for (int i = 0; i < heap->alloc_count; i++) {
+        if (heap->allocs[i].used && heap->allocs[i].offset == offset) {
+            heap->allocs[i].used = false;
+            heap->allocated -= heap->allocs[i].size;
             break;
         }
     }
@@ -200,16 +165,21 @@ static inline void memheap_free(struct memheap *heap, size_t offset) {
     mutex_unlock(&heap->lock);
 }
 
-/* 调试函数：打印内存块状态 */
-static inline void memheap_dump(struct memheap *heap) {
+/* 可选：压缩空闲块（如果需要） */
+static inline void memheap_compact(struct memheap *heap) {
     mutex_lock(&heap->lock);
-    printf("Memory heap (size=%zu, allocated=%zu, blocks=%d):\n", 
-           heap->size, heap->allocated, heap->block_count);
-    for (int i = 0; i < heap->block_count; i++) {
-        printf("  Block %d: offset=%zu, size=%zu, %s\n", i,
-               heap->blocks[i].offset, heap->blocks[i].size,
-               heap->blocks[i].used ? "used" : "free");
+    
+    // 简单的冒泡排序，将使用的块移到前面
+    for (int i = 0; i < heap->alloc_count - 1; i++) {
+        for (int j = 0; j < heap->alloc_count - i - 1; j++) {
+            if (heap->allocs[j].offset > heap->allocs[j + 1].offset) {
+                struct memheap_allocation tmp = heap->allocs[j];
+                heap->allocs[j] = heap->allocs[j + 1];
+                heap->allocs[j + 1] = tmp;
+            }
+        }
     }
+    
     mutex_unlock(&heap->lock);
 }
 
