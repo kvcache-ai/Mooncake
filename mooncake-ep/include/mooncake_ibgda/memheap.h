@@ -11,264 +11,171 @@
 
 #include "os.h"
 
-/* 内存块头部结构 */
-struct memheap_block {
-    size_t size;                    /* 块大小（包括头部） */
-    bool used;                      /* 是否已使用 */
-    struct memheap_block *next;      /* 下一个块（用于遍历） */
+#define MEMHEAP_MAX_BLOCKS 1024  /* 最大块数量 */
+
+/* 内存块记录 */
+struct memheap_block_record {
+    size_t offset;  /* 块起始偏移 */
+    size_t size;    /* 块大小 */
+    bool used;      /* 是否已使用 */
 };
 
 /* 内存堆结构 */
 struct memheap {
-    size_t size;                     /* 总大小 */
-    size_t allocated;                /* 已分配大小（统计用） */
-    pthread_mutex_t lock;             /* 互斥锁 */
-    void *base;                       /* 内存基址 */
-    struct memheap_block *first_block; /* 第一个内存块 */
+    size_t size;                          /* 总大小 */
+    pthread_mutex_t lock;                  /* 互斥锁 */
+    size_t allocated;                      /* 已分配大小（统计用） */
+    struct memheap_block_record blocks[MEMHEAP_MAX_BLOCKS];  /* 块记录数组 */
+    int block_count;                        /* 当前块数量 */
 };
 
-/* 获取块的数据区起始地址 */
-static inline void *memheap_block_data(struct memheap_block *block) {
-    return (void *)((char *)block + sizeof(struct memheap_block));
-}
-
-/* 获取数据区对应的块头部 */
-static inline struct memheap_block *memheap_block_from_data(void *data) {
-    return (struct memheap_block *)((char *)data - sizeof(struct memheap_block));
-}
-
-/* 对齐宏 */
-#define MEMHEAP_ALIGN(size, align) \
-    (((size) + (align) - 1) & ~((align) - 1))
-
-/* 默认对齐 */
-#define MEMHEAP_DEFAULT_ALIGN sizeof(max_align_t)
-
 static inline struct memheap *memheap_create(size_t size) {
-    /* 确保至少能容纳一个块 */
-    if (size < sizeof(struct memheap_block) + 1) {
-        return NULL;
-    }
-    
     struct memheap *heap = (struct memheap *)malloc(sizeof(struct memheap));
     if (!heap) {
         return NULL;
     }
     
-    /* 分配实际内存池 */
-    heap->base = malloc(size);
-    if (!heap->base) {
-        free(heap);
-        return NULL;
-    }
-    
     heap->size = size;
     heap->allocated = 0;
+    heap->block_count = 1;  /* 初始一个空闲块 */
+    heap->blocks[0].offset = 0;
+    heap->blocks[0].size = size;
+    heap->blocks[0].used = false;
+    
     mutex_init(&heap->lock);
-    
-    /* 初始化：创建一个空闲块覆盖整个内存池 */
-    heap->first_block = (struct memheap_block *)heap->base;
-    heap->first_block->size = size;
-    heap->first_block->used = false;
-    heap->first_block->next = NULL;
-    
     return heap;
 }
 
 static inline void memheap_destroy(struct memheap *heap) {
     if (heap) {
         mutex_destroy(&heap->lock);
-        if (heap->base) {
-            free(heap->base);
-        }
         free(heap);
     }
 }
 
-/* 查找合适的空闲块（首次适应算法） */
-static inline struct memheap_block *memheap_find_block(struct memheap *heap, 
-                                                       size_t size, 
-                                                       size_t align) {
-    struct memheap_block *curr = heap->first_block;
-    
-    while (curr) {
-        if (!curr->used) {
-            /* 计算在这个块中，数据区对齐后的起始地址 */
-            void *data_start = memheap_block_data(curr);
-            uintptr_t addr = (uintptr_t)data_start;
-            uintptr_t aligned_addr = (addr + align - 1) & ~(align - 1);
-            size_t padding = aligned_addr - addr;
+/* 查找合适的空闲块（首次适应） */
+static inline int memheap_find_free_block(struct memheap *heap, size_t size, 
+                                          size_t align, size_t *offset) {
+    for (int i = 0; i < heap->block_count; i++) {
+        if (!heap->blocks[i].used) {
+            size_t block_offset = heap->blocks[i].offset;
+            size_t block_size = heap->blocks[i].size;
             
-            /* 检查是否足够空间（包括对齐填充） */
-            if (curr->size >= size + padding + sizeof(struct memheap_block)) {
-                return curr;
+            /* 计算对齐后的偏移 */
+            size_t aligned_offset = block_offset;
+            if (aligned_offset & (align - 1)) {
+                aligned_offset = (aligned_offset | (align - 1)) + 1;
             }
-        }
-        curr = curr->next;
-    }
-    
-    return NULL;
-}
-
-/* 分割内存块 */
-static inline void memheap_split_block(struct memheap *heap,
-                                       struct memheap_block *block,
-                                       size_t size,
-                                       size_t align) {
-    /* 计算对齐后的数据区起始地址 */
-    void *data_start = memheap_block_data(block);
-    uintptr_t addr = (uintptr_t)data_start;
-    uintptr_t aligned_addr = (addr + align - 1) & ~(align - 1);
-    size_t padding = aligned_addr - addr;
-    
-    /* 如果有填充，创建填充块 */
-    if (padding >= sizeof(struct memheap_block)) {
-        struct memheap_block *padding_block = (struct memheap_block *)((char *)block + padding);
-        padding_block->size = block->size - padding;
-        padding_block->used = false;
-        padding_block->next = block->next;
-        
-        block->size = padding;
-        block->next = padding_block;
-        block = padding_block;
-        
-        /* 重新计算对齐 */
-        data_start = memheap_block_data(block);
-        addr = (uintptr_t)data_start;
-        aligned_addr = (addr + align - 1) & ~(align - 1);
-        padding = aligned_addr - addr;
-    }
-    
-    /* 计算分配块的位置 */
-    struct memheap_block *alloc_block = (struct memheap_block *)((char *)block + padding);
-    size_t alloc_size = size + sizeof(struct memheap_block);
-    size_t remaining_size = block->size - padding - alloc_size;
-    
-    if (remaining_size >= sizeof(struct memheap_block)) {
-        /* 有剩余空间，创建剩余块 */
-        struct memheap_block *remaining = (struct memheap_block *)((char *)alloc_block + alloc_size);
-        remaining->size = remaining_size;
-        remaining->used = false;
-        remaining->next = block->next;
-        
-        /* 设置分配块 */
-        alloc_block->size = alloc_size;
-        alloc_block->used = true;
-        alloc_block->next = remaining;
-        
-        /* 更新前一个块的next指针 */
-        if (block == heap->first_block) {
-            heap->first_block = alloc_block;
-        } else {
-            struct memheap_block *prev = heap->first_block;
-            while (prev && prev->next != block) {
-                prev = prev->next;
-            }
-            if (prev) {
-                prev->next = alloc_block;
-            }
-        }
-    } else {
-        /* 剩余空间太小，整个块都给分配块 */
-        alloc_block->size = block->size - padding;
-        alloc_block->used = true;
-        alloc_block->next = block->next;
-        
-        /* 更新前一个块的next指针 */
-        if (block == heap->first_block) {
-            heap->first_block = alloc_block;
-        } else {
-            struct memheap_block *prev = heap->first_block;
-            while (prev && prev->next != block) {
-                prev = prev->next;
-            }
-            if (prev) {
-                prev->next = alloc_block;
+            
+            /* 计算对齐需要的额外空间 */
+            size_t padding = aligned_offset - block_offset;
+            
+            /* 检查是否足够 */
+            if (padding + size <= block_size) {
+                *offset = aligned_offset;
+                return i;
             }
         }
     }
+    return -1;
 }
 
-/* 偏移量转指针 */
-static inline void *memheap_offset_to_ptr(struct memheap *heap, size_t offset) {
-    if (offset == (size_t)-1 || offset >= heap->size) {
-        return NULL;
+/* 插入新的块记录 */
+static inline void memheap_insert_block(struct memheap *heap, int index,
+                                        size_t offset, size_t size, bool used) {
+    if (heap->block_count >= MEMHEAP_MAX_BLOCKS) {
+        return;  /* 超过最大块数，忽略 */
     }
-    return (void *)((char *)heap->base + offset);
+    
+    /* 向后移动元素 */
+    for (int i = heap->block_count; i > index; i--) {
+        heap->blocks[i] = heap->blocks[i - 1];
+    }
+    
+    /* 插入新块 */
+    heap->blocks[index].offset = offset;
+    heap->blocks[index].size = size;
+    heap->blocks[index].used = used;
+    heap->block_count++;
 }
 
-/* 指针转偏移量 */
-static inline size_t memheap_ptr_to_offset(struct memheap *heap, void *ptr) {
-    if (ptr < heap->base || ptr >= (void *)((char *)heap->base + heap->size)) {
-        return (size_t)-1;
+/* 删除块记录 */
+static inline void memheap_remove_block(struct memheap *heap, int index) {
+    /* 向前移动元素 */
+    for (int i = index; i < heap->block_count - 1; i++) {
+        heap->blocks[i] = heap->blocks[i + 1];
     }
-    return (size_t)((char *)ptr - (char *)heap->base);
+    heap->block_count--;
+}
+
+/* 合并相邻的空闲块 */
+static inline void memheap_merge_blocks(struct memheap *heap) {
+    for (int i = 0; i < heap->block_count - 1; i++) {
+        if (!heap->blocks[i].used && !heap->blocks[i + 1].used) {
+            /* 检查是否相邻 */
+            if (heap->blocks[i].offset + heap->blocks[i].size == 
+                heap->blocks[i + 1].offset) {
+                /* 合并 */
+                heap->blocks[i].size += heap->blocks[i + 1].size;
+                memheap_remove_block(heap, i + 1);
+                i--;  /* 重新检查这个位置 */
+            }
+        }
+    }
 }
 
 static inline size_t memheap_aligned_alloc(struct memheap *heap, size_t size,
                                            size_t align) {
     if (size == 0) {
-        return (size_t)-1;
+        return (size_t)-1;  /* 使用-1表示无效偏移 */
     }
     
-    /* 检查对齐参数 */
     if (align == 0 || (align & (align - 1)) != 0) {
         errno = EINVAL;
         return (size_t)-1;
     }
     
-    /* 确保对齐至少为默认对齐 */
-    if (align < MEMHEAP_DEFAULT_ALIGN) {
-        align = MEMHEAP_DEFAULT_ALIGN;
-    }
-    
     mutex_lock(&heap->lock);
     
-    /* 查找合适的空闲块 */
-    struct memheap_block *block = memheap_find_block(heap, size, align);
-    size_t result_offset = (size_t)-1;
+    size_t offset = (size_t)-1;
+    int block_index = memheap_find_free_block(heap, size, align, &offset);
     
-    if (block) {
-        /* 分割块并分配 */
-        memheap_split_block(heap, block, size, align);
+    if (block_index >= 0) {
+        size_t block_offset = heap->blocks[block_index].offset;
+        size_t block_size = heap->blocks[block_index].size;
+        size_t padding = offset - block_offset;
         
-        /* 找到分配的块 */
-        struct memheap_block *curr = heap->first_block;
-        while (curr) {
-            if (curr->used) {
-                void *data = memheap_block_data(curr);
-                /* 验证这是我们要找的块 */
-                result_offset = memheap_ptr_to_offset(heap, data);
-                heap->allocated += curr->size;
-                break;
-            }
-            curr = curr->next;
+        if (padding > 0) {
+            /* 有对齐填充，在分配块前插入一个填充块 */
+            memheap_insert_block(heap, block_index, block_offset, padding, false);
+            block_index++;  /* 分配块索引后移 */
         }
+        
+        if (padding + size < block_size) {
+            /* 分配后还有剩余空间，在分配块后插入剩余块 */
+            size_t remaining_offset = offset + size;
+            size_t remaining_size = block_size - padding - size;
+            memheap_insert_block(heap, block_index + 1, remaining_offset, 
+                                 remaining_size, false);
+        }
+        
+        /* 标记分配块为已使用 */
+        heap->blocks[block_index].offset = offset;
+        heap->blocks[block_index].size = size;
+        heap->blocks[block_index].used = true;
+        
+        heap->allocated += size;
     } else {
         errno = ENOMEM;
     }
     
     mutex_unlock(&heap->lock);
-    return result_offset;
+    return offset;
 }
 
 static inline size_t memheap_alloc(struct memheap *heap, size_t size) {
-    return memheap_aligned_alloc(heap, size, MEMHEAP_DEFAULT_ALIGN);
-}
-
-/* 合并相邻的空闲块 */
-static inline void memheap_coalesce(struct memheap *heap) {
-    struct memheap_block *curr = heap->first_block;
-    
-    while (curr && curr->next) {
-        if (!curr->used && !curr->next->used) {
-            /* 合并相邻的空闲块 */
-            curr->size += curr->next->size;
-            curr->next = curr->next->next;
-        } else {
-            curr = curr->next;
-        }
-    }
+    /* 简单的对齐策略：使用默认对齐 */
+    return memheap_aligned_alloc(heap, size, alignof(max_align_t));
 }
 
 static inline void memheap_free(struct memheap *heap, size_t offset) {
@@ -278,40 +185,32 @@ static inline void memheap_free(struct memheap *heap, size_t offset) {
     
     mutex_lock(&heap->lock);
     
-    /* 获取数据区指针 */
-    void *ptr = memheap_offset_to_ptr(heap, offset);
-    
-    /* 获取块头部 */
-    struct memheap_block *block = memheap_block_from_data(ptr);
-    
-    /* 简单的验证：检查指针范围 */
-    if ((void *)block >= heap->base && 
-        (void *)((char *)block + block->size) <= (void *)((char *)heap->base + heap->size)) {
-        
-        if (block->used) {
-            block->used = false;
-            heap->allocated -= block->size;
+    /* 查找对应的块 */
+    for (int i = 0; i < heap->block_count; i++) {
+        if (heap->blocks[i].used && heap->blocks[i].offset == offset) {
+            heap->blocks[i].used = false;
+            heap->allocated -= heap->blocks[i].size;
             
             /* 合并相邻的空闲块 */
-            memheap_coalesce(heap);
+            memheap_merge_blocks(heap);
+            break;
         }
     }
     
     mutex_unlock(&heap->lock);
 }
 
-/* 获取已分配大小 */
-static inline size_t memheap_allocated_size(struct memheap *heap) {
-    size_t allocated;
+/* 调试函数：打印内存块状态 */
+static inline void memheap_dump(struct memheap *heap) {
     mutex_lock(&heap->lock);
-    allocated = heap->allocated;
+    printf("Memory heap (size=%zu, allocated=%zu, blocks=%d):\n", 
+           heap->size, heap->allocated, heap->block_count);
+    for (int i = 0; i < heap->block_count; i++) {
+        printf("  Block %d: offset=%zu, size=%zu, %s\n", i,
+               heap->blocks[i].offset, heap->blocks[i].size,
+               heap->blocks[i].used ? "used" : "free");
+    }
     mutex_unlock(&heap->lock);
-    return allocated;
-}
-
-/* 获取总大小 */
-static inline size_t memheap_total_size(struct memheap *heap) {
-    return heap->size;
 }
 
 #endif
