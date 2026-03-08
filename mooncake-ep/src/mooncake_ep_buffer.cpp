@@ -403,8 +403,8 @@ int MooncakeEpBuffer::init_ibgda() {
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
     // WQ doesn't need initialization as it's zeroed before each use.
     CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    ctrl_buf_umem = mlx5dv_devx_umem_reg(
-        ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
+    ctrl_buf_umem = mlx5dv_devx_umem_reg(ctx, ctrl_buf, CTRL_BUF_SIZE,
+                                         IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
         fprintf(stderr,
