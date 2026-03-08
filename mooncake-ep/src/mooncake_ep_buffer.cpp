@@ -15,9 +15,8 @@ static bool supportFabricMem() {
 
     for (int dev = 0; dev < num_devices; ++dev) {
         int supported = 0;
-        cuDeviceGetAttribute(&supported,
-                             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                             dev);
+        cuDeviceGetAttribute(
+            &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
         if (!supported) return false;
     }
     return true;
@@ -706,8 +705,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                     }
                     nvlink_array[dst_rank] = 1;
 
-                    if (dst_rank >=
-                        static_cast<int>(remote_handles.size())) {
+                    if (dst_rank >= static_cast<int>(remote_handles.size())) {
                         LOG(WARNING)
                             << "[EP] Rank " << rank
                             << " missing IPC handle for rank " << dst_rank;
@@ -721,8 +719,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                     if (handle_ints.size() < num_int32s) {
                         LOG(WARNING)
                             << "[EP] Rank " << rank
-                            << " invalid IPC handle size for rank "
-                            << dst_rank;
+                            << " invalid IPC handle size for rank " << dst_rank;
                         continue;
                     }
 
@@ -730,15 +727,14 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                     memcpy(&remote_handle, handle_ints.data(), handle_size);
 
                     void* peer_ptr = nullptr;
-                    cudaError_t ipc_err = cudaIpcOpenMemHandle(
-                        &peer_ptr, remote_handle,
-                        cudaIpcMemLazyEnablePeerAccess);
+                    cudaError_t ipc_err =
+                        cudaIpcOpenMemHandle(&peer_ptr, remote_handle,
+                                             cudaIpcMemLazyEnablePeerAccess);
                     if (ipc_err != cudaSuccess) {
                         LOG(WARNING)
                             << "[EP] Rank " << rank
                             << " failed to open IPC handle for rank "
-                            << dst_rank << ": "
-                            << cudaGetErrorString(ipc_err);
+                            << dst_rank << ": " << cudaGetErrorString(ipc_err);
                         nvlink_array[dst_rank] = 0;
                     } else {
                         ipc_peer_ptrs_host[dst_rank] = peer_ptr;
