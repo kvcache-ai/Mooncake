@@ -84,10 +84,10 @@ class AscendDirectTransport : public Transport {
 
     void processSliceList(const std::vector<Slice *> &slice_list);
 
-    void connectAndTransfer(const std::string &target_adxl_engine_name,
+    void connectAndTransfer(const std::string &target_seg_name,
+                            const std::string &target_adxl_engine_name,
                             adxl::TransferOp operation,
-                            const std::vector<Slice *> &slice_list,
-                            int32_t times = 0);
+                            const std::vector<Slice *> &slice_list);
 
     void localCopy(TransferRequest::OpCode opcode,
                    const std::vector<Slice *> &slice_list);
@@ -112,9 +112,10 @@ class AscendDirectTransport : public Transport {
     int checkAndConnect(const std::string &target_adxl_engine_name);
 
     int disconnect(const std::string &target_adxl_engine_name,
-                   int32_t timeout_in_millis, bool force = false);
+                   int32_t timeout_in_millis);
 
-    void TransferWithAsync(const std::string &target_adxl_engine_name,
+    void TransferWithAsync(const std::string &target_seg_name,
+                           const std::string &target_adxl_engine_name,
                            adxl::TransferOp operation,
                            const std::vector<Slice *> &slice_list,
                            const std::vector<adxl::TransferOpDesc> &op_descs);
