@@ -33,8 +33,9 @@ setup(
                 "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
                 "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
             },
-            libraries=["ibverbs", "mlx5"],
+            libraries=["cuda", "ibverbs", "mlx5"],
             extra_link_args=[
+                "-Wl,--allow-shlib-undefined",
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
                 "-l:engine.so",
