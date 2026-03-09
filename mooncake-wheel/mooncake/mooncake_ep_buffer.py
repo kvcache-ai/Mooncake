@@ -83,134 +83,9 @@ class Buffer:
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
         self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
-        if not self._use_fallback:
-            (raddr, rkey) = self.runtime.get_mr_info()
-
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
-            raddrs = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(raddrs, raddr, group)
-            raddrs = torch.cat(raddrs).tolist()
-
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
-            rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(rkeys, rkey, group)
-            rkeys = torch.cat(rkeys).tolist()
-
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
-
-            local_qpns = self.runtime.get_local_qpns()
-            local_qpns = list(
-                torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
-                        -1, all_to_all_size
-                    )
-                )
-            )
-            remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_to_all(remote_qpns, local_qpns, group)
-            remote_qpns = torch.cat(remote_qpns).tolist()
-
-            if self.runtime.is_roce():
-                (subnet_prefix, interface_id) = self.runtime.get_gid()
-
-                subnet_prefix = torch.tensor(
-                    [subnet_prefix], dtype=torch.int64, device="cuda"
-                )
-                subnet_prefixes = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(subnet_prefixes, subnet_prefix, group)
-                subnet_prefixes = torch.cat(subnet_prefixes).tolist()
-
-                interface_id = torch.tensor(
-                    [interface_id], dtype=torch.int64, device="cuda"
-                )
-                interface_ids = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(interface_ids, interface_id, group)
-                interface_ids = torch.cat(interface_ids).tolist()
-
-                self.runtime.sync_roce(
-                    raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids
-                )
-            else:
-                local_lids = self.runtime.get_local_lids()
-                local_lids = list(
-                    torch.unbind(
-                        torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
-                            -1, all_to_all_size
-                        )
-                    )
-                )
-                remote_lids = [
-                    torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_to_all(remote_lids, local_lids, group)
-                remote_lids = torch.cat(remote_lids).tolist()
-
-                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
-
-        # Exchange CUDA IPC handles for NVLink/P2P.
-        #
-        # Important:
-        # - This is *independent* from IBGDA. Some environments (e.g. SGLang CI) may have NVLink
-        #   (or CUDA P2P+IPC) available while IBGDA is unavailable/disabled. We still want to
-        #   enable the fast-path in that case.
-        # - If this fails (no NVLink / CUDA IPC unavailable / platform restrictions), we swallow the
-        #   error and keep going in fallback mode.
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
-            local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
-            )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, group)
-            remote_handles = [h.tolist() for h in handles]
-            self.runtime.sync_nvlink_ipc_handles(remote_handles)
-        except Exception as e:
-            import warnings
-
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        # Final decision: Use fast-path (CUDA kernel + IBGDA/NVLink) only if it's safe.
-        # The runtime checks:
-        # - If IBGDA is available, use fast-path
-        # - If IBGDA is unavailable but P2P+IPC is fully enabled AND IBGDA resources
-        #   are initialized (for fallback in kernel), use fast-path
-        # - Otherwise, fall back to Python implementation
-        use_fast_path = False
-        try:
-            use_fast_path = bool(self.runtime.use_fast_path())
-        except Exception:
-            # Older runtimes may not expose this yet; be conservative.
-            ibgda_disabled = bool(self.runtime.ibgda_disabled())
-            use_fast_path = not ibgda_disabled
-
-        # Use fast-path only if runtime says it's safe
-        self._use_fallback = not use_fast_path
-
-    def update_ep_member(self):
+        self.connect()
+    
+    def connect(self, is_update: bool = False):
         from mooncake import ep
 
         if not self._use_fallback:
@@ -234,7 +109,8 @@ class Buffer:
 
             all_to_all_size = ep.MAX_QP_COUNT // self.group_size
 
-            self.runtime.update_local_qpns()
+            if is_update:
+                self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
             local_qpns = list(
@@ -325,6 +201,10 @@ class Buffer:
             use_fast_path = not ibgda_disabled
 
         self._use_fallback = not use_fast_path
+
+
+    def update_ep_member(self):
+        self.connect(True)
 
     @staticmethod
     def get_ep_buffer_size_hint(
