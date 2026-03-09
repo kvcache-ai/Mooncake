@@ -442,7 +442,9 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
     gid_index = -1;
     int i;
     struct ibv_gid_entry gid_entry;
-    bool fallback_found = false;
+    int fallback_ipv4_gid_without_network = -1;
+    int fallback_ipv6_gid_with_network = -1;
+    int fallback_ipv6_gid_without_network = -1;
     GidNetworkState state = GidNetworkState::GID_NOT_FOUND;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
@@ -451,23 +453,53 @@ GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
             break;
         }
 
-        if (gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2 ||
-            gid_entry.gid_type == IBV_GID_TYPE_IB) {
-            // Check if this GID has an associated network device
-            if (hasNetworkDevice(device_name, port, i)) {
-                // Found a GID with network device, this is the best choice
+        if (gid_entry.gid_type != IBV_GID_TYPE_ROCE_V2 &&
+            gid_entry.gid_type != IBV_GID_TYPE_IB) {
+            continue;
+        }
+
+        const bool is_ipv4_gid =
+            gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2 &&
+            ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw);
+        const bool has_network_device = hasNetworkDevice(device_name, port, i);
+
+        if (is_ipv4_gid) {
+            if (has_network_device) {
                 gid_index = i;
-                state = GidNetworkState::GID_WITH_NETWORK;
-                break;
+                return GidNetworkState::GID_WITH_NETWORK;
             }
-            // No network device, keep the first one as fallback candidate
-            if (!fallback_found) {
+            if (fallback_ipv4_gid_without_network < 0) {
                 gid_index = i;
-                fallback_found = true;
+                fallback_ipv4_gid_without_network = i;
                 state = GidNetworkState::GID_WITHOUT_NETWORK;
             }
+            continue;
+        }
+
+        if (has_network_device && fallback_ipv6_gid_with_network < 0) {
+            fallback_ipv6_gid_with_network = i;
+        }
+
+        if (!has_network_device && fallback_ipv6_gid_without_network < 0) {
+            fallback_ipv6_gid_without_network = i;
         }
     }
+
+    if (fallback_ipv4_gid_without_network >= 0) {
+        gid_index = fallback_ipv4_gid_without_network;
+        return GidNetworkState::GID_WITHOUT_NETWORK;
+    }
+
+    if (fallback_ipv6_gid_with_network >= 0) {
+        gid_index = fallback_ipv6_gid_with_network;
+        return GidNetworkState::GID_WITH_NETWORK;
+    }
+
+    if (fallback_ipv6_gid_without_network >= 0) {
+        gid_index = fallback_ipv6_gid_without_network;
+        return GidNetworkState::GID_WITHOUT_NETWORK;
+    }
+
     return state;
 }
 
