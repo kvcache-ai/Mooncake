@@ -491,12 +491,11 @@ int MooncakeEpBuffer::init_ibgda() {
     }
     ibv_free_device_list(dev_list);
 
-    ibv_pd* pd = ibv_alloc_pd(ctx);
+    pd = ibv_alloc_pd(ctx);
     if (!pd) {
         perror("Failed to allocate protection domain");
         return -1;
     }
-    mlx5dv_pd mpd;
     mlx5dv_obj dv_obj = {};
     dv_obj.pd.in = pd;
     dv_obj.pd.out = &mpd;
@@ -514,8 +513,8 @@ int MooncakeEpBuffer::init_ibgda() {
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
     // WQ doesn't need initialization as it's zeroed before each use.
     CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    mlx5dv_devx_umem* ctrl_buf_umem = mlx5dv_devx_umem_reg(
-        ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
+    ctrl_buf_umem = mlx5dv_devx_umem_reg(ctx, ctrl_buf, CTRL_BUF_SIZE,
+                                         IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
         fprintf(stderr,
@@ -529,7 +528,7 @@ int MooncakeEpBuffer::init_ibgda() {
         }
         return -1;
     }
-    memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
+    ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
         return -1;
@@ -566,6 +565,47 @@ int MooncakeEpBuffer::init_ibgda() {
         qps.push_back(qp);
     }
     return 0;
+}
+
+void MooncakeEpBuffer::update_local_qpns() {
+    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        if (qps[i]) {
+            mlx5gda_destroy_qp(ctrl_buf_heap, qps[i]);
+            qps[i] = nullptr;
+        }
+    }
+
+    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        mlx5gda_qp* qp =
+            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
+                                 pd, 16384, 1, comm_stream.stream());
+        if (!qp) {
+            perror("Failed to recreate QP");
+            ibgda_disabled_ = true;
+            return;
+        }
+        is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
+        if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
+            perror("Failed to mlx5gda_modify_rc_qp_rst2init");
+            ibgda_disabled_ = true;
+            return;
+        }
+        // Ensure all async memset operations are complete before accessing QP
+        // structures
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
+        mlx5gda_qp_devctx qp_devctx = {
+            .qpn = qp->qpn,
+            .wqeid_mask = qp->num_wqebb - 1,
+            .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
+            .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
+            .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
+            .bf = (char*)qp->uar->reg_addr,
+        };
+        cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
+                   sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+        qps[i] = qp;
+    }
 }
 
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
