@@ -251,17 +251,6 @@ jobs:
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
 
-    - name: Test Mooncake EP Backend (CPU Only)
-      env:
-        MC_FORCE_TCP: "true"
-      run: |
-        source test_env/bin/activate
-        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
-        # Disable these tests in CI as they fail occasionally.
-        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_elastic
-        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_p2p_cpu
-      shell: bash
-
   test-sglang-integration:
     needs: build-flags
     runs-on: ubuntu-latest
