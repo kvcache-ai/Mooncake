@@ -591,8 +591,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
                       << " on " << device_name << "/" << port << " ("
-                      << (has_ndev ? "with" : "without")
-                      << " network device)";
+                      << (has_ndev ? "with" : "without") << " network device)";
         }
 
         // Continue with GID validation
