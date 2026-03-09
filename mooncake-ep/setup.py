@@ -48,7 +48,6 @@ setup(
             libraries=cuda_libraries,
             library_dirs=cuda_library_dirs,
             extra_link_args=[
-                "-Wl,--allow-shlib-undefined",
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
                 "-l:engine.so",
