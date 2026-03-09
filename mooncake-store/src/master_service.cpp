@@ -68,7 +68,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      enable_kv_event_publish(config.enable_kv_event_publish) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto backend_type =
@@ -149,6 +150,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+
+    if (enable_kv_event_publish) {
+        publisher =
+            std::make_unique<KVEventSystem>(config.kv_event_publisher_config);
+    }
 }
 
 MasterService::~MasterService() {
@@ -166,6 +172,9 @@ MasterService::~MasterService() {
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
+    }
+    if (publisher) {
+        publisher->shutdown();
     }
     if (snapshot_thread_.joinable()) {
         snapshot_thread_.join();
@@ -262,18 +271,30 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 }
 
 void MasterService::ClearInvalidHandles() {
+    size_t replica_count{0};
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
+            if (publisher) {
+                replica_count = it->second.CountReplicas();
+            }
             if (CleanupStaleHandles(it->second)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys and
                 // replication_tasks.
+                if (publisher) {
+                    publisher->publish<BlockUpdateEvent>(
+                        it->first, std::vector<Replica::Descriptor>{});
+                }
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 it = shard->metadata.erase(it);
             } else {
+                if (publisher && replica_count != it->second.CountReplicas()) {
+                    publisher->publish<BlockUpdateEvent>(
+                        it->first, it->second.GetReplicasDescriptorList());
+                }
                 ++it;
             }
         }
@@ -523,6 +544,12 @@ auto MasterService::BatchReplicaClear(
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
                        "for key="
                     << key << " for client_id=" << client_id;
+
+            if (publisher) {
+                publisher->publish<BlockUpdateEvent>(
+                    key, std::vector<Replica::Descriptor>{});
+            }
+
         } else {
             // Clear only replicas on the specified segment_name
             bool has_replica_on_segment = false;
@@ -571,6 +598,11 @@ auto MasterService::BatchReplicaClear(
                        "segment_name="
                     << segment_name << " for key=" << key
                     << " for client_id=" << client_id;
+
+            if (publisher) {
+                publisher->publish<BlockUpdateEvent>(
+                    key, metadata.GetReplicasDescriptorList());
+            }
         }
     }
 
@@ -806,6 +838,11 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
         accessor.EraseFromProcessing();
+    }
+
+    if (publisher) {
+        publisher->publish<BlockUpdateEvent>(
+            key, metadata.GetReplicasDescriptorList());
     }
 
     if (replica_type == ReplicaType::MEMORY) {
@@ -1115,6 +1152,11 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
 
     accessor.EraseReplicationTask();
 
+    if (publisher) {
+        publisher->publish<BlockUpdateEvent>(
+            key, metadata.GetReplicasDescriptorList());
+    }
+
     return all_complete ? tl::expected<void, ErrorCode>()
                         : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
 }
@@ -1331,6 +1373,11 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
     accessor.EraseReplicationTask();
 
+    if (publisher) {
+        publisher->publish<BlockUpdateEvent>(
+            key, metadata.GetReplicasDescriptorList());
+    }
+
     return {};
 }
 
@@ -1421,6 +1468,12 @@ auto MasterService::Remove(const std::string& key, bool force)
 
     // Remove object metadata
     accessor.Erase();
+
+    if (publisher) {
+        publisher->publish<BlockUpdateEvent>(
+            key, std::vector<Replica::Descriptor>{});
+    }
+
     return {};
 }
 
@@ -1474,6 +1527,12 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+
+                if (publisher) {
+                    publisher->publish<BlockUpdateEvent>(
+                        it->first, std::vector<Replica::Descriptor>{});
+                }
+
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1524,6 +1583,10 @@ long MasterService::RemoveAll(bool force) {
         }
     }
 
+    if (publisher) {
+        publisher->publish<RemoveAllEvent>();
+    }
+
     VLOG(1) << "action=remove_all_objects"
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
@@ -1547,6 +1610,19 @@ size_t MasterService::GetKeyCount() const {
         total += shard->metadata.size();
     }
     return total;
+}
+
+auto MasterService::GetPublisherStats() const
+    -> tl::expected<KVEventSystem::Stats, ErrorCode> {
+    if (!enable_kv_event_publish || !publisher) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    try {
+        return publisher->get_stats();
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
 }
 
 auto MasterService::Ping(const UUID& client_id)
@@ -1645,6 +1721,17 @@ auto MasterService::NotifyOffloadSuccess(
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
         auto res = AddReplica(client_id, key, replica);
+
+        if (publisher) {
+            MetadataAccessor accessor(this, key);
+            if (!accessor.Exists()) {
+                LOG(ERROR) << "key=" << key << ", error=object_not_found";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
+            publisher->publish<BlockUpdateEvent>(
+                key, accessor.Get().GetReplicasDescriptorList());
+        }
+
         if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id << ", key=" << key;
@@ -2867,8 +2954,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (it->second.lease_timeout <= target_timeout) {
                     // Evict this object
                     total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
+                        it->second.size * evict_replicas(it->second);
+
+                    if (publisher) {
+                        publisher->publish<BlockUpdateEvent>(
+                            it->first, it->second.GetReplicasDescriptorList());
+                    }
+                    // Erase memory replicas
                     if (it->second.IsValid() == false) {
                         it = shard->metadata.erase(it);
                     } else {
@@ -2929,6 +3021,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             it->second.size *
                             evict_replicas(
                                 it->second);  // Erase memory replicas
+
+                        if (publisher) {
+                            publisher->publish<BlockUpdateEvent>(
+                                it->first,
+                                it->second.GetReplicasDescriptorList());
+                        }
+
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
@@ -2978,6 +3077,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             it->second.size *
                             evict_replicas(
                                 it->second);  // Erase memory replicas
+
+                        if (publisher) {
+                            publisher->publish<BlockUpdateEvent>(
+                                it->first,
+                                it->second.GetReplicasDescriptorList());
+                        }
+
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
@@ -3015,7 +3121,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

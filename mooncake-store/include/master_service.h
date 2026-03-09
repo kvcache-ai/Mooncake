@@ -28,6 +28,7 @@
 #include "replica.h"
 #include "serialize/serializer_backend.h"
 #include "task_manager.h"
+#include "kv_event_publisher.h"
 
 namespace mooncake {
 // Forward declarations
@@ -325,6 +326,24 @@ class MasterService {
      * @return The count of keys
      */
     size_t GetKeyCount() const;
+
+    /**
+     * @brief Check if the event publisher is enabled.
+     * @return true if the publisher is enabled, false if disabled.
+     */
+    bool IsPublisherEnabled() const { return enable_kv_event_publish; }
+
+    /**
+     * @brief Retrieve statistics from the event publisher.
+     * @return On success, returns KVEventSystem::Stats.
+     *         On failure, returns an ErrorCode indicating the reason:
+     *         - ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the publisher is
+     * not enabled
+     *         - ErrorCode::INTERNAL_ERROR if publisher exists but statistics
+     * cannot be retrieved
+     */
+    auto GetPublisherStats() const
+        -> tl::expected<KVEventSystem::Stats, ErrorCode>;
 
     /**
      * @brief Heartbeat from client
@@ -694,6 +713,21 @@ class MasterService {
                 }
             }
             return segment_names;
+        }
+
+        std::vector<Replica::Descriptor> GetReplicasDescriptorList() {
+            if (!IsValid()) {
+                return {};
+            }
+
+            std::vector<Replica::Descriptor> replica_list;
+            replica_list.reserve(replicas_.size());
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+                    replica_list.emplace_back(replica.get_descriptor());
+                });
+
+            return replica_list;
         }
 
        private:
@@ -1084,6 +1118,10 @@ class MasterService {
 
     // Task manager
     ClientTaskManager task_manager_;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish;
+    std::unique_ptr<KVEventSystem> publisher;
 };
 
 }  // namespace mooncake

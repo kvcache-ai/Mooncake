@@ -1,6 +1,9 @@
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
 
+find_package(cppzmq REQUIRED)
+find_package(msgpack-cxx REQUIRED)
+
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
@@ -34,6 +37,7 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
+    kv_event_publisher.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -103,6 +107,8 @@ target_link_libraries(mooncake_store
         gflags::gflags
         ${EXTRA_LIBS}
         asio_shared
+        cppzmq
+        msgpack-cxx
     PRIVATE
         transfer_engine
 )

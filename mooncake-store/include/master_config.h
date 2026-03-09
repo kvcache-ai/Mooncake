@@ -7,6 +7,7 @@
 
 #include "config_helper.h"
 #include "types.h"
+#include "kv_event/kv_event_publisher_config.h"
 
 namespace mooncake {
 
@@ -70,6 +71,10 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
 };
 
 class MasterServiceSupervisorConfig {
@@ -125,6 +130,11 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -183,6 +193,13 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        if (config.enable_kv_event_publish) {
+            kv_event_publisher_config = config.kv_event_publisher_config;
+        }
+
         validate();
     }
 
@@ -222,6 +239,9 @@ class MasterServiceSupervisorConfig {
         }
         if (!rpc_thread_num.IsSet()) {
             throw std::runtime_error("rpc_thread_num is not set");
+        }
+        if (enable_kv_event_publish && !kv_event_publisher_config.validate()) {
+            throw std::runtime_error("Invalid KVEventPublisher configuration");
         }
     }
 };
@@ -275,6 +295,11 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
+
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -343,6 +368,12 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        if (config.enable_kv_event_publish) {
+            kv_event_publisher_config = config.kv_event_publisher_config;
+        }
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -391,6 +422,12 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        if (config.enable_kv_event_publish) {
+            kv_event_publisher_config = config.kv_event_publisher_config;
+        }
     }
 };
 
@@ -439,6 +476,10 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish_ = false;
+    KVEventPublisherConfig kv_event_publisher_config_{};
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -617,6 +658,18 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    // KV Event Publisher configuration
+    MasterServiceConfigBuilder& set_enable_kv_event_publish(bool enable) {
+        enable_kv_event_publish_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_kv_event_publisher_config(
+        const KVEventPublisherConfig& config) {
+        kv_event_publisher_config_ = config;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -674,6 +727,11 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
+
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -723,6 +781,9 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        kv_event_publisher_config = config.kv_event_publisher_config;
     }
 
     // Static factory method to create a builder
@@ -771,6 +832,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    // KV Event Publisher configuration
+    config.enable_kv_event_publish = enable_kv_event_publish_;
+    config.kv_event_publisher_config = kv_event_publisher_config_;
     return config;
 }
 
@@ -792,6 +856,9 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    // KV Event Publisher configuration
+    std::optional<bool> enable_kv_event_publish;
+    std::optional<KVEventPublisherConfig> kv_event_publisher_config;
 };
 
 // Builder class for InProcMasterConfig
@@ -808,6 +875,10 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    // KV Event Publisher configuration
+    std::optional<bool> enable_kv_event_publish_ = std::nullopt;
+    std::optional<KVEventPublisherConfig> kv_event_publisher_config_ =
+        std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -871,6 +942,18 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    // KV Event Publisher configuration
+    InProcMasterConfigBuilder& set_enable_kv_event_publish(bool enable) {
+        enable_kv_event_publish_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_kv_event_publisher_config(
+        const KVEventPublisherConfig& config) {
+        kv_event_publisher_config_ = config;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -888,6 +971,9 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    // KV Event Publisher configuration
+    config.enable_kv_event_publish = enable_kv_event_publish_;
+    config.kv_event_publisher_config = kv_event_publisher_config_;
     return config;
 }
 
