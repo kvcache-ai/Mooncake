@@ -47,7 +47,7 @@ setup(
                     "-g0",
                 ],
             },
-            libraries=["ibverbs", "mlx5"],
+            libraries=["ibverbs", "mlx5", "cuda"],
             extra_link_args=[
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
