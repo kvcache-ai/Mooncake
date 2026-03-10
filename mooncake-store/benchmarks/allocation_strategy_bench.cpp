@@ -5,13 +5,11 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
-#include <sstream>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
 
 #include <gflags/gflags.h>
-#include <any>
 #include "types.h"
 
 #include "offset_allocator/offset_allocator.hpp"
@@ -30,11 +28,13 @@ DEFINE_bool(
 
 // Scale-Out workload flags
 DEFINE_string(workload, "fillup", "Workload type: fillup (default), scaleout");
-DEFINE_int32(scale_out_trigger_pct, 50,
-             "Percentage of num_allocations after which new nodes are injected "
-             "(scaleout mode only)");
-DEFINE_int32(alloc_percent_after_scale, 30,
-             "Percentage of num_allocations to allocate after scaleout");
+DEFINE_int32(
+    scale_out_trigger_pct, 50,
+    "Pre-fill cluster to this utilization % before injecting new nodes "
+    "(scaleout mode only)");
+DEFINE_int32(
+    alloc_percent_after_scale, 30,
+    "Percentage of expanded cluster capacity to allocate after scaleout");
 DEFINE_double(convergence_threshold, 0.1, "Threshold for convergence");
 DEFINE_int32(
     prefill_pct, 0,
@@ -53,7 +53,7 @@ static constexpr double GiB = 1024.0 * 1024 * 1024;
 constexpr int kNumVirtualNodes = 10;
 constexpr double kSkewRatio = 0.5;  // +/- 50% capacity for skewed clusters
 constexpr uint64_t kPrimaryBaseAddr = 0x100000000ULL;
-constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
+constexpr uint64_t kInjectedBaseAddr = 1ULL << 52;
 constexpr size_t kMaxExpectedAllocs = 600000;
 constexpr double kLargeClusterThresholdGB = 500.0;
 constexpr int kPreFillSampleInterval = 100;
@@ -152,8 +152,8 @@ static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
 static void setupResourceLimits() {
     struct rlimit rl;
     // Cap virtual address space (RLIMIT_AS) to 4TB
-    rl.rlim_cur = 4048ULL * 1024 * 1024 * 1024;
-    rl.rlim_max = 4048ULL * 1024 * 1024 * 1024;
+    rl.rlim_cur = 4096ULL * 1024 * 1024 * 1024;
+    rl.rlim_max = 4096ULL * 1024 * 1024 * 1024;
     setrlimit(RLIMIT_AS, &rl);
 
     rl.rlim_cur = RLIM_INFINITY;
@@ -209,7 +209,6 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
     AllocatorManager& manager, int count, size_t capacity, int id_offset) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
     new_allocs.reserve(count);
-    constexpr uint64_t kInjectedBaseAddr = 0x800000000ULL;
     for (int i = 0; i < count; ++i) {
         std::string name = "new_node_" + std::to_string(id_offset + i);
         uint64_t base_addr = kInjectedBaseAddr +
@@ -799,7 +798,7 @@ static void runFillupBenchmarks() {
     AllocationStrategyType current_strategy = AllocationStrategyType::RANDOM;
     bool first = true;
     for (const auto& cfg : configs) {
-        // Print header when strategy or skewness changes
+        // Print header when strategy
         if (first || cfg.strategy_type != current_strategy) {
             printFillUpHeader();
             current_strategy = cfg.strategy_type;
@@ -889,6 +888,10 @@ int main(int argc, char* argv[]) {
         runFillupBenchmarks();
     } else if (FLAGS_workload == "scaleout") {
         runScaleOutMatrix();
+    } else {
+        std::cout << "Invalid workload type: " << FLAGS_workload
+                  << ". Use --workload=fillup or --workload=scaleout."
+                  << std::endl;
     }
 
     return 0;
