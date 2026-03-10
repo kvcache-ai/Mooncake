@@ -241,11 +241,11 @@ def deserialize_block_store_event(event_array):
     event_type = event_array[0]  # "BlockStoreEvent"
     mooncake_key = event_array[1]
     replicas = event_array[2]  # Nested array of replica locations
-    model_name = event_array[3] # Could be an empty string
-    block_size = event_array[4] # Could be an empty string
-    block_hash = event_array[5] # Could be an empty string
-    parent_block_hash = event_array[6] # Could be an empty string
-    token_ids = event_array[7] # Could be an empty string
+    model_name = event_array[3] # String, defaults to ""
+    block_size = event_array[4] # Integer, defaults to 0
+    block_hash = event_array[5] # String, defaults to ""
+    parent_block_hash = event_array[6] # String, defaults to ""
+    token_ids = event_array[7] # List of integers, defaults to []
     
     # Handle default values according to StoreEventInfo specifications
     if model_name == "":

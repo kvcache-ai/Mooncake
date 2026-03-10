@@ -399,7 +399,6 @@ KVEventProducer::Stats KVEventProducer::get_stats() const {
     Stats stats{
         .events_created = events_created_.load(std::memory_order_relaxed),
         .enqueue_failed = enqueue_failed_.load(std::memory_order_relaxed),
-        .store_event = store_event_.load(std::memory_order_relaxed),
         .update_event = update_event_.load(std::memory_order_relaxed),
         .remove_all_event = remove_all_event_.load(std::memory_order_relaxed),
     };
@@ -426,8 +425,7 @@ std::ostream& operator<<(std::ostream& os,
     os << "(Total=" << stats.events_created << ", Fail=" << stats.enqueue_failed
        << ")";
 
-    os << " | Evt Types: Store=" << stats.store_event
-       << ", Update=" << stats.update_event
+    os << " | Evt Types: Update=" << stats.update_event
        << ", RemoveAll=" << stats.remove_all_event;
 
     return os;
@@ -854,9 +852,10 @@ void KVEventConsumer::service_replay(ThreadResources& resources) {
                                      client_id_frame.size());
         end_reply.push_back(std::move(end_client_id));
 
-        end_reply.emplace_back();
-        end_reply.emplace_back(END_SEQ.data(), END_SEQ.size());
-        end_reply.emplace_back();
+        end_reply.emplace_back();  // ZMQ ROUTER-DEALER delimiter
+        end_reply.emplace_back();  // End marker's empty sequence part
+        end_reply.emplace_back(END_SEQ.data(),
+                               END_SEQ.size());  // Payload is the end marker
 
         zmq::send_multipart(*resources.replay_socket, end_reply,
                             zmq::send_flags::dontwait);

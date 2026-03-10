@@ -22,10 +22,7 @@ class KVEventSystemTest : public ::testing::Test {
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
 
-    void SetUp() override {
-        create_test_descriptors();
-        create_test_store_event_info();
-    }
+    void SetUp() override { create_test_descriptors(); }
 
     Replica::Descriptor create_memory_replica() {
         Replica::Descriptor desc;
@@ -56,13 +53,6 @@ class KVEventSystemTest : public ::testing::Test {
         replicas_disk_only_ = {disk_replica_, disk_replica_};
     }
 
-    void create_test_store_event_info() {
-        std::vector<uint32_t> token_ids = {1, 2, 3, 4, 5};
-
-        store_event_info = {"gpt-4", 1024, "0xABCD1234", "0x9876FEDC",
-                            token_ids};
-    }
-
     template <typename ConfigType>
     std::unique_ptr<KVEventSystem> create_publish_system(ConfigType&& config) {
         static_assert(
@@ -72,37 +62,13 @@ class KVEventSystemTest : public ::testing::Test {
             std::forward<ConfigType>(config));
     }
 
-    static void verify_block_store_serialization(const BlockStoreEvent& event) {
-        msgpack::sbuffer buffer;
-        msgpack::packer<msgpack::sbuffer> pk(buffer);
-        event.pack(pk);
-
-        msgpack::object_handle oh =
-            msgpack::unpack(buffer.data(), buffer.size());
-        msgpack::object obj = oh.get();
-
-        EXPECT_EQ(obj.type, msgpack::type::ARRAY);
-        EXPECT_EQ(obj.via.array.size, 8);
-    }
-
    protected:
     Replica::Descriptor memory_replica_;
     Replica::Descriptor disk_replica_;
-    StoreEventInfo store_event_info;
     std::vector<Replica::Descriptor> replicas_mixed_;
     std::vector<Replica::Descriptor> replicas_memory_only_;
     std::vector<Replica::Descriptor> replicas_disk_only_;
 };
-
-TEST_F(KVEventSystemTest, BlockStoreEventSerialization) {
-    std::string model_name = "gpt-4";
-    std::vector<uint32_t> token_ids = {1, 2, 3, 4, 5};
-
-    BlockStoreEvent event("key123", replicas_mixed_, store_event_info);
-
-    EXPECT_EQ(event.type_tag(), "BlockStoreEvent");
-    verify_block_store_serialization(event);
-}
 
 TEST_F(KVEventSystemTest, BlockUpdateEventSerialization) {
     BlockUpdateEvent event("key123", replicas_mixed_);
@@ -121,8 +87,8 @@ TEST_F(KVEventSystemTest, BlockUpdateEventSerialization) {
 }
 
 TEST_F(KVEventSystemTest, EventBatchSerialization) {
-    auto event1 = std::make_shared<BlockStoreEvent>(
-        "key1", replicas_memory_only_, store_event_info);
+    auto event1 =
+        std::make_shared<BlockUpdateEvent>("key1", replicas_memory_only_);
 
     auto event2 =
         std::make_shared<BlockUpdateEvent>("key2", replicas_disk_only_);
@@ -159,8 +125,8 @@ TEST_F(KVEventSystemTest, KVEventSystemMultipleConstruction) {
     EXPECT_TRUE(publisher1->is_running());
     EXPECT_TRUE(publisher2->is_running());
 
-    auto future1 = publisher1->publish<BlockStoreEvent>("key1", replicas_mixed_,
-                                                        store_event_info);
+    auto future1 =
+        publisher1->publish<BlockUpdateEvent>("key1", replicas_mixed_);
 
     auto status1 = future1.wait_for(std::chrono::seconds(2));
     EXPECT_EQ(status1, std::future_status::ready);
@@ -175,8 +141,8 @@ TEST_F(KVEventSystemTest, KVEventSystemMultipleConstruction) {
 TEST_F(KVEventSystemTest, KVEventSystemBasicPublish) {
     auto publisher_ = create_publish_system(KVEventPublisherConfig{});
 
-    auto future_store = publisher_->publish<BlockStoreEvent>(
-        "test_key_store", replicas_mixed_, store_event_info);
+    auto future_store = publisher_->publish<BlockUpdateEvent>("test_key_store",
+                                                              replicas_mixed_);
 
     auto future_update = publisher_->publish<BlockUpdateEvent>(
         "test_key_update", replicas_mixed_);
@@ -225,8 +191,8 @@ TEST_F(KVEventSystemTest, KVEventSystemConcurrentPublishing) {
                     "key_" + std::to_string(i) + "_" + std::to_string(j);
 
                 try {
-                    auto future = publisher_->publish<BlockStoreEvent>(
-                        key, replicas_mixed_, store_event_info);
+                    auto future = publisher_->publish<BlockUpdateEvent>(
+                        key, replicas_mixed_);
                     {
                         std::lock_guard<std::mutex> lock(futures_mutex);
                         futures.push_back(std::move(future));
@@ -270,8 +236,8 @@ TEST_F(KVEventSystemTest, KVEventSystemGracefulShutdown) {
 
     std::vector<std::future<bool>> futures;
     for (int i = 0; i < 50; ++i) {
-        futures.push_back(publisher_->publish<BlockStoreEvent>(
-            "key_" + std::to_string(i), replicas_mixed_, store_event_info));
+        futures.push_back(publisher_->publish<BlockUpdateEvent>(
+            "key_" + std::to_string(i), replicas_mixed_));
     }
 
     for (auto& future : futures) {
@@ -280,8 +246,8 @@ TEST_F(KVEventSystemTest, KVEventSystemGracefulShutdown) {
 
     EXPECT_NO_THROW(publisher_->shutdown());
 
-    auto future_after_shutdown = publisher_->publish<BlockStoreEvent>(
-        "should_fail", replicas_mixed_, store_event_info);
+    auto future_after_shutdown =
+        publisher_->publish<BlockUpdateEvent>("should_fail", replicas_mixed_);
 
     EXPECT_EQ(future_after_shutdown.wait_for(std::chrono::milliseconds(100)),
               std::future_status::ready);
@@ -292,8 +258,8 @@ TEST_F(KVEventSystemTest, KVEventSystemEdgeCases) {
     auto publisher_ = create_publish_system(KVEventPublisherConfig{});
 
     std::vector<Replica::Descriptor> empty_replicas;
-    auto future1 = publisher_->publish<BlockStoreEvent>(
-        "empty_replicas_key", empty_replicas, store_event_info);
+    auto future1 = publisher_->publish<BlockUpdateEvent>("empty_replicas_key",
+                                                         empty_replicas);
 
     EXPECT_EQ(future1.wait_for(std::chrono::seconds(2)),
               std::future_status::ready);
@@ -304,11 +270,8 @@ TEST_F(KVEventSystemTest, KVEventSystemEdgeCases) {
         large_tokens[i] = static_cast<uint32_t>(i);
     }
 
-    StoreEventInfo large_info = {"large_model", 1024 * 1024, "0x12345678",
-                                 "0x87654321", large_tokens};
-
-    auto future2 = publisher_->publish<BlockStoreEvent>(
-        "large_tokens_key", replicas_mixed_, large_info);
+    auto future2 = publisher_->publish<BlockUpdateEvent>("large_tokens_key",
+                                                         replicas_mixed_);
 
     EXPECT_EQ(future2.wait_for(std::chrono::seconds(2)),
               std::future_status::ready);
@@ -328,8 +291,8 @@ TEST_F(KVEventSystemTest, KVEventSystemStats) {
 
     std::vector<std::future<bool>> futures;
     for (int i = 0; i < 10; ++i) {
-        futures.push_back(publisher_->publish<BlockStoreEvent>(
-            "key_" + std::to_string(i), replicas_mixed_, store_event_info));
+        futures.push_back(publisher_->publish<BlockUpdateEvent>(
+            "key_" + std::to_string(i), replicas_mixed_));
     }
 
     for (auto& future : futures) {
@@ -358,9 +321,8 @@ TEST_F(KVEventSystemTest, PerformanceTest) {
     futures.reserve(num_events);
 
     for (int i = 0; i < num_events; ++i) {
-        futures.push_back(publisher_->publish<BlockStoreEvent>(
-            "perf_key_" + std::to_string(i), replicas_mixed_,
-            store_event_info));
+        futures.push_back(publisher_->publish<BlockUpdateEvent>(
+            "perf_key_" + std::to_string(i), replicas_mixed_));
     }
 
     int successful_events = 0;

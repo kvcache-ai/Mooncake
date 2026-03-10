@@ -144,9 +144,7 @@ class KVEventSystem {
      * @return Shared pointer to event consumer
      * Used for advanced usage to directly access consumer interface
      */
-    std::shared_ptr<KVEventConsumer> get_publisher() const {
-        return consumer_;
-    };
+    std::shared_ptr<KVEventConsumer> get_consumer() const { return consumer_; };
 
    private:
     KVEventPublisherConfig config_;

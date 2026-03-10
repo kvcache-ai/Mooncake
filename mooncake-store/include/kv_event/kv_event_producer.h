@@ -40,7 +40,6 @@ class KVEventProducer {
         size_t enqueue_failed{0};
         double success_rate{0.0};
 
-        size_t store_event{0};
         size_t update_event{0};
         size_t remove_all_event{0};
 
@@ -82,9 +81,7 @@ class KVEventProducer {
      */
     template <DerivedFromKVCacheEvent Event>
     void increment_event_count() {
-        if constexpr (std::is_same_v<Event, BlockStoreEvent>) {
-            store_event_.fetch_add(1, std::memory_order_relaxed);
-        } else if constexpr (std::is_same_v<Event, BlockUpdateEvent>) {
+        if constexpr (std::is_same_v<Event, BlockUpdateEvent>) {
             update_event_.fetch_add(1, std::memory_order_relaxed);
         } else if constexpr (std::is_same_v<Event, RemoveAllEvent>) {
             remove_all_event_.fetch_add(1, std::memory_order_relaxed);
@@ -153,7 +150,6 @@ class KVEventProducer {
     std::atomic<size_t> events_created_{0};
     std::atomic<size_t> enqueue_failed_{0};
 
-    std::atomic<size_t> store_event_{0};
     std::atomic<size_t> update_event_{0};
     std::atomic<size_t> remove_all_event_{0};
 };
