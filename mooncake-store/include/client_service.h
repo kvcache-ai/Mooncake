@@ -611,7 +611,7 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
-    MasterViewHelper master_view_helper_;
+    std::unique_ptr<MasterViewHelper> master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     std::atomic<bool> last_ping_success_{false};

@@ -40,6 +40,11 @@ if (STORE_USE_ETCD)
   add_compile_definitions(STORE_USE_ETCD)
 endif()
 
+option(STORE_USE_K8S "build mooncake store with Kubernetes" OFF)
+if (STORE_USE_K8S)
+  add_compile_definitions(STORE_USE_K8S)
+endif()
+
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 
 # Define ASIO macros before adding mooncake-asio subdirectory

@@ -29,7 +29,7 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
-static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
+static constexpr int64_t MASTER_VIEW_LEASE_TTL = 5;         // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
     60 * 10;  // in seconds
@@ -204,10 +204,12 @@ enum class ErrorCode : int32_t {
     RPC_FAIL = -900,  ///< RPC operation failed.
 
     // High availability errors (Range: -1000 to -1099)
-    ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
-    ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
-    ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
-    ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
+    ETCD_OPERATION_ERROR = -1000,        ///< etcd operation failed.
+    ETCD_KEY_NOT_EXIST = -1001,          ///< key not found in etcd.
+    ETCD_TRANSACTION_FAIL = -1002,       ///< etcd transaction failed.
+    ETCD_CTX_CANCELLED = -1003,          ///< etcd context cancelled.
+    K8S_OPERATION_ERROR = -1004,         ///< k8s operation failed.
+    K8S_LEADER_ELECTION_FAILED = -1005,  ///< k8s leader election failed.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =

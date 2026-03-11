@@ -1017,6 +1017,9 @@ class MasterService {
 
     const bool enable_offload_;
 
+    // high availability coordinator
+    const std::string ha_coordinator_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     // root filesystem directory for persistent storage

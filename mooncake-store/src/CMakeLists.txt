@@ -14,10 +14,10 @@ set(MOONCAKE_STORE_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     ha_helper.cpp
+    k8s_helper.cpp
+    k8s_ha_helper.cpp
     segment.cpp
     transfer_task.cpp
-    etcd_helper.cpp
-    ha_helper.cpp
     rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
@@ -99,6 +99,7 @@ target_link_libraries(mooncake_store
     PUBLIC
         cachelib_memory_allocator
         ${ETCD_WRAPPER_LIB}
+        ${K8S_WRAPPER_LIB}
         glog::glog
         gflags::gflags
         ${EXTRA_LIBS}
@@ -108,6 +109,9 @@ target_link_libraries(mooncake_store
 )
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+if (STORE_USE_K8S)
+    add_dependencies(mooncake_store build_k8s_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)
@@ -140,12 +144,17 @@ target_link_libraries(mooncake_master PRIVATE
     ibverbs
     mooncake_common
     ${ETCD_WRAPPER_LIB}
+    ${K8S_WRAPPER_LIB}
     ${MASTER_EXTRA_LIBS}
     asio_shared
 )
 
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
+endif()
+
+if (STORE_USE_K8S)
+    add_dependencies(mooncake_master build_k8s_wrapper)
 endif()
 
 target_compile_options(mooncake_master PRIVATE -Os)
