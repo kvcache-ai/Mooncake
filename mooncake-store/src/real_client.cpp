@@ -117,12 +117,12 @@ void ResourceTracker::startSignalThread() {
         sigaddset(&set, SIGUSR1);  // used to interrupt sigwait on stop
         pthread_sigmask(SIG_BLOCK, &set, nullptr);
 
-        signal_thread_ = std::jthread(
-            [set, ready = std::move(ready)](std::stop_token st) mutable {
+        signal_thread_ = std::jthread([set, ready = std::move(ready)](
+                                          std::stop_token st) mutable {
             // Register a stop callback to interrupt sigwait via SIGUSR1
             pthread_t self = pthread_self();
-                std::stop_callback cb(
-                    st, [self]() { pthread_kill(self, SIGUSR1); });
+            std::stop_callback cb(st,
+                                  [self]() { pthread_kill(self, SIGUSR1); });
             ready.set_value();
             for (;;) {
                 int sig = 0;
