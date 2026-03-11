@@ -428,10 +428,6 @@ class MasterService {
         const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
-    // Resolve the key to a sanitized format for storage
-    std::string SanitizeKey(const std::string& key) const;
-    std::string ResolvePath(const std::string& key) const;
-
     void SnapshotThreadFunc();
 
     // Persist master state
@@ -1076,7 +1072,9 @@ class MasterService {
                           std::chrono::system_clock::time_point ttl)
             : replicas_(std::move(replicas)), ttl_(ttl), mem_size_(0) {
             for (auto& replica : replicas_) {
-                mem_size_ += replica.get_memory_buffer_size();
+                if (replica.is_memory_replica()) {
+                    mem_size_ += replica.get_memory_buffer_size();
+                }
             }
             MasterMetricManager::instance().inc_put_start_discard_cnt(
                 1, mem_size_);

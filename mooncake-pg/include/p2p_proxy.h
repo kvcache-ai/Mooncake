@@ -13,6 +13,7 @@
 #include <optional>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 
 namespace mooncake {
 
@@ -43,7 +44,8 @@ struct alignas(64) AtomicHeadTail {
 //
 // State by (head, tail), modulo N:
 // - empty: head == tail
-// - full : (head + 1) % N == tail   (one slot reserved to distinguish full/empty)
+// - full : (head + 1) % N == tail   (one slot reserved to distinguish
+// full/empty)
 // - ready: head != tail
 //
 // Protocol:
@@ -54,8 +56,11 @@ struct P2PControlSlot {
     AtomicHeadTail tail;
 };
 
+class P2PDeviceWorker;
 class P2PProxy {
    public:
+    friend class P2PDeviceWorker;
+
     struct Options {
         bool is_cpu = false;
         int rank = 0;
@@ -79,13 +84,9 @@ class P2PProxy {
     };
 
     P2PProxy(TransferEngine* engine, const Options& options);
-
     ~P2PProxy();
 
-    void BindMeta(TransferGroupMeta* meta);
-    void AllocateResources();
-    void ReleaseResources();
-
+    void BindMeta(const std::shared_ptr<TransferGroupMeta>& meta);
     void* send_buffer() const { return resources_.send_buffer_; }
     void* recv_buffer() const { return resources_.recv_buffer_; }
     P2PControlSlot* ctrl_send_region() const {
@@ -95,11 +96,10 @@ class P2PProxy {
         return resources_.ctrl_recv_region_;
     }
 
-    void Start();
-    void Stop();
-
     void EnqueueSend(SendOp op);
     void EnqueueRecv(RecvOp op);
+
+    void ResetPeerState(int peer_rank);
 
    private:
     enum class TransferState {
@@ -181,6 +181,18 @@ class P2PProxy {
         std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
     };
 
+    // Resources are allocated and released by constructor/destructor
+    void AllocateResources();
+    void ReleaseResources();
+
+    // For P2PDeviceWorker
+    bool StepSend();
+    bool StepRecv();
+    void SetDeviceWorker(P2PDeviceWorker*);
+    bool HasActiveSendWork() const;
+    bool HasActiveRecvWork() const;
+
+    // Internal Steps
     bool TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity);
     bool StepSendTransferTask(SendOpContext& op_ctx, SendTransferTask& task);
     bool StepSendDataCopy(SendTransferTask& task);
@@ -188,20 +200,20 @@ class P2PProxy {
     bool StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity);
     bool IsSendDataPathCompleted(const SendOpContext& op_ctx) const;
     bool IsSendOpCompleted(const SendOpContext& op_ctx) const;
+    void PerformSendReset(int peer_rank);
 
     bool TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity);
     bool StepRecvTransferTask(RecvTransferTask& task);
     bool StepRecvDataCopy(RecvTransferTask& task);
     bool StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity);
     bool IsRecvDataPathCompleted(const RecvOpContext& op_ctx) const;
+    void PerformRecvReset(int peer_rank);
+
     uint64_t GetLocalSendSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetLocalRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetRemoteRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
     uint64_t GetRemoteCtrlRecvHeadOffset(int peer_rank) const;
     uint64_t GetRemoteCtrlSendTailOffset(int peer_rank) const;
-
-    void SendWorkerThread();
-    void RecvWorkerThread();
 
    private:
     struct P2PResources {
@@ -211,8 +223,10 @@ class P2PProxy {
         P2PControlSlot* ctrl_recv_region_ = nullptr;
     };
 
+    P2PDeviceWorker* device_worker_ = nullptr;
+
     TransferEngine* engine_ = nullptr;
-    TransferGroupMeta* meta_ = nullptr;
+    std::shared_ptr<TransferGroupMeta> meta_;
     bool is_cpu_ = false;
     int rank_ = 0;
     int size_ = 0;
@@ -221,18 +235,83 @@ class P2PProxy {
 
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;
-    std::atomic<bool> send_worker_running_{false};
-    std::thread send_worker_thread_;
 
     std::queue<RecvOp> recv_queue_;
     std::mutex recv_queue_mutex_;
-    std::atomic<bool> recv_worker_running_{false};
-    std::thread recv_worker_thread_;
+
+    std::array<std::atomic<bool>, kMaxNumRanks> reset_send_req_;
+    std::array<std::atomic<bool>, kMaxNumRanks> reset_recv_req_;
+
+    std::atomic<int> active_send_tasks_{0};
+    std::atomic<int> active_recv_tasks_{0};
 
     std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
     std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;
 };
 
+// P2PDeviceWorker instances are shared across multiple backends within the same
+// process. Therefore, they must not be instantiated directly. Instead, obtain
+// an instance through P2PDeviceWorkerManager.
+class P2PDeviceWorker {
+   public:
+    friend class P2PDeviceWorkerManager;
+    void registerProxy(const std::shared_ptr<P2PProxy>&);
+    void removeProxy(const std::shared_ptr<P2PProxy>&);
+
+    P2PDeviceWorker(bool is_cpu, int cuda_device_index)
+        : is_cpu_(is_cpu), cuda_device_index_(cuda_device_index) {
+        Start();
+    }
+
+    ~P2PDeviceWorker() { Stop(); }
+
+    void WakeUpSend();
+    void WakeUpRecv();
+
+   private:
+    void Start();
+    void Stop();
+
+    void SendWorkerThread();
+    void RecvWorkerThread();
+
+    std::mutex send_wakeup_mutex_;
+    std::condition_variable send_wakeup_cv_;
+
+    std::mutex recv_wakeup_mutex_;
+    std::condition_variable recv_wakeup_cv_;
+
+    std::atomic<bool> send_worker_running_{false};
+    std::thread send_worker_thread_;
+
+    std::atomic<bool> recv_worker_running_{false};
+    std::thread recv_worker_thread_;
+
+    std::mutex proxies_mutex_;
+    std::atomic<uint64_t> proxies_version_{0};
+    std::vector<std::shared_ptr<P2PProxy>> proxies_;
+
+    bool is_cpu_;
+    int cuda_device_index_;
+};
+
+class P2PDeviceWorkerManager {
+   public:
+    static P2PDeviceWorkerManager& GetInstance() {
+        // leaky singleton to avoid destructor fiasco problem
+        static P2PDeviceWorkerManager* manager = new P2PDeviceWorkerManager;
+        return *manager;
+    }
+
+    std::shared_ptr<P2PDeviceWorker> GetCPUWorker();
+    std::shared_ptr<P2PDeviceWorker> GetCUDAWorker(int cuda_device_index);
+
+   private:
+    static constexpr int CPUWorkerID = -1;
+    std::mutex manager_mutex_;
+    std::unordered_map<int, std::weak_ptr<P2PDeviceWorker>> workers_;
+};
+
 }  // namespace mooncake
 
-#endif  // MOONCAKE_P2P_PROXY_HH
+#endif  // MOONCAKE_P2P_PROXY_H

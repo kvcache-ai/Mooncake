@@ -26,9 +26,10 @@ setup(
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",
-                "src/p2p_proxy.cc",
+                "src/p2p_proxy.cpp",
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_thread.cpp",
+                "src/connection_poller.cpp",
             ],
             extra_compile_args={
                 "cxx": [

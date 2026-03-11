@@ -15,6 +15,7 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include <ylt/coro_http/coro_http_server.hpp>
 
 namespace mooncake {
 
@@ -244,6 +245,8 @@ class RealClient : public PyClient {
     long removeAll(bool force = false);
 
     int tearDownAll();
+
+    int health_check() override;
 
     /**
      * @brief Check if an object exists
@@ -520,17 +523,10 @@ class RealClient : public PyClient {
     };
 
     struct AscendSegmentDeleter {
+        std::string protocol = "ascend";
         void operator()(void *ptr) {
             if (ptr) {
-                free_memory("ascend", ptr);
-            }
-        }
-    };
-
-    struct UbshmemSegmentDeleter {
-        void operator()(void *ptr) {
-            if (ptr) {
-                free_memory("ubshmem", ptr);
+                free_memory(protocol.c_str(), ptr);
             }
         }
     };
@@ -540,8 +536,6 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
-    std::vector<std::unique_ptr<void, UbshmemSegmentDeleter>>
-        ubshmem_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -598,6 +592,11 @@ class RealClient : public PyClient {
     int start_ipc_server();
     int stop_ipc_server();
     void ipc_server_func();
+    // Embedded HTTP server for health-check / metrics
+    std::unique_ptr<coro_http::coro_http_server> http_server_;
+    int start_http_server();
+    void stop_http_server();
+
     void handle_ipc_shm_register(int client_sock);
     void handle_ipc_shm_fd_request(int client_sock);
 };

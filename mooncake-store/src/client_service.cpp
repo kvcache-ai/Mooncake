@@ -372,22 +372,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend") {
+        } else if (protocol == "ascend" || protocol == "ubshmem") {
             if (device_names.has_value()) {
-                LOG(WARNING) << "Ascend protocol does not use device "
-                                "names, ignoring";
+                LOG(WARNING) << protocol
+                             << " protocol does not use device names, ignoring";
             }
             try {
                 transport =
-                    transfer_engine_->installTransport("ascend", nullptr);
+                    transfer_engine_->installTransport(protocol, nullptr);
             } catch (std::exception& e) {
-                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
+                LOG(ERROR) << protocol
+                           << "_transport_install_failed error_message=\""
                            << e.what() << "\"";
                 return ErrorCode::INTERNAL_ERROR;
             }
 
             if (!transport) {
-                LOG(ERROR) << "Failed to install Ascend transport";
+                LOG(ERROR) << "Failed to install " << protocol << " transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxl") {
@@ -405,25 +406,6 @@ ErrorCode Client::InitTransferEngine(
 
             if (!transport) {
                 LOG(ERROR) << "Failed to install CXL transport";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else if (protocol == "ubshmem") {
-            if (device_names.has_value()) {
-                LOG(WARNING) << "Ubshmem protocol does not use device "
-                                "names, ignoring";
-            }
-            try {
-                transport =
-                    transfer_engine_->installTransport("ubshmem", nullptr);
-            } catch (std::exception& e) {
-                LOG(ERROR)
-                    << "ubshmem_transport_install_failed error_message=\""
-                    << e.what() << "\"";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-
-            if (!transport) {
-                LOG(ERROR) << "Failed to install Ubshmem transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else {
@@ -2359,6 +2341,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
+            last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
@@ -2376,6 +2359,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         ping_fail_count++;
+        last_ping_success_.store(false);
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
             std::this_thread::sleep_for(
