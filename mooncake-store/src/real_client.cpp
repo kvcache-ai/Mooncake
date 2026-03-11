@@ -119,56 +119,54 @@ void ResourceTracker::startSignalThread() {
 
         signal_thread_ = std::jthread(
             [set, ready = std::move(ready)](std::stop_token st) mutable {
-                // Register a stop callback to interrupt sigwait via SIGUSR1
-                pthread_t self = pthread_self();
+            // Register a stop callback to interrupt sigwait via SIGUSR1
+            pthread_t self = pthread_self();
                 std::stop_callback cb(
                     st, [self]() { pthread_kill(self, SIGUSR1); });
-                ready.set_value();
-                for (;;) {
-                    int sig = 0;
-                    int rc = sigwait(&set, &sig);
-                    if (rc != 0) {
-                        LOG(ERROR) << "sigwait failed: " << strerror(rc);
-                        continue;
-                    }
-
-                    if (sig == SIGUSR1) {
-                        if (st.stop_requested()) {
-                            break;  // graceful stop
-                        }
-                        continue;  // spurious
-                    }
-
-                    // Perform cleanup in normal thread context
-                    LOG(INFO) << "Received signal " << sig
-                              << ", cleaning up resources";
-                    ResourceTracker::getInstance().cleanupAllResources();
-
-                    // Restore default action and re-raise to terminate normally
-                    struct sigaction sa;
-                    sa.sa_handler = SIG_DFL;
-                    sigemptyset(&sa.sa_mask);
-                    sa.sa_flags = 0;
-                    sigaction(sig, &sa, nullptr);
-
-                    // Unblock the signal before raising, otherwise raise()
-                    // sends a thread-directed signal that stays pending
-                    // (blocked by pthread_sigmask) and is lost when this
-                    // thread exits, leaving the process alive.
-                    sigset_t unblock;
-                    sigemptyset(&unblock);
-                    sigaddset(&unblock, sig);
-                    int ret = pthread_sigmask(SIG_UNBLOCK, &unblock, nullptr);
-                    if (ret != 0) {
-                        LOG(ERROR) << "Failed to unblock signal " << sig
-                                   << " before raising: " << strerror(ret);
-                        _exit(EXIT_FAILURE);
-                    }
-                    raise(sig);
-
-                    break;  // Should not reach due to process termination
+            ready.set_value();
+            for (;;) {
+                int sig = 0;
+                int rc = sigwait(&set, &sig);
+                if (rc != 0) {
+                    LOG(ERROR) << "sigwait failed: " << strerror(rc);
+                    continue;
                 }
-            });
+
+                if (sig == SIGUSR1) {
+                    if (st.stop_requested()) {
+                        break;  // graceful stop
+                    }
+                    continue;  // spurious
+                }
+
+                // Perform cleanup in normal thread context
+                LOG(INFO) << "Received signal " << sig
+                          << ", cleaning up resources";
+                ResourceTracker::getInstance().cleanupAllResources();
+
+                // Restore default action and re-raise to terminate normally
+                struct sigaction sa;
+                sa.sa_handler = SIG_DFL;
+                sigemptyset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(sig, &sa, nullptr);
+
+                // Unblock the signal before raising it so it can be
+                // delivered immediately
+                sigset_t unblock_set;
+                sigemptyset(&unblock_set);
+                sigaddset(&unblock_set, sig);
+                int ret = pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+                if (ret != 0) {
+                    LOG(ERROR) << "Failed to unblock signal " << sig
+                               << " before raising: " << strerror(ret);
+                    _exit(EXIT_FAILURE);
+                }
+                raise(sig);
+
+                break;  // Should not reach due to process termination
+            }
+        });
         ready_future.wait();  // Ensure thread is ready
     });
 }
