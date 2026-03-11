@@ -9,6 +9,7 @@ on:
 
 jobs:
   build-and-test:
+    if: github.repository == 'kvcache-ai/Mooncake'
     runs-on: self-hosted
 
     container:
@@ -147,8 +148,7 @@ jobs:
               # Run the test with run.sh
               python3 $test_case \
                   --device_id=0 \
-                  --schema="d2d" \
-                  --rank=0
+                  --rank=0 \
                   2>&1 | tee "/tmp/hixl_test_${test_case%.py}.log"
 
               TEST_RESULT=${PIPESTATUS[0]}
