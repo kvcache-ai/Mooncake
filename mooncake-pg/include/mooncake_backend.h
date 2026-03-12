@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
 #include <p2p_proxy.h>
@@ -29,13 +31,18 @@ class MooncakeBackend final : public ::c10d::Backend {
         bool isExtension_ = false;
     };
 
-    MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    MooncakeBackend(c10d::DistributedBackendOptions distBackendOpts,
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
 
     ~MooncakeBackend() override;
 
     const std::string getBackendName() const override;
+
+    c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override {
+        return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
+            options_);
+    }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -127,6 +134,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     static MooncakeWorker* worker_;
     static bool engineInitialized_;
     static int backendIndex_;
+    const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;
     void* send_buffer_[2];

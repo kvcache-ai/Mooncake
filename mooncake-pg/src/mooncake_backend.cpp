@@ -31,8 +31,6 @@ MooncakeWorker* MooncakeBackend::worker_ = new MooncakeWorker();
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
 
-namespace {
-
 // Async Work implementation for P2P operations processed by worker threads.
 class MooncakeP2PWork : public ::c10d::Work {
    public:
@@ -67,12 +65,17 @@ class MooncakeP2PWork : public ::c10d::Work {
     std::shared_ptr<std::atomic<bool>> completed_;
 };
 
-}  // namespace
-
 MooncakeBackend::MooncakeBackend(
-    c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(rank, size), isCpu_(isCpu) {
+    : Backend(distBackendOpts.group_rank, distBackendOpts.group_size),
+      options_(std::move(options)),
+      isCpu_(isCpu) {
+    auto store = std::move(distBackendOpts.store);
+    const int rank = distBackendOpts.group_rank;
+    const int size = distBackendOpts.group_size;
+    const auto& globalRanks = distBackendOpts.global_ranks_in_group;
+
     // Get device data
     std::string location;
     int deviceCount = 0;
@@ -95,9 +98,10 @@ MooncakeBackend::MooncakeBackend(
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
                                   std::to_string(localRpcMeta.rpc_port);
     // construct local to global rank map
-    if (options && (int)options->global_ranks_in_group.size() == size) {
+    if (globalRanks.size() == static_cast<size_t>(size)) {
         for (int i = 0; i < size; ++i) {
-            local2global_rank_map_[i] = options->global_ranks_in_group[i];
+            local2global_rank_map_[i] =
+                static_cast<uint64_t>(globalRanks[i]);
         }
     } else {
         for (int i = 0; i < size; ++i) {
@@ -148,7 +152,8 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Register CPU sync regions
-    TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
+    TORCH_CHECK(static_cast<size_t>(size) <= kMaxNumRanks,
+                "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
         int rc = engine_->registerLocalMemory(
@@ -229,17 +234,17 @@ MooncakeBackend::MooncakeBackend(
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_->activeRanks[i] = true;
     }
-    if (options) {
-        TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
+    if (options_ && options_->activeRanks_.defined()) {
+        TORCH_CHECK(options_->activeRanks_.dtype() == at::kInt,
                     "activeRanks must be int.");
         if (isCpu) {
-            TORCH_CHECK(options->activeRanks_.device().is_cpu(),
+            TORCH_CHECK(options_->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
-            TORCH_CHECK(options->activeRanks_.device().is_cuda(),
+            TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
                         "activeRanks must be on CUDA.");
         }
-        meta_->activeRanksTensor = options->activeRanks_;
+        meta_->activeRanksTensor = options_->activeRanks_;
     } else {
         meta_->activeRanksTensor =
             at::ones({size}, torch::dtype(torch::kInt32)
@@ -254,7 +259,7 @@ MooncakeBackend::MooncakeBackend(
     // Wait for peers
     connection_ctx_->waitUntilAllConnected();
 
-    if (options && options->isExtension_) {
+    if (options_ && options_->isExtension_) {
         auto key = ConnectionContext::getExtensionTaskCountStoreKey(
             backendIndex_, rank_);
         while (true) {
