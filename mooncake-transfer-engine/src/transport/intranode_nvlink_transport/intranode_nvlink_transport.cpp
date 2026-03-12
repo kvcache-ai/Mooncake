@@ -15,7 +15,6 @@
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 
 #include <bits/stdint-uintn.h>
-#include <cuda.h>
 #include "cuda_alike.h"
 #include <glog/logging.h>
 
