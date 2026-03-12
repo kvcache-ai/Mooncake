@@ -77,6 +77,11 @@ class RdmaContext {
 
     MemReg registerMemReg(void *addr, size_t length, int access);
 
+    // Warm up RDMA MR registration by temporarily registering/deregistering.
+    // This targets RDMA driver-side pinning/metadata and differs from CPU
+    // prefault (madvise/mlock/touch) used before NUMA probing.
+    int warmupMrRegistration(void *addr, size_t length);
+
     int unregisterMemReg(MemReg id);
 
     const std::pair<uint32_t, uint32_t> queryMemRegKey(MemReg id) const {

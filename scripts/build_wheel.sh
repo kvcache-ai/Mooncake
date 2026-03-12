@@ -32,6 +32,9 @@ echo "Creating directory structure..."
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
+# Copy libasio.so to mooncake directory (runtime dependency of engine.so)
+cp build/mooncake-asio/libasio.so mooncake-wheel/mooncake/libasio.so
+
 # Copy store.so to mooncake directory
 if [ -f build/mooncake-integration/store.*.so ]; then
     echo "Copying store.so..."
@@ -108,6 +111,10 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
+# Build EP/PG CUDA extensions and stage them; they are injected into the wheel
+# AFTER auditwheel so that patchelf never touches CUDA fatbins (see below).
+CUDA_EP_STAGING_DIR=$(mktemp -d)
+
 if [ "$BUILD_WITH_EP" = "1" ]; then
     echo "Building Mooncake EP"
     cd mooncake-ep
@@ -125,7 +132,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cp mooncake/*.so "$CUDA_EP_STAGING_DIR/"
     cd ..
 fi
 
@@ -146,7 +153,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cp mooncake/*.so "$CUDA_EP_STAGING_DIR/"
     cd ..
 fi
 
@@ -254,114 +261,9 @@ echo "Detected architecture: $ARCH_SUFFIX"
 echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
-if [ "$PYTHON_VERSION" = "3.8" ]; then
-    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
-
-    echo "python 3.8 auditwheel does not support wild-cards..."
-    PATTERNS=(
-        "libcurl.so*"
-        "libibverbs.so*"
-        "libmlx5.so*"
-        "libnuma.so*"
-        "libstdc++.so*"
-        "libgcc_s.so*"
-        "libc.so*"
-        "libnghttp2.so*"
-        "libidn2.so*"
-        "librtmp.so*"
-        "libssh.so*"
-        "libpsl.so*"
-        "libssl.so*"
-        "libcrypto.so*"
-        "libgssapi_krb5.so*"
-        "libldap.so*"
-        "liblber.so*"
-        "libbrotlidec.so*"
-        "libz.so*"
-        "libnl-route-3.so*"
-        "libnl-3.so*"
-        "libm.so*"
-        "liblzma.so*"
-        "libunistring.so*"
-        "libgnutls.so*"
-        "libhogweed.so*"
-        "libnettle.so*"
-        "libgmp.so*"
-        "libkrb5.so*"
-        "libk5crypto.so*"
-        "libcom_err.so*"
-        "libkrb5support.so*"
-        "libsasl2.so*"
-        "libbrotlicommon.so*"
-        "libp11-kit.so*"
-        "libtasn1.so*"
-        "libkeyutils.so*"
-        "libresolv.so*"
-        "libffi.so*"
-        "libcuda.so*"
-        "libcudart.so*"
-        "libc10.so*"
-        "libc10_cuda.so*"
-        "libtorch.so*"
-        "libtorch_cpu.so*"
-        "libtorch_cuda.so*"
-        "libtorch_python.so*"
-        "libascendcl.so*"
-        "libhccl.so*"
-        "libmsprofiler.so*"
-        "libgert.so*"
-        "libascendcl_impl.so*"
-        "libge_executor.so*"
-        "libascend_dump.so*"
-        "libgraph.so*"
-        "libruntime.so*"
-        "libascend_watchdog.so*"
-        "libprofapi.so*"
-        "liberror_manager.so*"
-        "libascendalog.so*"
-        "libc_sec.so*"
-        "libhccl_alg.so*"
-        "libhccl_plf.so*"
-        "libascend_protobuf.so*"
-        "libhybrid_executor.so*"
-        "libdavinci_executor.so*"
-        "libge_common.so*"
-        "libge_common_base.so*"
-        "liblowering.so*"
-        "libregister.so*"
-        "libexe_graph.so*"
-        "libmmpa.so*"
-        "libplatform.so*"
-        "libgraph_base.so*"
-        "libruntime_common.so*"
-        "libqos_manager.so*"
-        "libascend_trace.so*"
-        "libmetadef*.so"
-        "libadxl*.so"
-    )
-
-    for pattern in "${PATTERNS[@]}"; do
-        for libpath in /usr/local/cuda* /usr/local/cuda-12.8/lib* /usr/lib* /usr/local/lib* /lib*; do
-            if [ -d "$libpath" ]; then
-                for lib in $(find $libpath -name "$pattern" 2>/dev/null); do
-                    # Get just the filename
-                    libname=$(basename "$lib")
-                    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude $libname "
-                done
-            fi
-        done
-    done
-
-    # Manually fix for libcuda since it needs libcuda.so.1 but I didn't get it.
-    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude libcuda.so.1 "
-
-    echo "Running auditwheel with exclude options: $EXCLUDE_OPTS"
-    auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
-else
-    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
-    auditwheel repair ${OUTPUT_DIR}/*.whl \
+echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+python -m build --wheel --outdir ${OUTPUT_DIR}
+auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
@@ -444,8 +346,29 @@ else
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
-fi
 
+# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
+# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
+# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+    if [ -n "$REPAIRED_WHEEL" ]; then
+        echo "Injecting CUDA extension .so files into repaired wheel..."
+        WHEEL_UNPACK_DIR=$(mktemp -d)
+        python -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
+            if [ -f "$so_file" ]; then
+                echo "  Adding $(basename "$so_file")"
+                cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
+            fi
+        done
+        rm "$REPAIRED_WHEEL"
+        python -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        rm -rf "$WHEEL_UNPACK_DIR"
+    fi
+    rm -rf "$CUDA_EP_STAGING_DIR"
+fi
 
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl

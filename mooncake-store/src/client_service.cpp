@@ -291,7 +291,7 @@ ErrorCode Client::InitTransferEngine(
         }
     }
 
-    if (protocol == "ascend") {
+    if (protocol == "ascend" || protocol == "ubshmem") {
         const char* ascend_use_fabric_mem =
             std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
         if (ascend_use_fabric_mem) {
@@ -372,22 +372,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install TCP transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
-        } else if (protocol == "ascend") {
+        } else if (protocol == "ascend" || protocol == "ubshmem") {
             if (device_names.has_value()) {
-                LOG(WARNING) << "Ascend protocol does not use device "
-                                "names, ignoring";
+                LOG(WARNING) << protocol
+                             << " protocol does not use device names, ignoring";
             }
             try {
                 transport =
-                    transfer_engine_->installTransport("ascend", nullptr);
+                    transfer_engine_->installTransport(protocol, nullptr);
             } catch (std::exception& e) {
-                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
+                LOG(ERROR) << protocol
+                           << "_transport_install_failed error_message=\""
                            << e.what() << "\"";
                 return ErrorCode::INTERNAL_ERROR;
             }
 
             if (!transport) {
-                LOG(ERROR) << "Failed to install Ascend transport";
+                LOG(ERROR) << "Failed to install " << protocol << " transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxl") {
@@ -1629,6 +1630,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+tl::expected<void, ErrorCode> Client::EvictDiskReplica(
+    const std::string& key, ReplicaType replica_type) {
+    return master_client_.EvictDiskReplica(key, replica_type);
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
@@ -2056,7 +2062,7 @@ void Client::PutToLocalFile(const std::string& key,
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object
-        auto store_result = backend->StoreObject(path, value);
+        auto store_result = backend->StoreObject(path, value, key);
         ReplicaType replica_type = ReplicaType::DISK;
 
         if (!store_result) {
@@ -2067,6 +2073,17 @@ void Client::PutToLocalFile(const std::string& key,
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
             return;
+        }
+
+        // Notify master about any evicted disk replicas
+        for (const auto& evicted_key : store_result.value()) {
+            auto evict_result =
+                master_client_.EvictDiskReplica(evicted_key, replica_type);
+            if (!evict_result) {
+                LOG(WARNING)
+                    << "Failed to notify master about evicted key: "
+                    << evicted_key << ", error: " << evict_result.error();
+            }
         }
 
         // If storage succeeded, end the put operation
@@ -2315,6 +2332,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
+            last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
@@ -2332,6 +2350,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         ping_fail_count++;
+        last_ping_success_.store(false);
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
             std::this_thread::sleep_for(

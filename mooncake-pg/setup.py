@@ -26,9 +26,10 @@ setup(
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",
-                "src/p2p_proxy.cc",
+                "src/p2p_proxy.cpp",
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_thread.cpp",
+                "src/connection_poller.cpp",
             ],
             extra_compile_args={
                 "cxx": [
@@ -47,8 +48,10 @@ setup(
                 ],
             },
             libraries=["ibverbs", "mlx5"],
-            extra_objects=[
-                os.path.join(current_dir, "../mooncake-wheel/mooncake/engine.so"),
+            extra_link_args=[
+                "-Wl,-rpath,$ORIGIN",
+                "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                "-l:engine.so",
             ],
         )
     ],

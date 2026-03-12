@@ -76,7 +76,8 @@ RUN apt-get update && \
         librdmacm1 \
         libnuma1 \
         liburing2 \
-        libyaml-0-2 && \
+        libyaml-0-2 \
+        libcurl4 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy wheels produced in builder stage and install them via pip

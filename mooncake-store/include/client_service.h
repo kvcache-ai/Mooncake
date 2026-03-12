@@ -227,6 +227,14 @@ class Client {
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     */
+    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
+                                                   ReplicaType replica_type);
+
+    /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
@@ -435,6 +443,8 @@ class Client {
         return 0;
     }
 
+    bool is_ping_healthy() const { return last_ping_success_.load(); }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -574,6 +584,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_success_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);

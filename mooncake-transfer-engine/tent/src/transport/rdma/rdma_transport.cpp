@@ -344,6 +344,28 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
+bool RdmaTransport::warmupMemory(void* addr, size_t length) {
+    if (length < kMrWarmupMinBytes) return false;
+    unsigned hwc = std::thread::hardware_concurrency();
+    if (hwc < 4) return false;
+    RdmaContext* warmup_ctx = nullptr;
+    for (auto& ctx : context_set_) {
+        if (ctx && ctx->status() == RdmaContext::DEVICE_ENABLED) {
+            warmup_ctx = ctx.get();
+            break;
+        }
+    }
+    if (!warmup_ctx) return false;
+    int ret = warmupMrRegistrationParallel(warmup_ctx, addr, length);
+    if (ret != 0) {
+        LOG(WARNING) << "MR warm-up failed (rc=" << ret
+                     << "), falling back to cold registration";
+        return false;
+    }
+    VLOG(1) << "MR warm-up succeeded for " << length << " bytes";
+    return true;
+}
+
 Status RdmaTransport::addMemoryBuffer(BufferDesc& desc,
                                       const MemoryOptions& options) {
     CHECK_STATUS(local_buffer_manager_.addBuffer(desc, options));
@@ -421,10 +443,12 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id) {
     SegmentDesc* segment_desc = nullptr;
+    std::string rpc_server_addr;
     if (target_id == LOCAL_SEGMENT_ID) {
         segment_desc = metadata_->segmentManager().getLocal().get();
     } else {
         metadata_->segmentManager().getRemoteCached(segment_desc, target_id);
+        rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
     }
     if (segment_desc->type != SegmentType::Memory) return nullptr;
     auto context = context_set_[0].get();
@@ -450,7 +474,8 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
-        auto status = endpoint->connect(target_seg_name, target_dev_name);
+        auto status = endpoint->connect(target_seg_name, target_dev_name,
+                                        rpc_server_addr);
         if (!status.ok()) {
             thread_local uint64_t tl_last_output_ts = 0;
             uint64_t current_ts = getCurrentTimeInNano();

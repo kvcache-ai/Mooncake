@@ -173,7 +173,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
             uint64_t file_size = entry.file_size(ec);
             if (!ec) {
                 const std::string& path_str = entry.path().string();
-                file_write_queue_.push_back({path_str, file_size});
+                file_write_queue_.push_back({path_str, file_size, ""});
                 file_queue_map_[path_str] = std::prev(file_write_queue_.end());
                 used_space_ += file_size;
             } else {
@@ -245,8 +245,8 @@ bool StorageBackend::InitQuotaEvict() {
             break;
         }
 
-        std::string evicted_file = EvictFile();
-        if (evicted_file.empty()) {
+        FileRecord evicted = EvictFile();
+        if (evicted.path.empty()) {
             LOG(ERROR) << "Failed to evict file to meet quota. "
                        << "The queue might be empty or a file is unremovable.";
             return false;
@@ -269,14 +269,16 @@ bool StorageBackend::InitQuotaEvict() {
     return true;
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::vector<Slice>& slices) {
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::vector<Slice>& slices,
+    const std::string& key) {
     size_t total_size = 0;
     for (const auto& slice : slices) {
         total_size += slice.size;
     }
 
     // For eviction-enabled mode, check space and reserve
+    std::vector<std::string> evicted_keys;
     uint64_t reserved_size = 0;
     if (IsEvictionEnabled()) {
         if (!initialized_.load(std::memory_order_acquire)) {
@@ -288,8 +290,9 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
         auto space_result = EnsureDiskSpace(total_size);
         if (!space_result) {
-            return space_result;
+            return tl::make_unexpected(space_result.error());
         }
+        evicted_keys = std::move(space_result.value());
         reserved_size = total_size;
     }
 
@@ -307,22 +310,25 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     // For eviction-enabled mode, add file to tracking queue
     if (IsEvictionEnabled()) {
-        AddFileToWriteQueue(path, total_size);
+        AddFileToWriteQueue(path, total_size, key);
     }
 
-    return {};
+    return evicted_keys;
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::string& str) {
-    return StoreObject(path, std::span<const char>(str.data(), str.size()));
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::string& str, const std::string& key) {
+    return StoreObject(path, std::span<const char>(str.data(), str.size()),
+                       key);
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, std::span<const char> data) {
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, std::span<const char> data,
+    const std::string& key) {
     size_t file_total_size = data.size();
 
     // For eviction-enabled mode, check space and reserve
+    std::vector<std::string> evicted_keys;
     uint64_t reserved_size = 0;
     if (IsEvictionEnabled()) {
         if (!initialized_.load(std::memory_order_acquire)) {
@@ -334,8 +340,9 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
         auto space_result = EnsureDiskSpace(file_total_size);
         if (!space_result) {
-            return space_result;
+            return tl::make_unexpected(space_result.error());
         }
+        evicted_keys = std::move(space_result.value());
         reserved_size = file_total_size;
     }
 
@@ -353,10 +360,10 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     // For eviction-enabled mode, add file to tracking queue
     if (IsEvictionEnabled()) {
-        AddFileToWriteQueue(path, file_total_size);
+        AddFileToWriteQueue(path, file_total_size, key);
     }
 
-    return {};
+    return evicted_keys;
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
@@ -809,12 +816,12 @@ bool StorageBackend::CheckDiskSpace(size_t required_size) {
     return has_enough_space;
 }
 
-std::string StorageBackend::EvictFile() {
+FileRecord StorageBackend::EvictFile() {
     // Eviction is only enabled for local storage
     if (!IsEvictionEnabled()) {
         LOG(WARNING)
             << "Eviction is disabled for 3FS mode. Cannot evict files.";
-        return "";
+        return {};
     }
 
     // Use FIFO based strategy (earliest written first out)
@@ -822,7 +829,7 @@ std::string StorageBackend::EvictFile() {
 
     if (record_to_evict.path.empty()) {
         LOG(WARNING) << "No file selected for eviction";
-        return "";
+        return {};
     }
 
     namespace fs = std::filesystem;
@@ -832,22 +839,22 @@ std::string StorageBackend::EvictFile() {
     if (fs::remove(record_to_evict.path, ec)) {
         RemoveFileFromWriteQueue(record_to_evict.path);
         ReleaseSpace(file_size);
-        return record_to_evict.path;
+        return record_to_evict;
     } else {
         if (!ec || ec == std::errc::no_such_file_or_directory) {
             RemoveFileFromWriteQueue(record_to_evict.path);
-            return record_to_evict.path;
+            return record_to_evict;
         } else {
             LOG(ERROR) << "Failed to evict file: " << record_to_evict.path
                        << ", error: " << ec.message();
             RemoveFileFromWriteQueue(record_to_evict.path);
-            return "";
+            return {};
         }
     }
 }
 
-void StorageBackend::AddFileToWriteQueue(const std::string& path,
-                                         uint64_t size) {
+void StorageBackend::AddFileToWriteQueue(const std::string& path, uint64_t size,
+                                         const std::string& key) {
     std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
 
     auto it = file_queue_map_.find(path);
@@ -856,7 +863,7 @@ void StorageBackend::AddFileToWriteQueue(const std::string& path,
         file_queue_map_.erase(it);
     }
 
-    file_write_queue_.push_back({path, size});
+    file_write_queue_.push_back({path, size, key});
     file_queue_map_[path] = std::prev(file_write_queue_.end());
 }
 
@@ -882,12 +889,13 @@ FileRecord StorageBackend::SelectFileToEvictByFIFO() {
     return file_write_queue_.front();
 }
 
-tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
-    size_t required_size) {
+tl::expected<std::vector<std::string>, ErrorCode>
+StorageBackend::EnsureDiskSpace(size_t required_size) {
+    std::vector<std::string> evicted_keys;
     // If eviction is disabled (3FS mode), skip space checking and eviction
     // Let 3FS filesystem handle space management itself
     if (!IsEvictionEnabled()) {
-        return {};
+        return evicted_keys;
     }
 
     const size_t kMaxEvictionAttempts = 1000;
@@ -896,10 +904,13 @@ tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
     bool space_reserved = CheckDiskSpace(required_size);
 
     while (!space_reserved && attempts < kMaxEvictionAttempts) {
-        std::string evicted_file = EvictFile();
-        if (evicted_file.empty()) {
+        FileRecord evicted = EvictFile();
+        if (evicted.path.empty()) {
             LOG(ERROR) << "Failed to evict file to make space.";
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (!evicted.key.empty()) {
+            evicted_keys.push_back(evicted.key);
         }
         attempts++;
 
@@ -911,7 +922,7 @@ tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    return {};
+    return evicted_keys;
 }
 
 void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
@@ -959,42 +970,6 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
     return {};
 }
 
-std::string StorageBackendAdaptor::SanitizeKey(const std::string& key) const {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
-    // Safely construct path using std::filesystem
-    namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
-
-    // Combine directory path with sanitized filename
-    fs::path full_path = fs::path(file_storage_config_.storage_filepath) /
-                         file_per_key_config_.fsdir / dir_path /
-                         SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
-}
-
 std::string StorageBackendAdaptor::ConcatSlicesToString(
     const std::vector<Slice>& slices) {
     size_t total = 0;
@@ -1017,7 +992,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    std::function<void(const std::string& evicted_key)> eviction_handler) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1047,17 +1023,26 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path = ResolvePath(kv.key);
+        auto path =
+            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
+                               file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
         struct_pb::to_pb(kv, kv_buf);
-        auto store_result = storage_backend_->StoreObject(path, kv_buf);
+        auto store_result = storage_backend_->StoreObject(path, kv_buf, kv.key);
         if (!store_result) {
             LOG(ERROR) << "Failed to store object for key: " << kv.key
                        << ", error: " << store_result.error()
                        << " - continuing with remaining keys";
             continue;  // Continue processing other keys
+        }
+
+        // Notify eviction handler about any evicted keys
+        if (eviction_handler) {
+            for (const auto& evicted_key : store_result.value()) {
+                eviction_handler(evicted_key);
+            }
         }
 
         {
@@ -1091,7 +1076,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePath(key);
+    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
+                                   file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
@@ -1101,7 +1087,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path = ResolvePath(kv.key);
+        auto path =
+            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
+                               file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
@@ -1278,7 +1266,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    std::function<void(const std::string& evicted_key)> /*eviction_handler*/) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -2540,7 +2529,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    std::function<void(const std::string& evicted_key)> /*eviction_handler*/) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
