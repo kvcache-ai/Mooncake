@@ -100,8 +100,7 @@ MooncakeBackend::MooncakeBackend(
     // construct local to global rank map
     if (globalRanks.size() == static_cast<size_t>(size)) {
         for (int i = 0; i < size; ++i) {
-            local2global_rank_map_[i] =
-                static_cast<uint64_t>(globalRanks[i]);
+            local2global_rank_map_[i] = static_cast<uint64_t>(globalRanks[i]);
         }
     } else {
         for (int i = 0; i < size; ++i) {
