@@ -354,8 +354,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto eviction_handler = [this](
-                                    const std::vector<std::string>& evicted_keys) {
+        auto eviction_handler = [this](const std::vector<std::string>&
+                                           evicted_keys) {
             if (evicted_keys.empty()) return;
             auto results = client_->BatchEvictDiskReplica(
                 evicted_keys, ReplicaType::LOCAL_DISK);
@@ -364,8 +364,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                     LOG(WARNING)
                         << "Failed to notify master about evicted local disk "
                            "key: "
-                        << evicted_keys[i]
-                        << ", error: " << results[i].error();
+                        << evicted_keys[i] << ", error: " << results[i].error();
                 }
             }
         };

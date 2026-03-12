@@ -798,9 +798,8 @@ tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
     return result;
 }
 
-std::vector<tl::expected<void, ErrorCode>>
-MasterClient::BatchEvictDiskReplica(const std::vector<std::string>& keys,
-                                    ReplicaType replica_type) {
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::BatchEvictDiskReplica");
     timer.LogRequest("keys_count=", keys.size(),
                      ", replica_type=", replica_type);

@@ -64,11 +64,11 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     config.bucket_size_limit = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
 
-    config.max_total_size = GetEnvOr<int64_t>(
-        "MOONCAKE_BUCKET_MAX_TOTAL_SIZE", config.max_total_size);
+    config.max_total_size = GetEnvOr<int64_t>("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
+                                              config.max_total_size);
 
-    const auto policy_str = GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY",
-                                           "none");
+    const auto policy_str =
+        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "none");
     if (policy_str == "fifo") {
         config.eviction_policy = BucketEvictionPolicy::FIFO;
     } else if (policy_str == "lru") {
@@ -1346,9 +1346,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         // Pre-check for duplicates before modifying any state
         for (const auto& key : bucket->keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                LOG(WARNING) << "Duplicate key detected in BatchOffload: " << key
-                             << ", bucket_id=" << bucket_id
-                             << ". Returning OBJECT_ALREADY_EXISTS.";
+                LOG(WARNING)
+                    << "Duplicate key detected in BatchOffload: " << key
+                    << ", bucket_id=" << bucket_id
+                    << ". Returning OBJECT_ALREADY_EXISTS.";
                 lock.unlock();
                 CleanupOrphanedBucket(bucket_id);
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -2140,17 +2141,17 @@ BucketStorageBackend::SelectEvictionCandidate() {
             return buckets_.begin();
 
         case BucketEvictionPolicy::LRU:
-            // Scan all buckets to find the one with the smallest last_access_ns_.
-            // Buckets that have never been read have last_access_ns_ == 0 and
-            // are therefore always evicted first (FIFO-among-unread).
-            return std::min_element(
-                buckets_.begin(), buckets_.end(),
-                [](const auto& a, const auto& b) {
-                    return a.second->last_access_ns_.load(
-                               std::memory_order_relaxed) <
-                           b.second->last_access_ns_.load(
-                               std::memory_order_relaxed);
-                });
+            // Scan all buckets to find the one with the smallest
+            // last_access_ns_. Buckets that have never been read have
+            // last_access_ns_ == 0 and are therefore always evicted first
+            // (FIFO-among-unread).
+            return std::min_element(buckets_.begin(), buckets_.end(),
+                                    [](const auto& a, const auto& b) {
+                                        return a.second->last_access_ns_.load(
+                                                   std::memory_order_relaxed) <
+                                               b.second->last_access_ns_.load(
+                                                   std::memory_order_relaxed);
+                                    });
 
         default:
             return buckets_.end();
@@ -2175,9 +2176,8 @@ BucketStorageBackend::PendingEviction BucketStorageBackend::PrepareEviction(
                   << " required=" << required_size;
     }
 
-    while (!buckets_.empty() &&
-           total_size_ + required_size >
-               bucket_backend_config_.max_total_size) {
+    while (!buckets_.empty() && total_size_ + required_size >
+                                    bucket_backend_config_.max_total_size) {
         auto evict_it = SelectEvictionCandidate();
         if (evict_it == buckets_.end()) break;
 
@@ -2261,8 +2261,7 @@ void BucketStorageBackend::FinalizeEviction(const PendingEviction& pending) {
                 // WriteBucket may then fail with ENOSPC. Orphan will be cleaned
                 // up on service restart.
                 LOG(ERROR) << "FinalizeEviction: failed to remove data file: "
-                           << data_path.value()
-                           << ", error: " << ec.message();
+                           << data_path.value() << ", error: " << ec.message();
             }
         }
         auto meta_path = GetBucketMetadataPath(bucket_id);
@@ -2275,7 +2274,6 @@ void BucketStorageBackend::FinalizeEviction(const PendingEviction& pending) {
                     << meta_path.value() << ", error: " << ec.message();
             }
         }
-
     }
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: deleted " << pending.buckets.size()

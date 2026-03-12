@@ -827,9 +827,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-WrappedMasterService::BatchEvictDiskReplica(const UUID& client_id,
-                                            const std::vector<std::string>& keys,
-                                            ReplicaType replica_type) {
+WrappedMasterService::BatchEvictDiskReplica(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "BatchEvictDiskReplica");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys,
