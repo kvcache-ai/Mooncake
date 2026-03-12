@@ -219,9 +219,9 @@ class SharedUringRing {
 
     bool in_registered_buf(const void* buf, size_t len) const {
         if (!buf_registered_ || !buf_base_ || !buf_size_) return false;
-        uintptr_t ba = reinterpret_cast<uintptr_t>(buf);
+        uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
         uintptr_t rb = reinterpret_cast<uintptr_t>(buf_base_);
-        return ba >= rb && (ba + len) <= (rb + buf_size_);
+        return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_);
     }
 
     static size_t next_pow2(size_t n) {
@@ -447,9 +447,9 @@ void UringFile::free_aligned_buffer(void* ptr) const {
 bool UringFile::in_registered_buffer(const void* buf, size_t len) const {
     auto& r = SharedUringRing::instance();
     if (!r.is_buffer_registered()) return false;
-    uintptr_t ba = reinterpret_cast<uintptr_t>(buf);
+    uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
     uintptr_t rb = reinterpret_cast<uintptr_t>(r.buffer_base());
-    return ba >= rb && (ba + len) <= (rb + r.buffer_size());
+    return buf_addr >= rb && (buf_addr + len) <= (rb + r.buffer_size());
 }
 
 // ---------------------------------------------------------------------------
