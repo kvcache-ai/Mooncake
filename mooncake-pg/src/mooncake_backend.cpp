@@ -65,6 +65,10 @@ class MooncakeP2PWork : public ::c10d::Work {
     std::shared_ptr<std::atomic<bool>> completed_;
 };
 
+/**
+ * @brief Initialize Mooncake backend state from the PyTorch process-group
+ * information and optional Mooncake-specific options.
+ */
 MooncakeBackend::MooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)

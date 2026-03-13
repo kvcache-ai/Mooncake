@@ -31,6 +31,17 @@ class MooncakeBackend final : public ::c10d::Backend {
         bool isExtension_ = false;
     };
 
+    /**
+     * @brief Construct a Mooncake process-group backend instance.
+     *
+     * `distBackendOpts` contains the PyTorch process-group information for this
+     * backend instance. `options` contains Mooncake-specific settings and may
+     * be null when callers omit `pg_options`.
+     *
+     * @param distBackendOpts Process-group information supplied by PyTorch.
+     * @param options *Optional* Mooncake-specific backend options.
+     * @param isCpu Whether to initialize the CPU backend variant.
+     */
     MooncakeBackend(c10d::DistributedBackendOptions distBackendOpts,
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
@@ -39,6 +50,16 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
+    /**
+     * @brief Return the stored Mooncake-specific backend options.
+     *
+     * PyTorch can use this to read Mooncake-specific options from an existing
+     * process group. This is used, for example, create sub-groups that inherit
+     * settings from the parent group.
+     *
+     * @return The stored backend options, or null when the backend was created
+     * without explicit Mooncake options.
+     */
     c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override {
         return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
             options_);
