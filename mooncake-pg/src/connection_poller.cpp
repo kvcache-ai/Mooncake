@@ -10,6 +10,7 @@
 #include <thread>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include "mooncake_worker.cuh"
 
@@ -20,7 +21,10 @@ namespace mooncake {
 // NVLink transport can only access cuMemCreate(FABRIC) memory
 // cross-node -- CPU heap buffers are invisible to remote peers.
 static bool supportFabricMem() {
-    if (getenv("MC_USE_NVLINK_IPC")) return false;
+    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+
+    bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
+    if (!fabric_enabled) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
