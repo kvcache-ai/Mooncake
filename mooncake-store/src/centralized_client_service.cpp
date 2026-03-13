@@ -1619,7 +1619,8 @@ HeartbeatRequest CentralizedClientService::build_heartbeat_request() {
     return req;
 }
 
-tl::expected<void, ErrorCode> CentralizedClientService::RegisterClient() {
+tl::expected<RegisterClientResponse, ErrorCode>
+CentralizedClientService::RegisterClient() {
     // This lock must be held until the register rpc is finished,
     // otherwise there will be corner cases, e.g., a segment is
     // unmounted successfully first, and then registered again in
@@ -1639,9 +1640,10 @@ tl::expected<void, ErrorCode> CentralizedClientService::RegisterClient() {
     auto register_result = master_client_.RegisterClient(req);
     if (!register_result) {
         LOG(ERROR) << "Failed to register client: " << register_result.error();
-        return tl::unexpected(register_result.error());
+    } else {
+        view_version_ = register_result.value().view_version;
     }
-    return {};
+    return register_result;
 }
 
 ErrorCode CentralizedClientService::FindFirstCompleteReplica(

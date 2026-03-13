@@ -214,7 +214,7 @@ class P2PClientService final : public ClientService {
      * Collects segments from mounted_segments_ and registers them.
      * @return An ErrorCode indicating success or failure.
      */
-    tl::expected<void, ErrorCode> RegisterClient() override;
+    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
 
     HeartbeatRequest build_heartbeat_request() override;
 

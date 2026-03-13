@@ -127,4 +127,20 @@ struct RegisterClientResponse {
 };
 YLT_REFL(RegisterClientResponse, view_version);
 
+/**
+ * @brief Request structure for QueryClientStatus operation.
+ */
+struct QueryClientStatusRequest {
+    UUID client_id;
+};
+YLT_REFL(QueryClientStatusRequest, client_id);
+
+/**
+ * @brief Response structure for QueryClientStatus operation.
+ */
+struct QueryClientStatusResponse {
+    ClientStatus status = ClientStatus::UNDEFINED;
+};
+YLT_REFL(QueryClientStatusResponse, status);
+
 }  // namespace mooncake

@@ -314,6 +314,8 @@ std::vector<Segment> P2PClientService::CollectTierSegments() const {
     for (const auto& view : tier_views) {
         Segment seg;
         seg.id = view.id;
+        seg.name = "tier_" + std::to_string(view.id.first) + "_" +
+                   std::to_string(view.id.second);
         seg.size = view.capacity;
         auto& p2p_extra = seg.GetP2PExtra();
         p2p_extra.priority = view.priority;
@@ -325,7 +327,8 @@ std::vector<Segment> P2PClientService::CollectTierSegments() const {
     return segments;
 }
 
-tl::expected<void, ErrorCode> P2PClientService::RegisterClient() {
+tl::expected<RegisterClientResponse, ErrorCode>
+P2PClientService::RegisterClient() {
     RegisterClientRequest req;
     req.client_id = client_id_;
     req.segments = CollectTierSegments();
@@ -336,10 +339,11 @@ tl::expected<void, ErrorCode> P2PClientService::RegisterClient() {
     auto register_result = master_client_.RegisterClient(req);
     if (!register_result) {
         LOG(ERROR) << "Failed to register P2P client: "
-                   << register_result.error();
-        return tl::unexpected(register_result.error());
+                   << register_result.error() << ", client_id=" << client_id_;
+    } else {
+        view_version_ = register_result.value().view_version;
     }
-    return {};
+    return register_result;
 }
 
 // ============================================================================

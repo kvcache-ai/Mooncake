@@ -138,6 +138,14 @@ class MasterClient {
         const UUID& segment_id);
 
     /**
+     * @brief Queries the status of a client.
+     * @param client_id The UUID of the client to query.
+     * @return tl::expected<QueryClientStatusResponse, ErrorCode>
+     */
+    [[nodiscard]] tl::expected<QueryClientStatusResponse, ErrorCode>
+    QueryClientStatus(const UUID& client_id);
+
+    /**
      * @brief Sends heartbeat to master to maintain client liveness
      * @return tl::expected<HeartbeatResponse, ErrorCode>
      * containing view version and client status

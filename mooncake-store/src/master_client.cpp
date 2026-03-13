@@ -84,6 +84,11 @@ struct RpcNameTraits<&WrappedMasterService::RegisterClient> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::QueryClientStatus> {
+    static constexpr const char* value = "QueryClientStatus";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
@@ -93,20 +98,28 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
-    if (client_addr_param_ != master_addr) {
+    bool is_same_addr = (client_addr_param_ == master_addr);
+    if (!is_same_addr) {
         // WARNING: The existing client pool cannot be erased. So if there are a
         // lot of different addresses, there will be resource leak problems.
         auto client_pool = client_pools_->at(master_addr);
         client_accessor_.SetClientPool(client_pool);
         client_addr_param_ = master_addr;
     }
-    auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result =
         invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
+    if (!result.has_value() && is_same_addr) {
+        timer.LogResponse("error_code=", result.error());
+        // Stale connection pool might still exist.
+        // Retrying once will force the pool to re-establish a new connection.
+        result = invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
+    }
+
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
+        client_addr_param_.clear();
         return result.error();
     }
     // Check if server version matches client version
@@ -256,6 +269,20 @@ tl::expected<HeartbeatResponse, ErrorCode> MasterClient::Heartbeat(
 
     auto result =
         invoke_rpc<&WrappedMasterService::Heartbeat, HeartbeatResponse>(req);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<QueryClientStatusResponse, ErrorCode>
+MasterClient::QueryClientStatus(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryClientStatus");
+    timer.LogRequest("client_id=", client_id);
+
+    QueryClientStatusRequest req;
+    req.client_id = client_id;
+
+    auto result = invoke_rpc<&WrappedMasterService::QueryClientStatus,
+                             QueryClientStatusResponse>(req);
     timer.LogResponseExpected(result);
     return result;
 }

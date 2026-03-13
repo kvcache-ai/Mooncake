@@ -328,6 +328,17 @@ tl::expected<HeartbeatResponse, ErrorCode> WrappedMasterService::Heartbeat(
     return result;
 }
 
+tl::expected<QueryClientStatusResponse, ErrorCode>
+WrappedMasterService::QueryClientStatus(const QueryClientStatusRequest& req) {
+    ScopedVLogTimer timer(1, "QueryClientStatus");
+    timer.LogRequest("client_id=", req.client_id);
+
+    auto result = GetMasterService().QueryClientStatus(req);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<RegisterClientResponse, ErrorCode>
 WrappedMasterService::RegisterClient(const RegisterClientRequest& req) {
     ScopedVLogTimer timer(1, "RegisterClient");
@@ -370,6 +381,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Heartbeat>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryClientStatus>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RegisterClient>(
         &wrapped_master_service);

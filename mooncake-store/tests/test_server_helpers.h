@@ -78,12 +78,22 @@ class InProcMaster {
             wms_cfg.eviction_high_watermark_ratio =
                 DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
             wms_cfg.view_version = 0;
-            // Use default client_live_ttl_sec to align with production defaults
-            wms_cfg.enable_ha = false;
-            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
-            wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
             wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
+
+            if (config.client_live_ttl_sec.has_value()) {
+                wms_cfg.client_live_ttl_sec =
+                    config.client_live_ttl_sec.value();
+            } else {
+                wms_cfg.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+            }
+
+            if (config.client_crashed_ttl_sec.has_value()) {
+                wms_cfg.client_crashed_ttl_sec =
+                    config.client_crashed_ttl_sec.value();
+            } else {
+                wms_cfg.client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
+            }
 
             wrapped_ =
                 std::make_unique<WrappedCentralizedMasterService>(wms_cfg);
@@ -129,6 +139,8 @@ class InProcMaster {
         return std::string("http://127.0.0.1:") +
                std::to_string(http_metrics_port_);
     }
+
+    WrappedCentralizedMasterService& GetWrapped() { return *wrapped_; }
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;

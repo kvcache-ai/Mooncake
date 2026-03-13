@@ -52,6 +52,20 @@ class InProcP2PMaster {
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
             wms_cfg.max_replicas_per_key = 0;  // no limit for P2P
 
+            if (config.client_live_ttl_sec.has_value()) {
+                wms_cfg.client_live_ttl_sec =
+                    config.client_live_ttl_sec.value();
+            } else {
+                wms_cfg.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+            }
+
+            if (config.client_crashed_ttl_sec.has_value()) {
+                wms_cfg.client_crashed_ttl_sec =
+                    config.client_crashed_ttl_sec.value();
+            } else {
+                wms_cfg.client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
+            }
+
             wrapped_ = std::make_unique<WrappedP2PMasterService>(wms_cfg);
             RegisterP2PRpcService(*server_, *wrapped_);
 

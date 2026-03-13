@@ -67,6 +67,9 @@ class WrappedMasterService {
     tl::expected<HeartbeatResponse, ErrorCode> Heartbeat(
         const HeartbeatRequest& req);
 
+    tl::expected<QueryClientStatusResponse, ErrorCode> QueryClientStatus(
+        const QueryClientStatusRequest& req);
+
     tl::expected<RegisterClientResponse, ErrorCode> RegisterClient(
         const RegisterClientRequest& req);
 

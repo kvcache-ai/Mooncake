@@ -188,6 +188,11 @@ auto MasterService::Heartbeat(const HeartbeatRequest& req)
     return GetClientManager().Heartbeat(req);
 }
 
+auto MasterService::QueryClientStatus(const QueryClientStatusRequest& req)
+    -> tl::expected<QueryClientStatusResponse, ErrorCode> {
+    return GetClientManager().QueryClientStatus(req);
+}
+
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
     auto accessor = GetMetadataAccessor(key);
@@ -234,6 +239,16 @@ auto MasterService::GetAllSegments()
     if (!result.has_value()) {
         LOG(ERROR) << "fail to get all segments"
                    << ", ret=" << result.error();
+    }
+    return result;
+}
+
+auto MasterService::GetClientSegments(const UUID& client_id)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    auto result = GetClientManager().GetClientSegments(client_id);
+    if (!result.has_value()) {
+        LOG(ERROR) << "fail to get client segments"
+                   << ", client_id=" << client_id << ", ret=" << result.error();
     }
     return result;
 }

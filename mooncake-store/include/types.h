@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <variant>
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
@@ -264,7 +265,9 @@ struct Segment {
     size_t size{0};
 
     // Polymorphic extra data
-    std::variant<CentralizedSegmentExtraData, P2PSegmentExtraData> extra;
+    std::variant<std::monostate, CentralizedSegmentExtraData,
+                 P2PSegmentExtraData>
+        extra;
 
     // Helper to check type
     bool IsP2PSegment() const {
@@ -275,13 +278,17 @@ struct Segment {
         return std::holds_alternative<CentralizedSegmentExtraData>(extra);
     }
 
+    bool IsEmpty() const {
+        return std::holds_alternative<std::monostate>(extra);
+    }
+
     CentralizedSegmentExtraData& GetCentralizedExtra() {
         if (IsP2PSegment()) {
             throw std::runtime_error(
                 "Segment already holds P2PSegmentExtraData; cannot assign "
                 "CentralizedSegmentExtraData");
         }
-        if (!IsCentralizedSegment()) extra = CentralizedSegmentExtraData{};
+        if (IsEmpty()) extra = CentralizedSegmentExtraData{};
         return std::get<CentralizedSegmentExtraData>(extra);
     }
     const CentralizedSegmentExtraData& GetCentralizedExtra() const {
@@ -294,7 +301,7 @@ struct Segment {
                 "Segment already holds CentralizedSegmentExtraData; cannot "
                 "assign P2PSegmentExtraData");
         }
-        if (!IsP2PSegment()) extra = P2PSegmentExtraData{};
+        if (IsEmpty()) extra = P2PSegmentExtraData{};
         return std::get<P2PSegmentExtraData>(extra);
     }
     const P2PSegmentExtraData& GetP2PExtra() const {

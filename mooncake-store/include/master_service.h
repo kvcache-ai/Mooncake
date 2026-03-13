@@ -57,6 +57,12 @@ class MasterService {
         -> tl::expected<HeartbeatResponse, ErrorCode>;
 
     /**
+     * @brief Queries the status of a client
+     */
+    auto QueryClientStatus(const QueryClientStatusRequest& req)
+        -> tl::expected<QueryClientStatusResponse, ErrorCode>;
+
+    /**
      * @brief Mount a memory segment.
      * @return ErrorCode::SEGMENT_ALREADY_EXISTS if it is already mounted.
      *         ErrorCode::CLIENT_UNHEALTHY if the client is unhealthy.
@@ -95,6 +101,15 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
+     * @brief Get all segments belonging to a specific client.
+     * @param client_id The UUID of the client.
+     * @return An expected object containing a vector of segment names on
+     * success, or ErrorCode on failure.
+     */
+    auto GetClientSegments(const UUID& client_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
      * @brief Query a segment's capacity and used size in bytes.

@@ -121,7 +121,7 @@ class CentralizedClientService
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
-    tl::expected<void, ErrorCode> RegisterClient() override;
+    tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
 
    protected:
     HeartbeatRequest build_heartbeat_request() override;

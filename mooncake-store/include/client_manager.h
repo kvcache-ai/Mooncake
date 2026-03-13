@@ -98,7 +98,12 @@ class ClientManager {
     auto Heartbeat(const HeartbeatRequest& req)
         -> tl::expected<HeartbeatResponse, ErrorCode>;
 
+    auto QueryClientStatus(const QueryClientStatusRequest& req)
+        -> tl::expected<QueryClientStatusResponse, ErrorCode>;
+
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto GetClientSegments(const UUID& client_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     auto QuerySegments(const std::string& segment)
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;

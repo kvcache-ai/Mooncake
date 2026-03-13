@@ -101,6 +101,30 @@ ClientManager::GetAllSegments() {
     return all_segments;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+ClientManager::GetClientSegments(const UUID& client_id) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        LOG(WARNING) << "GetClientSegments: client not found"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    auto segments_res = it->second->GetSegments();
+    if (!segments_res) {
+        LOG(WARNING) << "GetClientSegments: failed to get segments"
+                     << ", client_id=" << client_id
+                     << ", error=" << segments_res.error();
+        return tl::make_unexpected(segments_res.error());
+    }
+    std::vector<std::string> segment_names;
+    segment_names.reserve(segments_res.value().size());
+    for (const auto& seg : segments_res.value()) {
+        segment_names.emplace_back(std::move(seg.name));
+    }
+    return segment_names;
+}
+
 tl::expected<std::pair<size_t, size_t>, ErrorCode> ClientManager::QuerySegments(
     const std::string& segment) {
     SharedMutexLocker lock(&clients_mutex_, shared_lock);
@@ -221,12 +245,29 @@ auto ClientManager::Heartbeat(const HeartbeatRequest& req)
     response.status = new_status;
     if (new_status == ClientStatus::HEALTH) {
         if (old_status != new_status) {
-            LOG(INFO) << "client recovered" << ", client_id=" << client_id;
+            LOG(INFO) << "client recovered"
+                      << ", client_id=" << client_id;
             meta->OnRecovered();
         }
         for (const auto& task : req.tasks) {
             response.task_results.push_back(ProcessTask(client_id, task));
         }
+    }
+
+    return response;
+}
+
+auto ClientManager::QueryClientStatus(const QueryClientStatusRequest& req)
+    -> tl::expected<QueryClientStatusResponse, ErrorCode> {
+    const auto& client_id = req.client_id;
+    QueryClientStatusResponse response;
+
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        response.status = ClientStatus::UNDEFINED;
+    } else {
+        response.status = it->second->get_health_state().status;
     }
 
     return response;

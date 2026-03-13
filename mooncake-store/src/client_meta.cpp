@@ -164,14 +164,17 @@ std::pair<ClientStatus, ClientStatus> ClientMeta::InnerUpdateHealthStatus() {
     auto now = std::chrono::steady_clock::now();
     ClientStatus old_status = health_state_.status;
 
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                       now - health_state_.last_heartbeat)
-                       .count();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - health_state_.last_heartbeat)
+                          .count();
+
+    int64_t disconnect_timeout_ms = disconnect_timeout_sec_ * 1000;
+    int64_t crash_timeout_ms = crash_timeout_sec_ * 1000;
 
     switch (health_state_.status) {
         case ClientStatus::HEALTH: {
-            if (elapsed > disconnect_timeout_sec_) {
-                if (elapsed > crash_timeout_sec_) {
+            if (elapsed_ms >= disconnect_timeout_ms) {
+                if (elapsed_ms >= crash_timeout_ms) {
                     health_state_.status = ClientStatus::CRASHED;
                 } else {
                     health_state_.status = ClientStatus::DISCONNECTION;
@@ -180,9 +183,9 @@ std::pair<ClientStatus, ClientStatus> ClientMeta::InnerUpdateHealthStatus() {
             break;
         }
         case ClientStatus::DISCONNECTION: {
-            if (elapsed <= disconnect_timeout_sec_) {
+            if (elapsed_ms < disconnect_timeout_ms) {
                 health_state_.status = ClientStatus::HEALTH;
-            } else if (elapsed > crash_timeout_sec_) {
+            } else if (elapsed_ms >= crash_timeout_ms) {
                 health_state_.status = ClientStatus::CRASHED;
             }
             break;

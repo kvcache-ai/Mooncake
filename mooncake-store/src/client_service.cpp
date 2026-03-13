@@ -94,7 +94,9 @@ ClientService::~ClientService() {
     Destroy();
 }
 
-void ClientService::Stop() {
+void ClientService::Stop() { StopHeartbeat(); }
+
+void ClientService::StopHeartbeat() {
     // Stop ping thread only after no need to contact master anymore
     if (heartbeat_running_) {
         {
@@ -461,7 +463,20 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
     // Increment after a heartbeat failure, reset after a heartbeat success
     int heartbeat_fail_count = 0;
 
-    auto register_client = [this]() { RegisterClient(); };
+    auto register_client = [this]() {
+        LOG(INFO) << "Sending RegisterClientRequest"
+                  << ", client_id=" << client_id_;
+        auto res = RegisterClient();
+        if (!res) {
+            LOG(ERROR) << "Failed to register client"
+                       << ", client_id=" << client_id_
+                       << ", error=" << res.error();
+        } else {
+            LOG(INFO) << "Client registered successfully"
+                      << ", client_id=" << client_id_
+                      << ", view_version=" << res.value().view_version;
+        }
+    };
     // Use another thread to register client to avoid blocking the heartbeat
     // thread
     std::future<void> register_client_future;
@@ -477,102 +492,99 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
         // Send heartbeat to master
         HeartbeatRequest req = build_heartbeat_request();
         auto heartbeat_result = GetMasterClient().Heartbeat(req);
-        if (heartbeat_result) {
-            // Reset heartbeat failure count
+        if (heartbeat_result) {  // Heartbeat success
             heartbeat_fail_count = 0;
-            auto& heartbeat_response = heartbeat_result.value();
-            if (heartbeat_response.status == ClientStatus::UNDEFINED &&
-                !register_client_future.valid()) {
-                // Ensure at most one register client thread is running
-                register_client_future =
-                    std::async(std::launch::async, register_client);
-            }
-            {
-                std::unique_lock<std::mutex> lock{heartbeat_mtx_};
-                heartbeat_cv_.wait_for(
-                    lock,
-                    std::chrono::milliseconds(success_heartbeat_interval_ms),
-                    [this] { return !heartbeat_running_; });
-            }
-            continue;
-        }
-
-        heartbeat_fail_count++;
-        if (heartbeat_fail_count < max_heartbeat_fail_count) {
-            LOG(ERROR) << "Failed to send heartbeat to master";
-            {
-                std::unique_lock<std::mutex> lock{heartbeat_mtx_};
-                heartbeat_cv_.wait_for(
-                    lock, std::chrono::milliseconds(fail_heartbeat_interval_ms),
-                    [this] { return !heartbeat_running_; });
-            }
-            continue;
-        }
-
-        // Exceeded heartbeat failure threshold. Reconnect based on mode.
-        if (is_ha_mode) {
-            LOG(ERROR)
-                << "Failed to send heartbeat to master for "
-                << heartbeat_fail_count
-                << " times; fetching latest master view and reconnecting";
-            std::string master_address;
-            ViewVersionId next_version = 0;
-            auto err =
-                master_view_helper_.GetMasterView(master_address, next_version);
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to get new master view: "
-                           << toString(err);
-                {
-                    std::unique_lock<std::mutex> lock{heartbeat_mtx_};
-                    heartbeat_cv_.wait_for(
-                        lock,
-                        std::chrono::milliseconds(fail_heartbeat_interval_ms),
-                        [this] { return !heartbeat_running_; });
+            HandleHeartbeatSuccess(heartbeat_result.value(),
+                                   current_master_address, register_client,
+                                   register_client_future);
+            WaitForNextHeartbeat(success_heartbeat_interval_ms);
+        } else {  // Heartbeat failed
+            heartbeat_fail_count++;
+            if (heartbeat_fail_count < max_heartbeat_fail_count) {
+                // just retry
+                LOG(ERROR) << "Failed to send heartbeat to master";
+            } else {
+                // Exceeded failure threshold, attempt reconnect
+                if (ReconnectToMaster(is_ha_mode, current_master_address)) {
+                    heartbeat_fail_count = 0;
+                    // Do NOT sleep here, immediately loop back to send
+                    // heartbeat so the client can discover UNDEFINED status and
+                    // re-register as fast as possible.
+                    continue;
                 }
-                continue;
             }
-
-            err = GetMasterClient().Connect(master_address);
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to connect to master " << master_address
-                           << ": " << toString(err);
-                {
-                    std::unique_lock<std::mutex> lock{heartbeat_mtx_};
-                    heartbeat_cv_.wait_for(
-                        lock,
-                        std::chrono::milliseconds(fail_heartbeat_interval_ms),
-                        [this] { return !heartbeat_running_; });
-                }
-                continue;
-            }
-
-            current_master_address = master_address;
-            LOG(INFO) << "Reconnected to master " << master_address;
-            heartbeat_fail_count = 0;
-        } else {
-            LOG(ERROR) << "Failed to ping master for " << heartbeat_fail_count
-                       << " times (non-HA); reconnecting to "
-                       << current_master_address;
-            auto err = GetMasterClient().Connect(current_master_address);
-            if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Reconnect failed to " << current_master_address
-                           << ": " << toString(err);
-                {
-                    std::unique_lock<std::mutex> lock{heartbeat_mtx_};
-                    heartbeat_cv_.wait_for(
-                        lock,
-                        std::chrono::milliseconds(fail_heartbeat_interval_ms),
-                        [this] { return !heartbeat_running_; });
-                }
-                continue;
-            }
-            LOG(INFO) << "Reconnected to master " << current_master_address;
-            heartbeat_fail_count = 0;
+            WaitForNextHeartbeat(fail_heartbeat_interval_ms);
         }
-    }
-    // Explicitly wait for the remount segment thread to finish
+    }  // end while
+
+    // Wait for any pending register client thread to finish
     if (register_client_future.valid()) {
         register_client_future.wait();
+    }
+}
+
+void ClientService::WaitForNextHeartbeat(int interval_ms) {
+    std::unique_lock<std::mutex> lock{heartbeat_mtx_};
+    heartbeat_cv_.wait_for(lock, std::chrono::milliseconds(interval_ms),
+                           [this] { return !heartbeat_running_; });
+}
+
+bool ClientService::HandleHeartbeatSuccess(
+    const HeartbeatResponse& response,
+    const std::string& current_master_address,
+    const std::function<void()>& register_client,
+    std::future<void>& register_client_future) {
+    if (response.view_version != view_version_) {
+        LOG(WARNING) << "Master view_version changed"
+                     << ", client status in master: " << (int)response.status
+                     << ", master address: " << current_master_address
+                     << ", Master version: " << response.view_version
+                     << ", Client version: " << view_version_;
+    }
+    if (response.status == ClientStatus::UNDEFINED &&
+        !register_client_future.valid()) {
+        // Ensure at most one register client thread is running
+        register_client_future =
+            std::async(std::launch::async, register_client);
+    }
+    return true;
+}
+
+bool ClientService::ReconnectToMaster(bool is_ha_mode,
+                                      std::string& current_master_address) {
+    if (is_ha_mode) {
+        LOG(ERROR) << "Heartbeat failure threshold exceeded;"
+                   << " fetching latest master view and reconnecting";
+        std::string master_address;
+        ViewVersionId next_version = 0;
+        auto err =
+            master_view_helper_.GetMasterView(master_address, next_version);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get new master view: " << toString(err);
+            return false;
+        }
+
+        err = GetMasterClient().Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to master " << master_address
+                       << ": " << toString(err);
+            return false;
+        }
+
+        current_master_address = master_address;
+        LOG(INFO) << "Reconnected to master " << master_address;
+        return true;
+    } else {
+        LOG(ERROR) << "Heartbeat failure threshold exceeded (non-HA);"
+                   << " reconnecting to " << current_master_address;
+        auto err = GetMasterClient().Connect(current_master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Reconnect failed to " << current_master_address
+                       << ": " << toString(err);
+            return false;
+        }
+        LOG(INFO) << "Reconnected to master " << current_master_address;
+        return true;
     }
 }
 

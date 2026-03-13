@@ -2,6 +2,7 @@
 
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -58,6 +59,11 @@ class ClientService {
      * @brief stops background threads
      */
     virtual void Stop();
+
+    /**
+     * @brief stops heartbeat thread
+     */
+    virtual void StopHeartbeat();
 
     /**
      * @brief Release internal resources. Should be called after Stop()
@@ -273,6 +279,7 @@ class ClientService {
         return str;
     }
 
+   public:
     /**
      * @brief Gets the local transport endpoint (IP and port).
      * @return The transport endpoint string.
@@ -281,6 +288,7 @@ class ClientService {
         return transfer_engine_->getLocalIpAndPort();
     }
     UUID GetClientID() const { return client_id_; }
+    ViewVersionId GetViewVersion() const { return view_version_; }
 
    public:
     /**
@@ -330,12 +338,6 @@ class ClientService {
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
 
     /**
-     * @brief Starts the heartbeat thread.
-     * @param master_server_entry Entry point of the master server.
-     */
-    void StartHeartbeat(const std::string& master_server_entry);
-
-    /**
      * @brief Initializes the Transfer Engine.
      * @param local_hostname Local hostname or IP.
      * @param metadata_connstring Connection string for metadata service.
@@ -348,15 +350,50 @@ class ClientService {
         const std::string& protocol,
         const std::optional<std::string>& device_names);
 
+   protected:
+    // Heartbeat-related function
+
+    /**
+     * @brief Starts the heartbeat thread.
+     * @param master_server_entry Entry point of the master server.
+     */
+    void StartHeartbeat(const std::string& master_server_entry);
+
     void HeartbeatThreadMain(bool is_ha_mode,
                              std::string current_master_address);
+
+    /**
+     * @brief Handles a successful heartbeat response.
+     * Triggers async RegisterClient if master reports UNDEFINED status.
+     * @return true if heartbeat was successfully processed.
+     */
+    bool HandleHeartbeatSuccess(const HeartbeatResponse& response,
+                                const std::string& current_master_address,
+                                const std::function<void()>& register_client,
+                                std::future<void>& register_client_future);
+
+    /**
+     * @brief Attempts to reconnect to master after heartbeat failures.
+     * For HA mode, fetches the latest master address from etcd.
+     * For non-HA mode, reconnects to the same address.
+     * @return true if reconnect succeeded, false otherwise.
+     */
+    bool ReconnectToMaster(bool is_ha_mode,
+                           std::string& current_master_address);
+
+    /**
+     * @brief Waits for the next heartbeat interval using condition variable.
+     * @param interval_ms Milliseconds to wait.
+     */
+    void WaitForNextHeartbeat(int interval_ms);
     virtual HeartbeatRequest build_heartbeat_request() = 0;
 
     /**
      * @brief Registers the client into the master server.
      * @return An ErrorCode indicating success or failure.
      */
-    virtual tl::expected<void, ErrorCode> RegisterClient() = 0;
+    virtual tl::expected<RegisterClientResponse, ErrorCode>
+    RegisterClient() = 0;
 
    protected:
     /**
@@ -449,6 +486,7 @@ class ClientService {
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;
     std::mutex heartbeat_mtx_;
+    ViewVersionId view_version_{0};
 
     // Shutdown protection
     std::shared_mutex running_rw_mtx_;
