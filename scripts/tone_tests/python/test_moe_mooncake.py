@@ -34,9 +34,9 @@ class TestDPAttn(CustomTestCase):
                 other_args=[
                     "--trust-remote-code",
                     "--tp",
-                    "2",
+                    "4",
                     "--dp",
-                    "2",
+                    "4",
                     "--enable-dp-attention",
                     "--elastic-ep-backend",
                     "mooncake",
