@@ -1535,8 +1535,8 @@ def batch_get_tensor_into(self, base_keys: List[str], buffer_ptrs: List[int], si
 **Parameters:**
 
   - `base_keys` (List[str]): List of base identifiers.
-  - `buffer_ptrs` (List[int]): List of the buffers pointer pre-allocated for tensor, and the buffers should be registered.
-  - `sizes` (List[int]): List of the size of buffers.
+  - `buffer_ptrs` (List[int]): List of buffer pointers pre-allocated for tensor; buffers should be registered.
+  - `sizes` (List[int]): List of buffer sizes.
 
 **Returns:**
 
@@ -1574,8 +1574,8 @@ def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[
 **Parameters:**
 
   - `base_keys` (List[str]): List of base identifiers.
-  - `buffer_ptrs` (List[int]): List of the buffers pointer pre-allocated for tensor, and the buffers should be registered.
-  - `sizes` (List[int]): List of the size of buffers.
+  - `buffer_ptrs` (List[int]): List of buffer pointers pre-allocated for tensor; buffers should be registered.
+  - `sizes` (List[int]): List of buffer sizes.
   - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0).
   - `tp_size` (int): Total tensor parallel size (default: 1).
 
