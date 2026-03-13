@@ -116,6 +116,7 @@ class AllocatorManager {
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_;
+    friend class SegmentSerializer;  // for fork serialize
 };
 
 /**

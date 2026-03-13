@@ -15,6 +15,7 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include <ylt/coro_http/coro_http_server.hpp>
 
 namespace mooncake {
 
@@ -229,13 +230,6 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
-     * @brief Get buffer information (address and size) for a key
-     * @param key Key to get buffer information for
-     * @return Tuple containing buffer address and size, or (0, 0) if error
-     */
-    std::tuple<uint64_t, size_t> get_buffer_info(const std::string &key);
-
-    /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
      * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
@@ -251,6 +245,8 @@ class RealClient : public PyClient {
     long removeAll(bool force = false);
 
     int tearDownAll();
+
+    int health_check() override;
 
     /**
      * @brief Check if an object exists
@@ -307,9 +303,37 @@ class RealClient : public PyClient {
      */
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
-    // Dummy client helper functions that return tl::expected
-    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-    get_buffer_info_dummy_helper(const std::string &key, const UUID &client_id);
+    // Hot cache acquire: returns (offset, size) within the shm region.
+    // Increments ref_count to prevent eviction.
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(
+        const std::string &key);
+
+    // Hot cache release: decrements ref_count after dummy is done reading.
+    tl::expected<void, ErrorCode> release_hot_cache(const std::string &key);
+
+    // Batch hot cache acquire: returns vector of (offset, size).
+    // SIZE_MAX offset indicates cache miss for that key.
+    std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+    batch_acquire_hot_cache(const std::vector<std::string> &keys);
+
+    // Batch hot cache release.
+    tl::expected<void, ErrorCode> batch_release_hot_cache(
+        const std::vector<std::string> &keys);
+
+    // Allocator-backed buffer acquire: allocates + fills, keeps handle alive.
+    // Returns (dummy_addr, size).
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_buffer_dummy(
+        const std::string &key, const UUID &client_id);
+
+    // Allocator-backed buffer release: frees the handle held by acquire.
+    tl::expected<void, ErrorCode> release_buffer_dummy(uint64_t dummy_addr,
+                                                       const UUID &client_id);
+
+    // Batch allocator-backed buffer acquire.
+    // Returns vector of (dummy_addr, size) per key.
+    std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+    batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
+                               const UUID &client_id);
 
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
@@ -447,7 +471,9 @@ class RealClient : public PyClient {
             nullptr);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys,
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
@@ -458,6 +484,14 @@ class RealClient : public PyClient {
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Releases buffer associated with a specific batch_id.
+     * Called by remote client after transfer completion.
+     * @param batch_id The unique identifier of the batch to release
+     * @return true if batch was found and released, false otherwise
+     */
+    bool release_offload_buffer(uint64_t batch_id);
 
     /**
      * @brief Retrieves multiple stored objects from a remote service.
@@ -489,9 +523,10 @@ class RealClient : public PyClient {
     };
 
     struct AscendSegmentDeleter {
+        std::string protocol = "ascend";
         void operator()(void *ptr) {
             if (ptr) {
-                free_memory("ascend", ptr);
+                free_memory(protocol.c_str(), ptr);
             }
         }
     };
@@ -521,6 +556,9 @@ class RealClient : public PyClient {
         std::vector<MappedShm> mapped_shms;
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
+        // Buffers held by dummy via acquire_buffer; keyed by dummy address
+        std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
+            active_handles;
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
@@ -554,6 +592,13 @@ class RealClient : public PyClient {
     int start_ipc_server();
     int stop_ipc_server();
     void ipc_server_func();
+    // Embedded HTTP server for health-check / metrics
+    std::unique_ptr<coro_http::coro_http_server> http_server_;
+    int start_http_server();
+    void stop_http_server();
+
+    void handle_ipc_shm_register(int client_sock);
+    void handle_ipc_shm_fd_request(int client_sock);
 };
 
 }  // namespace mooncake

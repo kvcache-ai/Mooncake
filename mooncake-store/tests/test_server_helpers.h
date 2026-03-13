@@ -77,14 +77,25 @@ class InProcMaster {
             wms_cfg.enable_metric_reporting = false;
             wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
             wms_cfg.eviction_high_watermark_ratio =
-                DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+                config.eviction_high_watermark_ratio.has_value()
+                    ? config.eviction_high_watermark_ratio.value()
+                    : DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
             wms_cfg.view_version = 0;
             // Use default client_live_ttl_sec to align with production defaults
             wms_cfg.enable_ha = false;
             wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
             wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
-            wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
+            wms_cfg.root_fs_dir = config.root_fs_dir.has_value()
+                                      ? config.root_fs_dir.value()
+                                      : DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
+            if (config.enable_disk_eviction.has_value()) {
+                wms_cfg.enable_disk_eviction =
+                    config.enable_disk_eviction.value();
+            }
+            if (config.quota_bytes.has_value()) {
+                wms_cfg.quota_bytes = config.quota_bytes.value();
+            }
 
             wms_cfg.enable_cxl = config.enable_cxl.has_value()
                                      ? config.enable_cxl.value()

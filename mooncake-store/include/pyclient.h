@@ -16,13 +16,46 @@
 namespace mooncake {
 
 #define MOONCAKE_SHM_NAME "mooncake_shm"
-// Protocol structure for IPC registration
+
+// IPC request type discriminator (sent as first 4 bytes on each connection)
+enum IpcRequestType : uint32_t {
+    IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
+    IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
+};
+
+// Segment types for IPC_SHM_FD_REQUEST
+enum ShmSegmentType : uint32_t {
+    SHM_SEG_HOT_CACHE = 0,  // local hot cache backing memory
+};
+
+// Return codes for health_check()
+enum HealthCheckStatus : int {
+    HC_HEALTHY = 0,          // Fully connected, all links up
+    HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
+    HC_MASTER_UNREACHABLE =
+        2  // Master (or RealClient for DummyClient) unreachable
+};
+
+// Payload for IPC_SHM_REGISTER (followed by fd via SCM_RIGHTS)
 struct ShmRegisterRequest {
     uint64_t client_id_first;
     uint64_t client_id_second;
     uint64_t dummy_base_addr;
     uint64_t shm_size;
     bool is_local_buffer;
+};
+
+// Payload for IPC_SHM_FD_REQUEST
+struct ShmFdRequest {
+    uint64_t client_id_first;
+    uint64_t client_id_second;
+    ShmSegmentType segment_type;
+};
+
+// Response for IPC_SHM_FD_REQUEST (fd sent back via SCM_RIGHTS)
+struct ShmFdResponse {
+    int32_t status;     // 0 = success, <0 = error
+    uint64_t shm_size;  // size of the shm region
 };
 
 class ClientRequester {
@@ -39,6 +72,16 @@ class ClientRequester {
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,
                              const std::vector<int64_t> sizes);
+
+    /**
+     * @brief Notifies remote FileStorage to release buffer after transfer
+     * completion. This is a fire-and-forget call - errors are logged but not
+     * propagated.
+     * @param client_addr Network address of the remote FileStorage service.
+     * @param batch_id The batch_id returned from batch_get_offload_object.
+     */
+    void release_offload_buffer(const std::string &client_addr,
+                                uint64_t batch_id);
 
    private:
     /**
@@ -149,9 +192,6 @@ class PyClient {
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 
-    virtual std::tuple<uint64_t, size_t> get_buffer_info(
-        const std::string &key) = 0;
-
     virtual std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys) = 0;
 
@@ -185,6 +225,8 @@ class PyClient {
         const std::string &key) = 0;
 
     virtual int tearDownAll() = 0;
+
+    virtual int health_check() = 0;
 
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;

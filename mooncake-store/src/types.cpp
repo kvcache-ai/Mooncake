@@ -55,7 +55,11 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::KEYS_EXCEED_BUCKET_LIMIT, "KEYS_EXCEED_BUCKET_LIMIT"},
         {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
-        {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"}};
+        {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
+        {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},
+        {ErrorCode::SERIALIZE_FAIL, "SERIALIZE_FAIL"},
+        {ErrorCode::DESERIALIZE_FAIL, "DESERIALIZE_FAIL"},
+        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";
@@ -78,6 +82,27 @@ UUID generate_uuid() {
     std::memcpy(&pair_uuid.second, uuid.data + sizeof(uint64_t),
                 sizeof(uint64_t));
     return pair_uuid;
+}
+
+std::string UuidToString(const UUID& uuid) {
+    return std::to_string(uuid.first) + "-" + std::to_string(uuid.second);
+}
+
+bool StringToUuid(const std::string& str, UUID& uuid) {
+    size_t dashPos = str.find('-');
+    if (dashPos == std::string::npos || dashPos == 0 ||
+        dashPos == str.length() - 1) {
+        return false;
+    }
+
+    try {
+        uint64_t first = std::stoull(str.substr(0, dashPos), nullptr, 10);
+        uint64_t second = std::stoull(str.substr(dashPos + 1), nullptr, 10);
+        uuid = UUID{first, second};
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 }  // namespace mooncake

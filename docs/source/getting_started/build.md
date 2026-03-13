@@ -160,6 +160,7 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
 - `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+
 - `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust support
+- `-DWITH_EP=[ON|OFF]`: Build the EP (Expert Parallelism) and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` (semicolon-separated) to build for specific PyTorch versions, or leave empty to use the currently-installed torch. The CUDA version is detected automatically. **Default: OFF.**
 - `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
 - `-DUSE_ETCD=[ON|OFF]`: Enable etcd-based metadata service, require go 1.23+

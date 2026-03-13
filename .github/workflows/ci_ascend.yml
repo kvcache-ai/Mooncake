@@ -1,0 +1,211 @@
+name: 'CI Test on ASCEND Platform'
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  build-and-test:
+    if: github.repository == 'kvcache-ai/Mooncake'
+    runs-on: self-hosted
+
+    container:
+      image: localhost:5000/mooncake-hixl-ci:v5
+      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3 
+                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7 
+                    --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc --ulimit nproc=65535:65535
+      env:
+        GITHUB_ACTIONS: "true"
+        LD_PRELOAD: "/usr/lib64/libjemalloc.so.2:"
+      volumes:
+        - /usr/local/dcmi:/usr/local/dcmi
+        - /usr/local/Ascend/driver/:/usr/local/Ascend/driver/
+        - /etc/ascend_install.info:/etc/ascend_install.info
+        - /etc/hccn.conf:/etc/hccn.conf
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Configure CMake
+      shell: bash
+      run: |
+        source /usr/local/Ascend/cann-9.0.0/set_env.sh
+        pwd
+        if ! git submodule update --init --recursive; then
+            if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
+                echo "git submodule update failed, try to cp pybind11..."
+                if [ -d "../pybind11" ]; then
+                    cp -r ../pybind11 extern/
+                else
+                    echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
+                    exit 1
+                fi
+            else
+                echo "Detected that extern/pybind11 already exists, continuing execution...."
+            fi
+        fi
+        echo "Configuring CMake..."
+        rm -rf build
+        mkdir -p build
+        cd build
+
+        cmake .. \
+          -DUSE_ASCEND_DIRECT=ON \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_UNIT_TESTS=OFF
+
+    - name: Build
+      shell: bash
+      run: |
+        source /usr/local/Ascend/cann-9.0.0/set_env.sh
+        echo "Building..."
+        cd build
+        make -j8
+        make install -j8
+        echo "Mooncake installed successfully."
+
+    - name: Run Hixl Mooncake Store Test
+      shell: bash
+      run: |
+          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          set -e
+          export ASCEND_PROCESS_LOG_PATH=/tmp/hixl-test-log/
+          export ASCEND_GLOBAL_LOG_LEVEL=3
+          echo "=== Cloning Hixl repository ==="
+          cd ..
+          rm -rf hixl
+          git clone https://gitcode.com/cann/hixl.git
+          cd hixl/examples/third_parties/mooncake_store/python/
+
+          export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+          echo "=== Starting Mooncake Master ==="
+
+          # Find mooncake_master binary
+          MOONCAKE_MASTER=$(find /usr/local/bin /usr/bin -name "mooncake_master" -type f 2>/dev/null | head -1)
+          if [ -z "$MOONCAKE_MASTER" ]; then
+              # Try finding in build directory
+              MOONCAKE_MASTER=$(find $GITHUB_WORKSPACE/build -name "mooncake_master" -type f 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$MOONCAKE_MASTER" ]; then
+              echo "Error: mooncake_master binary not found"
+              exit 1
+          fi
+
+          echo "Found mooncake_master at: $MOONCAKE_MASTER"
+
+          # Start Mooncake master in background
+          $MOONCAKE_MASTER \
+            --enable_http_metadata_server=true \
+            --http_metadata_server_host=0.0.0.0 \
+            --http_metadata_server_port=8080 \
+            > /tmp/mooncake_master.log 2>&1 &
+          MASTER_PID=$!
+          echo "Mooncake Master started with PID: $MASTER_PID"
+
+          # Wait for master to be ready
+          echo "Waiting for Mooncake Master to initialize..."
+          sleep 5
+
+          # Check if master is running
+          if ! kill -0 $MASTER_PID 2>/dev/null; then
+              echo "Error: Mooncake Master failed to start"
+              cat /tmp/mooncake_master.log 
+              exit 1
+          fi
+
+          echo "Mooncake Master is running"
+          echo "=== Running Hixl Mooncake Store Tests ==="
+          # List of test cases to run
+          TEST_CASES=(
+              "batch_put_get_sample.py"
+              "batch_put_get_multi_buffers_sample.py"
+          )
+
+          # Track test results
+          FAILED_TESTS=()
+          PASSED_TESTS=()
+
+          # Run each test case
+          export ASCEND_BUFFER_POOL=4:8
+          for test_case in "${TEST_CASES[@]}"; do
+              echo ""
+              echo "========================================="
+              echo "Running test: $test_case"
+              echo "========================================="
+
+              if [ ! -f "$test_case" ]; then
+                  echo "Warning: Test file $test_case not found, skipping..."
+                  continue
+              fi
+              # Run the test with run.sh
+              python3 $test_case \
+                  --device_id=0 \
+                  --rank=0 \
+                  2>&1 | tee "/tmp/hixl_test_${test_case%.py}.log"
+
+              TEST_RESULT=${PIPESTATUS[0]}
+
+              if [ $TEST_RESULT -eq 0 ]; then
+                  echo "✓ $test_case PASSED"
+                  PASSED_TESTS+=("$test_case")
+              else
+                  echo "✗ $test_case FAILED with exit code: $TEST_RESULT"
+                  FAILED_TESTS+=("$test_case")
+              fi
+          done
+
+          echo ""
+          echo "========================================="
+          echo "Test Summary"
+          echo "========================================="
+          echo "Passed tests: ${#PASSED_TESTS[@]}"
+          for test in "${PASSED_TESTS[@]}"; do
+              echo "  ✓ $test"
+          done
+
+          echo ""
+          echo "Failed tests: ${#FAILED_TESTS[@]}"
+          for test in "${FAILED_TESTS[@]}"; do
+              echo "  ✗ $test"
+          done
+
+          # Cleanup: Stop Mooncake Master
+          echo ""
+          echo "Stopping Mooncake Master..."
+          kill $MASTER_PID 2>/dev/null || true
+          wait $MASTER_PID 2>/dev/null || true
+
+          # Exit with error if any tests failed
+          if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
+              echo ""
+              echo "Some tests failed!"
+              exit 1
+          fi
+
+          echo ""
+          echo "All Hixl Mooncake Store tests completed successfully!"
+          
+
+    - name: Test Summary
+      if: always()
+      shell: bash
+      run: |
+        echo "CI Test completed"
+
+    - name: Upload Test Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{ github.run_number }}
+        path: |
+          /tmp/hixl-test-log/*
+        retention-days: 30
+        if-no-files-found: warn

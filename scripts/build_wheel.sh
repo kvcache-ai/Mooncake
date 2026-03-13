@@ -10,14 +10,10 @@ set -x
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
-# Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
-CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
-if [ -z "$CUDA_VERSION" ] && [ -f /usr/local/cuda/version.txt ]; then
-    CUDA_VERSION=$(grep -Eo "[0-9]+\.[0-9]+" /usr/local/cuda/version.txt | head -n1)
-fi
-CUDA_VERSION=${CUDA_VERSION:-"0.0"}
+# CMake build directory (default: build).  EP/PG extensions are staged under
+# ${BUILD_DIR}/ep_pg_staging when the project was built with -DWITH_EP=ON.
+BUILD_DIR="${BUILD_DIR:-build}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
-echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-asio:/usr/local/lib
@@ -31,6 +27,9 @@ echo "Creating directory structure..."
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+
+# Copy libasio.so to mooncake directory (runtime dependency of engine.so)
+cp build/mooncake-asio/libasio.so mooncake-wheel/mooncake/libasio.so
 
 # Copy store.so to mooncake directory
 if [ -f build/mooncake-integration/store.*.so ]; then
@@ -108,52 +107,30 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-if [ "$BUILD_WITH_EP" = "1" ]; then
-    echo "Building Mooncake EP"
-    cd mooncake-ep
-    if [ -z "$EP_TORCH_VERSIONS" ]; then
-        python setup.py build_ext --build-lib .
-    else
-        for version in ${EP_TORCH_VERSIONS//;/ }; do
-            cuda_major=${CUDA_VERSION%%.*}
-            if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
-            else
-                pip install torch==$version
-            fi
-            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
-        done
-    fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
-    cd ..
-fi
-
-if [ "$BUILD_WITH_EP" = "1" ]; then
-    echo "Building Mooncake PG"
-    cd mooncake-pg
-    if [ -z "$EP_TORCH_VERSIONS" ]; then
-        python setup.py build_ext --build-lib .
-    else
-        for version in ${EP_TORCH_VERSIONS//;/ }; do
-            cuda_major=${CUDA_VERSION%%.*}
-            if [ "$cuda_major" -ge 13 ]; then
-                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
-            else
-                pip install torch==$version
-            fi
-            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
-        done
-    fi
-    cp mooncake/*.so ../mooncake-wheel/mooncake/
-    cd ..
-fi
+# EP/PG CUDA extensions are built during the cmake/make process when the
+# project is configured with -DWITH_EP=ON.  The resulting .so files land in
+# ${BUILD_DIR}/ep_pg_staging and are injected into the wheel AFTER auditwheel
+# so that patchelf never touches CUDA fatbins (see injection step below).
+# Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
+# relative path would silently point to the wrong location.
+CUDA_EP_STAGING_DIR="$(pwd)/${BUILD_DIR}/ep_pg_staging"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
+# If EP/PG .so files were staged inside the build directory, preserve them in a
+# temporary location so they survive the cleanup.
+CUDA_EP_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
+    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+        CUDA_EP_STAGING_TEMP=$(mktemp -d)
+        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
+        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+    fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
-    rm -rf build/
+    rm -rf "${BUILD_DIR}/"
+    # Point the injection step to the preserved copy (if any).
+    if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+        CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
+    fi
 fi
 
 echo "Building wheel package..."
@@ -254,114 +231,9 @@ echo "Detected architecture: $ARCH_SUFFIX"
 echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
-if [ "$PYTHON_VERSION" = "3.8" ]; then
-    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
-
-    echo "python 3.8 auditwheel does not support wild-cards..."
-    PATTERNS=(
-        "libcurl.so*"
-        "libibverbs.so*"
-        "libmlx5.so*"
-        "libnuma.so*"
-        "libstdc++.so*"
-        "libgcc_s.so*"
-        "libc.so*"
-        "libnghttp2.so*"
-        "libidn2.so*"
-        "librtmp.so*"
-        "libssh.so*"
-        "libpsl.so*"
-        "libssl.so*"
-        "libcrypto.so*"
-        "libgssapi_krb5.so*"
-        "libldap.so*"
-        "liblber.so*"
-        "libbrotlidec.so*"
-        "libz.so*"
-        "libnl-route-3.so*"
-        "libnl-3.so*"
-        "libm.so*"
-        "liblzma.so*"
-        "libunistring.so*"
-        "libgnutls.so*"
-        "libhogweed.so*"
-        "libnettle.so*"
-        "libgmp.so*"
-        "libkrb5.so*"
-        "libk5crypto.so*"
-        "libcom_err.so*"
-        "libkrb5support.so*"
-        "libsasl2.so*"
-        "libbrotlicommon.so*"
-        "libp11-kit.so*"
-        "libtasn1.so*"
-        "libkeyutils.so*"
-        "libresolv.so*"
-        "libffi.so*"
-        "libcuda.so*"
-        "libcudart.so*"
-        "libc10.so*"
-        "libc10_cuda.so*"
-        "libtorch.so*"
-        "libtorch_cpu.so*"
-        "libtorch_cuda.so*"
-        "libtorch_python.so*"
-        "libascendcl.so*"
-        "libhccl.so*"
-        "libmsprofiler.so*"
-        "libgert.so*"
-        "libascendcl_impl.so*"
-        "libge_executor.so*"
-        "libascend_dump.so*"
-        "libgraph.so*"
-        "libruntime.so*"
-        "libascend_watchdog.so*"
-        "libprofapi.so*"
-        "liberror_manager.so*"
-        "libascendalog.so*"
-        "libc_sec.so*"
-        "libhccl_alg.so*"
-        "libhccl_plf.so*"
-        "libascend_protobuf.so*"
-        "libhybrid_executor.so*"
-        "libdavinci_executor.so*"
-        "libge_common.so*"
-        "libge_common_base.so*"
-        "liblowering.so*"
-        "libregister.so*"
-        "libexe_graph.so*"
-        "libmmpa.so*"
-        "libplatform.so*"
-        "libgraph_base.so*"
-        "libruntime_common.so*"
-        "libqos_manager.so*"
-        "libascend_trace.so*"
-        "libmetadef*.so"
-        "libadxl*.so"
-    )
-
-    for pattern in "${PATTERNS[@]}"; do
-        for libpath in /usr/local/cuda* /usr/local/cuda-12.8/lib* /usr/lib* /usr/local/lib* /lib*; do
-            if [ -d "$libpath" ]; then
-                for lib in $(find $libpath -name "$pattern" 2>/dev/null); do
-                    # Get just the filename
-                    libname=$(basename "$lib")
-                    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude $libname "
-                done
-            fi
-        done
-    done
-
-    # Manually fix for libcuda since it needs libcuda.so.1 but I didn't get it.
-    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude libcuda.so.1 "
-
-    echo "Running auditwheel with exclude options: $EXCLUDE_OPTS"
-    auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
-else
-    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
-    auditwheel repair ${OUTPUT_DIR}/*.whl \
+echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+python -m build --wheel --outdir ${OUTPUT_DIR}
+auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
@@ -444,8 +316,35 @@ else
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+
+# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
+# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
+# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
+if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+    REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+    if [ -n "$REPAIRED_WHEEL" ]; then
+        echo "Injecting CUDA extension .so files into repaired wheel..."
+        WHEEL_UNPACK_DIR=$(mktemp -d)
+        python -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
+            if [ -f "$so_file" ]; then
+                echo "  Adding $(basename "$so_file")"
+                cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
+            fi
+        done
+        rm "$REPAIRED_WHEEL"
+        python -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        rm -rf "$WHEEL_UNPACK_DIR"
+    fi
+else
+    echo "No EP/PG staging directory found (${CUDA_EP_STAGING_DIR}); skipping CUDA extension injection"
 fi
 
+# Clean up the temporary EP/PG staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
+if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+    rm -rf "$CUDA_EP_STAGING_TEMP"
+fi
 
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl

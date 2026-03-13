@@ -6,7 +6,7 @@
 # EP: @UNIDY2002 UNIDY2002@outlook.com
 # PG: @UNIDY2002 UNIDY2002@outlook.com
 
-.github @stmatengss @ykwd @Ann-1024
+.github @stmatengss @ykwd @Ann-1024 @luketong777
 /docs @ShangmingCai @stmatengss @ykwd
 /mooncake-ep @UNIDY2002 @ympcMark
 /mooncake-integration/ep @UNIDY2002 @ympcMark
@@ -18,3 +18,4 @@
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov
 /mooncake-transfer-engine/*/transport/ascend_transport/ @alogfans @ascend-direct-dev
 /mooncake-wheel @ShangmingCai @stmatengss
+/scripts/tone_tests @luketong777

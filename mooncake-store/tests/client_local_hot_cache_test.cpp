@@ -188,8 +188,9 @@ class LocalHotCacheTest : public ::testing::Test {
 
     TestClientContext SetupTestClientWithHotCache() {
         TestClientContext ctx;
-        ctx.original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
-        setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
+        ctx.original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432",
+               1);  // 32MB = 2 blocks
 
         std::string local_ip = getLocalIpAddress();
         std::string local_hostname = local_ip + ":12345";
@@ -229,9 +230,9 @@ class LocalHotCacheTest : public ::testing::Test {
             free_memory("", ctx.segment_ptr);
         }
         if (ctx.original_env) {
-            setenv("LOCAL_HOT_CACHE_SIZE", ctx.original_env, 1);
+            setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", ctx.original_env, 1);
         } else {
-            unsetenv("LOCAL_HOT_CACHE_SIZE");
+            unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         }
     }
 
@@ -573,9 +574,9 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
 // Test 1: Valid environment variable - hot cache should be enabled
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "33554432",
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432",
            1);  // 32MB = 2 blocks (16MB each)
 
     auto client_opt = CreateTestClient("localhost");
@@ -586,9 +587,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -596,9 +597,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
 // INVALID_PARAMS
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_InvalidEnvVar) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "invalid", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "invalid", 1);
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -608,18 +609,18 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_InvalidEnvVar) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
 // Test 3: Zero value - InitLocalHotCache returns INVALID_PARAMS
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "0", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "0", 1);
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -629,18 +630,18 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
 // Test 4: Negative value - InitLocalHotCache returns INVALID_PARAMS
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "-1", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "-1", 1);
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -649,9 +650,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
     }
 
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -659,9 +660,10 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
 // enabled
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608",
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8388608",
            1);  // 8MB < 16MB (default block size)
 
     auto client_opt = CreateTestClient("localhost");
@@ -675,9 +677,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -685,11 +687,14 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
 TEST_F(LocalHotCacheTest,
        InitLocalHotCacheViaClientCreate_LessThanOneBlock_CustomBlockSize) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
-    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size =
+        std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
 
-    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB custom block size
-    setenv("LOCAL_HOT_CACHE_SIZE", "2097152",
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4194304",
+           1);  // 4MB custom block size
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "2097152",
            1);  // 2MB < 4MB (custom block size)
 
     auto client_opt = CreateTestClient("localhost");
@@ -703,23 +708,23 @@ TEST_F(LocalHotCacheTest,
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (original_block_size) {
-        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     }
 }
 
 // Test 7: No environment variable - hot cache should be disabled (valid case)
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    unsetenv("LOCAL_HOT_CACHE_SIZE");
+    unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -729,9 +734,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -752,12 +757,15 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
  */
 TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
-    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size =
+        std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
 
     // Enable hot cache with custom block size (4MB)
-    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB = 2 blocks (4MB each)
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8388608",
+           1);  // 8MB = 2 blocks (4MB each)
 
     // Get local IP address instead of using "localhost" to avoid hostname
     // resolution issues
@@ -829,25 +837,28 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (original_block_size) {
-        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     }
 }
 
 TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
-    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size =
+        std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
 
     // Enable hot cache with custom block size (4MB)
-    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB = 2 blocks (4MB each)
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8388608",
+           1);  // 8MB = 2 blocks (4MB each)
 
     // Get local IP address instead of using "localhost" to avoid hostname
     // resolution issues
@@ -944,14 +955,14 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (original_block_size) {
-        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     }
 }
 

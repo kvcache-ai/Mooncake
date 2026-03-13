@@ -18,6 +18,7 @@ namespace mooncake {
 struct FileRecord {
     std::string path;
     uint64_t size;
+    std::string key;  // Associated object key for eviction tracking
 };
 
 struct BucketObjectMetadata {
@@ -200,6 +201,9 @@ struct FileStorageConfig {
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
 
+    // Use io_uring for file I/O instead of POSIX pread/pwrite
+    bool use_uring = false;
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -227,10 +231,12 @@ class StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) = 0;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) = 0;
+        std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
@@ -368,26 +374,31 @@ class StorageBackend {
      * @param slices Vector of data slices to store
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              const std::vector<Slice>& slices);
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
+        const std::string& path, const std::vector<Slice>& slices,
+        const std::string& key = "");
 
     /**
      * @brief Stores an object from a string
      * @param path path for the object
      * @param str String containing object data
-     * @return tl::expected<void, ErrorCode> indicating operation status
+     * @param key Optional object key for eviction tracking
+     * @return tl::expected with evicted keys on success, ErrorCode on failure
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              const std::string& str);
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
+        const std::string& path, const std::string& str,
+        const std::string& key = "");
 
     /**
      * @brief Stores an object from a span of data
      * @param path path for the object
      * @param data Span containing object data
-     * @return tl::expected<void, ErrorCode> indicating operation status
+     * @param key Optional object key for eviction tracking
+     * @return tl::expected with evicted keys on success, ErrorCode on failure
      */
-    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
-                                              std::span<const char> data);
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
+        const std::string& path, std::span<const char> data,
+        const std::string& key = "");
 
     /**
      * @brief Loads an object into slices
@@ -438,6 +449,7 @@ class StorageBackend {
     std::string fsdir_;
     bool enable_eviction_{
         true};  // User-configurable flag to enable/disable eviction
+    bool use_uring_{false};  // Use io_uring for file I/O
 
 #ifdef USE_3FS
     bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
@@ -478,16 +490,18 @@ class StorageBackend {
 
     /**
      * @brief Evicts a file based on FIFO order (earliest written first out)
-     * @return Path of the evicted file, or empty string if no file was evicted
+     * @return FileRecord of the evicted file, or empty record if no file was
+     * evicted
      */
-    std::string EvictFile();
+    FileRecord EvictFile();
 
     /**
      * @brief Add file to write queue for FIFO tracking
      * @param path Path of the file to add to queue
      * @param size Size of the file
      */
-    void AddFileToWriteQueue(const std::string& path, uint64_t size);
+    void AddFileToWriteQueue(const std::string& path, uint64_t size,
+                             const std::string& key = "");
 
     /**
      * @brief Remove file from write queue
@@ -519,7 +533,8 @@ class StorageBackend {
      *         ErrorCode::FILE_WRITE_FAIL if insufficient space remains after
      *         attempting evictions up to the maximum attempt limit.
      */
-    tl::expected<void, ErrorCode> EnsureDiskSpace(size_t required_size);
+    tl::expected<std::vector<std::string>, ErrorCode> EnsureDiskSpace(
+        size_t required_size);
 
     /**
      * @brief Releases a specified amount of disk space and updates internal
@@ -611,10 +626,12 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
@@ -644,10 +661,6 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     std::unique_ptr<StorageBackend> storage_backend_;
 
-    std::string SanitizeKey(const std::string& key) const;
-
-    std::string ResolvePath(const std::string& key) const;
-
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
 
     mutable Mutex mutex_;
@@ -674,6 +687,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
 
+    ~BucketStorageBackend();
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be
@@ -686,7 +701,9 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -708,7 +725,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
@@ -858,11 +875,37 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
 
+   public:
+    /**
+     * @brief Get a file instance for external buffer registration
+     * Opens a temporary file to get access to the UringFile instance
+     * @return Shared pointer to StorageFile or error
+     */
+    tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
+        const;
+
    private:
+    // Alignment helper functions for O_DIRECT I/O
+    static constexpr size_t kDirectIOAlignment = 4096;
+
+    static inline size_t align_up(size_t size, size_t alignment) {
+        return (size + alignment - 1) & ~(alignment - 1);
+    }
+
+    static inline int64_t align_down(int64_t offset, int64_t alignment) {
+        return offset & ~(alignment - 1);
+    }
+
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+
+    // Aligned buffer for O_DIRECT I/O operations
+    // We use a fixed-size buffer to avoid frequent allocations
+    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
+    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
+                                                              [](void*) {}};
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
@@ -886,6 +929,18 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+
+    // File handle cache for UringFile to avoid repeated open/close overhead
+    mutable Mutex file_cache_mutex_;
+    mutable std::unordered_map<std::string, std::shared_ptr<StorageFile>>
+        file_cache_ GUARDED_BY(file_cache_mutex_);
+
+    // Get or open a file with caching support
+    tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetOrOpenFile(
+        const std::string& path, FileMode mode) const;
+
+    // Clear file cache (called on destruction or when needed)
+    void ClearFileCache();
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
@@ -913,7 +968,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler) override;
+            complete_handler,
+        std::function<void(const std::string& evicted_key)> eviction_handler =
+            nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
@@ -922,7 +979,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices) override;
+        std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Checks whether an object with the specified key exists in the

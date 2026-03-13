@@ -12,5 +12,6 @@ Current list of codeowners on this project:
 | ---------------------------- | ---------------------------- | ---------------------------- | ---------------------------- |
 | <img src="image/partners/approaching_ai_logo.png" width="120"/> | <img src="image/partners/ant_group_logo.png" width="120"/> | <img src="image/partners/huawei_logo.png" width="120"/> | <img src="image/partners/nvidia_logo.png" width="120"/> |
 | <img src="image/partners/moore_thread_logo.jpg" width="120"/> | <img src="image/partners/tencent_logo.png" width="120"/> | <img src="image/partners/volcengine_logo.png" width="120"/> | <img src="image/partners/amd_logo.png" width="120"/> |
+| <img src="image/partners/ieitsystems_logo.png" width="120"/> | | | |
 
 Want to include your company logo? Just open a Pull Request!

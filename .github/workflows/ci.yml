@@ -386,15 +386,11 @@ jobs:
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
 
-    - name: Test Mooncake EP Backend (CPU Only)
-      env:
-        MC_FORCE_TCP: "true"
+    - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
-        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
-        # Disable these tests in CI as they fail occasionally.
-        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_elastic
-        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_p2p_cpu
+        pip install safetensors
+        python -m unittest mooncake-wheel.tests.test_safetensor_functions
       shell: bash
 
   build-flags:
@@ -409,7 +405,6 @@ jobs:
     env:
       CI: "true"
       BUILD_WITH_EP: "1"
-      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
 
@@ -466,7 +461,7 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
         make -j4
         sudo make install
         df -h
@@ -476,7 +471,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -510,7 +505,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
       shell: bash
 
     - name: Build project
@@ -564,7 +559,11 @@ jobs:
       uses: docker/setup-buildx-action@v2
 
     - name: Build Docker image
-      run: docker build -t mooncake-app .
+      run: |
+        docker build -f docker/mooncake.Dockerfile \
+          --build-arg PYTHON_VERSION=3.10 \
+          --build-arg EP_TORCH_VERSIONS="2.9.1" \
+          -t mooncake:from-source .
 
   spell-check:
     name: Spell Check with Typos

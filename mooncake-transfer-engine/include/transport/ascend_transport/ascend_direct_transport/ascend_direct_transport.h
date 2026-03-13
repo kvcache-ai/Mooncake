@@ -84,10 +84,18 @@ class AscendDirectTransport : public Transport {
 
     void processSliceList(const std::vector<Slice *> &slice_list);
 
-    void connectAndTransfer(const std::string &target_adxl_engine_name,
-                            adxl::TransferOp operation,
-                            const std::vector<Slice *> &slice_list,
-                            int32_t times = 0);
+    int connectAndTransfer(const std::string &target_seg_name,
+                           const std::string &target_adxl_engine_name,
+                           adxl::TransferOp operation,
+                           const std::vector<Slice *> &slice_list,
+                           adxl::Status &status);
+
+    int TransferWithAsync(const std::string &target_seg_name,
+                          const std::string &target_adxl_engine_name,
+                          adxl::TransferOp operation,
+                          const std::vector<Slice *> &slice_list,
+                          const std::vector<adxl::TransferOpDesc> &op_descs,
+                          adxl::Status &status);
 
     void localCopy(TransferRequest::OpCode opcode,
                    const std::vector<Slice *> &slice_list);
@@ -112,12 +120,7 @@ class AscendDirectTransport : public Transport {
     int checkAndConnect(const std::string &target_adxl_engine_name);
 
     int disconnect(const std::string &target_adxl_engine_name,
-                   int32_t timeout_in_millis, bool force = false);
-
-    void TransferWithAsync(const std::string &target_adxl_engine_name,
-                           adxl::TransferOp operation,
-                           const std::vector<Slice *> &slice_list,
-                           const std::vector<adxl::TransferOpDesc> &op_descs);
+                   int32_t timeout_in_millis);
 
     template <class F, class... Args>
     void enqueue(F &&f, Args &&...args);

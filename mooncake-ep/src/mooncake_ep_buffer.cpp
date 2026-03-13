@@ -1,7 +1,29 @@
 #include <mooncake_ep_buffer.h>
 #include <arpa/inet.h>
+#include <glog/logging.h>
 
 namespace mooncake {
+
+// Check if all GPUs support fabric memory handles (MNNVL).
+// Mirrors the check in nvlink_transport.cpp.
+static bool supportFabricMem() {
+    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+
+    bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
+    if (!fabric_enabled) return false;
+
+    int num_devices = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess || num_devices == 0) return false;
+
+    for (int dev = 0; dev < num_devices; ++dev) {
+        int supported = 0;
+        cuDeviceGetAttribute(
+            &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
+        if (!supported) return false;
+    }
+    return true;
+}
 
 // Check if IPv6 address is an IPv4-mapped address (::ffff:x.x.x.x)
 static inline bool ipv6_addr_v4mapped(const struct in6_addr* a) {
@@ -44,7 +66,91 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
-    CUDA_CHECK(cudaMalloc(&gdr_buffer, num_ep_buffer_bytes));
+
+    // Allocate gdr_buffer. On MNNVL clusters, use cuMemCreate with a fabric
+    // handle so the buffer is accessible cross-node via NVLink fabric.
+    // On IB clusters or single-node setups, fall back to cudaMalloc.
+    use_fabric_mem_ = supportFabricMem();
+    if (use_fabric_mem_) {
+        CUdevice cu_dev;
+        CUresult res = cuDeviceGet(&cu_dev, device_id);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "[EP] cuDeviceGet failed: " << res;
+            throw std::runtime_error("cuDeviceGet failed");
+        }
+
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = cu_dev;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+        int rdma_flag = 0;
+        cuDeviceGetAttribute(
+            &rdma_flag,
+            CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
+            cu_dev);
+        if (rdma_flag) prop.allocFlags.gpuDirectRDMACapable = 1;
+
+        size_t granularity = 0;
+        res = cuMemGetAllocationGranularity(&granularity, &prop,
+                                            CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "[EP] cuMemGetAllocationGranularity failed: " << res;
+            throw std::runtime_error("cuMemGetAllocationGranularity failed");
+        }
+
+        fabric_alloc_size_ =
+            (num_ep_buffer_bytes + granularity - 1) & ~(granularity - 1);
+        if (fabric_alloc_size_ == 0) fabric_alloc_size_ = granularity;
+
+        res = cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
+        if (res != CUDA_SUCCESS) {
+            LOG(ERROR) << "[EP] cuMemCreate(FABRIC) failed: " << res;
+            throw std::runtime_error("cuMemCreate failed");
+        }
+
+        CUdeviceptr dptr = 0;
+        res = cuMemAddressReserve(&dptr, fabric_alloc_size_, granularity, 0, 0);
+        if (res != CUDA_SUCCESS) {
+            cuMemRelease(fabric_mem_handle_);
+            LOG(ERROR) << "[EP] cuMemAddressReserve failed: " << res;
+            throw std::runtime_error("cuMemAddressReserve failed");
+        }
+
+        res = cuMemMap(dptr, fabric_alloc_size_, 0, fabric_mem_handle_, 0);
+        if (res != CUDA_SUCCESS) {
+            cuMemAddressFree(dptr, fabric_alloc_size_);
+            cuMemRelease(fabric_mem_handle_);
+            LOG(ERROR) << "[EP] cuMemMap failed: " << res;
+            throw std::runtime_error("cuMemMap failed");
+        }
+
+        // Grant read/write access to all devices in the fabric clique
+        int device_count = 0;
+        cudaGetDeviceCount(&device_count);
+        std::vector<CUmemAccessDesc> access(device_count);
+        for (int i = 0; i < device_count; ++i) {
+            access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access[i].location.id = i;
+            access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        }
+        res = cuMemSetAccess(dptr, fabric_alloc_size_, access.data(),
+                             device_count);
+        if (res != CUDA_SUCCESS) {
+            cuMemUnmap(dptr, fabric_alloc_size_);
+            cuMemAddressFree(dptr, fabric_alloc_size_);
+            cuMemRelease(fabric_mem_handle_);
+            LOG(ERROR) << "[EP] cuMemSetAccess failed: " << res;
+            throw std::runtime_error("cuMemSetAccess failed");
+        }
+
+        gdr_buffer = reinterpret_cast<void*>(dptr);
+        LOG(INFO) << "[EP] Allocated " << fabric_alloc_size_
+                  << " bytes with fabric handle on GPU " << device_id;
+    } else {
+        CUDA_CHECK(cudaMalloc(&gdr_buffer, num_ep_buffer_bytes));
+    }
     CUDA_CHECK(cudaMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
     CUDA_CHECK(
@@ -71,7 +177,14 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    cudaFree(gdr_buffer);
+    if (use_fabric_mem_) {
+        CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(gdr_buffer);
+        cuMemUnmap(dptr, fabric_alloc_size_);
+        cuMemAddressFree(dptr, fabric_alloc_size_);
+        cuMemRelease(fabric_mem_handle_);
+    } else {
+        cudaFree(gdr_buffer);
+    }
     cudaFree(raddrs);
     cudaFree(rkeys);
     cudaFree(qp_devctxs);
@@ -381,12 +494,11 @@ int MooncakeEpBuffer::init_ibgda() {
     }
     ibv_free_device_list(dev_list);
 
-    ibv_pd* pd = ibv_alloc_pd(ctx);
+    pd = ibv_alloc_pd(ctx);
     if (!pd) {
         perror("Failed to allocate protection domain");
         return -1;
     }
-    mlx5dv_pd mpd;
     mlx5dv_obj dv_obj = {};
     dv_obj.pd.in = pd;
     dv_obj.pd.out = &mpd;
@@ -404,8 +516,8 @@ int MooncakeEpBuffer::init_ibgda() {
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
     // WQ doesn't need initialization as it's zeroed before each use.
     CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    mlx5dv_devx_umem* ctrl_buf_umem = mlx5dv_devx_umem_reg(
-        ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
+    ctrl_buf_umem = mlx5dv_devx_umem_reg(ctx, ctrl_buf, CTRL_BUF_SIZE,
+                                         IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
         fprintf(stderr,
@@ -419,7 +531,7 @@ int MooncakeEpBuffer::init_ibgda() {
         }
         return -1;
     }
-    memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
+    ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
         return -1;
@@ -456,6 +568,47 @@ int MooncakeEpBuffer::init_ibgda() {
         qps.push_back(qp);
     }
     return 0;
+}
+
+void MooncakeEpBuffer::update_local_qpns() {
+    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        if (qps[i]) {
+            mlx5gda_destroy_qp(ctrl_buf_heap, qps[i]);
+            qps[i] = nullptr;
+        }
+    }
+
+    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        mlx5gda_qp* qp =
+            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
+                                 pd, 16384, 1, comm_stream.stream());
+        if (!qp) {
+            perror("Failed to recreate QP");
+            ibgda_disabled_ = true;
+            return;
+        }
+        is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
+        if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
+            perror("Failed to mlx5gda_modify_rc_qp_rst2init");
+            ibgda_disabled_ = true;
+            return;
+        }
+        // Ensure all async memset operations are complete before accessing QP
+        // structures
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
+        mlx5gda_qp_devctx qp_devctx = {
+            .qpn = qp->qpn,
+            .wqeid_mask = qp->num_wqebb - 1,
+            .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
+            .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
+            .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
+            .bf = (char*)qp->uar->reg_addr,
+        };
+        cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
+                   sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+        qps[i] = qp;
+    }
 }
 
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
@@ -529,6 +682,12 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
+    if (use_fabric_mem_) {
+        // Fabric memory is globally accessible via cuMemSetAccess — no IPC
+        // handle exchange needed. Return an empty vector so the caller knows
+        // to skip IPC for this rank.
+        return {};
+    }
     cudaIpcMemHandle_t handle;
     CUDA_CHECK(cudaIpcGetMemHandle(&handle, gdr_buffer));
     // Convert handle bytes to int32_t array
@@ -542,106 +701,109 @@ std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
 
 void MooncakeEpBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles) {
-    // We assume ranks are grouped by device_count (same node)
     int device_count = 0;
     CUDA_CHECK(cudaGetDeviceCount(&device_count));
 
     std::vector<int32_t> nvlink_array(num_ranks, 0);
     nvlink_array[rank] = 1;
 
-    int node_id = rank / device_count;
-    int group_start = node_id * device_count;
-    int group_end = std::min(group_start + device_count, num_ranks);
+    if (use_fabric_mem_) {
+        // MNNVL: fabric addresses are globally visible across the clique.
+        // All ranks can directly access each other's gdr_buffer without IPC
+        // handle exchange — cuMemSetAccess already granted all devices
+        // read/write access during allocation.
+        for (int i = 0; i < num_ranks; ++i) {
+            nvlink_array[i] = 1;
+            // Each rank's gdr_buffer is directly accessible; the remote
+            // addresses will be exchanged via the RDMA address sync path
+            // (sync_ib / sync_roce) or via a separate fabric address exchange.
+            // For local rank, point to our own buffer.
+            ipc_peer_ptrs_host[i] = (i == rank) ? gdr_buffer : nullptr;
+        }
+        p2p_ipc_all_enabled_ = true;
+        LOG(INFO) << "[EP] Fabric memory enabled, skipping IPC handle exchange";
+    } else {
+        // Non-MNNVL: use cudaIpc for intra-node P2P (original path)
+        int node_id = rank / device_count;
+        int group_start = node_id * device_count;
+        int group_end = std::min(group_start + device_count, num_ranks);
 
-    // Check peer access and enable it within the same node group
-    for (int dst_rank = group_start; dst_rank < group_end; ++dst_rank) {
-        if (dst_rank == rank) {
-            // Local rank - use local pointer
-            ipc_peer_ptrs_host[dst_rank] = gdr_buffer;
-            continue;
+        for (int dst_rank = group_start; dst_rank < group_end; ++dst_rank) {
+            if (dst_rank == rank) {
+                ipc_peer_ptrs_host[dst_rank] = gdr_buffer;
+                continue;
+            }
+
+            int dst_device = dst_rank % device_count;
+            int can_access_peer = 0;
+            cudaError_t err = cudaDeviceCanAccessPeer(&can_access_peer,
+                                                      device_id, dst_device);
+            if (err == cudaSuccess && can_access_peer) {
+                cudaError_t peer_err =
+                    cudaDeviceEnablePeerAccess(dst_device, 0);
+                if (peer_err == cudaSuccess ||
+                    peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                    if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                        cudaGetLastError();
+                    }
+                    nvlink_array[dst_rank] = 1;
+
+                    if (dst_rank >= static_cast<int>(remote_handles.size())) {
+                        LOG(WARNING)
+                            << "[EP] Rank " << rank
+                            << " missing IPC handle for rank " << dst_rank;
+                        continue;
+                    }
+
+                    const size_t handle_size = sizeof(cudaIpcMemHandle_t);
+                    const size_t num_int32s =
+                        (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
+                    const auto& handle_ints = remote_handles[dst_rank];
+                    if (handle_ints.size() < num_int32s) {
+                        LOG(WARNING)
+                            << "[EP] Rank " << rank
+                            << " invalid IPC handle size for rank " << dst_rank;
+                        continue;
+                    }
+
+                    cudaIpcMemHandle_t remote_handle;
+                    memcpy(&remote_handle, handle_ints.data(), handle_size);
+
+                    void* peer_ptr = nullptr;
+                    cudaError_t ipc_err =
+                        cudaIpcOpenMemHandle(&peer_ptr, remote_handle,
+                                             cudaIpcMemLazyEnablePeerAccess);
+                    if (ipc_err != cudaSuccess) {
+                        LOG(WARNING)
+                            << "[EP] Rank " << rank
+                            << " failed to open IPC handle for rank "
+                            << dst_rank << ": " << cudaGetErrorString(ipc_err);
+                        nvlink_array[dst_rank] = 0;
+                    } else {
+                        ipc_peer_ptrs_host[dst_rank] = peer_ptr;
+                    }
+                }
+            }
         }
 
-        int dst_device = dst_rank % device_count;
-        int can_access_peer = 0;
-        cudaError_t err =
-            cudaDeviceCanAccessPeer(&can_access_peer, device_id, dst_device);
-        if (err == cudaSuccess && can_access_peer) {
-            cudaError_t peer_err = cudaDeviceEnablePeerAccess(dst_device, 0);
-            if (peer_err == cudaSuccess ||
-                peer_err == cudaErrorPeerAccessAlreadyEnabled) {
-                // Clear sticky error on re-init so CUDA graph capture /
-                // dispatch later does not see
-                // cudaErrorPeerAccessAlreadyEnabled.
-                if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
-                    cudaGetLastError();
-                }
-                nvlink_array[dst_rank] = 1;
-
-                // Open IPC handle for this peer
-                if (dst_rank >= static_cast<int>(remote_handles.size())) {
-                    LOG(WARNING) << "[EP] Rank " << rank
-                                 << " missing IPC handle for rank " << dst_rank;
-                    continue;
-                }
-
-                const size_t handle_size = sizeof(cudaIpcMemHandle_t);
-                const size_t num_int32s =
-                    (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
-                const auto& handle_ints = remote_handles[dst_rank];
-                if (handle_ints.size() < num_int32s) {
-                    LOG(WARNING)
-                        << "[EP] Rank " << rank
-                        << " invalid IPC handle size for rank " << dst_rank;
-                    continue;
-                }
-
-                cudaIpcMemHandle_t remote_handle;
-                memcpy(&remote_handle, handle_ints.data(), handle_size);
-
-                void* peer_ptr = nullptr;
-                cudaError_t ipc_err = cudaIpcOpenMemHandle(
-                    &peer_ptr, remote_handle, cudaIpcMemLazyEnablePeerAccess);
-                if (ipc_err != cudaSuccess) {
-                    LOG(WARNING)
-                        << "[EP] Rank " << rank
-                        << " failed to open IPC handle for rank " << dst_rank
-                        << ": " << cudaGetErrorString(ipc_err);
-                    nvlink_array[dst_rank] = 0;
-                } else {
-                    ipc_peer_ptrs_host[dst_rank] = peer_ptr;
-                }
+        p2p_ipc_all_enabled_ = true;
+        for (int i = 0; i < num_ranks; ++i) {
+            if (nvlink_array[i] == 0 || ipc_peer_ptrs_host[i] == nullptr) {
+                p2p_ipc_all_enabled_ = false;
+                break;
+            }
+        }
+        if (p2p_ipc_all_enabled_ && num_ranks > 1) {
+            int first_node_id = 0 / device_count;
+            int last_node_id = (num_ranks - 1) / device_count;
+            if (first_node_id != last_node_id) {
+                p2p_ipc_all_enabled_ = false;
             }
         }
     }
 
-    // Check if P2P+IPC is available for ALL rank pairs.
-    // For P2P+IPC to be fully usable without IBGDA, every rank must be able to
-    // access every other rank via P2P+IPC. Since we only check within the same
-    // node group, all ranks must be in the same node group.
-    p2p_ipc_all_enabled_ = true;
-    for (int i = 0; i < num_ranks; ++i) {
-        // Must have P2P enabled and a valid peer pointer for every rank.
-        // Note: for local rank we set ipc_peer_ptrs_host[rank] = gdr_buffer.
-        if (nvlink_array[i] == 0 || ipc_peer_ptrs_host[i] == nullptr) {
-            p2p_ipc_all_enabled_ = false;
-            break;
-        }
-    }
-    // Verify all ranks are in the same node group (cross-node requires IBGDA)
-    if (p2p_ipc_all_enabled_ && num_ranks > 1) {
-        int first_node_id = 0 / device_count;
-        int last_node_id = (num_ranks - 1) / device_count;
-        if (first_node_id != last_node_id) {
-            // Ranks span multiple nodes, P2P only works within nodes
-            p2p_ipc_all_enabled_ = false;
-        }
-    }
-
-    // Copy NVLink availability to device memory
     CUDA_CHECK(cudaMemcpy(nvlink_available, nvlink_array.data(),
                           num_ranks * sizeof(int32_t), cudaMemcpyHostToDevice));
-
-    // Copy IPC pointers to device memory for kernel access
     CUDA_CHECK(cudaMemcpy(ipc_peer_ptrs, ipc_peer_ptrs_host,
                           num_ranks * sizeof(void*), cudaMemcpyHostToDevice));
 }

@@ -253,16 +253,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
-        if (force_mnnvl || local_topology_->getHcaList().empty()) {
-            Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
-            if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
-                return -1;
-            }
-            LOG(INFO) << "Using cross-node NVLink transport "
-                      << "(MC_FORCE_MNNVL or no HCA detected)";
-        } else if (intra_env) {
+        // Explicit env var overrides take priority over HCA auto-detection
+        if (intra_env) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
@@ -271,6 +263,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
+        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+            Transport* t =
+                multi_transports_->installTransport("nvlink", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install NVLink transport";
+                return -1;
+            }
+            LOG(INFO) << "Using cross-node NVLink transport "
+                      << "(MC_FORCE_MNNVL or no HCA detected)";
         } else {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);

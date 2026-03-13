@@ -1,53 +1,15 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
 #include "real_client.h"
+#include "shm_helper.h"
 #include <memory>
 
 namespace mooncake {
-
-class ShmHelper {
-   public:
-    struct ShmSegment {
-        int fd = -1;
-        void *base_addr = nullptr;
-        size_t size = 0;
-        std::string name;
-        bool registered = false;
-        bool is_local = false;
-    };
-
-    static ShmHelper *getInstance();
-
-    void *allocate(size_t size);
-    int free(void *addr);
-
-    bool cleanup();
-
-    // Get the shm that contains the given address
-    // Returns a shared_ptr to ensure the segment remains valid
-    std::shared_ptr<ShmSegment> get_shm(void *addr);
-
-    const std::vector<std::shared_ptr<ShmSegment>> &get_shms() const {
-        return shms_;
-    }
-
-    bool is_hugepage() const { return use_hugepage_; }
-
-    ShmHelper(const ShmHelper &) = delete;
-    ShmHelper &operator=(const ShmHelper &) = delete;
-
-   private:
-    ShmHelper();
-    ~ShmHelper();
-
-    std::vector<std::shared_ptr<ShmSegment>> shms_;
-    static std::mutex shm_mutex_;
-    bool use_hugepage_ = false;
-};
 
 class DummyClient : public PyClient {
    public:
@@ -119,8 +81,6 @@ class DummyClient : public PyClient {
 
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
-    std::tuple<uint64_t, size_t> get_buffer_info(const std::string &key);
-
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
@@ -133,6 +93,14 @@ class DummyClient : public PyClient {
                   const ReplicateConfig &config = ReplicateConfig{});
 
     [[nodiscard]] std::string get_hostname() const;
+
+    // Check if a pointer falls within the hot cache shm region
+    bool is_hot_cache_ptr(const void *ptr) const {
+        if (!hot_cache_base_) return false;
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        auto base = reinterpret_cast<uintptr_t>(hot_cache_base_);
+        return p >= base && p < base + hot_cache_size_;
+    }
 
     int remove(const std::string &key, bool force = false);
 
@@ -151,6 +119,8 @@ class DummyClient : public PyClient {
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
     int tearDownAll();
+
+    int health_check() override;
 
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
@@ -234,11 +204,19 @@ class DummyClient : public PyClient {
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
 
+    // Hot cache shm mapping (obtained from real client via IPC)
+    void *hot_cache_base_ = nullptr;
+    size_t hot_cache_size_ = 0;
+    int hot_cache_fd_ = -1;
+
+    int request_hot_cache_fd();
+
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
-    volatile bool connected_ = false;
+    std::atomic<bool> connected_{false};
 };
 
 }  // namespace mooncake

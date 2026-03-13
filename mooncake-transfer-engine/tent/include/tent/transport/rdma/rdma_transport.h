@@ -87,6 +87,8 @@ class RdmaTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc& desc);
 
+    bool warmupMemory(void* addr, size_t length) override;
+
     virtual const char* getName() const { return "rdma"; }
 
     virtual bool supportNotification() const override { return true; }
