@@ -15,17 +15,10 @@
 #ifndef TCP_TRANSPORT_H_
 #define TCP_TRANSPORT_H_
 
-#include <atomic>
 #include <functional>
-#include <memory>
-#include <mutex>
+#include <iostream>
+#include <queue>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
-#include <asio/io_context.hpp>
-#include <asio/ip/tcp.hpp>
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
@@ -84,45 +77,16 @@ class TcpTransport : public Transport {
     virtual Status receiveNotification(std::vector<Notification> &notify_list);
 
    private:
-    // Initiate an async transfer for one task via raw TCP socket.
     void startTransfer(TcpTask *task);
 
-    // Resolve the remote segment to get the TCP data endpoint (host:dataport).
-    Status findRemoteDataEndpoint(uint64_t dest_addr, uint64_t length,
-                                  uint64_t target_id, std::string &host,
-                                  uint16_t &data_port);
-
-    // Server-side: start accepting incoming data connections.
-    void doAccept();
-
-    // Find an available TCP port and bind the acceptor.
-    Status startDataServer();
-
-    // Connection pool: acquire/release reusable TCP connections.
-    asio::ip::tcp::socket acquireConnection(const std::string &host,
-                                            uint16_t port);
-    void releaseConnection(const std::string &key,
-                           asio::ip::tcp::socket socket);
+    Status findRemoteSegment(uint64_t dest_addr, uint64_t length,
+                             uint64_t target_id, std::string &rpc_server_addr);
 
    private:
-    bool installed_ = false;
+    bool installed_;
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
-
-    // ASIO data plane
-    std::unique_ptr<asio::io_context> io_context_;
-    std::unique_ptr<asio::executor_work_guard<asio::io_context::executor_type>>
-        work_guard_;
-    std::unique_ptr<asio::ip::tcp::acceptor> acceptor_;
-    std::thread worker_thread_;
-    std::atomic<bool> running_{false};
-    uint16_t data_port_ = 0;
-
-    // Connection pool for reusing TCP connections to remote endpoints.
-    std::mutex pool_mutex_;
-    std::unordered_map<std::string, std::vector<asio::ip::tcp::socket>>
-        conn_pool_;
 
     RWSpinlock notify_lock_;
     std::vector<Notification> notify_list_;

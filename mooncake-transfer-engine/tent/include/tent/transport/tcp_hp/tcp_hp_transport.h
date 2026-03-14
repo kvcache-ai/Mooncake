@@ -40,6 +40,22 @@ struct TcpHpTask {
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::INITIAL};
     std::atomic<size_t> transferred_bytes{0};
     uint64_t target_addr = 0;
+
+    TcpHpTask() = default;
+    TcpHpTask(TcpHpTask&& other) noexcept
+        : request(std::move(other.request)),
+          status_word(other.status_word.load(std::memory_order_relaxed)),
+          transferred_bytes(other.transferred_bytes.load(std::memory_order_relaxed)),
+          target_addr(other.target_addr) {}
+    TcpHpTask& operator=(TcpHpTask&& other) noexcept {
+        request = std::move(other.request);
+        status_word.store(other.status_word.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        transferred_bytes.store(other.transferred_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        target_addr = other.target_addr;
+        return *this;
+    }
+    TcpHpTask(const TcpHpTask&) = delete;
+    TcpHpTask& operator=(const TcpHpTask&) = delete;
 };
 
 struct TcpHpSubBatch : public Transport::SubBatch {
