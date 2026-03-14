@@ -68,8 +68,12 @@ class ConnectionContext {
 
     PeerConnection peerStates_[kMaxNumRanks];
 
+    // On MNNVL, warmup is skipped because CPU heap buffers aren't
+    // fabric-accessible for cross-node NVLink writes.
+    bool skip_warmup_;
+
     // warmup_send_region_ and warmup_recv_region_ are managed by
-    // ConnectionContext.
+    // ConnectionContext. nullptr when skip_warmup_ is true.
     int32_t* warmup_send_region_;
     int32_t* warmup_recv_region_;
 
