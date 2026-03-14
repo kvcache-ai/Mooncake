@@ -50,9 +50,10 @@ std::shared_ptr<Config> loadConfig() {
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},        {"tcp", "tcp"},    {"shm", "shm"},
-            {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},          {"mnnvl", "mnnvl"}};
+            {"rdma", "rdma"}, {"tcp", "tcp"},          {"tcp_hp", "tcp_hp"},
+            {"shm", "shm"},   {"iouring", "io_uring"},  // Note: iouring ->
+                                                        // io_uring
+            {"gds", "gds"},   {"mnnvl", "mnnvl"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -75,6 +76,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "gds") return GDS;
     if (xport_type == "mnnvl") return MNNVL;
     if (xport_type == "tcp") return TCP;
+    if (xport_type == "tcp_hp") return TCP_HP;
     if (xport_type == "iouring") return IOURING;
     return UNSPEC;
 }
@@ -212,7 +214,8 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+        ;
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #else

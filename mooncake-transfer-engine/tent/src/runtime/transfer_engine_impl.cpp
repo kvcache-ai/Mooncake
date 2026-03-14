@@ -463,6 +463,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[TCP_HP]) result.push_back(TCP_HP);
     if (transport_list_[GDS]) result.push_back(GDS);
     return result;
 }

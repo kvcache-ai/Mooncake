@@ -15,7 +15,10 @@
 #include "utils.h"
 
 #include <gflags/gflags.h>
+#include <algorithm>
+#include <cctype>
 #include <iostream>
+#include <sstream>
 
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
@@ -44,8 +47,9 @@ DEFINE_string(metadata_url_list, "",
 DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
-DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
-DEFINE_string(backend, "tent", "Transport backend: classic|tent");
+DEFINE_string(xport_type, "",
+              "Transport type: tcp|tcp_hp|rdma|shm|mnnvl|gds|iouring|io_uring");
+DEFINE_string(backend, "tent", "Transport backend: te|classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
 
@@ -76,6 +80,12 @@ bool XferBenchConfig::notifi = false;
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
 
+static std::string normalizeFlagValue(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    return value;
+}
+
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
     seg_name = FLAGS_seg_name;
@@ -96,13 +106,49 @@ void XferBenchConfig::loadFromFlags() {
     metadata_url_list = FLAGS_metadata_url_list;
     rpc_server_port = FLAGS_rpc_server_port;
 
-    xport_type = FLAGS_xport_type;
-    backend = FLAGS_backend;
+    xport_type = normalizeFlagValue(FLAGS_xport_type);
+    if (xport_type == "io_uring") xport_type = "iouring";
+
+    backend = normalizeFlagValue(FLAGS_backend);
+    if (backend == "te") backend = "classic";
+    if (backend.empty()) backend = "tent";
+
+    if (backend != "classic" && backend != "tent") {
+        LOG(ERROR) << "Invalid --backend=" << FLAGS_backend
+                   << ", only support te|classic|tent";
+        exit(EXIT_FAILURE);
+    }
+
+    static const std::vector<std::string> kSupportedXports = {
+        "", "tcp", "tcp_hp", "rdma", "shm", "mnnvl", "gds", "iouring"};
+    if (std::find(kSupportedXports.begin(), kSupportedXports.end(),
+                  xport_type) == kSupportedXports.end()) {
+        std::ostringstream oss;
+        for (size_t i = 1; i < kSupportedXports.size(); ++i) {
+            if (i > 1) oss << "|";
+            oss << kSupportedXports[i];
+        }
+        LOG(ERROR) << "Invalid --xport_type=" << FLAGS_xport_type
+                   << ", only support " << oss.str();
+        exit(EXIT_FAILURE);
+    }
+
+    if (backend == "classic" && xport_type == "tcp_hp") {
+        LOG(ERROR)
+            << "classic/TE backend does not support --xport_type=tcp_hp; "
+            << "please use --backend=tent for tcp_hp benchmark";
+        exit(EXIT_FAILURE);
+    }
+
     notifi = FLAGS_notifi;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
 }
+
+bool XferBenchConfig::useClassicBackend() { return backend == "classic"; }
+
+bool XferBenchConfig::useTentBackend() { return backend == "tent"; }
 
 double XferMetricStats::percentile(double p) {
     if (samples.empty()) return 0.0;
