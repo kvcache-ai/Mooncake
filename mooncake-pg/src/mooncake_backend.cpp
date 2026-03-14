@@ -182,8 +182,8 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, store, meta_,
-        p2p_proxy_, engine_);
+        backendIndex_, rank, size, local2global_rank_map_, location, store,
+        meta_, p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
