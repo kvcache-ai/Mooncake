@@ -46,7 +46,8 @@ set(MOONCAKE_STORE_SOURCES
     oplog_applier.cpp
     hot_standby_service.cpp
     standby_state_machine.cpp
-    ha_metric_manager.cpp)
+    ha_metric_manager.cpp
+    store_c.cpp)
 
 set(EXTRA_LIBS "")
 
