@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <shared_mutex>
+#include <thread>
 #include <regex>
 #include <unordered_set>
 #include <unistd.h>
@@ -1496,40 +1497,72 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 }
 
 long MasterService::RemoveAll(bool force) {
+    // When force=true (e.g. flush_cache), retry a few times to let in-flight
+    // writes finish.  Without this, concurrent put operations cause RemoveAll
+    // to silently skip objects, leaving the cache partially flushed.
+    constexpr int kMaxDrainRetries = 5;
+    constexpr auto kDrainInterval = std::chrono::milliseconds(100);
+
     long removed_count = 0;
     uint64_t total_freed_size = 0;
-    // Store the current time to avoid repeatedly
-    // calling std::chrono::steady_clock::now()
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto now = std::chrono::system_clock::now();
 
-    for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, i);
-        if (shard->metadata.empty()) {
-            continue;
-        }
+    for (int attempt = 0; ; ++attempt) {
+        long pass_removed = 0;
+        long pass_skipped = 0;
 
-        // Only remove completed objects with expired leases (unless force=true)
-        auto it = shard->metadata.begin();
-        while (it != shard->metadata.end()) {
-            /**
-             * The reason the force operation here does not bypass the replica
-             * check is that put operations (which could also be copy or move)
-             * and remove operations might be happening concurrently, making it
-             * extremely dangerous to perform a direct removal at this point.
-             */
-            if ((force || it->second.IsLeaseExpired(now)) &&
-                it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !shard->replication_tasks.contains(it->first)) {
-                auto mem_rep_count =
-                    it->second.CountReplicas(&Replica::fn_is_memory_replica);
-                total_freed_size += it->second.size * mem_rep_count;
-                it = shard->metadata.erase(it);
-                removed_count++;
-            } else {
-                ++it;
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        auto now = std::chrono::system_clock::now();
+
+        for (size_t i = 0; i < kNumShards; i++) {
+            MetadataShardAccessorRW shard(this, i);
+            if (shard->metadata.empty()) {
+                continue;
+            }
+
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end()) {
+                /**
+                 * The reason the force operation here does not bypass the
+                 * replica check is that put operations (which could also be
+                 * copy or move) and remove operations might be happening
+                 * concurrently, making it extremely dangerous to perform a
+                 * direct removal at this point.
+                 */
+                if ((force || it->second.IsLeaseExpired(now)) &&
+                    it->second.AllReplicas(&Replica::fn_is_completed) &&
+                    !shard->replication_tasks.contains(it->first)) {
+                    auto mem_rep_count =
+                        it->second.CountReplicas(&Replica::fn_is_memory_replica);
+                    total_freed_size += it->second.size * mem_rep_count;
+                    it = shard->metadata.erase(it);
+                    pass_removed++;
+                } else {
+                    pass_skipped++;
+                    ++it;
+                }
             }
         }
+
+        // Release the lock before sleeping
+        shared_lock.unlock();
+        removed_count += pass_removed;
+
+        // If nothing was skipped, or we've exhausted retries, we're done.
+        if (pass_skipped == 0 || !force || attempt >= kMaxDrainRetries) {
+            if (pass_skipped > 0) {
+                LOG(WARNING) << "action=remove_all_objects"
+                             << ", skipped=" << pass_skipped
+                             << " objects with in-flight replicas after "
+                             << (attempt + 1) << " attempts";
+            }
+            break;
+        }
+
+        VLOG(1) << "action=remove_all_drain"
+                << ", attempt=" << (attempt + 1)
+                << ", skipped=" << pass_skipped
+                << ", waiting " << kDrainInterval.count() << "ms";
+        std::this_thread::sleep_for(kDrainInterval);
     }
 
     VLOG(1) << "action=remove_all_objects"
