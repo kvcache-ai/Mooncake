@@ -1,6 +1,7 @@
 #include <c10/util/Exception.h>
 #include <connection_poller.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_alike.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <atomic>
@@ -27,15 +28,20 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
       meta_(std::move(meta)),
       p2p_proxy_(std::move(p2p_proxy)),
       engine_(engine) {
+    int deviceId_;
+    cudaError err = cudaGetDevice(&deviceId_);
+    TORCH_CHECK(!err, c10::str("Failed to get device id"));
+    std::string location = GPU_PREFIX + std::to_string(deviceId_);
+
     warmup_send_region_ = new int32_t[kMaxNumRanks];
     warmup_send_region_[0] = 1;
     int rc = engine_->registerLocalMemory(
-        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), location);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_->registerLocalMemory(
-        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+    rc = engine_->registerLocalMemory(warmup_recv_region_,
+                                      kMaxNumRanks * sizeof(int32_t), location);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 }
 
