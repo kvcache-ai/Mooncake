@@ -74,9 +74,17 @@ MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
     : Backend(rank, size), isCpu_(isCpu) {
     // Get device data
-    int deviceId_;
-    cudaError err = cudaGetDevice(&deviceId_);
-    TORCH_CHECK(!err, c10::str("Failed to get device id"));
+    std::string location;
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    if (err != cudaSuccess || deviceCount == 0) {
+        location = kWildcardLocation;
+    } else {
+        int deviceId_;
+        err = cudaGetDevice(&deviceId_);
+        TORCH_CHECK(!err, c10::str("Failed to get device id"));
+        location = GPU_PREFIX + std::to_string(deviceId_);
+    }
 
     // Initialize transfer engine
     if (!engineInitialized_) {
@@ -98,7 +106,6 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Register buffers
-    std::string location = GPU_PREFIX + std::to_string(deviceId_);
     if (isCpu) {
         for (size_t i = 0; i < 2; i++) {
             send_buffer_[i] = malloc(kBufferSize);

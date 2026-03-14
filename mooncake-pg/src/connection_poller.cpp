@@ -16,6 +16,7 @@
 namespace mooncake {
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      uint64_t* local2global_rank_map,
+                                     std::string location,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
                                      std::shared_ptr<P2PProxy> p2p_proxy,
@@ -28,11 +29,6 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
       meta_(std::move(meta)),
       p2p_proxy_(std::move(p2p_proxy)),
       engine_(engine) {
-    int deviceId_;
-    cudaError err = cudaGetDevice(&deviceId_);
-    TORCH_CHECK(!err, c10::str("Failed to get device id"));
-    std::string location = GPU_PREFIX + std::to_string(deviceId_);
-
     warmup_send_region_ = new int32_t[kMaxNumRanks];
     warmup_send_region_[0] = 1;
     int rc = engine_->registerLocalMemory(
