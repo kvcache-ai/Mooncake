@@ -104,17 +104,16 @@ auto P2PClientMeta::CollectWriteRouteCandidates(
 
         const auto& p2p_extra = seg.GetP2PExtra();
 
-        // exclude segments that contain all tags in tag_filters
-        bool hit_fillter_tag = false;
+        // exclude segments that contain any tags in tag_filters
+        bool hit_filter_tag = false;
         for (const auto& tag : req.config.tag_filters) {
-            if (std::find(p2p_extra.tags.begin(), p2p_extra.tags.end(), tag) ==
+            if (std::find(p2p_extra.tags.begin(), p2p_extra.tags.end(), tag) !=
                 p2p_extra.tags.end()) {
-                hit_fillter_tag = true;
+                hit_filter_tag = true;
                 break;
             }
         }
-        if (hit_fillter_tag)
-            return false;  // hit excluding tag, candidaes are not enough
+        if (hit_filter_tag) return false;  // hit excluding tag, skip segment
 
         if (p2p_extra.priority < req.config.priority_limit)
             return false;  // priority does not enough, candidaes are not enough

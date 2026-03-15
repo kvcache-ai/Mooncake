@@ -89,7 +89,7 @@ class P2PMasterServiceTest : public ::testing::Test {
 
 TEST_F(P2PMasterServiceTest, RegisterClientBasic) {
     auto service = CreateService();
-    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"gpu"}, 5);
+    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"memory"}, 5);
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
@@ -157,22 +157,23 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteNoCapacity) {
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteTagFilter) {
     auto service = CreateService();
-    auto seg_gpu =
-        MakeP2PSegment("seg_gpu", kDefaultSegmentSize, {"gpu", "fast"}, 1);
-    auto seg_cpu = MakeP2PSegment("seg_cpu", kDefaultSegmentSize, {"cpu"}, 1);
+    auto seg_memory = MakeP2PSegment("seg_memory", kDefaultSegmentSize,
+                                     {"memory", "fast"}, 1);
+    auto seg_disk =
+        MakeP2PSegment("seg_disk", kDefaultSegmentSize, {"disk"}, 1);
 
     auto client1 = generate_uuid();
     auto client2 = generate_uuid();
-    RegisterP2PClient(*service, client1, {seg_gpu}, "10.0.0.1", 50051);
-    RegisterP2PClient(*service, client2, {seg_cpu}, "10.0.0.2", 50052);
+    RegisterP2PClient(*service, client1, {seg_memory}, "10.0.0.1", 50051);
+    RegisterP2PClient(*service, client2, {seg_disk}, "10.0.0.2", 50052);
 
-    // Request with tag filter "gpu" — only seg_gpu matches
+    // Request with tag filter "disk" — only seg_memory remains
     WriteRouteRequest req;
     req.key = "test_key";
     req.client_id = generate_uuid();
     req.size = 1024;
     req.config.max_candidates = 10;
-    req.config.tag_filters = {"gpu"};
+    req.config.tag_filters = {"disk"};
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value());
@@ -256,10 +257,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteEarlyReturn) {
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteMultipleSegments) {
     auto service = CreateService();
-    auto seg1 = MakeP2PSegment("seg1", kDefaultSegmentSize, {"gpu"}, 5);
-    auto seg2 = MakeP2PSegment("seg2", kDefaultSegmentSize, {"cpu"}, 3);
-    auto seg3 = MakeP2PSegment("seg3", kDefaultSegmentSize, {"gpu"}, 5);
-    auto seg4 = MakeP2PSegment("seg4", kDefaultSegmentSize, {"cpu"}, 3);
+    auto seg1 = MakeP2PSegment("seg1", kDefaultSegmentSize, {"memory"}, 5);
+    auto seg2 = MakeP2PSegment("seg2", kDefaultSegmentSize, {"disk"}, 3);
+    auto seg3 = MakeP2PSegment("seg3", kDefaultSegmentSize, {"memory"}, 5);
+    auto seg4 = MakeP2PSegment("seg4", kDefaultSegmentSize, {"disk"}, 3);
     auto client_id = generate_uuid();
     auto client_id2 = generate_uuid();
     auto client_id3 = generate_uuid();
@@ -499,8 +500,8 @@ TEST_F(P2PMasterServiceTest, GetReplicaListNotFound) {
 TEST_F(P2PMasterServiceTest, FilterReplicasWithTagAndPriority) {
     auto service = CreateService();
     auto seg_a =
-        MakeP2PSegment("seg_a", kDefaultSegmentSize, {"gpu", "fast"}, 10);
-    auto seg_b = MakeP2PSegment("seg_b", kDefaultSegmentSize, {"cpu"}, 2);
+        MakeP2PSegment("seg_a", kDefaultSegmentSize, {"memory", "fast"}, 10);
+    auto seg_b = MakeP2PSegment("seg_b", kDefaultSegmentSize, {"disk"}, 2);
     auto client1 = generate_uuid();
     auto client2 = generate_uuid();
     RegisterP2PClient(*service, client1, {seg_a}, "10.0.0.1", 50051);
@@ -509,12 +510,11 @@ TEST_F(P2PMasterServiceTest, FilterReplicasWithTagAndPriority) {
     AddReplicaHelper(*service, "key1", 1024, client1, seg_a.id);
     AddReplicaHelper(*service, "key1", 1024, client2, seg_b.id);
 
-    // Filter out replicas with tag "gpu" — seg_a is excluded, only seg_b
-    // remains
+    // Filter out replicas with tag "memory" — only seg_b remains
     GetReplicaListRequestConfig config;
     config.max_candidates = 10;
     config.p2p_config = P2PGetReplicaListConfigExtra{
-        .tag_filters = {"gpu"},
+        .tag_filters = {"memory"},
         .priority_limit = 0,
     };
 
@@ -637,7 +637,7 @@ TEST_F(P2PMasterServiceTest, MountUnmountSegment) {
 
 TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     auto service = CreateService();
-    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"gpu"}, 5,
+    auto seg = MakeP2PSegment("seg1", kDefaultSegmentSize, {"memory"}, 5,
                               MemoryType::DRAM);
     auto writer_id = generate_uuid();
     auto reader_id = generate_uuid();
