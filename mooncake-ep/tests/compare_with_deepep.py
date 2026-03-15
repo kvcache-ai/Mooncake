@@ -6,6 +6,7 @@ import faulthandler
 
 from deep_ep.buffer import Buffer as DeepEPBuffer
 from mooncake.mooncake_ep_buffer import Buffer as MooncakeBuffer
+import mooncake.pg as pg
 
 
 def check_close(
@@ -291,10 +292,12 @@ def worker(rank: int, num_ranks: int):
     total_configs = len(combinations)
 
     # Device filter
-    device_filter = ["mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4"]
+    device_filter = [
+        f
+        for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
+        if f
+    ]
     if device_filter:
-        import mooncake.pg as pg
-
         pg.set_device_filter(device_filter)
 
     # Print message
