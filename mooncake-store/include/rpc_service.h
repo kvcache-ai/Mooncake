@@ -77,6 +77,30 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
 
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config);
+
+    tl::expected<void, ErrorCode> UpsertEnd(const UUID& client_id,
+                                            const std::string& key,
+                                            ReplicaType replica_type);
+
+    tl::expected<void, ErrorCode> UpsertRevoke(const UUID& client_id,
+                                               const std::string& key,
+                                               ReplicaType replica_type);
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
     tl::expected<void, ErrorCode> Remove(const std::string& key,
                                          bool force = false);
 

@@ -1086,6 +1086,98 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
+                                             std::vector<Slice>& slices,
+                                             const ReplicateConfig& config) {
+    // Prepare slice lengths
+    std::vector<size_t> slice_lengths;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        slice_lengths.emplace_back(slices[i].size);
+    }
+
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
+    // Start upsert operation
+    auto start_result =
+        master_client_.UpsertStart(key, slice_lengths, client_cfg);
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+            LOG(WARNING) << "Failed to start upsert operation for key=" << key
+                         << PUT_NO_SPACE_HELPER_STR;
+        } else {
+            LOG(ERROR) << "Failed to start upsert operation for key=" << key
+                       << ": " << toString(err);
+        }
+        return tl::unexpected(err);
+    }
+
+    // Record transfer latency
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Handle disk replicas first
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if (replica.is_disk_replica()) {
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(key, slices, disk_descriptor);
+                break;
+            }
+        }
+    }
+
+    // Transfer to memory replicas
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica()) {
+            ErrorCode transfer_err = TransferWrite(replica, slices);
+            if (transfer_err != ErrorCode::OK) {
+                auto revoke_result =
+                    master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
+                if (!revoke_result) {
+                    LOG(ERROR) << "Failed to revoke upsert operation";
+                    return tl::unexpected(revoke_result.error());
+                }
+                return tl::unexpected(transfer_err);
+            }
+        }
+    }
+
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us);
+    }
+
+    // End upsert operation
+    auto end_result = master_client_.UpsertEnd(key, ReplicaType::MEMORY);
+    if (!end_result) {
+        ErrorCode err = end_result.error();
+        LOG(ERROR) << "Failed to end upsert operation: " << err;
+        return tl::unexpected(err);
+    }
+
+    return {};
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
+    // Simple implementation: loop over keys calling Upsert individually
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results.emplace_back(Upsert(keys[i], batched_slices[i], config));
+    }
+    return results;
+}
+
 // TODO: `client.cpp` is too long, consider split it into multiple files
 enum class PutOperationState {
     PENDING,

@@ -891,6 +891,110 @@ class MooncakeStorePyWrapper {
         return batch_put_tensor_from(shard_keys, buffer_ptrs, sizes);
     }
 
+    // --- Upsert tensor methods ---
+
+    int upsert_tensor_impl(const std::string &key, pybind11::object tensor,
+                           const ReplicateConfig &config) {
+        auto info = extract_tensor_info(tensor, key);
+        if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+
+        std::vector<std::span<const char>> values;
+        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
+                            sizeof(TensorMetadata));
+        values.emplace_back(reinterpret_cast<const char *>(info.data_ptr),
+                            info.tensor_size);
+
+        py::gil_scoped_release release_gil;
+        int ret = store_->upsert_parts(key, values, config);
+        if (ret != 0)
+            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
+                       << ret;
+        return ret;
+    }
+
+    int upsert_tensor(const std::string &key, pybind11::object tensor) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        return upsert_tensor_impl(key, tensor, ReplicateConfig{});
+    }
+
+    int upsert_tensor_from(const std::string &key, uintptr_t buffer_ptr,
+                           size_t size) {
+        if (buffer_ptr == 0) {
+            LOG(ERROR) << "Buffer pointer cannot be null";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        void *buffer = reinterpret_cast<void *>(buffer_ptr);
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR)
+                << "upsert_tensor_from is not supported for dummy client";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (size <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Buffer size too small for tensor metadata";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        py::gil_scoped_release release_gil;
+        return store_->upsert_from(key, buffer, size, ReplicateConfig{});
+    }
+
+    std::vector<int> batch_upsert_tensor_from(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR)
+                << "batch_upsert_tensor_from is not supported for dummy client";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (keys.empty()) {
+            return std::vector<int>();
+        }
+        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
+                          "have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (buffer_ptrs[i] == 0) {
+                LOG(ERROR) << "Buffer pointer at index " << i
+                           << " cannot be null";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            if (sizes[i] <= sizeof(TensorMetadata)) {
+                LOG(ERROR) << "Buffer size at index " << i
+                           << " too small for tensor metadata";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+        }
+        std::vector<void *> buffers;
+        buffers.reserve(buffer_ptrs.size());
+        for (uintptr_t ptr : buffer_ptrs) {
+            buffers.push_back(reinterpret_cast<void *>(ptr));
+        }
+        py::gil_scoped_release release_gil;
+        return store_->batch_upsert_from(keys, buffers, sizes,
+                                         ReplicateConfig{});
+    }
+
+    // --- End Upsert tensor methods ---
+
     int validate_replicate_config(
         const ReplicateConfig &config = ReplicateConfig{}) {
         if (!config.preferred_segments.empty() &&
@@ -1544,6 +1648,73 @@ PYBIND11_MODULE(store, m) {
              py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
              "Put a batch of tensor shards directly from pre-allocated "
              "buffers for a given Tensor Parallel rank.")
+        .def("upsert_tensor", &MooncakeStorePyWrapper::upsert_tensor,
+             py::arg("key"), py::arg("tensor"),
+             "Upsert a PyTorch tensor into the store (insert or update)")
+        .def("upsert_tensor_from",
+             &MooncakeStorePyWrapper::upsert_tensor_from, py::arg("key"),
+             py::arg("buffer_ptr"), py::arg("size"),
+             "Upsert a tensor directly from a pre-allocated buffer. Buffer "
+             "layout must be [TensorMetadata][tensor data].")
+        .def("batch_upsert_tensor_from",
+             &MooncakeStorePyWrapper::batch_upsert_tensor_from,
+             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             "Upsert tensors directly from pre-allocated buffers for "
+             "multiple keys. Each buffer layout: [TensorMetadata][tensor "
+             "data].")
+        .def(
+            "upsert_from",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                if (self.use_dummy_client_) {
+                    LOG(ERROR)
+                        << "upsert_from is not supported for dummy client now";
+                    return -1;
+                }
+                return self.store_->upsert_from(key, buffer, size, config);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("config") = ReplicateConfig{},
+            "Upsert object data directly from a pre-allocated buffer")
+        .def(
+            "batch_upsert_from",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_upsert_from(keys, buffers, sizes,
+                                                      config);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Upsert object data directly from pre-allocated buffers for "
+            "multiple keys")
+        .def(
+            "upsert",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               py::buffer buf,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                py::buffer_info info = buf.request(/*writable=*/false);
+                py::gil_scoped_release release;
+                return self.store_->upsert(
+                    key,
+                    std::span<const char>(static_cast<char *>(info.ptr),
+                                          static_cast<size_t>(info.size)),
+                    config);
+            },
+            py::arg("key"), py::arg("value"),
+            py::arg("config") = ReplicateConfig{},
+            "Upsert raw bytes into the store (insert or update)")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
