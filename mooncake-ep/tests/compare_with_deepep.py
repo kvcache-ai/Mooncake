@@ -2,17 +2,10 @@ import os
 import itertools
 import torch
 import torch.distributed as dist
+import faulthandler
 
 from deep_ep.buffer import Buffer as DeepEPBuffer
 from mooncake.mooncake_ep_buffer import Buffer as MooncakeBuffer
-
-import faulthandler
-
-faulthandler.enable()
-
-
-class OutputMismatchError(Exception):
-    pass
 
 
 def check_close(
@@ -413,5 +406,6 @@ def worker(rank: int, num_ranks: int):
 
 
 if __name__ == "__main__":
+    faulthandler.enable()
     num_processes = int(os.environ.get("NUM_PROCESSES", torch.cuda.device_count()))
     torch.multiprocessing.spawn(worker, args=(num_processes,), nprocs=num_processes)
