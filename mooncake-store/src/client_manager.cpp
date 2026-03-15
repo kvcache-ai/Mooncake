@@ -10,19 +10,31 @@ ClientManager::ClientManager(const int64_t disconnect_timeout_sec,
     ClientMeta::SetTimeouts(disconnect_timeout_sec, crash_timeout_sec);
 }
 
-void ClientManager::Start() {
+void ClientManager::Start() { StartClientMonitor(); }
+
+void ClientManager::StartClientMonitor() {
+    if (client_monitor_running_) return;
     client_monitor_running_ = true;
-    client_monitor_thread_ =
-        std::thread(&ClientManager::ClientMonitorFunc, this);
+    client_monitor_thread_ = std::thread([this]() {
+        while (client_monitor_running_) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kClientMonitorSleepMs));
+            if (client_monitor_running_) ClientMonitorFunc();
+        }
+    });
     VLOG(1) << "action=start_client_monitor_thread";
 }
 
-ClientManager::~ClientManager() {
+void ClientManager::Stop() { StopClientMonitor(); }
+
+void ClientManager::StopClientMonitor() {
     client_monitor_running_ = false;
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
     }
 }
+
+ClientManager::~ClientManager() { Stop(); }
 
 auto ClientManager::GetClient(const UUID& client_id)
     -> std::shared_ptr<ClientMeta> {
@@ -273,61 +285,54 @@ auto ClientManager::QueryClientStatus(const QueryClientStatusRequest& req)
     return response;
 }
 
-// Monitor Strategy:
 // 1. Phase 1 (Shared Lock): Check health status
 // 2. Phase 2 (No Lock): Execute crashed client hooks
 // 3. Phase 3 (Write Lock): Clean up crashed clients
 void ClientManager::ClientMonitorFunc() {
-    while (client_monitor_running_) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
+    // Attention:
+    // 1. DISCONNECTED is not finnal status. The clients in
+    // newly_disconnected might change its status.
+    // 2. CRASHED is finnal status. The clients in newly_crashed will always
+    // be crashed.
+    std::vector<std::shared_ptr<ClientMeta>> newly_disconnected;
+    std::vector<std::shared_ptr<ClientMeta>> newly_crashed;
 
-        // Attention:
-        // 1. DISCONNECTED is not finnal status. The clients in
-        // newly_disconnected might change its status.
-        // 2. CRASHED is finnal status. The clients in newly_crashed will always
-        // be crashed.
-        std::vector<std::shared_ptr<ClientMeta>> newly_disconnected;
-        std::vector<std::shared_ptr<ClientMeta>> newly_crashed;
-
-        // Phase 1: Check health status
-        {
-            SharedMutexLocker lock(&clients_mutex_, shared_lock);
-            for (auto& [client_id, meta] : client_metas_) {
-                auto [old_status, new_status] = meta->CheckHealth();
-                if (old_status != new_status) {
-                    if (new_status == ClientStatus::DISCONNECTION) {
-                        newly_disconnected.push_back(meta);
-                    } else if (new_status == ClientStatus::CRASHED) {
-                        newly_crashed.push_back(meta);
-                    }
+    // Phase 1: Check health status
+    {
+        SharedMutexLocker lock(&clients_mutex_, shared_lock);
+        for (auto& [client_id, meta] : client_metas_) {
+            auto [old_status, new_status] = meta->CheckHealth();
+            if (old_status != new_status) {
+                if (new_status == ClientStatus::DISCONNECTION) {
+                    newly_disconnected.push_back(meta);
+                } else if (new_status == ClientStatus::CRASHED) {
+                    newly_crashed.push_back(meta);
                 }
             }
         }
+    }
 
-        // Phase 2: Execute hooks (No client_mutex lock)
-        // We can safely execute hooks because we hold shared_ptrs to
-        // ClientMeta, so they won't be destroyed.
-        // And hooks don't need client_mutex because they are protected by
-        // client_meta itself
-        for (const auto& client : newly_disconnected) {
-            // The client might change to Healthy by concurrent heartbeat.
-            // So OnDisconnected() need to check the status again.
-            client->OnDisconnected();
-        }
+    // Phase 2: Execute hooks (No client_mutex lock)
+    // We can safely execute hooks because we hold shared_ptrs to
+    // ClientMeta, so they won't be destroyed.
+    // And hooks don't need client_mutex because they are protected by
+    // client_meta itself
+    for (const auto& client : newly_disconnected) {
+        // The client might change to Healthy by concurrent heartbeat.
+        // So OnDisconnected() need to check the status again.
+        client->OnDisconnected();
+    }
 
+    for (const auto& client : newly_crashed) {
+        client->OnCrashed();
+    }
+
+    // Phase 3: Clean up crashed clients (Write Lock)
+    if (!newly_crashed.empty()) {
+        SharedMutexLocker lock(&clients_mutex_);
         for (const auto& client : newly_crashed) {
-            client->OnCrashed();
-        }
-
-        // Phase 3: Clean up crashed clients (Write Lock)
-        if (!newly_crashed.empty()) {
-            SharedMutexLocker lock(&clients_mutex_);
-            for (const auto& client : newly_crashed) {
-                client_metas_.erase(client->get_client_id());
-            }
+            client_metas_.erase(client->get_client_id());
         }
     }
 }
-
 }  // namespace mooncake

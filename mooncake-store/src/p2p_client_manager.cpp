@@ -63,14 +63,26 @@ HeartbeatTaskResult P2PClientManager::ProcessTask(const UUID& client_id,
 
     switch (task.type_) {
         case HeartbeatTaskType::SYNC_SEGMENT_META: {
-            if (auto p2p_meta = std::static_pointer_cast<P2PClientMeta>(
-                    GetClient(client_id))) {
-                if (const auto* p =
-                        std::get_if<SyncSegmentMetaParam>(&task.param_)) {
-                    p2p_meta->UpdateSegmentUsages(p->tier_usages);
+            auto client_meta =
+                std::static_pointer_cast<P2PClientMeta>(GetClient(client_id));
+            const auto* param = std::get_if<SyncSegmentMetaParam>(&task.param_);
+            if (client_meta && param) {
+                auto sync_res =
+                    client_meta->UpdateSegmentUsages(param->tier_usages);
+                result.detail = sync_res;
+                for (const auto& sub : sync_res.sub_results) {
+                    if (sub.error != ErrorCode::OK) {
+                        // result.error means the task is failed.
+                        // here just sub task error, don't affect task result.
+                        LOG(ERROR) << "fail to update segment usages"
+                                   << ", client_id=" << client_id
+                                   << ", segment_id=" << sub.segment_id
+                                   << ", error=" << sub.error;
+                    }
                 }
+            } else {
+                result.error = ErrorCode::INVALID_PARAMS;
             }
-            result.error = ErrorCode::OK;
             break;
         }
         default:

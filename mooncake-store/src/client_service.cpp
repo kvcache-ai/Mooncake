@@ -494,9 +494,9 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
         auto heartbeat_result = GetMasterClient().Heartbeat(req);
         if (heartbeat_result) {  // Heartbeat success
             heartbeat_fail_count = 0;
-            HandleHeartbeatSuccess(heartbeat_result.value(),
-                                   current_master_address, register_client,
-                                   register_client_future);
+            HandleHeartbeatResponse(heartbeat_result.value(),
+                                    current_master_address, register_client,
+                                    register_client_future);
             WaitForNextHeartbeat(success_heartbeat_interval_ms);
         } else {  // Heartbeat failed
             heartbeat_fail_count++;
@@ -529,7 +529,7 @@ void ClientService::WaitForNextHeartbeat(int interval_ms) {
                            [this] { return !heartbeat_running_; });
 }
 
-bool ClientService::HandleHeartbeatSuccess(
+bool ClientService::HandleHeartbeatResponse(
     const HeartbeatResponse& response,
     const std::string& current_master_address,
     const std::function<void()>& register_client,
@@ -541,6 +541,9 @@ bool ClientService::HandleHeartbeatSuccess(
                      << ", Master version: " << response.view_version
                      << ", Client version: " << view_version_;
     }
+    for (auto& task_result : response.task_results) {
+        HandleHeartbeatTaskResult(task_result);
+    }
     if (response.status == ClientStatus::UNDEFINED &&
         !register_client_future.valid()) {
         // Ensure at most one register client thread is running
@@ -548,6 +551,26 @@ bool ClientService::HandleHeartbeatSuccess(
             std::async(std::launch::async, register_client);
     }
     return true;
+}
+
+void ClientService::HandleHeartbeatTaskResult(
+    const HeartbeatTaskResult& task_result) {
+    if (task_result.error != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to process task"
+                   << ", task_type=" << (int)task_result.type
+                   << ", error=" << toString(task_result.error);
+    }
+
+    if (std::holds_alternative<SyncSegmentMetaResult>(task_result.detail)) {
+        auto& sync_res = std::get<SyncSegmentMetaResult>(task_result.detail);
+        for (auto& sub : sync_res.sub_results) {
+            if (sub.error != ErrorCode::OK) {
+                LOG(WARNING) << "Failed to sync segment usage"
+                             << ", segment_id=" << sub.segment_id
+                             << ", error=" << toString(sub.error);
+            }
+        }
+    }
 }
 
 bool ClientService::ReconnectToMaster(bool is_ha_mode,

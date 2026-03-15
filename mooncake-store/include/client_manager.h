@@ -74,6 +74,10 @@ class ClientManager {
     virtual ~ClientManager();
 
     void Start();
+    void Stop();
+
+    void StartClientMonitor();
+    void StopClientMonitor();
 
     /**
      * @brief Register a client with its segments.

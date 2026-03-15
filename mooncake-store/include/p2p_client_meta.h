@@ -15,7 +15,8 @@ class P2PClientMeta final : public ClientMeta {
     auto QueryIp(const UUID& client_id)
         -> tl::expected<std::vector<std::string>, ErrorCode> override;
 
-    void UpdateSegmentUsages(const std::vector<TierUsageInfo>& usages);
+    auto UpdateSegmentUsages(const std::vector<TierUsageInfo>& usages)
+        -> SyncSegmentMetaResult;
 
     size_t GetAvailableCapacity() const;
 

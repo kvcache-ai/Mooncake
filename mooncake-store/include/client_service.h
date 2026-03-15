@@ -367,10 +367,16 @@ class ClientService {
      * Triggers async RegisterClient if master reports UNDEFINED status.
      * @return true if heartbeat was successfully processed.
      */
-    bool HandleHeartbeatSuccess(const HeartbeatResponse& response,
-                                const std::string& current_master_address,
-                                const std::function<void()>& register_client,
-                                std::future<void>& register_client_future);
+    bool HandleHeartbeatResponse(const HeartbeatResponse& response,
+                                 const std::string& current_master_address,
+                                 const std::function<void()>& register_client,
+                                 std::future<void>& register_client_future);
+
+    /**
+     * @brief Handles the result of a task received in a heartbeat response.
+     * @param task_result The result of the task.
+     */
+    void HandleHeartbeatTaskResult(const HeartbeatTaskResult& task_result);
 
     /**
      * @brief Attempts to reconnect to master after heartbeat failures.

@@ -61,10 +61,26 @@ struct HeartbeatTask {
 };
 YLT_REFL(HeartbeatTask, type_, param_);
 
+/**
+ * @brief Detailed result for SYNC_SEGMENT_META task.
+ */
+struct SyncSegmentMetaResult {
+    struct SubResult {
+        UUID segment_id;
+        ErrorCode error = ErrorCode::OK;
+    };
+    std::vector<SubResult> sub_results;
+};
+YLT_REFL(SyncSegmentMetaResult::SubResult, segment_id, error);
+YLT_REFL(SyncSegmentMetaResult, sub_results);
+
 struct HeartbeatTaskResult {
+    using DetailVariant = std::variant<std::monostate, SyncSegmentMetaResult>;
+
     HeartbeatTaskType type;
     ErrorCode error = ErrorCode::OK;
+    DetailVariant detail;
 };
-YLT_REFL(HeartbeatTaskResult, type, error);
+YLT_REFL(HeartbeatTaskResult, type, error, detail);
 
 }  // namespace mooncake
