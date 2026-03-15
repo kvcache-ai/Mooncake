@@ -17,14 +17,47 @@ class OutputMismatchError(Exception):
     pass
 
 
-def check_close(actual, expected, rank, **kwargs):
-    try:
-        testing.assert_close(actual, expected, **kwargs)
-    except AssertionError as e:
-        msg = f"expected '{expected}', but got '{actual}'."
-        print(f"❌ Rank {rank} assert fail: {e}. {msg}", flush=True)
-        return 1
-    return 0
+def check_close(
+    actual: torch.Tensor, expected: torch.Tensor, rank: int, msg: str, **kwargs
+) -> int:
+    if torch.allclose(actual, expected, **kwargs):
+        return 0
+
+    # same as torch.allclose
+    rtol = kwargs.get("rtol", 1e-05)
+    atol = kwargs.get("atol", 1e-08)
+
+    a = actual.cpu().to(torch.float64)
+    b = expected.cpu().to(torch.float64)
+
+    a_flat = a.reshape(-1)
+    b_flat = b.reshape(-1)
+    diff = (a_flat - b_flat).abs()
+
+    max_abs = float(diff.max().item())
+    mean_abs = float(diff.mean().item())
+
+    eps = 1e-12
+    rel = diff / (b_flat.abs() + eps)
+    max_rel = float(rel.max().item())
+
+    tol = atol + rtol * b_flat.abs()
+    above_mask = diff > tol
+    count_above = int(above_mask.sum().item())
+    total = diff.numel()
+    frac_above = count_above / total if total > 0 else 0.0
+
+    metrics = (
+        f"max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, "
+        f"max_rel={max_rel:.3e}, {count_above}/{total} elements > tol ({frac_above:.2%})"
+    )
+
+    print(
+        f"❌ Rank {rank} assert fail: {msg}. Metrics: {metrics}.\n"
+        + f"Expected:\n{expected},\nbut got:\n{actual}.",
+        flush=True,
+    )
+    return 1
 
 
 class CUDATimer:
@@ -160,7 +193,7 @@ def run_test_iteration(
 
     # Check m_count, d_count
     failed_check_count += check_close(
-        m_count, d_count, rank, msg="Dispatch token counts differ"
+        m_count, d_count, rank, "Dispatch token counts differ"
     )
 
     # --- PHASE 2: MOCK EXPERT COMPUTATION ---
@@ -219,7 +252,7 @@ def run_test_iteration(
             topk_idx,
             topk_weights,
             active_ranks,
-            timeout_us=0,
+            timeout_us=-1,
             handle=m_handle,
             zero_copy=zero_copy,
             async_finish=async_finish,
@@ -236,9 +269,9 @@ def run_test_iteration(
         m_combined,
         d_combined,
         rank,
-        rtol=5e-2,
-        atol=5e-2,
-        msg="Combined outputs differ",
+        "Combined outputs differ",
+        rtol=0.15 if use_fp8 else 5e-2,
+        atol=5e-3 if use_fp8 else 1e-3,
     )
 
     # Destroy buffer
@@ -262,12 +295,6 @@ def worker(rank: int, num_ranks: int):
         "async_finish": [False, True],
         "use_fallback": [False, True],
     }
-    # hyper_grid = {
-    #     "use_fp8": [True],
-    #     "zero_copy": [False],
-    #     "async_finish": [False],
-    #     "use_fallback": [False],
-    # }
     keys = list(hyper_grid.keys())
     combinations = list(itertools.product(*[hyper_grid[k] for k in keys]))
     total_configs = len(combinations)
@@ -282,7 +309,7 @@ def worker(rank: int, num_ranks: int):
     # Print message
     if rank == 0:
         print("\n" + "=" * 110)
-        print(f"Differential Test between Mooncake EP and DeepEP Started...")
+        print(f"Differential Test between MooncakeEP and DeepEP Started...")
         print(
             f"   Tokens: {NUM_TOKENS} | Hidden: {HIDDEN_DIM} | Experts: {NUM_EXPERTS} | Top-K: {TOP_K}"
         )
@@ -361,11 +388,11 @@ def worker(rank: int, num_ranks: int):
         print("\n\n" + "=" * 110)
         print(" Summary: MooncakeEP vs DeepEP")
         print("=" * 110)
-    
+
         header = f"| {' | '.join(f'{k[:6]:<6}' for k in keys)} |"
         header += " M-Disp(ms) | D-Disp(ms) | M-Comb(ms) | D-Comb(ms) | Match? |"
         print(header)
-        
+
         separator = "-" * len(header)
         print(separator)
 
