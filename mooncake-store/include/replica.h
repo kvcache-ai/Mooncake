@@ -238,6 +238,12 @@ class Replica {
         return replica.is_processing();
     }
 
+    [[nodiscard]] bool is_busy() const { return refcnt_.load() > 0; }
+
+    [[nodiscard]] static bool fn_is_busy(const Replica& replica) {
+        return replica.is_busy();
+    }
+
     [[nodiscard]] ReplicaType type() const {
         return std::visit(ReplicaTypeVisitor{}, data_);
     }
@@ -294,6 +300,14 @@ class Replica {
             LOG(WARNING) << "Replica already marked as complete";
         } else {
             LOG(ERROR) << "Invalid replica status: " << status_;
+        }
+    }
+
+    void mark_processing() {
+        if (status_ == ReplicaStatus::COMPLETE) {
+            status_ = ReplicaStatus::PROCESSING;
+        } else {
+            LOG(ERROR) << "Cannot mark_processing from status: " << status_;
         }
     }
 
