@@ -661,6 +661,64 @@ auto MasterService::GetReplicaList(const std::string& key)
                                   default_kv_lease_ttl_);
 }
 
+auto MasterService::AllocateAndInsertMetadata(
+    MetadataShardAccessorRW& shard, const UUID& client_id,
+    const std::string& key, uint64_t slice_length, uint64_t total_length,
+    const ReplicateConfig& config,
+    const std::chrono::system_clock::time_point& now)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    std::vector<Replica> replicas;
+    {
+        ScopedAllocatorAccess allocator_access =
+            segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+        std::vector<std::string> preferred_segments;
+        if (!config.preferred_segment.empty()) {
+            preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
+        }
+
+        auto allocation_result = allocation_strategy_->Allocate(
+            allocator_manager, slice_length, config.replica_num,
+            preferred_segments);
+
+        if (!allocation_result.has_value()) {
+            VLOG(1) << "Failed to allocate replicas for key=" << key
+                    << ", error: " << allocation_result.error();
+            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            need_eviction_ = true;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        replicas = std::move(allocation_result.value());
+    }
+
+    if (use_disk_replica_) {
+        std::string file_path =
+            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
+        replicas.emplace_back(file_path, total_length,
+                              ReplicaStatus::PROCESSING);
+    }
+
+    std::vector<Replica::Descriptor> replica_list;
+    replica_list.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        replica_list.emplace_back(replica.get_descriptor());
+    }
+
+    shard->metadata.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
+                              config.with_soft_pin));
+    shard->processing_keys.insert(key);
+
+    return replica_list;
+}
+
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
@@ -715,62 +773,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
     }
 
-    // Allocate replicas
-    std::vector<Replica> replicas;
-    {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-
-        std::vector<std::string> preferred_segments;
-        if (!config.preferred_segment.empty()) {
-            preferred_segments.push_back(config.preferred_segment);
-        } else if (!config.preferred_segments.empty()) {
-            preferred_segments = config.preferred_segments;
-        }
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, slice_length, config.replica_num,
-            preferred_segments);
-
-        if (!allocation_result.has_value()) {
-            VLOG(1) << "Failed to allocate all replicas for key=" << key
-                    << ", error: " << allocation_result.error();
-            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            need_eviction_ = true;
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        replicas = std::move(allocation_result.value());
-    }
-
-    // If disk replica is enabled, allocate a disk replica
-    if (use_disk_replica_) {
-        // Allocate a file path for the disk replica
-        std::string file_path =
-            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
-        replicas.emplace_back(file_path, total_length,
-                              ReplicaStatus::PROCESSING);
-    }
-
-    std::vector<Replica::Descriptor> replica_list;
-    replica_list.reserve(replicas.size());
-    for (const auto& replica : replicas) {
-        replica_list.emplace_back(replica.get_descriptor());
-    }
-
-    // No need to set lease here. The object will not be evicted until
-    // PutEnd is called.
-    shard->metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
-                              config.with_soft_pin));
-    // Also insert the metadata into processing set for monitoring.
-    shard->processing_keys.insert(key);
-
-    return replica_list;
+    return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                      total_length, config, now);
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
@@ -1024,58 +1028,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // or never existed), fall through to Case A
     if (it == shard->metadata.end()) {
         // Case A: key does not exist — same as PutStart
-        std::vector<Replica> replicas;
-        {
-            ScopedAllocatorAccess allocator_access =
-                segment_manager_.getAllocatorAccess();
-            const auto& allocator_manager =
-                allocator_access.getAllocatorManager();
-
-            std::vector<std::string> preferred_segments;
-            if (!config.preferred_segment.empty()) {
-                preferred_segments.push_back(config.preferred_segment);
-            } else if (!config.preferred_segments.empty()) {
-                preferred_segments = config.preferred_segments;
-            }
-
-            auto allocation_result = allocation_strategy_->Allocate(
-                allocator_manager, slice_length, config.replica_num,
-                preferred_segments);
-
-            if (!allocation_result.has_value()) {
-                VLOG(1) << "Failed to allocate replicas for key=" << key
-                        << ", error: " << allocation_result.error();
-                if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                }
-                need_eviction_ = true;
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-            }
-
-            replicas = std::move(allocation_result.value());
-        }
-
-        if (use_disk_replica_) {
-            std::string file_path =
-                ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
-            replicas.emplace_back(file_path, total_length,
-                                  ReplicaStatus::PROCESSING);
-        }
-
-        std::vector<Replica::Descriptor> replica_list;
-        replica_list.reserve(replicas.size());
-        for (const auto& replica : replicas) {
-            replica_list.emplace_back(replica.get_descriptor());
-        }
-
-        shard->metadata.emplace(
-            std::piecewise_construct, std::forward_as_tuple(key),
-            std::forward_as_tuple(client_id, now, total_length,
-                                  std::move(replicas), config.with_soft_pin));
-        shard->processing_keys.insert(key);
-
         VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
-        return replica_list;
+        return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                         total_length, config, now);
     }
 
     // Key exists with COMPLETE replicas — Case B or Case C
@@ -1091,6 +1046,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // Case B: same size — in-place update
         metadata.client_id = client_id;
         metadata.put_start_time = now;
+
+        // Reconcile soft_pin state with the incoming config
+        {
+            SpinLocker locker(&metadata.lock);
+            if (config.with_soft_pin && !metadata.soft_pin_timeout) {
+                metadata.soft_pin_timeout.emplace();
+                MasterMetricManager::instance().inc_soft_pin_key_count(1);
+            } else if (!config.with_soft_pin && metadata.soft_pin_timeout) {
+                metadata.soft_pin_timeout.reset();
+                MasterMetricManager::instance().dec_soft_pin_key_count(1);
+            }
+        }
 
         metadata.VisitReplicas(
             &Replica::fn_is_completed,
@@ -1119,59 +1086,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     shard->metadata.erase(it);
 
-    // Allocate new replicas (same as Case A)
-    std::vector<Replica> replicas;
-    {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager =
-            allocator_access.getAllocatorManager();
-
-        std::vector<std::string> preferred_segments;
-        if (!config.preferred_segment.empty()) {
-            preferred_segments.push_back(config.preferred_segment);
-        } else if (!config.preferred_segments.empty()) {
-            preferred_segments = config.preferred_segments;
-        }
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, slice_length, config.replica_num,
-            preferred_segments);
-
-        if (!allocation_result.has_value()) {
-            VLOG(1) << "Failed to allocate replicas for key=" << key
-                    << ", error: " << allocation_result.error();
-            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            need_eviction_ = true;
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        replicas = std::move(allocation_result.value());
-    }
-
-    if (use_disk_replica_) {
-        std::string file_path =
-            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
-        replicas.emplace_back(file_path, total_length,
-                              ReplicaStatus::PROCESSING);
-    }
-
-    std::vector<Replica::Descriptor> replica_list;
-    replica_list.reserve(replicas.size());
-    for (const auto& replica : replicas) {
-        replica_list.emplace_back(replica.get_descriptor());
-    }
-
-    shard->metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, total_length,
-                              std::move(replicas), config.with_soft_pin));
-    shard->processing_keys.insert(key);
-
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
-    return replica_list;
+    return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                     total_length, config, now);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
@@ -1191,6 +1108,13 @@ MasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths,
     const ReplicateConfig& config) {
+    if (keys.size() != slice_lengths.size()) {
+        LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
+                   << " != slice_lengths.size()=" << slice_lengths.size();
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
     results.reserve(keys.size());

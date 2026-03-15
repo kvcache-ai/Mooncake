@@ -1865,6 +1865,10 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

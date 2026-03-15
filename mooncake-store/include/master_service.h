@@ -819,6 +819,15 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
 
+    // Helper: allocate replicas, create ObjectMetadata, insert into shard,
+    // and return descriptor list.  Shared by PutStart and UpsertStart.
+    auto AllocateAndInsertMetadata(
+        MetadataShardAccessorRW& shard, const UUID& client_id,
+        const std::string& key, uint64_t slice_length, uint64_t total_length,
+        const ReplicateConfig& config,
+        const std::chrono::system_clock::time_point& now)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     /**
      * @brief Helper to discard expired processing keys.
      */
