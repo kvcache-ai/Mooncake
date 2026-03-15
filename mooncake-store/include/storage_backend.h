@@ -4,8 +4,10 @@
 
 #include <atomic>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -977,6 +979,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
+    // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
+    // Maintained lazily — reads update last_access_ns_ atomically without
+    // touching this index; SelectEvictionCandidate() repairs stale entries.
+    std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 

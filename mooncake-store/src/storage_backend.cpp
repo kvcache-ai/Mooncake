@@ -1369,6 +1369,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             }
         }
         buckets_.emplace(bucket_id, std::move(bucket));
+        lru_index_.emplace(0LL, bucket_id);
     }
 
     return bucket_id;
@@ -1566,6 +1567,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
+        lru_index_.clear();
         total_size_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
         for (const auto& entry :
@@ -1576,6 +1578,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 int64_t bucket_id = std::stoll(bucket_id_str);
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
+                if (success) lru_index_.emplace(0LL, bucket_id);
                 if (!success) {
                     LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
                     return tl::make_unexpected(
@@ -1600,6 +1603,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
+                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -1634,6 +1638,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
+                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -2141,17 +2146,37 @@ BucketStorageBackend::SelectEvictionCandidate() {
             return buckets_.begin();
 
         case BucketEvictionPolicy::LRU:
-            // Scan all buckets to find the one with the smallest
-            // last_access_ns_. Buckets that have never been read have
-            // last_access_ns_ == 0 and are therefore always evicted first
-            // (FIFO-among-unread).
-            return std::min_element(buckets_.begin(), buckets_.end(),
-                                    [](const auto& a, const auto& b) {
-                                        return a.second->last_access_ns_.load(
-                                                   std::memory_order_relaxed) <
-                                               b.second->last_access_ns_.load(
-                                                   std::memory_order_relaxed);
-                                    });
+            // Use lru_index_ (a std::set ordered by {last_access_ns_,
+            // bucket_id}) for O(log N) candidate selection.
+            //
+            // The index may be stale: BatchLoad updates last_access_ns_
+            // atomically under a shared lock without touching lru_index_.
+            // We repair lazily here (called under exclusive lock):
+            //   - If the top entry's timestamp matches the actual
+            //     last_access_ns_, it is the true LRU candidate.
+            //   - If stale, re-insert with the correct timestamp and retry.
+            //   - If the bucket no longer exists, discard the entry.
+            while (!lru_index_.empty()) {
+                auto top_it = lru_index_.begin();
+                auto [ts, id] = *top_it;
+                auto bucket_it = buckets_.find(id);
+                if (bucket_it == buckets_.end()) {
+                    lru_index_.erase(top_it);
+                    continue;
+                }
+                int64_t actual_ts = bucket_it->second->last_access_ns_.load(
+                    std::memory_order_relaxed);
+                if (actual_ts == ts) {
+                    // Correct entry: remove from index (bucket is about to be
+                    // evicted) and return.
+                    lru_index_.erase(top_it);
+                    return bucket_it;
+                }
+                // Stale: repair and retry to find the true minimum.
+                lru_index_.erase(top_it);
+                lru_index_.emplace(actual_ts, id);
+            }
+            return buckets_.end();
 
         default:
             return buckets_.end();
@@ -2218,7 +2243,6 @@ void BucketStorageBackend::FinalizeEviction(const PendingEviction& pending) {
     namespace fs = std::filesystem;
 
     constexpr int kMaxSpinIterations = 1000;
-    constexpr auto kSleepDuration = std::chrono::microseconds(100);
     constexpr auto kMaxWaitTime = std::chrono::seconds(10);
 
     for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
@@ -2229,7 +2253,7 @@ void BucketStorageBackend::FinalizeEviction(const PendingEviction& pending) {
         while (bucket_meta->inflight_reads_.load(std::memory_order_acquire) >
                0) {
             if (++spin_count > kMaxSpinIterations) {
-                std::this_thread::sleep_for(kSleepDuration);
+                std::this_thread::yield();
                 spin_count = 0;
                 if (std::chrono::steady_clock::now() - wait_start >
                     kMaxWaitTime) {
@@ -2301,6 +2325,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
         // Move the shared_ptr out - we now own it
         bucket_metadata = std::move(bucket_it->second);
+        lru_index_.erase(
+            {bucket_metadata->last_access_ns_.load(std::memory_order_relaxed),
+             bucket_id});
         buckets_.erase(bucket_it);
 
         // Collect keys to remove (they reference this bucket)
