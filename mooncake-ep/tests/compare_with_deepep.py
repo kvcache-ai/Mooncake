@@ -1,9 +1,7 @@
 import os
 import itertools
-import traceback
 import torch
 import torch.distributed as dist
-import torch.testing as testing
 
 from deep_ep.buffer import Buffer as DeepEPBuffer
 from mooncake.mooncake_ep_buffer import Buffer as MooncakeBuffer
