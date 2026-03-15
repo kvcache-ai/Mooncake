@@ -18,6 +18,14 @@ class SegmentManager {
     auto MountSegment(const Segment& segment) -> tl::expected<void, ErrorCode>;
     auto UnmountSegment(const UUID& segment_id)
         -> tl::expected<void, ErrorCode>;
+    // TODO: wanyue-wy
+    // There is currently no mechanism to guarantee `segment_name`'s uniqueness
+    // within the cluster.
+    // For backward compatibility during refactoring, we temporarily maintain a
+    // weak assumption of `segment_name`'s uniqueness.
+    // However, before merging to main, we need to discuss whether name
+    // uniqueness is necessary and whether the query interface definition should
+    // be modified.
     virtual auto QuerySegments(const std::string& segment)
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode> = 0;
     auto QuerySegment(const UUID& segment_id)

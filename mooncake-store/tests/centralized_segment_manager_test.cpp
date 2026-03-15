@@ -3,6 +3,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #include <boost/functional/hash.hpp>
 
 namespace mooncake {
@@ -214,6 +218,20 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
     ValidateMountedSegments(segment_manager, empty_segment_vec);
 }
 
+TEST_F(SegmentTest, GetSegmentsEmpty) {
+    CentralizedSegmentManager segment_manager;
+    auto result = segment_manager.GetSegments();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result.value().empty());
+}
+
+TEST_F(SegmentTest, QuerySegmentByIDNotFound) {
+    CentralizedSegmentManager segment_manager;
+    auto res = segment_manager.QuerySegment(generate_uuid());
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 // QuerySegments:
 // 1. Create and mount 10 different segments with different names and different
 // client ids;
@@ -314,6 +332,165 @@ TEST_F(SegmentTest, MountLocalDiskSegmentDuplicate) {
 
     // Verify state remains the same after duplicate mount
     ValidateMountedLocalDiskSegments(segment_manager, segment);
+}
+
+// ============================================================
+// Concurrency Tests
+// ============================================================
+
+TEST_F(SegmentTest, ConcurrentMountAndUnmount) {
+    CentralizedSegmentManager segment_manager;
+    constexpr int kNumThreads = 16;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    for (int i = 0; i < kNumThreads; i++) {
+        threads.emplace_back([&segment_manager, &success_count, i]() {
+            Segment segment;
+            segment.id = generate_uuid();
+            segment.name = "concurrent_seg_" + std::to_string(i);
+            segment.size = 1024 * 1024 * 16;
+            segment.extra = CentralizedSegmentExtraData{
+                .base =
+                    static_cast<uintptr_t>(0x100000000 + i * 0x100000000ULL),
+                .te_endpoint = ""};
+
+            auto mount_result = segment_manager.MountSegment(segment);
+            ASSERT_TRUE(mount_result.has_value());
+            success_count.fetch_add(1);
+
+            auto unmount_result = segment_manager.UnmountSegment(segment.id);
+            ASSERT_TRUE(unmount_result.has_value());
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count, kNumThreads);
+
+    // All segments should be unmounted
+    std::vector<Segment> empty_vec;
+    ValidateMountedSegments(segment_manager, empty_vec);
+}
+
+TEST_F(SegmentTest, ConcurrentMountSameSegment) {
+    CentralizedSegmentManager segment_manager;
+    constexpr int kNumThreads = 16;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "same_segment";
+    segment.size = 1024 * 1024 * 16;
+    segment.extra =
+        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = ""};
+
+    std::vector<std::thread> threads;
+    std::atomic<int> mount_success{0};
+    std::atomic<int> mount_duplicate{0};
+
+    for (int i = 0; i < kNumThreads; i++) {
+        threads.emplace_back([&segment_manager, &segment, &mount_success,
+                              &mount_duplicate]() {
+            auto result = segment_manager.MountSegment(segment);
+            if (result.has_value()) {
+                mount_success.fetch_add(1);
+            } else if (result.error() == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                mount_duplicate.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Exactly one mount should succeed
+    EXPECT_EQ(mount_success, 1);
+    EXPECT_EQ(mount_duplicate, kNumThreads - 1);
+}
+
+// ============================================================
+// Additional Interface Tests
+// ============================================================
+
+TEST_F(SegmentTest, QuerySegmentAndIp) {
+    CentralizedSegmentManager segment_manager;
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_ip_segment";
+    segment.size = 1024;
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "192.168.1.100:1234"};
+
+    ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
+
+    // Test QuerySegment
+    auto query_res = segment_manager.QuerySegment(segment.id);
+    ASSERT_TRUE(query_res.has_value());
+    EXPECT_EQ(query_res.value()->name, segment.name);
+
+    // Test QueryIp
+    auto ip_res = segment_manager.QueryIp();
+    ASSERT_TRUE(ip_res.has_value());
+    ASSERT_EQ(ip_res.value().size(), 1);
+    EXPECT_EQ(ip_res.value()[0], "192.168.1.100");
+
+    // Test QuerySegment Not Found
+    EXPECT_EQ(segment_manager.QuerySegment(generate_uuid()).error(),
+              ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(SegmentTest, Callbacks) {
+    CentralizedSegmentManager segment_manager;
+    UUID callback_removed_id;
+    bool segment_removal_callback_triggered = false;
+    segment_manager.SetSegmentRemovalCallback([&](const UUID& id) {
+        callback_removed_id = id;
+        segment_removal_callback_triggered = true;
+    });
+
+    std::string allocator_change_segment_name;
+    bool allocator_add_triggered = false;
+    bool allocator_remove_triggered = false;
+    segment_manager.SetAllocatorChangeCallback(
+        [&](const std::string& name,
+            const std::shared_ptr<BufferAllocatorBase>& allocator,
+            bool is_add) -> tl::expected<void, ErrorCode> {
+            allocator_change_segment_name = name;
+            if (is_add)
+                allocator_add_triggered = true;
+            else
+                allocator_remove_triggered = true;
+            return {};
+        });
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "callback_seg";
+    segment.size = 1024;
+    segment.extra =
+        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = ""};
+
+    // Test Mount calls AllocatorChangeCallback
+    ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
+    EXPECT_TRUE(allocator_add_triggered);
+    EXPECT_EQ(allocator_change_segment_name, segment.name);
+
+    // Test SetGlobalVisibility
+    ASSERT_TRUE(segment_manager.SetGlobalVisibility(false).has_value());
+    EXPECT_TRUE(allocator_remove_triggered);
+    allocator_remove_triggered = false;
+    allocator_add_triggered = false;
+    ASSERT_TRUE(segment_manager.SetGlobalVisibility(true).has_value());
+    EXPECT_TRUE(allocator_add_triggered);
+
+    // Test Unmount calls Local and Removal Callbacks
+    ASSERT_TRUE(segment_manager.UnmountSegment(segment.id).has_value());
+    EXPECT_TRUE(allocator_remove_triggered);
+    EXPECT_TRUE(segment_removal_callback_triggered);
+    EXPECT_EQ(callback_removed_id, segment.id);
 }
 
 }  // namespace mooncake
