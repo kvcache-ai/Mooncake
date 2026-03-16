@@ -31,7 +31,12 @@ WrappedMasterService::WrappedMasterService(
     : master_service_(MasterServiceConfig(config)),
       http_server_(4, config.http_port),
       metric_report_running_(config.enable_metric_reporting) {
-    init_http_server();
+    // In HA mode, the HTTP server is managed by MasterServiceSupervisor.
+    // It starts before the election loop to ensure health/readiness probes
+    // are always responsive, regardless of leader/follower status.
+    if (!config.enable_ha) {
+        init_http_server();
+    }
 
     if (config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
