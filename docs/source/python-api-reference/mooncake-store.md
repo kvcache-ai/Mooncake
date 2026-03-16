@@ -629,6 +629,74 @@ result = store.put_batch(keys, values)
 
 ---
 
+#### upsert()
+
+Insert a new object if the key does not exist, or update the existing object in place when possible. They use the same replication configuration model as `put()`.
+
+Upsert binary data in the distributed storage.
+
+```python
+def upsert(self, key: str, value: bytes, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Unique object identifier
+- `value` (bytes): Binary data to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+config = ReplicateConfig()
+config.replica_num = 2
+
+rc = store.upsert("weights", b"new-bytes", config)
+if rc == 0:
+    print("Upsert succeeded")
+```
+
+#### upsert_from()
+
+Upsert object data directly from a pre-allocated buffer (zero-copy).
+
+```python
+def upsert_from(self, key: str, buffer_ptr: int, size: int, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Memory address of the source buffer
+- `size` (int): Number of bytes to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This is the zero-copy counterpart of `upsert()`. As with
+`put_from()`, register the buffer before issuing the request.
+
+#### batch_upsert_from()
+
+Upsert multiple objects directly from pre-allocated buffers.
+
+```python
+def batch_upsert_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int],
+                      config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `buffer_ptrs` (List[int]): List of source buffer addresses
+- `sizes` (List[int]): List of byte lengths for each buffer
+- `config` (ReplicateConfig, optional): Replication configuration shared by all objects
+
+**Returns:**
+- `List[int]`: List of status codes for each upsert
+
+---
+
 #### get_batch()
 Retrieve multiple objects in a single batch operation.
 
@@ -1497,6 +1565,64 @@ def batch_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], co
 - `List[int]`: List of status codes for each tensor operation.
 
 **Note:** This function requires `torch` to be installed and available in the environment.
+
+---
+
+#### upsert_tensor()
+
+Insert a tensor if its key is missing, or update the existing tensor if the key already exists. The current tensor upsert helpers use the default `ReplicateConfig` and therefore do not take a `config` parameter.
+
+Upsert a PyTorch tensor into the store.
+
+```python
+def upsert_tensor(self, key: str, tensor: torch.Tensor) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `tensor` (torch.Tensor): The PyTorch tensor to insert or update
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+#### upsert_tensor_from()
+
+Upsert a tensor directly from a pre-allocated buffer. The buffer layout must be
+`[TensorMetadata][tensor data]`, matching the layout used by
+`get_tensor_into()`.
+
+```python
+def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Buffer pointer containing serialized tensor metadata and payload
+- `size` (int): Actual serialized byte length of the tensor buffer
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function is not supported for dummy client.
+
+#### batch_upsert_tensor_from()
+
+Upsert multiple tensors directly from pre-allocated buffers. Each buffer must
+use layout `[TensorMetadata][tensor data]`.
+
+```python
+def batch_upsert_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `buffer_ptrs` (List[int]): List of serialized tensor buffer pointers
+- `sizes` (List[int]): List of actual serialized byte lengths
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor upsert
 
 ---
 
