@@ -33,10 +33,12 @@ export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 mooncake_client \
     --master_server_address=127.0.0.1:50051 \
     --host=<machine IP> \
+    --protocol="rdma"  \
     --device_names=<NIC name, e.g. eth0> \
     --port=50052 \
     --global_segment_size="4 GB" \
-    --enable_offload=true
+    --enable_offload=true  \
+    --metadata_server="P2PHANDSHAKE"
 ```
 
 > **Note:** On startup, the real client automatically scans existing SSD data and reports it to the master. No manual recovery is needed.
@@ -51,10 +53,10 @@ from mooncake.store import MooncakeDistributedStore
 store = MooncakeDistributedStore()
 store.setup(
     local_hostname="<machine IP>",
-    metadata_server="127.0.0.1:2379",   # etcd, or http://127.0.0.1:8080/metadata
+    metadata_server="P2PHANDSHAKE",
     global_segment_size=4 * 1024 * 1024 * 1024,   # 4 GB
     local_buffer_size=512 * 1024 * 1024,           # 512 MB
-    protocol="tcp",
+    protocol="rdma",
     device_name="eth0",
     master_server_address="127.0.0.1:50051",
 )
