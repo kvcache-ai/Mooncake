@@ -138,3 +138,13 @@ Available log levels: trace, debug, info, warn (or warning), error, and critical
 - Scale `--rpc_thread_num` with available CPU cores and workload.
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
+
+
+---
+
+:::{toctree}
+:caption: Advanced Topics
+:maxdepth: 1
+
+ssd-offload
+:::
