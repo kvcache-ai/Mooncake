@@ -936,7 +936,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     }
     auto &context = it->second;
 
-    return put_parts_internal(key, std::move(values), config,
+    return put_parts_internal(key, values, config,
                               context.client_buffer_allocator);
 }
 
