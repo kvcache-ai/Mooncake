@@ -3,8 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <limits>
 #include <thread>
+#include <vector>
+#include <limits>
 
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/tiered_backend.h"
@@ -662,6 +663,107 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_auto_eviction");
+}
+
+// ============================================================
+// Concurrency Tests
+// ============================================================
+
+// Test concurrent Allocate+Write+Commit and Get on TieredBackend
+TEST_F(StorageTierTest, ConcurrentReadWrite) {
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "file_per_key_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_concurrent_rw", 1);
+
+    fs::remove_all("/tmp/mooncake_test_concurrent_rw");
+    fs::create_directories("/tmp/mooncake_test_concurrent_rw");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value());
+
+    // Phase 1: Concurrent writes
+    constexpr int kNumWriters = 4;
+    constexpr int kKeysPerWriter = 10;
+    constexpr size_t kDataSize = 1024;
+    std::atomic<int> write_success{0};
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < kNumWriters; ++i) {
+        threads.emplace_back([&, i]() {
+            for (int j = 0; j < kKeysPerWriter; ++j) {
+                std::string key =
+                    "rw_key_" + std::to_string(i) + "_" + std::to_string(j);
+
+                auto alloc_result = backend.Allocate(kDataSize);
+                if (!alloc_result.has_value()) continue;
+                AllocationHandle handle = alloc_result.value();
+
+                auto test_buffer = CreateTestBuffer(kDataSize);
+                DataSource source;
+                source.buffer = std::make_unique<TempDRAMBuffer>(
+                    std::move(test_buffer), kDataSize);
+                source.type = MemoryType::DRAM;
+
+                auto write_result = backend.Write(source, handle);
+                if (!write_result.has_value()) continue;
+
+                auto commit_result = backend.Commit(key, handle);
+                if (commit_result.has_value()) {
+                    write_success.fetch_add(1);
+                }
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    threads.clear();
+    EXPECT_EQ(write_success.load(), kNumWriters * kKeysPerWriter);
+
+    // Flush to persist
+    auto tier_views = backend.GetTierViews();
+    ASSERT_FALSE(tier_views.empty());
+    auto tier = backend.GetTier(tier_views[0].id);
+    const_cast<CacheTier*>(tier)->Flush();
+
+    // Phase 2: Concurrent reads
+    std::atomic<int> read_success{0};
+    for (int i = 0; i < kNumWriters; ++i) {
+        threads.emplace_back([&, i]() {
+            for (int j = 0; j < kKeysPerWriter; ++j) {
+                std::string key =
+                    "rw_key_" + std::to_string(i) + "_" + std::to_string(j);
+                auto get_result = backend.Get(key);
+                if (get_result.has_value()) {
+                    read_success.fetch_add(1);
+                }
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(read_success.load(), kNumWriters * kKeysPerWriter);
+
+    fs::remove_all("/tmp/mooncake_test_concurrent_rw");
 }
 
 }  // namespace mooncake::test
