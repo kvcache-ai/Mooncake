@@ -288,7 +288,7 @@ struct ClientMetric {
      *   (default: 0, 0 = collect but don't report)
      */
     static std::unique_ptr<ClientMetric> Create(
-        std::map<std::string, std::string> labels = {});
+        const std::map<std::string, std::string>& labels = {});
 
     void serialize(std::string& str);
     std::string summary_metrics();
@@ -296,7 +296,7 @@ struct ClientMetric {
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
     explicit ClientMetric(uint64_t interval_seconds = 0,
-                          std::map<std::string, std::string> labels = {});
+                          const std::map<std::string, std::string>& labels = {});
     ~ClientMetric();
 
    private:
