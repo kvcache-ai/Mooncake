@@ -40,7 +40,10 @@ if (STORE_USE_ETCD)
   add_compile_definitions(STORE_USE_ETCD)
 endif()
 
-option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" ON)
+if (STORE_USE_JEMALLOC)
+  message(STATUS "jemalloc support is enabled for Mooncake Store master (improves memory management)")
+endif()
 
 # Define ASIO macros before adding mooncake-asio subdirectory
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
