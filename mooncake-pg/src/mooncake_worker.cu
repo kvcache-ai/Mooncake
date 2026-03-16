@@ -244,7 +244,8 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
-MooncakeWorker::MooncakeWorker() {
+MooncakeWorker::MooncakeWorker(int cuda_device_index)
+    : cuda_device_index_(cuda_device_index) {
     int deviceCount = 0;
     cudaError err = cudaGetDeviceCount(&deviceCount);
     if (!err && deviceCount > 0) {
@@ -260,8 +261,6 @@ MooncakeWorker::MooncakeWorker() {
         tasks_[i].active = false;
     }
 
-    // Start worker
-    startWorker();
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(

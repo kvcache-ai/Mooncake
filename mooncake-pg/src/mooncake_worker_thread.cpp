@@ -1,3 +1,4 @@
+#include <cuda_runtime.h>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <transfer_engine.h>
@@ -14,6 +15,9 @@ enum WorkerTaskStatus {
 void MooncakeWorker::startWorker() {
     running_ = true;
     std::thread([this] {
+        if (cuda_device_index_ >= 0) {
+            cudaSetDevice(cuda_device_index_);
+        }
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
@@ -124,7 +128,8 @@ void MooncakeWorker::startWorker() {
                                 task.batchID, rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
-                                    (diff.count() > kPingTimeoutMicroseconds_ &&
+                                    (j != group->rank &&
+                                        diff.count() > kPingTimeoutMicroseconds_ &&
                                      group->engine->sendNotifyByID(
                                          group->segmentIDs[j], msg))) {
                                     LOG(ERROR)
@@ -205,7 +210,8 @@ void MooncakeWorker::startWorker() {
                         if (signal_ptr[j] != 1 ||
                             status.s != TransferStatusEnum::COMPLETED) {
                             if (status.s == TransferStatusEnum::FAILED ||
-                                (diff.count() > kPingTimeoutMicroseconds_ &&
+                                (j != group->rank &&
+                                    diff.count() > kPingTimeoutMicroseconds_ &&
                                  group->engine->sendNotifyByID(
                                      group->segmentIDs[j], msg))) {
                                 LOG(ERROR) << "Rank " << group->rank
@@ -252,6 +258,31 @@ void MooncakeWorker::startWorker() {
             }
         }
     }).detach();
+}
+
+std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetCPUWorker() {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = workers_.find(CPUWorkerID);
+    if (it != workers_.end()) {
+        return it->second;
+    }
+    auto worker = std::make_shared<MooncakeWorker>(CPUWorkerID);
+    workers_[CPUWorkerID] = worker;
+    worker->startWorker();
+    return worker;
+}
+
+std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetCUDAWorker(
+    int cuda_device_index) {
+    std::lock_guard<std::mutex> lock(manager_mutex_);
+    auto it = workers_.find(cuda_device_index);
+    if (it != workers_.end()) {
+        return it->second;
+    }
+    auto worker = std::make_shared<MooncakeWorker>(cuda_device_index);
+    workers_[cuda_device_index] = worker;
+    worker->startWorker();
+    return worker;
 }
 
 }  // namespace mooncake
