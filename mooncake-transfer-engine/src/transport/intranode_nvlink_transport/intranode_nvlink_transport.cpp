@@ -889,9 +889,7 @@ void *IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     return nullptr;
 }
 
-void IntraNodeNvlinkTransport::freePinnedLocalMemory(void *ptr) {
-    (void)ptr;
-}
+void IntraNodeNvlinkTransport::freePinnedLocalMemory(void *ptr) { (void)ptr; }
 
 }  // namespace mooncake
 

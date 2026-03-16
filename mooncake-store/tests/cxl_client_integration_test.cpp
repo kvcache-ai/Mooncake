@@ -102,7 +102,8 @@ class ClientIntegrationTestCxl : public ::testing::Test {
             master_address_);
 
         if (!client_opt.has_value()) {
-            LOG(WARNING) << "Failed to create client with host_name: " << host_name;
+            LOG(WARNING) << "Failed to create client with host_name: "
+                         << host_name;
             return nullptr;
         }
         return client_opt.value();

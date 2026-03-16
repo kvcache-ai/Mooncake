@@ -140,7 +140,8 @@ Environ::Environ() {
     rpc_protocol_ = GetString("MC_RPC_PROTOCOL", "");
     slice_timeout_ = GetInt("MC_SLICE_TIMEOUT", 0);
     store_client_metric_ = GetString("MC_STORE_CLIENT_METRIC", "");
-    store_client_metric_interval_ = GetInt("MC_STORE_CLIENT_METRIC_INTERVAL", 0);
+    store_client_metric_interval_ =
+        GetInt("MC_STORE_CLIENT_METRIC_INTERVAL", 0);
     store_cluster_id_ = GetString("MC_STORE_CLUSTER_ID", "");
     store_hugepage_size_ = GetString("MC_STORE_HUGEPAGE_SIZE", "");
     store_memcpy_ = GetString("MC_STORE_MEMCPY", "");
