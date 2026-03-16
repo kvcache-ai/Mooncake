@@ -219,7 +219,7 @@ jobs:
       run: |
         cd build
         source ~/.bashrc
-        make -j
+        make -j4
         make install
       shell: bash
 
