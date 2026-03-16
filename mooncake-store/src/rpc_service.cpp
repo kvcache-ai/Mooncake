@@ -769,8 +769,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-WrappedMasterService::BatchUpsertRevoke(
-    const UUID& client_id, const std::vector<std::string>& keys) {
+WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
+                                        const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchUpsertRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);

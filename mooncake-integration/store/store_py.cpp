@@ -1651,14 +1651,13 @@ PYBIND11_MODULE(store, m) {
         .def("upsert_tensor", &MooncakeStorePyWrapper::upsert_tensor,
              py::arg("key"), py::arg("tensor"),
              "Upsert a PyTorch tensor into the store (insert or update)")
-        .def("upsert_tensor_from",
-             &MooncakeStorePyWrapper::upsert_tensor_from, py::arg("key"),
-             py::arg("buffer_ptr"), py::arg("size"),
+        .def("upsert_tensor_from", &MooncakeStorePyWrapper::upsert_tensor_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              "Upsert a tensor directly from a pre-allocated buffer. Buffer "
              "layout must be [TensorMetadata][tensor data].")
         .def("batch_upsert_tensor_from",
-             &MooncakeStorePyWrapper::batch_upsert_tensor_from,
-             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             &MooncakeStorePyWrapper::batch_upsert_tensor_from, py::arg("keys"),
+             py::arg("buffer_ptrs"), py::arg("sizes"),
              "Upsert tensors directly from pre-allocated buffers for "
              "multiple keys. Each buffer layout: [TensorMetadata][tensor "
              "data].")

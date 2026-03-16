@@ -1952,9 +1952,10 @@ int RealClient::upsert_from(const std::string &key, void *buffer, size_t size,
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-RealClient::batch_upsert_from_internal(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
+                                       const std::vector<void *> &buffers,
+                                       const std::vector<size_t> &sizes,
+                                       const ReplicateConfig &config) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return std::vector<tl::expected<void, ErrorCode>>(

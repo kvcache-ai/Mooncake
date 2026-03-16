@@ -4298,8 +4298,7 @@ TEST_F(MasterServiceTest, UpsertNewKey) {
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     // UpsertEnd completes the operation
-    auto end_result =
-        service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
+    auto end_result = service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(end_result.has_value());
 
     // Verify replica is COMPLETE
@@ -4321,8 +4320,7 @@ TEST_F(MasterServiceTest, UpsertSameSize) {
     config.replica_num = 1;
 
     // First: PutStart + PutEnd to create the object
-    auto put_result =
-        service_->PutStart(client_id, key, slice_length, config);
+    auto put_result = service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_result.has_value());
     auto original_replicas = put_result.value();
     auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -4338,9 +4336,11 @@ TEST_F(MasterServiceTest, UpsertSameSize) {
     EXPECT_EQ(ReplicaStatus::PROCESSING, upsert_replicas[0].status);
 
     // Verify same buffer address (in-place reuse)
-    EXPECT_EQ(original_replicas[0].get_memory_descriptor()
+    EXPECT_EQ(original_replicas[0]
+                  .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
-              upsert_replicas[0].get_memory_descriptor()
+              upsert_replicas[0]
+                  .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_);
 
     // UpsertEnd with the new client_id
@@ -4379,14 +4379,12 @@ TEST_F(MasterServiceTest, UpsertSameSizeRefreshesMetadata) {
     ASSERT_TRUE(upsert_result.has_value());
 
     // UpsertEnd with client_a should fail (client_id was refreshed to client_b)
-    auto end_fail =
-        service_->UpsertEnd(client_id_a, key, ReplicaType::MEMORY);
+    auto end_fail = service_->UpsertEnd(client_id_a, key, ReplicaType::MEMORY);
     EXPECT_FALSE(end_fail.has_value());
     EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, end_fail.error());
 
     // UpsertEnd with client_b should succeed
-    auto end_ok =
-        service_->UpsertEnd(client_id_b, key, ReplicaType::MEMORY);
+    auto end_ok = service_->UpsertEnd(client_id_b, key, ReplicaType::MEMORY);
     ASSERT_TRUE(end_ok.has_value());
 }
 
@@ -4403,8 +4401,7 @@ TEST_F(MasterServiceTest, UpsertDifferentSize) {
     config.replica_num = 1;
 
     // Create object with original_size
-    auto put_result =
-        service_->PutStart(client_id, key, original_size, config);
+    auto put_result = service_->PutStart(client_id, key, original_size, config);
     ASSERT_TRUE(put_result.has_value());
     auto original_replicas = put_result.value();
     auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -4419,14 +4416,15 @@ TEST_F(MasterServiceTest, UpsertDifferentSize) {
     EXPECT_EQ(ReplicaStatus::PROCESSING, new_replicas[0].status);
 
     // Buffer address should be different (reallocated)
-    EXPECT_NE(original_replicas[0].get_memory_descriptor()
+    EXPECT_NE(original_replicas[0]
+                  .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
-              new_replicas[0].get_memory_descriptor()
+              new_replicas[0]
+                  .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_);
 
     // UpsertEnd
-    auto end_result =
-        service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
+    auto end_result = service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(end_result.has_value());
 
     // Verify the object is complete
@@ -4456,15 +4454,14 @@ TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
     config.preferred_segment = "segment_1";
 
     // Create object
-    auto put_result =
-        service_->PutStart(client_id, key, slice_length, config);
+    auto put_result = service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_result.has_value());
     auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // Start a Copy
-    auto copy_result = service_->CopyStart(client_id, key, "segment_1",
-                                           {"segment_2"});
+    auto copy_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_result.has_value());
 
     // UpsertStart should fail with OBJECT_HAS_REPLICATION_TASK
@@ -4488,8 +4485,7 @@ TEST_F(MasterServiceTest, UpsertPreemptsInProgressPut) {
     config.replica_num = 1;
 
     // Client A starts a Put but doesn't finish
-    auto put_result =
-        service_->PutStart(client_a, key, slice_length, config);
+    auto put_result = service_->PutStart(client_a, key, slice_length, config);
     ASSERT_TRUE(put_result.has_value());
 
     // Client B upserts the same key — should preempt client A
@@ -4505,8 +4501,7 @@ TEST_F(MasterServiceTest, UpsertPreemptsInProgressPut) {
     EXPECT_FALSE(put_end_a.has_value());
 
     // Client B's UpsertEnd should succeed
-    auto upsert_end =
-        service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
+    auto upsert_end = service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
     ASSERT_TRUE(upsert_end.has_value());
 
     // Verify final state
@@ -4554,8 +4549,7 @@ TEST_F(MasterServiceTest, UpsertInPlaceThenRevoke) {
     config.replica_num = 1;
 
     // Create object first
-    auto put_result =
-        service_->PutStart(client_id, key, slice_length, config);
+    auto put_result = service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_result.has_value());
     auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
@@ -4587,8 +4581,7 @@ TEST_F(MasterServiceTest, BatchUpsertStart) {
     config.replica_num = 1;
 
     // Create key_1 with size 1024
-    auto put_result =
-        service_->PutStart(client_id, "key_1", 1024, config);
+    auto put_result = service_->PutStart(client_id, "key_1", 1024, config);
     ASSERT_TRUE(put_result.has_value());
     auto put_end = service_->PutEnd(client_id, "key_1", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());

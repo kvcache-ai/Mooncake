@@ -774,7 +774,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
 
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                      total_length, config, now);
+                                     total_length, config, now);
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
@@ -991,15 +991,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
         // Safety check: reject if Copy/Move in progress
         if (shard->replication_tasks.count(key) > 0) {
-            LOG(INFO) << "key=" << key
-                      << ", error=object_has_replication_task";
+            LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
         // Safety check: reject if offloading in progress
         if (shard->offloading_tasks.count(key) > 0) {
-            LOG(INFO) << "key=" << key
-                      << ", error=object_has_offloading_task";
+            LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
@@ -1059,9 +1057,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
         }
 
-        metadata.VisitReplicas(
-            &Replica::fn_is_completed,
-            [](Replica& replica) { replica.mark_processing(); });
+        metadata.VisitReplicas(&Replica::fn_is_completed, [](Replica& replica) {
+            replica.mark_processing();
+        });
 
         shard->processing_keys.insert(key);
 
@@ -1080,9 +1078,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {
         std::lock_guard lock(discarded_replicas_mutex_);
-        discarded_replicas_.emplace_back(
-            std::move(old_replicas),
-            now + put_start_release_timeout_sec_);
+        discarded_replicas_.emplace_back(std::move(old_replicas),
+                                         now + put_start_release_timeout_sec_);
     }
     shard->metadata.erase(it);
 
@@ -1104,10 +1101,10 @@ auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterService::BatchUpsertStart(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<uint64_t>& slice_lengths,
-    const ReplicateConfig& config) {
+MasterService::BatchUpsertStart(const UUID& client_id,
+                                const std::vector<std::string>& keys,
+                                const std::vector<uint64_t>& slice_lengths,
+                                const ReplicateConfig& config) {
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();

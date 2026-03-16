@@ -1621,7 +1621,8 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // Pre-create key_b (for Case B: same size) and key_c (for Case C: diff size)
+    // Pre-create key_b (for Case B: same size) and key_c (for Case C: diff
+    // size)
     std::string key_b = "batch_upsert_case_b";
     std::string key_c = "batch_upsert_case_c";
 
@@ -1633,7 +1634,8 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
         std::vector<Slice> sl;
         sl.emplace_back(Slice{buf, data_size});
         auto r = test_client_->Put(key_b, sl, config);
-        ASSERT_TRUE(r.has_value()) << "Put key_b failed: " << toString(r.error());
+        ASSERT_TRUE(r.has_value())
+            << "Put key_b failed: " << toString(r.error());
         client_buffer_allocator_->deallocate(buf, data_size);
     }
 
@@ -1645,7 +1647,8 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
         std::vector<Slice> sl;
         sl.emplace_back(Slice{buf, data_size});
         auto r = test_client_->Put(key_c, sl, config);
-        ASSERT_TRUE(r.has_value()) << "Put key_c failed: " << toString(r.error());
+        ASSERT_TRUE(r.has_value())
+            << "Put key_c failed: " << toString(r.error());
         client_buffer_allocator_->deallocate(buf, data_size);
     }
 
@@ -1706,8 +1709,7 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
         sl.emplace_back(Slice{buf, sz});
         auto get_result = test_client_->Get(key, sl);
         EXPECT_TRUE(get_result.has_value())
-            << "Get failed for " << key << ": "
-            << toString(get_result.error());
+            << "Get failed for " << key << ": " << toString(get_result.error());
         if (get_result.has_value()) {
             EXPECT_EQ(sl[0].size, sz);
             EXPECT_EQ(memcmp(sl[0].ptr, expected.data(), sz), 0)

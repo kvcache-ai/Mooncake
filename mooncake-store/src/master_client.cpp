@@ -613,9 +613,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
     timer.LogRequest("keys_count=", keys.size());
 
-    auto result =
-        invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
-            keys.size(), client_id_, keys);
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
+        keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

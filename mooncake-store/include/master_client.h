@@ -205,7 +205,8 @@ class MasterClient {
      * @return Replica descriptors on success, ErrorCode on failure
      */
     [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-    UpsertStart(const std::string& key, const std::vector<size_t>& slice_lengths,
+    UpsertStart(const std::string& key,
+                const std::vector<size_t>& slice_lengths,
                 const ReplicateConfig& config);
 
     [[nodiscard]] std::vector<
