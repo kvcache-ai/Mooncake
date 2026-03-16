@@ -295,8 +295,9 @@ struct ClientMetric {
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
-    explicit ClientMetric(uint64_t interval_seconds = 0,
-                          const std::map<std::string, std::string>& labels = {});
+    explicit ClientMetric(
+        uint64_t interval_seconds = 0,
+        const std::map<std::string, std::string>& labels = {});
     ~ClientMetric();
 
    private:
