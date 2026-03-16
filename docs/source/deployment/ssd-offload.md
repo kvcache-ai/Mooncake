@@ -55,7 +55,7 @@ store.setup(
     local_hostname="<machine IP>",
     metadata_server="P2PHANDSHAKE",
     global_segment_size=4 * 1024 * 1024 * 1024,   # 4 GB
-    local_buffer_size=512 * 1024 * 1024,           # 512 MB
+    local_buffer_size=512 * 1024 * 1024, #512MB
     protocol="rdma",
     device_name="eth0",
     master_server_address="127.0.0.1:50051",
@@ -182,12 +182,13 @@ export MOONCAKE_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
 export MOONCAKE_BUCKET_EVICTION_POLICY=lru
 
 mooncake_client \
-    --master_server_address=192.168.1.10:50051 \
-    --host=192.168.1.10 \
-    --device_names=eth0 \
+    --master_server_address="192.168.1.10:50051" \
+    --host="192.168.1.10" \
+    --device_names="eth0" \
     --port=50052 \
-    --global_segment_size="4 GB" \
-    --enable_offload=true
+    --protocol="rdma" \
+    --global_segment_size="4GB" \
+    --enable_offload="true"
 ```
 
 ---
@@ -207,24 +208,28 @@ mooncake_master --rpc_port=50051 --enable-offload true &
 
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 mooncake_client \
-    --master_server_address=192.168.1.10:50051 \
-    --host=192.168.1.10 \        # externally reachable IP of Node A
-    --device_names=eth0 \
+    --master_server_address="192.168.1.10:50051" \
+    --host="192.168.1.10" \        # externally reachable IP of Node A
+    --device_names="eth0" \
+    --protocol="rdma" \
+    --metadata_server="P2PHANDSHAKE" \
     --port=50052 \
-    --global_segment_size="4 GB" \
-    --enable_offload=true
+    --global_segment_size="4GB" \
+    --enable_offload="true"
 ```
 
 ```bash
 # Node B — real client only; points to the same master on Node A
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 mooncake_client \
-    --master_server_address=192.168.1.10:50051 \
-    --host=192.168.1.11 \        # externally reachable IP of Node B, NOT 127.0.0.1
-    --device_names=eth0 \
+    --master_server_address="192.168.1.10:50051" \
+    --host="192.168.1.11" \        # externally reachable IP of Node B, NOT 127.0.0.1
+    --device_names="eth0" \
+    --protocol="rdma" \
+    --metadata_server="P2PHANDSHAKE" \
     --port=50052 \
-    --global_segment_size="4 GB" \
-    --enable_offload=true
+    --global_segment_size="4GB" \
+    --enable_offload="true"
 ```
 
 ---
