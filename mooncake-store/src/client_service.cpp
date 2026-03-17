@@ -203,8 +203,8 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     }};
 }
 
-tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
-                                                        size_t length) {
+tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
+    const void* addr, size_t length, const std::string& protocol) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -213,12 +213,14 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
         LOG(ERROR) << "length is 0";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Tcp is not limited by max_mr_size, but we ignore it for now.
-    auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
-    if (length > max_mr_size) {
-        LOG(ERROR) << "length " << length
-                   << " is larger than max_mr_size: " << max_mr_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Only RDMA is limited by max_mr_size due to ibv_reg_mr() hardware limits.
+    if (protocol == "rdma") {
+        auto max_mr_size = globalConfig().max_mr_size;
+        if (length > max_mr_size) {
+            LOG(ERROR) << "length " << length
+                       << " is larger than max_mr_size: " << max_mr_size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
     return {};
 }
@@ -2039,7 +2041,7 @@ std::vector<int> Client::GetNicNumaNodes() const {
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
-    auto check_result = CheckRegisterMemoryParams(buffer, size);
+    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol_);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -2148,7 +2150,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
-    auto check_result = CheckRegisterMemoryParams(addr, length);
+    auto check_result = CheckRegisterMemoryParams(addr, length, protocol_);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }

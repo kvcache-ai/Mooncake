@@ -434,10 +434,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    // If global_segment_size is 0, skip mount segment;
-    // If global_segment_size is larger than max_mr_size, split to multiple
-    // mapped_shms.
-    if (protocol == "cxl") {
+    if (global_segment_size == 0) {
+        LOG(INFO) << "Global segment size is 0, skip mounting segment";
+    } else if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
         if (env) {
@@ -459,11 +458,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
-
     } else {
-        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-        uint64_t total_glbseg_size = global_segment_size;  // For logging
-        uint64_t current_glbseg_size = 0;                  // For logging
+        // Only RDMA needs splitting due to ibv_reg_mr() hardware limits.
+        // Other transports mount as a single segment to avoid unnecessary
+        // allocator fragmentation. RDMA splits into equal-sized segments
+        // for balanced allocation (e.g. 1.4TB → 2×0.7TB).
+        size_t max_segment_size = (protocol == "rdma")
+                                      ? globalConfig().max_mr_size
+                                      : global_segment_size;
+        size_t num_segments =
+            (global_segment_size + max_segment_size - 1) / max_segment_size;
 
         // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
         // and distribute global_segment across them for full NIC utilization.
@@ -483,12 +487,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        while (global_segment_size > 0) {
-            size_t segment_size = std::min(global_segment_size, max_mr_size);
-            global_segment_size -= segment_size;
-            current_glbseg_size += segment_size;
+        size_t remaining = global_segment_size;
+        for (size_t i = 0; i < num_segments; i++) {
+            size_t segment_size = remaining / (num_segments - i);
+            remaining -= segment_size;
             LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                      << current_glbseg_size << " of " << total_glbseg_size;
+                      << (global_segment_size - remaining) << " of "
+                      << global_segment_size;
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
@@ -536,9 +541,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
             }
-        }
-        if (total_glbseg_size == 0) {
-            LOG(INFO) << "Global segment size is 0, skip mounting segment";
         }
     }
 
