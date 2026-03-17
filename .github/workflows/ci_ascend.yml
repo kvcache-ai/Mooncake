@@ -51,6 +51,7 @@ jobs:
                 echo "Detected that extern/pybind11 already exists, continuing execution...."
             fi
         fi
+        bash scripts/ascend/dependencies_ascend_installation.sh
         echo "Configuring CMake..."
         rm -rf build
         mkdir -p build
