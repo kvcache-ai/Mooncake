@@ -127,6 +127,7 @@ SYSTEM_PACKAGES="build-essential \
                   libmsgpack-dev \
                   libzstd-dev \
                   libasio-dev \
+                  libxxhash-dev \
                   pkg-config \
                   patchelf \
                   libc6-dev \
