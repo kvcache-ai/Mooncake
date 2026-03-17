@@ -76,7 +76,136 @@ std::string StorageBackend::GetActualFsdir() const {
     return actual_fsdir;
 }
 
-void StorageBackend::RecalculateAvailableSpace() {
+LocalStorageSpaceManager::LocalStorageSpaceManager(
+    std::filesystem::path storage_root)
+    : storage_root_(std::move(storage_root)) {}
+
+void LocalStorageSpaceManager::SetStorageRoot(
+    std::filesystem::path storage_root) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    storage_root_ = std::move(storage_root);
+}
+
+tl::expected<void, ErrorCode> LocalStorageSpaceManager::Init(
+    uint64_t used_space_bytes, uint64_t quota_bytes) {
+    namespace fs = std::filesystem;
+
+    std::shared_lock<std::shared_mutex> root_lock(mutex_);
+    if (storage_root_.empty()) {
+        LOG(ERROR) << "Storage root is empty for LocalStorageSpaceManager";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::error_code ec;
+    auto space_info = fs::space(storage_root_, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to query filesystem space for " << storage_root_
+                   << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    root_lock.unlock();
+
+    uint64_t total_space = quota_bytes;
+    if (total_space == 0) {
+        constexpr double kDefaultQuotaPercentage = 0.9;
+        total_space = static_cast<uint64_t>(space_info.capacity *
+                                            kDefaultQuotaPercentage);
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    total_space_ = total_space;
+    used_space_ = used_space_bytes;
+    RecalculateAvailableSpaceLocked();
+    initialized_.store(true, std::memory_order_release);
+    return {};
+}
+
+tl::expected<bool, ErrorCode> LocalStorageSpaceManager::HasPhysicalSpace(
+    uint64_t required_size) const {
+    namespace fs = std::filesystem;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        if (!initialized_.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (available_space_ < required_size) {
+            return false;
+        }
+        if (storage_root_.empty()) {
+            LOG(ERROR) << "Storage root is empty for LocalStorageSpaceManager";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    std::error_code ec;
+    const auto space_info = fs::space(storage_root_, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to query filesystem space for " << storage_root_
+                   << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return space_info.available >= required_size;
+}
+
+bool LocalStorageSpaceManager::TryReserve(uint64_t required_size) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
+        return false;
+    }
+
+    if (available_space_ < required_size) {
+        return false;
+    }
+
+    used_space_ += required_size;
+    available_space_ -= required_size;
+    return true;
+}
+
+void LocalStorageSpaceManager::Release(uint64_t size_to_release) {
+    if (size_to_release == 0) {
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
+        return;
+    }
+
+    if (size_to_release <= used_space_) {
+        used_space_ -= size_to_release;
+    } else {
+        used_space_ = 0;
+    }
+    RecalculateAvailableSpaceLocked();
+}
+
+uint64_t LocalStorageSpaceManager::TotalSpace() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return total_space_;
+}
+
+uint64_t LocalStorageSpaceManager::UsedSpace() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return used_space_;
+}
+
+uint64_t LocalStorageSpaceManager::AvailableSpace() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return available_space_;
+}
+
+bool LocalStorageSpaceManager::IsOverQuota() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return used_space_ > total_space_;
+}
+
+void LocalStorageSpaceManager::RecalculateAvailableSpaceLocked() {
     if (total_space_ >= used_space_) {
         available_space_ = total_space_ - used_space_;
     } else {
@@ -114,6 +243,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
     namespace fs = std::filesystem;
     std::string actual_fsdir = GetActualFsdir();
     fs::path storage_root = fs::path(root_dir_) / actual_fsdir;
+    space_manager_.SetStorageRoot(storage_root);
 
     std::error_code ec;
     if (!fs::exists(storage_root)) {
@@ -123,11 +253,6 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                        << storage_root;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-    }
-    const auto space_info = fs::space(storage_root, ec);
-    if (ec) {
-        LOG(ERROR) << "Init: Failed to get disk space info: " << ec.message();
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     LOG(INFO) << "Reconstructing storage state from disk at: " << storage_root;
     std::vector<fs::directory_entry> existing_files;
@@ -161,10 +286,9 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                   return stx_a.stx_btime.tv_sec < stx_b.stx_btime.tv_sec;
               });
     bool eviction_needed = false;
+    uint64_t used_space = 0;
     {
-        std::unique_lock<std::shared_mutex> space_lock(space_mutex_);
         std::unique_lock<std::shared_mutex> queue_lock(file_queue_mutex_);
-        used_space_ = 0;
 
         for (const auto& entry : existing_files) {
             uint64_t file_size = entry.file_size(ec);
@@ -172,39 +296,27 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                 const std::string& path_str = entry.path().string();
                 file_write_queue_.push_back({path_str, file_size});
                 file_queue_map_[path_str] = std::prev(file_write_queue_.end());
-                used_space_ += file_size;
+                used_space += file_size;
             } else {
                 LOG(WARNING) << "Could not get size of existing file "
                              << entry.path() << ", skipping.";
             }
         }
-        if (quota_bytes > 0) {
-            total_space_ = quota_bytes;
-        } else {
-            constexpr double kDefaultQuotaPercentage = 0.9;
-            total_space_ = static_cast<uint64_t>(space_info.capacity *
-                                                 kDefaultQuotaPercentage);
-        }
-        if (total_space_ >= used_space_) {
-            RecalculateAvailableSpace();
-        } else {
-            // Only enable eviction for local storage, not for 3FS
-            if (IsEvictionEnabled()) {
-                eviction_needed = true;
-                available_space_ = -1;
-                LOG(WARNING)
-                    << "Existing used space (" << used_space_
-                    << ") exceeds the new quota (" << total_space_
-                    << "). Eviction will be triggered after initial setup.";
-            } else {
-                // For 3FS mode, just log a warning but don't trigger eviction
-                LOG(WARNING) << "Existing used space (" << used_space_
-                             << ") exceeds the new quota (" << total_space_
-                             << "). Eviction is disabled for 3FS mode.";
-                RecalculateAvailableSpace();  // Still calculate available space
-            }
-        }
     }
+
+    auto init_space_result = space_manager_.Init(used_space, quota_bytes);
+    if (!init_space_result) {
+        return init_space_result;
+    }
+
+    if (space_manager_.IsOverQuota()) {
+        eviction_needed = true;
+        LOG(WARNING) << "Existing used space (" << space_manager_.UsedSpace()
+                     << ") exceeds the new quota ("
+                     << space_manager_.TotalSpace()
+                     << "). Eviction will be triggered after initial setup.";
+    }
+
     if (eviction_needed) {
         if (!InitQuotaEvict()) {
             LOG(ERROR) << "Initialization failed due to failure in enforcing "
@@ -214,14 +326,9 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         }
     }
 
-    {
-        std::unique_lock<std::shared_mutex> lock(space_mutex_);
-        RecalculateAvailableSpace();
-
-        LOG(INFO) << "Init: " << "Quota: " << total_space_
-                  << ", Used: " << used_space_
-                  << ", Available: " << available_space_;
-    }
+    LOG(INFO) << "Init: " << "Quota: " << space_manager_.TotalSpace()
+              << ", Used: " << space_manager_.UsedSpace()
+              << ", Available: " << space_manager_.AvailableSpace();
 
     initialized_.store(true, std::memory_order_release);
     return {};
@@ -238,7 +345,7 @@ bool StorageBackend::InitQuotaEvict() {
     size_t eviction_attempts = 0;
 
     while (eviction_attempts < kMaxEvictionAttempts) {
-        if (used_space_ <= total_space_) {
+        if (!space_manager_.IsOverQuota()) {
             break;
         }
 
@@ -251,16 +358,10 @@ bool StorageBackend::InitQuotaEvict() {
         eviction_attempts++;
     }
 
-    if (used_space_ > total_space_) {
+    if (space_manager_.IsOverQuota()) {
         LOG(ERROR) << "Could not bring storage usage under quota after "
                    << eviction_attempts << " eviction attempts.";
         return false;
-    }
-
-    // Recalculate available_space_ after eviction
-    {
-        std::unique_lock<std::shared_mutex> lock(space_mutex_);
-        RecalculateAvailableSpace();
     }
 
     return true;
@@ -768,23 +869,13 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 }
 
 bool StorageBackend::CheckDiskSpace(size_t required_size) {
-    std::unique_lock<std::shared_mutex> lock(space_mutex_);
-
-    if (!initialized_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "CheckDiskSpace called before StorageBackend::Init was "
-                      "completed.";
-        return false;
-    }
-
-    bool has_enough_space = available_space_ >= required_size;
-
+    bool has_enough_space =
+        space_manager_.TryReserve(static_cast<uint64_t>(required_size));
     if (has_enough_space) {
-        used_space_ += required_size;
-        available_space_ -= required_size;
-        VLOG(2) << "Reserved space. New available: " << available_space_
-                << ", New used (this session): " << used_space_;
+        VLOG(2) << "Reserved space. New available: "
+                << space_manager_.AvailableSpace()
+                << ", New used (this session): " << space_manager_.UsedSpace();
     }
-
     return has_enough_space;
 }
 
@@ -894,24 +985,7 @@ tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
 }
 
 void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
-    if (size_to_release == 0) {
-        return;
-    }
-
-    try {
-        std::unique_lock<std::shared_mutex> lock(space_mutex_);
-        if (size_to_release <= used_space_) {
-            used_space_ -= size_to_release;
-            available_space_ += size_to_release;
-        } else {
-            available_space_ += used_space_;
-            used_space_ = 0;
-        }
-
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to acquire lock while updating space tracking: "
-                   << e.what();
-    }
+    space_manager_.Release(size_to_release);
 }
 
 StorageBackendAdaptor::StorageBackendAdaptor(
@@ -1209,7 +1283,8 @@ BucketStorageBackend::BucketStorageBackend(
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      bucket_backend_config_(bucket_backend_config_) {}
+      bucket_backend_config_(bucket_backend_config_),
+      space_manager_(storage_path_) {}
 
 BucketStorageBackend::~BucketStorageBackend() { StopDeletionWorker(); }
 
@@ -1341,6 +1416,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         if (initialized_.load(std::memory_order_acquire)) {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        std::error_code ec;
+        if (!fs::exists(storage_path_)) {
+            fs::create_directories(storage_path_, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to create bucket storage directory: "
+                           << storage_path_ << ", error: " << ec.message();
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
         }
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
@@ -1492,6 +1576,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                       << orphaned_files_count
                       << " orphaned bucket file(s), freed "
                       << orphaned_space_freed << " bytes";
+        }
+
+        auto init_space_result =
+            space_manager_.Init(static_cast<uint64_t>(total_size_));
+        if (!init_space_result) {
+            return init_space_result;
         }
 
         bucket_id_generator_.emplace(max_bucket_id);
@@ -1660,6 +1750,8 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
     int64_t bucket_id) {
     size_t freed_size = 0;
     size_t key_count = 0;
+    uint64_t data_bytes = 0;
+    uint64_t meta_bytes = 0;
     uint64_t queued_delete_bytes = 0;
 
     {
@@ -1688,7 +1780,9 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
 
         // Metadata remains counted until the bucket itself is evicted.
         total_size_ -= bucket_meta->meta_size;
-        queued_delete_bytes = bucket_meta->data_size + bucket_meta->meta_size;
+        data_bytes = static_cast<uint64_t>(bucket_meta->data_size);
+        meta_bytes = static_cast<uint64_t>(bucket_meta->meta_size);
+        queued_delete_bytes = data_bytes + meta_bytes;
 
         buckets_.erase(bucket_it);
         bucket_valid_keys_.erase(bucket_id);
@@ -1709,8 +1803,8 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
     }
 
     EnqueueBucketDeletion(PendingBucketDeletion{
-        bucket_id, queued_delete_bytes, std::move(data_path_res.value()),
-        std::move(meta_path_res.value())});
+        bucket_id, data_bytes, meta_bytes, queued_delete_bytes,
+        std::move(data_path_res.value()), std::move(meta_path_res.value())});
 
     LOG(INFO) << "Evicted bucket " << bucket_id << " with " << key_count
               << " keys, freed " << freed_size
@@ -1748,8 +1842,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::CanAcceptAnotherBucket()
     const {
-    namespace fs = std::filesystem;
-
     const uint64_t pending_bytes =
         pending_deletion_bytes_.load(std::memory_order_acquire);
     const uint64_t pending_count =
@@ -1762,19 +1854,17 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::CanAcceptAnotherBucket()
         return false;
     }
 
-    std::error_code ec;
-    auto space_info = fs::space(storage_path_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to query bucket backend disk space for "
-                   << storage_path_ << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
     const uint64_t required_space =
         static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
-    if (space_info.available < required_space) {
+    auto physical_space_result =
+        space_manager_.HasPhysicalSpace(required_space);
+    if (!physical_space_result) {
+        return tl::make_unexpected(physical_space_result.error());
+    }
+
+    if (!physical_space_result.value()) {
         LOG(WARNING) << "Insufficient physical disk space for next bucket: "
-                     << "available=" << space_info.available
+                     << "available_quota=" << space_manager_.AvailableSpace()
                      << ", required=" << required_space
                      << ", pending_delete_bytes=" << pending_bytes
                      << ", pending_delete_count=" << pending_count;
@@ -1845,20 +1935,45 @@ void BucketStorageBackend::BucketDeletionWorker() {
         }
 
         std::error_code ec;
+        bool release_data_space = false;
         fs::remove(task.data_path, ec);
         if (ec) {
-            LOG(WARNING) << "Failed to remove bucket data file: "
-                         << task.data_path << ", bucket_id=" << task.bucket_id
-                         << ", error: " << ec.message();
+            if (ec == std::errc::no_such_file_or_directory) {
+                release_data_space = true;
+            } else {
+                LOG(WARNING)
+                    << "Failed to remove bucket data file: " << task.data_path
+                    << ", bucket_id=" << task.bucket_id
+                    << ", error: " << ec.message();
+            }
+        } else {
+            release_data_space = true;
         }
 
         ec.clear();
+        bool release_meta_space = false;
         fs::remove(task.meta_path, ec);
         if (ec) {
-            LOG(WARNING) << "Failed to remove bucket metadata file: "
-                         << task.meta_path << ", bucket_id=" << task.bucket_id
-                         << ", error: " << ec.message();
+            if (ec == std::errc::no_such_file_or_directory) {
+                release_meta_space = true;
+            } else {
+                LOG(WARNING)
+                    << "Failed to remove bucket metadata file: "
+                    << task.meta_path << ", bucket_id=" << task.bucket_id
+                    << ", error: " << ec.message();
+            }
+        } else {
+            release_meta_space = true;
         }
+
+        uint64_t released_bytes = 0;
+        if (release_data_space) {
+            released_bytes += task.data_bytes;
+        }
+        if (release_meta_space) {
+            released_bytes += task.meta_bytes;
+        }
+        space_manager_.Release(released_bytes);
 
         pending_deletion_count_.fetch_sub(1, std::memory_order_acq_rel);
         pending_deletion_bytes_.fetch_sub(task.queued_bytes,
@@ -2007,13 +2122,56 @@ BucketStorageBackend::BuildBucket(
     return bucket;
 }
 
+tl::expected<std::string, ErrorCode>
+BucketStorageBackend::SerializeBucketMetadata(
+    const std::shared_ptr<BucketMetadata>& bucket_metadata) {
+    if (!bucket_metadata) {
+        LOG(ERROR) << "Bucket metadata is null";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::string serialized_metadata;
+    struct_pb::to_pb(*bucket_metadata, serialized_metadata);
+    return serialized_metadata;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
     namespace fs = std::filesystem;
+
+    auto serialized_metadata_result = SerializeBucketMetadata(bucket_metadata);
+    if (!serialized_metadata_result) {
+        return tl::make_unexpected(serialized_metadata_result.error());
+    }
+    std::string serialized_metadata =
+        std::move(serialized_metadata_result.value());
+    bucket_metadata->meta_size = serialized_metadata.size();
+
+    const uint64_t reserved_size = static_cast<uint64_t>(
+        bucket_metadata->data_size + bucket_metadata->meta_size);
+    auto physical_space_result = space_manager_.HasPhysicalSpace(reserved_size);
+    if (!physical_space_result) {
+        return tl::make_unexpected(physical_space_result.error());
+    }
+    if (!physical_space_result.value()) {
+        LOG(ERROR) << "Insufficient physical disk space for bucket write: "
+                   << "bucket_id=" << bucket_id
+                   << ", required=" << reserved_size
+                   << ", available=" << space_manager_.AvailableSpace();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!space_manager_.TryReserve(reserved_size)) {
+        LOG(ERROR) << "Failed to reserve bucket write space: bucket_id="
+                   << bucket_id << ", required=" << reserved_size
+                   << ", available=" << space_manager_.AvailableSpace();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
+        space_manager_.Release(reserved_size);
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto bucket_data_path = bucket_data_path_res.value();
@@ -2021,6 +2179,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: "
                    << bucket_data_path;
+        space_manager_.Release(reserved_size);
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
@@ -2029,6 +2188,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     if (!write_result) {
         LOG(ERROR) << "vector_write failed for: " << bucket_id
                    << ", error: " << write_result.error();
+        space_manager_.Release(reserved_size);
         return tl::make_unexpected(write_result.error());
     }
     if (static_cast<int64_t>(write_result.value()) !=
@@ -2036,10 +2196,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
                    << ", expected: " << bucket_metadata->data_size
                    << ", got: " << write_result.value();
+        space_manager_.Release(reserved_size);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     auto store_bucket_metadata_result =
-        StoreBucketMetadata(bucket_id, bucket_metadata);
+        StoreBucketMetadata(bucket_id, serialized_metadata);
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
@@ -2056,13 +2217,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << bucket_data_path << ", error: " << ec.message();
         }
 
+        auto meta_path_res = GetBucketMetadataPath(bucket_id);
+        if (meta_path_res) {
+            ec.clear();
+            fs::remove(meta_path_res.value(), ec);
+        }
+        space_manager_.Release(reserved_size);
+
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
-    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
+    int64_t id, const std::string& serialized_metadata) {
     auto meta_path_res = GetBucketMetadataPath(id);
     if (!meta_path_res) {
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
@@ -2075,21 +2243,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
+    auto write_result =
+        file->write(serialized_metadata, serialized_metadata.size());
     if (!write_result) {
         LOG(ERROR) << "Write failed for: " << meta_path
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
-    if (write_result.value() != str.size()) {
+    if (write_result.value() != serialized_metadata.size()) {
         LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
+                   << ", expected: " << serialized_metadata.size()
                    << ", got: " << write_result.value();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    metadata->meta_size = str.size();
     return {};
 }
 

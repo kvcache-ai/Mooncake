@@ -7,6 +7,7 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -148,6 +149,43 @@ class StorageBackendInterface {
     }
 
     FileStorageConfig file_storage_config_;
+};
+
+class LocalStorageSpaceManager {
+   public:
+    explicit LocalStorageSpaceManager(
+        std::filesystem::path storage_root = std::filesystem::path());
+
+    void SetStorageRoot(std::filesystem::path storage_root);
+
+    tl::expected<void, ErrorCode> Init(uint64_t used_space_bytes,
+                                       uint64_t quota_bytes = 0);
+
+    tl::expected<bool, ErrorCode> HasPhysicalSpace(
+        uint64_t required_size) const;
+
+    bool TryReserve(uint64_t required_size);
+
+    void Release(uint64_t size_to_release);
+
+    uint64_t TotalSpace() const;
+
+    uint64_t UsedSpace() const;
+
+    uint64_t AvailableSpace() const;
+
+    bool IsOverQuota() const;
+
+   private:
+    void RecalculateAvailableSpaceLocked();
+
+   private:
+    std::filesystem::path storage_root_;
+    mutable std::shared_mutex mutex_;
+    uint64_t total_space_ = 0;
+    uint64_t used_space_ = 0;
+    uint64_t available_space_ = 0;
+    std::atomic<bool> initialized_{false};
 };
 
 /**
@@ -350,14 +388,8 @@ class StorageBackend {
     mutable std::shared_mutex
         file_queue_mutex_;  // Mutex to protect file queue operations
 
-    // Storage space tracking variables
-    mutable std::shared_mutex
-        space_mutex_;               // Mutex to protect space tracking variables
-    uint64_t total_space_ = 0;      // Total storage space in bytes
-    uint64_t used_space_ = 0;       // Used storage space in bytes
-    uint64_t available_space_ = 0;  // Available storage space in bytes
-
     std::atomic<bool> initialized_{false};
+    LocalStorageSpaceManager space_manager_;
 
     /**
      * @brief Make sure the path is valid and create necessary directories
@@ -424,12 +456,6 @@ class StorageBackend {
      * @param size_to_release The amount of space, in bytes, to be released.
      */
     void ReleaseSpace(uint64_t size_to_release);
-
-    /**
-     * @brief Recalculates available_space_ based on total_space_ and
-     * used_space_. Must be called with space_mutex_ locked.
-     */
-    void RecalculateAvailableSpace();
 
     /**
      * @brief Gets the actual filesystem directory name by removing "moon_"
@@ -717,7 +743,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
-        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+        int64_t bucket_id, const std::string& serialized_metadata);
+
+    tl::expected<std::string, ErrorCode> SerializeBucketMetadata(
+        const std::shared_ptr<BucketMetadata>& bucket_metadata);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
@@ -750,6 +779,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     struct PendingBucketDeletion {
         int64_t bucket_id;
+        uint64_t data_bytes;
+        uint64_t meta_bytes;
         uint64_t queued_bytes;
         std::string data_path;
         std::string meta_path;
@@ -791,6 +822,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+    LocalStorageSpaceManager space_manager_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
