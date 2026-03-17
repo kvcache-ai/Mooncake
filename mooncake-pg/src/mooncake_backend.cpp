@@ -80,17 +80,17 @@ MooncakeBackend::MooncakeBackend(
     const int size = distBackendOpts.group_size;
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
 
-    // Use separate locations for data-plane GPU buffers and host-side
-    // control buffers. Host pointers must not be registered as gpu:<device>.
-    std::string data_location = kWildcardLocation;
-    std::string host_location = kWildcardLocation;
+    // Get device data
+    std::string location;
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
-    if (!isCpu_ && err == cudaSuccess && deviceCount > 0) {
+    if (err != cudaSuccess || deviceCount == 0) {
+        location = kWildcardLocation;
+    } else {
         int deviceId_;
         err = cudaGetDevice(&deviceId_);
         TORCH_CHECK(!err, c10::str("Failed to get device id"));
-        data_location = GPU_PREFIX + std::to_string(deviceId_);
+        location = GPU_PREFIX + std::to_string(deviceId_);
     }
 
     // Initialize transfer engine
@@ -118,7 +118,7 @@ MooncakeBackend::MooncakeBackend(
                         c10::str("Failed to allocate CPU send buffer"));
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                  data_location);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -128,7 +128,7 @@ MooncakeBackend::MooncakeBackend(
                         c10::str("Failed to allocate CPU recv buffer"));
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                  data_location);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -138,7 +138,7 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                  data_location);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -147,7 +147,7 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                  data_location);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     }
@@ -157,17 +157,15 @@ MooncakeBackend::MooncakeBackend(
                 "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_->registerLocalMemory(cpu_sync_send_region_[i],
-                                              kMaxNumRanks * sizeof(int32_t),
-                                              host_location);
+        int rc = engine_->registerLocalMemory(
+            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), location);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_->registerLocalMemory(cpu_sync_recv_region_[i],
-                                              kMaxNumRanks * sizeof(int32_t),
-                                              host_location);
+        int rc = engine_->registerLocalMemory(
+            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), location);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
@@ -184,6 +182,7 @@ MooncakeBackend::MooncakeBackend(
         worker_ = worker_mgr.GetCPUWorker();
     else
         worker_ = worker_mgr.GetCUDAWorker(cuda_device_index);
+    worker_->Start();
 
     p2p_proxy_ = std::make_shared<P2PProxy>(
         engine_, P2PProxy::Options{
@@ -196,7 +195,7 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, host_location, store,
+        backendIndex_, rank, size, local2global_rank_map_, location, store,
         meta_, p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];

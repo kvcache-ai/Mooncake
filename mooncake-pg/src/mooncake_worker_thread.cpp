@@ -12,6 +12,13 @@ enum WorkerTaskStatus {
     DONE = 3,
 };
 
+void MooncakeWorker::Start() {
+    bool expected = false;
+    if (started_.compare_exchange_strong(expected, true)) {
+        startWorker();
+    }
+}
+
 void MooncakeWorker::startWorker() {
     running_ = true;
     std::thread([this] {
@@ -269,7 +276,6 @@ std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetWorker(
     }
     auto worker = std::make_shared<MooncakeWorker>(worker_id);
     workers_[worker_id] = worker;
-    worker->startWorker();
     return worker;
 }
 

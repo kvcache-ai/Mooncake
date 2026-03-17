@@ -82,16 +82,19 @@ class MooncakeWorker {
         const std::function<void(void* src, size_t pos, size_t realSize)>&
             bufferToTensor);
 
-    void startWorker();
+    void Start();
 
-    void stopWorker() { running_ = false; }
+    void Stop() { running_ = false; }
 
    private:
+    void startWorker();
+
     static constexpr size_t kNumTasks_ = 4;
 
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
 
     bool running_ = false;
+    std::atomic<bool> started_{false};
     int cuda_device_index_;
 
     Task *tasks_, *tasks_device_;
