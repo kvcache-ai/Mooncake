@@ -2,9 +2,12 @@
 
 #include <glog/logging.h>
 
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "file_interface.h"
@@ -554,6 +557,7 @@ class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
+    ~BucketStorageBackend();
 
     /**
      * @brief Offload objects in batches
@@ -743,6 +747,20 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> HasNext();
 
+    struct PendingBucketDeletion {
+        int64_t bucket_id;
+        std::string data_path;
+        std::string meta_path;
+    };
+
+    void StartDeletionWorker();
+
+    void StopDeletionWorker();
+
+    void EnqueueBucketDeletion(PendingBucketDeletion task);
+
+    void BucketDeletionWorker();
+
    private:
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
@@ -774,6 +792,12 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Track valid key count per bucket for fragmentation calculation
     std::unordered_map<int64_t, int> GUARDED_BY(mutex_) bucket_valid_keys_;
+
+    std::mutex deletion_mutex_;
+    std::condition_variable deletion_cv_;
+    std::deque<PendingBucketDeletion> pending_bucket_deletions_;
+    std::thread deletion_thread_;
+    bool stop_deletion_worker_ = false;
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>

@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
+#include <chrono>
 #include <filesystem>
+#include <thread>
 
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/tiered_backend.h"
@@ -35,6 +37,37 @@ class StorageTierTest : public ::testing::Test {
         return reader->parse(json_str.c_str(),
                              json_str.c_str() + json_str.size(), &config,
                              &errors);
+    }
+
+    bool WaitForNoFilesWithExtension(
+        const fs::path& dir, const std::string& extension,
+        std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            bool found = false;
+            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (entry.path().extension() == extension) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    }
+
+    int CountFilesWithExtension(const fs::path& dir,
+                                const std::string& extension) {
+        int count = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.path().extension() == extension) {
+                ++count;
+            }
+        }
+        return count;
     }
 };
 
@@ -272,16 +305,12 @@ TEST_F(StorageTierTest, BucketEviction) {
     ASSERT_TRUE(exist_res.has_value());
     EXPECT_FALSE(exist_res.value()) << "key3 should not exist after eviction";
 
-    // Verify physical files are deleted
-    bool bucket_file_exists = false;
-    bool meta_file_exists = false;
-    for (const auto& entry : fs::recursive_directory_iterator(
-             "/tmp/mooncake_test_bucket_eviction")) {
-        if (entry.path().extension() == ".bucket") bucket_file_exists = true;
-        if (entry.path().extension() == ".meta") meta_file_exists = true;
-    }
-    EXPECT_FALSE(bucket_file_exists) << "Bucket file should be deleted";
-    EXPECT_FALSE(meta_file_exists) << "Meta file should be deleted";
+    // Physical deletion is asynchronous; verify eventual removal instead of
+    // checking synchronously on the eviction path.
+    EXPECT_TRUE(WaitForNoFilesWithExtension(
+        "/tmp/mooncake_test_bucket_eviction", ".bucket"));
+    EXPECT_TRUE(WaitForNoFilesWithExtension(
+        "/tmp/mooncake_test_bucket_eviction", ".meta"));
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_bucket_eviction");
@@ -362,18 +391,13 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
     // (they were removed from the bucket that was evicted)
     // Note: We can't use backend.Get() because it might return from
     // pending_batch Instead, verify that bucket files were deleted
-    int bucket_files_count = 0;
-    for (const auto& entry :
-         fs::recursive_directory_iterator("/tmp/mooncake_test_auto_eviction")) {
-        if (entry.path().extension() == ".bucket") {
-            bucket_files_count++;
-        }
-    }
+    EXPECT_TRUE(WaitForNoFilesWithExtension("/tmp/mooncake_test_auto_eviction",
+                                            ".bucket"));
+    EXPECT_TRUE(WaitForNoFilesWithExtension("/tmp/mooncake_test_auto_eviction",
+                                            ".meta"));
 
-    // After eviction, there should be fewer bucket files
-    // (originally had 2 buckets with 10 keys each, evicted 1)
-    EXPECT_EQ(bucket_files_count, 0)
-        << "All buckets should have been evicted, found " << bucket_files_count;
+    int bucket_files_count =
+        CountFilesWithExtension("/tmp/mooncake_test_auto_eviction", ".bucket");
     LOG(INFO) << "After eviction, " << bucket_files_count
               << " bucket files remain";
 

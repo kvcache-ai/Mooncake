@@ -9,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -217,8 +218,8 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         std::unique_lock<std::shared_mutex> lock(space_mutex_);
         RecalculateAvailableSpace();
 
-        LOG(INFO) << "Init: "
-                  << "Quota: " << total_space_ << ", Used: " << used_space_
+        LOG(INFO) << "Init: " << "Quota: " << total_space_
+                  << ", Used: " << used_space_
                   << ", Available: " << available_space_;
     }
 
@@ -1210,6 +1211,8 @@ BucketStorageBackend::BucketStorageBackend(
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {}
 
+BucketStorageBackend::~BucketStorageBackend() { StopDeletionWorker(); }
+
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -1476,8 +1479,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 orphaned_space_freed += file_size;
                 LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
                              << entry.path().string() << " (size: " << file_size
-                             << " bytes, "
-                             << "bucket_id: " << bucket_id << ")";
+                             << " bytes, " << "bucket_id: " << bucket_id << ")";
             } else if (cleanup_ec) {
                 LOG(ERROR) << "Failed to remove orphaned bucket file: "
                            << entry.path().string()
@@ -1501,6 +1503,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
+        StartDeletionWorker();
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
@@ -1569,8 +1572,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
         if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: "
-                       << "bucket_id=" << bucket_it->first
+            LOG(ERROR) << "Bucket key count exceeds limit: " << "bucket_id="
+                       << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
@@ -1646,61 +1649,61 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::SelectBucketForEviction()
 
 tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
     int64_t bucket_id) {
-    SharedMutexLocker lock(&mutex_);
-
-    // Find bucket metadata
-    auto bucket_it = buckets_.find(bucket_id);
-    if (bucket_it == buckets_.end()) {
-        LOG(ERROR) << "Bucket " << bucket_id << " not found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    auto bucket_meta = bucket_it->second;
     size_t freed_size = 0;
+    size_t key_count = 0;
 
-    // Remove all keys from object_bucket_map_ and calculate freed size
-    for (const auto& key : bucket_meta->keys) {
-        auto obj_it = object_bucket_map_.find(key);
-        if (obj_it != object_bucket_map_.end()) {
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        // Find bucket metadata
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(ERROR) << "Bucket " << bucket_id << " not found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+
+        auto bucket_meta = bucket_it->second;
+        key_count = bucket_meta->keys.size();
+
+        // Remove all live keys from object_bucket_map_ and calculate freed size
+        for (const auto& key : bucket_meta->keys) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it == object_bucket_map_.end()) {
+                continue;
+            }
             freed_size += obj_it->second.data_size;
             total_size_ -= obj_it->second.data_size;
             object_bucket_map_.erase(obj_it);
         }
+
+        // Metadata remains counted until the bucket itself is evicted.
+        total_size_ -= bucket_meta->meta_size;
+
+        buckets_.erase(bucket_it);
+        bucket_valid_keys_.erase(bucket_id);
     }
 
-    // Remove bucket from buckets_ map
-    buckets_.erase(bucket_it);
-
-    // Remove from valid_keys tracking
-    bucket_valid_keys_.erase(bucket_id);
-
-    // Delete physical files
-    namespace fs = std::filesystem;
     auto data_path_res = GetBucketDataPath(bucket_id);
-    if (data_path_res) {
-        std::error_code ec;
-        fs::remove(data_path_res.value(), ec);
-        if (ec) {
-            LOG(WARNING) << "Failed to remove bucket data file: "
-                         << data_path_res.value()
-                         << ", error: " << ec.message();
-        }
+    if (!data_path_res) {
+        LOG(ERROR) << "Failed to build data path for bucket " << bucket_id
+                   << ": " << data_path_res.error();
+        return tl::make_unexpected(data_path_res.error());
     }
 
     auto meta_path_res = GetBucketMetadataPath(bucket_id);
-    if (meta_path_res) {
-        std::error_code ec;
-        fs::remove(meta_path_res.value(), ec);
-        if (ec) {
-            LOG(WARNING) << "Failed to remove bucket metadata file: "
-                         << meta_path_res.value()
-                         << ", error: " << ec.message();
-        }
+    if (!meta_path_res) {
+        LOG(ERROR) << "Failed to build metadata path for bucket " << bucket_id
+                   << ": " << meta_path_res.error();
+        return tl::make_unexpected(meta_path_res.error());
     }
 
-    LOG(INFO) << "Evicted bucket " << bucket_id << " with "
-              << bucket_meta->keys.size() << " keys, freed " << freed_size
-              << " bytes";
+    EnqueueBucketDeletion(
+        PendingBucketDeletion{bucket_id, std::move(data_path_res.value()),
+                              std::move(meta_path_res.value())});
+
+    LOG(INFO) << "Evicted bucket " << bucket_id << " with " << key_count
+              << " keys, freed " << freed_size
+              << " bytes and scheduled async file deletion";
 
     return freed_size;
 }
@@ -1730,6 +1733,74 @@ tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(
     object_bucket_map_.erase(obj_it);
 
     return {};
+}
+
+void BucketStorageBackend::StartDeletionWorker() {
+    std::lock_guard<std::mutex> lock(deletion_mutex_);
+    if (deletion_thread_.joinable()) {
+        return;
+    }
+
+    stop_deletion_worker_ = false;
+    deletion_thread_ =
+        std::thread(&BucketStorageBackend::BucketDeletionWorker, this);
+}
+
+void BucketStorageBackend::StopDeletionWorker() {
+    {
+        std::lock_guard<std::mutex> lock(deletion_mutex_);
+        stop_deletion_worker_ = true;
+    }
+    deletion_cv_.notify_all();
+    if (deletion_thread_.joinable()) {
+        deletion_thread_.join();
+    }
+}
+
+void BucketStorageBackend::EnqueueBucketDeletion(PendingBucketDeletion task) {
+    {
+        std::lock_guard<std::mutex> lock(deletion_mutex_);
+        pending_bucket_deletions_.push_back(std::move(task));
+    }
+    deletion_cv_.notify_one();
+}
+
+void BucketStorageBackend::BucketDeletionWorker() {
+    namespace fs = std::filesystem;
+
+    for (;;) {
+        PendingBucketDeletion task;
+        {
+            std::unique_lock<std::mutex> lock(deletion_mutex_);
+            deletion_cv_.wait(lock, [this] {
+                return stop_deletion_worker_ ||
+                       !pending_bucket_deletions_.empty();
+            });
+
+            if (stop_deletion_worker_ && pending_bucket_deletions_.empty()) {
+                return;
+            }
+
+            task = std::move(pending_bucket_deletions_.front());
+            pending_bucket_deletions_.pop_front();
+        }
+
+        std::error_code ec;
+        fs::remove(task.data_path, ec);
+        if (ec) {
+            LOG(WARNING) << "Failed to remove bucket data file: "
+                         << task.data_path << ", bucket_id=" << task.bucket_id
+                         << ", error: " << ec.message();
+        }
+
+        ec.clear();
+        fs::remove(task.meta_path, ec);
+        if (ec) {
+            LOG(WARNING) << "Failed to remove bucket metadata file: "
+                         << task.meta_path << ", bucket_id=" << task.bucket_id
+                         << ", error: " << ec.message();
+        }
+    }
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
