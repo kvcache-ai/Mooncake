@@ -114,6 +114,7 @@ class MooncakeWorkerManager {
     std::shared_ptr<MooncakeWorker> GetCUDAWorker(int cuda_device_index);
 
    private:
+    std::shared_ptr<MooncakeWorker> GetWorker(int worker_id);
     static constexpr int CPUWorkerID = -1;
     std::mutex manager_mutex_;
     // Keep workers alive for the entire process lifetime because their

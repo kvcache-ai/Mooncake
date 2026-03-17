@@ -260,29 +260,26 @@ void MooncakeWorker::startWorker() {
     }).detach();
 }
 
-std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetCPUWorker() {
+std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetWorker(
+    int worker_id) {
     std::lock_guard<std::mutex> lock(manager_mutex_);
-    auto it = workers_.find(CPUWorkerID);
+    auto it = workers_.find(worker_id);
     if (it != workers_.end()) {
         return it->second;
     }
-    auto worker = std::make_shared<MooncakeWorker>(CPUWorkerID);
-    workers_[CPUWorkerID] = worker;
+    auto worker = std::make_shared<MooncakeWorker>(worker_id);
+    workers_[worker_id] = worker;
     worker->startWorker();
     return worker;
 }
 
+std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetCPUWorker() {
+    return GetWorker(CPUWorkerID);
+}
+
 std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetCUDAWorker(
     int cuda_device_index) {
-    std::lock_guard<std::mutex> lock(manager_mutex_);
-    auto it = workers_.find(cuda_device_index);
-    if (it != workers_.end()) {
-        return it->second;
-    }
-    auto worker = std::make_shared<MooncakeWorker>(cuda_device_index);
-    workers_[cuda_device_index] = worker;
-    worker->startWorker();
-    return worker;
+    return GetWorker(cuda_device_index);
 }
 
 }  // namespace mooncake
