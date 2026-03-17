@@ -8,6 +8,7 @@
 
 #include "client_wrapper.h"
 #include "e2e_utils.h"
+#include "ha/ha_backend_factory.h"
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"
@@ -27,6 +28,25 @@ constexpr int client_port_base = 12888;
 namespace mooncake {
 namespace testing {
 
+namespace {
+
+std::shared_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
+    const std::string& endpoints) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = endpoints,
+        .cluster_namespace = "",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    if (!coordinator) {
+        return nullptr;
+    }
+    return std::shared_ptr<ha::LeaderCoordinator>(
+        std::move(coordinator.value()));
+}
+
+}  // namespace
+
 class ChaosRandTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -42,10 +62,9 @@ class ChaosRandTest : public ::testing::Test {
         LOG(INFO) << "Random seed: " << FLAGS_rand_seed;
         srand(FLAGS_rand_seed);
 
-        master_view_helper_ = std::make_shared<MasterViewHelper>();
-        EXPECT_EQ(master_view_helper_->ConnectToEtcd(FLAGS_etcd_endpoints),
-                  ErrorCode::OK)
-            << "Failed to connect to etcd";
+        leader_coordinator_ = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+        ASSERT_TRUE(leader_coordinator_ != nullptr)
+            << "Failed to create HA leader coordinator";
     }
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
@@ -66,16 +85,19 @@ class ChaosRandTest : public ::testing::Test {
 
     static void WaitMasterViewChange() {
         sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
+        auto current_view = leader_coordinator_->ReadCurrentView();
+        EXPECT_TRUE(current_view.has_value()) << "Failed to read leader view";
     }
 
     static void WaitClientCrashDetection() {
         sleep(DEFAULT_CLIENT_LIVE_TTL_SEC + 5);
     }
 
-    static std::shared_ptr<MasterViewHelper> master_view_helper_;
+    static std::shared_ptr<ha::LeaderCoordinator> leader_coordinator_;
 };
 
-std::shared_ptr<MasterViewHelper> ChaosRandTest::master_view_helper_ = nullptr;
+std::shared_ptr<ha::LeaderCoordinator> ChaosRandTest::leader_coordinator_ =
+    nullptr;
 
 // Verify the system failover ability by randomly killing masters.
 // This test repeats the following steps:

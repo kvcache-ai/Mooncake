@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <future>
+#include <memory>
 #include <string>
 
 #include "etcd_helper.h"
-#include "ha_helper.h"
+#include "ha/ha_backend_factory.h"
 #include "types.h"
 
 namespace mooncake {
@@ -67,6 +69,28 @@ class HighAvailabilityTest : public ::testing::Test {
 };
 
 bool HighAvailabilityTest::etcd_available_ = false;
+
+namespace {
+
+ha::HABackendSpec MakeEtcdBackendSpec(const std::string& endpoints) {
+    return ha::HABackendSpec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = endpoints,
+        .cluster_namespace = "",
+    };
+}
+
+std::unique_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
+    const std::string& endpoints) {
+    auto coordinator =
+        ha::CreateLeaderCoordinator(MakeEtcdBackendSpec(endpoints));
+    if (!coordinator) {
+        return nullptr;
+    }
+    return std::move(coordinator.value());
+}
+
+}  // namespace
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     // == Test grant lease, create kv and get kv ==
@@ -197,34 +221,49 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
 }
 
 TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
-    MasterViewHelper mv_helper;
-    mv_helper.ConnectToEtcd(FLAGS_etcd_endpoints);
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
     std::string master_address = "0.0.0.0:8888";
-    ViewVersionId version = 0;
 
     // Initially, the master view is not set
-    ASSERT_NE(ErrorCode::OK, mv_helper.GetMasterView(master_address, version));
+    auto current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_FALSE(current_view.value().has_value());
 
-    // Elect and keep leader
-    EtcdLeaseId lease_id = 0;
-    mv_helper.ElectLeader(master_address, version, lease_id);
-    std::thread keep_alive_thread([&]() { mv_helper.KeepLeader(lease_id); });
+    auto acquire = coordinator->TryAcquireLeadership(master_address);
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
 
     // Check the master view is correctly set
-    std::string get_master_address;
-    ASSERT_EQ(ErrorCode::OK,
-              mv_helper.GetMasterView(get_master_address, version));
-    ASSERT_EQ(get_master_address, master_address);
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_TRUE(current_view.value().has_value());
+    ASSERT_EQ(current_view.value()->leader_address, master_address);
+    ASSERT_EQ(current_view.value()->view_version, session.view.view_version);
+
+    auto no_change = coordinator->WaitForViewChange(
+        session.view.view_version, std::chrono::milliseconds(200));
+    ASSERT_TRUE(no_change.has_value());
+    ASSERT_FALSE(no_change->changed);
+    ASSERT_TRUE(no_change->timed_out);
 
     // Check the master view does not change
     std::this_thread::sleep_for(
         std::chrono::seconds(ETCD_MASTER_VIEW_LEASE_TTL + 2));
-    ASSERT_EQ(ErrorCode::OK,
-              mv_helper.GetMasterView(get_master_address, version));
-    ASSERT_EQ(get_master_address, master_address);
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_TRUE(current_view.value().has_value());
+    ASSERT_EQ(current_view.value()->leader_address, master_address);
+    ASSERT_EQ(current_view.value()->view_version, session.view.view_version);
 
-    EtcdHelper::CancelKeepAlive(lease_id);
-    keep_alive_thread.join();
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
 }
 
 TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
@@ -293,7 +332,6 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
     // CreateWithLease & DeleteRange
     int64_t lease_ttl = 10;
     EtcdLeaseId lease_id;
-    EtcdRevisionId lease_rev;
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
 
     // Use DeleteRange to clear k1-k3

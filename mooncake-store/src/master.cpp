@@ -10,7 +10,7 @@
 
 #include "default_config.h"
 #include "duration_utils.h"
-#include "ha_helper.h"
+#include "ha/master_service_supervisor.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -731,7 +731,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
-        mooncake::MasterServiceSupervisor supervisor(
+        mooncake::ha::MasterServiceSupervisor supervisor(
             mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();
     } else {

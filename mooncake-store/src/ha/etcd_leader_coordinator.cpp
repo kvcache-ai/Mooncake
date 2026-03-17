@@ -1,0 +1,360 @@
+#include "ha/backends/etcd/etcd_leader_coordinator.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
+#include <optional>
+#include <thread>
+
+#include <glog/logging.h>
+#include <ylt/util/tl/expected.hpp>
+
+namespace mooncake {
+namespace ha {
+namespace backends {
+namespace etcd {
+
+namespace {
+
+constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
+
+}  // namespace
+
+EtcdLeaderCoordinator::EtcdLeaderCoordinator(const HABackendSpec& spec)
+    : spec_(spec),
+      master_view_key_(
+          BuildMasterViewKey(ResolveClusterNamespace(spec.cluster_namespace))) {
+}
+
+EtcdLeaderCoordinator::~EtcdLeaderCoordinator() { ShutdownKeepAliveThread(); }
+
+ErrorCode EtcdLeaderCoordinator::Connect() {
+    if (connected_) {
+        return ErrorCode::OK;
+    }
+
+    auto err = EtcdHelper::ConnectToEtcdStoreClient(spec_.connstring);
+    if (err == ErrorCode::OK) {
+        connected_ = true;
+    }
+    return err;
+}
+
+tl::expected<std::optional<MasterView>, ErrorCode>
+EtcdLeaderCoordinator::ReadCurrentView() {
+    auto err = EnsureConnected();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    std::string leader_address;
+    ViewVersionId view_version = 0;
+    err = EtcdHelper::Get(master_view_key_.c_str(), master_view_key_.size(),
+                          leader_address, view_version);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return std::optional<MasterView>{std::nullopt};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    return std::optional<MasterView>{
+        MasterView{.leader_address = std::move(leader_address),
+                   .view_version = view_version}};
+}
+
+tl::expected<AcquireLeadershipResult, ErrorCode>
+EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
+    auto err = EnsureConnected();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    EtcdLeaseId lease_id = 0;
+    err = EtcdHelper::GrantLease(ETCD_MASTER_VIEW_LEASE_TTL, lease_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    ViewVersionId view_version = 0;
+    err = EtcdHelper::CreateWithLease(
+        master_view_key_.c_str(), master_view_key_.size(),
+        leader_address.c_str(), leader_address.size(), lease_id, view_version);
+    if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        auto observed_view = ReadCurrentView();
+        if (!observed_view) {
+            return tl::make_unexpected(observed_view.error());
+        }
+        return AcquireLeadershipResult{
+            .status = AcquireLeadershipStatus::BUSY,
+            .session = std::nullopt,
+            .observed_view = observed_view.value(),
+        };
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    LeadershipSession session{
+        .view = MasterView{.leader_address = leader_address,
+                           .view_version = view_version},
+        .owner_token = MakeOwnerToken(lease_id),
+        .lease_ttl = std::chrono::seconds(ETCD_MASTER_VIEW_LEASE_TTL),
+    };
+
+    {
+        std::lock_guard<std::mutex> lock(keepalive_mutex_);
+        keepalive_shutdown_requested_ = false;
+    }
+
+    return AcquireLeadershipResult{
+        .status = AcquireLeadershipStatus::ACQUIRED,
+        .session = std::move(session),
+        .observed_view = std::nullopt,
+    };
+}
+
+tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
+    const LeadershipSession& session) {
+    auto err = EnsureConnected();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    auto lease_id = ParseLeaseId(session.owner_token);
+    if (!lease_id) {
+        return tl::make_unexpected(lease_id.error());
+    }
+
+    // The current etcd wrapper only exposes a blocking KeepAlive loop, not a
+    // one-shot renew RPC. Keep the adapter local to the etcd implementation so
+    // the public LeaderCoordinator contract can still stay renew-oriented.
+    std::thread thread_to_join;
+    bool should_return_false = false;
+    {
+        std::lock_guard<std::mutex> lock(keepalive_mutex_);
+        if (keepalive_shutdown_requested_) {
+            return false;
+        }
+
+        if (keepalive_thread_.joinable()) {
+            if (keepalive_owner_token_ != session.owner_token) {
+                return false;
+            }
+
+            if (keepalive_stopped_) {
+                thread_to_join = std::move(keepalive_thread_);
+                keepalive_owner_token_.clear();
+                keepalive_lease_id_ = 0;
+                should_return_false = true;
+            } else {
+                return true;
+            }
+        } else {
+            keepalive_owner_token_ = session.owner_token;
+            keepalive_lease_id_ = lease_id.value();
+            keepalive_stopped_ = false;
+            keepalive_result_ = ErrorCode::OK;
+            keepalive_thread_ = std::thread([this, lease = lease_id.value()]() {
+                auto rc = EtcdHelper::KeepAlive(lease);
+                std::lock_guard<std::mutex> lock(keepalive_mutex_);
+                keepalive_result_ = rc;
+                keepalive_stopped_ = true;
+            });
+            return true;
+        }
+    }
+
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
+    }
+
+    return !should_return_false;
+}
+
+tl::expected<ViewChangeResult, ErrorCode>
+EtcdLeaderCoordinator::WaitForViewChange(
+    std::optional<ViewVersionId> known_version,
+    std::chrono::milliseconds timeout) {
+    auto err = EnsureConnected();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+        auto current_view = ReadCurrentView();
+        if (!current_view) {
+            return tl::make_unexpected(current_view.error());
+        }
+
+        if (!IsSameViewVersion(current_view.value(), known_version)) {
+            return ViewChangeResult{
+                .changed = true,
+                .timed_out = false,
+                .current_view = current_view.value(),
+            };
+        }
+
+        if (timeout <= std::chrono::milliseconds::zero() ||
+            std::chrono::steady_clock::now() >= deadline) {
+            return ViewChangeResult{
+                .changed = false,
+                .timed_out = true,
+                .current_view = std::nullopt,
+            };
+        }
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+        std::this_thread::sleep_for(
+            std::min(kViewChangePollInterval, remaining));
+    }
+}
+
+ErrorCode EtcdLeaderCoordinator::ReleaseLeadership(
+    const LeadershipSession& session) {
+    auto lease_id = ParseLeaseId(session.owner_token);
+    if (!lease_id) {
+        return lease_id.error();
+    }
+
+    std::thread thread_to_join;
+    EtcdLeaseId lease_id_to_cancel = lease_id.value();
+    bool should_cancel = false;
+    {
+        std::lock_guard<std::mutex> lock(keepalive_mutex_);
+        if (!keepalive_owner_token_.empty() &&
+            keepalive_owner_token_ != session.owner_token) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+
+        keepalive_shutdown_requested_ = true;
+        if (!keepalive_thread_.joinable()) {
+            keepalive_owner_token_.clear();
+            keepalive_lease_id_ = 0;
+            keepalive_stopped_ = true;
+            return ErrorCode::OK;
+        }
+        if (keepalive_lease_id_ != 0) {
+            lease_id_to_cancel = keepalive_lease_id_;
+        }
+        thread_to_join = std::move(keepalive_thread_);
+        keepalive_owner_token_.clear();
+        keepalive_lease_id_ = 0;
+        keepalive_stopped_ = true;
+        should_cancel = true;
+    }
+
+    if (should_cancel) {
+        auto err = EtcdHelper::CancelKeepAlive(lease_id_to_cancel);
+        if (thread_to_join.joinable()) {
+            thread_to_join.join();
+        }
+        if (err != ErrorCode::OK && err != ErrorCode::ETCD_OPERATION_ERROR) {
+            return err;
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
+ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
+    const ClusterNamespace& cluster_namespace) {
+    if (!cluster_namespace.empty()) {
+        return cluster_namespace;
+    }
+
+    std::string resolved_namespace;
+    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
+    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
+        resolved_namespace = env_cluster_id;
+    } else {
+        resolved_namespace = "mooncake";
+    }
+    return resolved_namespace;
+}
+
+std::string EtcdLeaderCoordinator::BuildMasterViewKey(
+    const ClusterNamespace& cluster_namespace) {
+    std::string normalized = cluster_namespace;
+    if (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    return "mooncake-store/" + normalized + "/master_view";
+}
+
+tl::expected<EtcdLeaseId, ErrorCode> EtcdLeaderCoordinator::ParseLeaseId(
+    const OwnerToken& owner_token) {
+    try {
+        return static_cast<EtcdLeaseId>(std::stoll(owner_token));
+    } catch (const std::exception&) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+}
+
+OwnerToken EtcdLeaderCoordinator::MakeOwnerToken(EtcdLeaseId lease_id) {
+    return std::to_string(static_cast<int64_t>(lease_id));
+}
+
+ErrorCode EtcdLeaderCoordinator::EnsureConnected() {
+    if (connected_) {
+        return ErrorCode::OK;
+    }
+    return Connect();
+}
+
+ErrorCode EtcdLeaderCoordinator::ShutdownKeepAliveThread() {
+    std::thread thread_to_join;
+    EtcdLeaseId lease_id_to_cancel = 0;
+    bool should_cancel = false;
+
+    {
+        std::lock_guard<std::mutex> lock(keepalive_mutex_);
+        keepalive_shutdown_requested_ = true;
+        if (!keepalive_thread_.joinable()) {
+            keepalive_owner_token_.clear();
+            keepalive_lease_id_ = 0;
+            keepalive_stopped_ = true;
+            return ErrorCode::OK;
+        }
+        lease_id_to_cancel = keepalive_lease_id_;
+        thread_to_join = std::move(keepalive_thread_);
+        keepalive_owner_token_.clear();
+        keepalive_lease_id_ = 0;
+        keepalive_stopped_ = true;
+        should_cancel = true;
+    }
+
+    ErrorCode err = ErrorCode::OK;
+    if (should_cancel) {
+        err = EtcdHelper::CancelKeepAlive(lease_id_to_cancel);
+        if (thread_to_join.joinable()) {
+            thread_to_join.join();
+        }
+    }
+
+    if (err == ErrorCode::ETCD_OPERATION_ERROR) {
+        return ErrorCode::OK;
+    }
+    return err;
+}
+
+bool EtcdLeaderCoordinator::IsSameViewVersion(
+    const std::optional<MasterView>& current_view,
+    std::optional<ViewVersionId> known_version) const {
+    if (!current_view.has_value() && !known_version.has_value()) {
+        return true;
+    }
+    if (!current_view.has_value() || !known_version.has_value()) {
+        return false;
+    }
+    return current_view->view_version == known_version.value();
+}
+
+}  // namespace etcd
+}  // namespace backends
+}  // namespace ha
+}  // namespace mooncake
