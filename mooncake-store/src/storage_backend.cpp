@@ -1531,12 +1531,21 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
                    << store_metadata_result.error();
         return tl::make_unexpected(store_metadata_result.error());
     }
+
+    auto physical_capacity_result = CanAcceptAnotherBucket();
+    if (!physical_capacity_result) {
+        LOG(ERROR) << "Failed to check bucket backend physical capacity: "
+                   << physical_capacity_result.error();
+        return tl::make_unexpected(physical_capacity_result.error());
+    }
+
     const auto& store_metadata = store_metadata_result.value();
     auto enable_offloading =
         store_metadata.total_keys + bucket_backend_config_.bucket_keys_limit <=
             file_storage_config_.total_keys_limit &&
         store_metadata.total_size + bucket_backend_config_.bucket_size_limit <=
-            file_storage_config_.total_size_limit;
+            file_storage_config_.total_size_limit &&
+        physical_capacity_result.value();
     return enable_offloading;
 }
 
@@ -1651,6 +1660,7 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
     int64_t bucket_id) {
     size_t freed_size = 0;
     size_t key_count = 0;
+    uint64_t queued_delete_bytes = 0;
 
     {
         SharedMutexLocker lock(&mutex_);
@@ -1678,6 +1688,7 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
 
         // Metadata remains counted until the bucket itself is evicted.
         total_size_ -= bucket_meta->meta_size;
+        queued_delete_bytes = bucket_meta->data_size + bucket_meta->meta_size;
 
         buckets_.erase(bucket_it);
         bucket_valid_keys_.erase(bucket_id);
@@ -1697,9 +1708,9 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
         return tl::make_unexpected(meta_path_res.error());
     }
 
-    EnqueueBucketDeletion(
-        PendingBucketDeletion{bucket_id, std::move(data_path_res.value()),
-                              std::move(meta_path_res.value())});
+    EnqueueBucketDeletion(PendingBucketDeletion{
+        bucket_id, queued_delete_bytes, std::move(data_path_res.value()),
+        std::move(meta_path_res.value())});
 
     LOG(INFO) << "Evicted bucket " << bucket_id << " with " << key_count
               << " keys, freed " << freed_size
@@ -1735,6 +1746,51 @@ tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(
     return {};
 }
 
+tl::expected<bool, ErrorCode> BucketStorageBackend::CanAcceptAnotherBucket()
+    const {
+    namespace fs = std::filesystem;
+
+    const uint64_t pending_bytes =
+        pending_deletion_bytes_.load(std::memory_order_acquire);
+    const uint64_t pending_count =
+        pending_deletion_count_.load(std::memory_order_acquire);
+    const uint64_t backlog_limit = MaxPendingDeletionBytes();
+    if (pending_bytes > backlog_limit) {
+        LOG(WARNING) << "Bucket deletion backlog is too large: pending_bytes="
+                     << pending_bytes << ", pending_count=" << pending_count
+                     << ", backlog_limit=" << backlog_limit;
+        return false;
+    }
+
+    std::error_code ec;
+    auto space_info = fs::space(storage_path_, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to query bucket backend disk space for "
+                   << storage_path_ << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const uint64_t required_space =
+        static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
+    if (space_info.available < required_space) {
+        LOG(WARNING) << "Insufficient physical disk space for next bucket: "
+                     << "available=" << space_info.available
+                     << ", required=" << required_space
+                     << ", pending_delete_bytes=" << pending_bytes
+                     << ", pending_delete_count=" << pending_count;
+        return false;
+    }
+
+    return true;
+}
+
+uint64_t BucketStorageBackend::MaxPendingDeletionBytes() const {
+    constexpr uint64_t kMaxPendingDeletionBuckets = 8;
+    const uint64_t bucket_bytes =
+        static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
+    return bucket_bytes * kMaxPendingDeletionBuckets;
+}
+
 void BucketStorageBackend::StartDeletionWorker() {
     std::lock_guard<std::mutex> lock(deletion_mutex_);
     if (deletion_thread_.joinable()) {
@@ -1758,10 +1814,13 @@ void BucketStorageBackend::StopDeletionWorker() {
 }
 
 void BucketStorageBackend::EnqueueBucketDeletion(PendingBucketDeletion task) {
+    const uint64_t queued_bytes = task.queued_bytes;
     {
         std::lock_guard<std::mutex> lock(deletion_mutex_);
         pending_bucket_deletions_.push_back(std::move(task));
     }
+    pending_deletion_count_.fetch_add(1, std::memory_order_acq_rel);
+    pending_deletion_bytes_.fetch_add(queued_bytes, std::memory_order_acq_rel);
     deletion_cv_.notify_one();
 }
 
@@ -1800,6 +1859,10 @@ void BucketStorageBackend::BucketDeletionWorker() {
                          << task.meta_path << ", bucket_id=" << task.bucket_id
                          << ", error: " << ec.message();
         }
+
+        pending_deletion_count_.fetch_sub(1, std::memory_order_acq_rel);
+        pending_deletion_bytes_.fetch_sub(task.queued_bytes,
+                                          std::memory_order_acq_rel);
     }
 }
 

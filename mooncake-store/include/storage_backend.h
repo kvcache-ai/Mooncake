@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -749,9 +750,14 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     struct PendingBucketDeletion {
         int64_t bucket_id;
+        uint64_t queued_bytes;
         std::string data_path;
         std::string meta_path;
     };
+
+    tl::expected<bool, ErrorCode> CanAcceptAnotherBucket() const;
+
+    uint64_t MaxPendingDeletionBytes() const;
 
     void StartDeletionWorker();
 
@@ -798,6 +804,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::deque<PendingBucketDeletion> pending_bucket_deletions_;
     std::thread deletion_thread_;
     bool stop_deletion_worker_ = false;
+    std::atomic<uint64_t> pending_deletion_bytes_{0};
+    std::atomic<uint64_t> pending_deletion_count_{0};
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>

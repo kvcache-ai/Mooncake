@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <thread>
 
 #include "tiered_cache/tiers/storage_tier.h"
@@ -223,6 +224,43 @@ TEST_F(StorageTierTest, StorageTierBucket) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_bucket");
+}
+
+TEST_F(StorageTierTest, BucketBackendRejectsOffloadWhenPhysicalSpaceTooLow) {
+    const fs::path test_dir = "/tmp/mooncake_test_bucket_space_guard";
+    fs::remove_all(test_dir);
+    fs::create_directories(test_dir);
+
+    std::error_code ec;
+    auto space_info = fs::space(test_dir, ec);
+    ASSERT_FALSE(ec) << "Failed to inspect filesystem space: " << ec.message();
+
+    if (space_info.available >=
+        static_cast<uintmax_t>(std::numeric_limits<int64_t>::max() - 1)) {
+        GTEST_SKIP() << "filesystem available space is too large to build a "
+                        "stable int64_t overflow-safe test";
+    }
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir.string();
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.total_size_limit = std::numeric_limits<int64_t>::max();
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit =
+        static_cast<int64_t>(space_info.available + 1);
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto enable_res = backend.IsEnableOffloading();
+    ASSERT_TRUE(enable_res.has_value());
+    EXPECT_FALSE(enable_res.value())
+        << "backend should reject offload when the next bucket cannot fit on "
+           "the filesystem";
+
+    fs::remove_all(test_dir);
 }
 
 // Test Bucket Eviction functionality
