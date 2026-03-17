@@ -195,18 +195,26 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
 }
 
 ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
-    if (master_server_entry.find("etcd://") == 0) {
-        std::string etcd_entry = master_server_entry.substr(strlen("etcd://"));
+    bool use_etcd = master_server_entry.starts_with("etcd://");
+    bool use_k8s = master_server_entry.starts_with("k8s://");
+    if (use_etcd || use_k8s) {
+        std::string coordinator_type = use_etcd ? "etcd" : "k8s";
+        std::string coordinator_endpoints =
+            use_etcd ? master_server_entry.substr(strlen("etcd://"))
+                     : master_server_entry.substr(strlen("k8s://"));
 
-        // Get master address from etcd
-        auto err = master_view_helper_.ConnectToEtcd(etcd_entry);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to etcd";
-            return err;
+        master_view_helper_ = MasterViewHelper::CreateForClient(
+            coordinator_type, coordinator_endpoints);
+        if (!master_view_helper_) {
+            LOG(ERROR) << "Failed to create MasterViewHelper for coordinator: "
+                       << coordinator_type << "coordinator_endpoints" << coordinator_endpoints;
+            return ErrorCode::INTERNAL_ERROR;
         }
+
         std::string master_address;
         ViewVersionId master_version = 0;
-        err = master_view_helper_.GetMasterView(master_address, master_version);
+        auto err =
+            master_view_helper_->GetMasterView(master_address, master_version);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to get master address";
             return err;
@@ -2395,8 +2403,8 @@ void Client::PingThreadMain(bool is_ha_mode,
                 << " times; fetching latest master view and reconnecting";
             std::string master_address;
             ViewVersionId next_version = 0;
-            auto err =
-                master_view_helper_.GetMasterView(master_address, next_version);
+            auto err = master_view_helper_->GetMasterView(master_address,
+                                                          next_version);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to get new master view: "
                            << toString(err);

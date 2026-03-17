@@ -42,9 +42,9 @@ class ChaosRandTest : public ::testing::Test {
         LOG(INFO) << "Random seed: " << FLAGS_rand_seed;
         srand(FLAGS_rand_seed);
 
-        master_view_helper_ = std::make_shared<MasterViewHelper>();
-        EXPECT_EQ(master_view_helper_->ConnectToEtcd(FLAGS_etcd_endpoints),
-                  ErrorCode::OK)
+        master_view_helper_ =
+            std::make_shared<EtcdMasterViewHelper>(FLAGS_etcd_endpoints);
+        EXPECT_EQ(master_view_helper_->ConnectToCoordinator(), ErrorCode::OK)
             << "Failed to connect to etcd";
     }
 
@@ -64,18 +64,16 @@ class ChaosRandTest : public ::testing::Test {
         return *client_opt;
     }
 
-    static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
-    }
+    static void WaitMasterViewChange() { sleep(MASTER_VIEW_LEASE_TTL * 3); }
 
     static void WaitClientCrashDetection() {
         sleep(DEFAULT_CLIENT_LIVE_TTL_SEC + 5);
     }
 
-    static std::shared_ptr<MasterViewHelper> master_view_helper_;
+    static std::shared_ptr<EtcdMasterViewHelper> master_view_helper_;
 };
 
-std::shared_ptr<MasterViewHelper> ChaosRandTest::master_view_helper_ = nullptr;
+std::shared_ptr<EtcdMasterViewHelper> ChaosRandTest::master_view_helper_ = nullptr;
 
 // Verify the system failover ability by randomly killing masters.
 // This test repeats the following steps:

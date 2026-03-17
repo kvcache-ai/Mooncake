@@ -10,6 +10,7 @@
 
 #include "default_config.h"
 #include "ha_helper.h"
+#include "k8s_ha_helper.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -61,12 +62,13 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
-DEFINE_bool(enable_ha, false,
-            "Enable high availability, which depends on etcd");
+DEFINE_bool(enable_ha, false, "Enable high availability");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
-DEFINE_string(
-    etcd_endpoints, "",
-    "Endpoints of ETCD server, separated by semicolon, required in HA mode");
+DEFINE_string(ha_coordinator, "etcd",
+              "High availability coordinator, defaults to using etcd");
+DEFINE_string(etcd_endpoints, "",
+              "Endpoints of ETCD server, separated by semicolon, required in "
+              "etcd HA mode");
 DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
@@ -190,6 +192,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_ha);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
+    default_config.GetString("ha_coordinator", &master_config.ha_coordinator,
+                             FLAGS_ha_coordinator);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -392,6 +396,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_offload = FLAGS_enable_offload;
     }
+    if ((google::GetCommandLineFlagInfo("ha_coordinator", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_coordinator = FLAGS_ha_coordinator;
+    }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -590,14 +599,29 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
 
-    if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
-        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
+    // Check for HA mode enabled
+    bool enable_k8s_ha =
+        master_config.enable_ha && master_config.ha_coordinator == "k8s";
+    bool enable_etcd_ha =
+        master_config.enable_ha && master_config.ha_coordinator == "etcd";
+
+    if (master_config.enable_ha && master_config.ha_coordinator != "k8s" &&
+        master_config.ha_coordinator != "etcd") {
+        LOG(FATAL) << "Invalid HA coordinator: " << master_config.ha_coordinator
+                   << ", must be 'etcd' or 'k8s'";
         return 1;
     }
-    if (!master_config.enable_ha && !master_config.etcd_endpoints.empty()) {
-        LOG(WARNING)
-            << "Etcd endpoints are set but will not be used in non-HA mode";
+
+    if (enable_etcd_ha && master_config.etcd_endpoints.empty()) {
+        LOG(FATAL) << "Etcd endpoints must be set when etcd HA is enabled";
+        return 1;
     }
+
+    if (!enable_etcd_ha && !master_config.etcd_endpoints.empty()) {
+        LOG(WARNING) << "Etcd endpoints are set but will not be used in "
+                        "non-etcd HA mode";
+    }
+
     if (master_config.memory_allocator != "cachelib" &&
         master_config.memory_allocator != "offset") {
         LOG(FATAL) << "Invalid memory allocator: "
@@ -625,6 +649,7 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
+        << ", ha_coordinator=" << master_config.ha_coordinator
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
@@ -687,7 +712,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    if (master_config.enable_ha) {
+    if (enable_etcd_ha || enable_k8s_ha) {
         mooncake::MasterServiceSupervisor supervisor(
             mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();

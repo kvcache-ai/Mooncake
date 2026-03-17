@@ -57,9 +57,7 @@ class E2ERandTest : public ::testing::Test {
         return *client_opt;
     }
 
-    static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
-    }
+    static void WaitMasterViewChange() { sleep(MASTER_VIEW_LEASE_TTL * 3); }
 };
 
 // Test the sequential delete, put and get operation from different clients.

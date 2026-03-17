@@ -29,6 +29,7 @@ struct MasterConfig {
 
     bool enable_ha;
     bool enable_offload;
+    std::string ha_coordinator;
     std::string etcd_endpoints;
 
     std::string cluster_id;
@@ -121,6 +122,8 @@ class MasterServiceSupervisorConfig {
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     std::string snapshot_backend_type;
+    bool enable_ha = false;
+    std::string ha_coordinator = "etcd";
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -183,6 +186,9 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+        enable_ha = config.enable_ha;
+        ha_coordinator = config.ha_coordinator;
+
         validate();
     }
 
@@ -244,6 +250,7 @@ class WrappedMasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_coordinator = "etcd";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -295,6 +302,7 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_coordinator = config.ha_coordinator;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -365,6 +373,8 @@ class WrappedMasterServiceConfig {
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        enable_ha = config.enable_ha;
+        ha_coordinator = config.ha_coordinator;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -411,6 +421,7 @@ class MasterServiceConfigBuilder {
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    std::string ha_coordinator_ = "etcd";
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -487,6 +498,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_coordinator(
+        const std::string& coordinator) {
+        ha_coordinator_ = coordinator;
         return *this;
     }
 
@@ -643,6 +660,7 @@ class MasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_coordinator = "etcd";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -690,6 +708,7 @@ class MasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_coordinator = config.ha_coordinator;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -741,6 +760,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.ha_coordinator = ha_coordinator_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;

@@ -1,10 +1,12 @@
 #include "ha_helper.h"
 #include "etcd_helper.h"
+#include "k8s_ha_helper.h"
 #include "rpc_service.h"
 
 namespace mooncake {
 
-MasterViewHelper::MasterViewHelper() {
+EtcdMasterViewHelper::EtcdMasterViewHelper(const std::string& etcd_endpoints)
+    : etcd_endpoints_(etcd_endpoints), lease_id_(0) {
     std::string cluster_id;
     const char* cluster_id_env = std::getenv("MC_STORE_CLUSTER_ID");
     if (cluster_id_env != nullptr && strlen(cluster_id_env) > 0) {
@@ -20,13 +22,12 @@ MasterViewHelper::MasterViewHelper() {
     LOG(INFO) << "Master view key: " << master_view_key_;
 }
 
-ErrorCode MasterViewHelper::ConnectToEtcd(const std::string& etcd_endpoints) {
-    return EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
+ErrorCode EtcdMasterViewHelper::ConnectToCoordinator() {
+    return EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints_);
 }
 
-void MasterViewHelper::ElectLeader(const std::string& master_address,
-                                   ViewVersionId& version,
-                                   EtcdLeaseId& lease_id) {
+ErrorCode EtcdMasterViewHelper::ElectLeader(const std::string& master_address,
+                                            ViewVersionId& version) {
     while (true) {
         // Check if there is already a leader
         ViewVersionId current_version = 0;
@@ -61,7 +62,7 @@ void MasterViewHelper::ElectLeader(const std::string& master_address,
         // try to elect ourselves as the leader. We vote ourselfves
         // as the leader by trying to creating the key in a transaction.
         // The one who successfully creates the key is the leader.
-        ret = EtcdHelper::GrantLease(ETCD_MASTER_VIEW_LEASE_TTL, lease_id);
+        ret = EtcdHelper::GrantLease(MASTER_VIEW_LEASE_TTL, lease_id_);
         if (ret != ErrorCode::OK) {
             LOG(ERROR) << "Failed to grant lease: " << ret;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -70,7 +71,7 @@ void MasterViewHelper::ElectLeader(const std::string& master_address,
 
         ret = EtcdHelper::CreateWithLease(
             master_view_key_.c_str(), master_view_key_.size(),
-            master_address.c_str(), master_address.size(), lease_id, version);
+            master_address.c_str(), master_address.size(), lease_id_, version);
         if (ret == ErrorCode::ETCD_TRANSACTION_FAIL) {
             LOG(INFO) << "Failed to elect self as leader: " << ret;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -81,17 +82,15 @@ void MasterViewHelper::ElectLeader(const std::string& master_address,
             continue;
         } else {
             LOG(INFO) << "Successfully elected self as leader";
-            return;
+            return ErrorCode::OK;
         }
     }
 }
 
-void MasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
-    EtcdHelper::KeepAlive(lease_id);
-}
+void EtcdMasterViewHelper::KeepLeader() { EtcdHelper::KeepAlive(lease_id_); }
 
-ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
-                                          ViewVersionId& version) {
+ErrorCode EtcdMasterViewHelper::GetMasterView(std::string& master_address,
+                                              ViewVersionId& version) {
     auto err_code =
         EtcdHelper::Get(master_view_key_.c_str(), master_view_key_.size(),
                         master_address, version);
@@ -109,9 +108,55 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
     }
 }
 
+ErrorCode EtcdMasterViewHelper::CancelKeepLeader() {
+    return EtcdHelper::CancelKeepAlive(lease_id_);
+}
+
 MasterServiceSupervisor::MasterServiceSupervisor(
     const MasterServiceSupervisorConfig& config)
     : config_(config) {}
+
+std::unique_ptr<MasterViewHelper> MasterViewHelper::CreateForMaster(
+    const std::string& coordinator_type, const std::string& coordinator_info) {
+    std::unique_ptr<MasterViewHelper> helper;
+    if (coordinator_type == "etcd") {
+        auto etcd_helper  = std::make_unique<EtcdMasterViewHelper>(coordinator_info);
+        auto err = etcd_helper->ConnectToCoordinator();
+        if ( err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to etcd, endpoints: " << coordinator_info
+            << " err: " << err;
+            return nullptr;
+        }
+        helper =std::unique_ptr<MasterViewHelper>(std::move(etcd_helper));
+    } else if (coordinator_type == "k8s") {
+        helper = std::make_unique<K8sMasterViewHelper>();
+    } else {
+        LOG(ERROR) << "Unsupported coordinator type: " << coordinator_type;
+        return nullptr;
+    }
+    return helper;
+}
+
+std::unique_ptr<MasterViewHelper> MasterViewHelper::CreateForClient(
+    const std::string& coordinator_type, const std::string& coordinator_info) {
+    std::unique_ptr<MasterViewHelper> helper;
+    if (coordinator_type == "etcd") {
+        auto etcd_helper = std::make_unique<EtcdMasterViewHelper>(coordinator_info);
+        auto err = etcd_helper->ConnectToCoordinator();
+        if ( err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to etcd, endpoints: " << coordinator_info
+            << " err: " << err;
+            return nullptr;
+        }
+        helper =std::unique_ptr<MasterViewHelper>(std::move(etcd_helper));
+    } else if (coordinator_type == "k8s") {
+        helper = std::make_unique<K8sMasterViewHelper>(coordinator_info);
+    } else {
+        LOG(ERROR) << "Unsupported coordinator type: " << coordinator_type;
+        return nullptr;
+    }
+    return helper;
+}
 
 int MasterServiceSupervisor::Start() {
     while (true) {
@@ -125,30 +170,33 @@ int MasterServiceSupervisor::Start() {
         }
 
         LOG(INFO) << "Init leader election helper...";
-        MasterViewHelper mv_helper;
-        if (mv_helper.ConnectToEtcd(config_.etcd_endpoints) != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to connect to etcd endpoints: "
-                       << config_.etcd_endpoints;
+        std::unique_ptr<MasterViewHelper> mv_helper =
+            MasterViewHelper::CreateForMaster(config_.ha_coordinator,
+                                              config_.etcd_endpoints);
+
+        if (mv_helper == nullptr) {
+            LOG(ERROR) << "Failed to init leader election helper, type: "
+                       << config_.ha_coordinator << "endpoint: " << config_.etcd_endpoints;
             return -1;
         }
+
         LOG(INFO) << "Trying to elect self as leader...";
-        EtcdLeaseId lease_id = 0;
         // view_version will be updated by ElectLeader and then used in
         // WrappedMasterService
         ViewVersionId view_version = 0;
-        mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
+        mv_helper->ElectLeader(config_.local_hostname, view_version);
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
-            std::thread([&server, &mv_helper, lease_id]() {
-                mv_helper.KeepLeader(lease_id);
+            std::thread([&server, &mv_helper]() {
+                mv_helper->KeepLeader();
                 LOG(INFO) << "Trying to stop server...";
                 server.stop();
             });
 
         // To prevent potential split-brain, wait long enough for the old leader
         // to retire.
-        const int waiting_time = ETCD_MASTER_VIEW_LEASE_TTL;
+        const int waiting_time = MASTER_VIEW_LEASE_TTL;
         std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
@@ -162,7 +210,7 @@ int MasterServiceSupervisor::Start() {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
-            auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+            auto etcd_err = mv_helper->CancelKeepLeader();
             if (etcd_err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to cancel keep leader alive: "
                            << etcd_err;
@@ -178,7 +226,7 @@ int MasterServiceSupervisor::Start() {
 
         // If the server is closed due to internal errors, we need to manually
         // stop keep leader alive.
-        auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
+        auto etcd_err = mv_helper->CancelKeepLeader();
         // The error here is predicatable, no need to log it as ERROR.
         LOG(INFO) << "Cancel keep leader alive: " << etcd_err;
         keep_leader_thread.join();

@@ -36,9 +36,9 @@ class ChaosTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata URL: " << FLAGS_engine_meta_url;
 
-        master_view_helper_ = std::make_shared<MasterViewHelper>();
-        EXPECT_EQ(master_view_helper_->ConnectToEtcd(FLAGS_etcd_endpoints),
-                  ErrorCode::OK)
+        master_view_helper_ =
+            std::make_shared<EtcdMasterViewHelper>(FLAGS_etcd_endpoints);
+        EXPECT_EQ(master_view_helper_->ConnectToCoordinator(), ErrorCode::OK)
             << "Failed to connect to etcd";
     }
 
@@ -112,15 +112,13 @@ class ChaosTest : public ::testing::Test {
         leader_index = port - master_port_base;
     }
 
-    static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
-    }
+    static void WaitMasterViewChange() { sleep(MASTER_VIEW_LEASE_TTL * 3); }
 
     static void WaitClientCrashDetection() {
         sleep(DEFAULT_CLIENT_LIVE_TTL_SEC + 5);
     }
 
-    static std::shared_ptr<MasterViewHelper> master_view_helper_;
+    static std::shared_ptr<EtcdMasterViewHelper> master_view_helper_;
 
     // Instance members for master management
     std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
@@ -128,7 +126,7 @@ class ChaosTest : public ::testing::Test {
     int leader_index_;
 };
 
-std::shared_ptr<MasterViewHelper> ChaosTest::master_view_helper_ = nullptr;
+std::shared_ptr<EtcdMasterViewHelper> ChaosTest::master_view_helper_ = nullptr;
 
 // Verify the system failover after the leader is killed.
 TEST_F(ChaosTest, LeaderKilledFailover) {
