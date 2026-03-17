@@ -5,8 +5,10 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <optional>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include "tiered_cache/scheduler/scheduler_policy.h"
 #include "tiered_cache/scheduler/stats_collector.h"
 #include "types.h"
@@ -38,8 +40,12 @@ class ClientScheduler {
     // Incoming event hook (thread-safe)
     void OnAccess(const std::string& key);
 
-    // Called when a key is deleted
-    void OnDelete(const std::string& key);
+    // Called when a replica is committed or updated
+    void OnCommit(const std::string& key, UUID tier_id, size_t size_bytes);
+
+    // Called when a key or a replica is deleted
+    void OnDelete(const std::string& key,
+                  std::optional<UUID> tier_id = std::nullopt);
 
     // Called when allocation fails due to insufficient space
     // Returns true if eviction was triggered (sync mode), false otherwise
@@ -55,6 +61,24 @@ class ClientScheduler {
     // Trigger immediate eviction for a tier (sync mode)
     void TriggerSyncEviction(UUID tier_id);
 
+    // Build policy input from the latest stats snapshot and scheduler cache
+    std::vector<KeyContext> BuildActiveKeys(
+        const AccessStats& access_stats,
+        std::optional<UUID> pinned_tier_id = std::nullopt);
+
+    // Build a fresh tier stats map for policy execution
+    std::unordered_map<UUID, TierStats> CollectTierStats() const;
+
+    struct CachedKeyState {
+        size_t size_bytes = 0;
+        std::vector<UUID> current_locations;
+    };
+
+    void TrackReplicaLocked(const std::string& key, UUID tier_id,
+                            size_t size_bytes);
+    void RemoveReplicaLocked(const std::string& key,
+                             std::optional<UUID> tier_id);
+
    private:
     TieredBackend* backend_;
     std::unique_ptr<SchedulerPolicy> policy_;
@@ -66,8 +90,16 @@ class ClientScheduler {
     // Local view of tiers for policy input
     std::unordered_map<UUID, CacheTier*> tiers_;
 
+    // Scheduler-side metadata cache to avoid full backend scans each cycle
+    std::mutex key_cache_mutex_;
+    std::unordered_map<std::string, CachedKeyState> key_cache_;
+    std::unordered_map<UUID, std::unordered_set<std::string>>
+        tier_resident_keys_;
+    std::optional<UUID> fast_tier_id_;
+
     // Configuration
     int loop_interval_ms_ = 1000;
+    size_t stats_snapshot_limit_ = detail::DefaultSnapshotLimit();
     enum class EvictionMode { SYNC, ASYNC };
     EvictionMode eviction_mode_ = EvictionMode::ASYNC;
 

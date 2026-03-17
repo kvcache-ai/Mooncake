@@ -7,8 +7,138 @@
 #include <cstring>
 #include <atomic>
 #include "tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
+#include "tiered_cache/scheduler/lru_stats_collector.h"
+#include "tiered_cache/scheduler/stats_collector.h"
 
 namespace mooncake {
+
+namespace {
+
+const AccessStatEntry* FindKeyStats(const AccessStats& stats,
+                                    const std::string& key) {
+    for (const auto& item : stats.hot_keys) {
+        if (item.key == key) {
+            return &item;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST(SchedulerStatsCollectorTest, SimpleCollectorAggregatesConcurrentAccesses) {
+    constexpr int kThreads = 8;
+    constexpr int kAccessesPerThread = 1000;
+
+    auto now = std::chrono::steady_clock::time_point{};
+    SimpleStatsCollector collector(0.5, 8, detail::DefaultSnapshotLimit(),
+                                   [&now]() { return now; });
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+
+    for (int thread_idx = 0; thread_idx < kThreads; ++thread_idx) {
+        workers.emplace_back([&collector]() {
+            for (int i = 0; i < kAccessesPerThread; ++i) {
+                collector.RecordAccess("hot_key");
+            }
+        });
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* first_stats = FindKeyStats(first_snapshot, "hot_key");
+    ASSERT_NE(first_stats, nullptr);
+    EXPECT_DOUBLE_EQ(first_stats->recent_heat_score,
+                     static_cast<double>(kThreads * kAccessesPerThread));
+
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(second_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* second_stats = FindKeyStats(second_snapshot, "hot_key");
+    ASSERT_NE(second_stats, nullptr);
+    EXPECT_DOUBLE_EQ(second_stats->recent_heat_score,
+                     static_cast<double>(kThreads * kAccessesPerThread));
+
+    now += std::chrono::seconds(1);
+    const auto third_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(third_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* third_stats = FindKeyStats(third_snapshot, "hot_key");
+    ASSERT_NE(third_stats, nullptr);
+    EXPECT_NEAR(third_stats->recent_heat_score,
+                static_cast<double>(kThreads * kAccessesPerThread) * 0.5, 1e-9);
+}
+
+TEST(SchedulerStatsCollectorTest, SimpleCollectorDecaysByElapsedWallClockTime) {
+    auto now = std::chrono::steady_clock::time_point{};
+    SimpleStatsCollector collector(0.5, 4, detail::DefaultSnapshotLimit(),
+                                   [&now]() { return now; });
+
+    for (int i = 0; i < 8; ++i) {
+        collector.RecordAccess("hot_key");
+    }
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* first_stats = FindKeyStats(first_snapshot, "hot_key");
+    ASSERT_NE(first_stats, nullptr);
+    EXPECT_DOUBLE_EQ(first_stats->recent_heat_score, 8.0);
+
+    now += std::chrono::seconds(2);
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(second_snapshot.metric, AccessStatMetric::kRecentHeat);
+    const auto* second_stats = FindKeyStats(second_snapshot, "hot_key");
+    ASSERT_NE(second_stats, nullptr);
+    EXPECT_NEAR(second_stats->recent_heat_score, 2.0, 1e-9);
+}
+
+TEST(SchedulerStatsCollectorTest, SimpleCollectorRemoveKeyDropsHistory) {
+    auto now = std::chrono::steady_clock::time_point{};
+    SimpleStatsCollector collector(0.5, 4, detail::DefaultSnapshotLimit(),
+                                   [&now]() { return now; });
+    collector.RecordAccess("cold_key");
+    collector.RecordAccess("cold_key");
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecentHeat);
+    ASSERT_NE(FindKeyStats(first_snapshot, "cold_key"), nullptr);
+
+    collector.RemoveKey("cold_key");
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(FindKeyStats(second_snapshot, "cold_key"), nullptr);
+}
+
+TEST(SchedulerStatsCollectorTest, LRUCollectorTracksGlobalRecency) {
+    LRUStatsCollector collector(4);
+    collector.RecordAccess("key_a");
+    collector.RecordAccess("key_b");
+    collector.RecordAccess("key_a");
+
+    const auto first_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(first_snapshot.metric, AccessStatMetric::kRecencyRank);
+    ASSERT_GE(first_snapshot.hot_keys.size(), 2u);
+    EXPECT_EQ(first_snapshot.hot_keys[0].key, "key_a");
+    EXPECT_EQ(first_snapshot.hot_keys[0].recency_rank, 1u);
+    EXPECT_EQ(first_snapshot.hot_keys[1].key, "key_b");
+    EXPECT_EQ(first_snapshot.hot_keys[1].recency_rank, 2u);
+
+    collector.RecordAccess("key_c");
+    const auto second_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(second_snapshot.metric, AccessStatMetric::kRecencyRank);
+    ASSERT_GE(second_snapshot.hot_keys.size(), 3u);
+    EXPECT_EQ(second_snapshot.hot_keys[0].key, "key_c");
+    EXPECT_EQ(second_snapshot.hot_keys[0].recency_rank, 1u);
+    EXPECT_EQ(second_snapshot.hot_keys[1].key, "key_a");
+    EXPECT_EQ(second_snapshot.hot_keys[1].recency_rank, 2u);
+    EXPECT_EQ(second_snapshot.hot_keys[2].key, "key_b");
+    EXPECT_EQ(second_snapshot.hot_keys[2].recency_rank, 3u);
+
+    collector.RemoveKey("key_a");
+    const auto third_snapshot = collector.GetSnapshot();
+    EXPECT_EQ(FindKeyStats(third_snapshot, "key_a"), nullptr);
+}
 
 class SchedulerIntegrationTest : public ::testing::Test {
    protected:
@@ -352,6 +482,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     config_["scheduler"]["policy"] = "LRU";
     config_["scheduler"]["high_watermark"] = 0.9;
     config_["scheduler"]["low_watermark"] = 0.7;
+    config_["scheduler"]["stats_snapshot_limit"] = 10;
 
     TieredBackend backend;
     auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);

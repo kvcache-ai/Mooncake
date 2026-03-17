@@ -42,7 +42,7 @@ class SimplePolicy : public SchedulerPolicy {
         // MVP Logic: Iterate active keys and promote if hot enough and not
         // already in target
         for (const auto& key_ctx : active_keys) {
-            if (key_ctx.heat_score < config_.promotion_threshold) {
+            if (key_ctx.recent_heat_score < config_.promotion_threshold) {
                 continue;
             }
 

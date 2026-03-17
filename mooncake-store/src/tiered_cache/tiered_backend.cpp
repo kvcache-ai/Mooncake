@@ -484,6 +484,10 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         return tl::make_unexpected(tier_commit_res.error());
     }
 
+    UUID current_tier_id = handle->loc.tier->GetTierId();
+    size_t handle_size =
+        handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
+
     // Update Entry (Entry Write Lock)
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
@@ -496,7 +500,6 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         }
 
         // Insert or replace the handle for this tier
-        UUID current_tier_id = handle->loc.tier->GetTierId();
         bool found = false;
         for (auto& replica : entry->replicas) {
             if (replica.first == current_tier_id) {
@@ -518,10 +521,11 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 
         // Increment Version on modification
         entry->version++;
+    }
 
-        if (scheduler_) {
-            scheduler_->OnAccess(key);
-        }
+    if (scheduler_) {
+        scheduler_->OnCommit(key, current_tier_id, handle_size);
+        scheduler_->OnAccess(key);
     }
 
     if (add_replica_callback_) {
@@ -698,6 +702,9 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         }
 
         if (found_tier) {
+            if (scheduler_) {
+                scheduler_->OnDelete(key, *tier_id);
+            }
             return tl::expected<void, ErrorCode>{};
         } else {
             LOG(ERROR) << "Tier not found: " << *tier_id;
@@ -742,7 +749,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
     if (scheduler_) {
-        scheduler_->OnDelete(key);
+        scheduler_->OnDelete(key, std::nullopt);
     }
     return tl::expected<void, ErrorCode>{};
 }

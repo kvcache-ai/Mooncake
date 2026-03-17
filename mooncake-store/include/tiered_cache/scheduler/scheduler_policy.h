@@ -19,11 +19,12 @@ struct TierStats {
 
 /**
  * @struct KeyContext
- * @brief Context for a key, including its heat and current location
+ * @brief Context for a key, including access metadata and current location.
  */
 struct KeyContext {
     std::string key;
-    double heat_score;
+    double recent_heat_score = 0.0;
+    size_t recency_rank = 0;
     std::vector<UUID> current_locations;  // Which tiers currently hold this key
     size_t size_bytes = 0;                // Size of the key's data in bytes
 };

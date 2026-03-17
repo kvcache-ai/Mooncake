@@ -9,10 +9,10 @@ namespace mooncake {
 
 /**
  * @class LRUPolicy
- * @brief Heat-based promotion/eviction policy with watermark control.
+ * @brief Recency-based promotion/eviction policy with watermark control.
  *
- * All keys are sorted by heat score. The hottest keys (up to target capacity)
- * should be in fast tier, the rest in slow tier.
+ * All keys are sorted by recency. The most recently used keys (up to target
+ * capacity) should be in fast tier, the rest in slow tier.
  */
 class LRUPolicy : public SchedulerPolicy {
    public:
@@ -65,12 +65,12 @@ class LRUPolicy : public SchedulerPolicy {
             }
         }
 
-        // Target: fill fast tier to low_watermark with hottest keys
+        // Target: fill fast tier to low_watermark with most recent keys
         size_t target_usage = static_cast<size_t>(stats.total_capacity_bytes *
                                                   config_.low_watermark);
 
         // Step 1: Determine which keys SHOULD be in fast tier
-        // active_keys is assumed sorted by heat (hottest first)
+        // active_keys is assumed sorted by recency (most recent first)
         std::vector<const KeyContext*> should_be_in_fast;
         size_t accumulated_size = 0;
 

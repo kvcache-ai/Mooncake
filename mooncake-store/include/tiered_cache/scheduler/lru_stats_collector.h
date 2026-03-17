@@ -1,9 +1,13 @@
 #pragma once
 
-#include <list>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
+
 #include "tiered_cache/scheduler/stats_collector.h"
 
 namespace mooncake {
@@ -15,54 +19,125 @@ namespace mooncake {
  */
 class LRUStatsCollector : public StatsCollector {
    public:
+    explicit LRUStatsCollector(
+        size_t shard_count = detail::DefaultStatsShardCount(),
+        size_t max_snapshot_keys = detail::DefaultSnapshotLimit())
+        : shards_(detail::NormalizeShardCount(shard_count)),
+          shard_mask_(shards_.size() - 1),
+          max_snapshot_keys_(
+              detail::NormalizeSnapshotLimit(max_snapshot_keys)) {}
+
     void RecordAccess(const std::string& key) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = key_map_.find(key);
-        if (it != key_map_.end()) {
-            // Move to front (MRU)
-            lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
-        } else {
-            // Add new key to front
-            lru_list_.push_front(key);
-            key_map_[key] = lru_list_.begin();
-        }
+        const uint64_t sequence =
+            next_sequence_.fetch_add(1, std::memory_order_relaxed);
+        auto& shard = GetShard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.pending_updates[key] = sequence;
     }
 
     AccessStats GetSnapshot() override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        AccessStats stats;
-        // Populate stats.hot_keys with the LRU list order.
-        // Head is MRU (Hottest), Tail is LRU (Coldest).
-        // Since AccessStats uses a vector of pairs, we use the position as heat
-        // (conceptually). Or just simple existence.
-
-        // MVP: Just dump equality, maybe with a fake score if needed by Policy.
-        // But specialized LRUPolicy will likely just check order.
-        // We'll give higher score to MRU just in case.
-
-        double score = static_cast<double>(lru_list_.size());
-        for (const auto& key : lru_list_) {
-            stats.hot_keys.push_back({key, score--});
-        }
-
-        // Note: For LRU, we do NOT clear the list. We need history for
-        // eviction.
-        return stats;
+        std::lock_guard<std::mutex> snapshot_lock(snapshot_mutex_);
+        ApplyPendingChanges();
+        return BuildSnapshot();
     }
 
     void RemoveKey(const std::string& key) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = key_map_.find(key);
-        if (it != key_map_.end()) {
-            lru_list_.erase(it->second);
-            key_map_.erase(it);
-        }
+        auto& shard = GetShard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.pending_updates.erase(key);
+        shard.pending_deletes.push_back(key);
     }
 
    private:
-    std::mutex mutex_;
-    std::list<std::string> lru_list_;
-    std::unordered_map<std::string, std::list<std::string>::iterator> key_map_;
+    struct OrderedKey {
+        uint64_t sequence;
+        std::string key;
+    };
+
+    struct OrderedKeyCompare {
+        bool operator()(const OrderedKey& lhs, const OrderedKey& rhs) const {
+            if (lhs.sequence != rhs.sequence) {
+                return lhs.sequence > rhs.sequence;
+            }
+            return lhs.key < rhs.key;
+        }
+    };
+
+    struct alignas(64) Shard {
+        std::mutex mutex;
+        std::unordered_map<std::string, uint64_t> pending_updates;
+        std::vector<std::string> pending_deletes;
+    };
+
+    Shard& GetShard(const std::string& key) {
+        const auto shard_index = std::hash<std::string>{}(key)&shard_mask_;
+        return shards_[shard_index];
+    }
+
+    void ApplyPendingChanges() {
+        for (auto& shard : shards_) {
+            std::unordered_map<std::string, uint64_t> pending_updates;
+            std::vector<std::string> pending_deletes;
+
+            {
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                pending_updates.swap(shard.pending_updates);
+                pending_deletes.swap(shard.pending_deletes);
+            }
+
+            for (const auto& key : pending_deletes) {
+                RemoveTrackedKey(key);
+            }
+
+            for (const auto& [key, sequence] : pending_updates) {
+                auto it = latest_access_.find(key);
+                if (it != latest_access_.end()) {
+                    ordered_keys_.erase(OrderedKey{it->second, key});
+                    it->second = sequence;
+                } else {
+                    latest_access_[key] = sequence;
+                }
+                ordered_keys_.insert(OrderedKey{sequence, key});
+            }
+        }
+    }
+
+    AccessStats BuildSnapshot() const {
+        AccessStats stats;
+        stats.metric = AccessStatMetric::kRecencyRank;
+        stats.hot_keys.reserve(
+            std::min(max_snapshot_keys_, ordered_keys_.size()));
+
+        size_t recency_rank = 1;
+        size_t emitted = 0;
+        for (const auto& ordered_key : ordered_keys_) {
+            stats.hot_keys.push_back(
+                AccessStatEntry{ordered_key.key, 0.0, recency_rank++});
+            emitted++;
+            if (emitted >= max_snapshot_keys_) {
+                break;
+            }
+        }
+        return stats;
+    }
+
+    void RemoveTrackedKey(const std::string& key) {
+        auto it = latest_access_.find(key);
+        if (it == latest_access_.end()) {
+            return;
+        }
+
+        ordered_keys_.erase(OrderedKey{it->second, key});
+        latest_access_.erase(it);
+    }
+
+    std::atomic<uint64_t> next_sequence_{1};
+    std::mutex snapshot_mutex_;
+    std::vector<Shard> shards_;
+    size_t shard_mask_;
+    size_t max_snapshot_keys_;
+    std::unordered_map<std::string, uint64_t> latest_access_;
+    std::set<OrderedKey, OrderedKeyCompare> ordered_keys_;
 };
 
 }  // namespace mooncake

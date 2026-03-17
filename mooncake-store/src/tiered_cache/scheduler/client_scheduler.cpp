@@ -4,6 +4,7 @@
 #include "tiered_cache/scheduler/lru_policy.h"
 #include "tiered_cache/scheduler/lru_stats_collector.h"
 #include "tiered_cache/scheduler/simple_policy.h"
+#include <algorithm>
 #include <chrono>
 #include <unordered_set>
 #include <glog/logging.h>
@@ -14,9 +15,26 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
                                  const Json::Value& config)
     : backend_(backend) {
     std::string policy_type = "SIMPLE";  // Default
+    size_t stats_shards = detail::DefaultStatsShardCount();
     if (config.isMember("scheduler") &&
         config["scheduler"].isMember("policy")) {
         policy_type = config["scheduler"]["policy"].asString();
+    }
+
+    if (config.isMember("scheduler") &&
+        config["scheduler"].isMember("stats_shards")) {
+        const auto configured_shards =
+            config["scheduler"]["stats_shards"].asUInt64();
+        if (configured_shards > 0) {
+            stats_shards = static_cast<size_t>(configured_shards);
+        }
+    }
+
+    if (config.isMember("scheduler") &&
+        config["scheduler"].isMember("stats_snapshot_limit")) {
+        const auto configured_limit =
+            config["scheduler"]["stats_snapshot_limit"].asUInt64();
+        stats_snapshot_limit_ = static_cast<size_t>(configured_limit);
     }
 
     // Read eviction mode configuration
@@ -34,7 +52,8 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
 
     if (policy_type == "LRU") {
         // Initialize LRU components
-        stats_collector_ = std::make_unique<LRUStatsCollector>();
+        stats_collector_ = std::make_unique<LRUStatsCollector>(
+            stats_shards, stats_snapshot_limit_);
 
         // LRU Policy Configuration
         LRUPolicy::Config lru_config;
@@ -53,7 +72,8 @@ ClientScheduler::ClientScheduler(TieredBackend* backend,
         LOG(INFO) << "ClientScheduler initialized with LRU Policy";
     } else {
         // Default: SIMPLE
-        stats_collector_ = std::make_unique<SimpleStatsCollector>();
+        stats_collector_ = std::make_unique<SimpleStatsCollector>(
+            0.5, stats_shards, stats_snapshot_limit_);
 
         // Simple Policy Configuration
         SimplePolicy::Config simple_config;
@@ -80,6 +100,7 @@ void ClientScheduler::RegisterTier(CacheTier* tier) {
     // Auto-Configuration: If tier is DRAM, set it as Fast Tier
     if (tier->GetMemoryType() == MemoryType::DRAM) {
         if (policy_) {
+            fast_tier_id_ = tier->GetTierId();
             policy_->SetFastTier(tier->GetTierId());
             LOG(INFO) << "Set Fast Tier to " << tier->GetTierId();
         }
@@ -106,8 +127,22 @@ void ClientScheduler::OnAccess(const std::string& key) {
     }
 }
 
-void ClientScheduler::OnDelete(const std::string& key) {
-    if (stats_collector_) {
+void ClientScheduler::OnCommit(const std::string& key, UUID tier_id,
+                               size_t size_bytes) {
+    std::lock_guard<std::mutex> lock(key_cache_mutex_);
+    TrackReplicaLocked(key, tier_id, size_bytes);
+}
+
+void ClientScheduler::OnDelete(const std::string& key,
+                               std::optional<UUID> tier_id) {
+    bool remove_stats = false;
+    {
+        std::lock_guard<std::mutex> lock(key_cache_mutex_);
+        RemoveReplicaLocked(key, tier_id);
+        remove_stats = !tier_id.has_value() || key_cache_.count(key) == 0;
+    }
+
+    if (remove_stats && stats_collector_) {
         stats_collector_->RemoveKey(key);
     }
 }
@@ -137,37 +172,12 @@ void ClientScheduler::WorkerLoop() {
 
         // 1. Collect Stats
         auto access_stats = stats_collector_->GetSnapshot();
-        if (access_stats.hot_keys.empty()) continue;
 
         // 2. Build Policy Context
-        std::vector<KeyContext> active_keys;
-        active_keys.reserve(access_stats.hot_keys.size());
+        auto active_keys = BuildActiveKeys(access_stats, fast_tier_id_);
+        if (active_keys.empty()) continue;
 
-        for (const auto& [key, score] : access_stats.hot_keys) {
-            KeyContext ctx;
-            ctx.key = key;
-            ctx.heat_score = score;
-
-            // Check if key exists before attempting to get its handle
-            ctx.current_locations = backend_->GetReplicaTierIds(key);
-            if (ctx.current_locations.empty()) {
-                // Key has been deleted, skip it
-                continue;
-            }
-
-            // Get size information from the allocation handle
-            auto handle = backend_->Get(key, std::nullopt, false);
-            if (handle.has_value() && handle.value()->loc.data.buffer) {
-                ctx.size_bytes = handle.value()->loc.data.buffer->size();
-            }
-
-            active_keys.push_back(std::move(ctx));
-        }
-
-        std::unordered_map<UUID, TierStats> tier_stats_map;
-        for (const auto& [id, tier] : tiers_) {
-            tier_stats_map[id] = {tier->GetCapacity(), tier->GetUsage()};
-        }
+        auto tier_stats_map = CollectTierStats();
 
         // 3. Make Decision
         auto actions = policy_->Decide(tier_stats_map, active_keys);
@@ -176,6 +186,136 @@ void ClientScheduler::WorkerLoop() {
         if (!actions.empty()) {
             ExecuteActions(actions);
         }
+    }
+}
+
+std::unordered_map<UUID, TierStats> ClientScheduler::CollectTierStats() const {
+    std::unordered_map<UUID, TierStats> tier_stats_map;
+    for (const auto& [id, tier] : tiers_) {
+        tier_stats_map[id] = {tier->GetCapacity(), tier->GetUsage()};
+    }
+    return tier_stats_map;
+}
+
+std::vector<KeyContext> ClientScheduler::BuildActiveKeys(
+    const AccessStats& access_stats, std::optional<UUID> pinned_tier_id) {
+    std::vector<KeyContext> active_keys;
+    std::unordered_set<std::string> seen_keys;
+
+    {
+        std::lock_guard<std::mutex> lock(key_cache_mutex_);
+
+        size_t reserved_size = access_stats.hot_keys.size();
+        if (pinned_tier_id.has_value()) {
+            auto resident_it = tier_resident_keys_.find(pinned_tier_id.value());
+            if (resident_it != tier_resident_keys_.end()) {
+                reserved_size += resident_it->second.size();
+            }
+        }
+
+        active_keys.reserve(reserved_size);
+        seen_keys.reserve(reserved_size);
+
+        for (const auto& stat_entry : access_stats.hot_keys) {
+            auto cache_it = key_cache_.find(stat_entry.key);
+            if (cache_it == key_cache_.end() ||
+                cache_it->second.current_locations.empty()) {
+                continue;
+            }
+
+            KeyContext key_ctx;
+            key_ctx.key = stat_entry.key;
+            key_ctx.current_locations = cache_it->second.current_locations;
+            key_ctx.size_bytes = cache_it->second.size_bytes;
+
+            if (access_stats.metric == AccessStatMetric::kRecentHeat) {
+                key_ctx.recent_heat_score = stat_entry.recent_heat_score;
+            } else if (access_stats.metric == AccessStatMetric::kRecencyRank) {
+                key_ctx.recency_rank = stat_entry.recency_rank;
+            }
+
+            seen_keys.insert(stat_entry.key);
+            active_keys.push_back(std::move(key_ctx));
+        }
+
+        if (!pinned_tier_id.has_value()) {
+            return active_keys;
+        }
+
+        auto resident_it = tier_resident_keys_.find(pinned_tier_id.value());
+        if (resident_it == tier_resident_keys_.end()) {
+            return active_keys;
+        }
+
+        for (const auto& key : resident_it->second) {
+            if (seen_keys.count(key) > 0) {
+                continue;
+            }
+
+            auto cache_it = key_cache_.find(key);
+            if (cache_it == key_cache_.end() ||
+                cache_it->second.current_locations.empty()) {
+                continue;
+            }
+
+            active_keys.push_back(KeyContext{
+                key,
+                0.0,
+                0,
+                cache_it->second.current_locations,
+                cache_it->second.size_bytes,
+            });
+        }
+    }
+
+    return active_keys;
+}
+
+void ClientScheduler::TrackReplicaLocked(const std::string& key, UUID tier_id,
+                                         size_t size_bytes) {
+    auto& state = key_cache_[key];
+    state.size_bytes = size_bytes;
+
+    const auto existing_it = std::find(state.current_locations.begin(),
+                                       state.current_locations.end(), tier_id);
+    if (existing_it == state.current_locations.end()) {
+        state.current_locations.push_back(tier_id);
+    }
+
+    tier_resident_keys_[tier_id].insert(key);
+}
+
+void ClientScheduler::RemoveReplicaLocked(const std::string& key,
+                                          std::optional<UUID> tier_id) {
+    auto cache_it = key_cache_.find(key);
+    if (cache_it == key_cache_.end()) {
+        return;
+    }
+
+    if (!tier_id.has_value()) {
+        for (const auto& resident_tier : cache_it->second.current_locations) {
+            auto resident_it = tier_resident_keys_.find(resident_tier);
+            if (resident_it != tier_resident_keys_.end()) {
+                resident_it->second.erase(key);
+            }
+        }
+        key_cache_.erase(cache_it);
+        return;
+    }
+
+    auto& current_locations = cache_it->second.current_locations;
+    current_locations.erase(
+        std::remove(current_locations.begin(), current_locations.end(),
+                    tier_id.value()),
+        current_locations.end());
+
+    auto resident_it = tier_resident_keys_.find(tier_id.value());
+    if (resident_it != tier_resident_keys_.end()) {
+        resident_it->second.erase(key);
+    }
+
+    if (current_locations.empty()) {
+        key_cache_.erase(cache_it);
     }
 }
 
@@ -267,42 +407,14 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
 
 void ClientScheduler::TriggerSyncEviction(UUID tier_id) {
     // Collect current stats
-    std::unordered_map<UUID, TierStats> tier_stats;
-    for (const auto& [tid, tier] : tiers_) {
-        TierStats stats;
-        stats.total_capacity_bytes = tier->GetCapacity();
-        stats.used_capacity_bytes = tier->GetUsage();
-        tier_stats[tid] = stats;
-    }
+    auto tier_stats = CollectTierStats();
 
     // Get active keys from stats collector
     auto access_stats = stats_collector_->GetSnapshot();
-
-    if (access_stats.hot_keys.empty()) {
+    auto active_keys = BuildActiveKeys(access_stats, tier_id);
+    if (active_keys.empty()) {
         LOG(WARNING) << "No active keys for sync eviction";
         return;
-    }
-
-    // Build KeyContext list
-    std::vector<KeyContext> active_keys;
-    active_keys.reserve(access_stats.hot_keys.size());
-
-    for (const auto& [key, score] : access_stats.hot_keys) {
-        KeyContext ctx;
-        ctx.key = key;
-        ctx.heat_score = score;
-
-        ctx.current_locations = backend_->GetReplicaTierIds(key);
-        if (ctx.current_locations.empty()) {
-            continue;  // Key deleted
-        }
-
-        auto handle = backend_->Get(key, std::nullopt, false);
-        if (handle.has_value() && handle.value()->loc.data.buffer) {
-            ctx.size_bytes = handle.value()->loc.data.buffer->size();
-        }
-
-        active_keys.push_back(ctx);
     }
 
     // Force policy to generate eviction actions
