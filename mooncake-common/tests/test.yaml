@@ -2,6 +2,11 @@ testInteger: 42
 testFloat: 3.14
 testString: "Hello, World!"
 testBoolean: true
+legacyDurationMs: 6000
+durationSeconds: 6s
+durationMinutes: "7m"
+durationHours: 1H
+durationWhitespace: " 8 h "
 testObject:
   nestedInteger: 100
   nestedString: "Nested Hello"
