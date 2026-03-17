@@ -1,14 +1,23 @@
 #include <glog/logging.h>
 
+#include <chrono>
+#include <cstring>
+
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/copier_registry.h"
-#include <cstring>
+#include "utils.h"
 
 namespace mooncake {
 
 StorageTier::StorageTier(UUID tier_id, const std::vector<std::string>& tags,
                          size_t capacity)
     : tier_id_(tier_id), tags_(tags), capacity_(capacity) {}
+
+void StorageTier::FreeStagingMemory(char* ptr) {
+    if (ptr) {
+        free_memory("", ptr);
+    }
+}
 
 StorageTier::~StorageTier() {
     // Stop flush thread
@@ -29,10 +38,38 @@ StorageTier::~StorageTier() {
             pending_batch_size_.store(0);
         }
     }
+
+    if (staging_allocator_) {
+        size_t allocated_size = staging_allocator_->size();
+        if (allocated_size > 0) {
+            LOG(WARNING) << "StorageTier " << tier_id_
+                         << " is being destroyed with " << allocated_size
+                         << " bytes still pinned in the staging pool. Waiting "
+                            "for buffers to be released...";
+
+            constexpr int kCheckIntervalMs = 100;
+            int log_counter = 0;
+            while (allocated_size > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(kCheckIntervalMs));
+                allocated_size = staging_allocator_->size();
+                if (++log_counter == 10 && allocated_size > 0) {
+                    LOG(INFO) << "StorageTier " << tier_id_ << " waiting for "
+                              << allocated_size
+                              << " bytes to be released from staging pool...";
+                    log_counter = 0;
+                }
+            }
+        }
+    }
+
+    staging_allocator_.reset();
+    staging_memory_.reset();
 }
 
 tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
                                                 TransferEngine* engine) {
+    static_cast<void>(engine);
     backend_ = backend;
     try {
         auto config = FileStorageConfig::FromEnvironment();
@@ -40,6 +77,30 @@ tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
             LOG(ERROR) << "Invalid FileStorageConfig for StorageTier";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (config.local_buffer_size <= 0) {
+            LOG(ERROR) << "StorageTier local buffer size must be positive, got "
+                       << config.local_buffer_size;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        constexpr size_t kStagingAlignment = 64;
+        staging_memory_.reset(
+            static_cast<char*>(allocate_buffer_allocator_memory(
+                static_cast<size_t>(config.local_buffer_size), "",
+                kStagingAlignment)));
+        if (!staging_memory_) {
+            LOG(ERROR) << "Failed to preallocate storage staging pool, size="
+                       << config.local_buffer_size;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        staging_buffer_capacity_ =
+            static_cast<size_t>(config.local_buffer_size);
+        std::string segment_name = "storage_tier_staging_" +
+                                   std::to_string(tier_id_.first) + "-" +
+                                   std::to_string(tier_id_.second);
+        staging_allocator_ = std::make_shared<OffsetBufferAllocator>(
+            segment_name, reinterpret_cast<uintptr_t>(staging_memory_.get()),
+            staging_buffer_capacity_, segment_name, tier_id_);
 
         auto backend_res = CreateStorageBackend(config);
         if (!backend_res) {
@@ -64,7 +125,8 @@ tl::expected<void, ErrorCode> StorageTier::Init(TieredBackend* backend,
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    LOG(INFO) << "StorageTier initialized successfully.";
+    LOG(INFO) << "StorageTier initialized successfully. staging_pool_size="
+              << staging_buffer_capacity_;
     return {};
 }
 
@@ -101,19 +163,32 @@ tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
         }
     }
 
-    try {
-        // Dynamic allocation (simple and safe)
-        auto staging_buffer =
-            std::make_unique<StorageBuffer>(size, storage_backend_.get());
-
-        data.buffer = std::move(staging_buffer);
-        data.type = MemoryType::NVME;
-
-        return {};
-    } catch (const std::bad_alloc& e) {
-        LOG(ERROR) << "Failed to allocate staging buffer: " << e.what();
+    if (!staging_allocator_) {
+        LOG(ERROR) << "StorageTier staging allocator is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (size > staging_buffer_capacity_) {
+        LOG(WARNING) << "Requested staging buffer exceeds configured local "
+                        "buffer pool: requested="
+                     << size << ", pool_capacity=" << staging_buffer_capacity_;
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
+
+    auto staging_handle = staging_allocator_->allocate(size);
+    if (!staging_handle) {
+        LOG(WARNING) << "Failed to allocate " << size
+                     << " bytes from storage staging pool. largest_free_region="
+                     << staging_allocator_->getLargestFreeRegion()
+                     << ", pool_capacity=" << staging_buffer_capacity_
+                     << ", pool_usage=" << staging_allocator_->size();
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    data.buffer = std::make_unique<StorageBuffer>(std::move(staging_handle),
+                                                  storage_backend_.get());
+    data.type = MemoryType::NVME;
+
+    return {};
 }
 
 tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
@@ -276,8 +351,11 @@ size_t StorageTier::GetCapacity() const {
 }
 
 size_t StorageTier::GetUsage() const {
-    // Total usage = pending (staging) + persisted (on disk)
-    return pending_batch_size_.load() + persisted_size_.load();
+    // Total usage = persisted bytes on disk + all bytes currently reserved from
+    // the staging pool, including uncommitted allocations.
+    const size_t staging_usage =
+        staging_allocator_ ? staging_allocator_->size() : 0;
+    return persisted_size_.load() + staging_usage;
 }
 
 tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(

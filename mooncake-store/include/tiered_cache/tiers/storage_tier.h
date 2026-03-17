@@ -23,82 +23,89 @@ namespace mooncake {
  */
 class StorageBuffer : public BufferBase {
    public:
-    explicit StorageBuffer(size_t size, StorageBackendInterface* backend)
-        : data_(size), backend_(backend), size_(size) {}
-
-    // For when we already have the data populated
-    explicit StorageBuffer(std::vector<char> data,
+    explicit StorageBuffer(std::unique_ptr<AllocatedBuffer> staging_buffer,
                            StorageBackendInterface* backend)
-        : data_(std::move(data)), backend_(backend), size_(data_.size()) {}
+        : staging_buffer_(std::move(staging_buffer)),
+          backend_(backend),
+          size_(staging_buffer_ ? staging_buffer_->size() : 0) {}
 
     uint64_t data() const override {
-        // Return valid pointer only if in staging (DRAM) mode
+        // Return valid pointer only while data is still in the staging pool.
         std::lock_guard<std::mutex> lock(data_mutex_);
-        if (!is_on_disk_.load(std::memory_order_acquire)) {
-            return reinterpret_cast<uint64_t>(data_.data());
+        if (!is_on_disk_.load(std::memory_order_acquire) && staging_buffer_) {
+            return reinterpret_cast<uint64_t>(staging_buffer_->data());
         }
-        return 0;  // Invalid for on-disk
+        return 0;
     }
 
     std::size_t size() const override { return size_; }
 
-    // Helper to get raw pointer (only valid in Staging mode)
+    // Helper to get raw pointer (only valid in staging mode).
     char* data_ptr() {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        return is_on_disk_.load(std::memory_order_acquire) ? nullptr
-                                                           : data_.data();
+        return is_on_disk_.load(std::memory_order_acquire) || !staging_buffer_
+                   ? nullptr
+                   : static_cast<char*>(staging_buffer_->data());
     }
+
     const char* data_ptr() const {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        return is_on_disk_.load(std::memory_order_acquire) ? nullptr
-                                                           : data_.data();
+        return is_on_disk_.load(std::memory_order_acquire) || !staging_buffer_
+                   ? nullptr
+                   : static_cast<const char*>(staging_buffer_->data());
     }
 
     Slice ToSlice() const {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        if (is_on_disk_.load(std::memory_order_acquire))
+        if (is_on_disk_.load(std::memory_order_acquire) || !staging_buffer_) {
             return Slice{nullptr, size_};
-        return Slice{const_cast<char*>(data_.data()), data_.size()};
+        }
+        return Slice{static_cast<char*>(staging_buffer_->data()), size_};
     }
 
     void SetKey(const std::string& key) { key_ = key; }
     const std::string& GetKey() const { return key_; }
 
-    // Transition from Staging -> OnDisk
+    // Transition from staging pool -> on disk.
     void Persist() {
         std::lock_guard<std::mutex> lock(data_mutex_);
         if (is_on_disk_.load(std::memory_order_acquire)) return;
-        size_ = data_.size();  // Ensure size is preserved
+        if (staging_buffer_) {
+            size_ = staging_buffer_->size();
+            staging_buffer_.reset();
+        }
         is_on_disk_.store(true, std::memory_order_release);
-        data_ = std::vector<char>();  // Clear after setting flag
     }
 
-    // Check if data has been persisted to disk
     bool IsPersisted() const {
         return is_on_disk_.load(std::memory_order_acquire);
     }
 
-    // Flushing state management (for thread safety during FlushInternal)
     void SetFlushing(bool flushing) {
         is_flushing_.store(flushing, std::memory_order_release);
     }
+
     bool IsFlushing() const {
         return is_flushing_.load(std::memory_order_acquire);
     }
 
-    // Read data to destination buffer (handles Staging vs Disk transparently)
+    // Read data to destination buffer (handles staging vs disk transparently).
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             if (!is_on_disk_.load(std::memory_order_acquire)) {
-                if (length > data_.size())
+                if (!staging_buffer_) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                if (length > size_) {
                     return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
-                std::memcpy(dst, data_.data(), length);
+                }
+                std::memcpy(dst, staging_buffer_->data(), length);
                 return {};
             }
         }
 
-        // On Disk: Load from backend (no lock needed)
+        // On disk: load from backend without holding the staging lock.
         if (!backend_ || key_.empty()) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -109,13 +116,13 @@ class StorageBuffer : public BufferBase {
     }
 
    private:
-    mutable std::mutex data_mutex_;  // Protects data_ access
-    std::vector<char> data_;
+    mutable std::mutex data_mutex_;
+    std::unique_ptr<AllocatedBuffer> staging_buffer_;
     StorageBackendInterface* backend_ = nullptr;
     std::string key_;
     std::atomic<bool> is_on_disk_{false};
-    std::atomic<bool> is_flushing_{false};  // True while being flushed
-    size_t size_ = 0;  // Store size because clearing data_ loses it
+    std::atomic<bool> is_flushing_{false};
+    size_t size_ = 0;
 };
 
 /**
@@ -161,6 +168,8 @@ class StorageTier : public CacheTier {
         size_t target_free_size = 0);
 
    private:
+    static void FreeStagingMemory(char* ptr);
+
     // Internal flush logic that triggers BatchOffload
     tl::expected<void, ErrorCode> FlushInternal();
 
@@ -188,6 +197,12 @@ class StorageTier : public CacheTier {
     // Configurable thresholds
     size_t batch_size_threshold_ = 64 * 1024 * 1024;  // 64MB
     size_t batch_count_threshold_ = 1000;
+
+    // Preallocated local staging pool for SSD writes.
+    std::shared_ptr<BufferAllocatorBase> staging_allocator_;
+    std::unique_ptr<char, void (*)(char*)> staging_memory_{
+        nullptr, &StorageTier::FreeStagingMemory};
+    size_t staging_buffer_capacity_ = 0;
 
     // Capacity tracking
     size_t capacity_ = 0;

@@ -19,9 +19,13 @@ class StorageTierTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("StorageTierTest");
         FLAGS_logtostderr = true;
+        unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        google::ShutdownGoogleLogging();
+    }
 
     std::unique_ptr<char[]> CreateTestBuffer(size_t size) {
         auto buffer = std::make_unique<char[]>(size);
@@ -148,6 +152,109 @@ TEST_F(StorageTierTest, StorageTierBasic) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_storage");
+}
+
+TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "file_per_key_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_local_buffer_pool", 1);
+    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "1024", 1);
+
+    fs::remove_all("/tmp/mooncake_test_local_buffer_pool");
+    fs::create_directories("/tmp/mooncake_test_local_buffer_pool");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+
+    auto oversized_alloc = backend.Allocate(2048);
+    EXPECT_FALSE(oversized_alloc.has_value())
+        << "allocation larger than configured local buffer pool should fail";
+
+    auto alloc_result = backend.Allocate(1024);
+    ASSERT_TRUE(alloc_result.has_value())
+        << "allocation within local buffer pool should succeed";
+    AllocationHandle handle = alloc_result.value();
+
+    auto test_buffer = CreateTestBuffer(1024);
+    DataSource source;
+    source.buffer =
+        std::make_unique<TempDRAMBuffer>(std::move(test_buffer), 1024);
+    source.type = MemoryType::DRAM;
+
+    auto write_result = backend.Write(source, handle);
+    ASSERT_TRUE(write_result.has_value())
+        << "Write failed: " << write_result.error();
+    ASSERT_TRUE(backend.Commit("local_buffer_key", handle).has_value());
+
+    auto tier = backend.GetTier(handle->loc.tier->GetTierId());
+    ASSERT_NE(tier, nullptr);
+    ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+
+    auto recycled_alloc = backend.Allocate(1024);
+    EXPECT_TRUE(recycled_alloc.has_value())
+        << "staging pool should recycle memory after flush";
+
+    fs::remove_all("/tmp/mooncake_test_local_buffer_pool");
+}
+
+TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "file_per_key_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_capacity_accounting", 1);
+    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "4096", 1);
+
+    fs::remove_all("/tmp/mooncake_test_capacity_accounting");
+    fs::create_directories("/tmp/mooncake_test_capacity_accounting");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 2048,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+
+    auto handle1 = backend.Allocate(1024);
+    ASSERT_TRUE(handle1.has_value());
+    auto handle2 = backend.Allocate(1024);
+    ASSERT_TRUE(handle2.has_value());
+
+    auto over_capacity = backend.Allocate(1);
+    EXPECT_FALSE(over_capacity.has_value())
+        << "uncommitted staging allocations should count against tier capacity";
+
+    handle1 = nullptr;
+
+    auto recovered = backend.Allocate(1024);
+    EXPECT_TRUE(recovered.has_value())
+        << "releasing an uncommitted handle should restore storage capacity";
+
+    fs::remove_all("/tmp/mooncake_test_capacity_accounting");
 }
 
 // Test Bucket Storage Backend
