@@ -21,12 +21,12 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
-static_assert(
-    mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
-    "Update kDefaultKvLeaseTtlFlagValue when DEFAULT_DEFAULT_KV_LEASE_TTL changes");
-static_assert(
-    mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
-    "Update kDefaultKvSoftPinTtlFlagValue when DEFAULT_KV_SOFT_PIN_TTL_MS changes");
+static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
+              "Update kDefaultKvLeaseTtlFlagValue when "
+              "DEFAULT_DEFAULT_KV_LEASE_TTL changes");
+static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
+              "Update kDefaultKvSoftPinTtlFlagValue when "
+              "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
