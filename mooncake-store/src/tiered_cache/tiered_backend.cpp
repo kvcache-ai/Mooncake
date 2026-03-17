@@ -15,8 +15,8 @@
 namespace mooncake {
 
 AllocationEntry::~AllocationEntry() {
-    if (backend && loc.tier) {
-        // When ref count drops to 0, free physical resource directly.
+    if (loc.tier) {
+        // Keep the tier alive until the final handle has released the buffer.
         loc.tier->Free(std::move(loc.data));
     }
 }
@@ -179,7 +179,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
                               ? ", numa_node=" + std::to_string(*numa_node)
                               : "");
 
-            auto tier = std::make_unique<DramCacheTier>(
+            auto tier = std::make_shared<DramCacheTier>(
                 id, capacity, tags, numa_node, allocator_type);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
@@ -205,7 +205,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
                       << ", capacity=" << capacity << ", priority=" << priority
                       << ", device_id=" << device_id;
 
-            auto tier = std::make_unique<AscendCacheTier>(id, capacity, tags,
+            auto tier = std::make_shared<AscendCacheTier>(id, capacity, tags,
                                                           device_id);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
@@ -223,7 +223,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
         else if (type == "STORAGE" || type == "DISK") {
             LOG(INFO) << "Creating Storage tier: id=" << id
                       << ", capacity=" << capacity << ", priority=" << priority;
-            auto tier = std::make_unique<StorageTier>(id, tags, capacity);
+            auto tier = std::make_shared<StorageTier>(id, tags, capacity);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
                 LOG(ERROR) << "Failed to initialize Storage tier: id=" << id
@@ -308,7 +308,7 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         if (it != tiers_.end()) {
             auto alloc_result = it->second->Allocate(size, out_loc->data);
             if (alloc_result) {
-                out_loc->tier = it->second.get();
+                out_loc->tier = it->second;
                 return true;
             }
         }
@@ -324,7 +324,7 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         auto& tier = it->second;
         auto alloc_result = tier->Allocate(size, out_loc->data);
         if (alloc_result) {
-            out_loc->tier = tier.get();
+            out_loc->tier = tier;
             return true;
         }
     }
@@ -350,7 +350,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         // Try allocation
         auto alloc_result = it->second->Allocate(size, loc.data);
         if (alloc_result) {
-            loc.tier = it->second.get();
+            loc.tier = it->second;
             return std::make_shared<AllocationEntry>(this, std::move(loc));
         }
 
@@ -363,7 +363,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
                 if (alloc_result) {
                     LOG(INFO)
                         << "Strict allocation succeeded after sync eviction";
-                    loc.tier = it->second.get();
+                    loc.tier = it->second;
                     return std::make_shared<AllocationEntry>(this,
                                                              std::move(loc));
                 }

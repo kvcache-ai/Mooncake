@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <limits>
@@ -255,6 +256,90 @@ TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
         << "releasing an uncommitted handle should restore storage capacity";
 
     fs::remove_all("/tmp/mooncake_test_capacity_accounting");
+}
+
+TEST_F(StorageTierTest,
+       StorageHandleKeepsPersistedDataAliveAfterBackendDestruction) {
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "file_per_key_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_handle_lifetime", 1);
+    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "4096", 1);
+
+    fs::remove_all("/tmp/mooncake_test_handle_lifetime");
+    fs::create_directories("/tmp/mooncake_test_handle_lifetime");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    auto backend = std::make_unique<TieredBackend>();
+    auto init_res = backend->Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+
+    constexpr size_t kDataSize = 1024;
+    auto alloc_result = backend->Allocate(kDataSize);
+    ASSERT_TRUE(alloc_result.has_value());
+    AllocationHandle handle = alloc_result.value();
+
+    auto test_buffer = CreateTestBuffer(kDataSize);
+    std::string expected(test_buffer.get(), test_buffer.get() + kDataSize);
+
+    DataSource source;
+    source.buffer =
+        std::make_unique<TempDRAMBuffer>(std::move(test_buffer), kDataSize);
+    source.type = MemoryType::DRAM;
+
+    ASSERT_TRUE(backend->Write(source, handle).has_value());
+    ASSERT_TRUE(backend->Commit("persisted_handle_key", handle).has_value());
+
+    auto tier = backend->GetTier(handle->loc.tier->GetTierId());
+    ASSERT_NE(tier, nullptr);
+    ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+
+    std::atomic<bool> backend_destroyed{false};
+    std::thread destroy_thread(
+        [backend = std::move(backend), &backend_destroyed]() mutable {
+            backend.reset();
+            backend_destroyed.store(true, std::memory_order_release);
+        });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!backend_destroyed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (!backend_destroyed.load(std::memory_order_acquire)) {
+        handle.reset();
+        destroy_thread.join();
+        FAIL() << "TieredBackend destruction should not block on outstanding "
+                  "SSD handles";
+    }
+
+    destroy_thread.join();
+
+    auto* storage_buffer =
+        dynamic_cast<StorageBuffer*>(handle->loc.data.buffer.get());
+    ASSERT_NE(storage_buffer, nullptr);
+
+    std::string restored(kDataSize, '\0');
+    auto read_res = storage_buffer->ReadTo(restored.data(), restored.size());
+    ASSERT_TRUE(read_res.has_value()) << "Read failed: " << read_res.error();
+    EXPECT_EQ(restored, expected);
+
+    handle.reset();
+    fs::remove_all("/tmp/mooncake_test_handle_lifetime");
 }
 
 // Test Bucket Storage Backend
