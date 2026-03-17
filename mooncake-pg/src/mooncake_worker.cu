@@ -260,7 +260,6 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
     }
-
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(

@@ -129,7 +129,7 @@ void MooncakeWorker::startWorker() {
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (j != group->rank &&
-                                        diff.count() > kPingTimeoutMicroseconds_ &&
+                                     diff.count() > kPingTimeoutMicroseconds_ &&
                                      group->engine->sendNotifyByID(
                                          group->segmentIDs[j], msg))) {
                                     LOG(ERROR)
@@ -211,7 +211,7 @@ void MooncakeWorker::startWorker() {
                             status.s != TransferStatusEnum::COMPLETED) {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
-                                    diff.count() > kPingTimeoutMicroseconds_ &&
+                                 diff.count() > kPingTimeoutMicroseconds_ &&
                                  group->engine->sendNotifyByID(
                                      group->segmentIDs[j], msg))) {
                                 LOG(ERROR) << "Rank " << group->rank
