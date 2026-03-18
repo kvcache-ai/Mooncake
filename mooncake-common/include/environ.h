@@ -88,6 +88,11 @@ class Environ {
     int GetTransferTimeout() const { return transfer_timeout_; }
     bool GetUseHipIpc() const { return use_hip_ipc_; }
     bool GetUseNvlinkIpc() const { return use_nvlink_ipc_; }
+    // Returns true only when MC_USE_NVLINK_IPC is explicitly set to "0",
+    // which opts in to fabric-memory mode on MNNVL clusters.
+    bool GetNvlinkFabricMemEnabled() const {
+        return use_nvlink_ipc_raw_ == "0";
+    }
     bool GetUseTent() const { return use_tent_; }
     bool GetUseTev1() const { return use_tev1_; }
     std::string GetYltLogLevel() const { return ylt_log_level_; }
@@ -194,6 +199,7 @@ class Environ {
     int transfer_timeout_;
     bool use_hip_ipc_;
     bool use_nvlink_ipc_;
+    std::string use_nvlink_ipc_raw_;
     bool use_tent_;
     bool use_tev1_;
     std::string ylt_log_level_;

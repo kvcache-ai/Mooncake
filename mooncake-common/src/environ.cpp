@@ -153,6 +153,7 @@ Environ::Environ() {
     transfer_timeout_ = GetInt("MC_TRANSFER_TIMEOUT", 0);
     use_hip_ipc_ = GetBool("MC_USE_HIP_IPC", true);
     use_nvlink_ipc_ = GetBool("MC_USE_NVLINK_IPC", false);
+    use_nvlink_ipc_raw_ = GetString("MC_USE_NVLINK_IPC", "");
     use_tent_ = GetBool("MC_USE_TENT", false);
     use_tev1_ = GetBool("MC_USE_TEV1", false);
     ylt_log_level_ = GetString("MC_YLT_LOG_LEVEL", "");

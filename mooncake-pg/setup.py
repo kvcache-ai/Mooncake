@@ -54,6 +54,7 @@ cuda_library_dirs = []
 include_dirs = [
     os.path.join(current_dir, "include"),
     os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+    os.path.join(current_dir, "../mooncake-common/include"),
 ]
 use_maca = (
     os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
