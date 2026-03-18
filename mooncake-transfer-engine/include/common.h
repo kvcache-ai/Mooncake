@@ -22,7 +22,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <unistd.h>
-
+#include <errno.h>
 #include <atomic>
 #include <charconv>
 #include <chrono>
