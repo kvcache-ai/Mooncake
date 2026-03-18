@@ -287,7 +287,11 @@ def generate_tests():
         if raw_dict["async_finish"] and raw_dict["return_recv_hook"]:
             continue
 
-        # FIXME: Don't test fault-tolerance for fallback implementation for now.
+        # NOTE: Fault-tolerance testing is currently disabled for the fallback implementation.
+        # In the fallback path, `dispatch` is implemented using collective communications.
+        # Since this test simulates failure by having a rank skip the `dispatch/combine` call
+        # (rather than killing the process), the simulated failed rank continues to acknowledge other's 
+        # `sendNotifyByID` in Mooncake-PG. This prevents the timeout on other ranks, leading to a hang.
         if raw_dict["use_fallback"] and raw_dict["fail_rank"] != -1:
             continue
 
