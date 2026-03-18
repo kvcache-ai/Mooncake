@@ -107,9 +107,7 @@ bool ConnManager::isSocketAlive(asio::ip::tcp::socket& socket) {
 
 Status ConnManager::clientHandshake(asio::ip::tcp::socket& socket) {
     HandshakeReq req;
-    req.magic = kMagic;
-    req.version = kProtocolVersion;
-    req.flags = 0;
+    req.encode();
 
     asio::error_code ec;
     asio::write(socket, asio::buffer(&req, sizeof(req)), ec);
@@ -125,9 +123,10 @@ Status ConnManager::clientHandshake(asio::ip::tcp::socket& socket) {
                                      ec.message());
     }
 
-    if (ack.status != kHandshakeOK) {
+    if (ack.decodedStatus() != kHandshakeOK) {
         return Status::InternalError(
-            "TCP_HP handshake rejected, status=" + std::to_string(ack.status));
+            "TCP_HP handshake rejected, status=" +
+            std::to_string(ack.decodedStatus()));
     }
     return Status::OK();
 }
@@ -142,22 +141,22 @@ Status ConnManager::serverHandshake(asio::ip::tcp::socket& socket) {
     }
 
     HandshakeAck ack;
-    ack.flags = 0;
 
-    if (req.magic != kMagic) {
-        ack.status = kHandshakeBadMagic;
+    if (req.decodedMagic() != kMagic) {
+        ack.encode(kHandshakeBadMagic);
         asio::write(socket, asio::buffer(&ack, sizeof(ack)), ec);
         return Status::InternalError("TCP_HP bad magic number");
     }
-    if (req.version != kProtocolVersion) {
-        ack.status = kHandshakeBadVersion;
+    if (req.decodedVersion() != kProtocolVersion) {
+        ack.encode(kHandshakeBadVersion);
         asio::write(socket, asio::buffer(&ack, sizeof(ack)), ec);
         return Status::InternalError(
-            "TCP_HP version mismatch: got " + std::to_string(req.version) +
-            ", expected " + std::to_string(kProtocolVersion));
+            "TCP_HP version mismatch: got " +
+            std::to_string(req.decodedVersion()) + ", expected " +
+            std::to_string(kProtocolVersion));
     }
 
-    ack.status = kHandshakeOK;
+    ack.encode(kHandshakeOK);
     asio::write(socket, asio::buffer(&ack, sizeof(ack)), ec);
     if (ec) {
         return Status::InternalError("TCP_HP server handshake write failed: " +
@@ -199,49 +198,54 @@ Status ConnManager::connectWithRetry(const std::string& host, uint16_t port,
                                  std::to_string(port));
 }
 
+std::shared_ptr<ConnManager::EndpointPool> ConnManager::getEndpointPool(
+    const std::string& key) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    auto& ptr = pool_map_[key];
+    if (!ptr) ptr = std::make_shared<EndpointPool>();
+    return ptr;
+}
+
 Status ConnManager::acquire(const std::string& host, uint16_t port,
                             asio::ip::tcp::socket& out_socket) {
     std::string key = makeKey(host, port);
+    auto ep = getEndpointPool(key);
     {
-        std::lock_guard<std::mutex> lock(pool_mutex_);
-        auto it = pool_map_.find(key);
-        if (it != pool_map_.end()) {
-            while (!it->second.empty()) {
-                auto socket = std::move(it->second.back());
-                it->second.pop_back();
-                if (isSocketAlive(socket)) {
-                    out_socket = std::move(socket);
-                    return Status::OK();
-                }
-                // Stale connection, discard and try next
+        std::lock_guard<std::mutex> lock(ep->mutex);
+        while (!ep->sockets.empty()) {
+            auto socket = std::move(ep->sockets.back());
+            ep->sockets.pop_back();
+            if (isSocketAlive(socket)) {
+                out_socket = std::move(socket);
+                return Status::OK();
             }
+            // Stale connection, discard and try next
         }
     }
     // No pooled connection — create new, configure, and handshake.
-    asio::ip::tcp::socket socket(pool_.getNextContext());
-    auto status = connectWithRetry(host, port, socket);
+    // connectWithRetry selects an io_context and creates the socket internally.
+    auto status = connectWithRetry(host, port, out_socket);
     if (!status.ok()) return status;
 
-    configureSocket(socket);
+    configureSocket(out_socket);
 
-    status = clientHandshake(socket);
+    status = clientHandshake(out_socket);
     if (!status.ok()) {
         asio::error_code ec;
-        socket.close(ec);
+        out_socket.close(ec);
         return status;
     }
 
-    out_socket = std::move(socket);
     return Status::OK();
 }
 
 void ConnManager::release(const std::string& host, uint16_t port,
                           asio::ip::tcp::socket socket) {
     std::string key = makeKey(host, port);
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-    auto& vec = pool_map_[key];
-    if (vec.size() < opts_.max_pool_size) {
-        vec.push_back(std::move(socket));
+    auto ep = getEndpointPool(key);
+    std::lock_guard<std::mutex> lock(ep->mutex);
+    if (ep->sockets.size() < opts_.max_pool_size) {
+        ep->sockets.push_back(std::move(socket));
     } else {
         asio::error_code ec;
         socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -273,20 +277,21 @@ struct AsyncHandshakeState
                             std::move(socket));
                     return;
                 }
-                ack.flags = 0;
-                if (req.magic != kMagic) {
-                    ack.status = kHandshakeBadMagic;
+                if (req.decodedMagic() != kMagic) {
+                    ack.encode(kHandshakeBadMagic);
                     sendAckAndFail("TCP_HP bad magic number");
                     return;
                 }
-                if (req.version != kProtocolVersion) {
-                    ack.status = kHandshakeBadVersion;
-                    sendAckAndFail("TCP_HP version mismatch: got " +
-                                  std::to_string(req.version) + ", expected " +
-                                  std::to_string(kProtocolVersion));
+                if (req.decodedVersion() != kProtocolVersion) {
+                    ack.encode(kHandshakeBadVersion);
+                    sendAckAndFail(
+                        "TCP_HP version mismatch: got " +
+                        std::to_string(req.decodedVersion()) +
+                        ", expected " +
+                        std::to_string(kProtocolVersion));
                     return;
                 }
-                ack.status = kHandshakeOK;
+                ack.encode(kHandshakeOK);
                 sendAckAndSucceed();
             });
     }
@@ -326,7 +331,7 @@ void ConnManager::asyncServerHandshake(asio::ip::tcp::socket socket,
 }
 
 void ConnManager::shutdown() {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<std::mutex> lock(map_mutex_);
     pool_map_.clear();
 }
 

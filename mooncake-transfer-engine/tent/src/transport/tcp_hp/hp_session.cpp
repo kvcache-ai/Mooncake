@@ -261,7 +261,15 @@ void HpSession::sendBodyChunked() {
         } else {
             bounce = new char[chunk];
         }
-        Platform::getLoader().copy(bounce, src, chunk);
+        auto copy_status = Platform::getLoader().copy(bounce, src, chunk);
+        if (!copy_status.ok()) {
+            LOG(ERROR) << "HpSession::sendBodyChunked: GPU->DRAM copy failed: "
+                       << copy_status.message();
+            if (bounce_from_pool) bounce_pool_->release(bounce);
+            else delete[] bounce;
+            finish(TransferStatusEnum::FAILED);
+            return;
+        }
         send_buf = bounce;
     }
 
@@ -326,16 +334,29 @@ void HpSession::recvBodyChunked() {
                 return;
             }
             if (bounce) {
-                Platform::getLoader().copy(dst, bounce, transferred);
+                auto copy_status =
+                    Platform::getLoader().copy(dst, bounce, transferred);
                 if (bounce_from_pool) pool->release(bounce);
                 else delete[] bounce;
+                if (!copy_status.ok()) {
+                    LOG(ERROR)
+                        << "HpSession::recvBodyChunked: DRAM->GPU copy failed: "
+                        << copy_status.message();
+                    finish(TransferStatusEnum::FAILED);
+                    return;
+                }
             }
             total_transferred_ += transferred;
             recvBodyChunked();
         });
 }
 
-// ========== Finish ==========
+// ========== Close / Finish ==========
+
+void HpSession::closeSocket() {
+    asio::error_code ec;
+    socket_.close(ec);  // cancels all pending async ops on this socket
+}
 
 void HpSession::finish(TransferStatusEnum status) {
     // Guard against double-finish (e.g. timeout fires after I/O error).
@@ -350,6 +371,11 @@ void HpSession::finish(TransferStatusEnum status) {
         local_buffer_ = nullptr;
         readHeader();
         return;
+    }
+
+    // Server session ending (error/EOF): notify transport for cleanup.
+    if (seg_mgr_ && on_close) {
+        on_close();
     }
 
     if (status == TransferStatusEnum::COMPLETED && return_socket) {

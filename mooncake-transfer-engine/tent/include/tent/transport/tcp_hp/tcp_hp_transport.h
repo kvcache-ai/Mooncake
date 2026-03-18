@@ -18,7 +18,9 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <asio/ip/tcp.hpp>
@@ -29,8 +31,10 @@
 #include "tent/runtime/transport.h"
 #include "tent/transport/tcp_hp/bounce_buffer_pool.h"
 #include "tent/transport/tcp_hp/conn_manager.h"
+#include "tent/transport/tcp_hp/hp_session.h"
 #include "tent/transport/tcp_hp/inflight_controller.h"
 #include "tent/transport/tcp_hp/io_context_pool.h"
+#include "tent/transport/tcp_hp/striped_transfer.h"
 
 namespace mooncake {
 namespace tent {
@@ -98,6 +102,17 @@ class TcpHpTransport : public Transport {
 
    private:
     void startTransfer(TcpHpSubBatch* batch, TcpHpTask* task);
+
+    // Single-connection transfer (small buffers, GPU memory).
+    void doSingleTransfer(TcpHpSubBatch* batch, TcpHpTask* task,
+                          const std::string& host, uint16_t port);
+
+    // Multi-connection striped transfer (large CPU buffers).
+    // Splits the buffer into num_stripes_ contiguous sub-ranges, each sent
+    // over an independent TCP connection in parallel.
+    void doStripedTransfer(TcpHpSubBatch* batch, TcpHpTask* task,
+                           const std::string& host, uint16_t port);
+
     Status findRemoteDataEndpoint(uint64_t dest_addr, uint64_t length,
                                   uint64_t target_id, std::string& host,
                                   uint16_t& data_port);
@@ -118,6 +133,11 @@ class TcpHpTransport : public Transport {
     size_t chunk_size_ = 65536;
     unsigned transfer_timeout_s_ = 30;  // 0 = no timeout
 
+    // Multi-rail striping: split large CPU transfers across parallel connections.
+    // Disabled for GPU memory (bounce-buffer path already limits parallelism).
+    size_t stripe_threshold_ = 1 * 1024 * 1024;  // 0 = always stripe
+    size_t num_stripes_ = 1;                       // 1 = disabled
+
     // Phase 2: bounce buffer pool for GPU transfers
     std::unique_ptr<tcp_hp::BounceBufferPool> bounce_pool_;
 
@@ -127,6 +147,11 @@ class TcpHpTransport : public Transport {
     // Thread pool for blocking connection work (connect + handshake),
     // so io_context threads are never blocked by synchronous operations.
     std::unique_ptr<asio::thread_pool> connect_pool_;
+
+    // Active server-side sessions: tracked so we can close their sockets
+    // during shutdown before destroying metadata_ / SegmentManager.
+    std::mutex server_sessions_mutex_;
+    std::unordered_set<std::shared_ptr<tcp_hp::HpSession>> server_sessions_;
 
     // Notification (same as TcpTransport)
     RWSpinlock notify_lock_;

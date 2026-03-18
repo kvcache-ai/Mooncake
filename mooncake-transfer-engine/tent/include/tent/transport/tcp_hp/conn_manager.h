@@ -78,10 +78,19 @@ class ConnManager {
     Status clientHandshake(asio::ip::tcp::socket& socket);
     bool isSocketAlive(asio::ip::tcp::socket& socket);
 
+    // Per-endpoint connection pool to avoid global lock contention.
+    struct EndpointPool {
+        std::mutex mutex;
+        std::vector<asio::ip::tcp::socket> sockets;
+    };
+
+    // Get or create per-endpoint pool (thread-safe).
+    std::shared_ptr<EndpointPool> getEndpointPool(const std::string& key);
+
     IoContextPool& pool_;
     ConnOptions opts_;
-    std::mutex pool_mutex_;
-    std::unordered_map<std::string, std::vector<asio::ip::tcp::socket>> pool_map_;
+    std::mutex map_mutex_;  // protects pool_map_ structural changes only
+    std::unordered_map<std::string, std::shared_ptr<EndpointPool>> pool_map_;
 };
 
 }  // namespace tcp_hp

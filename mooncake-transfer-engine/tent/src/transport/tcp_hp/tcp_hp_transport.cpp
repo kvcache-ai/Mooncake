@@ -17,7 +17,6 @@
 #include <glog/logging.h>
 
 #include <chrono>
-#include <random>
 #include <thread>
 
 #include <asio.hpp>
@@ -27,7 +26,6 @@
 #include "tent/common/utils/ip.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
-#include "tent/transport/tcp_hp/hp_session.h"
 #include "tent/transport/tcp_hp/protocol.h"
 
 namespace mooncake {
@@ -69,53 +67,36 @@ TcpHpTransport::~TcpHpTransport() { uninstall(); }
 Status TcpHpTransport::startDataServer() {
     auto& ctx = io_pool_->getContext(0);
 
-    const int kStartPort = 10000;
-    const int kPortRange = 50000;
-    const int kMaxRetries = 32;
-    std::mt19937 rng(std::random_device{}());
+    // Use port 0 to let the OS assign an available ephemeral port.
+    // Try IPv6 dual-stack first, then fall back to IPv4.
+    auto try_bind = [&](asio::ip::tcp protocol) -> bool {
+        auto acc = std::make_unique<asio::ip::tcp::acceptor>(ctx);
+        asio::error_code ec;
+        acc->open(protocol, ec);
+        if (ec) return false;
 
-    for (int i = 0; i < kMaxRetries; ++i) {
-        uint16_t port = kStartPort + static_cast<uint16_t>(rng() % kPortRange);
-        try {
-            // Try IPv6 dual-stack first.
-            asio::ip::tcp::endpoint ep(asio::ip::tcp::v6(), port);
-            auto acc = std::make_unique<asio::ip::tcp::acceptor>(ctx);
-            std::error_code ec;
-            acc->open(ep.protocol(), ec);
-            if (!ec) {
-                acc->set_option(asio::ip::v6_only(false), ec);
-                if (!ec) {
-                    acc->set_option(
-                        asio::ip::tcp::acceptor::reuse_address(true));
-                    acc->bind(ep, ec);
-                    if (!ec) {
-                        acc->listen(asio::socket_base::max_listen_connections);
-                        acceptor_ = std::move(acc);
-                        data_port_ = port;
-                        return Status::OK();
-                    }
-                }
-                acc->close();
-            }
-            // Fallback: IPv4.
-            asio::ip::tcp::endpoint ep4(asio::ip::tcp::v4(), port);
-            acc = std::make_unique<asio::ip::tcp::acceptor>(ctx);
-            acc->open(ep4.protocol(), ec);
-            if (ec) continue;
-            acc->set_option(asio::ip::tcp::acceptor::reuse_address(true));
-            acc->bind(ep4, ec);
-            if (ec) continue;
-            acc->listen(asio::socket_base::max_listen_connections);
-            acceptor_ = std::move(acc);
-            data_port_ = port;
-            return Status::OK();
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "TCP_HP data server: port " << port
-                         << " failed: " << e.what();
+        if (protocol == asio::ip::tcp::v6()) {
+            acc->set_option(asio::ip::v6_only(false), ec);
+            if (ec) { acc->close(); return false; }
         }
+
+        acc->set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
+        acc->bind(asio::ip::tcp::endpoint(protocol, 0), ec);
+        if (ec) { acc->close(); return false; }
+
+        acc->listen(asio::socket_base::max_listen_connections, ec);
+        if (ec) { acc->close(); return false; }
+
+        data_port_ = acc->local_endpoint().port();
+        acceptor_ = std::move(acc);
+        return true;
+    };
+
+    if (try_bind(asio::ip::tcp::v6()) || try_bind(asio::ip::tcp::v4())) {
+        return Status::OK();
     }
     return Status::InternalError(
-        "TCP_HP data server: unable to find available port");
+        "TCP_HP data server: unable to bind on any protocol");
 }
 
 void TcpHpTransport::doAccept() {
@@ -134,6 +115,23 @@ void TcpHpTransport::doAccept() {
                         auto session = std::make_shared<tcp_hp::HpSession>(
                             std::move(hs_socket), chunk_size_,
                             bounce_pool_.get(), transfer_timeout_s_);
+
+                        // Track server session so we can close it on shutdown
+                        // before metadata_/SegmentManager is destroyed.
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                server_sessions_mutex_);
+                            server_sessions_.insert(session);
+                        }
+                        std::weak_ptr<tcp_hp::HpSession> weak = session;
+                        session->on_close = [this, weak]() {
+                            if (auto s = weak.lock()) {
+                                std::lock_guard<std::mutex> lock(
+                                    server_sessions_mutex_);
+                                server_sessions_.erase(s);
+                            }
+                        };
+
                         session->onAccept(&metadata_->segmentManager());
                     } else {
                         LOG(WARNING) << "TCP_HP handshake rejected: "
@@ -207,6 +205,11 @@ Status TcpHpTransport::install(std::string& local_segment_name,
         conn_opts.keepalive_count =
             conf->get("transports/tcp_hp/socket/keepalive_count",
                       conn_opts.keepalive_count);
+        stripe_threshold_ =
+            conf->get("transports/tcp_hp/stripe_threshold",
+                      static_cast<int>(stripe_threshold_));
+        num_stripes_ = conf->get("transports/tcp_hp/num_stripes",
+                                 static_cast<int>(num_stripes_));
     }
 
     // Create I/O pool and connection manager.
@@ -240,7 +243,9 @@ Status TcpHpTransport::install(std::string& local_segment_name,
               << " (io_threads=" << io_threads << ", chunk_size=" << chunk_size_
               << ", max_inflight=" << max_inflight
               << ", bounce_pool=" << (bounce_pool_ ? "yes" : "no")
-              << ", timeout=" << transfer_timeout_s_ << "s)";
+              << ", timeout=" << transfer_timeout_s_ << "s"
+              << ", stripes=" << num_stripes_
+              << ", stripe_threshold=" << stripe_threshold_ << ")";
 
     // Publish TCP_HP data port in segment's transport_attrs.
     auto& manager = metadata_->segmentManager();
@@ -285,6 +290,16 @@ Status TcpHpTransport::uninstall() {
                              << " transfers still inflight after "
                              << kDrainTimeoutMs << "ms, forcing shutdown";
             }
+        }
+
+        // Close all active server sessions to cancel their pending I/O,
+        // ensuring seg_mgr_ pointers are not accessed after metadata_ reset.
+        {
+            std::lock_guard<std::mutex> lock(server_sessions_mutex_);
+            for (auto& session : server_sessions_) {
+                session->closeSocket();
+            }
+            server_sessions_.clear();
         }
 
         if (connect_pool_) connect_pool_->join();
@@ -336,7 +351,10 @@ Status TcpHpTransport::submitTransferTasks(
 
     size_t base = tcp_batch->task_list.size();
     for (auto& request : request_list) {
-        tcp_batch->task_list.push_back(TcpHpTask{});
+        // emplace_back: TcpHpTask contains std::atomic members (non-movable),
+        // so push_back(TcpHpTask{}) is ill-formed. The vector is pre-reserved
+        // to max_size (checked above), so no reallocation will occur.
+        tcp_batch->task_list.emplace_back();
         auto& task = tcp_batch->task_list.back();
         task.target_addr = request.target_offset;
         task.request = request;
@@ -375,7 +393,7 @@ Status TcpHpTransport::removeMemoryBuffer(BufferDesc& desc) {
 }
 
 // ---------------------------------------------------------------------------
-// startTransfer
+// startTransfer / doSingleTransfer / doStripedTransfer
 // ---------------------------------------------------------------------------
 void TcpHpTransport::startTransfer(TcpHpSubBatch* batch, TcpHpTask* task) {
     if (task->request.target_id == LOCAL_SEGMENT_ID &&
@@ -385,7 +403,15 @@ void TcpHpTransport::startTransfer(TcpHpSubBatch* batch, TcpHpTask* task) {
             << local_segment_name_;
     }
 
-    auto do_transfer = [this, batch, task]() {
+    // Decide routing before posting: GPU memory always uses the single-conn
+    // path (bounce-buffer chunking already limits parallelism), while large
+    // CPU buffers use the striped path when num_stripes_ > 1.
+    bool is_gpu = (Platform::getLoader().getMemoryType(task->request.source) ==
+                   MTYPE_CUDA);
+    bool use_stripe = num_stripes_ > 1 &&
+                      task->request.length >= stripe_threshold_ && !is_gpu;
+
+    auto do_transfer = [this, batch, task, use_stripe]() {
         std::string host;
         uint16_t remote_data_port = 0;
         auto status = findRemoteDataEndpoint(
@@ -399,43 +425,10 @@ void TcpHpTransport::startTransfer(TcpHpSubBatch* batch, TcpHpTask* task) {
             return;
         }
 
-        asio::ip::tcp::socket socket(io_pool_->getNextContext());
-        status = conn_mgr_->acquire(host, remote_data_port, socket);
-        if (!status.ok()) {
-            LOG(ERROR) << "TCP_HP connect failed to " << host << ":"
-                       << remote_data_port << ": " << status.message();
-            task->status_word.store(TransferStatusEnum::FAILED,
-                                   std::memory_order_release);
-            batch->outstanding.fetch_sub(1, std::memory_order_release);
-            if (inflight_ctrl_) inflight_ctrl_->release();
-            return;
-        }
-
-        auto session = std::make_shared<tcp_hp::HpSession>(
-            std::move(socket), chunk_size_, bounce_pool_.get(),
-            transfer_timeout_s_);
-
-        // Release inflight slot when transfer completes.
-        auto* ctrl = inflight_ctrl_.get();
-        session->on_complete = [batch, task, ctrl](TransferStatusEnum s) {
-            if (s == TransferStatusEnum::COMPLETED)
-                task->transferred_bytes.store(task->request.length,
-                                             std::memory_order_release);
-            task->status_word.store(s, std::memory_order_release);
-            batch->outstanding.fetch_sub(1, std::memory_order_release);
-            if (ctrl) ctrl->release();
-        };
-
-        auto* mgr = conn_mgr_.get();
-        session->return_socket =
-            [mgr, host, remote_data_port](asio::ip::tcp::socket s) {
-                mgr->release(host, remote_data_port, std::move(s));
-            };
-
-        session->initiateClient(
-            task->request.source, task->request.target_offset,
-            task->request.length,
-            static_cast<uint8_t>(task->request.opcode));
+        if (use_stripe)
+            doStripedTransfer(batch, task, host, remote_data_port);
+        else
+            doSingleTransfer(batch, task, host, remote_data_port);
     };
 
     // Wrap do_transfer to always run on connect_pool_ so that blocking
@@ -449,6 +442,98 @@ void TcpHpTransport::startTransfer(TcpHpSubBatch* batch, TcpHpTask* task) {
         inflight_ctrl_->enqueue(std::move(posted_transfer));
     } else {
         posted_transfer();
+    }
+}
+
+void TcpHpTransport::doSingleTransfer(TcpHpSubBatch* batch, TcpHpTask* task,
+                                       const std::string& host, uint16_t port) {
+    asio::ip::tcp::socket socket(io_pool_->getNextContext());
+    auto status = conn_mgr_->acquire(host, port, socket);
+    if (!status.ok()) {
+        LOG(ERROR) << "TCP_HP connect failed to " << host << ":" << port
+                   << ": " << status.message();
+        task->status_word.store(TransferStatusEnum::FAILED,
+                               std::memory_order_release);
+        batch->outstanding.fetch_sub(1, std::memory_order_release);
+        if (inflight_ctrl_) inflight_ctrl_->release();
+        return;
+    }
+
+    auto session = std::make_shared<tcp_hp::HpSession>(
+        std::move(socket), chunk_size_, bounce_pool_.get(), transfer_timeout_s_);
+
+    auto* ctrl = inflight_ctrl_.get();
+    session->on_complete = [batch, task, ctrl](TransferStatusEnum s) {
+        if (s == TransferStatusEnum::COMPLETED)
+            task->transferred_bytes.store(task->request.length,
+                                         std::memory_order_release);
+        task->status_word.store(s, std::memory_order_release);
+        batch->outstanding.fetch_sub(1, std::memory_order_release);
+        if (ctrl) ctrl->release();
+    };
+
+    auto* mgr = conn_mgr_.get();
+    session->return_socket = [mgr, host, port](asio::ip::tcp::socket s) {
+        mgr->release(host, port, std::move(s));
+    };
+
+    session->initiateClient(task->request.source, task->request.target_offset,
+                            task->request.length,
+                            static_cast<uint8_t>(task->request.opcode));
+}
+
+void TcpHpTransport::doStripedTransfer(TcpHpSubBatch* batch, TcpHpTask* task,
+                                        const std::string& host, uint16_t port) {
+    const size_t total = task->request.length;
+    const size_t n = num_stripes_;
+    const size_t base_len = total / n;
+
+    // The coordinator fires on_complete exactly once — when all n stripes
+    // report back — consuming the single inflight slot acquired by the caller.
+    auto* ctrl = inflight_ctrl_.get();
+    auto coord = std::make_shared<tcp_hp::StripedTransfer>(
+        n, [batch, task, ctrl](TransferStatusEnum s) {
+            if (s == TransferStatusEnum::COMPLETED)
+                task->transferred_bytes.store(task->request.length,
+                                             std::memory_order_release);
+            task->status_word.store(s, std::memory_order_release);
+            batch->outstanding.fetch_sub(1, std::memory_order_release);
+            if (ctrl) ctrl->release();
+        });
+
+    auto* mgr = conn_mgr_.get();
+    for (size_t i = 0; i < n; ++i) {
+        const size_t offset = i * base_len;
+        const size_t len = (i + 1 == n) ? (total - offset) : base_len;
+        char* src = static_cast<char*>(task->request.source) + offset;
+        uint64_t dest = task->request.target_offset + offset;
+
+        asio::ip::tcp::socket socket(io_pool_->getNextContext());
+        auto status = conn_mgr_->acquire(host, port, socket);
+        if (!status.ok()) {
+            LOG(ERROR) << "TCP_HP stripe " << i << "/" << n
+                       << " connect failed to " << host << ":" << port
+                       << ": " << status.message();
+            // Report FAILED for this stripe and all remaining ones so the
+            // coordinator fires exactly once with n total completions.
+            for (size_t j = i; j < n; ++j)
+                coord->onStripeComplete(TransferStatusEnum::FAILED);
+            return;
+        }
+
+        auto session = std::make_shared<tcp_hp::HpSession>(
+            std::move(socket), chunk_size_, bounce_pool_.get(),
+            transfer_timeout_s_);
+
+        session->on_complete = [coord](TransferStatusEnum s) {
+            coord->onStripeComplete(s);
+        };
+        session->return_socket = [mgr, host, port](asio::ip::tcp::socket s) {
+            mgr->release(host, port, std::move(s));
+        };
+
+        session->initiateClient(src, dest, len,
+                                static_cast<uint8_t>(task->request.opcode));
     }
 }
 

@@ -57,6 +57,12 @@ class HpSession : public std::enable_shared_from_this<HpSession> {
     std::function<void(TransferStatusEnum)> on_complete;
     // Socket return callback: called on success to return socket to pool.
     std::function<void(asio::ip::tcp::socket)> return_socket;
+    // Server session close callback: notifies transport when a server-side
+    // session ends (error/EOF), so it can be removed from active tracking.
+    std::function<void()> on_close;
+
+    // Close socket externally (used during shutdown to cancel pending I/O).
+    void closeSocket();
 
    private:
     void writeHeader();

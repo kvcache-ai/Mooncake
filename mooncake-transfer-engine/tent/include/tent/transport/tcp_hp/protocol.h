@@ -27,16 +27,34 @@ static constexpr uint64_t kMagic = 0x4D4F4F4E54435048ULL;
 static constexpr uint32_t kProtocolVersion = 1;
 
 // Sent by client immediately after TCP connect.
+// All fields are stored in little-endian wire format.
 struct __attribute__((packed)) HandshakeReq {
-    uint64_t magic;     // kMagic
-    uint32_t version;   // kProtocolVersion
+    uint64_t magic;     // kMagic (little-endian)
+    uint32_t version;   // kProtocolVersion (little-endian)
     uint32_t flags;     // reserved, set to 0
+
+    void encode() {
+        magic = htole64(kMagic);
+        version = htole32(kProtocolVersion);
+        flags = 0;
+    }
+
+    uint64_t decodedMagic() const { return le64toh(magic); }
+    uint32_t decodedVersion() const { return le32toh(version); }
 };
 
 // Sent by server in response to HandshakeReq.
+// All fields are stored in little-endian wire format.
 struct __attribute__((packed)) HandshakeAck {
-    uint16_t status;    // 0 = OK, non-zero = error
+    uint16_t status;    // 0 = OK, non-zero = error (little-endian)
     uint16_t flags;     // reserved
+
+    void encode(uint16_t s) {
+        status = htole16(s);
+        flags = 0;
+    }
+
+    uint16_t decodedStatus() const { return le16toh(status); }
 };
 
 // Status codes for HandshakeAck.
