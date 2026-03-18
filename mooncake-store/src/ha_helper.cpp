@@ -130,18 +130,6 @@ int MasterServiceSupervisor::Start() {
         });
 
     http_server.set_http_handler<GET>(
-        "/ready",
-        [&active_service](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            if (active_service.load(std::memory_order_acquire)) {
-                resp.set_status_and_content(status_type::ok, "OK");
-            } else {
-                resp.set_status_and_content(
-                    status_type::service_unavailable, "STANDBY");
-            }
-        });
-
-    http_server.set_http_handler<GET>(
         "/metrics",
         [&active_service](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
