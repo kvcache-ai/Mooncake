@@ -7,11 +7,13 @@
 #include <string>
 #include <limits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+#include "ylt/struct_pack.hpp"
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
@@ -22,6 +24,63 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
+
+// Sequence ID comparison utilities for wrap-around safety.
+// These functions use signed difference to correctly handle uint64_t overflow
+// (from UINT64_MAX wrapping to 0). Assumes sequence IDs won't differ by more
+// than 2^63, which is reasonable for practical systems.
+//
+// Example: If sequence_id wraps from UINT64_MAX to 0, then:
+//   IsSequenceNewer(0, UINT64_MAX) = true  (0 is newer after wrap)
+//   IsSequenceNewer(UINT64_MAX, 0) = false (UINT64_MAX is older before wrap)
+//
+// Note: We use 'inline' here to allow multiple definition but keep external
+// linkage.
+inline bool IsSequenceNewer(uint64_t a, uint64_t b) {
+    // Cast to int64_t to get signed difference, then check if positive.
+    // This correctly handles wrap-around: if a wrapped from UINT64_MAX to 0,
+    // then (int64_t)(a - b) will be positive (assuming gap < 2^63).
+    return static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlder(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) < 0;
+}
+
+inline bool IsSequenceEqual(uint64_t a, uint64_t b) { return a == b; }
+
+inline bool IsSequenceNewerOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlderOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) < 0;
+}
+
+// Cluster ID validation utilities.
+//
+// cluster_id is used to construct etcd key prefixes (e.g.
+// "/oplog/<cluster_id>/..."). To avoid key-prefix injection / accidental
+// cross-cluster overlap, we restrict the allowed characters to a conservative
+// safe set. We validate the "component" form (without trailing slash). Trailing
+// slashes should be normalized away before validation.
+inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
+    if (cluster_id.empty()) {
+        return false;
+    }
+    if (cluster_id.size() > 128) {
+        return false;
+    }
+    for (unsigned char c : cluster_id) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+                        c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     5000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
