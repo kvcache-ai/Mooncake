@@ -185,6 +185,7 @@ MooncakeBackend::MooncakeBackend(
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
+                     .location = location,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
