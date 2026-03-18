@@ -356,7 +356,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
 
         // Failed - try sync eviction if available
         if (scheduler_) {
-            bool evicted = scheduler_->OnAllocationFailure(*preferred_tier);
+            bool evicted =
+                scheduler_->OnAllocationFailure(*preferred_tier, size);
             if (evicted) {
                 // Retry after eviction
                 alloc_result = it->second->Allocate(size, loc.data);
@@ -396,7 +397,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
             evict_tier_id = sorted[0];
         }
 
-        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id);
+        bool evicted = scheduler_->OnAllocationFailure(evict_tier_id, size);
         if (evicted) {
             // Retry allocation after eviction
             if (AllocateInternalRaw(size, preferred_tier, &loc)) {
@@ -431,7 +432,7 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
 
 tl::expected<void, ErrorCode> TieredBackend::Commit(
     const std::string& key, AllocationHandle handle,
-    std::optional<uint64_t> expected_version) {
+    std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -525,7 +526,9 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 
     if (scheduler_) {
         scheduler_->OnCommit(key, current_tier_id, handle_size);
-        scheduler_->OnAccess(key);
+        if (record_access) {
+            scheduler_->OnAccess(key);
+        }
     }
 
     if (add_replica_callback_) {
@@ -756,7 +759,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
     const std::string& key, const DataSource& source, UUID dest_tier_id,
-    std::optional<uint64_t> expected_version) {
+    std::optional<uint64_t> expected_version, bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -781,7 +784,8 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
 
     // Commit (Add Replica)
     // Takes ownership of dest_handle into the map
-    auto commit_result = Commit(key, dest_handle.value(), expected_version);
+    auto commit_result =
+        Commit(key, dest_handle.value(), expected_version, record_access);
     if (!commit_result.has_value()) {
         // If CAS failed, we should probably warn specifically
         if (commit_result.error() != ErrorCode::CAS_FAILED) {
@@ -796,7 +800,8 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(
 
 tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
                                                       UUID source_tier_id,
-                                                      UUID dest_tier_id) {
+                                                      UUID dest_tier_id,
+                                                      bool record_access) {
     if (is_shutting_down_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
@@ -828,7 +833,8 @@ tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
         }
     }
 
-    return CopyData(key, source_handle->loc.data, dest_tier_id, start_version);
+    return CopyData(key, source_handle->loc.data, dest_tier_id, start_version,
+                    record_access);
 }
 
 std::vector<TierView> TieredBackend::GetTierViews() const {

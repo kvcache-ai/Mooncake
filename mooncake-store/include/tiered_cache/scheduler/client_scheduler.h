@@ -48,10 +48,20 @@ class ClientScheduler {
                   std::optional<UUID> tier_id = std::nullopt);
 
     // Called when allocation fails due to insufficient space
-    // Returns true if eviction was triggered (sync mode), false otherwise
-    bool OnAllocationFailure(UUID tier_id);
+    // Returns true if reclaim freed enough space for an immediate retry
+    bool OnAllocationFailure(UUID tier_id, size_t required_bytes);
 
    private:
+    struct PlannedReclaim {
+        struct Step {
+            SchedAction action;
+            size_t size_bytes = 0;
+        };
+
+        std::vector<Step> steps;
+        size_t target_reclaim_bytes = 0;
+    };
+
     // Background worker loop
     void WorkerLoop();
 
@@ -59,7 +69,20 @@ class ClientScheduler {
     void ExecuteActions(const std::vector<SchedAction>& actions);
 
     // Trigger immediate eviction for a tier (sync mode)
-    void TriggerSyncEviction(UUID tier_id);
+    bool TriggerSyncEviction(UUID tier_id, size_t required_bytes);
+
+    // Reclaim pre-replicated cold replicas without copying data on the
+    // allocation failure path.
+    bool TryFastReclaim(UUID tier_id, size_t required_bytes);
+
+    PlannedReclaim BuildReclaimPlan(
+        UUID tier_id, const std::unordered_map<UUID, TierStats>& tier_stats,
+        const std::vector<KeyContext>& active_keys,
+        bool require_existing_replica, size_t required_bytes) const;
+
+    size_t ExecuteReclaimPlan(const PlannedReclaim& plan);
+    bool HasAvailableBytes(UUID tier_id, size_t required_bytes) const;
+    std::optional<UUID> SelectDemotionTier(UUID source_tier_id) const;
 
     // Build policy input from the latest stats snapshot and scheduler cache
     std::vector<KeyContext> BuildActiveKeys(

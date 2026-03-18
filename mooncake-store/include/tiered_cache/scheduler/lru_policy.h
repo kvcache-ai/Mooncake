@@ -25,6 +25,10 @@ class LRUPolicy : public SchedulerPolicy {
 
     void SetFastTier(UUID id) override { fast_tier_id_ = id; }
 
+    bool IsFastTier(UUID id) const {
+        return fast_tier_id_.has_value() && fast_tier_id_.value() == id;
+    }
+
     std::vector<SchedAction> Decide(
         const std::unordered_map<UUID, TierStats>& tier_stats,
         const std::vector<KeyContext>& active_keys) override {
@@ -49,12 +53,9 @@ class LRUPolicy : public SchedulerPolicy {
         double usage_ratio = static_cast<double>(stats.used_capacity_bytes) /
                              static_cast<double>(stats.total_capacity_bytes);
 
-        // Only trigger scheduling when usage > high_watermark or <
-        // low_watermark
-        if (usage_ratio <= config_.high_watermark &&
-            usage_ratio >= config_.low_watermark) {
-            return actions;
-        }
+        const bool above_high = usage_ratio > config_.high_watermark;
+        const bool pre_demote_window = usage_ratio > config_.low_watermark &&
+                                       usage_ratio <= config_.high_watermark;
 
         // Find slow tier ID for migrations
         std::optional<UUID> slow_id;
@@ -105,25 +106,35 @@ class LRUPolicy : public SchedulerPolicy {
                 // Evict: in fast tier but shouldn't be
                 bool has_other_copy = (key_ctx.current_locations.size() > 1);
                 SchedAction action;
-                if (has_other_copy) {
-                    action.type = SchedAction::Type::EVICT;
-                    action.key = key_ctx.key;
-                    action.source_tier_id = fast_id;
-                } else if (slow_id.has_value()) {
-                    action.type = SchedAction::Type::MIGRATE;
+                if (above_high) {
+                    if (has_other_copy) {
+                        action.type = SchedAction::Type::EVICT;
+                        action.key = key_ctx.key;
+                        action.source_tier_id = fast_id;
+                    } else if (slow_id.has_value()) {
+                        action.type = SchedAction::Type::MIGRATE;
+                        action.key = key_ctx.key;
+                        action.source_tier_id = fast_id;
+                        action.target_tier_id = slow_id.value();
+                    } else {
+                        // Single-tier configuration: no slow tier available
+                        // Must evict (delete) to free space
+                        action.type = SchedAction::Type::EVICT;
+                        action.key = key_ctx.key;
+                        action.source_tier_id = fast_id;
+                    }
+                    actions.push_back(action);
+                } else if (pre_demote_window && !has_other_copy &&
+                           slow_id.has_value()) {
+                    action.type = SchedAction::Type::REPLICATE;
                     action.key = key_ctx.key;
                     action.source_tier_id = fast_id;
                     action.target_tier_id = slow_id.value();
-                } else {
-                    // Single-tier configuration: no slow tier available
-                    // Must evict (delete) to free space
-                    action.type = SchedAction::Type::EVICT;
-                    action.key = key_ctx.key;
-                    action.source_tier_id = fast_id;
+                    actions.push_back(action);
                 }
-                actions.push_back(action);
             } else if (!is_in_fast && should_be &&
-                       !key_ctx.current_locations.empty()) {
+                       !key_ctx.current_locations.empty() &&
+                       !pre_demote_window) {
                 // Promote: should be in fast tier but isn't
                 SchedAction action;
                 action.type = SchedAction::Type::MIGRATE;

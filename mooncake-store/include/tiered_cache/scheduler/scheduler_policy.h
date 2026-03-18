@@ -35,8 +35,9 @@ struct KeyContext {
  */
 struct SchedAction {
     enum class Type {
-        MIGRATE,  // Move data from Source to Target (Promote/Offload)
-        EVICT,    // Delete data from Source
+        REPLICATE,  // Copy data from Source to Target and keep the source copy
+        MIGRATE,    // Move data from Source to Target (Promote/Offload)
+        EVICT,      // Delete data from Source
     };
 
     Type type;

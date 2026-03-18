@@ -147,12 +147,17 @@ void ClientScheduler::OnDelete(const std::string& key,
     }
 }
 
-bool ClientScheduler::OnAllocationFailure(UUID tier_id) {
+bool ClientScheduler::OnAllocationFailure(UUID tier_id, size_t required_bytes) {
+    if (TryFastReclaim(tier_id, required_bytes)) {
+        LOG(INFO) << "Allocation failed on tier " << tier_id
+                  << ", reclaimed pre-replicated cold replicas";
+        return true;
+    }
+
     if (eviction_mode_ == EvictionMode::SYNC) {
         LOG(INFO) << "Allocation failed on tier " << tier_id
                   << ", triggering SYNC eviction";
-        TriggerSyncEviction(tier_id);
-        return true;
+        return TriggerSyncEviction(tier_id, required_bytes);
     } else {
         VLOG(2) << "Allocation failed on tier " << tier_id
                 << ", ASYNC mode - will handle in next cycle";
@@ -320,8 +325,9 @@ void ClientScheduler::RemoveReplicaLocked(const std::string& key,
 }
 
 void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
-    // Execute in two phases: EVICT first, then MIGRATE
-    // This ensures space is freed before attempting promotions
+    // Execute in three phases: EVICT first, then MIGRATE, then REPLICATE.
+    // This keeps the fast path biased towards freeing space before background
+    // copy work.
 
     // Phase 1: Execute all EVICT actions
     for (const auto& action : actions) {
@@ -343,7 +349,7 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
     }
 
     // Phase 2: Execute all MIGRATE actions
-    std::unordered_set<UUID> tiers_needing_eviction;
+    std::unordered_map<UUID, size_t> tiers_needing_eviction;
 
     for (const auto& action : actions) {
         if (!running_) return;  // Fast exit on shutdown
@@ -357,7 +363,7 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
             // Execute Transfer (Migration/Promotion)
             auto res =
                 backend_->Transfer(action.key, action.source_tier_id.value(),
-                                   action.target_tier_id.value());
+                                   action.target_tier_id.value(), false);
 
             if (!res) {
                 // Log error
@@ -367,11 +373,21 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                               << action.key;
                 } else if (res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                     // Insufficient space - mark tier for eviction
+                    size_t key_size = 1;
+                    {
+                        std::lock_guard<std::mutex> lock(key_cache_mutex_);
+                        auto key_it = key_cache_.find(action.key);
+                        if (key_it != key_cache_.end() &&
+                            key_it->second.size_bytes > 0) {
+                            key_size = key_it->second.size_bytes;
+                        }
+                    }
                     VLOG(2) << "Transfer skipped due to insufficient space for "
                                "key: "
                             << action.key << ", will trigger eviction";
-                    tiers_needing_eviction.insert(
-                        action.target_tier_id.value());
+                    auto& required_bytes =
+                        tiers_needing_eviction[action.target_tier_id.value()];
+                    required_bytes = std::max(required_bytes, key_size);
                 } else {
                     LOG(ERROR) << "Transfer failed for key: " << action.key
                                << ", error: " << res.error();
@@ -394,8 +410,9 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
             // Sync mode: trigger immediate eviction
             VLOG(1) << "Triggering SYNC eviction for "
                     << tiers_needing_eviction.size() << " tier(s)";
-            for (const auto& tier_id : tiers_needing_eviction) {
-                TriggerSyncEviction(tier_id);
+            for (const auto& [tier_id, required_bytes] :
+                 tiers_needing_eviction) {
+                TriggerSyncEviction(tier_id, required_bytes);
             }
         } else {
             // Async mode: rely on next scheduling cycle
@@ -403,77 +420,251 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                     << tiers_needing_eviction.size() << " tier(s)";
         }
     }
+
+    // Phase 4: Prepare cold replicas in lower tiers without deleting the fast
+    // copy. This builds a reclaimable window before the tier reaches the high
+    // watermark.
+    for (const auto& action : actions) {
+        if (action.type != SchedAction::Type::REPLICATE ||
+            !action.source_tier_id.has_value() ||
+            !action.target_tier_id.has_value()) {
+            continue;
+        }
+
+        uint64_t start_version = 0;
+        auto source_handle = backend_->Get(action.key, action.source_tier_id,
+                                           false, &start_version);
+        if (!source_handle) {
+            if (source_handle.error() != ErrorCode::INVALID_KEY &&
+                source_handle.error() != ErrorCode::TIER_NOT_FOUND) {
+                LOG(ERROR) << "Failed to prepare replica for key: "
+                           << action.key
+                           << ", error: " << source_handle.error();
+            }
+            continue;
+        }
+
+        auto copy_res = backend_->CopyData(
+            action.key, source_handle.value()->loc.data,
+            action.target_tier_id.value(), start_version, false);
+        if (!copy_res) {
+            if (copy_res.error() == ErrorCode::CAS_FAILED ||
+                copy_res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+                VLOG(2) << "Replica preparation skipped for key: " << action.key
+                        << ", error: " << copy_res.error();
+            } else {
+                LOG(ERROR) << "Replica preparation failed for key: "
+                           << action.key << ", error: " << copy_res.error();
+            }
+            continue;
+        }
+
+        VLOG(1) << "Prepared reclaimable replica for key: " << action.key
+                << " from tier " << action.source_tier_id.value() << " to tier "
+                << action.target_tier_id.value();
+    }
 }
 
-void ClientScheduler::TriggerSyncEviction(UUID tier_id) {
-    // Collect current stats
+bool ClientScheduler::TriggerSyncEviction(UUID tier_id, size_t required_bytes) {
     auto tier_stats = CollectTierStats();
-
-    // Get active keys from stats collector
     auto access_stats = stats_collector_->GetSnapshot();
     auto active_keys = BuildActiveKeys(access_stats, tier_id);
-    if (active_keys.empty()) {
-        LOG(WARNING) << "No active keys for sync eviction";
-        return;
+    auto plan = BuildReclaimPlan(tier_id, tier_stats, active_keys, false,
+                                 required_bytes);
+
+    if (plan.steps.empty()) {
+        LOG(WARNING) << "No sync reclaim candidates found for tier " << tier_id;
+        return false;
     }
 
-    // Force policy to generate eviction actions
-    auto evict_actions = policy_->Decide(tier_stats, active_keys);
+    const size_t reclaimed_bytes = ExecuteReclaimPlan(plan);
+    const bool enough_space = HasAvailableBytes(tier_id, required_bytes);
+    if (!enough_space) {
+        VLOG(1) << "Sync reclaim on tier " << tier_id << " freed "
+                << reclaimed_bytes << " bytes, still short for "
+                << required_bytes << " bytes";
+    }
+    return reclaimed_bytes >= plan.target_reclaim_bytes && enough_space;
+}
 
-    // Filter to EVICT or MIGRATE-away actions for the target tier
-    std::vector<SchedAction> filtered_actions;
-    for (const auto& action : evict_actions) {
-        bool is_eviction_from_target = false;
+bool ClientScheduler::TryFastReclaim(UUID tier_id, size_t required_bytes) {
+    auto tier_stats = CollectTierStats();
+    auto access_stats = stats_collector_->GetSnapshot();
+    auto active_keys = BuildActiveKeys(access_stats, tier_id);
+    auto plan = BuildReclaimPlan(tier_id, tier_stats, active_keys, true,
+                                 required_bytes);
+    if (plan.steps.empty()) {
+        return false;
+    }
 
-        if (action.type == SchedAction::Type::EVICT &&
-            action.source_tier_id.has_value() &&
-            action.source_tier_id.value() == tier_id) {
-            is_eviction_from_target = true;
-        } else if (action.type == SchedAction::Type::MIGRATE &&
-                   action.source_tier_id.has_value() &&
-                   action.source_tier_id.value() == tier_id &&
-                   action.target_tier_id.has_value() &&
-                   action.target_tier_id.value() != tier_id) {
-            // MIGRATE away from target tier also frees space
-            is_eviction_from_target = true;
+    const size_t reclaimed_bytes = ExecuteReclaimPlan(plan);
+    const bool enough_space = HasAvailableBytes(tier_id, required_bytes);
+    return reclaimed_bytes >= plan.target_reclaim_bytes && enough_space;
+}
+
+ClientScheduler::PlannedReclaim ClientScheduler::BuildReclaimPlan(
+    UUID tier_id, const std::unordered_map<UUID, TierStats>& tier_stats,
+    const std::vector<KeyContext>& active_keys, bool require_existing_replica,
+    size_t required_bytes) const {
+    PlannedReclaim plan;
+
+    auto tier_it = tier_stats.find(tier_id);
+    if (tier_it == tier_stats.end()) {
+        return plan;
+    }
+
+    const size_t total_capacity = tier_it->second.total_capacity_bytes;
+    const size_t used_capacity = tier_it->second.used_capacity_bytes;
+    const size_t available_bytes =
+        (total_capacity > used_capacity) ? (total_capacity - used_capacity) : 0;
+    const size_t reclaim_needed = (required_bytes > available_bytes)
+                                      ? (required_bytes - available_bytes)
+                                      : 1;
+
+    plan.target_reclaim_bytes = reclaim_needed;
+    plan.steps.reserve(active_keys.size());
+
+    const auto demotion_tier_id =
+        require_existing_replica ? std::nullopt : SelectDemotionTier(tier_id);
+
+    size_t planned_reclaim_bytes = 0;
+    for (auto it = active_keys.rbegin(); it != active_keys.rend(); ++it) {
+        const auto tier_pos = std::find(it->current_locations.begin(),
+                                        it->current_locations.end(), tier_id);
+        if (tier_pos == it->current_locations.end()) {
+            continue;
         }
 
-        if (is_eviction_from_target) {
-            filtered_actions.push_back(action);
+        PlannedReclaim::Step step;
+        step.action.key = it->key;
+        step.action.source_tier_id = tier_id;
+        step.size_bytes = it->size_bytes;
+
+        const bool has_other_replica = it->current_locations.size() > 1;
+        if (require_existing_replica) {
+            if (!has_other_replica) {
+                continue;
+            }
+            step.action.type = SchedAction::Type::EVICT;
+        } else if (has_other_replica) {
+            step.action.type = SchedAction::Type::EVICT;
+        } else if (demotion_tier_id.has_value()) {
+            step.action.type = SchedAction::Type::MIGRATE;
+            step.action.target_tier_id = demotion_tier_id.value();
+        } else {
+            step.action.type = SchedAction::Type::EVICT;
+        }
+
+        plan.steps.push_back(std::move(step));
+        planned_reclaim_bytes += it->size_bytes;
+        if (planned_reclaim_bytes >= plan.target_reclaim_bytes) {
+            break;
         }
     }
 
-    if (filtered_actions.empty()) {
-        LOG(WARNING) << "No eviction candidates found for tier " << tier_id;
-        return;
-    }
+    return plan;
+}
 
-    // Execute evictions
-    for (const auto& action : filtered_actions) {
+size_t ClientScheduler::ExecuteReclaimPlan(const PlannedReclaim& plan) {
+    size_t reclaimed_bytes = 0;
+
+    for (const auto& step : plan.steps) {
+        const auto& action = step.action;
+        if (!action.source_tier_id.has_value()) {
+            continue;
+        }
+
         if (action.type == SchedAction::Type::EVICT) {
-            // Direct eviction
-            auto del_res = backend_->Delete(action.key, tier_id);
-            if (!del_res) {
-                LOG(WARNING) << "Failed to evict key: " << action.key;
+            auto delete_res =
+                backend_->Delete(action.key, action.source_tier_id.value());
+            if (!delete_res) {
+                continue;
             }
         } else if (action.type == SchedAction::Type::MIGRATE) {
-            // Migrate to another tier (also frees space)
+            if (!action.target_tier_id.has_value()) {
+                continue;
+            }
+
             auto transfer_res =
                 backend_->Transfer(action.key, action.source_tier_id.value(),
-                                   action.target_tier_id.value());
-            if (transfer_res) {
-                // Transfer succeeded - delete from source to free space
-                auto del_res =
-                    backend_->Delete(action.key, action.source_tier_id.value());
-                if (!del_res) {
-                    LOG(WARNING) << "Failed to delete source after migration: "
-                                 << action.key;
-                }
-            } else {
-                LOG(WARNING) << "Failed to migrate key: " << action.key;
+                                   action.target_tier_id.value(), false);
+            if (!transfer_res) {
+                continue;
             }
+
+            auto delete_res =
+                backend_->Delete(action.key, action.source_tier_id.value());
+            if (!delete_res) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        reclaimed_bytes += step.size_bytes;
+        if (reclaimed_bytes >= plan.target_reclaim_bytes) {
+            break;
         }
     }
+
+    return reclaimed_bytes;
+}
+
+bool ClientScheduler::HasAvailableBytes(UUID tier_id,
+                                        size_t required_bytes) const {
+    auto tier_it = tiers_.find(tier_id);
+    if (tier_it == tiers_.end() || !tier_it->second) {
+        return false;
+    }
+
+    const size_t capacity = tier_it->second->GetCapacity();
+    const size_t usage = tier_it->second->GetUsage();
+    const size_t available_bytes = (capacity > usage) ? (capacity - usage) : 0;
+    return available_bytes >= required_bytes;
+}
+
+std::optional<UUID> ClientScheduler::SelectDemotionTier(
+    UUID source_tier_id) const {
+    const auto tier_views = backend_->GetTierViews();
+    const TierView* source_view = nullptr;
+    for (const auto& tier_view : tier_views) {
+        if (tier_view.id == source_tier_id) {
+            source_view = &tier_view;
+            break;
+        }
+    }
+    if (!source_view) {
+        return std::nullopt;
+    }
+
+    const TierView* best_lower_priority = nullptr;
+    const TierView* best_fallback = nullptr;
+    for (const auto& tier_view : tier_views) {
+        if (tier_view.id == source_tier_id) {
+            continue;
+        }
+
+        if (!best_fallback || tier_view.priority > best_fallback->priority) {
+            best_fallback = &tier_view;
+        }
+
+        if (tier_view.priority >= source_view->priority) {
+            continue;
+        }
+
+        if (!best_lower_priority ||
+            tier_view.priority > best_lower_priority->priority) {
+            best_lower_priority = &tier_view;
+        }
+    }
+
+    if (best_lower_priority) {
+        return best_lower_priority->id;
+    }
+    if (best_fallback) {
+        return best_fallback->id;
+    }
+    return std::nullopt;
 }
 
 }  // namespace mooncake

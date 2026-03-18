@@ -163,7 +163,8 @@ class TieredBackend {
      */
     tl::expected<void, ErrorCode> Commit(
         const std::string& key, AllocationHandle handle,
-        std::optional<uint64_t> expected_version = std::nullopt);
+        std::optional<uint64_t> expected_version = std::nullopt,
+        bool record_access = true);
 
     /**
      * @brief Checks if a key exists in the backend.
@@ -197,11 +198,13 @@ class TieredBackend {
 
     tl::expected<void, ErrorCode> CopyData(
         const std::string& key, const DataSource& source, UUID dest_tier_id,
-        std::optional<uint64_t> expected_version = std::nullopt);
+        std::optional<uint64_t> expected_version = std::nullopt,
+        bool record_access = true);
 
     tl::expected<void, ErrorCode> Transfer(const std::string& key,
                                            UUID source_tier_id,
-                                           UUID dest_tier_id);
+                                           UUID dest_tier_id,
+                                           bool record_access = true);
 
     // --- Introspection & Internal ---
 

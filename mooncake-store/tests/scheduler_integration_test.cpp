@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "tiered_cache/tiered_backend.h"
@@ -593,6 +594,98 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     EXPECT_LE(cold_in_dram, expected_cold_in_dram + 1);
 }
 
+TEST_F(SchedulerIntegrationTest, LRUPreCopyEnablesFastReclaimInAsyncMode) {
+    config_["scheduler"]["policy"] = "LRU";
+    config_["scheduler"]["high_watermark"] = 0.9;
+    config_["scheduler"]["low_watermark"] = 0.7;
+    config_["scheduler"]["stats_snapshot_limit"] = 16;
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value());
+
+    auto views = backend.GetTierViews();
+    UUID dram_id;
+    UUID storage_id;
+    for (const auto& v : views) {
+        if (v.type == MemoryType::DRAM) dram_id = v.id;
+        if (v.type == MemoryType::NVME) storage_id = v.id;
+    }
+
+    const size_t item_size = 1024 * 1024;
+    for (int i = 0; i < 8; ++i) {
+        std::string key = "precopy_key_" + std::to_string(i);
+        auto handle = backend.Allocate(item_size, dram_id, true);
+        ASSERT_TRUE(handle.has_value());
+
+        auto buffer = std::make_unique<char[]>(item_size);
+        std::memset(buffer.get(), 'P' + i, item_size);
+        DataSource source{
+            std::make_unique<TempDRAMBuffer>(std::move(buffer), item_size),
+            MemoryType::DRAM,
+        };
+
+        ASSERT_TRUE(backend.Write(source, handle.value()).has_value());
+        ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+    }
+
+    size_t usage_before_precopy = 0;
+    for (const auto& v : backend.GetTierViews()) {
+        if (v.id == dram_id) {
+            usage_before_precopy = v.usage;
+        }
+    }
+    ASSERT_EQ(usage_before_precopy, item_size * 8);
+
+    for (int round = 0; round < 6; ++round) {
+        for (int i = 0; i < 7; ++i) {
+            ASSERT_TRUE(
+                backend.Get("precopy_key_" + std::to_string(i)).has_value());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    auto has_replica_on = [&](const std::string& key, UUID tier_id) {
+        auto replicas = backend.GetReplicaTierIds(key);
+        return std::find(replicas.begin(), replicas.end(), tier_id) !=
+               replicas.end();
+    };
+
+    const auto precopy_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < precopy_deadline) {
+        if (has_replica_on("precopy_key_7", dram_id) &&
+            has_replica_on("precopy_key_7", storage_id)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    EXPECT_TRUE(has_replica_on("precopy_key_7", dram_id));
+    EXPECT_TRUE(has_replica_on("precopy_key_7", storage_id))
+        << "cold DRAM key should be pre-copied to storage before eviction";
+
+    size_t usage_after_precopy = 0;
+    for (const auto& v : backend.GetTierViews()) {
+        if (v.id == dram_id) {
+            usage_after_precopy = v.usage;
+        }
+    }
+    EXPECT_EQ(usage_after_precopy, usage_before_precopy)
+        << "pre-copy should not evict the fast-tier replica";
+
+    auto large_alloc = backend.Allocate(item_size * 3, dram_id, true);
+    ASSERT_TRUE(large_alloc.has_value())
+        << "strict allocation should reclaim a pre-copied cold replica even "
+           "when eviction mode is async";
+    EXPECT_EQ(large_alloc.value()->loc.tier->GetTierId(), dram_id);
+
+    EXPECT_FALSE(has_replica_on("precopy_key_7", dram_id))
+        << "fast reclaim should drop the DRAM copy of the cold key";
+    EXPECT_TRUE(has_replica_on("precopy_key_7", storage_id))
+        << "fast reclaim should preserve the prepared storage replica";
+}
+
 class ConcurrencyTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -1015,11 +1108,16 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     ASSERT_TRUE(backend.Write(src6, handle6.value()).has_value());
     ASSERT_TRUE(backend.Commit(key6, handle6.value()).has_value());
 
-    // Verify: at least one key should have been evicted from DRAM
+    // Verify: reclaim planner should free only the requested 1MB, so exactly
+    // one original key leaves DRAM.
     int keys_in_dram = 0;
+    int keys_still_present = 0;
     for (int i = 0; i < 5; i++) {
         std::string key = "sync_key_" + std::to_string(i);
         auto replicas = backend.GetReplicaTierIds(key);
+        if (!replicas.empty()) {
+            keys_still_present++;
+        }
         for (auto tid : replicas) {
             if (tid == dram_id) {
                 keys_in_dram++;
@@ -1029,8 +1127,12 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     }
     LOG(INFO) << "Original keys in DRAM after sync eviction: " << keys_in_dram
               << "/5";
-    EXPECT_LT(keys_in_dram, 5)
-        << "At least one key should have been evicted from DRAM";
+    EXPECT_EQ(keys_in_dram, 4)
+        << "Sync reclaim should free only the bytes needed for the failed "
+           "allocation";
+    EXPECT_EQ(keys_still_present, 5)
+        << "Two-tier sync reclaim should migrate cold keys instead of deleting "
+           "them";
 
     LOG(INFO) << "Sync eviction mode test completed";
 }
