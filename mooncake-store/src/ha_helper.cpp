@@ -1,4 +1,5 @@
 #include "ha_helper.h"
+#include <atomic>
 #include "etcd_helper.h"
 #include "master_metric_manager.h"
 #include "rpc_service.h"
@@ -121,7 +122,7 @@ int MasterServiceSupervisor::Start() {
     // This ensures liveness/readiness probes are always responsive,
     // regardless of leader/follower status.
     coro_http::coro_http_server http_server(4, config_.metrics_port);
-    std::atomic<WrappedMasterService*> active_service{nullptr};
+    std::atomic<bool> is_leader{false};
 
     http_server.set_http_handler<GET>(
         "/health", [](coro_http_request& req, coro_http_response& resp) {
@@ -131,9 +132,9 @@ int MasterServiceSupervisor::Start() {
 
     http_server.set_http_handler<GET>(
         "/metrics",
-        [&active_service](coro_http_request& req, coro_http_response& resp) {
+        [&is_leader](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            if (!active_service.load(std::memory_order_acquire)) {
+            if (!is_leader.load(std::memory_order_acquire)) {
                 resp.set_status_and_content(
                     status_type::service_unavailable, "STANDBY");
                 return;
@@ -145,9 +146,9 @@ int MasterServiceSupervisor::Start() {
 
     http_server.set_http_handler<GET>(
         "/metrics/summary",
-        [&active_service](coro_http_request& req, coro_http_response& resp) {
+        [&is_leader](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            if (!active_service.load(std::memory_order_acquire)) {
+            if (!is_leader.load(std::memory_order_acquire)) {
                 resp.set_status_and_content(
                     status_type::service_unavailable, "STANDBY");
                 return;
@@ -157,7 +158,11 @@ int MasterServiceSupervisor::Start() {
             resp.set_status_and_content(status_type::ok, std::move(summary));
         });
 
-    http_server.async_start();
+    if (auto err = http_server.async_start(); err.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP health server on port "
+                   << config_.metrics_port << ": " << err.result().value();
+        return -1;
+    }
     LOG(INFO) << "HTTP health server started on port " << config_.metrics_port;
 
     while (true) {
@@ -200,8 +205,7 @@ int MasterServiceSupervisor::Start() {
         LOG(INFO) << "Starting master service...";
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(config_, view_version));
-        active_service.store(&wrapped_master_service,
-                             std::memory_order_release);
+        is_leader.store(true, std::memory_order_release);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 
@@ -210,7 +214,7 @@ int MasterServiceSupervisor::Start() {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
-            active_service.store(nullptr, std::memory_order_release);
+            is_leader.store(false, std::memory_order_release);
             auto etcd_err = EtcdHelper::CancelKeepAlive(lease_id);
             if (etcd_err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to cancel keep leader alive: "
@@ -226,7 +230,7 @@ int MasterServiceSupervisor::Start() {
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         // Mark service as inactive before cleanup
-        active_service.store(nullptr, std::memory_order_release);
+        is_leader.store(false, std::memory_order_release);
 
         // If the server is closed due to internal errors, we need to manually
         // stop keep leader alive.
