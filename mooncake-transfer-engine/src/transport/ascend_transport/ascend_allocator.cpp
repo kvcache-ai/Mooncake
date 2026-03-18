@@ -48,8 +48,13 @@ int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle &handle) {
         prop.location.id = 0;
         ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
         if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "Failed to allocate memory: " << ret;
-            return -1;
+            LOG(INFO) << "Malloc failed, try smaller page instead.";
+            prop.memAttr = ACL_MEM_P2P_HUGE;
+            ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to allocate memory: " << ret;
+                return -1;
+            }
         }
     }
     return 0;
