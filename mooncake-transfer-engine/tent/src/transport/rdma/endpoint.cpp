@@ -340,6 +340,32 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                             BootstrapDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (status_ == EP_READY) {
+        // Idempotency check: if the incoming bootstrap is from the same peer
+        // and has the same number of QPs as we already have connected, this is
+        // a duplicate request (e.g. from a concurrent connect() on the
+        // initiator that released its lock during Phase 2).  Re-using the
+        // existing connection is safe and avoids resetting QPs that may
+        // already have in-flight RDMA operations.
+        auto incoming_peer_server =
+            getServerNameFromNicPath(peer_desc.local_nic_path);
+        auto incoming_peer_nic =
+            getNicNameFromNicPath(peer_desc.local_nic_path);
+        if (incoming_peer_server == peer_server_name_ &&
+            incoming_peer_nic == peer_nic_name_ &&
+            peer_desc.qp_num.size() == qp_list_.size()) {
+            LOG(INFO) << "Endpoint already established with " << peer_nic_name_
+                      << " of " << peer_server_name_
+                      << " (duplicate bootstrap, reusing connection)";
+            auto& transport = context_->transport_;
+            local_desc.local_nic_path =
+                MakeNicPath(transport.local_segment_name_, context_->name());
+            local_desc.peer_nic_path = peer_desc.local_nic_path;
+            local_desc.qp_num = qpNum();
+            local_desc.local_lid = context_->lid();
+            local_desc.local_gid = context_->gid();
+            local_desc.notify_qp_num = notifyQpNum();
+            return Status::OK();
+        }
         LOG(WARNING) << "Endpoint is established with " << peer_nic_name_
                      << " of " << peer_server_name_ << ", resetting first";
         resetUnlocked();
