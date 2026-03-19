@@ -13,24 +13,16 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
-    for (const auto& rank : distBackendOpts.global_ranks_in_group) {
-        backendOptions->global_ranks_in_group.push_back(rank);
-    }
-    return c10::make_intrusive<MooncakeBackend>(
-        distBackendOpts.store, distBackendOpts.group_rank,
-        distBackendOpts.group_size, backendOptions);
+    return c10::make_intrusive<MooncakeBackend>(std::move(distBackendOpts),
+                                                std::move(backendOptions));
 }
 
 c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
-    for (const auto& rank : distBackendOpts.global_ranks_in_group) {
-        backendOptions->global_ranks_in_group.push_back(rank);
-    }
     return c10::make_intrusive<MooncakeBackend>(
-        distBackendOpts.store, distBackendOpts.group_rank,
-        distBackendOpts.group_size, backendOptions, true);
+        std::move(distBackendOpts), std::move(backendOptions), true);
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {

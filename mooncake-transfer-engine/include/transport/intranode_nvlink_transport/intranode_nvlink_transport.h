@@ -11,6 +11,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -78,6 +79,7 @@ class IntraNodeNvlinkTransport : public Transport {
     // bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    std::unordered_set<uint64_t> registered_base_addrs_;
 };
 
 }  // namespace mooncake

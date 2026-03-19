@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
 #include <p2p_proxy.h>
@@ -29,13 +31,39 @@ class MooncakeBackend final : public ::c10d::Backend {
         bool isExtension_ = false;
     };
 
-    MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    /**
+     * @brief Construct a Mooncake process-group backend instance.
+     *
+     * `distBackendOpts` contains the PyTorch process-group information for this
+     * backend instance. `options` contains Mooncake-specific settings and may
+     * be null when callers omit `pg_options`.
+     *
+     * @param distBackendOpts Process-group information supplied by PyTorch.
+     * @param options *Optional* Mooncake-specific backend options.
+     * @param isCpu Whether to initialize the CPU backend variant.
+     */
+    MooncakeBackend(c10d::DistributedBackendOptions distBackendOpts,
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
 
     ~MooncakeBackend() override;
 
     const std::string getBackendName() const override;
+
+    /**
+     * @brief Return the stored Mooncake-specific backend options.
+     *
+     * PyTorch can use this to read Mooncake-specific options from an existing
+     * process group. This is used, for example, create sub-groups that inherit
+     * settings from the parent group.
+     *
+     * @return The stored backend options, or null when the backend was created
+     * without explicit Mooncake options.
+     */
+    c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override {
+        return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
+            options_);
+    }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -124,9 +152,10 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     static TransferEngine* engine_;
-    static MooncakeWorker* worker_;
+    std::shared_ptr<MooncakeWorker> worker_;
     static bool engineInitialized_;
     static int backendIndex_;
+    const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;
     void* send_buffer_[2];

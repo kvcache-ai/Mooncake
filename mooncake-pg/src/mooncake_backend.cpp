@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <cuda_alike.h>
 #include <mooncake_backend.h>
 #include <p2p_proxy.h>
 #include <thread>
@@ -26,11 +27,9 @@ constexpr int kBarrierDummyTensorSize = 1;
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 // leaky singleton to avoid destructor fiasco problem
 TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
-MooncakeWorker* MooncakeBackend::worker_ = new MooncakeWorker();
+// worker_ is now owned per backend instance via MooncakeWorkerManager.
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
-
-namespace {
 
 // Async Work implementation for P2P operations processed by worker threads.
 class MooncakeP2PWork : public ::c10d::Work {
@@ -66,24 +65,44 @@ class MooncakeP2PWork : public ::c10d::Work {
     std::shared_ptr<std::atomic<bool>> completed_;
 };
 
-}  // namespace
-
+/**
+ * @brief Initialize Mooncake backend state from the PyTorch process-group
+ * information and optional Mooncake-specific options.
+ */
 MooncakeBackend::MooncakeBackend(
-    c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(rank, size), isCpu_(isCpu) {
+    : Backend(distBackendOpts.group_rank, distBackendOpts.group_size),
+      options_(std::move(options)),
+      isCpu_(isCpu) {
+    auto store = std::move(distBackendOpts.store);
+    const int rank = distBackendOpts.group_rank;
+    const int size = distBackendOpts.group_size;
+    const auto& globalRanks = distBackendOpts.global_ranks_in_group;
+
+    // Get device data
+    std::string location;
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    if (err != cudaSuccess || deviceCount == 0) {
+        location = kWildcardLocation;
+    } else {
+        int deviceId_;
+        err = cudaGetDevice(&deviceId_);
+        TORCH_CHECK(!err, c10::str("Failed to get device id"));
+        location = GPU_PREFIX + std::to_string(deviceId_);
+    }
+
     // Initialize transfer engine
     if (!engineInitialized_) {
         engine_->init(P2PHANDSHAKE, hostIp_);
         engineInitialized_ = true;
     }
-    auto localRpcMeta = engine_->getMetadata()->localRpcMeta();
-    std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
-                                  std::to_string(localRpcMeta.rpc_port);
+    std::string localServerName = engine_->getLocalIpAndPort();
     // construct local to global rank map
-    if (options && (int)options->global_ranks_in_group.size() == size) {
+    if (globalRanks.size() == static_cast<size_t>(size)) {
         for (int i = 0; i < size; ++i) {
-            local2global_rank_map_[i] = options->global_ranks_in_group[i];
+            local2global_rank_map_[i] = static_cast<uint64_t>(globalRanks[i]);
         }
     } else {
         for (int i = 0; i < size; ++i) {
@@ -99,7 +118,7 @@ MooncakeBackend::MooncakeBackend(
                         c10::str("Failed to allocate CPU send buffer"));
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                  kWildcardLocation);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -109,7 +128,7 @@ MooncakeBackend::MooncakeBackend(
                         c10::str("Failed to allocate CPU recv buffer"));
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                  kWildcardLocation);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -119,7 +138,7 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                  kWildcardLocation);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -128,26 +147,25 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                  kWildcardLocation);
+                                                  location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     }
 
     // Register CPU sync regions
-    TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
+    TORCH_CHECK(static_cast<size_t>(size) <= kMaxNumRanks,
+                "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_->registerLocalMemory(cpu_sync_send_region_[i],
-                                              kMaxNumRanks * sizeof(int32_t),
-                                              kWildcardLocation);
+        int rc = engine_->registerLocalMemory(
+            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), location);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_->registerLocalMemory(cpu_sync_recv_region_[i],
-                                              kMaxNumRanks * sizeof(int32_t),
-                                              kWildcardLocation);
+        int rc = engine_->registerLocalMemory(
+            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), location);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
@@ -159,19 +177,27 @@ MooncakeBackend::MooncakeBackend(
     else
         p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
 
+    auto& worker_mgr = MooncakeWorkerManager::GetInstance();
+    if (isCpu_)
+        worker_ = worker_mgr.GetCPUWorker();
+    else
+        worker_ = worker_mgr.GetCUDAWorker(cuda_device_index);
+    worker_->Start();
+
     p2p_proxy_ = std::make_shared<P2PProxy>(
         engine_, P2PProxy::Options{
                      .is_cpu = isCpu_,
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
+                     .location = location,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, store, meta_,
-        p2p_proxy_, engine_);
+        backendIndex_, rank, size, local2global_rank_map_, location, store,
+        meta_, p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
@@ -217,17 +243,17 @@ MooncakeBackend::MooncakeBackend(
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_->activeRanks[i] = true;
     }
-    if (options) {
-        TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
+    if (options_ && options_->activeRanks_.defined()) {
+        TORCH_CHECK(options_->activeRanks_.dtype() == at::kInt,
                     "activeRanks must be int.");
         if (isCpu) {
-            TORCH_CHECK(options->activeRanks_.device().is_cpu(),
+            TORCH_CHECK(options_->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
-            TORCH_CHECK(options->activeRanks_.device().is_cuda(),
+            TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
                         "activeRanks must be on CUDA.");
         }
-        meta_->activeRanksTensor = options->activeRanks_;
+        meta_->activeRanksTensor = options_->activeRanks_;
     } else {
         meta_->activeRanksTensor =
             at::ones({size}, torch::dtype(torch::kInt32)
@@ -242,7 +268,7 @@ MooncakeBackend::MooncakeBackend(
     // Wait for peers
     connection_ctx_->waitUntilAllConnected();
 
-    if (options && options->isExtension_) {
+    if (options_ && options_->isExtension_) {
         auto key = ConnectionContext::getExtensionTaskCountStoreKey(
             backendIndex_, rank_);
         while (true) {

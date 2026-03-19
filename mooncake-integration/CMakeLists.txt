@@ -24,6 +24,12 @@ include_directories("../mooncake-transfer-engine/include")
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+    OUTPUT_VARIABLE PYTHON_EXT_SUFFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
@@ -187,4 +193,26 @@ endif()
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
     install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
+if (WITH_EP)
+    install(
+        DIRECTORY "${EP_PG_STAGING_DIR}/"
+        DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"
+        FILES_MATCHING PATTERN "*.so"
+    )
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+    # ep.so / pg.so link against engine.so by that exact bare name.
+    # Create a engine.so -> engine<EXT_SUFFIX> symlink so they can find it.
+    install(CODE "
+        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
+            \"engine${PYTHON_EXT_SUFFIX}\"
+            \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/engine.so\"
+        )
+    ")
 endif()

@@ -18,7 +18,6 @@ jobs:
     env:
       BUILD_WITH_EP: "1"
       CU13_BUILD: "1"
-      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
     steps:
       - name: Checkout source
@@ -66,7 +65,7 @@ jobs:
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0" -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       - name: Build project

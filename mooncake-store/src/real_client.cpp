@@ -3,11 +3,13 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <numa.h>
+#include <numaif.h>
 #include <pthread.h>
 #include <signal.h>
 #include <thread>
 #include <stop_token>
 
+#include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
@@ -24,6 +26,7 @@
 #include "file_storage.h"
 #include "default_config.h"
 #include "shm_helper.h"
+#include "memory_location.h"
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
@@ -44,9 +47,18 @@ ResourceTracker &ResourceTracker::getInstance() {
 }
 
 ResourceTracker::ResourceTracker() {
-    // Start dedicated signal handling thread (best-effort)
-    startSignalThread();
-    // Register exit handler as a backstop
+    // In embedded environments (e.g. Python), the host runtime owns signal
+    // handling.  Blocking SIGINT with pthread_sigmask (done inside
+    // startSignalThread) would prevent Python from raising KeyboardInterrupt,
+    // causing the process to hang on Ctrl-C.  Detect Python at runtime via
+    // dlsym so we don't need to include <Python.h> or change any public API.
+    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+        // Standalone C/C++ process – install our own signal handling.
+        startSignalThread();
+    }
+
+    // Register exit handler as a backstop (works in both standalone and
+    // embedded modes).
     std::atexit(exitHandler);
 }
 
@@ -107,52 +119,56 @@ void ResourceTracker::startSignalThread() {
         sigaddset(&set, SIGUSR1);  // used to interrupt sigwait on stop
         pthread_sigmask(SIG_BLOCK, &set, nullptr);
 
-        signal_thread_ = std::jthread(
-            [set, ready = std::move(ready)](std::stop_token st) mutable {
-                // Register a stop callback to interrupt sigwait via SIGUSR1
-                pthread_t self = pthread_self();
-                std::stop_callback cb(
-                    st, [self]() { pthread_kill(self, SIGUSR1); });
-                ready.set_value();
-                for (;;) {
-                    int sig = 0;
-                    int rc = sigwait(&set, &sig);
-                    if (rc != 0) {
-                        LOG(ERROR) << "sigwait failed: " << strerror(rc);
-                        continue;
-                    }
-
-                    if (sig == SIGUSR1) {
-                        if (st.stop_requested()) {
-                            break;  // graceful stop
-                        }
-                        continue;  // spurious
-                    }
-
-                    // Perform cleanup in normal thread context
-                    LOG(INFO) << "Received signal " << sig
-                              << ", cleaning up resources";
-                    ResourceTracker::getInstance().cleanupAllResources();
-
-                    // Restore default action and re-raise to terminate normally
-                    struct sigaction sa;
-                    sa.sa_handler = SIG_DFL;
-                    sigemptyset(&sa.sa_mask);
-                    sa.sa_flags = 0;
-                    sigaction(sig, &sa, nullptr);
-
-                    // Unblock the signal before raising it so it can be
-                    // delivered immediately
-                    sigset_t unblock_set;
-                    sigemptyset(&unblock_set);
-                    sigaddset(&unblock_set, sig);
-                    pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
-
-                    raise(sig);
-
-                    break;  // Should not reach due to process termination
+        signal_thread_ = std::jthread([set, ready = std::move(ready)](
+                                          std::stop_token st) mutable {
+            // Register a stop callback to interrupt sigwait via SIGUSR1
+            pthread_t self = pthread_self();
+            std::stop_callback cb(st,
+                                  [self]() { pthread_kill(self, SIGUSR1); });
+            ready.set_value();
+            for (;;) {
+                int sig = 0;
+                int rc = sigwait(&set, &sig);
+                if (rc != 0) {
+                    LOG(ERROR) << "sigwait failed: " << strerror(rc);
+                    continue;
                 }
-            });
+
+                if (sig == SIGUSR1) {
+                    if (st.stop_requested()) {
+                        break;  // graceful stop
+                    }
+                    continue;  // spurious
+                }
+
+                // Perform cleanup in normal thread context
+                LOG(INFO) << "Received signal " << sig
+                          << ", cleaning up resources";
+                ResourceTracker::getInstance().cleanupAllResources();
+
+                // Restore default action and re-raise to terminate normally
+                struct sigaction sa;
+                sa.sa_handler = SIG_DFL;
+                sigemptyset(&sa.sa_mask);
+                sa.sa_flags = 0;
+                sigaction(sig, &sa, nullptr);
+
+                // Unblock the signal before raising it so it can be
+                // delivered immediately
+                sigset_t unblock_set;
+                sigemptyset(&unblock_set);
+                sigaddset(&unblock_set, sig);
+                int ret = pthread_sigmask(SIG_UNBLOCK, &unblock_set, nullptr);
+                if (ret != 0) {
+                    LOG(ERROR) << "Failed to unblock signal " << sig
+                               << " before raising: " << strerror(ret);
+                    _exit(EXIT_FAILURE);
+                }
+                raise(sig);
+
+                break;  // Should not reach due to process termination
+            }
+        });
         ready_future.wait();  // Ensure thread is ready
     });
 }
@@ -317,6 +333,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
+
+        // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
+        // and distribute global_segment across them for full NIC utilization.
+        std::vector<int> seg_numa_nodes;
+        if (!ipc_socket_path_.empty() && protocol == "rdma") {
+            seg_numa_nodes = client_->GetNicNumaNodes();
+            if (seg_numa_nodes.size() > 1) {
+                std::string nodes_str;
+                for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
+                    if (i) nodes_str += ",";
+                    nodes_str += std::to_string(seg_numa_nodes[i]);
+                }
+                LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
+                          << nodes_str << "]";
+            } else {
+                seg_numa_nodes.clear();
+            }
+        }
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
@@ -326,7 +361,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
-            if (should_use_hugepage) {
+            std::string seg_location = kWildcardLocation;
+
+            if (!seg_numa_nodes.empty()) {
+                // NUMA-segmented allocation: contiguous VMA, per-region binding
+                size_t page_sz = should_use_hugepage
+                                     ? get_hugepage_size_from_env()
+                                     : static_cast<size_t>(getpagesize());
+                mapped_size =
+                    align_up(segment_size, page_sz * seg_numa_nodes.size());
+                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
+                                                    page_sz);
+                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+            } else if (should_use_hugepage) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
@@ -343,14 +390,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
-            } else if (should_use_hugepage) {
+            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+                // NUMA-segmented or hugepage: track as mmap allocation for
+                // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol);
+                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
@@ -388,6 +437,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << FLAGS_http_port;
         }
     }
+
     return {};
 }
 
@@ -1217,7 +1267,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Allocate buffer using the new allocator
+    // Normal allocation path
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
