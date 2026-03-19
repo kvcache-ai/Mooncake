@@ -39,6 +39,10 @@ option(STORE_USE_ETCD "build mooncake store with etcd" OFF)
 if (STORE_USE_ETCD)
   add_compile_definitions(STORE_USE_ETCD)
 endif()
+option(STORE_USE_REDIS "build mooncake store with redis" OFF)
+if (STORE_USE_REDIS)
+  add_compile_definitions(STORE_USE_REDIS)
+endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 

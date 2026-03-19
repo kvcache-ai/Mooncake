@@ -25,8 +25,13 @@ ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
                                        const std::string& device_name,
                                        const std::string& master_server_entry,
                                        size_t local_buffer_size) {
+    std::optional<std::string> device_names = std::nullopt;
+    if (!device_name.empty()) {
+        device_names = device_name;
+    }
+
     auto client_opt = Client::Create(hostname, metadata_connstring, protocol,
-                                     std::nullopt, master_server_entry);
+                                     device_names, master_server_entry);
 
     if (!client_opt.has_value()) {
         return std::nullopt;

@@ -1,15 +1,15 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <gtest/gtest.h>
 
 #include <atomic>
-#include <cstdint>
+#include <chrono>
 #include <future>
-#include <memory>
+#include <mutex>
 #include <string>
 
 #include "etcd_helper.h"
 #include "ha/ha_backend_factory.h"
+#include "high_availability_test_fixture.h"
 #include "types.h"
 
 namespace mooncake {
@@ -19,59 +19,59 @@ DEFINE_string(etcd_endpoints, "127.0.0.1:2379", "Etcd endpoints");
 DEFINE_string(etcd_test_key_prefix, "mooncake-store/test/",
               "The prefix of the test keys in ETCD");
 
-class HighAvailabilityTest : public ::testing::Test {
-   protected:
-    static bool etcd_available_;
+void HighAvailabilityTest::SetUpTestSuite() {
+    // Initialize glog
+    google::InitGoogleLogging("HighAvailabilityTest");
 
-    static void SetUpTestSuite() {
-        // Initialize glog
-        google::InitGoogleLogging("HighAvailabilityTest");
+    // Set VLOG level to 1 for detailed logs
+    google::SetVLOGLevel("*", 1);
+    FLAGS_logtostderr = 1;
+}
 
-        // Set VLOG level to 1 for detailed logs
-        google::SetVLOGLevel("*", 1);
-        FLAGS_logtostderr = 1;
-
-        // Initialize etcd client
-        ErrorCode err =
-            EtcdHelper::ConnectToEtcdStoreClient(FLAGS_etcd_endpoints);
-        if (err != ErrorCode::OK) {
-            LOG(WARNING) << "Failed to initialize etcd client, skipping tests.";
-            etcd_available_ = false;
-            return;
-        }
-
-        // Probe connectivity: Try to get a non-existent key
-        // We use a short timeout check implicitly via the wrapper's timeout
-        // (default 5s) If this fails, the etcd server is likely down.
-        std::string val;
-        EtcdRevisionId rev;
-        // Using a key that likely doesn't exist
-        err = EtcdHelper::Get("probe_connection_key", 20, val, rev);
-
-        if (err == ErrorCode::ETCD_OPERATION_ERROR) {
-            LOG(WARNING) << "Failed to connect to Etcd at "
-                         << FLAGS_etcd_endpoints << " (Error: " << (int)err
-                         << "). Integration tests will be S K I P P E D.";
-            etcd_available_ = false;
-        } else {
-            // OK or KEY_NOT_EXIST means connection is good
-            etcd_available_ = true;
-        }
-    }
-
-    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
-
-    void SetUp() override {
-        if (!etcd_available_) {
-            GTEST_SKIP() << "Etcd server not reachable at "
-                         << FLAGS_etcd_endpoints;
-        }
-    }
-};
-
-bool HighAvailabilityTest::etcd_available_ = false;
+void HighAvailabilityTest::TearDownTestSuite() {
+    google::ShutdownGoogleLogging();
+}
 
 namespace {
+
+#ifdef STORE_USE_ETCD
+std::once_flag g_etcd_probe_once;
+bool g_etcd_available = false;
+
+void ProbeEtcdAvailability() {
+    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(FLAGS_etcd_endpoints);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to initialize etcd client, skipping tests.";
+        g_etcd_available = false;
+        return;
+    }
+
+    std::string val;
+    EtcdRevisionId rev;
+    err = EtcdHelper::Get("probe_connection_key", 20, val, rev);
+    if (err == ErrorCode::ETCD_OPERATION_ERROR) {
+        LOG(WARNING) << "Failed to connect to Etcd at " << FLAGS_etcd_endpoints
+                     << " (Error: " << static_cast<int>(err)
+                     << "). Integration tests will be skipped.";
+        g_etcd_available = false;
+        return;
+    }
+
+    g_etcd_available = true;
+}
+#endif
+
+std::optional<std::string> GetEtcdSkipReason() {
+#ifdef STORE_USE_ETCD
+    std::call_once(g_etcd_probe_once, ProbeEtcdAvailability);
+    if (!g_etcd_available) {
+        return "Etcd server not reachable at " + FLAGS_etcd_endpoints;
+    }
+    return std::nullopt;
+#else
+    return "Etcd HA backend is not enabled in this build";
+#endif
+}
 
 ha::HABackendSpec MakeEtcdBackendSpec(const std::string& endpoints) {
     return ha::HABackendSpec{
@@ -94,6 +94,10 @@ std::unique_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
 }  // namespace
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
     // == Test grant lease, create kv and get kv ==
     int64_t lease_ttl = 10;
     std::vector<std::string> keys;
@@ -238,6 +242,10 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
 }
 
 TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
     auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
     ASSERT_NE(coordinator, nullptr);
 
@@ -301,6 +309,10 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
 }
 
 TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
     auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
     ASSERT_NE(coordinator, nullptr);
 
@@ -334,6 +346,10 @@ TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
 }
 
 TEST_F(HighAvailabilityTest, LeadershipMonitorIgnoresExplicitRelease) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
     auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
     ASSERT_NE(coordinator, nullptr);
 
@@ -360,6 +376,10 @@ TEST_F(HighAvailabilityTest, LeadershipMonitorIgnoresExplicitRelease) {
 }
 
 TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
+    if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
     // 1. Basic Put & Get
     std::string key = FLAGS_etcd_test_key_prefix + "oplog_test_1";
     std::string val = "v1";
