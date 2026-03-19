@@ -31,7 +31,8 @@ int main() {
     // Import single object
     ReplicateConfig config;
     config.replica_num = 2;
-    auto result = importer.ImportObject("models/bert.bin", "bert_model", config);
+    auto result =
+        importer.ImportObject("models/bert.bin", "bert_model", config);
 
     // Import by prefix
     auto count = importer.ImportByPrefix("models/", config);
