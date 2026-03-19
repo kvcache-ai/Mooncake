@@ -4,6 +4,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <string_view>
 #include <thread>
@@ -22,6 +23,21 @@ namespace {
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
 constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
+
+enum class LeadershipLossReason {
+    kRenewError,
+    kLostLeadership,
+};
+
+const char* LeadershipLossReasonToString(LeadershipLossReason reason) {
+    switch (reason) {
+        case LeadershipLossReason::kRenewError:
+            return "renew_error";
+        case LeadershipLossReason::kLostLeadership:
+            return "lost_leadership";
+    }
+    return "unknown";
+}
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
@@ -158,20 +174,25 @@ tl::expected<bool, ErrorCode> WarmupLeadership(
     }
 }
 
-std::thread StartServePhaseMonitor(coro_rpc::coro_rpc_server& server,
-                                   LeaderCoordinator& coordinator,
-                                   LeadershipSession session,
-                                   std::atomic<bool>& stop_requested) {
-    return std::thread([&server, &coordinator, session = std::move(session),
-                        &stop_requested]() {
+std::thread StartServePhaseMonitor(
+    LeaderCoordinator& coordinator, LeadershipSession session,
+    std::atomic<bool>& stop_requested,
+    std::function<void(LeadershipLossReason)> on_leadership_lost) {
+    return std::thread([&coordinator, session = std::move(session),
+                        &stop_requested,
+                        on_leadership_lost = std::move(on_leadership_lost)]() {
+        LeadershipLossReason loss_reason =
+            LeadershipLossReason::kLostLeadership;
         while (!stop_requested.load()) {
             auto renewed = coordinator.RenewLeadership(session);
             if (!renewed) {
+                loss_reason = LeadershipLossReason::kRenewError;
                 LOG(ERROR) << "Leadership renewal failed: "
                            << toString(renewed.error());
                 break;
             }
             if (!renewed.value()) {
+                loss_reason = LeadershipLossReason::kLostLeadership;
                 LOG(INFO) << "Leadership is no longer valid";
                 break;
             }
@@ -179,8 +200,7 @@ std::thread StartServePhaseMonitor(coro_rpc::coro_rpc_server& server,
         }
 
         if (!stop_requested.exchange(true)) {
-            LOG(INFO) << "Trying to stop server...";
-            server.stop();
+            on_leadership_lost(loss_reason);
         }
     });
 }
@@ -289,7 +309,12 @@ int MasterServiceSupervisor::Start() {
 
         std::atomic<bool> stop_requested{false};
         auto keep_leader_thread = StartServePhaseMonitor(
-            server, leader_coordinator, leadership_session, stop_requested);
+            leader_coordinator, leadership_session, stop_requested,
+            [&server](auto reason) {
+                LOG(INFO) << "Trying to stop server, reason="
+                          << LeadershipLossReasonToString(reason);
+                server.stop();
+            });
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
