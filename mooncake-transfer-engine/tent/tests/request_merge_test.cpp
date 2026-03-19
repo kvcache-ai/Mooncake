@@ -39,11 +39,7 @@ namespace {
 Request makeWriteRequest(char* base, size_t source_offset,
                          uint64_t target_offset, size_t length) {
     return Request{
-        Request::WRITE,
-        base + source_offset,
-        7,
-        target_offset,
-        length,
+        Request::WRITE, base + source_offset, 7, target_offset, length,
     };
 }
 

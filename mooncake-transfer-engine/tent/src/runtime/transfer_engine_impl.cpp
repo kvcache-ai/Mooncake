@@ -811,8 +811,8 @@ std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
 }
 
 RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
-                                          SegmentDesc* local_desc,
-                                          const Request& request) {
+                                           SegmentDesc* local_desc,
+                                           const Request& request) {
     RequestBoundaryInfo boundary;
 
     if (local_desc) {
@@ -826,15 +826,13 @@ RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
     if (request.target_id == LOCAL_SEGMENT_ID) {
         target_desc = local_desc;
     } else {
-        auto status =
-            metadata->segmentManager().getRemoteCached(target_desc,
-                                                      request.target_id);
+        auto status = metadata->segmentManager().getRemoteCached(
+            target_desc, request.target_id);
         if (!status.ok()) return boundary;
     }
     if (target_desc) {
-        boundary.target_key =
-            toBufferKey(target_desc->findBuffer(request.target_offset,
-                                                request.length));
+        boundary.target_key = toBufferKey(
+            target_desc->findBuffer(request.target_offset, request.length));
     }
     return boundary;
 }
@@ -935,9 +933,11 @@ Status TransferEngineImpl::submitTransfer(
     auto submit_time = std::chrono::steady_clock::now();
 
     auto merge_boundaries =
-        merge_requests_ ? resolveRequestBoundaries(metadata_.get(), request_list)
-                        : std::vector<RequestBoundaryInfo>{};
-    auto merged = mergeRequests(request_list, merge_boundaries, merge_requests_);
+        merge_requests_
+            ? resolveRequestBoundaries(metadata_.get(), request_list)
+            : std::vector<RequestBoundaryInfo>{};
+    auto merged =
+        mergeRequests(request_list, merge_boundaries, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
         size_t task_id = start_task_id + kv.first;
