@@ -1,10 +1,8 @@
 #include "ha/master_service_supervisor.h"
 
-#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
-#include <functional>
 #include <memory>
 #include <string_view>
 #include <thread>
@@ -23,21 +21,6 @@ namespace {
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
 constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
-
-enum class LeadershipLossReason {
-    kRenewError,
-    kLostLeadership,
-};
-
-const char* LeadershipLossReasonToString(LeadershipLossReason reason) {
-    switch (reason) {
-        case LeadershipLossReason::kRenewError:
-            return "renew_error";
-        case LeadershipLossReason::kLostLeadership:
-            return "lost_leadership";
-    }
-    return "unknown";
-}
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
@@ -174,37 +157,6 @@ tl::expected<bool, ErrorCode> WarmupLeadership(
     }
 }
 
-std::thread StartServePhaseMonitor(
-    LeaderCoordinator& coordinator, LeadershipSession session,
-    std::atomic<bool>& stop_requested,
-    std::function<void(LeadershipLossReason)> on_leadership_lost) {
-    return std::thread([&coordinator, session = std::move(session),
-                        &stop_requested,
-                        on_leadership_lost = std::move(on_leadership_lost)]() {
-        LeadershipLossReason loss_reason =
-            LeadershipLossReason::kLostLeadership;
-        while (!stop_requested.load()) {
-            auto renewed = coordinator.RenewLeadership(session);
-            if (!renewed) {
-                loss_reason = LeadershipLossReason::kRenewError;
-                LOG(ERROR) << "Leadership renewal failed: "
-                           << toString(renewed.error());
-                break;
-            }
-            if (!renewed.value()) {
-                loss_reason = LeadershipLossReason::kLostLeadership;
-                LOG(INFO) << "Leadership is no longer valid";
-                break;
-            }
-            std::this_thread::sleep_for(kRenewCheckInterval);
-        }
-
-        if (!stop_requested.exchange(true)) {
-            on_leadership_lost(loss_reason);
-        }
-    });
-}
-
 }  // namespace
 
 MasterServiceSupervisor::MasterServiceSupervisor(
@@ -296,6 +248,23 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
 
+        auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
+            leadership_session, [&server](auto reason) {
+                LOG(INFO) << "Trying to stop server, reason="
+                          << LeadershipLossReasonToString(reason);
+                server.stop();
+            });
+        if (!leadership_monitor) {
+            if (HandleLeadershipPhaseError(
+                    "serve monitor startup failure", "start leadership monitor",
+                    leader_coordinator, leadership_session,
+                    leadership_monitor.error(), spec->type)) {
+                return -1;
+            }
+            continue;
+        }
+        auto leadership_monitor_handle = std::move(leadership_monitor.value());
+
         async_simple::Future<coro_rpc::err_code> ec = server.async_start();
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
@@ -307,22 +276,12 @@ int MasterServiceSupervisor::Start() {
             return -1;
         }
 
-        std::atomic<bool> stop_requested{false};
-        auto keep_leader_thread = StartServePhaseMonitor(
-            leader_coordinator, leadership_session, stop_requested,
-            [&server](auto reason) {
-                LOG(INFO) << "Trying to stop server, reason="
-                          << LeadershipLossReasonToString(reason);
-                server.stop();
-            });
-
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
-        stop_requested.store(true);
+        leadership_monitor_handle->Stop();
         auto err = leader_coordinator.ReleaseLeadership(leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
-        keep_leader_thread.join();
     }
 
     return 0;

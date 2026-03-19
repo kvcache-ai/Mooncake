@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -10,6 +11,12 @@
 
 namespace mooncake {
 namespace ha {
+
+class LeadershipMonitorHandle {
+   public:
+    virtual ~LeadershipMonitorHandle() = default;
+    virtual void Stop() = 0;
+};
 
 class LeaderCoordinator {
    public:
@@ -27,6 +34,10 @@ class LeaderCoordinator {
     virtual tl::expected<ViewChangeResult, ErrorCode> WaitForViewChange(
         std::optional<ViewVersionId> known_version,
         std::chrono::milliseconds timeout) = 0;
+
+    virtual tl::expected<std::unique_ptr<LeadershipMonitorHandle>, ErrorCode>
+    StartLeadershipMonitor(const LeadershipSession& session,
+                           LeadershipLostCallback on_leadership_lost) = 0;
 
     virtual ErrorCode ReleaseLeadership(const LeadershipSession& session) = 0;
 };

@@ -1,9 +1,10 @@
 #include "ha/backends/etcd/etcd_leader_coordinator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <thread>
 
@@ -17,7 +18,24 @@ namespace etcd {
 
 namespace {
 
+constexpr int kKeepAliveReadyTimeoutMs = 1000;
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
+
+class EtcdLeadershipMonitorHandle final : public LeadershipMonitorHandle {
+   public:
+    explicit EtcdLeadershipMonitorHandle(
+        std::shared_ptr<std::atomic<bool>> armed)
+        : armed_(std::move(armed)) {}
+
+    void Stop() override {
+        if (armed_ != nullptr) {
+            armed_->store(false);
+        }
+    }
+
+   private:
+    std::shared_ptr<std::atomic<bool>> armed_;
+};
 
 }  // namespace
 
@@ -118,6 +136,7 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         keepalive_stopped_ = false;
         keepalive_result_ = ErrorCode::OK;
         keepalive_shutdown_requested_ = false;
+        ClearLeadershipMonitorStateLocked();
     }
 
     return AcquireLeadershipResult{
@@ -144,6 +163,7 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
     // the public LeaderCoordinator contract can still stay renew-oriented.
     std::thread thread_to_join;
     bool should_return_false = false;
+    bool started_keepalive = false;
     {
         std::lock_guard<std::mutex> lock(keepalive_mutex_);
         if (keepalive_shutdown_requested_) {
@@ -159,6 +179,7 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
                 thread_to_join = std::move(keepalive_thread_);
                 keepalive_owner_token_.clear();
                 keepalive_lease_id_ = 0;
+                ClearLeadershipMonitorStateLocked();
                 should_return_false = true;
             } else {
                 return true;
@@ -168,14 +189,44 @@ tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
             keepalive_lease_id_ = lease_id.value();
             keepalive_stopped_ = false;
             keepalive_result_ = ErrorCode::OK;
+            started_keepalive = true;
             keepalive_thread_ = std::thread([this, lease = lease_id.value()]() {
                 auto rc = EtcdHelper::KeepAlive(lease);
-                std::lock_guard<std::mutex> lock(keepalive_mutex_);
-                keepalive_result_ = rc;
-                keepalive_stopped_ = true;
+                std::shared_ptr<std::atomic<bool>> monitor_armed;
+                LeadershipLostCallback on_leadership_lost;
+                LeadershipLossReason loss_reason =
+                    ClassifyLeadershipLossReason(rc);
+                {
+                    std::lock_guard<std::mutex> lock(keepalive_mutex_);
+                    keepalive_result_ = rc;
+                    keepalive_stopped_ = true;
+                    if (!keepalive_shutdown_requested_ &&
+                        keepalive_owner_token_ ==
+                            leadership_monitor_owner_token_) {
+                        monitor_armed = leadership_monitor_armed_;
+                        on_leadership_lost =
+                            std::move(leadership_monitor_callback_);
+                        leadership_monitor_armed_.reset();
+                        leadership_monitor_owner_token_.clear();
+                    }
+                }
+
+                if (monitor_armed != nullptr &&
+                    monitor_armed->exchange(false) &&
+                    on_leadership_lost != nullptr) {
+                    on_leadership_lost(loss_reason);
+                }
             });
-            return true;
         }
+    }
+
+    if (started_keepalive) {
+        auto ready_err = EtcdHelper::WaitKeepAliveReady(
+            lease_id.value(), kKeepAliveReadyTimeoutMs);
+        if (ready_err != ErrorCode::OK) {
+            return tl::make_unexpected(ready_err);
+        }
+        return true;
     }
 
     if (thread_to_join.joinable()) {
@@ -226,6 +277,39 @@ EtcdLeaderCoordinator::WaitForViewChange(
     }
 }
 
+tl::expected<std::unique_ptr<LeadershipMonitorHandle>, ErrorCode>
+EtcdLeaderCoordinator::StartLeadershipMonitor(
+    const LeadershipSession& session,
+    LeadershipLostCallback on_leadership_lost) {
+    auto err = EnsureConnected();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    if (!on_leadership_lost) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(keepalive_mutex_);
+    if (keepalive_shutdown_requested_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (keepalive_owner_token_ != session.owner_token ||
+        !keepalive_thread_.joinable() || keepalive_stopped_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (leadership_monitor_armed_ != nullptr &&
+        leadership_monitor_armed_->load()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    leadership_monitor_owner_token_ = session.owner_token;
+    leadership_monitor_callback_ = std::move(on_leadership_lost);
+    leadership_monitor_armed_ = std::make_shared<std::atomic<bool>>(true);
+    return std::unique_ptr<LeadershipMonitorHandle>(
+        std::make_unique<EtcdLeadershipMonitorHandle>(
+            leadership_monitor_armed_));
+}
+
 ErrorCode EtcdLeaderCoordinator::ReleaseLeadership(
     const LeadershipSession& session) {
     auto lease_id = ParseLeaseId(session.owner_token);
@@ -236,6 +320,7 @@ ErrorCode EtcdLeaderCoordinator::ReleaseLeadership(
     std::thread thread_to_join;
     EtcdLeaseId lease_id_to_cancel = lease_id.value();
     bool should_cancel = false;
+    bool should_join = false;
     {
         std::lock_guard<std::mutex> lock(keepalive_mutex_);
         if (!keepalive_owner_token_.empty() &&
@@ -247,13 +332,15 @@ ErrorCode EtcdLeaderCoordinator::ReleaseLeadership(
         if (keepalive_lease_id_ != 0) {
             lease_id_to_cancel = keepalive_lease_id_;
         }
-        should_cancel = keepalive_thread_.joinable();
-        if (should_cancel) {
+        should_join = keepalive_thread_.joinable();
+        should_cancel = should_join && !keepalive_stopped_;
+        if (should_join) {
             thread_to_join = std::move(keepalive_thread_);
         }
         keepalive_owner_token_.clear();
         keepalive_lease_id_ = 0;
         keepalive_stopped_ = true;
+        ClearLeadershipMonitorStateLocked();
     }
 
     if (should_cancel) {
@@ -264,6 +351,8 @@ ErrorCode EtcdLeaderCoordinator::ReleaseLeadership(
         if (err != ErrorCode::OK && err != ErrorCode::ETCD_OPERATION_ERROR) {
             return err;
         }
+    } else if (thread_to_join.joinable()) {
+        thread_to_join.join();
     }
 
     return EtcdHelper::RevokeLease(lease_id_to_cancel);
@@ -319,6 +408,7 @@ ErrorCode EtcdLeaderCoordinator::ShutdownKeepAliveThread() {
     EtcdLeaseId lease_id_to_release = 0;
     bool should_cancel = false;
     bool should_revoke = false;
+    bool should_join = false;
 
     {
         std::lock_guard<std::mutex> lock(keepalive_mutex_);
@@ -327,13 +417,15 @@ ErrorCode EtcdLeaderCoordinator::ShutdownKeepAliveThread() {
             lease_id_to_release = keepalive_lease_id_;
             should_revoke = true;
         }
-        should_cancel = keepalive_thread_.joinable();
-        if (should_cancel) {
+        should_join = keepalive_thread_.joinable();
+        should_cancel = should_join && !keepalive_stopped_;
+        if (should_join) {
             thread_to_join = std::move(keepalive_thread_);
         }
         keepalive_owner_token_.clear();
         keepalive_lease_id_ = 0;
         keepalive_stopped_ = true;
+        ClearLeadershipMonitorStateLocked();
     }
 
     if (!should_cancel && !should_revoke) {
@@ -346,6 +438,8 @@ ErrorCode EtcdLeaderCoordinator::ShutdownKeepAliveThread() {
         if (thread_to_join.joinable()) {
             thread_to_join.join();
         }
+    } else if (thread_to_join.joinable()) {
+        thread_to_join.join();
     }
 
     ErrorCode revoke_err = ErrorCode::OK;
@@ -360,6 +454,23 @@ ErrorCode EtcdLeaderCoordinator::ShutdownKeepAliveThread() {
         return err;
     }
     return revoke_err;
+}
+
+void EtcdLeaderCoordinator::ClearLeadershipMonitorStateLocked() {
+    if (leadership_monitor_armed_ != nullptr) {
+        leadership_monitor_armed_->store(false);
+        leadership_monitor_armed_.reset();
+    }
+    leadership_monitor_callback_ = nullptr;
+    leadership_monitor_owner_token_.clear();
+}
+
+LeadershipLossReason EtcdLeaderCoordinator::ClassifyLeadershipLossReason(
+    ErrorCode err) {
+    if (err == ErrorCode::OK || err == ErrorCode::ETCD_CTX_CANCELLED) {
+        return LeadershipLossReason::kLostLeadership;
+    }
+    return LeadershipLossReason::kRenewError;
 }
 
 bool EtcdLeaderCoordinator::IsSameViewVersion(

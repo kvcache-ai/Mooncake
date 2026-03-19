@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -297,6 +298,65 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     ASSERT_TRUE(reacquire->session.has_value());
     ASSERT_EQ(ErrorCode::OK,
               coordinator->ReleaseLeadership(*reacquire->session));
+}
+
+TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:7777");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    std::promise<ha::LeadershipLossReason> loss_promise;
+    auto loss_future = loss_promise.get_future();
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [&loss_promise](ha::LeadershipLossReason reason) {
+            loss_promise.set_value(reason);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    const auto lease_id =
+        static_cast<EtcdLeaseId>(std::stoll(session.owner_token));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::CancelKeepAlive(lease_id));
+    ASSERT_EQ(loss_future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(ha::LeadershipLossReason::kLostLeadership, loss_future.get());
+
+    monitor.value()->Stop();
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
+TEST_F(HighAvailabilityTest, LeadershipMonitorIgnoresExplicitRelease) {
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:6666");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    auto callback_fired = std::make_shared<std::atomic<bool>>(false);
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [callback_fired](ha::LeadershipLossReason) {
+            callback_fired->store(true);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    EXPECT_FALSE(callback_fired->load());
 }
 
 TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {

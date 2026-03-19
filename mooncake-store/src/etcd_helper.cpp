@@ -206,6 +206,17 @@ ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdHelper::WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms) {
+    char* err_msg = nullptr;
+    if (0 !=
+        EtcdStoreWaitKeepAliveReadyWrapper(lease_id, timeout_ms, &err_msg)) {
+        LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::Put(const char* key, const size_t key_size,
                           const char* value, const size_t value_size) {
     char* err_msg = nullptr;
@@ -460,6 +471,13 @@ ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
 
 ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     (void)lease_id;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms) {
+    (void)lease_id;
+    (void)timeout_ms;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }

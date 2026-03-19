@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -31,6 +33,10 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
         std::optional<ViewVersionId> known_version,
         std::chrono::milliseconds timeout) override;
 
+    tl::expected<std::unique_ptr<LeadershipMonitorHandle>, ErrorCode>
+    StartLeadershipMonitor(const LeadershipSession& session,
+                           LeadershipLostCallback on_leadership_lost) override;
+
     ErrorCode ReleaseLeadership(const LeadershipSession& session) override;
 
    private:
@@ -41,9 +47,11 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     static tl::expected<EtcdLeaseId, ErrorCode> ParseLeaseId(
         const OwnerToken& owner_token);
     static OwnerToken MakeOwnerToken(EtcdLeaseId lease_id);
+    static LeadershipLossReason ClassifyLeadershipLossReason(ErrorCode err);
 
     ErrorCode EnsureConnected();
     ErrorCode ShutdownKeepAliveThread();
+    void ClearLeadershipMonitorStateLocked();
     bool IsSameViewVersion(const std::optional<MasterView>& current_view,
                            std::optional<ViewVersionId> known_version) const;
 
@@ -58,6 +66,9 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     bool keepalive_stopped_ = false;
     bool keepalive_shutdown_requested_ = false;
     ErrorCode keepalive_result_ = ErrorCode::OK;
+    LeadershipLostCallback leadership_monitor_callback_;
+    std::shared_ptr<std::atomic<bool>> leadership_monitor_armed_;
+    OwnerToken leadership_monitor_owner_token_;
 };
 
 }  // namespace etcd

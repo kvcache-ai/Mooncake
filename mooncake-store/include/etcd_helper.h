@@ -110,6 +110,14 @@ class EtcdHelper {
     static ErrorCode CancelKeepAlive(EtcdLeaseId lease_id);
 
     /*
+     * @brief Wait until a keep alive context is registered and cancellable.
+     * @param lease_id: The lease id to wait for.
+     * @param timeout_ms: Wait timeout in milliseconds.
+     * @return: Error code.
+     */
+    static ErrorCode WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms);
+
+    /*
      * @brief Put a key-value pair to etcd.
      * @param key: The key to put.
      * @param key_size: The size of the key in bytes.

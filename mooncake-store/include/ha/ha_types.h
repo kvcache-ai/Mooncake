@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -86,6 +87,23 @@ struct ViewChangeResult {
     bool timed_out = false;
     std::optional<MasterView> current_view;
 };
+
+enum class LeadershipLossReason {
+    kRenewError,
+    kLostLeadership,
+};
+
+inline const char* LeadershipLossReasonToString(LeadershipLossReason reason) {
+    switch (reason) {
+        case LeadershipLossReason::kRenewError:
+            return "renew_error";
+        case LeadershipLossReason::kLostLeadership:
+            return "lost_leadership";
+    }
+    return "unknown";
+}
+
+using LeadershipLostCallback = std::function<void(LeadershipLossReason reason)>;
 
 struct OpLogRecord {
     OpLogSequenceId seq = 0;

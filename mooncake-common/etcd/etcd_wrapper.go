@@ -480,6 +480,14 @@ func cancelAndDeleteKeepAlive(leaseId int64) int {
 	return -1
 }
 
+func hasKeepAliveContext(leaseId int64) bool {
+	storeKeepAliveMutex.Lock()
+	defer storeKeepAliveMutex.Unlock()
+
+	_, exists := storeKeepAliveCtx[leaseId]
+	return exists
+}
+
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	if storeClient == nil {
@@ -537,6 +545,21 @@ func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 		return -1
 	}
 	return 0
+}
+
+//export EtcdStoreWaitKeepAliveReadyWrapper
+func EtcdStoreWaitKeepAliveReadyWrapper(leaseId int64, timeoutMs int, errMsg **C.char) int {
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for {
+		if hasKeepAliveContext(leaseId) {
+			return 0
+		}
+		if timeoutMs <= 0 || !time.Now().Before(deadline) {
+			*errMsg = C.CString("keep alive context did not become ready before timeout")
+			return -1
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 //export EtcdStorePutWrapper
