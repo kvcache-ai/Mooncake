@@ -93,90 +93,92 @@ def run_test_iteration(
 
     cpu_group.barrier()
 
+    if rank == fail_rank:
+        os._exit(0)
+
     # Dispatch
-    if rank != fail_rank:
-        recv_x, recv_count, handle, event, hook = buf.dispatch(
-            x,
-            topk_idx,
-            active_ranks,
-            num_max_dispatch_tokens_per_rank=max_tokens,
-            num_experts=num_experts,
-            timeout_us=timeout_us,
-            use_fp8=use_fp8,
-            async_finish=async_finish,
-            return_recv_hook=return_recv_hook,
+    recv_x, recv_count, handle, event, hook = buf.dispatch(
+        x,
+        topk_idx,
+        active_ranks,
+        num_max_dispatch_tokens_per_rank=max_tokens,
+        num_experts=num_experts,
+        timeout_us=timeout_us,
+        use_fp8=use_fp8,
+        async_finish=async_finish,
+        return_recv_hook=return_recv_hook,
+    )
+
+    if return_recv_hook:
+        hook()
+    if async_finish:
+        event.current_stream_wait()
+
+    torch.cuda.synchronize()
+    # Fault-tolerance check
+    if fail_rank != -1:
+        assert active_ranks[fail_rank].item() == 0, (
+            f"[Rank {rank}] Failed rank {fail_rank} is not recorded in active_ranks. "
+            f"active_ranks: {active_ranks}"
+        )
+        assert active_ranks.sum().item() == active_ranks.numel() - 1, (
+            f"[Rank {rank}] Expected exactly one failed rank {fail_rank}, but found "
+            f"{active_ranks.numel() - active_ranks.sum().item()} inactive ranks. "
+            f"Maybe the timeout is too small? "
+            f"active_ranks: {active_ranks}"
         )
 
-        if return_recv_hook:
-            hook()
-        if async_finish:
-            event.current_stream_wait()
+    # Mock expert forward
+    if use_fp8:
+        recv_bf16 = dequantize_fp8(recv_x[0], recv_x[1])
+    else:
+        recv_bf16 = recv_x
 
-        torch.cuda.synchronize()
-        # Fault-tolerance check
-        if fail_rank != -1:
-            assert active_ranks[fail_rank].item() == 0, (
-                f"[Rank {rank}] Failed rank {fail_rank} is not recorded in active_ranks. "
-                f"active_ranks: {active_ranks}"
-            )
-            assert active_ranks.sum().item() == active_ranks.numel() - 1, (
-                f"[Rank {rank}] Expected exactly one failed rank {fail_rank}, but found "
-                f"{active_ranks.numel() - active_ranks.sum().item()} inactive ranks. "
-                f"Maybe the timeout is too small? "
-                f"active_ranks: {active_ranks}"
-            )
+    expert_out = torch.empty_like(recv_bf16)
 
-        # Mock expert forward
-        if use_fp8:
-            recv_bf16 = dequantize_fp8(recv_x[0], recv_x[1])
-        else:
-            recv_bf16 = recv_x
+    for le in range(num_local_experts):
+        expert_id = rank * num_local_experts + le
+        mock_expert_factor = get_mock_factor(expert_id)
+        expert_out[le] = recv_bf16[le] * mock_expert_factor
 
-        expert_out = torch.empty_like(recv_bf16)
+    expert_out = expert_out.to(torch.bfloat16)
 
-        for le in range(num_local_experts):
-            expert_id = rank * num_local_experts + le
-            mock_expert_factor = get_mock_factor(expert_id)
-            expert_out[le] = recv_bf16[le] * mock_expert_factor
+    # Combine
+    if zero_copy:
+        cb_buf = buf.get_next_combine_buffer(handle)
+        cb_buf.copy_(expert_out)
+        expert_to_pass = cb_buf.contiguous()
+    else:
+        expert_to_pass = expert_out.contiguous()
 
-        expert_out = expert_out.to(torch.bfloat16)
+    out_tensor = torch.zeros_like(x)
+    combined_x, event, hook = buf.combine(
+        expert_to_pass,
+        topk_idx,
+        topk_weights,
+        active_ranks,
+        timeout_us=timeout_us,
+        handle=handle,
+        zero_copy=zero_copy,
+        async_finish=async_finish,
+        return_recv_hook=return_recv_hook,
+        out=out_tensor,
+    )
 
-        # Combine
-        if zero_copy:
-            cb_buf = buf.get_next_combine_buffer(handle)
-            cb_buf.copy_(expert_out)
-            expert_to_pass = cb_buf.contiguous()
-        else:
-            expert_to_pass = expert_out.contiguous()
+    if return_recv_hook:
+        hook()
+    if async_finish:
+        event.current_stream_wait()
 
-        out_tensor = torch.zeros_like(x)
-        combined_x, event, hook = buf.combine(
-            expert_to_pass,
-            topk_idx,
-            topk_weights,
-            active_ranks,
-            timeout_us=timeout_us,
-            handle=handle,
-            zero_copy=zero_copy,
-            async_finish=async_finish,
-            return_recv_hook=return_recv_hook,
-            out=out_tensor,
-        )
+    torch.cuda.synchronize()
 
-        if return_recv_hook:
-            hook()
-        if async_finish:
-            event.current_stream_wait()
-
-        torch.cuda.synchronize()
-
-        testing.assert_close(
-            combined_x,
-            expected_out,
-            rtol=0.15 if use_fp8 else 5e-2,
-            atol=5e-3 if use_fp8 else 1e-3,
-            msg=lambda msg: f"[Rank {rank}] Combine Mismatch. {msg}",
-        )
+    testing.assert_close(
+        combined_x,
+        expected_out,
+        rtol=0.15 if use_fp8 else 5e-2,
+        atol=5e-3 if use_fp8 else 1e-3,
+        msg=lambda msg: f"[Rank {rank}] Combine Mismatch. {msg}",
+    )
 
     torch.cuda.synchronize()
     dist.barrier(cpu_group)
@@ -285,14 +287,6 @@ def generate_tests():
         raw_dict = dict(zip(keys, t))
 
         if raw_dict["async_finish"] and raw_dict["return_recv_hook"]:
-            continue
-
-        # NOTE: Fault-tolerance testing is currently disabled for the fallback implementation.
-        # In the fallback path, `dispatch` is implemented using collective communications.
-        # Since this test simulates failure by having a rank skip the `dispatch/combine` call
-        # (rather than killing the process), the simulated failed rank continues to acknowledge other's 
-        # `sendNotifyByID` in Mooncake-PG. This prevents the timeout on other ranks, leading to a hang.
-        if raw_dict["use_fallback"] and raw_dict["fail_rank"] != -1:
             continue
 
         # Flatten
