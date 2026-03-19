@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-and-test:
-    # if: github.repository == 'kvcache-ai/Mooncake'
+    if: github.repository == 'kvcache-ai/Mooncake'
     runs-on: self-hosted
 
     container:
