@@ -26,8 +26,8 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
     - `free_ratio_first`: Free-ratio-first strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
 
 - Eviction and TTLs
-  - `--default_kv_lease_ttl` (duration, default `5000` ms): Default lease TTL for KV objects. Supports raw milliseconds for backward compatibility (`5000`) and duration strings such as `5000ms`, `5s`, `30m`, or `1h`.
-  - `--default_kv_soft_pin_ttl` (duration, default `1800000` ms): Soft pin TTL (30 minutes). Supports raw milliseconds for backward compatibility (`1800000`) and duration strings such as `1800000ms`, `30m`, or `1h`.
+  - `--default_kv_lease_ttl` (duration, default `5000` ms): Default lease TTL for KV objects. The default unit is milliseconds, so `5000` means `5000ms`. Duration strings such as `5000ms`, `5s`, `30m`, or `1h` are also supported.
+  - `--default_kv_soft_pin_ttl` (duration, default `1800000` ms): Soft pin TTL (30 minutes). The default unit is milliseconds, so `1800000` means `1800000ms`. Duration strings such as `1800000ms`, `30m`, or `1h` are also supported.
   - `--allow_evict_soft_pinned_objects` (bool, default `true`): Allow evicting soft-pinned objects.
   - `--eviction_ratio` (double, default `0.05`): Fraction evicted when hitting high watermark.
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.

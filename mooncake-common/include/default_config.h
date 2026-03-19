@@ -77,7 +77,7 @@ class DefaultConfig {
      * @param val Pointer to store the retrieved value in milliseconds
      * @param default_value Default value to return if the key is not found
      * @note Duration strings may use ms, s, m, or h as suffixes. Bare numbers
-     * are interpreted as milliseconds for backward compatibility.
+     * are interpreted as milliseconds.
      */
     void GetDurationMs(const std::string& key, uint64_t* val,
                        uint64_t default_value = 0) const;
