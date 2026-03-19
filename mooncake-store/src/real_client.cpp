@@ -120,7 +120,7 @@ void ResourceTracker::startSignalThread() {
         pthread_sigmask(SIG_BLOCK, &set, nullptr);
 
         signal_thread_ = std::jthread([set, ready = std::move(ready)](
-                                          std::stop_token st) mutable {
+                                          const std::stop_token &st) mutable {
             // Register a stop callback to interrupt sigwait via SIGUSR1
             pthread_t self = pthread_self();
             std::stop_callback cb(st,
@@ -217,8 +217,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Check if hostname already contains a port
-    std::string hostname = local_hostname;
-    size_t colon_pos = hostname.find(":");
+    const std::string &hostname = local_hostname;
+    size_t colon_pos = hostname.find(':');
     bool user_specified_port = (colon_pos != std::string::npos);
 
     if (user_specified_port) {
@@ -723,7 +723,7 @@ void RealClient::stop_http_server() {
 tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -779,7 +779,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -866,9 +866,9 @@ int RealClient::put_batch(const std::vector<std::string> &keys,
 }
 
 tl::expected<void, ErrorCode> RealClient::put_parts_internal(
-    const std::string &key, std::vector<std::span<const char>> values,
+    const std::string &key, const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1225,7 +1225,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -1475,7 +1475,7 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -2784,7 +2784,7 @@ ClientRequester::ClientRequester() {
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 ClientRequester::batch_get_offload_object(const std::string &client_addr,
                                           const std::vector<std::string> &keys,
-                                          const std::vector<int64_t> sizes) {
+                                          const std::vector<int64_t> &sizes) {
     auto result =
         invoke_rpc<&RealClient::batch_get_offload_object,
                    BatchGetOffloadObjectResponse>(client_addr, keys, sizes);

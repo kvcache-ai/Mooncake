@@ -71,7 +71,7 @@ class ClientRequester {
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,
-                             const std::vector<int64_t> sizes);
+                             const std::vector<int64_t> &sizes);
 
     /**
      * @brief Notifies remote FileStorage to release buffer after transfer
