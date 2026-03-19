@@ -12,6 +12,10 @@ namespace {
 constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024;  // 16MB default block
 }
 
+// ---------------------------------------------------------------------------
+// LocalHotCache
+// ---------------------------------------------------------------------------
+
 LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes,
                              bool use_shm)
     : block_size_((block_size_bytes > 0) ? block_size_bytes
@@ -72,6 +76,9 @@ LocalHotCache::~LocalHotCache() {
 bool LocalHotCache::PutHotKey(HotMemBlock* block) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
 
+    // Drain deferred LRU touches
+    drainDeferredTouches();
+
     if (!block) return false;
 
     // Handle return-to-lru tail case (empty key or cancelled task)
@@ -106,7 +113,7 @@ bool LocalHotCache::HasHotKey(const std::string& key) const {
 }
 
 HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return nullptr;
@@ -120,14 +127,14 @@ HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
     // Mark block as in use to prevent it from being reused during memcpy
     blk->ref_count++;
 
-    // update lru queue
-    touchLRU(it);
+    // Defer LRU reordering via atomic flag (drained before eviction)
+    blk->accessed.store(true, std::memory_order_relaxed);
 
     return blk;
 }
 
 void LocalHotCache::ReleaseHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return;
@@ -139,17 +146,23 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
 }
 
 bool LocalHotCache::TouchHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return false;
     }
-    touchLRU(it);
+    HotMemBlock* blk = *(it->second);
+    if (blk) {
+        blk->accessed.store(true, std::memory_order_relaxed);
+    }
     return true;
 }
 
 HotMemBlock* LocalHotCache::GetFreeBlock() {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    // Drain deferred LRU touches before scanning for victims
+    drainDeferredTouches();
 
     if (lru_queue_.empty()) {
         return nullptr;
@@ -191,13 +204,29 @@ HotMemBlock* LocalHotCache::GetFreeBlock() {
     return victim;
 }
 
-void LocalHotCache::touchLRU(
-    std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator
-        it) {
-    HotMemBlock* blk = *(it->second);
-    lru_queue_.erase(it->second);
-    lru_queue_.push_front(blk);
-    it->second = lru_queue_.begin();
+void LocalHotCache::drainDeferredTouches() {
+    // Caller must hold exclusive lock on lru_mutex_.
+    // Iterate the LRU list and splice any block with accessed=true to front.
+    for (auto it = lru_queue_.begin(); it != lru_queue_.end();) {
+        HotMemBlock* blk = *it;
+        if (blk && blk->accessed.exchange(false, std::memory_order_relaxed)) {
+            if (it != lru_queue_.begin()) {
+                auto cur = it++;
+                lru_queue_.splice(lru_queue_.begin(), lru_queue_, cur);
+                // Update the map iterator
+                if (!blk->key_.empty()) {
+                    auto map_it = key_to_lru_it_.find(blk->key_);
+                    if (map_it != key_to_lru_it_.end()) {
+                        map_it->second = lru_queue_.begin();
+                    }
+                }
+            } else {
+                ++it;
+            }
+        } else {
+            ++it;
+        }
+    }
 }
 
 size_t LocalHotCache::GetCacheSize() const {

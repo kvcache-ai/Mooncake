@@ -27,7 +27,7 @@ constexpr int kBarrierDummyTensorSize = 1;
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 // leaky singleton to avoid destructor fiasco problem
 TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
-MooncakeWorker* MooncakeBackend::worker_ = new MooncakeWorker();
+// worker_ is now owned per backend instance via MooncakeWorkerManager.
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
 
@@ -98,9 +98,7 @@ MooncakeBackend::MooncakeBackend(
         engine_->init(P2PHANDSHAKE, hostIp_);
         engineInitialized_ = true;
     }
-    auto localRpcMeta = engine_->getMetadata()->localRpcMeta();
-    std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
-                                  std::to_string(localRpcMeta.rpc_port);
+    std::string localServerName = engine_->getLocalIpAndPort();
     // construct local to global rank map
     if (globalRanks.size() == static_cast<size_t>(size)) {
         for (int i = 0; i < size; ++i) {
@@ -179,12 +177,20 @@ MooncakeBackend::MooncakeBackend(
     else
         p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
 
+    auto& worker_mgr = MooncakeWorkerManager::GetInstance();
+    if (isCpu_)
+        worker_ = worker_mgr.GetCPUWorker();
+    else
+        worker_ = worker_mgr.GetCUDAWorker(cuda_device_index);
+    worker_->Start();
+
     p2p_proxy_ = std::make_shared<P2PProxy>(
         engine_, P2PProxy::Options{
                      .is_cpu = isCpu_,
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
+                     .location = location,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 

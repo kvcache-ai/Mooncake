@@ -128,7 +128,7 @@ troubleshooting/troubleshooting
 
 :::{toctree}
 :caption: Deployment
-:maxdepth: 1
+:maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
 :::
