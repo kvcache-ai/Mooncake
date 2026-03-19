@@ -8,6 +8,8 @@ namespace ha {
 tl::expected<std::unique_ptr<LeaderCoordinator>, ErrorCode>
 CreateLeaderCoordinator(const HABackendSpec& spec) {
     switch (spec.type) {
+        case HABackendType::UNKNOWN:
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         case HABackendType::ETCD: {
             auto coordinator =
                 std::make_unique<backends::etcd::EtcdLeaderCoordinator>(spec);

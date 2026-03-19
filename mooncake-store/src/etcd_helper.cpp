@@ -141,6 +141,16 @@ ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     return ErrorCode::OK;
 }
 
+ErrorCode EtcdHelper::RevokeLease(EtcdLeaseId lease_id) {
+    char* err_msg = nullptr;
+    if (0 != EtcdStoreRevokeLeaseWrapper(lease_id, &err_msg)) {
+        LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::WatchUntilDeleted(const char* key,
                                         const size_t key_size) {
     char* err_msg = nullptr;
@@ -416,6 +426,12 @@ ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
 
 ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     (void)lease_ttl;
+    (void)lease_id;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::RevokeLease(EtcdLeaseId lease_id) {
     (void)lease_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;

@@ -20,6 +20,39 @@ namespace {
 
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
+constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
+
+std::string ResolveHABackendConnstring(
+    const MasterServiceSupervisorConfig& config) {
+    if (!config.ha_backend_connstring.empty()) {
+        return config.ha_backend_connstring;
+    }
+    return config.etcd_endpoints;
+}
+
+tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
+    const MasterServiceSupervisorConfig& config) {
+    auto backend_type = ParseHABackendType(config.ha_backend_type);
+    if (!backend_type.has_value()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto connstring = ResolveHABackendConnstring(config);
+    if (connstring.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return HABackendSpec{
+        .type = backend_type.value(),
+        .connstring = connstring,
+        .cluster_namespace = config.cluster_id,
+    };
+}
+
+bool IsFatalHABackendError(ErrorCode err) {
+    return err == ErrorCode::INVALID_PARAMS ||
+           err == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+}
 
 tl::expected<LeadershipSession, ErrorCode> AcquireLeadershipOrWait(
     LeaderCoordinator& coordinator, const std::string& leader_address) {
@@ -40,7 +73,11 @@ tl::expected<LeadershipSession, ErrorCode> AcquireLeadershipOrWait(
                 return *acquire->session;
             }
 
-            auto wait = coordinator.WaitForViewChange(std::nullopt,
+            std::optional<ViewVersionId> observed_version = std::nullopt;
+            if (acquire->observed_view.has_value()) {
+                observed_version = acquire->observed_view->view_version;
+            }
+            auto wait = coordinator.WaitForViewChange(observed_version,
                                                       kAcquireRetryInterval);
             if (!wait) {
                 return tl::make_unexpected(wait.error());
@@ -64,6 +101,14 @@ MasterServiceSupervisor::MasterServiceSupervisor(
     : config_(config) {}
 
 int MasterServiceSupervisor::Start() {
+    auto spec = BuildHABackendSpec(config_);
+    if (!spec) {
+        LOG(ERROR) << "Failed to parse HA backend config: "
+                   << toString(spec.error())
+                   << ", backend_type=" << config_.ha_backend_type;
+        return -1;
+    }
+
     while (true) {
         LOG(INFO) << "Init master service...";
         coro_rpc::coro_rpc_server server(
@@ -74,36 +119,76 @@ int MasterServiceSupervisor::Start() {
             server.init_ibv();
         }
 
-        HABackendSpec spec{
-            .type = HABackendType::ETCD,
-            .connstring = config_.etcd_endpoints,
-            .cluster_namespace = config_.cluster_id,
-        };
-        auto coordinator = CreateLeaderCoordinator(spec);
+        auto coordinator = CreateLeaderCoordinator(*spec);
         if (!coordinator) {
-            LOG(ERROR) << "Failed to create leader coordinator: "
-                       << toString(coordinator.error());
-            return -1;
+            auto err = coordinator.error();
+            if (IsFatalHABackendError(err)) {
+                LOG(ERROR) << "Failed to create leader coordinator: "
+                           << toString(err) << ", backend_type="
+                           << HABackendTypeToString(spec->type);
+                return -1;
+            }
+            LOG(WARNING) << "Failed to create leader coordinator: "
+                         << toString(err) << ", backend_type="
+                         << HABackendTypeToString(spec->type)
+                         << ", retrying in " << kSupervisorRetryInterval.count()
+                         << "s";
+            std::this_thread::sleep_for(kSupervisorRetryInterval);
+            continue;
         }
 
         auto session = AcquireLeadershipOrWait(*coordinator.value(),
                                                config_.local_hostname);
         if (!session) {
-            LOG(ERROR) << "Failed to acquire leadership: "
-                       << toString(session.error());
-            return -1;
+            auto err = session.error();
+            if (IsFatalHABackendError(err)) {
+                LOG(ERROR) << "Failed to acquire leadership: " << toString(err)
+                           << ", backend_type="
+                           << HABackendTypeToString(spec->type);
+                return -1;
+            }
+            LOG(WARNING) << "Failed to acquire leadership: " << toString(err)
+                         << ", backend_type="
+                         << HABackendTypeToString(spec->type)
+                         << ", retrying in " << kSupervisorRetryInterval.count()
+                         << "s";
+            std::this_thread::sleep_for(kSupervisorRetryInterval);
+            continue;
         }
         LeadershipSession leadership_session = *session;
 
         auto renew_result =
             coordinator.value()->RenewLeadership(leadership_session);
         if (!renew_result) {
-            LOG(ERROR) << "Failed to start leadership renewal: "
-                       << toString(renew_result.error());
-            return -1;
+            auto err = renew_result.error();
+            auto release_err =
+                coordinator.value()->ReleaseLeadership(leadership_session);
+            if (release_err != ErrorCode::OK) {
+                LOG(WARNING) << "Failed to release leadership after renewal "
+                             << "startup failure: " << toString(release_err);
+            }
+            if (IsFatalHABackendError(err)) {
+                LOG(ERROR) << "Failed to start leadership renewal: "
+                           << toString(err) << ", backend_type="
+                           << HABackendTypeToString(spec->type);
+                return -1;
+            }
+            LOG(WARNING) << "Failed to start leadership renewal: "
+                         << toString(err) << ", backend_type="
+                         << HABackendTypeToString(spec->type)
+                         << ", retrying in " << kSupervisorRetryInterval.count()
+                         << "s";
+            std::this_thread::sleep_for(kSupervisorRetryInterval);
+            continue;
         }
         if (!renew_result.value()) {
-            LOG(ERROR) << "Leadership expired before service start";
+            auto err =
+                coordinator.value()->ReleaseLeadership(leadership_session);
+            if (err != ErrorCode::OK) {
+                LOG(WARNING) << "Failed to release expired leadership: "
+                             << toString(err);
+            }
+            LOG(WARNING) << "Leadership expired before service start";
             continue;
         }
 

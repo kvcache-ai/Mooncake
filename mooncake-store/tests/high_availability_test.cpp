@@ -160,6 +160,22 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     ASSERT_EQ(future.get(), ErrorCode::ETCD_CTX_CANCELLED);
     keep_alive_thread.join();
 
+    // == Test explicit lease revoke ==
+    lease_ttl = 10;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
+    std::string revoke_key =
+        FLAGS_etcd_test_key_prefix + std::string("revoke_key");
+    std::string revoke_value = "revoke_value";
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::CreateWithLease(
+                  revoke_key.c_str(), revoke_key.size(), revoke_value.c_str(),
+                  revoke_value.size(), lease_id, version));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(lease_id));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ASSERT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              EtcdHelper::Get(revoke_key.c_str(), revoke_key.size(),
+                              revoke_value, version));
+
     // == Test watch key and cancel watch ==
     lease_ttl = 2;
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
@@ -264,6 +280,23 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     ASSERT_EQ(current_view.value()->view_version, session.view.view_version);
 
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+
+    auto released = coordinator->WaitForViewChange(session.view.view_version,
+                                                   std::chrono::seconds(2));
+    ASSERT_TRUE(released.has_value());
+    ASSERT_TRUE(released->changed);
+    ASSERT_FALSE(released->current_view.has_value());
+
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_FALSE(current_view.value().has_value());
+
+    auto reacquire = coordinator->TryAcquireLeadership("0.0.0.0:9999");
+    ASSERT_TRUE(reacquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, reacquire->status);
+    ASSERT_TRUE(reacquire->session.has_value());
+    ASSERT_EQ(ErrorCode::OK,
+              coordinator->ReleaseLeadership(*reacquire->session));
 }
 
 TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {

@@ -34,11 +34,13 @@ import "C"
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
+	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -64,11 +66,11 @@ var (
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
 	// watch contexts for store
-	storeWatchCtx = make(map[string]context.CancelFunc)
-	storeWatchMutex    sync.Mutex
+	storeWatchCtx   = make(map[string]context.CancelFunc)
+	storeWatchMutex sync.Mutex
 	// etcd client for HA snapshot
-	snapshotClient  *clientv3.Client
-	snapshotMutex   sync.Mutex
+	snapshotClient *clientv3.Client
+	snapshotMutex  sync.Mutex
 	// watch contexts for prefix watch
 	storePrefixWatchCtx   = make(map[string]prefixWatchInfo)
 	storePrefixWatchMutex sync.Mutex
@@ -76,7 +78,7 @@ var (
 
 const (
 	// Snapshot client config (for GB-level snapshot files)
-	snapshotMaxMsgSize = 2000 * 1000 * 1000  // 2GB
+	snapshotMaxMsgSize = 2000 * 1000 * 1000 // 2GB
 	snapshotTimeout    = 60 * time.Second   // 1 minute for large files
 )
 
@@ -322,6 +324,25 @@ func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int 
 		return -1
 	}
 	*leaseId = int64(resp.ID)
+	return 0
+}
+
+//export EtcdStoreRevokeLeaseWrapper
+func EtcdStoreRevokeLeaseWrapper(leaseId int64, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := storeClient.Revoke(ctx, clientv3.LeaseID(leaseId))
+	if err != nil {
+		if errors.Is(err, rpctypes.ErrLeaseNotFound) {
+			return 0
+		}
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 	return 0
 }
 

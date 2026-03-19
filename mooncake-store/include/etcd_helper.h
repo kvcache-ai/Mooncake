@@ -71,6 +71,13 @@ class EtcdHelper {
     static ErrorCode GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
 
     /*
+     * @brief Revoke a lease in etcd immediately.
+     * @param lease_id: The lease id to revoke.
+     * @return: Error code.
+     */
+    static ErrorCode RevokeLease(EtcdLeaseId lease_id);
+
+    /*
      * @brief Watch a key until it is deleted. This is a blocking function.
      * @param key: The key to watch.
      * @param key_size: The size of the key in bytes.
