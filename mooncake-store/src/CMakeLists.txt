@@ -19,6 +19,7 @@ set(MOONCAKE_STORE_SOURCES
     etcd_helper.cpp
     ha_helper.cpp
     rpc_service.cpp
+    master_http_server.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp

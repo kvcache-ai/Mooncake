@@ -11,6 +11,7 @@
 
 #include "http_metadata_server.h"
 #include "master_config.h"
+#include "master_http_server.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -83,7 +84,6 @@ class InProcMaster {
             wms_cfg.view_version = 0;
             // Use default client_live_ttl_sec to align with production defaults
             wms_cfg.enable_ha = false;
-            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
             wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
             wms_cfg.root_fs_dir = config.root_fs_dir.has_value()
                                       ? config.root_fs_dir.value()
@@ -122,6 +122,11 @@ class InProcMaster {
             wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
             RegisterRpcService(*server_, *wrapped_);
 
+            http_server_ = std::make_unique<MasterHttpServer>(
+                static_cast<uint16_t>(http_metrics_port_));
+            http_server_->SetService(wrapped_.get());
+            http_server_->Start();
+
             auto ec = server_->async_start();
             if (ec.hasResult()) {
                 return false;
@@ -135,6 +140,10 @@ class InProcMaster {
     }
 
     void Stop() {
+        if (http_server_) {
+            http_server_->ClearService();
+            http_server_.reset();
+        }
         if (server_) {
             server_->stop();
             server_.reset();
@@ -166,6 +175,7 @@ class InProcMaster {
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::unique_ptr<WrappedMasterService> wrapped_;
+    std::unique_ptr<MasterHttpServer> http_server_;
     std::unique_ptr<HttpMetadataServer> meta_server_;
     int rpc_port_ = 0;
     int http_metrics_port_ = 0;

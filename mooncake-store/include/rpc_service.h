@@ -5,7 +5,6 @@
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <thread>
-#include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -23,8 +22,6 @@ class WrappedMasterService {
     WrappedMasterService(const WrappedMasterServiceConfig& config);
 
     ~WrappedMasterService();
-
-    void init_http_server();
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
@@ -151,10 +148,15 @@ class WrappedMasterService {
                                                    const std::string& key,
                                                    ReplicaType replica_type);
 
+    // Forwarding methods for MasterHttpServer
+    auto GetAllKeys() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto QuerySegments(const std::string& segment)
+        -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;
-    coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
 };
 

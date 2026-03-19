@@ -11,6 +11,7 @@
 #include "default_config.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
+#include "master_http_server.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -703,8 +704,15 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
+
+        mooncake::MasterHttpServer http_server(
+            static_cast<uint16_t>(master_config.metrics_port));
+
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(master_config, version));
+
+        http_server.SetService(&wrapped_master_service);
+        http_server.Start();
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();
