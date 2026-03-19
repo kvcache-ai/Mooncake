@@ -250,19 +250,22 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return err;
         }
 
-        leader_coordinator_ = std::move(coordinator.value());
+        auto leader_coordinator = std::shared_ptr<ha::LeaderCoordinator>(
+            std::move(coordinator.value()));
 
         // Start ping thread to monitor master health and trigger remount if
         // needed.
         ping_running_ = true;
         std::string current_master_address = master_view.leader_address;
-        ping_thread_ = std::thread([this, current_master_address]() mutable {
-            this->PingThreadMain(std::move(current_master_address));
-        });
+        ping_thread_ = std::thread(
+            [this, current_master_address,
+             leader_coordinator = std::move(leader_coordinator)]() mutable {
+                this->PingThreadMain(std::move(current_master_address),
+                                     std::move(leader_coordinator));
+            });
 
         return ErrorCode::OK;
     } else {
-        leader_coordinator_.reset();
         auto err = master_client_.Connect(master_server_entry);
         if (err != ErrorCode::OK) {
             return err;
@@ -271,7 +274,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         ping_running_ = true;
         std::string current_master_address = master_server_entry;
         ping_thread_ = std::thread([this, current_master_address]() mutable {
-            this->PingThreadMain(std::move(current_master_address));
+            this->PingThreadMain(std::move(current_master_address), nullptr);
         });
         return ErrorCode::OK;
     }
@@ -2357,7 +2360,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     }
 }
 
-void Client::PingThreadMain(std::string current_master_address) {
+void Client::PingThreadMain(
+    std::string current_master_address,
+    std::shared_ptr<ha::LeaderCoordinator> leader_coordinator) {
     // How many failed pings before reconnecting via the HA coordinator
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -2428,11 +2433,11 @@ void Client::PingThreadMain(std::string current_master_address) {
         }
 
         // Exceeded ping failure threshold. Reconnect based on mode.
-        if (leader_coordinator_) {
+        if (leader_coordinator) {
             LOG(ERROR)
                 << "Failed to ping master for " << ping_fail_count
                 << " times; fetching latest master view and reconnecting";
-            auto current_view = leader_coordinator_->ReadCurrentView();
+            auto current_view = leader_coordinator->ReadCurrentView();
             if (!current_view) {
                 LOG(ERROR) << "Failed to get new master view: "
                            << toString(current_view.error());

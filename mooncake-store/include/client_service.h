@@ -614,11 +614,12 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
-    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     std::atomic<bool> last_ping_success_{false};
-    void PingThreadMain(std::string current_master_address);
+    void PingThreadMain(
+        std::string current_master_address,
+        std::shared_ptr<ha::LeaderCoordinator> leader_coordinator);
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
 
