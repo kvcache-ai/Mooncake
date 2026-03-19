@@ -1,5 +1,6 @@
 #include "ha/master_service_supervisor.h"
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -54,6 +55,39 @@ bool IsFatalHABackendError(ErrorCode err) {
            err == ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 }
 
+void LogLeadershipReleaseWarning(std::string_view context, ErrorCode err) {
+    if (err == ErrorCode::OK) {
+        return;
+    }
+    LOG(WARNING) << "Failed to release leadership after " << context << ": "
+                 << toString(err);
+}
+
+bool HandleSupervisorError(std::string_view action, ErrorCode err,
+                           HABackendType backend_type) {
+    if (IsFatalHABackendError(err)) {
+        LOG(ERROR) << "Failed to " << action << ": " << toString(err)
+                   << ", backend_type=" << HABackendTypeToString(backend_type);
+        return true;
+    }
+
+    LOG(WARNING) << "Failed to " << action << ": " << toString(err)
+                 << ", backend_type=" << HABackendTypeToString(backend_type)
+                 << ", retrying in " << kSupervisorRetryInterval.count() << "s";
+    std::this_thread::sleep_for(kSupervisorRetryInterval);
+    return false;
+}
+
+bool HandleLeadershipPhaseError(std::string_view release_context,
+                                std::string_view action,
+                                LeaderCoordinator& coordinator,
+                                const LeadershipSession& session, ErrorCode err,
+                                HABackendType backend_type) {
+    LogLeadershipReleaseWarning(release_context,
+                                coordinator.ReleaseLeadership(session));
+    return HandleSupervisorError(action, err, backend_type);
+}
+
 tl::expected<LeadershipSession, ErrorCode> AcquireLeadershipOrWait(
     LeaderCoordinator& coordinator, const std::string& leader_address) {
     while (true) {
@@ -94,6 +128,63 @@ tl::expected<LeadershipSession, ErrorCode> AcquireLeadershipOrWait(
     }
 }
 
+tl::expected<bool, ErrorCode> WarmupLeadership(
+    LeaderCoordinator& coordinator, const LeadershipSession& session) {
+    const auto deadline = std::chrono::steady_clock::now() + session.lease_ttl;
+    const auto max_sleep_interval =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            kRenewCheckInterval);
+
+    while (true) {
+        auto renewed = coordinator.RenewLeadership(session);
+        if (!renewed) {
+            return tl::make_unexpected(renewed.error());
+        }
+        if (!renewed.value()) {
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return true;
+        }
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                  now);
+        const auto sleep_interval =
+            remaining < max_sleep_interval ? remaining : max_sleep_interval;
+        std::this_thread::sleep_for(sleep_interval);
+    }
+}
+
+std::thread StartServePhaseMonitor(coro_rpc::coro_rpc_server& server,
+                                   LeaderCoordinator& coordinator,
+                                   LeadershipSession session,
+                                   std::atomic<bool>& stop_requested) {
+    return std::thread([&server, &coordinator, session = std::move(session),
+                        &stop_requested]() {
+        while (!stop_requested.load()) {
+            auto renewed = coordinator.RenewLeadership(session);
+            if (!renewed) {
+                LOG(ERROR) << "Leadership renewal failed: "
+                           << toString(renewed.error());
+                break;
+            }
+            if (!renewed.value()) {
+                LOG(INFO) << "Leadership is no longer valid";
+                break;
+            }
+            std::this_thread::sleep_for(kRenewCheckInterval);
+        }
+
+        if (!stop_requested.exchange(true)) {
+            LOG(INFO) << "Trying to stop server...";
+            server.stop();
+        }
+    });
+}
+
 }  // namespace
 
 MasterServiceSupervisor::MasterServiceSupervisor(
@@ -121,124 +212,90 @@ int MasterServiceSupervisor::Start() {
 
         auto coordinator = CreateLeaderCoordinator(*spec);
         if (!coordinator) {
-            auto err = coordinator.error();
-            if (IsFatalHABackendError(err)) {
-                LOG(ERROR) << "Failed to create leader coordinator: "
-                           << toString(err) << ", backend_type="
-                           << HABackendTypeToString(spec->type);
+            if (HandleSupervisorError("create leader coordinator",
+                                      coordinator.error(), spec->type)) {
                 return -1;
             }
-            LOG(WARNING) << "Failed to create leader coordinator: "
-                         << toString(err) << ", backend_type="
-                         << HABackendTypeToString(spec->type)
-                         << ", retrying in " << kSupervisorRetryInterval.count()
-                         << "s";
-            std::this_thread::sleep_for(kSupervisorRetryInterval);
             continue;
         }
 
-        auto session = AcquireLeadershipOrWait(*coordinator.value(),
-                                               config_.local_hostname);
+        auto& leader_coordinator = *coordinator.value();
+        auto session =
+            AcquireLeadershipOrWait(leader_coordinator, config_.local_hostname);
         if (!session) {
-            auto err = session.error();
-            if (IsFatalHABackendError(err)) {
-                LOG(ERROR) << "Failed to acquire leadership: " << toString(err)
-                           << ", backend_type="
-                           << HABackendTypeToString(spec->type);
+            if (HandleSupervisorError("acquire leadership", session.error(),
+                                      spec->type)) {
                 return -1;
             }
-            LOG(WARNING) << "Failed to acquire leadership: " << toString(err)
-                         << ", backend_type="
-                         << HABackendTypeToString(spec->type)
-                         << ", retrying in " << kSupervisorRetryInterval.count()
-                         << "s";
-            std::this_thread::sleep_for(kSupervisorRetryInterval);
             continue;
         }
         LeadershipSession leadership_session = *session;
 
-        auto renew_result =
-            coordinator.value()->RenewLeadership(leadership_session);
-        if (!renew_result) {
-            auto err = renew_result.error();
-            auto release_err =
-                coordinator.value()->ReleaseLeadership(leadership_session);
-            if (release_err != ErrorCode::OK) {
-                LOG(WARNING) << "Failed to release leadership after renewal "
-                             << "startup failure: " << toString(release_err);
-            }
-            if (IsFatalHABackendError(err)) {
-                LOG(ERROR) << "Failed to start leadership renewal: "
-                           << toString(err) << ", backend_type="
-                           << HABackendTypeToString(spec->type);
+        LOG(INFO) << "Entering warmup phase...";
+        auto warmup_result =
+            WarmupLeadership(leader_coordinator, leadership_session);
+        if (!warmup_result) {
+            if (HandleLeadershipPhaseError(
+                    "renewal startup failure", "start leadership renewal",
+                    leader_coordinator, leadership_session,
+                    warmup_result.error(), spec->type)) {
                 return -1;
             }
-            LOG(WARNING) << "Failed to start leadership renewal: "
-                         << toString(err) << ", backend_type="
-                         << HABackendTypeToString(spec->type)
-                         << ", retrying in " << kSupervisorRetryInterval.count()
-                         << "s";
-            std::this_thread::sleep_for(kSupervisorRetryInterval);
             continue;
         }
-        if (!renew_result.value()) {
-            auto err =
-                coordinator.value()->ReleaseLeadership(leadership_session);
-            if (err != ErrorCode::OK) {
-                LOG(WARNING) << "Failed to release expired leadership: "
-                             << toString(err);
-            }
-            LOG(WARNING) << "Leadership expired before service start";
+        if (!warmup_result.value()) {
+            LogLeadershipReleaseWarning(
+                "warmup expiration",
+                leader_coordinator.ReleaseLeadership(leadership_session));
+            LOG(WARNING) << "Leadership expired during warmup phase";
             continue;
         }
 
-        auto keep_leader_thread =
-            std::thread([&server, &coordinator, leadership_session]() {
-                while (true) {
-                    auto renewed = coordinator.value()->RenewLeadership(
-                        leadership_session);
-                    if (!renewed) {
-                        LOG(ERROR) << "Leadership renewal failed: "
-                                   << toString(renewed.error());
-                        break;
-                    }
-                    if (!renewed.value()) {
-                        LOG(INFO) << "Leadership is no longer valid";
-                        break;
-                    }
-                    std::this_thread::sleep_for(kRenewCheckInterval);
-                }
-                LOG(INFO) << "Trying to stop server...";
-                server.stop();
-            });
-
-        // Preserve the old safety window before serving requests, so this
-        // master does not start immediately after taking over leadership.
-        std::this_thread::sleep_for(leadership_session.lease_ttl);
-
-        LOG(INFO) << "Starting master service...";
+        LOG(INFO) << "Starting serve phase...";
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(
                 config_, leadership_session.view.view_version));
         mooncake::RegisterRpcService(server, wrapped_master_service);
 
+        auto serve_preflight =
+            leader_coordinator.RenewLeadership(leadership_session);
+        if (!serve_preflight) {
+            if (HandleLeadershipPhaseError(
+                    "serve preflight failure",
+                    "validate leadership before serving", leader_coordinator,
+                    leadership_session, serve_preflight.error(), spec->type)) {
+                return -1;
+            }
+            continue;
+        }
+        if (!serve_preflight.value()) {
+            LogLeadershipReleaseWarning(
+                "serve preflight expiration",
+                leader_coordinator.ReleaseLeadership(leadership_session));
+            LOG(WARNING) << "Leadership expired before entering serve phase";
+            continue;
+        }
+
         async_simple::Future<coro_rpc::err_code> ec = server.async_start();
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
-            auto err =
-                coordinator.value()->ReleaseLeadership(leadership_session);
+            auto err = leader_coordinator.ReleaseLeadership(leadership_session);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to release leadership: " << toString(err);
             }
-            keep_leader_thread.join();
             return -1;
         }
+
+        std::atomic<bool> stop_requested{false};
+        auto keep_leader_thread = StartServePhaseMonitor(
+            server, leader_coordinator, leadership_session, stop_requested);
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
-        auto err = coordinator.value()->ReleaseLeadership(leadership_session);
+        stop_requested.store(true);
+        auto err = leader_coordinator.ReleaseLeadership(leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         keep_leader_thread.join();
     }
