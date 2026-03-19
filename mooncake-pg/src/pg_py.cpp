@@ -13,9 +13,8 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
-    return c10::make_intrusive<MooncakeBackend>(
-        distBackendOpts.store, distBackendOpts.group_rank,
-        distBackendOpts.group_size, backendOptions);
+    return c10::make_intrusive<MooncakeBackend>(std::move(distBackendOpts),
+                                                std::move(backendOptions));
 }
 
 c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
@@ -23,8 +22,7 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     return c10::make_intrusive<MooncakeBackend>(
-        distBackendOpts.store, distBackendOpts.group_rank,
-        distBackendOpts.group_size, backendOptions, true);
+        std::move(distBackendOpts), std::move(backendOptions), true);
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {
@@ -67,14 +65,14 @@ void extendGroupSizeTo(c10::intrusive_ptr<c10d::Backend> backend, int size) {
 }
 
 std::vector<bool> getPeerState(c10::intrusive_ptr<c10d::Backend> backend,
-                               const std::vector<int> &ranks) {
+                               const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     return mooncakeBackend->getPeerState(ranks);
 }
 
 void recoverRanks(c10::intrusive_ptr<c10d::Backend> backend,
-                  const std::vector<int> &ranks) {
+                  const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     mooncakeBackend->recoverRanks(ranks);

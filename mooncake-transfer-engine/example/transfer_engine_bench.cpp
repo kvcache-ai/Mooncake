@@ -135,12 +135,13 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #endif
-        if (FLAGS_protocol == "nvlink") {
+        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
 #ifdef USE_MNNVL
             d_buf = allocateFabricMemory(size);
             LOG(INFO) << "Using MNNVL fabric memory allocation";
 #else
-            LOG(ERROR) << "--protocol=nvlink requires USE_MNNVL=ON";
+            LOG(ERROR)
+                << "--protocol=nvlink or --protocol=hip requires USE_MNNVL=ON";
             return nullptr;
 #endif
         } else if (FLAGS_protocol == "nvlink_intra") {
@@ -190,7 +191,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_UBSHMEM)
-    if (FLAGS_protocol == "nvlink") {
+    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
 #ifdef USE_MNNVL
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);

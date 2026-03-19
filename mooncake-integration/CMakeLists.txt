@@ -24,6 +24,12 @@ include_directories("../mooncake-transfer-engine/include")
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+    OUTPUT_VARIABLE PYTHON_EXT_SUFFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 
@@ -73,10 +79,20 @@ endif()
 
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
+set(UBSHMEM_ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so")
+
 if(USE_MNNVL)
     message(STATUS "USE_MNNVL is enabled, nvlink_allocator.so will be installed in the Python package")
     install(FILES
         "${ALLOCATOR_SO_PATH}"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
+
+if(USE_UBSHMEM)
+    message(STATUS "USE_UBSHMEM is enabled, ubshmem_fabric_allocator.so will be installed in the Python package")
+    install(FILES
+        "${UBSHMEM_ALLOCATOR_SO_PATH}"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
 endif()
@@ -116,9 +132,17 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/__init__.py
 )
 
 if (USE_MNNVL)
-    message(STATUS "USE_MNNVL is enabled, allocator.py will be installed in the Python package")
+    message(STATUS "allocator.py will be installed in the Python package")
     install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
+
+if (USE_UBSHMEM)
+    message(STATUS "allocator_ascend_npu.py will be installed in the Python package")
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/allocator_ascend_npu.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
 endif()
@@ -169,4 +193,26 @@ endif()
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
     install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
+if (WITH_EP)
+    install(
+        DIRECTORY "${EP_PG_STAGING_DIR}/"
+        DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"
+        FILES_MATCHING PATTERN "*.so"
+    )
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/ep.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ep_buffer.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+    # ep.so / pg.so link against engine.so by that exact bare name.
+    # Create a engine.so -> engine<EXT_SUFFIX> symlink so they can find it.
+    install(CODE "
+        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
+            \"engine${PYTHON_EXT_SUFFIX}\"
+            \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/engine.so\"
+        )
+    ")
 endif()

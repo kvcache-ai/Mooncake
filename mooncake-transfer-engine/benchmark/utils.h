@@ -65,6 +65,7 @@ struct XferBenchConfig {
 
     static std::string metadata_type;
     static std::string metadata_url_list;
+    static int rpc_server_port;
     static std::string xport_type;
     static std::string backend;
     static bool notifi;

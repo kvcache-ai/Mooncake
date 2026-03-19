@@ -7,11 +7,13 @@
 #include <string>
 #include <limits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+#include "ylt/struct_pack.hpp"
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
@@ -22,6 +24,63 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
+
+// Sequence ID comparison utilities for wrap-around safety.
+// These functions use signed difference to correctly handle uint64_t overflow
+// (from UINT64_MAX wrapping to 0). Assumes sequence IDs won't differ by more
+// than 2^63, which is reasonable for practical systems.
+//
+// Example: If sequence_id wraps from UINT64_MAX to 0, then:
+//   IsSequenceNewer(0, UINT64_MAX) = true  (0 is newer after wrap)
+//   IsSequenceNewer(UINT64_MAX, 0) = false (UINT64_MAX is older before wrap)
+//
+// Note: We use 'inline' here to allow multiple definition but keep external
+// linkage.
+inline bool IsSequenceNewer(uint64_t a, uint64_t b) {
+    // Cast to int64_t to get signed difference, then check if positive.
+    // This correctly handles wrap-around: if a wrapped from UINT64_MAX to 0,
+    // then (int64_t)(a - b) will be positive (assuming gap < 2^63).
+    return static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlder(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) < 0;
+}
+
+inline bool IsSequenceEqual(uint64_t a, uint64_t b) { return a == b; }
+
+inline bool IsSequenceNewerOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlderOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) < 0;
+}
+
+// Cluster ID validation utilities.
+//
+// cluster_id is used to construct etcd key prefixes (e.g.
+// "/oplog/<cluster_id>/..."). To avoid key-prefix injection / accidental
+// cross-cluster overlap, we restrict the allowed characters to a conservative
+// safe set. We validate the "component" form (without trailing slash). Trailing
+// slashes should be normalized away before validation.
+inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
+    if (cluster_id.empty()) {
+        return false;
+    }
+    if (cluster_id.size() > 128) {
+        return false;
+    }
+    for (unsigned char c : cluster_id) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+                        c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     5000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
@@ -31,6 +90,13 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
+    60 * 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
+    60 * 5;  // in seconds
+static constexpr uint32_t DEFAULT_SNAPSHOT_RETENTION_COUNT =
+    2;  // Keep 2 recent snapshots by default
+static const std::string DEFAULT_SNAPSHOT_BACKUP_DIR = "";
 constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
 static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
@@ -118,6 +184,21 @@ inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
     return os;
 }
+
+/**
+ * @brief Convert UUID to string representation
+ * @param uuid The UUID to convert
+ * @return String representation of the UUID in format "first-second"
+ */
+std::string UuidToString(const UUID& uuid);
+
+/**
+ * @brief Convert string representation back to UUID
+ * @param str String representation of UUID in format "first-second"
+ * @param uuid Output parameter for the parsed UUID
+ * @return true if parsing succeeded, false otherwise
+ */
+bool StringToUuid(const std::string& str, UUID& uuid);
 
 UUID generate_uuid();
 
@@ -207,6 +288,10 @@ enum class ErrorCode : int32_t {
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
+    SERIALIZE_UNSUPPORTED = -1500,  ///< Serialization unsupported.
+    SERIALIZE_FAIL = -1501,         ///< Serialization failed.
+    DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
+    PERSISTENT_FAIL = -1503,        ///< Persistent failed.
     // Task errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
     TASK_PENDING_LIMIT_EXCEEDED =
@@ -222,6 +307,17 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ErrorCode& errorCode) noexcept {
     return os << toString(errorCode);
 }
+
+struct SerializationError {
+    ErrorCode code;
+    std::string message;
+
+    SerializationError(ErrorCode c, const std::string& msg)
+        : code(c), message(msg) {}
+
+    // Construct from ErrorCode
+    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
+};
 
 /**
  * @brief Represents a contiguous memory region
@@ -249,6 +345,15 @@ struct Segment {
     Segment() = default;
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+
+/**
+ * @brief Allocation strategy type for segment allocation
+ */
+enum class AllocationStrategyType {
+    RANDOM = 0,        // Pure random allocation
+    FREE_RATIO_FIRST,  // Free-ratio-first allocation
+    CXL,               // CXL-specific allocation
+};
 
 /**
  * @brief Client status from the master's perspective

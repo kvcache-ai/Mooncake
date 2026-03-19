@@ -29,6 +29,21 @@ namespace tent {
 using namespace coro_rpc;
 using namespace async_simple::coro;
 
+namespace {
+thread_local bool tl_inside_rpc_handler = false;
+
+struct RpcHandlerScope {
+    explicit RpcHandlerScope(bool& flag) : flag_(flag), prev_(flag) {
+        flag_ = true;
+    }
+    ~RpcHandlerScope() { flag_ = prev_; }
+
+   private:
+    bool& flag_;
+    bool prev_;
+};
+}  // namespace
+
 CoroRpcAgent::CoroRpcAgent() {}
 
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
@@ -79,6 +94,7 @@ Status CoroRpcAgent::stop() {
 }
 
 void CoroRpcAgent::process(int func_id) {
+    RpcHandlerScope handler_scope(tl_inside_rpc_handler);
     auto ctx = coro_rpc::get_context();
     if (func_map_.count(func_id)) {
         auto request = ctx->get_request_attachment();
@@ -92,6 +108,10 @@ void CoroRpcAgent::process(int func_id) {
 Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
                           const std::string_view& request,
                           std::string& response) {
+    if (tl_inside_rpc_handler) {
+        return Status::InvalidArgument(
+            "Synchronous RPC call from RPC handler is forbidden" LOC_MARK);
+    }
     coro_rpc::coro_rpc_client* client = nullptr;
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);

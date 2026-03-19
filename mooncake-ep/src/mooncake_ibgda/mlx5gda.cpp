@@ -29,13 +29,13 @@ constexpr T round_up_pow2(T n) {
 
 #define IBGDA_ROUND_UP_POW2_OR_0(_n) (((_n) == 0) ? 0 : round_up_pow2(_n))
 
-static void print_cuda_error(const char *msg) {
-    const char *err_str = cudaGetErrorString(cudaGetLastError());
+static void print_cuda_error(const char* msg) {
+    const char* err_str = cudaGetErrorString(cudaGetLastError());
     fprintf(stderr, "%s: %s\n", msg, err_str);
 }
 
-static struct mlx5dv_devx_uar *create_uar(struct ibv_context *ctx) {
-    struct mlx5dv_devx_uar *uar =
+static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
+    struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
     if (!uar) {
         errno = EIO;
@@ -52,7 +52,7 @@ static struct mlx5dv_devx_uar *create_uar(struct ibv_context *ctx) {
     return uar;
 }
 
-static void destroy_uar(struct mlx5dv_devx_uar *uar) {
+static void destroy_uar(struct mlx5dv_devx_uar* uar) {
     if (!uar) return;
     if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
         print_cuda_error("Failed to unregister MMIO memory");
@@ -60,21 +60,21 @@ static void destroy_uar(struct mlx5dv_devx_uar *uar) {
     mlx5dv_devx_free_uar(uar);
 }
 
-struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
-                                     struct mlx5dv_devx_umem *ctrl_buf_umem,
-                                     struct memheap *ctrl_buf_heap,
-                                     struct ibv_pd *pd, int cqe,
+struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
+                                     struct mlx5dv_devx_umem* ctrl_buf_umem,
+                                     struct memheap* ctrl_buf_heap,
+                                     struct ibv_pd* pd, int cqe,
                                      cudaStream_t stream) {
-    struct mlx5gda_cq *cq = NULL;
-    struct mlx5dv_devx_uar *uar = NULL;
+    struct mlx5gda_cq* cq = NULL;
+    struct mlx5dv_devx_uar* uar = NULL;
     uint32_t eqn = 0;
     size_t cq_offset = -1;
     size_t dbr_offset = -1;
-    struct mlx5dv_devx_obj *mlx5_cq = NULL;
+    struct mlx5dv_devx_obj* mlx5_cq = NULL;
     uint32_t cqn = 0;
 
-    struct ibv_context *ctx = pd->context;
-    void *cq_context = NULL;
+    struct ibv_context* ctx = pd->context;
+    void* cq_context = NULL;
 
     if (cqe <= 0) {
         errno = EINVAL;
@@ -107,7 +107,7 @@ struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
         perror("Failed to allocate DBR memory");
         goto fail;
     }
-    cq = (struct mlx5gda_cq *)malloc(sizeof(struct mlx5gda_cq));
+    cq = (struct mlx5gda_cq*)malloc(sizeof(struct mlx5gda_cq));
     if (!cq) goto fail;
     if (mlx5dv_devx_query_eqn(ctx, 0, &eqn)) {
         perror("Failed to query EQN");
@@ -166,7 +166,7 @@ fail:
     return NULL;
 }
 
-void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq) {
+void mlx5gda_destroy_cq(struct memheap* ctrl_buf_heap, struct mlx5gda_cq* cq) {
     if (!cq) return;
     if (cq->mcq) {
         mlx5dv_devx_obj_destroy(cq->mcq);
@@ -179,21 +179,21 @@ void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq) {
     free(cq);
 }
 
-struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
-                                        struct mlx5dv_devx_umem *ctrl_buf_umem,
-                                        struct memheap *ctrl_buf_heap,
-                                        struct ibv_pd *pd, int wqe,
+struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
+                                        struct mlx5dv_devx_umem* ctrl_buf_umem,
+                                        struct memheap* ctrl_buf_heap,
+                                        struct ibv_pd* pd, int wqe,
                                         uint8_t port_num, cudaStream_t stream) {
-    struct mlx5gda_qp *qp = NULL;
-    struct mlx5gda_cq *send_cq = NULL;
-    struct mlx5dv_devx_uar *uar = NULL;
-    struct mlx5dv_devx_obj *mlx5_qp = NULL;
+    struct mlx5gda_qp* qp = NULL;
+    struct mlx5gda_cq* send_cq = NULL;
+    struct mlx5dv_devx_uar* uar = NULL;
+    struct mlx5dv_devx_obj* mlx5_qp = NULL;
     size_t wq_offset = -1;
     size_t dbr_offset = -1;
 
-    struct ibv_context *ctx = pd->context;
-    void *qp_context = NULL;
-    void *cap = NULL;
+    struct ibv_context* ctx = pd->context;
+    void* qp_context = NULL;
+    void* cap = NULL;
     uint32_t cqe_version = 0;
 
     if (wqe <= 0) {
@@ -208,7 +208,7 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
     uint8_t cmd_cap_in[DEVX_ST_SZ_BYTES(query_hca_cap_in)] = {0};
     uint8_t cmd_cap_out[DEVX_ST_SZ_BYTES(query_hca_cap_out)] = {0};
 
-    qp = (struct mlx5gda_qp *)calloc(1, sizeof(struct mlx5gda_qp));
+    qp = (struct mlx5gda_qp*)calloc(1, sizeof(struct mlx5gda_qp));
     if (!qp) {
         perror("Failed to allocate QP memory");
         goto fail;
@@ -347,7 +347,28 @@ fail:
     return NULL;
 }
 
-int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index) {
+void mlx5gda_destroy_qp(struct memheap* ctrl_buf_heap, struct mlx5gda_qp* qp) {
+    if (qp->mqp) {
+        mlx5dv_devx_obj_destroy(qp->mqp);
+    }
+    if (qp->uar) {
+        destroy_uar(qp->uar);
+    }
+    if (qp->send_cq) {
+        mlx5gda_destroy_cq(ctrl_buf_heap, qp->send_cq);
+    }
+    if (qp->wq_offset != -1) {
+        memheap_free(ctrl_buf_heap, qp->wq_offset);
+    }
+    if (qp->dbr_offset != -1) {
+        memheap_free(ctrl_buf_heap, qp->dbr_offset);
+    }
+    if (qp) {
+        free(qp);
+    }
+}
+
+int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp* qp, uint16_t pkey_index) {
     if (!qp || !qp->mqp) {
         errno = EINVAL;
         return -1;
@@ -358,7 +379,7 @@ int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index) {
     DEVX_SET(rst2init_qp_in, cmd_in, opcode, MLX5_CMD_OP_RST2INIT_QP);
     DEVX_SET(rst2init_qp_in, cmd_in, qpn, qp->qpn);
 
-    void *qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
+    void* qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
 
     DEVX_SET(qpc, qpc, rwe, 1);
     DEVX_SET(qpc, qpc, rre, 1);
@@ -381,7 +402,7 @@ int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index) {
     return ret;
 }
 
-int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
+int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp* qp,
                                   struct ibv_ah_attr ah_attr,
                                   uint32_t remote_qpn, enum ibv_mtu mtu) {
     if (!qp || !qp->mqp) {
@@ -389,14 +410,14 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
         return -1;
     }
     int ret = 0;
-    struct ibv_ah *ah = NULL;
+    struct ibv_ah* ah = NULL;
     uint8_t cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {0};
     uint8_t cmd_out[DEVX_ST_SZ_BYTES(init2rtr_qp_out)] = {0};
 
     DEVX_SET(rst2init_qp_in, cmd_in, opcode, MLX5_CMD_OP_INIT2RTR_QP);
     DEVX_SET(rst2init_qp_in, cmd_in, qpn, qp->qpn);
 
-    void *qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
+    void* qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
 
     DEVX_SET(qpc, qpc, mtu, mtu);
     DEVX_SET(qpc, qpc, log_msg_max, 30);
@@ -445,7 +466,7 @@ cleanup:
     return ret;
 }
 
-int mlx5gda_modify_rc_qp_rtr2rts(struct mlx5gda_qp *qp) {
+int mlx5gda_modify_rc_qp_rtr2rts(struct mlx5gda_qp* qp) {
     if (!qp || !qp->mqp) {
         errno = EINVAL;
         return -1;
@@ -456,7 +477,7 @@ int mlx5gda_modify_rc_qp_rtr2rts(struct mlx5gda_qp *qp) {
     DEVX_SET(rst2init_qp_in, cmd_in, opcode, MLX5_CMD_OP_RTR2RTS_QP);
     DEVX_SET(rst2init_qp_in, cmd_in, qpn, qp->qpn);
 
-    void *qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
+    void* qpc = DEVX_ADDR_OF(rst2init_qp_in, cmd_in, qpc);
 
     DEVX_SET(qpc, qpc, log_ack_req_freq, 0x0);  // Ack every packet
     DEVX_SET(qpc, qpc, log_sra_max, 1);         // log2(max_qp_rd_atomic)

@@ -1,15 +1,17 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 #include <mooncake_worker.cuh>
+#include <connection_poller.h>
+#include <p2p_proxy.h>
+#include <sys/types.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
-#include <thread>
 
 namespace mooncake {
 
@@ -29,13 +31,39 @@ class MooncakeBackend final : public ::c10d::Backend {
         bool isExtension_ = false;
     };
 
-    MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    /**
+     * @brief Construct a Mooncake process-group backend instance.
+     *
+     * `distBackendOpts` contains the PyTorch process-group information for this
+     * backend instance. `options` contains Mooncake-specific settings and may
+     * be null when callers omit `pg_options`.
+     *
+     * @param distBackendOpts Process-group information supplied by PyTorch.
+     * @param options *Optional* Mooncake-specific backend options.
+     * @param isCpu Whether to initialize the CPU backend variant.
+     */
+    MooncakeBackend(c10d::DistributedBackendOptions distBackendOpts,
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
 
     ~MooncakeBackend() override;
 
     const std::string getBackendName() const override;
+
+    /**
+     * @brief Return the stored Mooncake-specific backend options.
+     *
+     * PyTorch can use this to read Mooncake-specific options from an existing
+     * process group. This is used, for example, create sub-groups that inherit
+     * settings from the parent group.
+     *
+     * @return The stored backend options, or null when the backend was created
+     * without explicit Mooncake options.
+     */
+    c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override {
+        return c10::static_intrusive_pointer_cast<::c10d::Backend::Options>(
+            options_);
+    }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -93,24 +121,26 @@ class MooncakeBackend final : public ::c10d::Backend {
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
     static void setDeviceFilter(std::vector<std::string> filters) {
-        engine_.setWhitelistFilters(std::move(filters));
+        engine_->setWhitelistFilters(std::move(filters));
     }
 
     std::string getPreferredHca(std::string location) {
-        auto matrix = engine_.getLocalTopology()->getMatrix();
+        auto matrix = engine_->getLocalTopology()->getMatrix();
         auto it = matrix.find(location);
         if (it == matrix.end()) {
-            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is "
+                      << engine_->getLocalTopology()->toJson();
             LOG(ERROR) << "Topology entry not found for location: " << location;
         } else if (it->second.preferred_hca.empty()) {
-            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(INFO) << "Topology is "
+                      << engine_->getLocalTopology()->toJson();
             LOG(ERROR) << "Preferred HCA list is empty for location: "
                        << location;
         }
         return it->second.preferred_hca[0];
     }
 
-    at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
+    at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
     int getNumSyncedRanks();
 
@@ -121,60 +151,36 @@ class MooncakeBackend final : public ::c10d::Backend {
     void recoverRanks(const std::vector<int>& ranks);
 
    private:
-    enum class P2POpType { SEND, RECV };
-
-    struct P2POp {
-        P2POpType opType;
-        at::Tensor tensor;  // For SEND: contiguous tensor to send; For RECV:
-                            // contiguous target tensor
-        at::Tensor originalTensor;  // For RECV: original (possibly
-                                    // non-contiguous) tensor to update
-        int peerRank;
-        int tag;
-        int64_t seq;  // Sequence number assigned at enqueue time for ordering
-        std::shared_ptr<std::atomic<bool>> completed;
-        std::shared_ptr<std::string> errorMsg;
-    };
-
-    void startP2PWorker();
-    void stopP2PWorker();
-    void p2PSendWorkerThread();
-    void p2PRecvWorkerThread();
-    void processSendOp(const P2POp& op);
-    void processRecvOp(const P2POp& op);
-
-    static TransferEngine engine_;
+    static TransferEngine* engine_;
+    std::shared_ptr<MooncakeWorker> worker_;
     static bool engineInitialized_;
     static int backendIndex_;
+    const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
-    int32_t* warmup_send_region_;
-    int32_t* warmup_recv_region_;
-    static MooncakeWorker worker_;
     SegmentInfo rank_info;
-    TransferGroupMeta meta_;
+    std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
-    int nextRankForConnection_ = 0;
+    uint64_t local2global_rank_map_[kMaxNumRanks];
 
-    void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
-                          int backendIndex);
+    // P2P async infrastructure
+    // p2p_proxy_ is created in MooncakeBackend, but can live longer than
+    // MooncakeBackend. Because it is shared in P2PDeviceWorker, which must
+    // ensure P2PProxy's resources are not released until all transfers are
+    // completed.
+    std::shared_ptr<P2PProxy> p2p_proxy_;
+    // p2p_device_worker_ is created in P2PDeviceWorkerManager,
+    // and is shared between backends in the same device.
+    std::shared_ptr<P2PDeviceWorker> p2p_device_worker_;
 
-    // P2P async infrastructure: separate queues and threads for send/recv
-    std::queue<P2POp> p2pSendQueue_;
-    std::mutex p2pSendQueueMutex_;
-    std::condition_variable p2pSendQueueCv_;
-    std::atomic<bool> p2pSendWorkerRunning_{false};
-    std::thread p2pSendWorkerThread_;
-
-    std::queue<P2POp> p2pRecvQueue_;
-    std::mutex p2pRecvQueueMutex_;
-    std::condition_variable p2pRecvQueueCv_;
-    std::atomic<bool> p2pRecvWorkerRunning_{false};
-    std::thread p2pRecvWorkerThread_;
+    // Connection Poller Context
+    // Similar to p2p_proxy_, connection_ctx_ is created in MooncakeBackend, but
+    // can live longer than MooncakeBackend.
+    std::shared_ptr<ConnectionContext> connection_ctx_;
 };
 
 }  // namespace mooncake

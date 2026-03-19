@@ -3,8 +3,13 @@
 #include <memory>
 #include <vector>
 
+#include "aligned_client_buffer.hpp"
 #include "storage_backend.h"
 #include "utils.h"
+#ifdef USE_URING
+#include "file_interface.h"
+#endif
+
 namespace mooncake {
 
 FileStorageConfig FileStorageConfig::FromEnvironment() {
@@ -51,6 +56,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.client_buffer_gc_ttl_ms =
         GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
+
+    auto use_uring_str = GetEnvStringOr("MOONCAKE_USE_URING", "false");
+    config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
 
     return config;
 }
@@ -142,7 +150,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       client_(client),
       local_rpc_addr_(local_rpc_addr),
       client_buffer_allocator_(
-          ClientBufferAllocator::create(config.local_buffer_size, "")) {
+          AlignedClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -150,9 +158,31 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     auto create_storage_backend_result = CreateStorageBackend(config_);
     if (!create_storage_backend_result) {
         LOG(ERROR) << "Failed to create storage backend";
+        throw std::runtime_error("Failed to create storage backend");
     }
 
     storage_backend_ = create_storage_backend_result.value();
+
+    // Register the client buffer with the process-wide io_uring fixed-buffer
+    // mechanism. This must happen before any I/O threads start so that they
+    // can lazily pick up the registration on their first I/O call.
+#ifdef USE_URING
+    if (config.use_uring) {
+        auto aligned_allocator =
+            std::static_pointer_cast<AlignedClientBufferAllocator>(
+                client_buffer_allocator_);
+        if (aligned_allocator) {
+            void* base_ptr = aligned_allocator->get_base_pointer();
+            size_t size = aligned_allocator->get_total_size();
+            if (UringFile::register_global_buffer(base_ptr, size)) {
+                LOG(INFO) << "Successfully registered buffer with UringFile: "
+                          << "base=" << base_ptr << ", size=" << size;
+            } else {
+                LOG(WARNING) << "Failed to register buffer with UringFile";
+            }
+        }
+    }
+#endif
 }
 
 FileStorage::~FileStorage() {
@@ -237,7 +267,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     return {};
 }
 
-tl::expected<std::vector<uint64_t>, ErrorCode> FileStorage::BatchGet(
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
@@ -251,15 +281,31 @@ tl::expected<std::vector<uint64_t>, ErrorCode> FileStorage::BatchGet(
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
         return tl::make_unexpected(result.error());
     }
+
+    // After BatchLoad, slice.ptr may have been adjusted by offset_in_buffer
+    // (for O_DIRECT aligned reads). Update pointers to reflect actual data
+    // positions.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto it = allocated_batch->slices.find(keys[i]);
+        if (it != allocated_batch->slices.end()) {
+            allocated_batch->pointers[i] =
+                reinterpret_cast<uintptr_t>(it->second.ptr);
+        }
+    }
+
+    uint64_t batch_id = allocated_batch->batch_id;
+    BatchGetResult batch_result{batch_id, allocated_batch->pointers};
+
     MutexLocker locker(&client_buffer_mutex_);
-    client_buffer_allocated_batches_.emplace_back(std::move(allocated_batch));
+    client_buffer_allocated_batches_.emplace(batch_id,
+                                             std::move(allocated_batch));
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
-            << "us, key size: " << keys.size();
-    return allocate_res.value<>()->pointers;
+            << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
+    return batch_result;
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -308,8 +354,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto offload_res =
-            storage_backend_->BatchOffload(batch_object, complete_handler);
+        auto eviction_handler = [this](const std::string& evicted_key) {
+            auto result =
+                client_->EvictDiskReplica(evicted_key, ReplicaType::LOCAL_DISK);
+            if (!result) {
+                LOG(WARNING)
+                    << "Failed to notify master about evicted local disk key: "
+                    << evicted_key << ", error: " << result.error();
+            }
+        };
+
+        auto offload_res = storage_backend_->BatchOffload(
+            batch_object, complete_handler, eviction_handler);
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
@@ -373,7 +429,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batch_object) {
+    std::unordered_map<std::string, Slice>& batch_object) {
     auto start_time = std::chrono::steady_clock::now();
     auto result = storage_backend_->BatchLoad(batch_object);
     auto end_time = std::chrono::steady_clock::now();
@@ -443,41 +499,63 @@ tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
     auto result = std::make_shared<AllocatedBatch>();
+    result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     auto lease_timeout =
         now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    static constexpr size_t kDirectIOAlignment = 4096;
+
     u_int64_t total_size = 0;
     bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
         assert(sizes[i] <= kMaxSliceSize);
-        auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+
+        // Allocate oversized buffer for O_DIRECT alignment:
+        //   +4096 for aligning the ptr to 4096 boundary
+        //   +4096 for aligned read tail padding (actual_offset may not be
+        //   aligned)
+        size_t data_size = static_cast<size_t>(sizes[i]);
+        size_t alloc_size =
+            align_up(data_size, kDirectIOAlignment) + 2 * kDirectIOAlignment;
+
+        auto alloc_result = client_buffer_allocator_->allocate(alloc_size);
         if (!alloc_result && !gc_triggered) {
             gc_triggered = true;
             {
                 MutexLocker locker(&client_buffer_mutex_);
                 auto gc_now = std::chrono::steady_clock::now();
-                auto it = client_buffer_allocated_batches_.begin();
-                while (it != client_buffer_allocated_batches_.end()) {
-                    if (gc_now >= (*it)->lease_timeout) {
+                for (auto it = client_buffer_allocated_batches_.begin();
+                     it != client_buffer_allocated_batches_.end();) {
+                    if (gc_now >= it->second->lease_timeout) {
                         it = client_buffer_allocated_batches_.erase(it);
                     } else {
                         ++it;
                     }
                 }
             }
-            alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+            alloc_result = client_buffer_allocator_->allocate(alloc_size);
         }
         if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate slice buffer, size = " << sizes[i]
-                       << ", key = " << keys[i];
+            LOG(ERROR) << "Failed to allocate slice buffer, size = "
+                       << alloc_size << " (data_size=" << data_size
+                       << "), key = " << keys[i];
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
-        total_size += sizes[i];
-        result->slices.emplace(
-            keys[i], Slice{alloc_result->ptr(), static_cast<size_t>(sizes[i])});
-        result->pointers.emplace_back(
-            reinterpret_cast<uintptr_t>(alloc_result->ptr()));
+
+        // Align ptr to 4096 boundary for O_DIRECT
+        void* raw_ptr = alloc_result->ptr();
+        void* aligned_ptr = reinterpret_cast<void*>(
+            (reinterpret_cast<uintptr_t>(raw_ptr) + kDirectIOAlignment - 1) &
+            ~(kDirectIOAlignment - 1));
+
+        total_size += data_size;
+        // Slice records data_size; the buffer behind aligned_ptr is oversized
+        // to accommodate aligned reads
+        result->slices.emplace(keys[i], Slice{aligned_ptr, data_size});
+        // pointers will be adjusted after BatchLoad (offset_in_buffer
+        // correction)
+        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(aligned_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
         result->lease_timeout = lease_timeout;
     }
@@ -492,20 +570,36 @@ void FileStorage::ClientBufferGCThreadFunc() {
             MutexLocker locker(&client_buffer_mutex_);
             if (!client_buffer_allocated_batches_.empty()) {
                 auto now = std::chrono::steady_clock::now();
-                client_buffer_allocated_batches_.erase(
-                    std::remove_if(
-                        client_buffer_allocated_batches_.begin(),
-                        client_buffer_allocated_batches_.end(),
-                        [&](const std::shared_ptr<AllocatedBatch>& batch) {
-                            return now >= batch->lease_timeout;
-                        }),
-                    client_buffer_allocated_batches_.end());
+                for (auto it = client_buffer_allocated_batches_.begin();
+                     it != client_buffer_allocated_batches_.end();) {
+                    if (now >= it->second->lease_timeout) {
+                        VLOG(1) << "GC releasing batch_id: " << it->first
+                                << " (lease expired)";
+                        it = client_buffer_allocated_batches_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
             }
         }
         std::this_thread::sleep_for(
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
+    MutexLocker locker(&client_buffer_mutex_);
+    auto it = client_buffer_allocated_batches_.find(batch_id);
+    if (it != client_buffer_allocated_batches_.end()) {
+        VLOG(1) << "Releasing buffer for batch_id: " << batch_id
+                << " (transfer completed)";
+        client_buffer_allocated_batches_.erase(it);
+        return true;
+    }
+    VLOG(1) << "batch_id " << batch_id
+            << " not found (may have been GC'd already)";
+    return false;
 }
 
 }  // namespace mooncake

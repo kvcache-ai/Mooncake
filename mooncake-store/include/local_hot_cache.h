@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "mutex.h"
+#include "shm_helper.h"
 #include "types.h"
 
 namespace mooncake {
@@ -26,6 +27,7 @@ struct HotMemBlock {
     size_t size;
     std::atomic<int> ref_count;
     std::string key_;
+    std::atomic<bool> accessed{false};  // Deferred LRU touch flag
     HotMemBlock() : addr(nullptr), size(0), ref_count(0) {}
 };
 
@@ -38,8 +40,10 @@ class LocalHotCache {
      * @brief Construct a LocalHotCache.
      * @param total_size_bytes Desired total local hot cache size in bytes.
      * @param block_size_bytes Block size in bytes. If 0, uses default 16MB.
+     * @param use_shm If true, allocate via memfd for cross-process sharing.
      */
-    LocalHotCache(size_t total_size_bytes, size_t block_size_bytes = 0);
+    LocalHotCache(size_t total_size_bytes, size_t block_size_bytes = 0,
+                  bool use_shm = false);
 
     /**
      * @brief Destructor.
@@ -108,19 +112,43 @@ class LocalHotCache {
      */
     size_t GetBlockSize() const { return block_size_; }
 
+    /**
+     * @brief Get the shm segment backing this cache.
+     * Only valid when constructed with use_shm=true.
+     * @return shared_ptr to the ShmSegment, or nullptr if shm is disabled.
+     */
+    std::shared_ptr<ShmHelper::ShmSegment> GetShmSegment() const {
+        return shm_segment_;
+    }
+
+    /**
+     * @brief Whether this cache was allocated in shm mode (cross-process).
+     */
+    bool IsShm() const { return use_shm_; }
+
+    /**
+     * @brief Compute offset of a block address relative to the bulk base.
+     * Used by dummy clients to translate to their own mmap'd address.
+     * @return offset in bytes, or SIZE_MAX if addr is not in the bulk region.
+     */
+    size_t GetBlockOffset(const void* addr) const;
+
    private:
-    // Touch LRU using iterator (avoids duplicate lookup)
-    void touchLRU(std::unordered_map<
-                  std::string, std::list<HotMemBlock*>::iterator>::iterator it);
+    // Drain deferred LRU touches: splice accessed blocks to front
+    void drainDeferredTouches();
 
     size_t block_size_;  // Actual block size used by this cache
 
     // All blocks owned by this cache (auto-cleaned on destruction)
     std::vector<std::unique_ptr<HotMemBlock>> blocks_;
 
-    // Bulk allocated memory pointer (nullptr if bulk allocation failed)
-    // Must save the original malloc pointer for correct free()
+    // Bulk allocated memory pointer (nullptr if allocation failed)
     void* bulk_memory_standard_;
+    size_t bulk_memory_size_ = 0;
+
+    // Shared memory segment (non-null only when use_shm=true)
+    std::shared_ptr<ShmHelper::ShmSegment> shm_segment_;
+    bool use_shm_ = false;
 
     mutable std::shared_mutex lru_mutex_;
     std::list<HotMemBlock*> lru_queue_ GUARDED_BY(lru_mutex_);  // prefilled LRU
@@ -144,7 +172,7 @@ struct HotCachePutTask {
     HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
                     std::shared_ptr<LocalHotCache> cache)
         : key(k), block(blk), size(slice.size), hot_cache(std::move(cache)) {
-        // No data copy here; memcpy is done by the caller into block->addr
+        // No data copy here; memcpy is done by SubmitPutTask into block->addr.
     }
 };
 
@@ -159,6 +187,7 @@ class LocalHotCacheHandler {
      * disabled).
      * @param num_worker_threads Number of worker threads for async processing
      * (default: 2).
+     * @param max_queue_capacity Maximum task queue capacity (default: 1024).
      */
     LocalHotCacheHandler(std::shared_ptr<LocalHotCache> hot_cache,
                          size_t num_worker_threads = 2,
@@ -175,8 +204,8 @@ class LocalHotCacheHandler {
     /**
      * @brief Submit an async task to put a slice into the hot cache.
      *
-     * The slice data will be deep copied, so the original slice data can be
-     * safely freed after this function returns.
+     * Data is copied into the cache block synchronously within this call.
+     * The caller may free the source slice memory after this function returns.
      * @param key Cache key: {object key}
      * @param slice Source slice to cache.
      * @return true if task was successfully submitted, false otherwise (e.g.,

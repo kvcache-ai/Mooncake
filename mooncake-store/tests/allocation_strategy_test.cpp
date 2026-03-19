@@ -2,9 +2,15 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <iomanip>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -17,6 +23,13 @@ namespace mooncake {
 // Size units for better readability
 static constexpr size_t MiB = 1024 * 1024;
 
+// Strategy types for parameterized tests
+const auto kStrategyTypes = ::testing::Values(
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
+
+const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
+                                               BufferAllocatorType::OFFSET);
+
 // Base class for non-parameterized tests
 class AllocationStrategyTest : public ::testing::Test {
    protected:
@@ -27,13 +40,15 @@ class AllocationStrategyTest : public ::testing::Test {
     std::unique_ptr<RandomAllocationStrategy> strategy_;
 };
 
-// Parameterized test class for allocator type variations
+// Parameterized test class for strategy and allocator type variations
 class AllocationStrategyParameterizedTest
-    : public ::testing::TestWithParam<BufferAllocatorType> {
+    : public ::testing::TestWithParam<
+          std::tuple<AllocationStrategyType, BufferAllocatorType>> {
    protected:
     void SetUp() override {
-        strategy_ = std::make_unique<RandomAllocationStrategy>();
-        allocator_type_ = GetParam();
+        auto [strategy_type, allocator_type] = GetParam();
+        strategy_ = CreateAllocationStrategy(strategy_type);
+        allocator_type_ = allocator_type;
     }
 
     // Helper function to create a BufferAllocator for testing
@@ -55,23 +70,32 @@ class AllocationStrategyParameterizedTest
     }
 
     BufferAllocatorType allocator_type_;
-    std::unique_ptr<RandomAllocationStrategy> strategy_;
+    std::shared_ptr<AllocationStrategy> strategy_;
 };
 
-// Instantiate parameterized tests for all allocator types
+// Instantiate parameterized tests for all strategy and allocator combinations
 INSTANTIATE_TEST_SUITE_P(
-    AllAllocatorTypes, AllocationStrategyParameterizedTest,
-    ::testing::Values(BufferAllocatorType::CACHELIB,
-                      BufferAllocatorType::OFFSET),
-    [](const ::testing::TestParamInfo<BufferAllocatorType>& info) {
-        switch (info.param) {
-            case BufferAllocatorType::CACHELIB:
-                return "Cachelib";
-            case BufferAllocatorType::OFFSET:
-                return "Offset";
+    AllCombinations, AllocationStrategyParameterizedTest,
+    ::testing::Combine(kStrategyTypes, kAllocatorTypes),
+    [](const ::testing::TestParamInfo<
+        std::tuple<AllocationStrategyType, BufferAllocatorType>>& info) {
+        AllocationStrategyType strategy_type = std::get<0>(info.param);
+        BufferAllocatorType allocator_type = std::get<1>(info.param);
+        std::string strategy_str;
+        switch (strategy_type) {
+            case AllocationStrategyType::RANDOM:
+                strategy_str = "Random";
+                break;
+            case AllocationStrategyType::FREE_RATIO_FIRST:
+                strategy_str = "FreeRatioFirst";
+                break;
             default:
-                return "Unknown";
+                strategy_str = "Unknown";
         }
+        std::string allocator_str =
+            (allocator_type == BufferAllocatorType::CACHELIB) ? "Cachelib"
+                                                              : "Offset";
+        return strategy_str + "_" + allocator_str;
     });
 
 // Test basic functionality with empty allocators map (non-parameterized)
@@ -533,6 +557,159 @@ TEST_P(AllocationStrategyParameterizedTest,
 }
 
 // Test the performance of AllocationStrategy.
+// Test FreeRatioFirst load balancing distribution with different sized segments
+TEST_P(AllocationStrategyParameterizedTest,
+       FreeRatioFirstLoadBalancingDistribution) {
+    auto [strategy_type, allocator_type] = GetParam();
+    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
+        // This test is only for FreeRatioFirst strategy
+        GTEST_SKIP();
+    }
+
+    const auto kNumSegments = 3;
+    // Different sized segments to test utilization ratio balancing
+    std::array<size_t, kNumSegments> kSegmentSizes = {32 * MiB, 64 * MiB,
+                                                      128 * MiB};
+
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = std::to_string(i) + "-segment";
+        allocator_manager.addAllocator(
+            name, CreateTestAllocator(name, i * 128 * MiB, kSegmentSizes[i]));
+    }
+
+    std::array<size_t, kNumSegments> count = {0};
+    size_t slice_length = 64 * 1024;      // 64KB per allocation
+    const size_t kNumAllocations = 3000;  // Total 192MB allocated
+    std::vector<std::vector<Replica>> test_replicas;
+
+    for (size_t i = 0; i < kNumAllocations; i++) {
+        auto result = strategy_->Allocate(allocator_manager, slice_length);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 1);
+
+        for (const auto& replica : result.value()) {
+            auto descriptor = replica.get_descriptor();
+            ASSERT_TRUE(descriptor.is_memory_replica());
+            const auto& mem_desc = descriptor.get_memory_descriptor();
+            std::string segment_name =
+                mem_desc.buffer_descriptor.transport_endpoint_;
+            EXPECT_EQ(mem_desc.buffer_descriptor.size_, slice_length);
+
+            // Extract segment index from name "X-segment"
+            size_t segment_idx = segment_name[0] - '0';
+            ASSERT_LT(segment_idx, kNumSegments);
+            count[segment_idx]++;
+        }
+
+        test_replicas.push_back(std::move(result.value()));
+    }
+
+    // Calculate utilization ratio for each segment
+    std::cout << "\nFreeRatioFirst Load Balancing Results (Different Sized "
+                 "Segments):\n";
+    std::cout << "Total allocations: " << kNumAllocations << " x "
+              << (slice_length / 1024)
+              << "KB = " << (kNumAllocations * slice_length / MiB) << "MB\n\n";
+
+    std::array<double, kNumSegments> utilization_ratios;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        size_t allocated_bytes = count[i] * slice_length;
+        double utilization = (allocated_bytes * 100.0) / kSegmentSizes[i];
+        utilization_ratios[i] = utilization;
+
+        std::cout << "Segment " << i << " (" << (kSegmentSizes[i] / MiB)
+                  << "MB capacity):\n"
+                  << "  Allocations: " << count[i] << " (" << std::fixed
+                  << std::setprecision(1)
+                  << (count[i] * 100.0 / kNumAllocations) << "% of total)\n"
+                  << "  Allocated: " << (allocated_bytes / MiB) << "MB\n"
+                  << "  Utilization: " << std::setprecision(1) << utilization
+                  << "%\n\n";
+    }
+
+    // FreeRatioFirst should balance utilization ratios across segments
+    // Even though segments have different capacities (32MB, 64MB, 128MB),
+    // their utilization ratios should be similar (within 15% difference)
+    double max_util =
+        *std::max_element(utilization_ratios.begin(), utilization_ratios.end());
+    double min_util =
+        *std::min_element(utilization_ratios.begin(), utilization_ratios.end());
+    double util_diff = max_util - min_util;
+
+    std::cout << "Utilization difference: " << std::setprecision(1) << util_diff
+              << "%\n";
+    std::cout << "Expected: < 15% for good load balancing\n\n";
+
+    // Verify that utilization ratios are balanced (within 15%)
+    EXPECT_LT(util_diff, 15.0)
+        << "FreeRatioFirst should balance utilization ratios";
+}
+
+// Test the performance comparison between strategies
+TEST_F(AllocationStrategyTest, PerformanceComparison) {
+    const auto kNumSegments = 512;
+    const auto kSegmentBase = 0x100000000ULL;
+    const auto kSegmentSize = 64 * MiB;
+    const auto kNumAllocations = 5000;
+    const auto kAllocationSize = 4 * MiB;
+
+    // Construct and add allocators
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = "segment_" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
+                                                          kSegmentSize, name));
+    }
+
+    // Test Random strategy
+    auto random_strategy = std::make_unique<RandomAllocationStrategy>();
+    std::vector<std::vector<Replica>> random_replicas;
+    random_replicas.reserve(kNumAllocations);
+
+    auto random_start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kNumAllocations; i++) {
+        auto result =
+            random_strategy->Allocate(allocator_manager, kAllocationSize);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 1);
+        random_replicas.emplace_back(std::move(result.value()));
+    }
+    auto random_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - random_start);
+
+    random_replicas.clear();
+
+    // Test FreeRatioFirst strategy
+    auto frf_strategy = std::make_unique<FreeRatioFirstAllocationStrategy>();
+    std::vector<std::vector<Replica>> frf_replicas;
+    frf_replicas.reserve(kNumAllocations);
+
+    auto frf_start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kNumAllocations; i++) {
+        auto result =
+            frf_strategy->Allocate(allocator_manager, kAllocationSize);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 1);
+        frf_replicas.emplace_back(std::move(result.value()));
+    }
+    auto frf_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - frf_start);
+
+    std::cout << "\nAllocation Strategy Performance Comparison:\n"
+              << "Num segments: " << kNumSegments << "\n"
+              << "Num allocations: " << kNumAllocations << "\n"
+              << "Random strategy: " << random_elapsed_us.count() << " us\n"
+              << "FreeRatioFirst strategy: " << frf_elapsed_us.count()
+              << " us\n"
+              << "Speedup: " << std::fixed << std::setprecision(2)
+              << (static_cast<double>(random_elapsed_us.count()) /
+                  frf_elapsed_us.count())
+              << "x\n\n";
+}
+
 TEST_F(AllocationStrategyTest, PerformanceTest) {
     const auto kNumSegments = 512;
     const auto kSegmentBase = 0x100000000ULL;

@@ -71,6 +71,7 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     // in case it is setting up connection or submitting slice
     if (iter != endpoint_map_.end()) {
         waiting_list_.insert(iter->second);
+        iter->second->set_active(false);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
         fifo_list_.erase(fifo_iter);
@@ -174,6 +175,7 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     if (iter != endpoint_map_.end()) {
         waiting_list_len_++;
         waiting_list_.insert(iter->second.first);
+        iter->second.first->set_active(false);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
         if (hand_.has_value() && hand_.value() == fifo_iter) {

@@ -75,3 +75,23 @@ add_test(NAME memory_location_test COMMAND memory_location_test)
 add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
+
+if (USE_ASCEND_DIRECT)
+    # AscendDirectTransport unit test with mock implementations
+    # Mock implementations are included in the test file via anonymous namespace
+    add_executable(ascend_direct_transport_test
+        ${WORKSPACE}/ascend_direct_transport_test.cpp
+    )
+    target_link_libraries(ascend_direct_transport_test PUBLIC
+        transfer_engine
+        gtest
+        gtest_main
+        metadef
+    )
+    # Allow shared library undefined symbols (Ascend libraries have circular deps)
+    set_target_properties(ascend_direct_transport_test PROPERTIES
+        LINK_FLAGS "-Wl,--allow-shlib-undefined"
+    )
+
+    add_test(NAME ascend_direct_transport_test COMMAND ascend_direct_transport_test)
+endif()

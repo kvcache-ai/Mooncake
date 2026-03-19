@@ -256,11 +256,12 @@ class MooncakeStorePyWrapper {
 
     // Helper to initialize real client and register it
     std::shared_ptr<RealClient> init_real_client() {
+        auto &resource_tracker = ResourceTracker::getInstance();
         auto real_client = RealClient::create();
         use_dummy_client_ = false;
         store_ = real_client;
-        ResourceTracker::getInstance().registerInstance(
-            std::dynamic_pointer_cast<PyClient>(store_));
+        resource_tracker.registerInstance(
+            std::static_pointer_cast<PyClient>(store_));
         return real_client;
     }
 
@@ -268,6 +269,11 @@ class MooncakeStorePyWrapper {
         // Check if the store and client are initialized
         // Dummy client does not use client_ instance
         return (store_ && (use_dummy_client_ || store_->client_));
+    }
+
+    int health_check() {
+        if (!store_) return HC_NOT_INITIALIZED;
+        return store_->health_check();
     }
 
     std::string get_tp_key_name(const std::string &base_key, int rank) {
@@ -284,26 +290,15 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            if (use_dummy_client_) {
-                auto [buffer_base, buffer_size] = store_->get_buffer_info(key);
-                if (buffer_size == 0) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
+            auto buffer_handle = store_->get_buffer(key);
+            if (!buffer_handle) {
                 py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
-                                       buffer_size);
-            } else {
-                auto buffer_handle = store_->get_buffer(key);
-                if (!buffer_handle) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
-
-                py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes((char *)buffer_handle->ptr(),
-                                       buffer_handle->size());
+                return kNullString;
             }
+
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::bytes((char *)buffer_handle->ptr(),
+                                   buffer_handle->size());
         }
     }
 
@@ -357,9 +352,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::object get_tensor(const std::string &key) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             return pybind11::none();
         }
 
@@ -373,9 +367,8 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client not initialized";
             py::list empty;
             for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
             return empty;
@@ -782,6 +775,122 @@ class MooncakeStorePyWrapper {
                                              tp_size, split_dim);
     }
 
+    // Zero-copy put from pre-allocated buffer (layout: [TensorMetadata][data])
+    int put_tensor_from(const std::string &key, uintptr_t buffer_ptr,
+                        size_t size) {
+        if (buffer_ptr == 0) {
+            LOG(ERROR) << "Buffer pointer cannot be null";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        void *buffer = reinterpret_cast<void *>(buffer_ptr);
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR) << "put_tensor_from is not supported for dummy client";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (size <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Buffer size too small for tensor metadata";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        py::gil_scoped_release release_gil;
+        return store_->put_from(key, buffer, size, ReplicateConfig{});
+    }
+
+    std::vector<int> batch_put_tensor_from(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR)
+                << "batch_put_tensor_from is not supported for dummy client";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (keys.empty()) {
+            return std::vector<int>();
+        }
+        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
+                          "have the same length";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (buffer_ptrs[i] == 0) {
+                LOG(ERROR) << "Buffer pointer at index " << i
+                           << " cannot be null";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            if (sizes[i] <= sizeof(TensorMetadata)) {
+                LOG(ERROR) << "Buffer size at index " << i
+                           << " too small for tensor metadata";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+        }
+        std::vector<void *> buffers;
+        buffers.reserve(buffer_ptrs.size());
+        for (uintptr_t ptr : buffer_ptrs) {
+            buffers.push_back(reinterpret_cast<void *>(ptr));
+        }
+        py::gil_scoped_release release_gil;
+        return store_->batch_put_from(keys, buffers, sizes, ReplicateConfig{});
+    }
+
+    int put_tensor_with_tp_from(const std::string &key, uintptr_t buffer_ptr,
+                                size_t size, int tp_rank = 0, int tp_size = 1,
+                                int split_dim = 0) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR)
+                << "put_tensor_with_tp_from is not supported for dummy client";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (tp_size <= 1) {
+            return put_tensor_from(key, buffer_ptr, size);
+        }
+        std::string tp_key = get_tp_key_name(key, tp_rank);
+        return put_tensor_from(tp_key, buffer_ptr, size);
+    }
+
+    std::vector<int> batch_put_tensor_with_tp_from(
+        const std::vector<std::string> &base_keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (use_dummy_client_) {
+            LOG(ERROR) << "batch_put_tensor_with_tp_from is not supported for "
+                          "dummy client";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        if (tp_size <= 1) {
+            return batch_put_tensor_from(base_keys, buffer_ptrs, sizes);
+        }
+        std::vector<std::string> shard_keys;
+        shard_keys.reserve(base_keys.size());
+        for (const auto &key : base_keys) {
+            shard_keys.push_back(get_tp_key_name(key, tp_rank));
+        }
+        return batch_put_tensor_from(shard_keys, buffer_ptrs, sizes);
+    }
+
     int validate_replicate_config(
         const ReplicateConfig &config = ReplicateConfig{}) {
         if (!config.preferred_segments.empty() &&
@@ -875,6 +984,99 @@ class MooncakeStorePyWrapper {
 
         return batch_put_tensor_with_tp_impl(base_keys, tensors_list, config,
                                              tp_rank, tp_size, split_dim);
+    }
+
+    int save_tensor_to_safetensor(const std::string &key,
+                                  py::object file_name_obj = py::none()) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "save_tensor_to_safetensor is not supported for "
+                       << "dummy client now";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        pybind11::object tensor = get_tensor(key);
+        if (tensor.is_none()) {
+            LOG(ERROR) << "Failed to fetch tensor for key: " << key;
+            return to_py_ret(ErrorCode::FILE_NOT_FOUND);
+        }
+
+        try {
+            std::string resolved_file_name =
+                file_name_obj.is_none() ? key
+                                        : file_name_obj.cast<std::string>();
+            auto safetensors_torch = py::module_::import("safetensors.torch");
+            py::dict payload;
+            payload[py::str(key)] = tensor;
+            safetensors_torch.attr("save_file")(payload, resolved_file_name);
+            return 0;
+        } catch (const pybind11::error_already_set &e) {
+            LOG(ERROR) << "Failed to save tensor to safetensor file: "
+                       << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    pybind11::object load_tensor_from_safetensor(py::object key_obj,
+                                                 const std::string &file_name) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return pybind11::none();
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "load_tensor_from_safetensor is not supported for "
+                       << "dummy client now";
+            return pybind11::none();
+        }
+
+        try {
+            auto safetensors_torch = py::module_::import("safetensors.torch");
+            py::dict loaded = safetensors_torch.attr("load_file")(file_name);
+            if (py::len(loaded) == 0) {
+                LOG(ERROR) << "No tensors found in safetensor file: "
+                           << file_name;
+                return pybind11::none();
+            }
+
+            std::string target_store_key =
+                key_obj.is_none() ? file_name : key_obj.cast<std::string>();
+
+            py::object selected_dict_key;
+            if (!key_obj.is_none()) {
+                py::str desired_key(target_store_key);
+                if (py::cast<bool>(loaded.attr("__contains__")(desired_key))) {
+                    selected_dict_key = desired_key;
+                } else {
+                    py::list dict_keys(loaded.attr("keys")());
+                    selected_dict_key = dict_keys[0];
+                    LOG(WARNING)
+                        << "Key " << target_store_key
+                        << " not found in safetensor file; using first entry";
+                }
+            } else {
+                py::list dict_keys(loaded.attr("keys")());
+                selected_dict_key = dict_keys[0];
+            }
+
+            py::object tensor = loaded[selected_dict_key];
+            int rc = put_tensor(target_store_key, tensor);
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to store tensor for key "
+                           << target_store_key << ", rc=" << rc;
+                return pybind11::none();
+            }
+
+            return tensor;
+        } catch (const pybind11::error_already_set &e) {
+            LOG(ERROR) << "Failed to load tensor from safetensor file: "
+                       << e.what();
+            return pybind11::none();
+        }
     }
 };
 
@@ -1108,10 +1310,11 @@ PYBIND11_MODULE(store, m) {
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
                size_t local_buffer_size, const std::string &server_address) {
+                auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
-                ResourceTracker::getInstance().registerInstance(
-                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                resource_tracker.registerInstance(
+                    std::static_pointer_cast<PyClient>(self.store_));
                 auto [ip, port] = parseHostNameWithPort(server_address);
                 return self.store_->setup_dummy(
                     mem_pool_size, local_buffer_size, server_address,
@@ -1145,11 +1348,6 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR) << "batch_get_buffer is not supported for dummy "
-                                  "client now";
-                    return std::vector<std::shared_ptr<BufferHandle>>{};
-                }
                 return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
@@ -1205,6 +1403,10 @@ PYBIND11_MODULE(store, m) {
                  self.store_.reset();
                  return rc;
              })
+        .def("health_check", &MooncakeStorePyWrapper::health_check,
+             "Health check for store connectivity. "
+             "Returns 0 if healthy, 1 if not initialized/closed, "
+             "2 if master unreachable.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
@@ -1250,6 +1452,22 @@ PYBIND11_MODULE(store, m) {
         .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
              py::arg("keys"), py::arg("tensors_list"),
              "Put a batch of PyTorch tensors into the store")
+        .def("save_tensor_to_safetensor",
+             &MooncakeStorePyWrapper::save_tensor_to_safetensor, py::arg("key"),
+             py::arg("file_name") = py::none(),
+             "Export a tensor stored under the given key into a safetensors "
+             "file. "
+             "If file_name is not provided, the key will be used as the "
+             "filename.")
+        .def("load_tensor_from_safetensor",
+             &MooncakeStorePyWrapper::load_tensor_from_safetensor,
+             py::arg("key") = py::none(), py::arg("file_name"),
+             "Load a tensor from a safetensors file and store it back in "
+             "Mooncake.\n"
+             "If the 'key' parameter is not provided, the file_name is used as "
+             "the store key.\n"
+             "If the provided key is not found in the safetensor file, the "
+             "first tensor in the file is used and a warning is logged.")
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
              py::arg("tensor"), py::arg("config") = ReplicateConfig{},
              "Publish a PyTorch tensor with configurable replication settings")
@@ -1305,6 +1523,27 @@ PYBIND11_MODULE(store, m) {
             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
             "Get a batch of PyTorch tensor shards from the store directly into "
             "pre-allocated buffers for a given Tensor Parallel rank.")
+        .def("put_tensor_from", &MooncakeStorePyWrapper::put_tensor_from,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             "Put a tensor directly from a pre-allocated buffer. Buffer layout "
+             "must be [TensorMetadata][tensor data], same as get_tensor_into.")
+        .def("batch_put_tensor_from",
+             &MooncakeStorePyWrapper::batch_put_tensor_from, py::arg("keys"),
+             py::arg("buffer_ptrs"), py::arg("sizes"),
+             "Put tensors directly from pre-allocated buffers for multiple "
+             "keys. Each buffer layout: [TensorMetadata][tensor data].")
+        .def("put_tensor_with_tp_from",
+             &MooncakeStorePyWrapper::put_tensor_with_tp_from, py::arg("key"),
+             py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
+             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+             "Put a tensor shard directly from a pre-allocated buffer for "
+             "Tensor Parallelism. Buffer is stored under key_tp_<tp_rank>.")
+        .def("batch_put_tensor_with_tp_from",
+             &MooncakeStorePyWrapper::batch_put_tensor_with_tp_from,
+             py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+             "Put a batch of tensor shards directly from pre-allocated "
+             "buffers for a given Tensor Parallel rank.")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,

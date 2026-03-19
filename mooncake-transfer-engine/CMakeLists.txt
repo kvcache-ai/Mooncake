@@ -65,6 +65,11 @@ if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
   add_subdirectory(nvlink-allocator)
 endif()
 
+# Build ubshmem allocator for Huawei NPU fabric memory
+if (USE_UBSHMEM)
+  add_subdirectory(ubshmem-allocator)
+endif()
+
 if (USE_TENT)
   add_subdirectory(tent)
   add_subdirectory(benchmark)

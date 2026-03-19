@@ -16,6 +16,7 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <csignal>
 #include <cstdint>
 #include <functional>
 #include <memory>

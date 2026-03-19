@@ -1,5 +1,7 @@
 // client_local_hot_cache_test.cpp
 #include "client_service.h"
+#include "client_buffer.hpp"
+#include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "replica.h"
 #include "test_server_helpers.h"
@@ -188,8 +190,9 @@ class LocalHotCacheTest : public ::testing::Test {
 
     TestClientContext SetupTestClientWithHotCache() {
         TestClientContext ctx;
-        ctx.original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
-        setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
+        ctx.original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432",
+               1);  // 32MB = 2 blocks
 
         std::string local_ip = getLocalIpAddress();
         std::string local_hostname = local_ip + ":12345";
@@ -229,9 +232,9 @@ class LocalHotCacheTest : public ::testing::Test {
             free_memory("", ctx.segment_ptr);
         }
         if (ctx.original_env) {
-            setenv("LOCAL_HOT_CACHE_SIZE", ctx.original_env, 1);
+            setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", ctx.original_env, 1);
         } else {
-            unsetenv("LOCAL_HOT_CACHE_SIZE");
+            unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
         }
     }
 
@@ -482,7 +485,7 @@ TEST_F(LocalHotCacheTest, GetHotKeyProtectsBlockFromReuse) {
 TEST_F(LocalHotCacheTest, LocalHotCacheHandlerBasic) {
     const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
     auto cache = std::make_shared<LocalHotCache>(cache_size);
-    LocalHotCacheHandler handler(cache, 2);
+    LocalHotCacheHandler handler(cache, 2, 1024);
 
     const size_t slice_size = 1024;
     std::vector<char> data(slice_size, 'Z');
@@ -573,9 +576,9 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
 // Test 1: Valid environment variable - hot cache should be enabled
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "33554432",
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432",
            1);  // 32MB = 2 blocks (16MB each)
 
     auto client_opt = CreateTestClient("localhost");
@@ -586,9 +589,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -596,9 +599,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
 // INVALID_PARAMS
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_InvalidEnvVar) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "invalid", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "invalid", 1);
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -608,18 +611,18 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_InvalidEnvVar) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
 // Test 3: Zero value - InitLocalHotCache returns INVALID_PARAMS
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "0", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "0", 1);
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -629,18 +632,18 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
 // Test 4: Negative value - InitLocalHotCache returns INVALID_PARAMS
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "-1", 1);
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "-1", 1);
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -649,9 +652,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
     }
 
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -659,9 +662,10 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
 // enabled
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608",
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8388608",
            1);  // 8MB < 16MB (default block size)
 
     auto client_opt = CreateTestClient("localhost");
@@ -675,9 +679,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -685,11 +689,14 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
 TEST_F(LocalHotCacheTest,
        InitLocalHotCacheViaClientCreate_LessThanOneBlock_CustomBlockSize) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
-    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size =
+        std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
 
-    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB custom block size
-    setenv("LOCAL_HOT_CACHE_SIZE", "2097152",
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4194304",
+           1);  // 4MB custom block size
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "2097152",
            1);  // 2MB < 4MB (custom block size)
 
     auto client_opt = CreateTestClient("localhost");
@@ -703,23 +710,23 @@ TEST_F(LocalHotCacheTest,
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (original_block_size) {
-        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     }
 }
 
 // Test 7: No environment variable - hot cache should be disabled (valid case)
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
     // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_env = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
-    unsetenv("LOCAL_HOT_CACHE_SIZE");
+    unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
 
     auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
@@ -729,9 +736,9 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
 
     // Restore original env var
     if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_env, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
 }
 
@@ -752,12 +759,15 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
  */
 TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
-    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size =
+        std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
 
     // Enable hot cache with custom block size (4MB)
-    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB = 2 blocks (4MB each)
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8388608",
+           1);  // 8MB = 2 blocks (4MB each)
 
     // Get local IP address instead of using "localhost" to avoid hostname
     // resolution issues
@@ -829,25 +839,28 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (original_block_size) {
-        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
     }
 }
 
 TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
     // Save original env vars
-    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
-    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    const char* original_cache_size =
+        std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size =
+        std::getenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
 
     // Enable hot cache with custom block size (4MB)
-    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB = 2 blocks (4MB each)
+    setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "8388608",
+           1);  // 8MB = 2 blocks (4MB each)
 
     // Get local IP address instead of using "localhost" to avoid hostname
     // resolution issues
@@ -944,14 +957,350 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
 
     // Restore original env vars
     if (original_cache_size) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_CACHE_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
     }
     if (original_block_size) {
-        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+        setenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
     } else {
-        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+        unsetenv("MC_STORE_LOCAL_HOT_BLOCK_SIZE");
+    }
+}
+
+// Test deferred LRU touch ordering: accessed blocks survive eviction
+TEST_F(LocalHotCacheTest, DeferredLRUTouchOrdering) {
+    // 3-block cache (48MB / 16MB = 3 blocks)
+    const size_t cache_size = 48 * 1024 * 1024;
+    LocalHotCache cache(cache_size);
+
+    // Put 3 keys to fill the cache
+    Slice slice1 = CreateSlice(1024, 'A');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key1", slice1));
+
+    Slice slice2 = CreateSlice(1024, 'B');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key2", slice2));
+
+    Slice slice3 = CreateSlice(1024, 'C');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key3", slice3));
+
+    // Access key1 to set its accessed flag (deferred LRU touch)
+    HotMemBlock* blk = cache.GetHotKey("key1");
+    ASSERT_NE(blk, nullptr);
+    cache.ReleaseHotKey("key1");
+
+    // Insert key4, which triggers eviction. key1 was accessed so it should
+    // survive. key2 is LRU among unaccessed keys and should be evicted.
+    Slice slice4 = CreateSlice(1024, 'D');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "key4", slice4));
+
+    EXPECT_TRUE(cache.HasHotKey("key1"));   // Survived (accessed)
+    EXPECT_FALSE(cache.HasHotKey("key2"));  // Evicted (LRU, unaccessed)
+    EXPECT_TRUE(cache.HasHotKey("key3"));
+    EXPECT_TRUE(cache.HasHotKey("key4"));
+}
+
+// Test concurrent GetHotKey with shared lock (no crashes)
+TEST_F(LocalHotCacheTest, ConcurrentGetHotKeySharedLock) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    Slice slice = CreateSlice(1024, 'X');
+    EXPECT_TRUE(PutHotKeyHelper(cache, "shared_key", slice));
+
+    const int num_threads = 8;
+    std::atomic<int> successful_gets(0);
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&cache, &successful_gets]() {
+            for (int i = 0; i < 100; ++i) {
+                HotMemBlock* blk = cache.GetHotKey("shared_key");
+                if (blk) {
+                    successful_gets++;
+                    cache.ReleaseHotKey("shared_key");
+                }
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // All gets should succeed since we have enough capacity and key exists
+    EXPECT_EQ(successful_gets.load(), num_threads * 100);
+}
+
+// ---------------------------------------------------------------------------
+// HotMemBlock ref_count and BufferHandle view mode test
+// ---------------------------------------------------------------------------
+
+// Test that GetHotKey + BufferHandle view mode ref_count lifecycle works
+// correctly.
+TEST_F(LocalHotCacheTest, HotCacheRefCountViewMode) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    auto cache = std::make_shared<LocalHotCache>(cache_size);
+
+    // Pre-fill a key
+    Slice slice = CreateSlice(1024, 'V');
+    EXPECT_TRUE(PutHotKeyHelper(*cache, "view_key", slice));
+
+    // GetHotKey increments ref_count, then we create a BufferHandle in view
+    // mode whose release_fn decrements ref_count.
+    HotMemBlock* blk = cache->GetHotKey("view_key");
+    ASSERT_NE(blk, nullptr);
+    EXPECT_EQ(blk->ref_count.load(), 1);
+
+    {
+        // Create a BufferHandle in view mode
+        auto handle = std::make_shared<BufferHandle>(
+            blk->addr, blk->size, [blk, cache]() {
+                blk->ref_count.fetch_sub(1, std::memory_order_release);
+            });
+
+        EXPECT_NE(handle->ptr(), nullptr);
+        EXPECT_EQ(handle->size(), blk->size);
+
+        // Verify data through the handle
+        const char* data = static_cast<const char*>(handle->ptr());
+        EXPECT_EQ(data[0], 'V');
+
+        // ref_count should still be 1 while handle is alive
+        EXPECT_EQ(blk->ref_count.load(), 1);
+
+        // Block should not be evictable (ref_count > 0): inserting a new key
+        // into a 1-block sub-cache should fail.
+        const size_t small_cache_size = 16 * 1024 * 1024;  // 1 block
+        LocalHotCache small_cache(small_cache_size);
+        Slice s2 = CreateSlice(512, 'W');
+        EXPECT_TRUE(PutHotKeyHelper(small_cache, "sk1", s2));
+
+        // Get the block to hold a ref
+        HotMemBlock* held = small_cache.GetHotKey("sk1");
+        ASSERT_NE(held, nullptr);
+
+        // Now try inserting another key → all blocks in use
+        Slice s3 = CreateSlice(512, 'X');
+        EXPECT_FALSE(PutHotKeyHelper(small_cache, "sk2", s3));
+
+        small_cache.ReleaseHotKey("sk1");
+    }
+
+    // After handle destruction, release_fn should have decremented ref_count
+    EXPECT_EQ(blk->ref_count.load(), 0);
+}
+
+// Test GetFreeBlock → direct write → PutHotKey → GetHotKey → BufferHandle
+// view mode (exercises the low-level cache block lifecycle).
+TEST_F(LocalHotCacheTest, CacheBlockWriteAndRetrieve) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    auto cache = std::make_shared<LocalHotCache>(cache_size);
+
+    // Step 1: Simulate cache miss — get a free block
+    HotMemBlock* block = cache->GetFreeBlock();
+    ASSERT_NE(block, nullptr);
+
+    // Step 2: Write data directly into the block (simulating TransferRead
+    // writing into cache block)
+    const size_t data_size = 4096;
+    std::memset(block->addr, 'Z', data_size);
+
+    // Step 3: Set metadata and insert into LRU
+    block->key_ = "zc_write_key";
+    block->size = data_size;
+    EXPECT_TRUE(cache->PutHotKey(block));
+
+    // Step 4: Re-acquire ref via GetHotKey
+    HotMemBlock* blk = cache->GetHotKey("zc_write_key");
+    ASSERT_NE(blk, nullptr);
+    EXPECT_EQ(blk->ref_count.load(), 1);
+    EXPECT_EQ(blk->size, data_size);
+
+    // Step 5: Create BufferHandle in view mode
+    {
+        auto handle = std::make_shared<BufferHandle>(
+            blk->addr, blk->size, [blk, cache]() {
+                blk->ref_count.fetch_sub(1, std::memory_order_release);
+            });
+
+        EXPECT_NE(handle->ptr(), nullptr);
+        EXPECT_EQ(handle->size(), data_size);
+
+        // Verify data through the handle
+        const char* data = static_cast<const char*>(handle->ptr());
+        for (size_t i = 0; i < data_size; ++i) {
+            ASSERT_EQ(data[i], 'Z') << "Data mismatch at offset " << i;
+        }
+
+        // ref_count should still be 1 while handle is alive
+        EXPECT_EQ(blk->ref_count.load(), 1);
+    }
+
+    // After handle destruction, ref_count should be 0
+    EXPECT_EQ(blk->ref_count.load(), 0);
+}
+
+TEST_F(LocalHotCacheTest, AdmissionSketchNotIncrementedOnCacheHit) {
+    class EnvGuard {
+       public:
+        explicit EnvGuard(const char* key) : key_(key) {
+            if (const char* value = std::getenv(key_)) {
+                old_value_ = value;
+            }
+        }
+
+        ~EnvGuard() {
+            if (old_value_.has_value()) {
+                setenv(key_, old_value_->c_str(), 1);
+            } else {
+                unsetenv(key_);
+            }
+        }
+
+       private:
+        const char* key_;
+        std::optional<std::string> old_value_;
+    };
+
+    EnvGuard cache_size_guard("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    EnvGuard memcpy_guard("MC_STORE_MEMCPY");
+    setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB
+    setenv("MC_STORE_MEMCPY", "1", 1);
+
+    auto client_opt = CreateTestClient("localhost");
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+    ASSERT_TRUE(client->IsHotCacheEnabled());
+
+    const std::string key = "admission_skip_on_cache_hit_key";
+    const std::string cached_data = "cache-hit-data";
+
+    // Pre-fill local hot cache entry.
+    Slice cache_slice{const_cast<char*>(cached_data.data()),
+                      cached_data.size()};
+    ASSERT_TRUE(PutHotKeyHelper(*client->GetHotCache(), key, cache_slice));
+    ASSERT_TRUE(client->GetHotCache()->HasHotKey(key));
+
+    // Build a synthetic COMPLETE memory replica.
+    // RedirectToHotCache() should rewrite this descriptor to local hot cache.
+    Replica::Descriptor replica;
+    replica.id = 1;
+    replica.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.transport_endpoint_ = "remote:9999";
+    mem_desc.buffer_descriptor.buffer_address_ = 0;
+    mem_desc.buffer_descriptor.size_ = cached_data.size();
+    replica.descriptor_variant = mem_desc;
+
+    std::vector<Replica::Descriptor> replicas;
+    replicas.emplace_back(replica);
+    QueryResult query_result(
+        std::move(replicas),
+        std::chrono::steady_clock::now() + std::chrono::seconds(60));
+
+    const uint8_t count_before = client->GetAdmissionCount(key);
+    EXPECT_EQ(count_before, 0);
+
+    auto do_cache_hit_get = [&]() {
+        std::vector<char> out(cached_data.size(), '\0');
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{out.data(), out.size()});
+        auto get_result = client->Get(key, query_result, slices);
+        EXPECT_TRUE(get_result.has_value());
+        EXPECT_EQ(
+            std::memcmp(out.data(), cached_data.data(), cached_data.size()), 0);
+    };
+
+    // Execute cache-hit Get path multiple times.
+    do_cache_hit_get();
+    do_cache_hit_get();
+    do_cache_hit_get();
+
+    // Admission sketch must not be incremented on cache hits.
+    EXPECT_EQ(client->GetAdmissionCount(key), count_before);
+}
+
+// ---------------------------------------------------------------------------
+// CountMinSketch basic tests
+// ---------------------------------------------------------------------------
+
+TEST_F(LocalHotCacheTest, CountMinSketchBasic) {
+    CountMinSketch sketch(64, 4);
+
+    // First increment returns 1
+    EXPECT_EQ(sketch.increment("key_a"), 1);
+    // Second increment returns 2
+    EXPECT_EQ(sketch.increment("key_a"), 2);
+    // Third increment returns 3
+    EXPECT_EQ(sketch.increment("key_a"), 3);
+
+    // A different key starts at 1
+    EXPECT_EQ(sketch.increment("key_b"), 1);
+
+    // Read-only count matches
+    EXPECT_EQ(sketch.count("key_a"), 3);
+    EXPECT_EQ(sketch.count("key_b"), 1);
+    // Never-seen key has count 0
+    EXPECT_EQ(sketch.count("key_c"), 0);
+
+    // Decay halves all counters
+    sketch.decay();
+    EXPECT_EQ(sketch.count("key_a"), 1);  // 3 >> 1 = 1
+    EXPECT_EQ(sketch.count("key_b"), 0);  // 1 >> 1 = 0
+}
+
+TEST_F(LocalHotCacheTest, CountMinSketchAutoDecay) {
+    // Small sketch: width=8, depth=2 → auto-decay threshold = 16
+    CountMinSketch sketch(8, 2);
+
+    // Increment one key 15 times (below threshold)
+    for (int i = 0; i < 15; ++i) {
+        sketch.increment("hot_key");
+    }
+    EXPECT_EQ(sketch.count("hot_key"), 15);
+
+    // The 16th increment triggers auto-decay: increment returns the
+    // pre-decay count (16), but afterwards counters are halved.
+    uint8_t ret = sketch.increment("hot_key");
+    EXPECT_EQ(ret, 16);
+    EXPECT_EQ(sketch.count("hot_key"), 8);  // 16 >> 1 = 8
+}
+
+TEST_F(LocalHotCacheTest, CountMinSketchZeroDimensions) {
+    CountMinSketch sketch(0, 0);
+
+    EXPECT_EQ(sketch.count("zero_key"), 0);
+    EXPECT_EQ(sketch.increment("zero_key"), 1);
+    EXPECT_EQ(sketch.count("zero_key"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Admission helpers when hot cache / sketch is disabled
+// ---------------------------------------------------------------------------
+
+TEST_F(LocalHotCacheTest, AdmissionHelpersWithoutHotCache) {
+    // Create a client without hot cache (no MC_STORE_LOCAL_HOT_CACHE_SIZE)
+    const char* prev = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+    unsetenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+
+    auto result = CreateTestClient("no_hot_cache_host:9999");
+    ASSERT_TRUE(result.has_value());
+    auto client = result.value();
+
+    // Hot cache should be disabled
+    EXPECT_FALSE(client->IsHotCacheEnabled());
+
+    // GetAdmissionCount returns 0 when sketch is null
+    EXPECT_EQ(client->GetAdmissionCount("any_key"), 0);
+
+    // ShouldAdmitToHotCache returns false when hot_cache_ is null
+    EXPECT_FALSE(client->ShouldAdmitToHotCache("any_key", false));
+    EXPECT_FALSE(client->ShouldAdmitToHotCache("any_key", true));
+
+    // Restore env
+    if (prev) {
+        setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", prev, 1);
     }
 }
 

@@ -39,7 +39,8 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ReplicaType& replicaType) noexcept {
     static const std::unordered_map<ReplicaType, std::string_view>
         replica_type_strings{{ReplicaType::MEMORY, "MEMORY"},
-                             {ReplicaType::DISK, "DISK"}};
+                             {ReplicaType::DISK, "DISK"},
+                             {ReplicaType::LOCAL_DISK, "LOCAL_DISK"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -404,6 +405,9 @@ class Replica {
     std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
+
+    friend class Serializer<Replica>;
+    friend class MasterService;  // For MetadataSerializer to access next_id_
     std::atomic<uint32_t> refcnt_{0};
 };
 
