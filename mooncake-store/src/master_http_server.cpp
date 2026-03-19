@@ -36,9 +36,13 @@ void MasterHttpServer::RegisterHandlers() {
 
     // /health -- always returns 200 OK regardless of service_ state
     http_server_.set_http_handler<GET>(
-        "/health", [](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, "OK");
+        "/health", [this](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json");
+            auto* svc = service_.load(std::memory_order_acquire);
+            const char* body = svc
+                ? R"({"status":"ok","role":"leader"})"
+                : R"({"status":"ok","role":"follower"})";
+            resp.set_status_and_content(status_type::ok, body);
         });
 
     // /metrics -- gated on service_
