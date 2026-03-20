@@ -528,6 +528,53 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    std::optional<TransferFuture> future;
+
+    if (replica.is_memory_replica()) {
+        auto& mem_desc = replica.get_memory_descriptor();
+        auto& handle = mem_desc.buffer_descriptor;
+
+        size_t slices_size = 0;
+        for (const auto& s : slices) slices_size += s.size;
+        if (src_offset + slices_size > handle.size_) {
+            LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
+                       << " + slices_size=" << slices_size
+                       << " > handle.size_=" << handle.size_;
+            return std::nullopt;
+        }
+
+        TransferStrategy strategy = selectStrategy(handle, slices);
+
+        if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+            future =
+                submitMemcpyOperation(handle, slices, TransferRequest::READ,
+                                     src_offset);
+        } else if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+            future = submitTransferEngineOperation(handle, slices,
+                                                  TransferRequest::READ,
+                                                  src_offset);
+        } else {
+            LOG(ERROR) << "Range read only supports LOCAL_MEMCPY or "
+                          "TRANSFER_ENGINE, got: "
+                       << strategy;
+            return std::nullopt;
+        }
+    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
+        LOG(ERROR)
+            << "Range read not supported for disk replicas (use full read)";
+        return std::nullopt;
+    }
+
+    if (future.has_value()) {
+        updateTransferMetrics(slices, TransferRequest::READ);
+    }
+
+    return future;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
@@ -595,6 +642,64 @@ TransferSubmitter::submit_batch_get_offload_object(
         requests.emplace_back(request);
     }
     return submitTransfer(requests);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    std::vector<TransferRequest> requests;
+    size_t total_ranges = 0;
+    for (const auto& [_, ranges] : key_ranges) {
+        total_ranges += ranges.size();
+    }
+    requests.reserve(total_ranges);
+
+    for (const auto& [replica, ranges] : key_ranges) {
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << "submitBatchReadRanges: disk replicas not supported";
+            return std::nullopt;
+        }
+        const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+        if (handle.transport_endpoint_.empty()) {
+            LOG(ERROR) << "submitBatchReadRanges: empty transport endpoint";
+            return std::nullopt;
+        }
+        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment for "
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+        uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+        char* dest_base = static_cast<char*>(dest_buffer);
+
+        for (const auto& [dest_offset, src_offset, size] : ranges) {
+            if (size == 0) continue;
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = dest_base + dest_offset;
+            request.target_id = seg;
+            request.target_offset = base_address + src_offset;
+            request.length = size;
+            requests.emplace_back(request);
+        }
+    }
+
+    if (requests.empty()) {
+        return TransferFuture(std::make_shared<EmptyOperationState>());
+    }
+
+    auto future = submitTransfer(requests);
+    if (future && transfer_metric_) {
+        size_t total_bytes = 0;
+        for (const auto& request : requests) {
+            total_bytes += request.length;
+        }
+        transfer_metric_->total_read_bytes.inc(total_bytes);
+    }
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(

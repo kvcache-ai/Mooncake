@@ -186,6 +186,21 @@ class Client {
         bool prefer_same_node = false);
 
     /**
+     * @brief Batch transfer read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode BatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store

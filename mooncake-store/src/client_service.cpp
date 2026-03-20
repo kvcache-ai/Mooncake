@@ -1170,6 +1170,24 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+ErrorCode Client::BatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto future =
+        transfer_submitter_->submitBatchReadRanges(dest_buffer, key_ranges);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit batch read ranges";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
+}
+
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
