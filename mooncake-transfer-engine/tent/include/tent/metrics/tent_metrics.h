@@ -34,6 +34,7 @@
 #endif
 
 #if TENT_METRICS_ENABLED
+#include <csignal>  // Required before ylt headers: coro_io.hpp uses std::signal/SIGPIPE
 #include <ylt/metric.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #endif
