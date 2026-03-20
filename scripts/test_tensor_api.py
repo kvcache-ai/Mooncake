@@ -982,13 +982,29 @@ class TestMooncakeDataTypes(MooncakeTestBase):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mooncake Distributed Store Tests")
-    parser.add_argument("--mode", type=str, default="all", choices=["all", "func", "perf", "stress", "types"],
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=["all", "func", "perf", "stress", "types"],
                         help="Run mode")
+    parser.add_argument("-n", "--iterations", "--bench-iterations",
+                        dest="bench_iterations", type=int, default=None,
+                        help="Benchmark iterations. When set without --mode, "
+                             "default to perf for backward compatibility.")
     parser.add_argument("--threads", type=int, default=8, help="Number of threads")
     parser.add_argument("--count", type=int, default=800, help="Total number of items to process")
     parser.add_argument("--size_mb", type=float, default=0.5, help="Tensor size in MB")
 
     args, unknown = parser.parse_known_args()
+    if unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+
+    selected_mode = args.mode
+    if args.bench_iterations is not None:
+        TestMooncakeBenchmark.BENCH_ITERATIONS = args.bench_iterations
+        if selected_mode is None:
+            selected_mode = "perf"
+
+    if selected_mode is None:
+        selected_mode = "all"
 
     # Update Stress Test Config
     TestMooncakeStress.NUM_THREADS = args.threads
@@ -998,19 +1014,19 @@ if __name__ == "__main__":
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
 
-    if args.mode in ["all", "func"]:
+    if selected_mode in ["all", "func"]:
         print(">> Loading Functional Tests...")
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeFunctional))
 
-    if args.mode in ["all", "perf"]:
+    if selected_mode in ["all", "perf"]:
         print(">> Loading Performance Benchmark Tests...")
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeBenchmark))
 
-    if args.mode in ["all", "stress"]:
+    if selected_mode in ["all", "stress"]:
         print(f">> Loading Stress Tests ({args.count} items, {args.threads} threads)...")
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeStress))
 
-    if args.mode in ["all", "types", "func"]: # 'types' can be part of 'func' or standalone
+    if selected_mode in ["all", "types", "func"]: # 'types' can be part of 'func' or standalone
         print(">> Loading Data Type Tests...")
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeDataTypes))
 
