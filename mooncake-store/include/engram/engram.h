@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -46,24 +49,6 @@ class Engram {
      */
     size_t get_query_workspace_size(int B, int L) const;
 
-    /** Timing breakdown for query_embeddings() (ms). */
-    struct QueryTiming {
-        double hash_ms = 0;
-        double store_read_ms = 0;   /* total embedding_lookup */
-        /* embedding_lookup breakdown (subset of store_read) */
-        double emb_register_ms = 0;
-        double emb_batch_query_ms = 0;
-        double emb_get_into_range_ms = 0;
-        double emb_scatter_ms = 0;
-        double emb_unregister_ms = 0;
-        double emb_prep_ms = 0;     /* unique_idx + range_merge */
-        double emb_remote_fetch_ms = 0;    /* remote data transfer or bulk fetch */
-        double emb_lookup_ms = 0;   /* memcpy from tables to output */
-        double emb_total_internal_ms = 0;  /* wall time inside embedding_lookup (for verification) */
-        double emb_gap_ms = 0;      /* unaccounted: internal - sum(phases), for debugging */
-        double emb_setup_ms = 0;    /* t_embed_start to t_register_start */
-    };
-
     /**
      * Query embedding rows for a batch of token IDs.
      * @param input_ids [B, L] token IDs
@@ -77,8 +62,7 @@ class Engram {
     int query_embeddings(const std::vector<std::vector<int64_t>>& input_ids,
                          void* output, size_t output_size,
                          void* workspace = nullptr,
-                         size_t workspace_size = 0,
-                         QueryTiming* out_timing = nullptr) const;
+                         size_t workspace_size = 0) const;
 
     /**
      * Hash input IDs into per-head embedding row indices.
@@ -129,6 +113,8 @@ class Engram {
     std::vector<int64_t> list_of_N_;
     int embed_D_;
     std::vector<std::string> embed_keys_;
+    std::string local_agent_name_;
+    std::string store_protocol_;
 
     // Optional internal scratch workspace reused across queries when the
     // caller does not provide one. This avoids per-query register/unregister
@@ -142,28 +128,82 @@ class Engram {
     mutable std::vector<QueryResult> cached_query_results_;
     mutable bool query_result_cache_valid_ = false;
 
+    // Consumer-side descriptor ring used by the generic SG submit path.
+    mutable std::mutex request_ring_mu_;
+    mutable std::condition_variable request_ring_cv_;
+    mutable std::vector<char> request_ring_workspace_;
+    mutable std::vector<void*> request_ring_buffers_;
+    mutable std::vector<AllocatedBuffer::Descriptor> request_ring_descriptors_;
+    mutable std::vector<bool> request_ring_in_use_;
+    mutable std::unordered_map<uint64_t, size_t> request_ring_request_to_slot_;
+    mutable bool request_ring_registered_ = false;
+    mutable size_t request_ring_slot_size_ = 0;
+    mutable size_t request_ring_slot_count_ = 0;
+
+    // Producer-side staging buffers used by remote gather requests. The
+    // consumer keeps using the normal query workspace; only the producer needs
+    // temporary registered buffers for WRITE-back.
+    std::mutex remote_gather_workspace_mu_;
+    std::vector<char> remote_gather_workspace_;
+    std::vector<void*> remote_gather_buffers_;
+    std::vector<size_t> remote_gather_buffer_sizes_;
+    bool remote_gather_workspace_registered_ = false;
+
+    std::mutex remote_descriptor_workspace_mu_;
+    std::vector<char> remote_descriptor_workspace_;
+    bool remote_descriptor_workspace_registered_ = false;
+
+    std::mutex remote_gather_service_mu_;
+    std::thread remote_gather_service_thread_;
+    std::atomic<bool> remote_gather_service_running_{false};
+    mutable std::atomic<uint64_t> remote_gather_request_seq_{1};
+
+    struct LookupRowRef {
+        int64_t idx = 0;
+        size_t output_offset = 0;
+    };
+
+    struct LookupPackedRange {
+        int64_t start = 0;
+        int64_t end = 0;
+        size_t buffer_offset = 0;
+        size_t ref_begin = 0;
+        size_t ref_end = 0;
+    };
+
     // Hash mapping helpers
     static bool is_prime(int64_t n);
     static int64_t find_next_prime(int64_t start,
                                    std::unordered_set<int64_t>& seen);
-    std::vector<std::vector<std::vector<int64_t>>> hash_(
-        const std::vector<std::vector<int64_t>>& input_ids, int layer_id) const;
+    void hash_flat_(
+        const std::vector<std::vector<int64_t>>& input_ids, int layer_id,
+        std::vector<int64_t>& flat_hash_ids,
+        std::vector<std::vector<LookupRowRef>>* head_refs = nullptr) const;
     std::vector<size_t> get_query_table_buffer_sizes(int B, int L) const;
     int ensure_internal_workspace(int B, int L) const;
     void release_internal_workspace() const;
     std::vector<tl::expected<QueryResult, ErrorCode>> get_query_results() const;
     void invalidate_query_result_cache() const;
+    bool remote_gather_enabled() const;
+    int ensure_request_ring(size_t min_slot_size = 0) const;
+    void release_request_ring() const;
+    int ensure_remote_gather_workspace(const std::vector<size_t>& head_sizes);
+    int ensure_remote_descriptor_workspace(size_t required_bytes);
+    void release_remote_descriptor_workspace();
+    void release_remote_gather_workspace();
+    void ensure_remote_gather_service();
+    void stop_remote_gather_service();
+    void remote_gather_service_loop();
 
     // Embedding lookup / populate
     // table_buffers/sizes: optional for zero-copy; when valid, use batch_get_into
-    // emb_timing: optional; when non-null, filled with per-phase breakdown
     int embedding_lookup(
-        const std::vector<std::vector<std::vector<int64_t>>>& hash_ids,
+        const std::vector<int64_t>& flat_hash_ids, int B, int L,
         void* output_buffer, size_t output_size,
         const std::vector<void*>* table_buffers = nullptr,
         const std::vector<size_t>* table_sizes = nullptr,
         bool buffers_are_pre_registered = false,
-        QueryTiming* emb_timing = nullptr) const;
+        std::vector<std::vector<LookupRowRef>>* prepared_head_refs = nullptr) const;
     int embedding_populate_from_tensors(
         const std::vector<void*>& embedding_data,
         const std::vector<size_t>& sizes);

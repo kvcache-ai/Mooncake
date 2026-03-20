@@ -1188,6 +1188,115 @@ ErrorCode Client::BatchTransferReadRanges(
     return future->get();
 }
 
+ErrorCode Client::BatchTransferReadBuffers(
+    const std::vector<AllocatedBuffer::Descriptor>& src_buffers,
+    const std::vector<void*>& dest_buffers, const std::vector<size_t>& sizes) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (src_buffers.size() != dest_buffers.size() ||
+        src_buffers.size() != sizes.size()) {
+        LOG(ERROR) << "BatchTransferReadBuffers: size mismatch";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<std::vector<Slice>> all_slices;
+    replicas.reserve(src_buffers.size());
+    all_slices.reserve(src_buffers.size());
+    for (size_t i = 0; i < src_buffers.size(); ++i) {
+        const auto& src = src_buffers[i];
+        if (sizes[i] == 0) {
+            continue;
+        }
+        if (dest_buffers[i] == nullptr || src.transport_endpoint_.empty() ||
+            src.size_ < sizes[i]) {
+            LOG(ERROR) << "BatchTransferReadBuffers: invalid buffer at index "
+                       << i;
+            return ErrorCode::INVALID_PARAMS;
+        }
+
+        Replica::Descriptor replica;
+        replica.id = static_cast<ReplicaID>(i + 1);
+        replica.status = ReplicaStatus::COMPLETE;
+        MemoryDescriptor mem_desc;
+        mem_desc.buffer_descriptor = src;
+        mem_desc.buffer_descriptor.size_ = sizes[i];
+        replica.descriptor_variant = std::move(mem_desc);
+        replicas.emplace_back(std::move(replica));
+
+        all_slices.emplace_back();
+        all_slices.back().push_back(Slice{dest_buffers[i], sizes[i]});
+    }
+
+    if (replicas.empty()) {
+        return ErrorCode::OK;
+    }
+
+    auto future = transfer_submitter_->submit_batch(
+        replicas, all_slices, TransferRequest::READ);
+    if (!future) {
+        LOG(ERROR) << "BatchTransferReadBuffers: failed to submit transfers";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
+}
+
+ErrorCode Client::BatchTransferWriteBuffers(
+    const std::vector<AllocatedBuffer::Descriptor>& dest_buffers,
+    const std::vector<void*>& src_buffers, const std::vector<size_t>& sizes) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (dest_buffers.size() != src_buffers.size() ||
+        dest_buffers.size() != sizes.size()) {
+        LOG(ERROR) << "BatchTransferWriteBuffers: size mismatch";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<std::vector<Slice>> all_slices;
+    replicas.reserve(dest_buffers.size());
+    all_slices.reserve(dest_buffers.size());
+    for (size_t i = 0; i < dest_buffers.size(); ++i) {
+        const auto& dest = dest_buffers[i];
+        if (sizes[i] == 0) {
+            continue;
+        }
+        if (src_buffers[i] == nullptr || dest.transport_endpoint_.empty() ||
+            dest.size_ < sizes[i]) {
+            LOG(ERROR) << "BatchTransferWriteBuffers: invalid buffer at index "
+                       << i;
+            return ErrorCode::INVALID_PARAMS;
+        }
+
+        Replica::Descriptor replica;
+        replica.id = static_cast<ReplicaID>(i + 1);
+        replica.status = ReplicaStatus::COMPLETE;
+        MemoryDescriptor mem_desc;
+        mem_desc.buffer_descriptor = dest;
+        replica.descriptor_variant = std::move(mem_desc);
+        replicas.emplace_back(std::move(replica));
+
+        all_slices.emplace_back();
+        all_slices.back().push_back(Slice{src_buffers[i], sizes[i]});
+    }
+
+    if (replicas.empty()) {
+        return ErrorCode::OK;
+    }
+
+    auto future = transfer_submitter_->submit_batch(
+        replicas, all_slices, TransferRequest::WRITE);
+    if (!future) {
+        LOG(ERROR) << "BatchTransferWriteBuffers: failed to submit transfers";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
+}
+
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
@@ -3018,7 +3127,6 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 
     return replica_list[0];
 }
-
 size_t Client::GetLocalHotCacheSizeFromEnv() {
     if (const char* ev_size = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE")) {
         std::string ev_size_str(ev_size);
@@ -3180,20 +3288,8 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     }
     return local_hostname_ == replica_transfer_endpoint;
 }
-
-tl::expected<void*, ErrorCode> Client::ResolveLocalMemoryAddress(
-    const QueryResult& query_result, size_t min_size) {
-    auto preferred_replica = GetPreferredReplica(query_result.replicas);
-    if (!preferred_replica) {
-        return tl::unexpected(preferred_replica.error());
-    }
-
-    const auto& replica = preferred_replica.value();
-    if (!replica.is_memory_replica()) {
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
-    }
-
-    const auto& desc = replica.get_memory_descriptor().buffer_descriptor;
+tl::expected<void*, ErrorCode> Client::ResolveLocalBufferAddress(
+    const AllocatedBuffer::Descriptor& desc, size_t min_size) {
     if (desc.size_ < min_size) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -3227,6 +3323,42 @@ tl::expected<void*, ErrorCode> Client::ResolveLocalMemoryAddress(
     }
 
     return tl::unexpected(ErrorCode::INVALID_REPLICA);
+}
+
+tl::expected<void*, ErrorCode> Client::ResolveLocalMemoryAddress(
+    const QueryResult& query_result, size_t min_size) {
+    auto preferred_replica = GetPreferredReplica(query_result.replicas);
+    if (!preferred_replica) {
+        return tl::unexpected(preferred_replica.error());
+    }
+
+    const auto& replica = preferred_replica.value();
+    if (!replica.is_memory_replica()) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    return ResolveLocalBufferAddress(
+        replica.get_memory_descriptor().buffer_descriptor, min_size);
+}
+
+int Client::SendTransferNotifyByName(const std::string& remote_agent,
+                                     const std::string& name,
+                                     const std::string& notify_msg) {
+    if (!transfer_engine_) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    TransferMetadata::NotifyDesc notify;
+    notify.name = name;
+    notify.notify_msg = notify_msg;
+    return transfer_engine_->sendNotifyByName(remote_agent, std::move(notify));
+}
+
+int Client::GetTransferNotifies(
+    std::vector<TransferMetadata::NotifyDesc>& notifies) {
+    if (!transfer_engine_) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    return transfer_engine_->getNotifies(notifies);
 }
 
 }  // namespace mooncake

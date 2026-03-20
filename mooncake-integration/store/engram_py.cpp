@@ -181,7 +181,7 @@ void bind_engram(py::module& m) {
 
                 int ret = self.query_embeddings(
                     input_ids_vec, out_buf.ptr, out_buf.size * sizeof(float),
-                    ws_ptr, ws_size, nullptr);
+                    ws_ptr, ws_size);
                 if (ret != 0) {
                     throw std::runtime_error("Engram query failed");
                 }
@@ -189,68 +189,6 @@ void bind_engram(py::module& m) {
             },
             py::arg("input_ids"), py::arg("workspace") = py::none(),
             "Query embeddings from Mooncake Store. Returns [B, L, num_heads, embed_D].")
-        .def(
-            "query_with_timing",
-            [](Engram& self, py::object input_ids, py::object workspace) {
-                std::vector<std::vector<int64_t>> input_ids_vec =
-                    py_list_to_vec2d(input_ids);
-                if (input_ids_vec.empty()) {
-                    throw std::runtime_error("input_ids must not be empty");
-                }
-
-                int B = static_cast<int>(input_ids_vec.size());
-                int L = static_cast<int>(input_ids_vec[0].size());
-                int H = self.get_num_heads();
-                int D = self.get_embedding_dim();
-
-                py::array_t<float> output = py::array_t<float>({B, L, H, D});
-                auto out_buf = output.request();
-
-                void* ws_ptr = nullptr;
-                size_t ws_size = 0;
-                if (!workspace.is_none()) {
-                    auto ws_arr = py::array::ensure(workspace);
-                    if (!ws_arr) {
-                        throw std::runtime_error(
-                            "workspace must be a NumPy array when provided");
-                    }
-                    auto ws_req = ws_arr.request();
-                    if (ws_req.ptr && ws_req.size > 0) {
-                        ws_ptr = ws_req.ptr;
-                        ws_size =
-                            static_cast<size_t>(ws_req.size) * ws_req.itemsize;
-                    }
-                }
-
-                Engram::QueryTiming timing;
-                int ret = self.query_embeddings(
-                    input_ids_vec, out_buf.ptr, out_buf.size * sizeof(float),
-                    ws_ptr, ws_size, &timing);
-                if (ret != 0) {
-                    throw std::runtime_error("Engram query failed");
-                }
-
-                py::dict timing_dict;
-                timing_dict["hash_ms"] = timing.hash_ms;
-                timing_dict["store_read_ms"] = timing.store_read_ms;
-                py::dict emb_detail;
-                emb_detail["setup_ms"] = timing.emb_setup_ms;
-                emb_detail["register_ms"] = timing.emb_register_ms;
-                emb_detail["batch_query_ms"] = timing.emb_batch_query_ms;
-                emb_detail["get_into_range_ms"] = timing.emb_get_into_range_ms;
-                emb_detail["scatter_ms"] = timing.emb_scatter_ms;
-                emb_detail["unregister_ms"] = timing.emb_unregister_ms;
-                emb_detail["prep_ms"] = timing.emb_prep_ms;
-                emb_detail["remote_fetch_ms"] = timing.emb_remote_fetch_ms;
-                emb_detail["lookup_ms"] = timing.emb_lookup_ms;
-                emb_detail["_total_internal_ms"] =
-                    timing.emb_total_internal_ms;
-                emb_detail["gap_ms"] = timing.emb_gap_ms;
-                timing_dict["embedding_lookup"] = emb_detail;
-                return py::make_tuple(output, timing_dict);
-            },
-            py::arg("input_ids"), py::arg("workspace") = py::none(),
-            "Query embeddings and return (output, timing_dict).")
         .def(
             "populate_store_from_buffers",
             [](Engram& self, py::list embedding_buffers) {

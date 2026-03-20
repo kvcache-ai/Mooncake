@@ -383,6 +383,14 @@ class PyClient {
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 
+    std::shared_ptr<mooncake::Client> get_client_shared() const {
+        return std::atomic_load_explicit(&client_, std::memory_order_acquire);
+    }
+
+    bool has_live_client() const {
+        return static_cast<bool>(get_client_shared());
+    }
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;

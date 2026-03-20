@@ -201,6 +201,32 @@ class Client {
             key_ranges);
 
     /**
+     * @brief Batch transfer read of multiple remote registered buffers into
+     * local registered buffers.
+     * @param src_buffers Remote source buffer descriptors
+     * @param dest_buffers Local destination buffers
+     * @param sizes Number of bytes to read for each buffer
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode BatchTransferReadBuffers(
+        const std::vector<AllocatedBuffer::Descriptor>& src_buffers,
+        const std::vector<void*>& dest_buffers,
+        const std::vector<size_t>& sizes);
+
+    /**
+     * @brief Batch transfer write of multiple local buffers into remote
+     * registered buffers.
+     * @param dest_buffers Remote destination buffer descriptors
+     * @param src_buffers Local registered source buffers
+     * @param sizes Number of bytes to write for each buffer
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode BatchTransferWriteBuffers(
+        const std::vector<AllocatedBuffer::Descriptor>& dest_buffers,
+        const std::vector<void*>& src_buffers,
+        const std::vector<size_t>& sizes);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -563,12 +589,27 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
     /**
+     * Resolve a buffer descriptor to a directly accessible local virtual
+     * address when it lives in one of this client's mounted segments.
+     * Returns INVALID_REPLICA when no matching local mapping exists.
+     */
+    tl::expected<void*, ErrorCode> ResolveLocalBufferAddress(
+        const AllocatedBuffer::Descriptor& buffer_desc, size_t min_size = 0);
+
+    /**
      * Resolve a memory replica to a directly accessible local virtual address
      * when the object lives in one of this client's mounted segments.
      * Returns INVALID_REPLICA when no matching local mapping exists.
      */
     tl::expected<void*, ErrorCode> ResolveLocalMemoryAddress(
         const QueryResult& query_result, size_t min_size = 0);
+
+    int SendTransferNotifyByName(const std::string& remote_agent,
+                                 const std::string& name,
+                                 const std::string& notify_msg);
+
+    int GetTransferNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
+    const std::string& GetProtocol() const { return protocol_; }
 
    private:
     /**

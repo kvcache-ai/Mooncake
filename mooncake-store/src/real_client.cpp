@@ -999,13 +999,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_http_server();
 
-    if (!client_) {
+    auto client =
+        std::atomic_exchange_explicit(&client_, std::shared_ptr<Client>{},
+                                      std::memory_order_acq_rel);
+    if (!client) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
+        auto unregister_result = client->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {
             LOG(WARNING)
@@ -1026,14 +1029,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     // Reset all resources
-    client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
-    local_hostname = "";
-    device_name = "";
-    protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto shm_it = shm_contexts_.begin();
     while (shm_it != shm_contexts_.end()) {
