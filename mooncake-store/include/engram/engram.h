@@ -36,6 +36,14 @@ class Engram {
     size_t get_forward_workspace_size(int B, int L) const;
 
     /**
+     * Return workspace size in bytes for embedding table buffers (zero-copy get).
+     * When workspace includes this size, forward uses batch_get_into for
+     * zero-copy RDMA transfer. Add this to get_forward_workspace_size(B,L)
+     * for full workspace with zero-copy embedding lookup.
+     */
+    size_t get_embedding_tables_workspace_size() const;
+
+    /**
      * Forward pass.
      * @param hidden_states [B, L, hc_mult, D] input hidden states
      * @param input_ids [B, L] token IDs
@@ -96,9 +104,12 @@ class Engram {
         const std::vector<std::vector<int64_t>>& input_ids, int layer_id) const;
 
     // Embedding lookup / populate
+    // table_buffers/sizes: optional for zero-copy; when valid, use batch_get_into
     int embedding_lookup(
         const std::vector<std::vector<std::vector<int64_t>>>& hash_ids,
-        void* output_buffer, size_t output_size) const;
+        void* output_buffer, size_t output_size,
+        const std::vector<void*>* table_buffers = nullptr,
+        const std::vector<size_t>* table_sizes = nullptr) const;
     int embedding_populate_from_tensors(
         const std::vector<void*>& embedding_data,
         const std::vector<size_t>& sizes);

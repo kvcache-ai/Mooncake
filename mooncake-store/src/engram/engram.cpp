@@ -196,7 +196,9 @@ std::vector<std::vector<std::vector<int64_t>>> Engram::hash_(
 
 int Engram::embedding_lookup(
     const std::vector<std::vector<std::vector<int64_t>>>& hash_ids,
-    void* output_buffer, size_t output_size) const {
+    void* output_buffer, size_t output_size,
+    const std::vector<void*>* table_buffers,
+    const std::vector<size_t>* table_sizes) const {
     if (store_ == nullptr) return -1;
     if (hash_ids.empty() || hash_ids[0].empty() || hash_ids[0][0].empty())
         return -1;
@@ -210,30 +212,85 @@ int Engram::embedding_lookup(
         static_cast<size_t>(B) * L * num_heads * embed_D_ * sizeof(float);
     if (output_size < expected_size) return -1;
 
-    std::vector<std::shared_ptr<BufferHandle>> buffers =
-        store_->batch_get_buffer(embed_keys_);
-    if (buffers.size() != embed_keys_.size()) return -1;
-
     float* output = static_cast<float*>(output_buffer);
+    bool use_zero_copy =
+        (table_buffers != nullptr && table_sizes != nullptr &&
+         static_cast<int>(table_buffers->size()) == num_heads &&
+         static_cast<int>(table_sizes->size()) == num_heads);
+
+    if (use_zero_copy) {
+        // Zero-copy path: register buffers, batch_get_into, then lookup
+        for (int h = 0; h < num_heads; ++h) {
+            size_t required =
+                static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float);
+            if ((*table_sizes)[h] < required) {
+                use_zero_copy = false;
+                break;
+            }
+        }
+    }
+
+    std::vector<const float*> tables(num_heads, nullptr);
+    std::vector<size_t> registered_indices;
+
+    if (use_zero_copy) {
+        for (int h = 0; h < num_heads; ++h) {
+            int ret = store_->register_buffer((*table_buffers)[h], (*table_sizes)[h]);
+            if (ret != 0) {
+                for (int j : registered_indices)
+                    store_->unregister_buffer((*table_buffers)[j]);
+                use_zero_copy = false;
+                break;
+            }
+            registered_indices.push_back(h);
+        }
+    }
+
+    if (use_zero_copy) {
+        std::vector<void*> bufs(num_heads);
+        std::vector<size_t> sz(num_heads);
+        for (int h = 0; h < num_heads; ++h) {
+            bufs[h] = (*table_buffers)[h];
+            sz[h] = (*table_sizes)[h];
+        }
+        auto get_results = store_->batch_get_into(embed_keys_, bufs, sz);
+        for (int h : registered_indices)
+            store_->unregister_buffer((*table_buffers)[h]);
+
+        for (int h = 0; h < num_heads; ++h) {
+            if (get_results[h] < 0 ||
+                static_cast<size_t>(get_results[h]) <
+                    static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float)) {
+                for (int b = 0; b < B; ++b) {
+                    for (int l = 0; l < L; ++l) {
+                        std::memset(
+                            output +
+                                (b * L * num_heads + l * num_heads + h) * embed_D_,
+                            0, embed_D_ * sizeof(float));
+                    }
+                }
+                continue;
+            }
+            tables[h] = static_cast<const float*>((*table_buffers)[h]);
+        }
+    } else {
+        // Fallback: batch_get_buffer (allocates internally)
+        std::vector<std::shared_ptr<BufferHandle>> buffers =
+            store_->batch_get_buffer(embed_keys_);
+        if (buffers.size() != embed_keys_.size()) return -1;
+        for (int h = 0; h < num_heads; ++h) {
+            if (buffers[h] &&
+                buffers[h]->size() >=
+                    static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float)) {
+                tables[h] = static_cast<const float*>(buffers[h]->ptr());
+            }
+        }
+    }
 
     for (int h = 0; h < num_heads; ++h) {
-        if (!buffers[h] ||
-            buffers[h]->size() <
-                static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float)) {
-            for (int b = 0; b < B; ++b) {
-                for (int l = 0; l < L; ++l) {
-                    std::memset(
-                        output +
-                            (b * L * num_heads + l * num_heads + h) * embed_D_,
-                        0, embed_D_ * sizeof(float));
-                }
-            }
-            continue;
-        }
-
-        const float* table = static_cast<const float*>(buffers[h]->ptr());
+        if (tables[h] == nullptr) continue;
+        const float* table = tables[h];
         int64_t vocab_size_h = list_of_N_[h];
-
         for (int b = 0; b < B; ++b) {
             for (int l = 0; l < L; ++l) {
                 int64_t idx = hash_ids[b][l][h];
@@ -463,6 +520,14 @@ void Engram::apply_short_conv(const float* input, int B, int L,
     }
 }
 
+size_t Engram::get_embedding_tables_workspace_size() const {
+    size_t total = 0;
+    for (int64_t N : list_of_N_) {
+        total += static_cast<size_t>(N) * embed_D_ * sizeof(float);
+    }
+    return total;
+}
+
 size_t Engram::get_forward_workspace_size(int B, int L) const {
     int engram_hidden =
         (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
@@ -493,13 +558,29 @@ int Engram::forward(const void* hidden_states, size_t hidden_states_size,
         (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
     size_t emb_sz = static_cast<size_t>(B) * L * engram_hidden * sizeof(float);
     size_t required_ws = get_forward_workspace_size(B, L);
+    size_t tables_ws = get_embedding_tables_workspace_size();
+    size_t full_ws = required_ws + tables_ws;
 
     float* embeddings_buffer = nullptr;
     float* gated_output = nullptr;
+    std::vector<void*> table_buffers;
+    std::vector<size_t> table_sizes;
     std::vector<float> embeddings_vec;
     std::vector<float> gated_vec;
 
-    if (workspace != nullptr && workspace_size >= required_ws) {
+    if (workspace != nullptr && workspace_size >= full_ws) {
+        char* base = static_cast<char*>(workspace);
+        embeddings_buffer = static_cast<float*>(workspace);
+        gated_output = reinterpret_cast<float*>(base + emb_sz);
+        char* tables_base = base + required_ws;
+        for (size_t h = 0; h < list_of_N_.size(); ++h) {
+            size_t sz =
+                static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float);
+            table_buffers.push_back(tables_base);
+            table_sizes.push_back(sz);
+            tables_base += sz;
+        }
+    } else if (workspace != nullptr && workspace_size >= required_ws) {
         embeddings_buffer = static_cast<float*>(workspace);
         gated_output = static_cast<float*>(workspace) + (emb_sz / sizeof(float));
     } else {
@@ -511,7 +592,13 @@ int Engram::forward(const void* hidden_states, size_t hidden_states_size,
 
     auto hash_ids = hash_(input_ids, layer_id_);
 
-    if (embedding_lookup(hash_ids, embeddings_buffer, emb_sz) != 0) return -1;
+    const std::vector<void*>* tbl_bufs =
+        table_buffers.empty() ? nullptr : &table_buffers;
+    const std::vector<size_t>* tbl_szs =
+        table_sizes.empty() ? nullptr : &table_sizes;
+    if (embedding_lookup(hash_ids, embeddings_buffer, emb_sz, tbl_bufs,
+                        tbl_szs) != 0)
+        return -1;
 
     compute_gates_and_fuse(embeddings_buffer,
                            static_cast<const float*>(hidden_states), B, L,

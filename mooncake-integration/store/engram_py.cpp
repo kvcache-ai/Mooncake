@@ -110,7 +110,7 @@ void bind_engram(py::module& m) {
         .def(
             "forward",
             [](Engram& self, py::array_t<float> hidden_states,
-               py::object input_ids) {
+               py::object input_ids, py::object workspace) {
                 // Extract shape
                 auto h_buf = hidden_states.request();
                 if (h_buf.ndim != 4) {
@@ -131,16 +131,34 @@ void bind_engram(py::module& m) {
                     py::array_t<float>({B, L, hc_mult, D});
                 auto out_buf = output.request();
 
-                // Call forward
-                int ret = self.forward(h_buf.ptr, h_buf.size * sizeof(float),
-                                       input_ids_vec, out_buf.ptr,
-                                       out_buf.size * sizeof(float));
+                void* ws_ptr = nullptr;
+                size_t ws_size = 0;
+                if (!workspace.is_none()) {
+                    try {
+                        auto ws_arr =
+                            py::array_t<float>::ensure(workspace);
+                        auto ws_req = ws_arr.request();
+                        if (ws_req.ptr && ws_req.size > 0) {
+                            ws_ptr = ws_req.ptr;
+                            ws_size = ws_req.size * sizeof(float);
+                        }
+                    } catch (py::error_already_set&) {
+                        ws_ptr = nullptr;
+                        ws_size = 0;
+                    }
+                }
+
+                // Call forward (uses zero-copy when workspace is large enough)
+                int ret = self.forward(
+                    h_buf.ptr, h_buf.size * sizeof(float), input_ids_vec,
+                    out_buf.ptr, out_buf.size * sizeof(float), ws_ptr, ws_size);
                 if (ret != 0) {
                     throw std::runtime_error("Engram forward failed");
                 }
                 return output;
             },
-            py::arg("hidden_states"), py::arg("input_ids"))
+            py::arg("hidden_states"), py::arg("input_ids"),
+            py::arg("workspace") = py::none())
         .def(
             "populate_store_from_buffers",
             [](Engram& self, py::list embedding_buffers) {
