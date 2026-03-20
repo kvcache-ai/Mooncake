@@ -1,290 +1,344 @@
-# Engram: Conditional Memory Module
+# Engram: Mooncake Data-Plane Integration
 
 ## Overview
 
-Engram is a **conditional memory module** that implements N-gram embedding lookup for large language models. It provides O(1) knowledge retrieval through scalable lookup tables, complementing Mixture-of-Experts (MoE) architectures by introducing a new axis of sparsity.
+In the current Mooncake branch, Engram integration is intentionally scoped to the data plane:
 
-**Key Features:**
-- ✅ **O(1) Lookup**: Direct hash-based access to N-gram embeddings
-- ✅ **Deterministic Addressing**: Supports prefetching and offloading
-- ✅ **Distributed Storage**: Integration with Mooncake Store for scalable embedding storage
-- ✅ **Zero-Copy Operations**: Efficient memory access using registered buffers
-- ✅ **Context-Aware Gating**: Dynamic fusion of embeddings with hidden states
+- Mooncake stores Engram embedding tables in Mooncake Store.
+- Mooncake hashes token sequences into deterministic row indices.
+- Mooncake queries the corresponding embedding rows and returns them as `[B, L, H, D]`.
 
-**Paper Reference:** [Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models](https://arxiv.org/abs/2601.07372) (arXiv:2601.07372)
+Mooncake no longer implements Engram's model-side forward path. The following pieces are outside Mooncake and should live in the model/runtime that consumes the queried embeddings:
 
-## Architecture
+- context-aware gating
+- value projection
+- short convolution
+- residual fusion
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Engram Module                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Input: hidden_states [B, L, hc_mult, D]                   │
-│         input_ids [B, L]                                    │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ 1. N-gram Hash Mapping                               │  │
-│  │    - Shift sequences: shift_k(input_ids)             │  │
-│  │    - Combine N-grams: XOR(multipliers * tokens)     │  │
-│  │    - Hash: hash_id = mix % vocab_size                │  │
-│  │    Output: hash_ids [B, L, num_heads]                │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                          ↓                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ 2. Embedding Lookup                                  │  │
-│  │    - Batch fetch: batch_get_buffer(embed_keys)      │  │
-│  │    - Direct lookup: embedding_table[hash_ids]       │  │
-│  │    Output: embeddings [B, L, num_heads, embed_D]    │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                          ↓                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ 3. Context-Aware Gating                              │  │
-│  │    - Normalize: RMSNorm(embeddings, hidden_states) │  │
-│  │    - Compute keys: Linear(embeddings)                │  │
-│  │    - Compute gates: sigmoid(sqrt(dot(key, query))) │  │
-│  │    - Fuse: gate * Linear(embeddings)                 │  │
-│  │    Output: gated_output [B, L, hc_mult, D]          │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                          ↓                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ 4. ShortConv                                         │  │
-│  │    - Normalize: RMSNorm(gated_output)                │  │
-│  │    - Convolve: DepthwiseConv1d(kernel, dilation)     │  │
-│  │    - Activate: SiLU(conv_output)                      │  │
-│  │    Output: conv_output [B, L, hc_mult, D]            │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                          ↓                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ 5. Residual Connection                               │  │
-│  │    output = gated_output + conv_output + hidden_states│ │
-│  │    Output: output [B, L, hc_mult, D]                  │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────────────┐
-│              Mooncake Store (Distributed)                    │
-│  - Embedding tables stored as keys:                         │
-│    "engram:l{layer_id}:h{head_idx}"                         │
-│  - Batch operations: batch_get_buffer, batch_put_from       │
-│  - Zero-copy: Registered buffers, GPUDirect RDMA            │
-└─────────────────────────────────────────────────────────────┘
+That boundary keeps Mooncake focused on what it does best: high-throughput, low-latency storage and retrieval of deterministic embedding data.
+
+**Paper Reference:** [Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models](https://arxiv.org/abs/2601.07372)
+
+## Current Architecture
+
+```text
+input_ids [B, L]
+    |
+    v
+hash_input_ids(...)
+    |
+    v
+hash_ids [B, L, H]
+    |
+    v
+Mooncake Store lookup
+  - key:   engram:l{layer_id}:h{head_idx}
+  - table: [N_h, D]
+    |
+    v
+query(...)
+    |
+    v
+embeddings [B, L, H, D]
+    |
+    v
+model-side fusion outside Mooncake
 ```
 
-## Core Components
+Where:
 
-### 1. N-gram Hash Mapping
+- `B`: batch size
+- `L`: sequence length
+- `H = (max_ngram_size - 1) * n_head_per_ngram`
+- `D = n_embed_per_ngram / n_head_per_ngram`
+- `N_h`: the real table size for head `h`
 
-**Purpose:** Convert token sequences into hash indices for O(1) embedding lookup.
+## What Mooncake Provides for Engram
 
-**Process:**
+### 1. Per-layer, per-head distributed storage
 
-1. **Sequence Shifting**: Create shifted versions of the input sequence
-   ```
-   Original: [t0, t1, t2, t3, t4]
-   Shift k=0: [t0, t1, t2, t3, t4]
-   Shift k=1: [pad, t0, t1, t2, t3]
-   Shift k=2: [pad, pad, t0, t1, t2]
-   ```
+Engram tables are stored in Mooncake Store under keys of the form:
 
-2. **N-gram Combination**: For each N-gram size (n=2, 3, ..., max_ngram_size), combine n shifted sequences
-   ```
-   For 3-gram at position t:
-     token[0] = shift_0[t]
-     token[1] = shift_1[t]
-     token[2] = shift_2[t]
-   ```
-
-3. **Hash Computation**: 
-   ```cpp
-   mix = token[0] * multiplier[0]
-   for k in 1..n-1:
-       mix = mix XOR (token[k] * multiplier[k])
-   hash_id = (mix % vocab_size + vocab_size) % vocab_size
-   ```
-
-**Key Design Choices:**
-- **Multipliers**: Random odd integers for each position, generated per layer
-- **XOR Mixing**: Ensures different token combinations produce different hashes
-- **Prime Modulo**: Each head uses a different prime as vocab_size to reduce collisions
-- **Multi-Head**: Multiple heads per N-gram capture different aspects
-
-### 2. Multi-Head Embedding Lookup
-
-**Purpose:** Store and retrieve N-gram embeddings efficiently.
-
-**Storage Structure:**
-- Each head has an independent embedding table: `[vocab_size, embed_D]`
-- Tables are stored in Mooncake Store with keys: `"engram:l{layer_id}:h{head_idx}"`
-- Total heads: `(max_ngram_size - 1) * n_head_per_ngram`
-
-**Lookup Process:**
-```cpp
-// 1. Batch fetch all embedding tables
-buffers = store->batch_get_buffer(embed_keys);
-
-// 2. For each position and head, direct lookup
-for (b, l, h):
-    hash_id = hash_ids[b][l][h]
-    embedding = buffers[h][hash_id * embed_D : (hash_id+1) * embed_D]
+```text
+engram:l{layer_id}:h{head_idx}
 ```
 
-**Performance Optimizations:**
-- **Batch Operations**: Fetch all tables in one `batch_get_buffer` call
-- **Zero-Copy**: Use registered buffers to avoid CPU-GPU copies
-- **Direct Memory Access**: O(1) lookup via array indexing
+Each key maps to one 2D embedding table:
 
-### 3. Context-Aware Gating
-
-**Purpose:** Dynamically determine how much embedding information to fuse with hidden states.
-
-**Computation Steps:**
-
-1. **Normalization**:
-   ```cpp
-   normed_embeddings = RMSNorm(embeddings)
-   normed_hidden = RMSNorm(hidden_states)  // Per hc group
-   ```
-
-2. **Key and Query**:
-   ```cpp
-   // For each hc group
-   key[hc] = RMSNorm(Linear(normed_embeddings, key_proj_weights[hc]))
-   query[hc] = normed_hidden[hc]
-   ```
-
-3. **Gate Computation**:
-   ```cpp
-   similarity = dot(key[hc], query[hc]) / sqrt(D)
-   g = sqrt(abs(similarity)) * sign(similarity)
-   gate[hc] = sigmoid(g)
-   ```
-
-4. **Value Fusion**:
-   ```cpp
-   value = Linear(normed_embeddings, value_proj_weights)
-   output[hc] = gate[hc] * value
-   ```
-
-**Gating Function Properties:**
-- Gate ∈ [0, 1]: Weight for embedding information
-- Gate ≈ 1: Heavy use of embeddings (high relevance)
-- Gate ≈ 0: Minimal use of embeddings (low relevance)
-- Context-dependent: Gate value depends on similarity between embeddings and hidden states
-
-### 4. ShortConv (Short Convolution)
-
-**Purpose:** Local feature extraction and smoothing in the sequence dimension.
-
-**Operation:**
-```cpp
-// 1D Depthwise Convolution
-for each position l:
-    sum = 0
-    for k in 0..kernel_size-1:
-        pos = l - pad + k * dilation
-        if pos >= 0 and pos < L:
-            sum += input[pos]
-    output[l] = sum
-
-// Activation
-output = SiLU(output)
+```text
+[N_h, D]
 ```
 
-**Parameters:**
-- **kernel_size**: Convolution kernel size (e.g., 4)
-- **dilation**: Dilation rate, equals `max_ngram_size` (e.g., 3)
-- **padding**: `(kernel_size - 1) * dilation`
+This layout means:
 
-**Effects:**
-- Captures local dependencies (interactions between adjacent positions)
-- Smooths output (reduces noise)
-- Enhances expressiveness
+- each layer is isolated
+- each head is independently addressable
+- each head can be placed, migrated, cached, or read independently
+- Mooncake can use batch metadata/data operations across all heads
 
-### 5. Residual Connection
+### 2. A deterministic hash-to-row mapping
 
-**Purpose:** Preserve gradient flow and original information.
+Mooncake exposes `hash_input_ids(...)`, which converts token IDs into per-head row indices.
 
-```cpp
-output = gated_output + shortconv_output + hidden_states
+The hash path is deterministic:
+
+1. Shift the sequence to form N-gram windows.
+2. Mix shifted token IDs with per-layer odd multipliers via XOR.
+3. Apply modulo with the target head's table size.
+
+The output shape is:
+
+```text
+[B, L, H]
 ```
 
-**Benefits:**
-- Prevents gradient vanishing
-- Preserves original information even when gates are small
-- Stabilizes training
+This is not ANN or similarity search. The row address is fully determined by the input token sequence, which is exactly the kind of access pattern Mooncake can serve efficiently.
 
-## Mooncake Store Integration
+### 3. Store-backed embedding query
 
-### Storage Format
+Mooncake exposes `query(...)` / `query_embeddings(...)`, which read the embedding rows addressed by the hash output and materialize:
 
-Embedding tables are stored in Mooncake Store with the following key format:
-```
-"engram:l{layer_id}:h{head_idx}"
+```text
+[B, L, H, D]
 ```
 
-**Example:**
-- Layer 1, Head 0: `"engram:l1:h0"`
-- Layer 1, Head 1: `"engram:l1:h1"`
-- Layer 15, Head 0: `"engram:l15:h0"`
+This is the only tensor Mooncake returns for Engram. Any later fusion with model hidden states happens outside Mooncake.
 
-**Storage Layout:**
-- Each embedding table is stored as a contiguous `[vocab_size, embed_D]` tensor
-- Data type: `float32`
-- Total size: `vocab_size * embed_D * sizeof(float)` bytes
+### 4. A batch populate path
 
-### Zero-Copy Operations
+Mooncake exposes `populate_store_from_buffers(...)` to upload all head tables in one pass.
 
-Engram uses Mooncake Store's zero-copy capabilities:
+The populate path:
 
-1. **Buffer Registration**: Embedding tables are registered with `register_buffer()` before upload
-2. **Batch Operations**: All tables are fetched/uploaded in a single `batch_get_buffer`/`batch_put_from` call
-3. **Direct Memory Access**: Lookups use direct memory access without copying
+- validates that each head buffer is 2D
+- validates that each buffer matches the expected `[N_h, D]`
+- registers the buffers with Mooncake Store
+- uploads them with `batch_put_from(...)`
 
-**Benefits:**
-- Reduced CPU-GPU memory copies
-- Lower latency for embedding lookups
-- Better bandwidth utilization
+This gives Engram one consistent path for initialization, checkpoint restore, or offline table construction.
 
-### Distributed Storage
+### 5. A layer-scoped cleanup path
 
-With Mooncake Store, embedding tables can be:
-- **Distributed**: Stored across multiple nodes
-- **Offloaded**: Automatically moved to SSD when memory is full
-- **Replicated**: Multiple copies for fault tolerance and load balancing
-- **Scalable**: Not limited by single-node memory capacity
+Mooncake exposes `remove_from_store(force=False)` to delete all store objects owned by one Engram layer instance.
 
-## Performance Considerations
+The cleanup path:
 
-### Memory Layout
+- enumerates the exact per-head keys for the current layer
+- checks whether each key currently exists
+- deletes them one by one with the store's regular remove API
+- ignores already-missing keys so repeated cleanup calls remain safe
+- invalidates Engram's cached query metadata after cleanup
 
-Engram processes 4D tensors with layout `[B, L, hc_mult, D]`:
+Operationally:
 
-```
-Memory layout (row-major):
-[b=0, l=0, hc=0, d=0..D-1] [b=0, l=0, hc=1, d=0..D-1] ... [b=0, l=0, hc=hc_mult-1, d=0..D-1]
-[b=0, l=1, hc=0, d=0..D-1] [b=0, l=1, hc=1, d=0..D-1] ... [b=0, l=1, hc=hc_mult-1, d=0..D-1]
-...
-[b=B-1, l=L-1, hc=hc_mult-1, d=0..D-1]
-```
+- `force=False` respects normal Mooncake lease protection, so cleanup can fail if readers still hold active leases
+- `force=True` bypasses the lease check, but it is still not meant to override replica/task safety checks during concurrent write/replication activity
 
-**Access Pattern:**
-```cpp
-index = (b * L * hc_mult + l * hc_mult + hc) * D + d;
-value = data[index];
+This is the recommended production cleanup mechanism for Engram data. It is much safer than calling store-wide `remove_all()`.
+
+## Engram Data Model in Mooncake
+
+### Per-head table layout
+
+For a given layer, Mooncake stores Engram as `H` separate 2D tables rather than one monolithic 4D tensor:
+
+```text
+key = (layer_id, head_idx)
+value = [N_h, D]
 ```
 
-### Optimization Tips
+This is important because each head can have a different table size `N_h`.
 
-1. **Batch Size**: Larger batch sizes improve throughput (amortize Store overhead)
-2. **Sequence Length**: Longer sequences benefit more from Engram (more N-grams)
-3. **Embedding Cache**: Frequently accessed tables can be cached in GPU memory
-4. **Prefetching**: Hash IDs can be computed ahead of time for prefetching
-5. **CUDA Kernels**: Linear, RMSNorm, and Conv1d operations can be accelerated with CUDA kernels
+### Is a dimension missing?
+
+No. The implementation does **not** lose a dimension.
+
+From the model view, the queried result is still:
+
+```text
+[B, L, H, D]
+```
+
+From the storage view:
+
+- `H` is represented in the key space (`head_idx`)
+- each head owns a table `[N_h, D]`
+
+So the head dimension is split into storage objects, not removed.
+
+### Use `get_table_vocab_sizes()`, not raw `engram_vocab_size`
+
+A key correctness detail is that the real table size of each head is not always the raw configured `engram_vocab_size`.
+
+Mooncake expands each per-N-gram base size into per-head prime-sized tables to reduce collisions. As a result:
+
+- different heads can have different `N_h`
+- the correct table shape must come from `get_table_vocab_sizes()`
+- upload/query correctness depends on the hash modulo space matching the stored table size exactly
+
+If tables are created from the raw `engram_vocab_size` only, the storage layout can become inconsistent with the row indices produced by hashing.
+
+## Query Path
+
+### Hash phase
+
+`hash_input_ids(...)` computes row indices shaped `[B, L, H]`.
+
+In the current C++ Mooncake path, hashing operates on the provided `input_ids` directly. Model-side tokenizer compression / vocabulary projection is not part of the current store-backed query path.
+
+### Read phase
+
+`query_embeddings(...)` uses a hybrid read strategy.
+
+1. Compute the hash IDs.
+2. Resolve table metadata with `batch_query(...)`, using a lease-aware cache when placement is stable.
+3. Try the local-direct fast path first:
+   - if a queried table replica lives in one of this client's mounted segments
+   - Mooncake resolves it to a directly accessible virtual address
+   - lookup then reads rows with local `memcpy` and skips `get_into_range(...)` / `batch_get_buffer(...)`
+4. If local direct access is not available, use scratch buffers for the range-read path.
+   - Mooncake first tries to reuse an internal registered workspace across queries
+   - if the caller passes a large enough workspace, that can be used as scratch space too
+5. In the range-read path:
+   - batch-resolve metadata for all head tables with `batch_query(...)`
+   - collect the unique rows needed by the current batch
+   - sort row indices and merge adjacent rows into ranges
+   - issue one batched multi-range transfer into the scratch workspace
+   - scatter/copy the retrieved rows into the final `[B, L, H, D]` output buffer
+
+### Optional workspace
+
+The query API accepts an optional preallocated workspace sized by:
+
+- `get_embedding_tables_workspace_size()`
+- `get_query_workspace_size(B, L)`
+
+Two sizes matter:
+
+- `get_embedding_tables_workspace_size()` is the size needed to hold every head table in full.
+- `get_query_workspace_size(B, L)` is the smaller scratch size needed for the current batch, capped by the number of rows that can actually be touched.
+
+If the caller does not provide a workspace, Engram can still reuse an internal registered workspace managed inside the C++ object. This avoids per-query register/unregister overhead in the common repeated-query case.
+
+## Current Performance Optimizations
+
+### 1. Per-head object layout
+
+Keeping one object per head makes sparse row access much more practical than a single giant tensor. It also keeps placement and parallelism flexible.
+
+### 2. Query-result caching
+
+`batch_query(...)` results are cached inside the Engram object while their leases remain valid. The cache is invalidated after repopulating the tables.
+
+This avoids repeated metadata lookups for steady-state query traffic.
+
+### 3. Same-node local-direct reads
+
+If a table replica is mounted in the same client process, Mooncake resolves the replica to a local virtual address and reads rows directly from the mounted segment.
+
+This is the critical fast path for same-node Engram benchmarks:
+
+- no RDMA read is needed
+- no range-read staging buffer is needed
+- no `batch_get_buffer(...)` is needed
+
+In this case the store-read cost becomes close to pure local memory access.
+
+### 4. Internal registered workspace reuse
+
+When the query cannot use the local-direct path, Engram reuses an internal scratch workspace that stays registered with Mooncake across queries.
+
+This removes repeated buffer registration overhead from the steady-state query path, while still allowing a caller-provided workspace when explicit control is needed.
+
+### 5. Unique-row extraction and range merge
+
+For each head, Mooncake first deduplicates the requested row indices, then merges adjacent rows into ranges. This reduces duplicated reads and improves RDMA/storage efficiency when nearby rows are requested together.
+
+### 6. Hybrid read strategy
+
+The implementation uses a mixed policy:
+
+- when the number of merged ranges is small, it reads only the touched ranges
+- when the total range count exceeds the current threshold, or the requested bytes approach a full-table read, it falls back to fetching table buffers
+
+This prevents extremely fragmented range reads from becoming slower than bulk fetch.
+
+### 7. Direct write into output layout
+
+The query API materializes output directly in `[B, L, H, D]` layout, which avoids extra result objects and keeps the interface simple for downstream model code.
+
+### 8. Batch upload path
+
+Engram table population uses registered buffers plus `batch_put_from(...)`, which is much better suited than one-object-at-a-time uploads when many head tables are initialized together.
+
+## What Engram Data Looks Like from a Systems Perspective
+
+Engram data has a very specific access pattern:
+
+- **static or mostly static**: tables are populated once and then read heavily
+- **read-dominant**: query cost matters much more than update cost
+- **deterministic addressing**: row addresses are computed directly from token IDs
+- **multi-table sparse access**: each request touches many heads but only a small subset of rows in each table
+- **hotspot potential**: repeated N-grams can create hot rows or hot heads across requests
+
+That combination makes Mooncake a good fit, because Mooncake is optimized for batched metadata resolution, remote object access, registered buffers, and efficient data movement.
+
+## Current Limits and Follow-up Opportunities
+
+The current implementation is intentionally minimal and correct for the data path, but there is still room to improve:
+
+1. **Tokenizer compression / vocabulary projection**
+   - The store-backed C++ path currently hashes raw token IDs.
+   - If we want full parity with upstream Engram variants that compress vocabulary before hashing, this should be added explicitly.
+
+2. **Adaptive read policy**
+   - The range-vs-full-table switch is currently a fixed threshold.
+   - It could be made adaptive based on head size, unique-row count, bandwidth, and observed latency.
+
+3. **Cache hot rows / hot heads**
+   - Repeated N-grams should make caching effective for real workloads.
+
+4. **Reduce scatter overhead**
+   - Query currently still has to scatter the retrieved rows into `[B, L, H, D]`.
+   - There is room to improve vectorization, memory layout, and GPU handoff.
+
+5. **Remote / cross-node query path**
+   - The current biggest win comes from the same-node local-direct path.
+   - Cross-node queries still rely on range reads or bulk fetch, so this is the next important place to optimize if we need microsecond-class latency beyond single-node access.
+
+6. **Explore finer-grained object layouts**
+   - Today each head is one object.
+   - For some workloads, row-block layouts or hot/cold partitioning may reduce remote read amplification further.
+
+## Validation
+
+The current implementation is validated with:
+
+- `scripts/test_engram.py` for API/correctness coverage
+- `scripts/bench_engram_27b.py` for one-token batch-size sweeps and timing breakdowns
+
+Operationally, benchmark/test environments must be cleaned before launching a new master or client. A stale `mooncake_master` can cause bind failures and invalidate measurements.
+
+## Production Cleanup Guidance
+
+For online cleanup, use the dedicated `Engram.remove_from_store(force=False)` API rather than `remove_all()`.
+
+Recommendations:
+
+- drain traffic for the target layer/model first
+- prefer exact per-layer cleanup over regex-wide or store-wide deletion
+- keep `force=False` in normal production flows so lease protection remains active
+- only use `force=True` during controlled maintenance when you are sure no live readers still depend on the objects
+- if cleanup succeeds and the same worker will continue serving, repopulate the tables before re-enabling traffic
+
+## Summary
+
+Mooncake's role for Engram is now clear:
+
+> Mooncake is not Engram's model computation module.
+> Mooncake is Engram's deterministic embedding data plane: it stores per-layer/per-head embedding tables, hashes token sequences into row indices, and returns `[B, L, H, D]` embeddings as fast as possible.
 
 ## References
 
 - **Paper**: [Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models](https://arxiv.org/abs/2601.07372)
-- **GitHub**: [DeepSeek Engram](https://github.com/deepseek-ai/Engram)
 - **Mooncake Store**: [Design Documentation](./mooncake-store.md)
