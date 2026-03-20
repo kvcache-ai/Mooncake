@@ -98,13 +98,52 @@ class ConnectionContext {
     int32_t* warmup_send_region() const { return warmup_send_region_; }
     int32_t* warmup_recv_region() const { return warmup_recv_region_; }
 
+    /**
+     * @brief Get the total number of actively connected peers.
+     * @return The count of peers currently in the CONNECTED state.
+     */
     int getTotalConnectedPeers() const;
 
+    /**
+     * @brief Expands the group to a new size.
+     *
+     * @note This is a non-blocking operation. Callers must invoke
+     *       `waitUntilNewRanksConnected()` prior to initiating any
+     *       subsequent communications (e.g., send, recv, putTaskCpu,
+     *       putTaskCuda) to ensure the new peers are ready.
+     *
+     * @param newGroupSize The target size for the extended group.
+     */
     void extendGroupSizeTo(int newGroupSize);
 
+    /**
+     * @brief Checks whether all peers within the group have
+     *        established connections.
+     *
+     * @return True if all peers are fully connected.
+     */
     bool isAllPeerConnected() const;
+
+    /**
+     * @brief Blocks until all peers in the group are connected.
+     *
+     * This method is primarily used during backend initialization.
+     * Upon completion, it set `establishedGroupSize_` to the
+     * current `groupSize_`.
+     */
     void waitUntilAllConnected();
 
+    /**
+     * @brief Blocks until all newly added ranks in the
+     *        extended group are connected.
+     *
+     * Specifically, it waits for pending ranks in the range
+     * `[establishedGroupSize_, groupSize_)` to reach the connected state.
+     * This should be called before starting new communications if
+     * `extendGroupSizeTo()` has been invoked.
+     * Upon completion, it set `establishedGroupSize_` to the
+     * current `groupSize_`.
+     */
     void waitUntilNewRanksConnected();
 
     void shutdown();
