@@ -94,10 +94,11 @@ void cleanup_segment() {
 }
 
 bool initialize_client() {
+    std::vector<std::string> protocols = {FLAGS_protocol};
     auto client_opt = Client::Create(
         FLAGS_local_hostname,              // Local hostname
         FLAGS_metadata_connection_string,  // Metadata connection string
-        FLAGS_protocol, FLAGS_master_address);
+        protocols, FLAGS_master_address);
 
     if (!client_opt.has_value()) {
         LOG(ERROR) << "Failed to create client";

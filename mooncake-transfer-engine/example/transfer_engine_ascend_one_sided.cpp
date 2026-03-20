@@ -148,32 +148,30 @@ int initiator() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     void *devAddr = nullptr;
+    void *devAddr2 = nullptr;
     ret = allocateDevMem(devAddr, FLAGS_block_size * FLAGS_batch_size);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
     }
 
-    LOG(INFO) << "devAddr_initiator: " << devAddr;
-
-    ret = engine->registerLocalMemory(devAddr, g_TotalSize,
-                                      "npu:" + std::to_string(g_devicePhyId));
-    if (ret) {
-        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
-        return ret;
-    }
-
-    void *devAddr2 = nullptr;
     ret = allocateDevMem(devAddr2, FLAGS_block_size * FLAGS_batch_size);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
     }
 
+    LOG(INFO) << "devAddr_initiator: " << devAddr;
     LOG(INFO) << "devAddr_initiator2: " << devAddr2;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        devAddr, g_TotalSize, "npu:" + std::to_string(g_devicePhyId));
+    buffer_map[FLAGS_protocol].emplace_back(
+        devAddr2, g_TotalSize, "npu:" + std::to_string(g_devicePhyId));
 
-    ret = engine->registerLocalMemory(devAddr2, g_TotalSize,
-                                      "npu:" + std::to_string(g_devicePhyId));
+    ret = engine->registerLocalMemory(buffer_map);
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
         return ret;
@@ -212,7 +210,7 @@ int initiator() {
         requests.emplace_back(entry);
     }
 
-    s = engine->submitTransfer(batch_id, requests);
+    s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
     LOG_ASSERT(s.ok());
     bool completed = false;
     TransferStatus status;
@@ -252,7 +250,7 @@ int initiator() {
         requests2.emplace_back(entry);
     }
     completed = false;
-    s = engine->submitTransfer(batch_id_2, requests2);
+    s = engine->submitTransfer(batch_id_2, requests2, FLAGS_protocol);
     LOG_ASSERT(s.ok());
     while (!completed) {
         Status s = engine->getBatchTransferStatus(batch_id_2, status);
@@ -320,7 +318,7 @@ int initiator() {
             requests.emplace_back(entry);
         }
 
-        s = engine->submitTransfer(batch_id, requests);
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -370,34 +368,33 @@ int target() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     void *devAddr = nullptr;
-    ret = allocateDevMem(devAddr, FLAGS_block_size * FLAGS_batch_size);
+    void *devAddr2 = nullptr ret =
+        allocateDevMem(devAddr, FLAGS_block_size * FLAGS_batch_size);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
     }
 
-    LOG(INFO) << "devAddr_target: " << devAddr;
-
-    ret = engine->registerLocalMemory(devAddr,
-                                      g_TotalSize * FLAGS_target_recv_count,
-                                      "npu:" + std::to_string(g_devicePhyId));
-    if (ret) {
-        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
-        return ret;
-    }
-
-    void *devAddr2 = nullptr;
     ret = allocateDevMem(devAddr2, FLAGS_block_size * FLAGS_batch_size);
     if (ret) {
         LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
         return ret;
     }
 
+    LOG(INFO) << "devAddr_target: " << devAddr;
     LOG(INFO) << "devAddr_target_2: " << devAddr2;
 
-    ret = engine->registerLocalMemory(devAddr2,
-                                      g_TotalSize * FLAGS_target_recv_count,
-                                      "npu:" + std::to_string(g_devicePhyId));
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        devAddr, g_TotalSize * FLAGS_target_recv_count,
+        "npu:" + std::to_string(g_devicePhyId));
+    buffer_map[FLAGS_protocol].emplace_back(
+        devAddr2, g_TotalSize * FLAGS_target_recv_count,
+        "npu:" + std::to_string(g_devicePhyId));
+
+    ret = engine->registerLocalMemory(buffer_map);
     if (ret) {
         LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
         return ret;

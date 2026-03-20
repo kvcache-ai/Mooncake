@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include "replica.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -402,13 +403,15 @@ TransferStrategy TransferFuture::strategy() const {
 // TransferSubmitter Implementation
 // ============================================================================
 
-TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     std::shared_ptr<StorageBackend>& backend,
-                                     TransferMetric* transfer_metric)
+TransferSubmitter::TransferSubmitter(
+    TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+    TransferMetric* transfer_metric,
+    std::unordered_map<StorageLevel, std::string> level_protocols)
     : engine_(engine),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
-      transfer_metric_(transfer_metric) {
+      transfer_metric_(transfer_metric),
+      level_protocols_(std::move(level_protocols)) {
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
@@ -449,13 +452,15 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         TransferStrategy strategy = selectStrategy(handle, slices);
+        std::string proto = level_protocols_[replica.get_storage_level()];
 
         switch (strategy) {
             case TransferStrategy::LOCAL_MEMCPY:
                 future = submitMemcpyOperation(handle, slices, op_code);
                 break;
             case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
+                future = submitTransferEngineOperation(handle, slices, op_code,
+                                                       proto);
                 break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -479,6 +484,17 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+
+    // obtain protocol from the first replica (assume all replicas have same
+    // protocol)
+    std::string proto;
+    if (!replicas.empty()) {
+        proto = level_protocols_[replicas[0].get_storage_level()];
+    } else {
+        LOG(ERROR) << "Replicas are empty";
+        return std::nullopt;
+    }
+
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -505,7 +521,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+    future = submitTransfer(requests, proto);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -519,7 +535,8 @@ std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, Slice>& batched_slices,
+    StorageLevel storage_level) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -539,7 +556,8 @@ TransferSubmitter::submit_batch_get_offload_object(
         request.length = slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    std::string proto = level_protocols_[storage_level];
+    return submitTransfer(requests, proto);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
@@ -588,7 +606,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests, std::string proto) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -598,7 +616,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     }
 
     // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
+    Status s = engine_.submitTransfer(batch_id, requests, proto);
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
@@ -624,7 +642,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, std::string& proto) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -658,7 +676,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, proto);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(

@@ -563,6 +563,7 @@ int HcclTransport::registerLocalMemory(void *addr, size_t length,
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
+    buffer_desc.protocol = "ascend";
 
     int ret;
     ret = regLocalRmaMem(addr, (uint64_t)length);
@@ -589,7 +590,7 @@ int HcclTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "ascend";
+    desc->protocol.push_back("ascend");
     desc->rank_info.rankId = local_rank_info_.rankId;
     desc->rank_info.hostIp = inet_ntoa(local_rank_info_.hostIp);
     desc->rank_info.hostPort = local_rank_info_.hostPort;

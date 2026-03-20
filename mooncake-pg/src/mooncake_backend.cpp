@@ -11,7 +11,7 @@
 #include <memory>
 #include "connection_poller.h"
 #include "mooncake_worker.cuh"
-
+#include <cstdlib>
 namespace mooncake {
 
 constexpr const char* REGISTER_BUFFER_ERROR_MSG =
@@ -111,44 +111,43 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Register buffers
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    const char* env_protocol = std::getenv("MC_PROTOCOL");
+    protocol_ = env_protocol ? env_protocol : "rdma";
+
     if (isCpu) {
         for (size_t i = 0; i < 2; i++) {
             send_buffer_[i] = malloc(kBufferSize);
             TORCH_CHECK(send_buffer_[i],
                         c10::str("Failed to allocate CPU send buffer"));
 
-            int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                  location);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+            buffer_map[protocol_].emplace_back(send_buffer_[i], kBufferSize,
+                                               location);
         }
 
         for (size_t i = 0; i < 2; i++) {
             recv_buffer_[i] = malloc(kBufferSize);
             TORCH_CHECK(recv_buffer_[i],
                         c10::str("Failed to allocate CPU recv buffer"));
-
-            int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                  location);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+            buffer_map[protocol_].emplace_back(recv_buffer_[i], kBufferSize,
+                                               location);
         }
 
     } else {
         for (size_t i = 0; i < 2; i++) {
             cudaError err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
-
-            int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                  location);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+            buffer_map[protocol_].emplace_back(send_buffer_[i], kBufferSize,
+                                               location);
         }
 
         for (size_t i = 0; i < 2; i++) {
             cudaError err = cudaMalloc(&recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
-
-            int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                  location);
-            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+            buffer_map[protocol_].emplace_back(recv_buffer_[i], kBufferSize,
+                                               location);
         }
     }
 
@@ -157,17 +156,17 @@ MooncakeBackend::MooncakeBackend(
                 "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_->registerLocalMemory(
+        buffer_map[protocol_].emplace_back(
             cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), location);
-        TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_->registerLocalMemory(
+        buffer_map[protocol_].emplace_back(
             cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), location);
-        TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
+    int rc = engine_->registerLocalMemory(buffer_map);
+    TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
     auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
     int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
@@ -747,11 +746,18 @@ void MooncakeBackend::shutdown() {
     connection_ctx_->shutdown();
     ConnectionPoller::GetInstance().removeContext(connection_ctx_);
 
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
     for (size_t i = 0; i < 2; i++) {
-        engine_->unregisterLocalMemory(cpu_sync_send_region_[i]);
-        engine_->unregisterLocalMemory(cpu_sync_recv_region_[i]);
-        engine_->unregisterLocalMemory(send_buffer_[i]);
-        engine_->unregisterLocalMemory(recv_buffer_[i]);
+        buffer_map[protocol_].emplace_back(cpu_sync_send_region_[i]);
+        buffer_map[protocol_].emplace_back(cpu_sync_recv_region_[i]);
+        buffer_map[protocol_].emplace_back(send_buffer_[i]);
+        buffer_map[protocol_].emplace_back(recv_buffer_[i]);
+    }
+    engine_->unregisterLocalMemory(buffer_map);
+
+    for (size_t i = 0; i < 2; i++) {
         delete[] cpu_sync_send_region_[i];
         delete[] cpu_sync_recv_region_[i];
         if (isCpu_) {

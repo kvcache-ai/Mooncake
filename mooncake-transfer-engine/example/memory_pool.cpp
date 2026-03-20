@@ -81,19 +81,23 @@ int target() {
     engine->installTransport("rdma", args);
 
     LOG_ASSERT(engine);
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
 
     void *addr[2] = {nullptr};
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(dram_buffer_size, i);
-        int rc = engine->registerLocalMemory(addr[i], dram_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map["rdma"].emplace_back(addr[i], dram_buffer_size,
+                                        "cpu:" + std::to_string(i));
     }
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 
     while (true) sleep(1);
 
+    engine->unregisterLocalMemory(buffer_map);
     for (int i = 0; i < NR_SOCKETS; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], dram_buffer_size);
     }
 

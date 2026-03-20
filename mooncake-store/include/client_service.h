@@ -59,13 +59,16 @@ class QueryResult {
  */
 class Client {
    public:
+    using RegisteredBuffer = TransferEngine::RegisteredBuffer;
+
+   public:
     ~Client();
 
     /**
      * @brief Creates and initializes a new Client instance
      * @param local_hostname Local host address (IP:Port)
      * @param metadata_connstring Connection string for metadata service
-     * @param protocol Transfer protocol ("rdma" or "tcp")
+     * @param protocols Transfer protocols (["rdma" or "tcp", "cxl"])
      * @param device_names Comma-separated RDMA device names.
      *        Optional with default auto-discovery. Only required when
      *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
@@ -77,7 +80,8 @@ class Client {
      */
     static std::optional<std::shared_ptr<Client>> Create(
         const std::string& local_hostname,
-        const std::string& metadata_connstring, const std::string& protocol,
+        const std::string& metadata_connstring,
+        const std::vector<std::string>& protocols,
         const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
@@ -329,6 +333,9 @@ class Client {
      */
     void* GetBaseAddr();
 
+    std::unordered_map<StorageLevel, std::string> GetLevelProtocols() {
+        return level_protocols_;
+    }
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
@@ -480,7 +487,7 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring, const std::string& protocol,
+           const std::string& metadata_connstring,
            const std::map<std::string, std::string>& labels = {});
 
     /**
@@ -489,7 +496,8 @@ class Client {
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
-        const std::string& metadata_connstring, const std::string& protocol,
+        const std::string& metadata_connstring,
+        const std::vector<std::string>& protocols,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
@@ -576,6 +584,7 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void DispatchProtocols(const std::vector<std::string>& protocols);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
@@ -588,6 +597,9 @@ class Client {
 
     // Client identification
     const UUID client_id_;
+
+    // Store Level
+    std::unordered_map<StorageLevel, std::string> level_protocols_;
 
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
@@ -604,7 +616,6 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
-    const std::string protocol_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;

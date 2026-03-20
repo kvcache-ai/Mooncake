@@ -84,10 +84,11 @@ class ClientIdCaptureSink : public google::LogSink {
 class ClientIntegrationTest : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
+        std::vector<std::string> protocols = {FLAGS_protocol};
         auto client_opt =
             Client::Create(host_name,       // Local hostname
                            "P2PHANDSHAKE",  // Metadata connection string
-                           FLAGS_protocol,  // Transfer protocol
+                           protocols,       // Transfer protocol
                            std::nullopt,  // RDMA device names (auto-discovery)
                            master_address_  // Master server address (non-HA)
             );
@@ -1321,8 +1322,9 @@ class EvictionNotificationTest : public ::testing::Test {
     }
 
     void CreateClientAndMount() {
+        std::vector<std::string> protocols = {FLAGS_protocol};
         auto client_opt = Client::Create("localhost:17820",  // unique hostname
-                                         "P2PHANDSHAKE", FLAGS_protocol,
+                                         "P2PHANDSHAKE", protocols,
                                          std::nullopt, master_address_);
         ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
         client_ = client_opt.value();

@@ -182,7 +182,7 @@ int NvlinkTransport::install(std::string &local_server_name,
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "nvlink";
+    desc->protocol.push_back("nvlink");
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -337,6 +337,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
+        desc.protocol = "nvlink";
         desc.shm_name =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
         return metadata_->addLocalMemoryBuffer(desc, true);

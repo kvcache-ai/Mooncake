@@ -32,6 +32,7 @@
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
+#include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
@@ -46,6 +47,8 @@ using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
+
+using RegisteredBuffer = TransferEngine::RegisteredBuffer;
 
 class TransferEngineImpl {
    public:
@@ -102,12 +105,13 @@ class TransferEngineImpl {
 
     int removeLocalSegment(const std::string& segment_name);
 
-    int registerLocalMemory(void* addr, size_t length,
-                            const std::string& location = kWildcardLocation,
-                            bool remote_accessible = true,
-                            bool update_metadata = true);
+    int registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
 
-    int unregisterLocalMemory(void* addr, bool update_metadata = true);
+    int unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
 
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string& location);
@@ -123,8 +127,9 @@ class TransferEngineImpl {
     }
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest>& entries) {
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
+                          const std::vector<TransferRequest>& entries,
+                          std::string& proto) {
+        Status s = multi_transports_->submitTransfer(batch_id, entries, proto);
 #ifdef WITH_METRICS
         if (metrics_enabled_ && s.ok()) {
             auto& batch = Transport::toBatchDesc(batch_id);
@@ -141,9 +146,10 @@ class TransferEngineImpl {
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
-                                    TransferMetadata::NotifyDesc notify_msg) {
+                                    TransferMetadata::NotifyDesc notify_msg,
+                                    std::string& proto) {
         auto target_id = entries[0].target_id;
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
+        Status s = multi_transports_->submitTransfer(batch_id, entries, proto);
         if (!s.ok()) {
             return s;
         }

@@ -23,7 +23,7 @@
 #include "test_server_helpers.h"
 #include "default_config.h"
 
-DEFINE_string(protocol, "cxl", "Transfer protocol: rdma|tcp|cxl");
+DEFINE_string(protocol, "cxl,tcp", "Transfer protocol: rdma|tcp|cxl");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects, must be set to the "
@@ -35,6 +35,7 @@ DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
               "Metadata connection string for transfer engine");
 DEFINE_double(eviction_high_watermark_ratio, 0.1,
               "Ratio of high watermark trigger eviction");
+DEFINE_uint64(segment_size, 512UL * 1024 * 1024, "Segment size");
 
 namespace mooncake {
 namespace testing {
@@ -94,7 +95,13 @@ class ClientIdCaptureSink : public google::LogSink {
 class ClientIntegrationTestCxl : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
-        std::vector<std::string> protocols = {FLAGS_protocol};
+        std::stringstream ss(FLAGS_protocol);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            if (!item.empty()) {
+                protocols.push_back(item);
+            }
+        }
         auto client_opt = Client::Create(
             host_name,                           // Local hostname
             FLAGS_transfer_engine_metadata_url,  // Metadata connection string
@@ -166,34 +173,56 @@ class ClientIntegrationTestCxl : public ::testing::Test {
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
 
         // Mount segment for test_client_ as well
-        ASSERT_TRUE(FLAGS_protocol == "cxl");
+        for (auto& protocol : test_client_->GetLevelProtocols()) {
+            if (protocol.first == StorageLevel::RAM) {
+                test_client_segment_ptr_ =
+                    allocate_buffer_allocator_memory(FLAGS_segment_size);
+                LOG_ASSERT(test_client_segment_ptr_);
 
-        size_t cxl_dev_size = 0;
-        const char* env_cxl_size = getenv("MC_CXL_DEV_SIZE");
-        if (env_cxl_size) {
-            char* end = nullptr;
-            unsigned long long val = std::strtoull(env_cxl_size, &end, 10);
-            if (end != env_cxl_size && *end == '\0')
-                cxl_dev_size = static_cast<size_t>(val);
-        } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE environment variable not set "
-                          "(required for CXL protocol)";
-            return;
+                auto test_client_mount_result = test_client_->MountSegment(
+                    test_client_segment_ptr_, FLAGS_segment_size,
+                    protocol.second);
+                if (!test_client_mount_result.has_value()) {
+                    LOG(ERROR)
+                        << "Failed to mount RAM segment for test_client_: "
+                        << toString(test_client_mount_result.error());
+                }
+                client_segment_ptrs_[test_client_.get()].emplace_back(
+                    reinterpret_cast<uintptr_t>(test_client_segment_ptr_),
+                    FLAGS_segment_size);
+            } else if (protocol.first == StorageLevel::CXL) {
+                size_t cxl_dev_size = 0;
+                const char* env_cxl_size = getenv("MC_CXL_DEV_SIZE");
+                if (env_cxl_size) {
+                    char* end = nullptr;
+                    unsigned long long val =
+                        std::strtoull(env_cxl_size, &end, 10);
+                    if (end != env_cxl_size && *end == '\0')
+                        cxl_dev_size = static_cast<size_t>(val);
+                } else {
+                    LOG(FATAL)
+                        << "MC_CXL_DEV_SIZE environment variable not set "
+                           "(required for CXL protocol)";
+                    return;
+                }
+                test_client_ram_buffer_size_ = cxl_dev_size;
+                test_client_segment_ptr_ = test_client_->GetBaseAddr();
+
+                LOG_ASSERT(test_client_segment_ptr_);
+
+                auto test_client_mount_result = test_client_->MountSegment(
+                    test_client_segment_ptr_, test_client_ram_buffer_size_,
+                    protocol.second);
+                if (!test_client_mount_result.has_value()) {
+                    LOG(ERROR)
+                        << "Failed to mount CXL segment for test_client_: "
+                        << toString(test_client_mount_result.error());
+                }
+                client_segment_ptrs_[test_client_.get()].emplace_back(
+                    reinterpret_cast<uintptr_t>(test_client_segment_ptr_),
+                    test_client_ram_buffer_size_);
+            }
         }
-        test_client_ram_buffer_size_ = cxl_dev_size;
-        test_client_segment_ptr_ = test_client_->GetBaseAddr();
-
-        LOG_ASSERT(test_client_segment_ptr_);
-        LOG(INFO) << "test_client_segment_ptr_: " << test_client_segment_ptr_;
-
-        auto test_client_mount_result = test_client_->MountSegment(
-            test_client_segment_ptr_, test_client_ram_buffer_size_,
-            FLAGS_protocol);
-        if (!test_client_mount_result.has_value()) {
-            LOG(ERROR) << "Failed to mount CXL segment for test_client_: "
-                       << toString(test_client_mount_result.error());
-        }
-        LOG(INFO) << "Test client CXL segment mounted successfully";
     }
 
     static void InitializeClients() {
@@ -228,13 +257,18 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     }
 
     static void CleanupSegment() {
-        // Unmount test client segment first
-        if (test_client_ && test_client_segment_ptr_) {
-            if (!test_client_
-                     ->UnmountSegment(test_client_segment_ptr_,
-                                      test_client_ram_buffer_size_)
-                     .has_value()) {
-                LOG(ERROR) << "Failed to unmount test client CXL segment";
+        if (!client_segment_ptrs_.empty()) {
+            for (auto& kv : client_segment_ptrs_) {
+                Client* client = kv.first;
+                auto& segment_ptrs = kv.second;
+                for (auto [ptr, size] : segment_ptrs) {
+                    if (!client
+                             ->UnmountSegment(reinterpret_cast<void*>(ptr),
+                                              size)
+                             .has_value()) {
+                        LOG(ERROR) << "Failed to unmount segment";
+                    }
+                }
             }
         }
     }
@@ -244,6 +278,10 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     // application, user should manage the memory allocation and deallocation
     // themselves.
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
+    static std::vector<std::string> protocols;
+    static std::unordered_map<Client*,
+                              std::vector<std::pair<uintptr_t, size_t>>>
+        client_segment_ptrs_;
     static void* test_client_segment_ptr_;
     static size_t test_client_ram_buffer_size_;
     static uint64_t default_kv_lease_ttl_;
@@ -262,6 +300,9 @@ std::unique_ptr<SimpleAllocator>
     ClientIntegrationTestCxl::client_buffer_allocator_ = nullptr;
 size_t ClientIntegrationTestCxl::test_client_ram_buffer_size_ = 0;
 uint64_t ClientIntegrationTestCxl::default_kv_lease_ttl_ = 0;
+std::vector<std::string> ClientIntegrationTestCxl::protocols = {};
+std::unordered_map<Client*, std::vector<std::pair<uintptr_t, size_t>>>
+    ClientIntegrationTestCxl::client_segment_ptrs_ = {};
 InProcMaster ClientIntegrationTestCxl::master_;
 std::string ClientIntegrationTestCxl::master_address_;
 std::string ClientIntegrationTestCxl::metadata_url_;
@@ -282,6 +323,7 @@ TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {
     // Test Put operation
     ReplicateConfig config;
     config.replica_num = 1;
+    config.preferred_storage_level = StorageLevel::CXL;
     auto put_result = test_client_->Put(key, slices, config);
     ASSERT_TRUE(put_result.has_value())
         << "Put operation failed: " << toString(put_result.error());
@@ -339,6 +381,7 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
     // Test Batch Put operation
     ReplicateConfig config;
     config.replica_num = 1;
+    config.preferred_storage_level = StorageLevel::CXL;
     auto start = std::chrono::high_resolution_clock::now();
     auto batch_put_results =
         test_client_->BatchPut(keys, batched_slices, config);
@@ -427,6 +470,7 @@ TEST_F(ClientIntegrationTestCxl, EvictOperation) {
         // Test Put operation
         ReplicateConfig config;
         config.replica_num = 1;
+        config.preferred_storage_level = StorageLevel::CXL;
         auto put_result = test_client_->Put(key, slices, config);
         ASSERT_TRUE(put_result.has_value())
             << "Put failed at i=" << i << " " << toString(put_result.error());

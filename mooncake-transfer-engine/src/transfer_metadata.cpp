@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <set>
+#include <algorithm>
 
 #include "common.h"
 #include "config.h"
@@ -25,6 +26,16 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
+
+static std::string protocolsToString(
+    const std::vector<std::string> &protocols) {
+    std::string result;
+    for (size_t i = 0; i < protocols.size(); ++i) {
+        if (i > 0) result += ",";
+        result += protocols[i];
+    }
+    return result;
+}
 
 static inline std::string extractProtocolFromConnString(
     const std::string &conn_string) {
@@ -165,118 +176,96 @@ int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
 int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                                         Json::Value &segmentJSON) {
     segmentJSON["name"] = desc.name;
-    segmentJSON["protocol"] = desc.protocol;
-    segmentJSON["tcp_data_port"] = desc.tcp_data_port;
-    segmentJSON["timestamp"] = getCurrentDateTime();
+    Json::Value protocolJSON(Json::arrayValue);
+    for (const auto &proto : desc.protocol) {
+        if (proto == "rdma" || proto == "barex" || proto == "efa") {
+            Json::Value devicesJSON(Json::arrayValue);
+            for (const auto &device : desc.devices) {
+                Json::Value deviceJSON;
+                deviceJSON["name"] = device.name;
+                deviceJSON["lid"] = device.lid;
+                deviceJSON["gid"] = device.gid;
+                devicesJSON.append(deviceJSON);
+            }
+            segmentJSON["devices"] = devicesJSON;
+            segmentJSON["priority_matrix"] = desc.topology.toJson();
+        } else if (proto == "ascend") {
+            Json::Value devicesJSON(Json::arrayValue);
+            for (const auto &device : desc.devices) {
+                Json::Value deviceJSON;
+                deviceJSON["name"] = device.name;
+                deviceJSON["lid"] = device.lid;
+                devicesJSON.append(deviceJSON);
+            }
+            segmentJSON["devices"] = devicesJSON;
 
-    if (segmentJSON["protocol"] == "rdma" ||
-        segmentJSON["protocol"] == "barex" ||
-        segmentJSON["protocol"] == "efa") {
-        Json::Value devicesJSON(Json::arrayValue);
-        for (const auto &device : desc.devices) {
-            Json::Value deviceJSON;
-            deviceJSON["name"] = device.name;
-            deviceJSON["lid"] = device.lid;
-            deviceJSON["gid"] = device.gid;
-            devicesJSON.append(deviceJSON);
+            Json::Value rankInfoJSON;
+            rankInfoJSON["rankId"] =
+                static_cast<Json::UInt64>(desc.rank_info.rankId);
+            rankInfoJSON["hostIp"] = desc.rank_info.hostIp;
+            rankInfoJSON["hostPort"] =
+                static_cast<Json::UInt64>(desc.rank_info.hostPort);
+            rankInfoJSON["deviceLogicId"] =
+                static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
+            rankInfoJSON["devicePhyId"] =
+                static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
+            rankInfoJSON["deviceType"] =
+                static_cast<Json::UInt64>(desc.rank_info.deviceType);
+            rankInfoJSON["deviceIp"] = desc.rank_info.deviceIp;
+            rankInfoJSON["devicePort"] =
+                static_cast<Json::UInt64>(desc.rank_info.devicePort);
+            rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
+
+            segmentJSON["rank_info"] = rankInfoJSON;
+        } else if (proto == "cxl") {
+            segmentJSON["cxl_name"] = desc.cxl_name;
+            segmentJSON["cxl_base_addr"] =
+                static_cast<Json::UInt64>(desc.cxl_base_addr);
         }
-        segmentJSON["devices"] = devicesJSON;
+        protocolJSON.append(proto);
+    }
 
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
+    // Encode buffers based on each buffer's protocol
+    Json::Value buffersJSON(Json::arrayValue);
+    for (const auto &buffer : desc.buffers) {
+        Json::Value bufferJSON;
+        bufferJSON["name"] = buffer.name;
+        bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+        bufferJSON["protocol"] = buffer.protocol;
+
+        if (buffer.protocol == "cxl") {
+            // CXL uses offset instead of addr
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+        } else if (buffer.protocol == "rdma" || buffer.protocol == "barex" ||
+                   buffer.protocol == "efa") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             Json::Value rkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.rkey) rkeyJSON.append(entry);
             bufferJSON["rkey"] = rkeyJSON;
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
-            buffersJSON.append(bufferJSON);
-        }
-        segmentJSON["buffers"] = buffersJSON;
-        segmentJSON["priority_matrix"] = desc.topology.toJson();
-    } else if (segmentJSON["protocol"] == "tcp") {
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
+        } else if (buffer.protocol == "tcp" || buffer.protocol == "ascend") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
-            buffersJSON.append(bufferJSON);
-        }
-        segmentJSON["buffers"] = buffersJSON;
-    } else if (segmentJSON["protocol"] == "ascend") {
-        Json::Value devicesJSON(Json::arrayValue);
-        for (const auto &device : desc.devices) {
-            Json::Value deviceJSON;
-            deviceJSON["name"] = device.name;
-            deviceJSON["lid"] = device.lid;
-            devicesJSON.append(deviceJSON);
-        }
-        segmentJSON["devices"] = devicesJSON;
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
+        } else if (buffer.protocol == "nvlink" ||
+                   buffer.protocol == "nvlink_intra" ||
+                   buffer.protocol == "hip" || buffer.protocol == "ubshmem") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
-            buffersJSON.append(bufferJSON);
-        }
-        segmentJSON["buffers"] = buffersJSON;
-
-        Json::Value rankInfoJSON;
-        rankInfoJSON["rankId"] =
-            static_cast<Json::UInt64>(desc.rank_info.rankId);
-        rankInfoJSON["hostIp"] = desc.rank_info.hostIp;
-        rankInfoJSON["hostPort"] =
-            static_cast<Json::UInt64>(desc.rank_info.hostPort);
-        rankInfoJSON["deviceLogicId"] =
-            static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
-        rankInfoJSON["devicePhyId"] =
-            static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
-        rankInfoJSON["deviceType"] =
-            static_cast<Json::UInt64>(desc.rank_info.deviceType);
-        rankInfoJSON["deviceIp"] = desc.rank_info.deviceIp;
-        rankInfoJSON["devicePort"] =
-            static_cast<Json::UInt64>(desc.rank_info.devicePort);
-        rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
-
-        segmentJSON["rank_info"] = rankInfoJSON;
-    } else if (segmentJSON["protocol"] == "nvlink" ||
-               segmentJSON["protocol"] == "nvlink_intra" ||
-               segmentJSON["protocol"] == "hip" ||
-               segmentJSON["protocol"] == "ubshmem") {
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
-            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["shm_name"] = buffer.shm_name;
-            buffersJSON.append(bufferJSON);
+        } else {
+            LOG(ERROR) << "Unsupported segment descriptor for register, name "
+                       << desc.name << " protocol "
+                       << Json::writeString(Json::StreamWriterBuilder(),
+                                            protocolJSON);
+            return ERR_METADATA;
         }
-        segmentJSON["buffers"] = buffersJSON;
-    } else if (segmentJSON["protocol"] == "cxl") {
-        segmentJSON["cxl_name"] = desc.cxl_name;
-        segmentJSON["cxl_base_addr"] =
-            static_cast<Json::UInt64>(desc.cxl_base_addr);
-        Json::Value buffersJSON(Json::arrayValue);
-        for (const auto &buffer : desc.buffers) {
-            Json::Value bufferJSON;
-            bufferJSON["name"] = buffer.name;
-            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
-            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
-            buffersJSON.append(bufferJSON);
-        }
-        segmentJSON["buffers"] = buffersJSON;
-    } else {
-        LOG(ERROR) << "Unsupported segment descriptor for register, name "
-                   << desc.name << " protocol " << desc.protocol;
-        return ERR_METADATA;
+        buffersJSON.append(bufferJSON);
     }
+    segmentJSON["buffers"] = buffersJSON;
+    segmentJSON["protocol"] = protocolJSON;
+    segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["timestamp"] = getCurrentDateTime();
+
     return 0;
 }
 
@@ -294,7 +283,8 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
     if (!storage_plugin_->set(getFullMetadataKey(segment_name), segmentJSON)) {
         LOG(ERROR) << "Failed to register segment descriptor, name "
-                   << desc.name << " protocol " << desc.protocol;
+                   << desc.name << " protocol "
+                   << protocolsToString(desc.protocol);
         return ERR_METADATA;
     }
 
@@ -328,31 +318,96 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                                     const std::string &segment_name) {
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
-    desc->protocol = segmentJSON["protocol"].asString();
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
-    if (desc->protocol == "rdma" || desc->protocol == "barex" ||
-        desc->protocol == "efa") {
-        for (const auto &deviceJSON : segmentJSON["devices"]) {
-            DeviceDesc device;
-            device.name = deviceJSON["name"].asString();
-            device.lid = deviceJSON["lid"].asUInt();
-            device.gid = deviceJSON["gid"].asString();
-            if (device.name.empty() || device.gid.empty()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
+    // Decode protocol-specific segment-level fields
+    for (const auto &protocolStr : segmentJSON["protocol"]) {
+        std::string proto = protocolStr.asString();
+        desc->protocol.push_back(proto);
+
+        if (proto == "rdma" || proto == "barex" || proto == "efa") {
+            // Decode devices for RDMA/Barex/EFA
+            if (desc->devices.empty()) {
+                for (const auto &deviceJSON : segmentJSON["devices"]) {
+                    DeviceDesc device;
+                    device.name = deviceJSON["name"].asString();
+                    device.lid = deviceJSON["lid"].asUInt();
+                    device.gid = deviceJSON["gid"].asString();
+                    if (device.name.empty() || device.gid.empty()) {
+                        LOG(WARNING) << "Corrupted segment descriptor, name "
+                                     << segment_name << " protocol " << proto;
+                        return nullptr;
+                    }
+                    desc->devices.push_back(device);
+                }
+
+                int ret = desc->topology.parse(
+                    segmentJSON["priority_matrix"].toStyledString());
+                if (ret) {
+                    LOG(WARNING) << "Corrupted segment descriptor, name "
+                                 << segment_name << " protocol " << proto;
+                }
+            }
+        } else if (proto == "ascend") {
+            if (desc->devices.empty()) {
+                for (const auto &deviceJSON : segmentJSON["devices"]) {
+                    DeviceDesc device;
+                    device.name = deviceJSON["name"].asString();
+                    device.lid = deviceJSON["lid"].asUInt();
+                    if (device.name.empty()) {
+                        LOG(WARNING) << "Corrupted segment descriptor, name "
+                                     << segment_name << " protocol " << proto;
+                        return nullptr;
+                    }
+                    desc->devices.push_back(device);
+                }
+            }
+
+            Json::Value rankInfoJSON = segmentJSON["rank_info"];
+            desc->rank_info.rankId = rankInfoJSON["rankId"].asUInt64();
+            desc->rank_info.hostIp = rankInfoJSON["hostIp"].asString();
+            desc->rank_info.hostPort = rankInfoJSON["hostPort"].asUInt64();
+            desc->rank_info.deviceLogicId =
+                rankInfoJSON["deviceLogicId"].asUInt64();
+            desc->rank_info.devicePhyId =
+                rankInfoJSON["devicePhyId"].asUInt64();
+            desc->rank_info.deviceType = rankInfoJSON["deviceType"].asUInt64();
+            desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
+            desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
+            desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+
+        } else if (proto == "cxl") {
+            desc->cxl_name = segmentJSON["cxl_name"].asString();
+            desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+        }
+    }
+
+    // Decode buffers based on each buffer's protocol
+    for (const auto &bufferJSON : segmentJSON["buffers"]) {
+        std::string buffer_protocol = bufferJSON["protocol"].asString();
+
+        if (buffer_protocol == "cxl") {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
                 return nullptr;
             }
-            desc->devices.push_back(device);
-        }
-
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "rdma" || buffer_protocol == "barex" ||
+                   buffer_protocol == "efa") {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
             for (const auto &rkeyJSON : bufferJSON["rkey"])
                 buffer.rkey.push_back(rkeyJSON.asUInt());
             for (const auto &lkeyJSON : bufferJSON["lkey"])
@@ -362,54 +417,47 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 buffer.rkey.size() != buffer.lkey.size()) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
-                    << " protocol " << desc->protocol << ", " << buffer.name
-                    << ", " << buffer.addr << ", " << buffer.length << ", "
-                    << buffer.rkey.size() << ", " << buffer.lkey.size();
+                    << " buffer_protocol " << buffer_protocol << ", "
+                    << buffer.name << ", " << buffer.addr << ", "
+                    << buffer.length << ", " << buffer.rkey.size() << ", "
+                    << buffer.lkey.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        }
-
-        int ret = desc->topology.parse(
-            segmentJSON["priority_matrix"].toStyledString());
-        if (ret) {
-            LOG(WARNING) << "Corrupted segment descriptor, name "
-                         << segment_name << " protocol " << desc->protocol;
-        }
-    } else if (desc->protocol == "tcp") {
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+        } else if (buffer_protocol == "tcp" || buffer_protocol == "ascend") {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        }
-    } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip" || desc->protocol == "ubshmem") {
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+        } else if (buffer_protocol == "nvlink" ||
+                   buffer_protocol == "nvlink_intra" ||
+                   buffer_protocol == "hip" || buffer_protocol == "ubshmem") {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.shm_name = bufferJSON["shm_name"].asString();
+            buffer.protocol = buffer_protocol;
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.shm_name.empty()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol
-                             << "buffer name " << buffer.name << "buffer addr "
-                             << buffer.addr << "buffer length " << buffer.length
-                             << "buffer shm_name " << buffer.shm_name;
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol << "buffer name "
+                    << buffer.name << "buffer addr " << buffer.addr
+                    << "buffer length " << buffer.length << "buffer shm_name "
+                    << buffer.shm_name;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
-        }
-    } else if (desc->protocol == "nvmeof") {
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+        } else if (buffer_protocol == "nvmeof") {
             NVMeoFBufferDesc buffer;
             buffer.file_path = bufferJSON["file_path"].asString();
             buffer.length = bufferJSON["length"].asUInt64();
@@ -418,64 +466,13 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 buffer.local_path_map[key] = local_path_map[key].asString();
             }
             desc->nvmeof_buffers.push_back(buffer);
+        } else {
+            LOG(ERROR) << "Unsupported buffer protocol, name " << segment_name
+                       << " buffer_protocol " << buffer_protocol;
+            return nullptr;
         }
-    } else if (desc->protocol == "ascend") {
-        for (const auto &deviceJSON : segmentJSON["devices"]) {
-            DeviceDesc device;
-            device.name = deviceJSON["name"].asString();
-            device.lid = deviceJSON["lid"].asUInt();
-            if (device.name.empty()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-                return nullptr;
-            }
-            desc->devices.push_back(device);
-        }
-
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            BufferDesc buffer;
-            buffer.name = bufferJSON["name"].asString();
-            buffer.addr = bufferJSON["addr"].asUInt64();
-            buffer.length = bufferJSON["length"].asUInt64();
-            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-                return nullptr;
-            }
-            desc->buffers.push_back(buffer);
-        }
-
-        Json::Value rankInfoJSON = segmentJSON["rank_info"];
-        desc->rank_info.rankId = rankInfoJSON["rankId"].asUInt64();
-        desc->rank_info.hostIp = rankInfoJSON["hostIp"].asString();
-        desc->rank_info.hostPort = rankInfoJSON["hostPort"].asUInt64();
-        desc->rank_info.deviceLogicId =
-            rankInfoJSON["deviceLogicId"].asUInt64();
-        desc->rank_info.devicePhyId = rankInfoJSON["devicePhyId"].asUInt64();
-        desc->rank_info.deviceType = rankInfoJSON["deviceType"].asUInt64();
-        desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
-        desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
-        desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
-    } else if (desc->protocol == "cxl") {
-        desc->cxl_name = segmentJSON["cxl_name"].asString();
-        desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
-        for (const auto &bufferJSON : segmentJSON["buffers"]) {
-            BufferDesc buffer;
-            buffer.name = bufferJSON["name"].asString();
-            buffer.offset = bufferJSON["offset"].asUInt64();
-            buffer.length = bufferJSON["length"].asUInt64();
-            if (buffer.name.empty() || !buffer.length) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
-                return nullptr;
-            }
-            desc->buffers.push_back(buffer);
-        }
-    } else {
-        LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
-                   << " protocol " << desc->protocol;
-        return nullptr;
     }
+
     return desc;
 }
 

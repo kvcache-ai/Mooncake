@@ -25,9 +25,10 @@ ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
                                        const std::string& device_name,
                                        const std::string& master_server_entry,
                                        size_t local_buffer_size) {
-    auto client_opt =
-        Client::Create(hostname,  // Local hostname
-                       metadata_connstring, protocol, master_server_entry);
+    std::vector<std::string> protocols = {protocol};
+    auto client_opt = Client::Create(hostname,  // Local hostname
+                                     metadata_connstring, protocols,
+                                     device_name, master_server_entry);
 
     if (!client_opt.has_value()) {
         return std::nullopt;

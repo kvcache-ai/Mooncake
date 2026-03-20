@@ -218,6 +218,7 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
             buffer_desc.name = entry.location;
             buffer_desc.addr = entry.start;
             buffer_desc.length = entry.len;
+            buffer_desc.protocol = "barex";
             int rc =
                 metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
             if (rc) return rc;
@@ -226,6 +227,7 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
         buffer_desc.name = name;
         buffer_desc.addr = (uint64_t)addr;
         buffer_desc.length = length;
+        buffer_desc.protocol = "barex";
         int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
         if (rc) return rc;
     }
@@ -282,7 +284,7 @@ int BarexTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "barex";
+    desc->protocol.push_back("barex");
     for (auto &entry : server_context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->getCtx()->GetXDevice()->GetName();

@@ -295,6 +295,7 @@ int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
+    buffer_desc.protocol = "efa";
     int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (rc) return rc;
     return 0;
@@ -360,7 +361,7 @@ int EfaTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
-    desc->protocol = "efa";
+    desc->protocol.push_back("efa");
     for (auto &entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();

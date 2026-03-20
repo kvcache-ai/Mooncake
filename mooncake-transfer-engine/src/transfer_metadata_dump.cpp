@@ -18,7 +18,10 @@
 namespace mooncake {
 void TransferMetadata::SegmentDesc::dump() const {
     LOG(INFO) << "  segment name: " << name;
-    LOG(INFO) << "  protocol: " << protocol;
+    LOG(INFO) << "  protocols: ";
+    for (std::string proto : protocol) {
+        LOG(INFO) << "    protocol: " << proto;
+    }
     LOG(INFO) << "  topology: " << topology.toString();
     LOG(INFO) << "  devices: ";
     for (auto &device : devices) {

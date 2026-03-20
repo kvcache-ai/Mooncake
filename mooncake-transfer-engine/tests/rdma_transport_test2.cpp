@@ -109,6 +109,9 @@ class RDMATransportTest : public ::testing::Test {
     mooncake::Transport::SegmentID segment_id;
     std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
     uint64_t remote_base;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
 
    protected:
     void SetUp() override {
@@ -130,17 +133,20 @@ class RDMATransportTest : public ::testing::Test {
         xport = engine->installTransport("rdma", args);
         ASSERT_NE(xport, nullptr);
         addr = allocateMemoryPool(ram_buffer_size, 0, false);
-        int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+        buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+        int rc = engine->registerLocalMemory(buffer_map);
         ASSERT_EQ(rc, 0);
         segment_id = engine->openSegment(FLAGS_segment_id.c_str());
         bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
         remote_base = (uint64_t)segment_desc->buffers[0].addr;
+        buffer_map.clear();
     }
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
-        engine->unregisterLocalMemory(addr);
+        buffer_map[FLAGS_protocol].emplace_back(addr);
+        engine->unregisterLocalMemory(buffer_map);
         freeMemoryPool(addr, ram_buffer_size);
     }
 };
@@ -159,7 +165,7 @@ TEST_F(RDMATransportTest, MultiWrite) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        s = engine->submitTransfer(batch_id, {entry});
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -193,7 +199,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
-        s = engine->submitTransfer(batch_id, {entry});
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -221,7 +227,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
         Status s;
-        s = engine->submitTransfer(batch_id, {entry});
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         ASSERT_EQ(s, Status::OK());
         bool completed = false;
         TransferStatus status;
@@ -240,7 +246,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
                      kDataLength);
         ASSERT_EQ(ret, 0);
     }
-    engine->unregisterLocalMemory(addr);
+    // engine->unregisterLocalMemory(addr);
     freeMemoryPool(addr, ram_buffer_size);
 }
 

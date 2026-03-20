@@ -67,10 +67,10 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
 
     void SetUp() override {
         // Create client 1
+        std::vector<std::string> protocols = {FLAGS_protocol};
         auto client1_opt = Client::Create(
             "127.0.0.1:18001",
-            metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_,
-            FLAGS_protocol,
+            metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_, protocols,
             FLAGS_device_name.empty() ? std::nullopt
                                       : std::make_optional(FLAGS_device_name),
             master_address_);
@@ -80,8 +80,7 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
         // Create client 2
         auto client2_opt = Client::Create(
             "127.0.0.1:18002",
-            metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_,
-            FLAGS_protocol,
+            metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_, protocols,
             FLAGS_device_name.empty() ? std::nullopt
                                       : std::make_optional(FLAGS_device_name),
             master_address_);
@@ -569,8 +568,8 @@ TEST_F(TaskExecutorIntegrationTest, MultipleCopyTasks) {
         // inconsistent cases
         ASSERT_NE(source_segment, target_segment)
             << "Source and target segments must be different for key: " << key
-            << ". "
-            << "Source: " << source_segment << ", Target: " << target_segment;
+            << ". " << "Source: " << source_segment
+            << ", Target: " << target_segment;
 
         // Step 3: Create copy task for this key
         // For the last key, use multiple target segments to test multi-target
@@ -768,8 +767,8 @@ TEST_F(TaskExecutorIntegrationTest, MultipleMoveTasks) {
 
         ASSERT_NE(source_segment, target_segment)
             << "Source and target segments must be different for key: " << key
-            << ". "
-            << "Source: " << source_segment << ", Target: " << target_segment;
+            << ". " << "Source: " << source_segment
+            << ", Target: " << target_segment;
 
         // Step 3: Create move task
         auto move_result =

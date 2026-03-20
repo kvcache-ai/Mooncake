@@ -27,6 +27,8 @@ using namespace mooncake;
 
 namespace mooncake {
 
+DEFINE_string(protocol, "efa", "Transfer protocol");
+
 static void *allocateMemoryPool(size_t size, int socket_id) {
     return numa_alloc_onnode(size, socket_id);
 }
@@ -45,6 +47,11 @@ static void freeMemoryPool(void *addr, size_t size) { numa_free(addr, size); }
 //   MC_LOCAL_SERVER_NAME - local server name (default: 127.0.0.1:12345)
 // ---------------------------------------------------------------------------
 class EFATransportTest : public ::testing::Test {
+   public:
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+
    protected:
     void SetUp() override {
         google::InitGoogleLogging("EFATransportTest");
@@ -89,7 +96,8 @@ class EFATransportTest : public ::testing::Test {
         s.addr = allocateMemoryPool(buffer_size, 0);
         EXPECT_NE(s.addr, nullptr) << "allocateMemoryPool failed";
 
-        rc = s.engine->registerLocalMemory(s.addr, buffer_size, "cpu:0");
+        buffer_map[FLAGS_protocol].emplace_back(s.addr, buffer_size, "cpu:0");
+        rc = s.engine->registerLocalMemory(buffer_map);
         EXPECT_EQ(rc, 0) << "registerLocalMemory failed";
 
         // Use actual RPC address (P2PHANDSHAKE picks a random port)
@@ -100,7 +108,9 @@ class EFATransportTest : public ::testing::Test {
 
     void destroyEngine(EngineSetup &s) {
         if (s.engine && s.addr) {
-            s.engine->unregisterLocalMemory(s.addr);
+            buffer_map.clear();
+            buffer_map[FLAGS_protocol].emplace_back(s.addr);
+            s.engine->unregisterLocalMemory(buffer_map);
         }
         if (s.addr) {
             freeMemoryPool(s.addr, s.buffer_size);
@@ -121,7 +131,7 @@ class EFATransportTest : public ::testing::Test {
         entry.target_id = segment_id;
         entry.target_offset = target_offset;
 
-        Status s = engine->submitTransfer(batch_id, {entry});
+        Status s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         if (!s.ok()) {
             LOG(ERROR) << "submitTransfer failed: " << s.ToString();
             engine->freeBatchID(batch_id);
@@ -249,7 +259,7 @@ TEST_F(EFATransportTest, MultiWrite) {
         requests.push_back(entry);
     }
 
-    Status s = setup.engine->submitTransfer(batch_id, requests);
+    Status s = setup.engine->submitTransfer(batch_id, requests, FLAGS_protocol);
     ASSERT_TRUE(s.ok()) << "submitTransfer failed: " << s.ToString();
 
     // Poll all tasks until completion
@@ -302,7 +312,8 @@ TEST_F(EFATransportTest, StressMultipleBatches) {
             requests.push_back(entry);
         }
 
-        Status s = setup.engine->submitTransfer(batch_id, requests);
+        Status s =
+            setup.engine->submitTransfer(batch_id, requests, FLAGS_protocol);
         ASSERT_TRUE(s.ok())
             << "Batch " << batch << " submitTransfer failed: " << s.ToString();
 

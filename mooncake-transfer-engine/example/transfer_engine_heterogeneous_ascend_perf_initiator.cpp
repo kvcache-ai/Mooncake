@@ -200,13 +200,11 @@ int initiator() {
     memset(hostAddr, 0, size);
 
     LOG(INFO) << "hostAddr: " << hostAddr << ", len: " << FLAGS_block_size;
-
-    ret = engine->registerLocalMemory(hostAddr, FLAGS_block_size,
-                                      "npu:" + std::to_string(g_devicePhyId));
-    if (ret) {
-        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
-        return ret;
-    }
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        hostAddr, FLAGS_block_size, "npu:" + std::to_string(g_devicePhyId));
 
     void *devAddr = NULL;
     std::vector<void *> g_addr;
@@ -219,17 +217,17 @@ int initiator() {
         }
         LOG(INFO) << "dev_addr_initiator: " << devAddr
                   << " len:" << FLAGS_batch_size * block_size;
-        ret =
-            engine->registerLocalMemory(devAddr, FLAGS_batch_size * block_size,
-                                        "npu:" + std::to_string(g_devicePhyId));
-        if (ret) {
-            LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
-            return ret;
-        }
-
+        buffer_map[FLAGS_protocol].emplace_back(
+            devAddr, FLAGS_batch_size * block_size,
+            "npu:" + std::to_string(g_devicePhyId));
         g_addr.push_back(devAddr);
     }
 
+    ret = engine->registerLocalMemory(buffer_map);
+    if (ret) {
+        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
+        return ret;
+    }
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
     TransferRequest::OpCode opcode;
@@ -261,7 +259,7 @@ int initiator() {
     entry.target_offset = remote_base;
     tmp_requests.emplace_back(entry);
 
-    s = engine->submitTransfer(tmp_batch_id, tmp_requests);
+    s = engine->submitTransfer(tmp_batch_id, tmp_requests, FLAGS_protocol);
     LOG_ASSERT(s.ok());
 
     bool completed = false;
@@ -300,7 +298,7 @@ int initiator() {
             entry.target_offset = remote_base + block_size * j;
             requests.emplace_back(entry);
         }
-        s = engine->submitTransfer(batch_id, requests);
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -360,12 +358,11 @@ int target() {
         return ret;
     }
 
-    ret = engine->registerLocalMemory(tmp_hostAddr, FLAGS_block_size,
-                                      "npu:" + std::to_string(g_devicePhyId));
-    if (ret) {
-        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
-        return ret;
-    }
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        tmp_hostAddr, FLAGS_block_size, "npu:" + std::to_string(g_devicePhyId));
 
     void *hostAddr = NULL;
     std::vector<void *> g_addr;
@@ -376,18 +373,17 @@ int target() {
             LOG(ERROR) << "Failed to aclrtMallocHost, ret: " << ret;
             return ret;
         }
-
-        ret =
-            engine->registerLocalMemory(hostAddr, FLAGS_batch_size * block_size,
-                                        "npu:" + std::to_string(g_devicePhyId));
-        if (ret) {
-            LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
-            return ret;
-        }
-
+        buffer_map[FLAGS_protocol].emplace_back(
+            hostAddr, FLAGS_batch_size * block_size,
+            "npu:" + std::to_string(g_devicePhyId));
         g_addr.push_back(hostAddr);
     }
 
+    ret = engine->registerLocalMemory(buffer_map);
+    if (ret) {
+        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
+        return ret;
+    }
     while (target_running) sleep(1);
 
     // release resource

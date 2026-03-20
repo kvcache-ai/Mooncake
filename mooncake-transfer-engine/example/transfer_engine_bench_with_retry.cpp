@@ -198,7 +198,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             requests.emplace_back(entry);
         }
 
-        s = engine->submitTransfer(batch_id, requests);
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
         if (!s.ok())
             LOG(INFO) << "Found Failed Requests";
         else {
@@ -295,6 +295,9 @@ int initiator() {
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
@@ -303,19 +306,20 @@ int initiator() {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
         int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : i;
-        int rc = engine->registerLocalMemory(
+        buffer_map[FLAGS_protocol].emplace_back(
             addr[i], FLAGS_buffer_size,
             name_prefix + std::to_string(name_suffix));
-        LOG_ASSERT(!rc);
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu:" + std::to_string(i));
     }
 #endif
+
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 
     std::thread workers[FLAGS_threads];
 
@@ -352,9 +356,9 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
+    engine->unregisterLocalMemory(buffer_map);
 
     for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 
@@ -394,19 +398,25 @@ int target() {
     }
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
         memset(addr[i], 'x', FLAGS_buffer_size);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu:" + std::to_string(i));
     }
+
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
+    engine->unregisterLocalMemory(buffer_map);
+
     for (int i = 0; i < NR_SOCKETS; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 

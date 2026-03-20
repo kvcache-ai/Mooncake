@@ -124,9 +124,11 @@ int removeLocalSegment(transfer_engine_t engine, const char *segment_name);
 void destroyTransferEngine(transfer_engine_t engine);
 
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
-                        const char *location, int remote_accessible);
+                        const char *location, int remote_accessible,
+                        const char *proto);
 
-int unregisterLocalMemory(transfer_engine_t engine, void *addr);
+int unregisterLocalMemory(transfer_engine_t engine, void *addr,
+                          const char *proto);
 
 int registerLocalMemoryBatch(transfer_engine_t engine,
                              buffer_entry_t *buffer_list, size_t buffer_len,

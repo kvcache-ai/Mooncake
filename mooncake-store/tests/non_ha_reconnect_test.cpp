@@ -29,7 +29,8 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     // Create client (non-HA), mount a segment
     std::string local_hostname = "127.0.0.1:18001";
     std::string master_addr = master.master_address();
-    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
+    std::vector<std::string> protocols = {"tcp"};
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", protocols,
                                      std::nullopt, master_addr);
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
