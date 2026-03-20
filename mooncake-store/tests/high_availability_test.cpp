@@ -281,7 +281,7 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
 
     // Check the master view does not change
     std::this_thread::sleep_for(
-        std::chrono::seconds(ETCD_MASTER_VIEW_LEASE_TTL + 2));
+        std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC + 2));
     current_view = coordinator->ReadCurrentView();
     ASSERT_TRUE(current_view.has_value());
     ASSERT_TRUE(current_view.value().has_value());

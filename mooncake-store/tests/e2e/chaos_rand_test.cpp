@@ -97,7 +97,7 @@ class ChaosRandTest : public ::testing::Test {
     }
 
     static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
+        sleep(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC * 3);
         auto current_view = leader_coordinator_->ReadCurrentView();
         EXPECT_TRUE(current_view.has_value()) << "Failed to read leader view";
     }

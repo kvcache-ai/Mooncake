@@ -32,7 +32,7 @@ constexpr auto kRedisCommandTimeout = std::chrono::seconds(3);
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
 constexpr auto kMinimumRenewInterval = std::chrono::milliseconds(200);
 constexpr auto kRedisLeaseTtl =
-    std::chrono::seconds(ETCD_MASTER_VIEW_LEASE_TTL);
+    std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC);
 
 constexpr char kLeaderAddressField[] = "leader_address";
 constexpr char kViewVersionField[] = "view_version";
