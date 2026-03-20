@@ -4,6 +4,9 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+
+#include <ylt/util/tl/expected.hpp>
+
 #include "types.h"
 
 namespace mooncake {
@@ -61,9 +64,10 @@ class SchedulerPolicy {
      * @brief Core decision function
      * @param tier_stats Current status of all managed tiers
      * @param active_keys List of active/hot keys with their context
-     * @return List of recommended actions
+     * @return List of recommended actions or an error when the policy cannot
+     *         produce a valid plan
      */
-    virtual std::vector<SchedAction> Decide(
+    virtual tl::expected<std::vector<SchedAction>, ErrorCode> Decide(
         const std::unordered_map<UUID, TierStats>& tier_stats,
         const std::vector<KeyContext>& active_keys) = 0;
 

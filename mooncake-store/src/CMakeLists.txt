@@ -51,6 +51,8 @@ set(MOONCAKE_STORE_SOURCES
     peer_client.cpp
     tiered_cache/tiers/dram_tier.cpp
     tiered_cache/tiers/storage_tier.cpp
+    tiered_cache/scheduler/simple_policy.cpp
+    tiered_cache/scheduler/lru_policy.cpp
     tiered_cache/scheduler/client_scheduler.cpp
 )
 

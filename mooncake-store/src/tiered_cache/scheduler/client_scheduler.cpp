@@ -185,7 +185,18 @@ void ClientScheduler::WorkerLoop() {
         auto tier_stats_map = CollectTierStats();
 
         // 3. Make Decision
-        auto actions = policy_->Decide(tier_stats_map, active_keys);
+        if (!policy_) {
+            LOG(ERROR) << "ClientScheduler worker has no policy configured";
+            continue;
+        }
+
+        auto decision = policy_->Decide(tier_stats_map, active_keys);
+        if (!decision) {
+            LOG(ERROR) << "Scheduler policy decide failed, error: "
+                       << decision.error();
+            continue;
+        }
+        const auto& actions = decision.value();
 
         // 4. Execute Actions
         if (!actions.empty()) {

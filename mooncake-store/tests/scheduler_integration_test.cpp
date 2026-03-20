@@ -8,8 +8,10 @@
 #include <thread>
 #include <cstring>
 #include <atomic>
+#include "tiered_cache/scheduler/lru_policy.h"
 #include "tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
 #include "tiered_cache/scheduler/lru_stats_collector.h"
+#include "tiered_cache/scheduler/simple_policy.h"
 #include "tiered_cache/scheduler/stats_collector.h"
 
 namespace mooncake {
@@ -140,6 +142,36 @@ TEST(SchedulerStatsCollectorTest, LRUCollectorTracksGlobalRecency) {
     collector.RemoveKey("key_a");
     const auto third_snapshot = collector.GetSnapshot();
     EXPECT_EQ(FindKeyStats(third_snapshot, "key_a"), nullptr);
+}
+
+TEST(SchedulerPolicyTest, SimplePolicyReturnsErrorWithoutFastTier) {
+    SimplePolicy policy(SimplePolicy::Config{});
+
+    KeyContext key_ctx;
+    key_ctx.key = "hot_key";
+    key_ctx.recent_heat_score = 100.0;
+    key_ctx.current_locations = {UUID{1, 1}};
+    key_ctx.size_bytes = 4096;
+
+    const auto decision = policy.Decide({}, {key_ctx});
+    ASSERT_FALSE(decision.has_value());
+    EXPECT_EQ(decision.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(SchedulerPolicyTest, LRUPolicyReturnsErrorWhenFastTierStatsMissing) {
+    LRUPolicy policy(LRUPolicy::Config{});
+    const UUID fast_tier{9, 9};
+    policy.SetFastTier(fast_tier);
+
+    KeyContext key_ctx;
+    key_ctx.key = "hot_key";
+    key_ctx.recency_rank = 1;
+    key_ctx.current_locations = {UUID{1, 1}};
+    key_ctx.size_bytes = 4096;
+
+    const auto decision = policy.Decide({}, {key_ctx});
+    ASSERT_FALSE(decision.has_value());
+    EXPECT_EQ(decision.error(), ErrorCode::TIER_NOT_FOUND);
 }
 
 class SchedulerIntegrationTest : public ::testing::Test {
