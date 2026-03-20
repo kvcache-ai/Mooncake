@@ -164,6 +164,8 @@ class LocalStorageSpaceManager {
     tl::expected<bool, ErrorCode> HasPhysicalSpace(
         uint64_t required_size) const;
 
+    bool IsInitialized() const;
+
     bool TryReserve(uint64_t required_size);
 
     void Release(uint64_t size_to_release);

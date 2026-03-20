@@ -150,6 +150,10 @@ tl::expected<bool, ErrorCode> LocalStorageSpaceManager::HasPhysicalSpace(
     return space_info.available >= required_size;
 }
 
+bool LocalStorageSpaceManager::IsInitialized() const {
+    return initialized_.load(std::memory_order_acquire);
+}
+
 bool LocalStorageSpaceManager::TryReserve(uint64_t required_size) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!initialized_.load(std::memory_order_acquire)) {
@@ -1856,6 +1860,17 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::CanAcceptAnotherBucket()
 
     const uint64_t required_space =
         static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
+    if (!space_manager_.IsInitialized()) {
+        std::error_code ec;
+        const auto space_info = std::filesystem::space(storage_path_, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to query bucket backend disk space for "
+                       << storage_path_ << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return space_info.available >= required_space;
+    }
+
     auto physical_space_result =
         space_manager_.HasPhysicalSpace(required_space);
     if (!physical_space_result) {
