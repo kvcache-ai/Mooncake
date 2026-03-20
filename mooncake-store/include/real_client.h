@@ -136,6 +136,13 @@ class RealClient : public PyClient {
                            size_t dst_offset, size_t src_offset, size_t size)
         override;
 
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
+
+    int64_t get_into_range_with_query_result(
+        const std::string &key, const QueryResult &query_result, void *buffer,
+        size_t dst_offset, size_t src_offset, size_t size) override;
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys (batch version)
@@ -443,6 +450,15 @@ class RealClient : public PyClient {
                                 const std::vector<size_t> &sizes,
                                 int32_t device_id, const UUID &client_id);
 
+    std::vector<BatchQueryResultItem> batch_query_dummy_helper(
+        const std::vector<std::string> &keys);
+
+    tl::expected<int64_t, ErrorCode>
+    get_into_range_with_query_result_dummy_helper(
+        const std::string &key, const BatchQueryResultItem &query_item,
+        uint64_t buffer, size_t dst_offset, size_t src_offset, size_t size,
+        const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &dummy_buffers,
@@ -570,6 +586,11 @@ class RealClient : public PyClient {
             *prepared_results = nullptr,
         const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
             nullptr);
+
+    tl::expected<int64_t, ErrorCode>
+    get_into_range_with_query_result_internal(
+        const std::string &key, const QueryResult &query_result, void *buffer,
+        size_t dst_offset, size_t src_offset, size_t size);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -15,11 +16,12 @@ namespace mooncake {
 namespace engram {
 
 /**
- * Engram conditional memory module (C++ implementation).
+ * Engram storage/query helper (C++ implementation).
  *
- * Integrates N-gram hash mapping, Mooncake Store-backed embedding lookup,
- * gating, and ShortConv. Requires Mooncake Store for forward (no local-only
- * mode).
+ * Integrates N-gram hash mapping with Mooncake Store-backed embedding storage
+ * and lookup. The original model-side forward/gating/ShortConv logic is
+ * intentionally kept out of Mooncake; this class only owns data placement and
+ * query-time embedding retrieval.
  */
 class Engram {
    public:
@@ -27,38 +29,68 @@ class Engram {
            const BackboneConfig& backbone_cfg,
            std::shared_ptr<PyClient> store = nullptr);
 
-    ~Engram() = default;
-
-    /**
-     * Return required workspace size in bytes for forward(B, L).
-     * Caller may allocate once and pass to forward() to avoid per-call allocation.
-     */
-    size_t get_forward_workspace_size(int B, int L) const;
+    ~Engram();
 
     /**
      * Return workspace size in bytes for embedding table buffers (zero-copy get).
-     * When workspace includes this size, forward uses batch_get_into for
-     * zero-copy RDMA transfer. Add this to get_forward_workspace_size(B,L)
-     * for full workspace with zero-copy embedding lookup.
+     * When workspace includes this size, query_embeddings() uses batch_get_into
+     * for zero-copy RDMA transfer.
      */
     size_t get_embedding_tables_workspace_size() const;
 
     /**
-     * Forward pass.
-     * @param hidden_states [B, L, hc_mult, D] input hidden states
+     * Return the workspace size in bytes required by query_embeddings(B, L).
+     * The query path only needs temporary per-head scratch buffers large enough
+     * for the requested rows in the current batch, so this can be much smaller
+     * than the full embedding-table footprint.
+     */
+    size_t get_query_workspace_size(int B, int L) const;
+
+    /** Timing breakdown for query_embeddings() (ms). */
+    struct QueryTiming {
+        double hash_ms = 0;
+        double store_read_ms = 0;   /* total embedding_lookup */
+        /* embedding_lookup breakdown (subset of store_read) */
+        double emb_register_ms = 0;
+        double emb_batch_query_ms = 0;
+        double emb_get_into_range_ms = 0;
+        double emb_scatter_ms = 0;
+        double emb_unregister_ms = 0;
+        double emb_prep_ms = 0;     /* unique_idx + range_merge */
+        double emb_batch_get_buffer_ms = 0;  /* when using batch_get_buffer path */
+        double emb_lookup_ms = 0;   /* memcpy from tables to output */
+        double emb_total_internal_ms = 0;  /* wall time inside embedding_lookup (for verification) */
+        double emb_gap_ms = 0;      /* unaccounted: internal - sum(phases), for debugging */
+        double emb_setup_ms = 0;    /* t_embed_start to t_register_start */
+    };
+
+    /**
+     * Query embedding rows for a batch of token IDs.
      * @param input_ids [B, L] token IDs
-     * @param output [B, L, hc_mult, D] output (pre-allocated, registered
-     * buffer)
+     * @param output [B, L, num_heads, embed_D] output buffer
      * @param workspace Optional pre-allocated buffer (size >=
-     * get_forward_workspace_size(B,L)); if nullptr or too small, allocates
-     * internally
+     * get_query_workspace_size(B,L)); if nullptr or too small, falls back to
+     * batch_get_buffer()
      * @param workspace_size Size of workspace in bytes
      * @return 0 on success, negative on error
      */
-    int forward(const void* hidden_states, size_t hidden_states_size,
-                const std::vector<std::vector<int64_t>>& input_ids,
-                void* output, size_t output_size, void* workspace = nullptr,
-                size_t workspace_size = 0) const;
+    int query_embeddings(const std::vector<std::vector<int64_t>>& input_ids,
+                         void* output, size_t output_size,
+                         void* workspace = nullptr,
+                         size_t workspace_size = 0,
+                         QueryTiming* out_timing = nullptr) const;
+
+    /**
+     * Hash input IDs into per-head embedding row indices.
+     * @return [B, L, num_heads]
+     */
+    std::vector<std::vector<std::vector<int64_t>>> hash_input_ids(
+        const std::vector<std::vector<int64_t>>& input_ids) const;
+
+    std::vector<int64_t> get_table_vocab_sizes() const;
+    std::vector<std::string> get_store_keys() const;
+    int get_num_heads() const;
+    int get_embedding_dim() const;
 
     /**
      * Populate Store with embedding tensors.
@@ -92,9 +124,17 @@ class Engram {
     int embed_D_;
     std::vector<std::string> embed_keys_;
 
-    // Projection weights (for gating and value)
-    std::vector<std::vector<float>> key_proj_weights_;
-    std::vector<float> value_proj_weights_;
+    // Optional internal scratch workspace reused across queries when the
+    // caller does not provide one. This avoids per-query register/unregister
+    // overhead while keeping ownership/lifetime inside Engram.
+    mutable std::mutex internal_workspace_mu_;
+    mutable std::vector<char> internal_workspace_;
+    mutable std::vector<void*> internal_table_buffers_;
+    mutable std::vector<size_t> internal_table_sizes_;
+    mutable bool internal_workspace_registered_ = false;
+    mutable std::mutex query_result_cache_mu_;
+    mutable std::vector<QueryResult> cached_query_results_;
+    mutable bool query_result_cache_valid_ = false;
 
     // Hash mapping helpers
     static bool is_prime(int64_t n);
@@ -102,24 +142,25 @@ class Engram {
                                    std::unordered_set<int64_t>& seen);
     std::vector<std::vector<std::vector<int64_t>>> hash_(
         const std::vector<std::vector<int64_t>>& input_ids, int layer_id) const;
+    std::vector<size_t> get_query_table_buffer_sizes(int B, int L) const;
+    int ensure_internal_workspace(int B, int L) const;
+    void release_internal_workspace() const;
+    std::vector<tl::expected<QueryResult, ErrorCode>> get_query_results() const;
+    void invalidate_query_result_cache() const;
 
     // Embedding lookup / populate
     // table_buffers/sizes: optional for zero-copy; when valid, use batch_get_into
+    // emb_timing: optional; when non-null, filled with per-phase breakdown
     int embedding_lookup(
         const std::vector<std::vector<std::vector<int64_t>>>& hash_ids,
         void* output_buffer, size_t output_size,
         const std::vector<void*>* table_buffers = nullptr,
-        const std::vector<size_t>* table_sizes = nullptr) const;
+        const std::vector<size_t>* table_sizes = nullptr,
+        bool buffers_are_pre_registered = false,
+        QueryTiming* emb_timing = nullptr) const;
     int embedding_populate_from_tensors(
         const std::vector<void*>& embedding_data,
         const std::vector<size_t>& sizes);
-
-    // Gating and ShortConv
-    void compute_gates_and_fuse(const float* embeddings,
-                                const float* hidden_states, int B, int L,
-                                float* output) const;
-    void apply_short_conv(const float* input, int B, int L,
-                          float* output) const;
 };
 
 }  // namespace engram

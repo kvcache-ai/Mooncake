@@ -562,6 +562,13 @@ class Client {
     }
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+    /**
+     * Resolve a memory replica to a directly accessible local virtual address
+     * when the object lives in one of this client's mounted segments.
+     * Returns INVALID_REPLICA when no matching local mapping exists.
+     */
+    tl::expected<void*, ErrorCode> ResolveLocalMemoryAddress(
+        const QueryResult& query_result, size_t min_size = 0);
 
    private:
     /**

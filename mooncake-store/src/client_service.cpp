@@ -3181,4 +3181,52 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     return local_hostname_ == replica_transfer_endpoint;
 }
 
+tl::expected<void*, ErrorCode> Client::ResolveLocalMemoryAddress(
+    const QueryResult& query_result, size_t min_size) {
+    auto preferred_replica = GetPreferredReplica(query_result.replicas);
+    if (!preferred_replica) {
+        return tl::unexpected(preferred_replica.error());
+    }
+
+    const auto& replica = preferred_replica.value();
+    if (!replica.is_memory_replica()) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    const auto& desc = replica.get_memory_descriptor().buffer_descriptor;
+    if (desc.size_ < min_size) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    for (const auto& [segment_id, segment] : mounted_segments_) {
+        (void)segment_id;
+        const bool endpoint_match =
+            segment.te_endpoint == desc.transport_endpoint_ ||
+            segment.name == desc.transport_endpoint_;
+        if (!endpoint_match) {
+            continue;
+        }
+
+        uintptr_t local_ptr = 0;
+        if (desc.protocol_ == "cxl") {
+            if (desc.buffer_address_ > segment.size ||
+                desc.size_ > segment.size - desc.buffer_address_) {
+                continue;
+            }
+            local_ptr = segment.base + desc.buffer_address_;
+        } else {
+            local_ptr = desc.buffer_address_;
+        }
+
+        if (local_ptr < segment.base ||
+            desc.size_ > segment.size - (local_ptr - segment.base)) {
+            continue;
+        }
+        return reinterpret_cast<void*>(local_ptr);
+    }
+
+    return tl::unexpected(ErrorCode::INVALID_REPLICA);
+}
+
 }  // namespace mooncake

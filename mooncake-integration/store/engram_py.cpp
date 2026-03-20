@@ -54,32 +54,31 @@ void bind_engram(py::module& m) {
         .def_readwrite("num_layers", &BackboneConfig::num_layers);
 
     py::class_<Engram>(m, "Engram")
+        .def("get_embedding_tables_workspace_size",
+             &Engram::get_embedding_tables_workspace_size)
+        .def("get_query_workspace_size", &Engram::get_query_workspace_size,
+             py::arg("B"), py::arg("L"))
+        .def("get_table_vocab_sizes", &Engram::get_table_vocab_sizes)
+        .def("get_store_keys", &Engram::get_store_keys)
+        .def("get_num_heads", &Engram::get_num_heads)
+        .def("get_embedding_dim", &Engram::get_embedding_dim)
         .def(
             py::init([](int layer_id, const EngramConfig& cfg,
                         const BackboneConfig& bb, py::object store_obj) {
                 std::shared_ptr<PyClient> store = nullptr;
                 if (!store_obj.is_none()) {
-                    // Try to cast as PyClient first (direct C++ store)
                     try {
                         store = store_obj.cast<std::shared_ptr<PyClient>>();
                     } catch (py::cast_error&) {
-                        // If that fails, try to extract from
-                        // MooncakeDistributedStore wrapper
                         try {
-                            // Get the type name to check if it's
-                            // MooncakeDistributedStore
                             std::string type_name =
                                 py::str(store_obj.get_type().attr("__name__"));
                             if (type_name == "MooncakeDistributedStore") {
-                                // Use the helper function from store module to
-                                // get PyClient shared_ptr
-                                py::module store_mod =
-                                    py::module::import("store");
-                                py::object helper_func = store_mod.attr(
-                                    "_get_pyclient_from_wrapper");
+                                py::module store_mod = py::module::import("store");
+                                py::object helper_func =
+                                    store_mod.attr("_get_pyclient_from_wrapper");
                                 py::object capsule = helper_func(store_obj);
                                 if (!capsule.is_none()) {
-                                    // Extract shared_ptr from capsule
                                     std::shared_ptr<PyClient>* ptr =
                                         static_cast<std::shared_ptr<PyClient>*>(
                                             py::capsule(capsule).get_pointer());
@@ -108,72 +107,179 @@ void bind_engram(py::module& m) {
             py::arg("layer_id"), py::arg("config"), py::arg("backbone_cfg"),
             py::arg("store") = py::none())
         .def(
-            "forward",
-            [](Engram& self, py::array_t<float> hidden_states,
-               py::object input_ids, py::object workspace) {
-                // Extract shape
-                auto h_buf = hidden_states.request();
-                if (h_buf.ndim != 4) {
-                    throw std::runtime_error(
-                        "hidden_states must be 4D [B, L, hc_mult, D]");
-                }
-                int B = static_cast<int>(h_buf.shape[0]);
-                int L = static_cast<int>(h_buf.shape[1]);
-                int hc_mult = static_cast<int>(h_buf.shape[2]);
-                int D = static_cast<int>(h_buf.shape[3]);
-
-                // Convert input_ids
+            "hash_input_ids",
+            [](Engram& self, py::object input_ids) {
                 std::vector<std::vector<int64_t>> input_ids_vec =
                     py_list_to_vec2d(input_ids);
+                auto hash_ids = self.hash_input_ids(input_ids_vec);
+                const ssize_t B = static_cast<ssize_t>(hash_ids.size());
+                const ssize_t L =
+                    B == 0 ? 0 : static_cast<ssize_t>(hash_ids[0].size());
+                const ssize_t H =
+                    (B == 0 || L == 0)
+                        ? 0
+                        : static_cast<ssize_t>(hash_ids[0][0].size());
+                py::array_t<int64_t> output({B, L, H});
+                auto out = output.mutable_unchecked<3>();
+                for (ssize_t b = 0; b < B; ++b) {
+                    for (ssize_t l = 0; l < L; ++l) {
+                        for (ssize_t h = 0; h < H; ++h) {
+                            out(b, l, h) = hash_ids[b][l][h];
+                        }
+                    }
+                }
+                return output;
+            },
+            py::arg("input_ids"),
+            "Hash token IDs into per-head embedding row indices.")
+        .def(
+            "query",
+            [](Engram& self, py::object input_ids, py::object workspace) {
+                std::vector<std::vector<int64_t>> input_ids_vec =
+                    py_list_to_vec2d(input_ids);
+                if (input_ids_vec.empty()) {
+                    throw std::runtime_error("input_ids must not be empty");
+                }
 
-                // Allocate output
-                py::array_t<float> output =
-                    py::array_t<float>({B, L, hc_mult, D});
+                int B = static_cast<int>(input_ids_vec.size());
+                int L = static_cast<int>(input_ids_vec[0].size());
+                int H = self.get_num_heads();
+                int D = self.get_embedding_dim();
+
+                py::array_t<float> output = py::array_t<float>({B, L, H, D});
                 auto out_buf = output.request();
 
                 void* ws_ptr = nullptr;
                 size_t ws_size = 0;
                 if (!workspace.is_none()) {
-                    try {
-                        auto ws_arr =
-                            py::array_t<float>::ensure(workspace);
-                        auto ws_req = ws_arr.request();
-                        if (ws_req.ptr && ws_req.size > 0) {
-                            ws_ptr = ws_req.ptr;
-                            ws_size = ws_req.size * sizeof(float);
-                        }
-                    } catch (py::error_already_set&) {
-                        ws_ptr = nullptr;
-                        ws_size = 0;
+                    auto ws_arr = py::array::ensure(workspace);
+                    if (!ws_arr) {
+                        throw std::runtime_error(
+                            "workspace must be a NumPy array when provided");
+                    }
+                    auto ws_req = ws_arr.request();
+                    if (ws_req.ptr && ws_req.size > 0) {
+                        ws_ptr = ws_req.ptr;
+                        ws_size =
+                            static_cast<size_t>(ws_req.size) * ws_req.itemsize;
                     }
                 }
 
-                // Call forward (uses zero-copy when workspace is large enough)
-                int ret = self.forward(
-                    h_buf.ptr, h_buf.size * sizeof(float), input_ids_vec,
-                    out_buf.ptr, out_buf.size * sizeof(float), ws_ptr, ws_size);
+                int ret = self.query_embeddings(
+                    input_ids_vec, out_buf.ptr, out_buf.size * sizeof(float),
+                    ws_ptr, ws_size, nullptr);
                 if (ret != 0) {
-                    throw std::runtime_error("Engram forward failed");
+                    throw std::runtime_error("Engram query failed");
                 }
                 return output;
             },
-            py::arg("hidden_states"), py::arg("input_ids"),
-            py::arg("workspace") = py::none())
+            py::arg("input_ids"), py::arg("workspace") = py::none(),
+            "Query embeddings from Mooncake Store. Returns [B, L, num_heads, embed_D].")
+        .def(
+            "query_with_timing",
+            [](Engram& self, py::object input_ids, py::object workspace) {
+                std::vector<std::vector<int64_t>> input_ids_vec =
+                    py_list_to_vec2d(input_ids);
+                if (input_ids_vec.empty()) {
+                    throw std::runtime_error("input_ids must not be empty");
+                }
+
+                int B = static_cast<int>(input_ids_vec.size());
+                int L = static_cast<int>(input_ids_vec[0].size());
+                int H = self.get_num_heads();
+                int D = self.get_embedding_dim();
+
+                py::array_t<float> output = py::array_t<float>({B, L, H, D});
+                auto out_buf = output.request();
+
+                void* ws_ptr = nullptr;
+                size_t ws_size = 0;
+                if (!workspace.is_none()) {
+                    auto ws_arr = py::array::ensure(workspace);
+                    if (!ws_arr) {
+                        throw std::runtime_error(
+                            "workspace must be a NumPy array when provided");
+                    }
+                    auto ws_req = ws_arr.request();
+                    if (ws_req.ptr && ws_req.size > 0) {
+                        ws_ptr = ws_req.ptr;
+                        ws_size =
+                            static_cast<size_t>(ws_req.size) * ws_req.itemsize;
+                    }
+                }
+
+                Engram::QueryTiming timing;
+                int ret = self.query_embeddings(
+                    input_ids_vec, out_buf.ptr, out_buf.size * sizeof(float),
+                    ws_ptr, ws_size, &timing);
+                if (ret != 0) {
+                    throw std::runtime_error("Engram query failed");
+                }
+
+                py::dict timing_dict;
+                timing_dict["hash_ms"] = timing.hash_ms;
+                timing_dict["store_read_ms"] = timing.store_read_ms;
+                py::dict emb_detail;
+                emb_detail["setup_ms"] = timing.emb_setup_ms;
+                emb_detail["register_ms"] = timing.emb_register_ms;
+                emb_detail["batch_query_ms"] = timing.emb_batch_query_ms;
+                emb_detail["get_into_range_ms"] = timing.emb_get_into_range_ms;
+                emb_detail["scatter_ms"] = timing.emb_scatter_ms;
+                emb_detail["unregister_ms"] = timing.emb_unregister_ms;
+                emb_detail["prep_ms"] = timing.emb_prep_ms;
+                emb_detail["batch_get_buffer_ms"] =
+                    timing.emb_batch_get_buffer_ms;
+                emb_detail["lookup_ms"] = timing.emb_lookup_ms;
+                emb_detail["_total_internal_ms"] =
+                    timing.emb_total_internal_ms;
+                emb_detail["gap_ms"] = timing.emb_gap_ms;
+                timing_dict["embedding_lookup"] = emb_detail;
+                return py::make_tuple(output, timing_dict);
+            },
+            py::arg("input_ids"), py::arg("workspace") = py::none(),
+            "Query embeddings and return (output, timing_dict).")
         .def(
             "populate_store_from_buffers",
             [](Engram& self, py::list embedding_buffers) {
+                std::vector<int64_t> vocab_sizes = self.get_table_vocab_sizes();
+                int embed_dim = self.get_embedding_dim();
+                if (static_cast<size_t>(py::len(embedding_buffers)) !=
+                    vocab_sizes.size()) {
+                    throw std::runtime_error(
+                        "embedding_buffers size must match num_heads");
+                }
+
                 std::vector<void*> bufs;
                 std::vector<size_t> sizes;
-                for (auto buf : embedding_buffers) {
-                    if (py::isinstance<py::array>(buf)) {
-                        auto arr = buf.cast<py::array_t<float>>();
-                        auto req = arr.request();
-                        bufs.push_back(req.ptr);
-                        sizes.push_back(req.size * sizeof(float));
-                    } else {
+                bufs.reserve(vocab_sizes.size());
+                sizes.reserve(vocab_sizes.size());
+                for (size_t i = 0; i < vocab_sizes.size(); ++i) {
+                    py::handle buf = embedding_buffers[i];
+                    if (!py::isinstance<py::array>(buf)) {
                         throw std::runtime_error(
-                            "embedding_buffers must be numpy arrays");
+                            "embedding_buffers must be NumPy arrays");
                     }
+                    auto arr = py::array_t<float,
+                                           py::array::c_style |
+                                               py::array::forcecast>::ensure(
+                        buf);
+                    if (!arr) {
+                        throw std::runtime_error(
+                            "embedding_buffers must be float32 arrays");
+                    }
+                    auto req = arr.request();
+                    if (req.ndim != 2) {
+                        throw std::runtime_error(
+                            "each embedding buffer must be 2D [N_h, D]");
+                    }
+                    if (req.shape[0] != vocab_sizes[i] ||
+                        req.shape[1] != embed_dim) {
+                        throw std::runtime_error(
+                            "embedding buffer shape does not match "
+                            "get_table_vocab_sizes()/get_embedding_dim()");
+                    }
+                    bufs.push_back(req.ptr);
+                    sizes.push_back(req.size * sizeof(float));
                 }
                 int ret = self.populate_store_from_buffers(bufs, sizes);
                 if (ret != 0) {

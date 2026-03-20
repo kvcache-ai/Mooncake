@@ -253,6 +253,23 @@ class PyClient {
                                   size_t dst_offset, size_t src_offset,
                                   size_t size) = 0;
 
+    /**
+     * Batch query replica metadata for keys (one round-trip to master).
+     * Use with get_into_range_with_query_result to avoid per-call queries.
+     * @return Vector of QueryResult or ErrorCode per key
+     */
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) = 0;
+
+    /**
+     * Read range using pre-fetched query result (skips master query).
+     * @param query_result From batch_query; must not be lease-expired
+     * @return bytes read on success, negative on error
+     */
+    virtual int64_t get_into_range_with_query_result(
+        const std::string &key, const QueryResult &query_result, void *buffer,
+        size_t dst_offset, size_t src_offset, size_t size) = 0;
+
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,

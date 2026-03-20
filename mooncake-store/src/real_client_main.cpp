@@ -56,6 +56,11 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::get_into_ranges_shm_helper>(
         &real_client);
+    server.register_handler<&RealClient::batch_query_dummy_helper>(
+        &real_client);
+    server.register_handler<
+        &RealClient::get_into_range_with_query_result_dummy_helper>(
+        &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);

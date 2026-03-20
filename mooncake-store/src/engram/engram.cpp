@@ -1,97 +1,20 @@
 #include "engram/engram.h"
 
 #include <algorithm>
-#include <cmath>
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <sstream>
+#include <set>
+#include <vector>
 
 #include "engram/engram_config.h"
 
 namespace mooncake {
 namespace engram {
-
-// -----------------------------------------------------------------------------
-// Helpers: RMSNorm, Linear, SiLU, DepthwiseConv1d
-// -----------------------------------------------------------------------------
-
-static void rms_norm(const float* input, int hidden_size, float eps,
-                     float* output, int numel) {
-    for (int i = 0; i < numel; i += hidden_size) {
-        float sum_sq = 0.0f;
-        for (int j = 0; j < hidden_size; ++j) {
-            float v = input[i + j];
-            sum_sq += v * v;
-        }
-        float rms = std::sqrt(sum_sq / hidden_size + eps);
-        for (int j = 0; j < hidden_size; ++j) {
-            output[i + j] = input[i + j] / rms;
-        }
-    }
-}
-
-// Strided version: each row has `hidden_size` elements; consecutive rows are
-// `input_stride` / `output_stride` floats apart. Avoids temporary copies when
-// normalizing non-contiguous groups (e.g. per hc_mult in [B, L, hc_mult, D]).
-static void rms_norm_strided(const float* input, int hidden_size,
-                             int input_stride, int num_rows, float eps,
-                             float* output, int output_stride) {
-    for (int r = 0; r < num_rows; ++r) {
-        const float* in_row = input + r * input_stride;
-        float* out_row = output + r * output_stride;
-        float sum_sq = 0.0f;
-        for (int j = 0; j < hidden_size; ++j) {
-            float v = in_row[j];
-            sum_sq += v * v;
-        }
-        float rms = std::sqrt(sum_sq / hidden_size + eps);
-        for (int j = 0; j < hidden_size; ++j) {
-            out_row[j] = in_row[j] / rms;
-        }
-    }
-}
-
-static void linear_proj(const float* input, const float* weight, int in_dim,
-                        int out_dim, int numel_in, float* output) {
-    int num_out = (numel_in / in_dim) * out_dim;
-    std::memset(output, 0, num_out * sizeof(float));
-    for (int i = 0; i < numel_in; i += in_dim) {
-        int out_base = (i / in_dim) * out_dim;
-        for (int j = 0; j < in_dim; ++j) {
-            float in_val = input[i + j];
-            for (int k = 0; k < out_dim; ++k) {
-                output[out_base + k] += in_val * weight[j * out_dim + k];
-            }
-        }
-    }
-}
-
-static void silu(float* data, int numel) {
-    for (int i = 0; i < numel; ++i) {
-        float x = data[i];
-        data[i] = x / (1.0f + std::exp(-x));
-    }
-}
-
-static void depthwise_conv1d(const float* input, int B, int L, int C,
-                             int kernel_size, int dilation, float* output) {
-    int pad = (kernel_size - 1) * dilation;
-    for (int b = 0; b < B; ++b) {
-        for (int c = 0; c < C; ++c) {
-            for (int l = 0; l < L; ++l) {
-                float sum = 0.0f;
-                for (int k = 0; k < kernel_size; ++k) {
-                    int pos = l - pad + k * dilation;
-                    if (pos >= 0 && pos < L) {
-                        sum += input[(b * L + pos) * C + c];
-                    }
-                }
-                output[(b * L + l) * C + c] = sum;
-            }
-        }
-    }
-}
 
 // -----------------------------------------------------------------------------
 // Hash mapping (inlined from NgramHashMapping)
@@ -198,7 +121,13 @@ int Engram::embedding_lookup(
     const std::vector<std::vector<std::vector<int64_t>>>& hash_ids,
     void* output_buffer, size_t output_size,
     const std::vector<void*>* table_buffers,
-    const std::vector<size_t>* table_sizes) const {
+    const std::vector<size_t>* table_sizes,
+    bool buffers_are_pre_registered,
+    QueryTiming* emb_timing) const {
+    auto t_embed_start = std::chrono::high_resolution_clock::now();
+    auto ns = [](auto t0, auto t1) {
+      return 1e-6 * std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    };
     if (store_ == nullptr) return -1;
     if (hash_ids.empty() || hash_ids[0].empty() || hash_ids[0][0].empty())
         return -1;
@@ -207,6 +136,7 @@ int Engram::embedding_lookup(
     int L = static_cast<int>(hash_ids[0].size());
     int num_heads = static_cast<int>(hash_ids[0][0].size());
     if (num_heads != static_cast<int>(list_of_N_.size())) return -1;
+    const size_t row_bytes = static_cast<size_t>(embed_D_) * sizeof(float);
 
     size_t expected_size =
         static_cast<size_t>(B) * L * num_heads * embed_D_ * sizeof(float);
@@ -219,10 +149,13 @@ int Engram::embedding_lookup(
          static_cast<int>(table_sizes->size()) == num_heads);
 
     if (use_zero_copy) {
-        // Zero-copy path: register buffers, batch_get_into, then lookup
+        const int64_t max_rows_per_head =
+            std::max<int64_t>(1, static_cast<int64_t>(B) * L);
         for (int h = 0; h < num_heads; ++h) {
             size_t required =
-                static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float);
+                static_cast<size_t>(
+                    std::min<int64_t>(list_of_N_[h], max_rows_per_head)) *
+                row_bytes;
             if ((*table_sizes)[h] < required) {
                 use_zero_copy = false;
                 break;
@@ -232,8 +165,13 @@ int Engram::embedding_lookup(
 
     std::vector<const float*> tables(num_heads, nullptr);
     std::vector<size_t> registered_indices;
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    bool have_query_results = false;
 
-    if (use_zero_copy) {
+    auto t_register_start = std::chrono::high_resolution_clock::now();
+    if (emb_timing)
+        emb_timing->emb_setup_ms = ns(t_embed_start, t_register_start);
+    if (use_zero_copy && !buffers_are_pre_registered) {
         for (int h = 0; h < num_heads; ++h) {
             int ret = store_->register_buffer((*table_buffers)[h], (*table_sizes)[h]);
             if (ret != 0) {
@@ -245,48 +183,307 @@ int Engram::embedding_lookup(
             registered_indices.push_back(h);
         }
     }
+    auto t_register_end = std::chrono::high_resolution_clock::now();
 
-    if (use_zero_copy) {
-        std::vector<void*> bufs(num_heads);
-        std::vector<size_t> sz(num_heads);
-        for (int h = 0; h < num_heads; ++h) {
-            bufs[h] = (*table_buffers)[h];
-            sz[h] = (*table_sizes)[h];
+    auto t_query_start = std::chrono::high_resolution_clock::now();
+    if (store_ != nullptr && store_->client_ != nullptr) {
+        query_results = get_query_results();
+        have_query_results =
+            (query_results.size() == static_cast<size_t>(num_heads));
+        if (have_query_results) {
+            for (int h = 0; h < num_heads; ++h) {
+                if (!query_results[h]) {
+                    continue;
+                }
+                size_t table_bytes =
+                    static_cast<size_t>(list_of_N_[h]) * row_bytes;
+                auto local_ptr = store_->client_->ResolveLocalMemoryAddress(
+                    query_results[h].value(), table_bytes);
+                if (local_ptr) {
+                    tables[h] = static_cast<const float*>(local_ptr.value());
+                }
+            }
         }
-        auto get_results = store_->batch_get_into(embed_keys_, bufs, sz);
-        for (int h : registered_indices)
-            store_->unregister_buffer((*table_buffers)[h]);
+    }
+    auto t_query_end = std::chrono::high_resolution_clock::now();
+    if (emb_timing) {
+        emb_timing->emb_batch_query_ms =
+            ns(t_query_start, t_query_end);
+    }
 
-        for (int h = 0; h < num_heads; ++h) {
-            if (get_results[h] < 0 ||
-                static_cast<size_t>(get_results[h]) <
-                    static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float)) {
+    bool all_tables_local = true;
+    for (int h = 0; h < num_heads; ++h) {
+        if (tables[h] == nullptr) {
+            all_tables_local = false;
+            break;
+        }
+    }
+    if (all_tables_local) {
+        use_zero_copy = false;
+    }
+
+    double acc_get_ms = 0, acc_scatter_ms = 0;
+    if (use_zero_copy) {
+        // Range-read path: one batch_query up front, then per-head offset reads
+        // into reusable scratch buffers.
+        if (!have_query_results) {
+            for (int h = 0; h < num_heads; ++h) {
                 for (int b = 0; b < B; ++b) {
                     for (int l = 0; l < L; ++l) {
                         std::memset(
                             output +
-                                (b * L * num_heads + l * num_heads + h) * embed_D_,
+                                (b * L * num_heads + l * num_heads + h) *
+                                    embed_D_,
                             0, embed_D_ * sizeof(float));
                     }
                 }
-                continue;
             }
-            tables[h] = static_cast<const float*>((*table_buffers)[h]);
+            if (!buffers_are_pre_registered) {
+                for (int h : registered_indices)
+                    store_->unregister_buffer((*table_buffers)[h]);
+            }
+            return -1;
         }
-    } else {
-        // Fallback: batch_get_buffer (allocates internally)
-        std::vector<std::shared_ptr<BufferHandle>> buffers =
-            store_->batch_get_buffer(embed_keys_);
-        if (buffers.size() != embed_keys_.size()) return -1;
+
+        int total_ranges = 0;
+        size_t total_requested_bytes = 0;
+        const size_t total_table_bytes = get_embedding_tables_workspace_size();
+        std::vector<std::vector<std::pair<int64_t, int64_t>>> head_ranges(
+            num_heads);
+        auto t_prep_start = std::chrono::high_resolution_clock::now();
         for (int h = 0; h < num_heads; ++h) {
-            if (buffers[h] &&
-                buffers[h]->size() >=
-                    static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float)) {
-                tables[h] = static_cast<const float*>(buffers[h]->ptr());
+            if (!query_results[h]) continue;
+            int64_t vocab_size_h = list_of_N_[h];
+            std::set<int64_t> unique_idx;
+            for (int b = 0; b < B; ++b) {
+                for (int l = 0; l < L; ++l) {
+                    int64_t idx = hash_ids[b][l][h];
+                    if (idx < 0) idx = 0;
+                    if (idx >= vocab_size_h) idx = vocab_size_h - 1;
+                    unique_idx.insert(idx);
+                }
             }
+            if (unique_idx.empty()) continue;
+            std::vector<std::pair<int64_t, int64_t>> ranges;
+            int64_t range_start = *unique_idx.begin();
+            int64_t range_end = range_start + 1;
+            for (auto it = std::next(unique_idx.begin()); it != unique_idx.end();
+                 ++it) {
+                if (*it == range_end) {
+                    range_end++;
+                } else {
+                    ranges.emplace_back(range_start, range_end);
+                    range_start = *it;
+                    range_end = range_start + 1;
+                }
+            }
+            ranges.emplace_back(range_start, range_end);
+            head_ranges[h] = std::move(ranges);
+            total_ranges += static_cast<int>(head_ranges[h].size());
+            for (const auto& r : head_ranges[h]) {
+                total_requested_bytes +=
+                    static_cast<size_t>(r.second - r.first) * row_bytes;
+            }
+        }
+        auto t_prep_end = std::chrono::high_resolution_clock::now();
+
+        constexpr int kRangeThreshold = 256;
+        const bool prefer_range =
+            total_ranges > 0 && total_ranges <= kRangeThreshold &&
+            total_requested_bytes * 2 < total_table_bytes;
+        if (!prefer_range) {
+            auto t_unreg_start = std::chrono::high_resolution_clock::now();
+            if (!buffers_are_pre_registered) {
+                for (int h : registered_indices)
+                    store_->unregister_buffer((*table_buffers)[h]);
+            }
+            auto t_unreg_end = std::chrono::high_resolution_clock::now();
+            use_zero_copy = false;
+            auto t_batch_start = std::chrono::high_resolution_clock::now();
+            auto buffers = store_->batch_get_buffer(embed_keys_);
+            if (buffers.size() == static_cast<size_t>(num_heads)) {
+                for (int h = 0; h < num_heads; ++h) {
+                    if (buffers[h] &&
+                        buffers[h]->size() >=
+                            static_cast<size_t>(list_of_N_[h]) * embed_D_ *
+                                sizeof(float)) {
+                        tables[h] =
+                            static_cast<const float*>(buffers[h]->ptr());
+                    }
+                }
+            }
+            auto t_batch_end = std::chrono::high_resolution_clock::now();
+            if (emb_timing) {
+                emb_timing->emb_register_ms = ns(t_register_start, t_register_end);
+                emb_timing->emb_prep_ms = ns(t_prep_start, t_prep_end);
+                emb_timing->emb_unregister_ms =
+                    buffers_are_pre_registered ? 0
+                                               : ns(t_unreg_start, t_unreg_end);
+                emb_timing->emb_batch_get_buffer_ms =
+                    ns(t_batch_start, t_batch_end);
+            }
+        }
+        if (use_zero_copy) {
+        auto process_head = [&](int h) {
+            double head_get_ms = 0, head_scatter_ms = 0;
+            if (!query_results[h]) {
+                for (int b = 0; b < B; ++b) {
+                    for (int l = 0; l < L; ++l) {
+                        std::memset(
+                            output +
+                                (b * L * num_heads + l * num_heads + h) *
+                                    embed_D_,
+                            0, embed_D_ * sizeof(float));
+                    }
+                }
+                return std::make_pair(head_get_ms, head_scatter_ms);
+            }
+            int64_t vocab_size_h = list_of_N_[h];
+            const auto& ranges = head_ranges[h];
+            if (ranges.empty()) {
+                return std::make_pair(head_get_ms, head_scatter_ms);
+            }
+
+            float* buf = static_cast<float*>((*table_buffers)[h]);
+            size_t buf_bytes = (*table_sizes)[h];
+            const QueryResult& qr = query_results[h].value();
+            bool ok = true;
+            for (const auto& r : ranges) {
+                int64_t start = r.first;
+                int64_t end = r.second;
+                size_t src_offset = static_cast<size_t>(start) * row_bytes;
+                size_t read_size =
+                    static_cast<size_t>(end - start) * row_bytes;
+                if (read_size > buf_bytes) {
+                    ok = false;
+                    break;
+                }
+                auto t_get_start = std::chrono::high_resolution_clock::now();
+                int64_t ret = store_->get_into_range_with_query_result(
+                    embed_keys_[h], qr, buf, 0, src_offset, read_size);
+                auto t_get_end = std::chrono::high_resolution_clock::now();
+                head_get_ms += ns(t_get_start, t_get_end);
+                if (ret < 0 || static_cast<size_t>(ret) < read_size) {
+                    ok = false;
+                    break;
+                }
+                auto t_scatter_start =
+                    std::chrono::high_resolution_clock::now();
+                for (int b = 0; b < B; ++b) {
+                    for (int l = 0; l < L; ++l) {
+                        int64_t idx = hash_ids[b][l][h];
+                        if (idx < 0) idx = 0;
+                        if (idx >= vocab_size_h) idx = vocab_size_h - 1;
+                        if (idx >= start && idx < end) {
+                            size_t off =
+                                static_cast<size_t>(idx - start) * embed_D_;
+                            float* dst =
+                                output +
+                                (b * L * num_heads + l * num_heads + h) *
+                                    embed_D_;
+                            std::memcpy(dst, buf + off,
+                                        embed_D_ * sizeof(float));
+                        }
+                    }
+                }
+                auto t_scatter_end =
+                    std::chrono::high_resolution_clock::now();
+                head_scatter_ms += ns(t_scatter_start, t_scatter_end);
+            }
+            if (!ok) {
+                for (int b = 0; b < B; ++b) {
+                    for (int l = 0; l < L; ++l) {
+                        std::memset(
+                            output +
+                                (b * L * num_heads + l * num_heads + h) *
+                                    embed_D_,
+                            0, embed_D_ * sizeof(float));
+                    }
+                }
+            }
+            return std::make_pair(head_get_ms, head_scatter_ms);
+        };
+
+        const bool parallelize_heads = total_ranges > num_heads * 2;
+        if (parallelize_heads) {
+            std::vector<std::future<std::pair<double, double>>> futures;
+            futures.reserve(num_heads);
+            for (int h = 0; h < num_heads; ++h) {
+                futures.push_back(
+                    std::async(std::launch::async, process_head, h));
+            }
+            for (int h = 0; h < num_heads; ++h) {
+                auto [head_get, head_scatter] = futures[h].get();
+                acc_get_ms = std::max(acc_get_ms, head_get);
+                acc_scatter_ms = std::max(acc_scatter_ms, head_scatter);
+            }
+        } else {
+            for (int h = 0; h < num_heads; ++h) {
+                auto [head_get, head_scatter] = process_head(h);
+                acc_get_ms += head_get;
+                acc_scatter_ms += head_scatter;
+            }
+        }
+        auto t_unreg_start = std::chrono::high_resolution_clock::now();
+        if (!buffers_are_pre_registered) {
+            for (int h : registered_indices)
+                store_->unregister_buffer((*table_buffers)[h]);
+        }
+        auto t_unreg_end = std::chrono::high_resolution_clock::now();
+        if (emb_timing) {
+            emb_timing->emb_register_ms = ns(t_register_start, t_register_end);
+            emb_timing->emb_get_into_range_ms = acc_get_ms;
+            emb_timing->emb_scatter_ms = acc_scatter_ms;
+            emb_timing->emb_prep_ms = ns(t_prep_start, t_prep_end);
+            emb_timing->emb_unregister_ms =
+                buffers_are_pre_registered ? 0
+                                           : ns(t_unreg_start, t_unreg_end);
+        }
+        }
+    }
+    if (!use_zero_copy) {
+        bool need_fetch = false;
+        for (int h = 0; h < num_heads; ++h) {
+            if (tables[h] == nullptr) {
+                need_fetch = true;
+                break;
+            }
+        }
+        if (need_fetch) {
+            auto t_batch_start = std::chrono::high_resolution_clock::now();
+            std::vector<std::shared_ptr<BufferHandle>> buffers =
+                store_->batch_get_buffer(embed_keys_);
+            if (buffers.size() != embed_keys_.size()) {
+                auto t_batch_end = std::chrono::high_resolution_clock::now();
+                if (emb_timing)
+                    emb_timing->emb_batch_get_buffer_ms =
+                        ns(t_batch_start, t_batch_end);
+                return -1;
+            }
+            for (int h = 0; h < num_heads; ++h) {
+                if (buffers[h] &&
+                    buffers[h]->size() >=
+                        static_cast<size_t>(list_of_N_[h]) * embed_D_ *
+                            sizeof(float)) {
+                    tables[h] =
+                        static_cast<const float*>(buffers[h]->ptr());
+                }
+            }
+            auto t_batch_end = std::chrono::high_resolution_clock::now();
+            if (emb_timing)
+                emb_timing->emb_batch_get_buffer_ms =
+                    ns(t_batch_start, t_batch_end);
         }
     }
 
+    for (int h = 0; h < num_heads; ++h) {
+        if (tables[h] == nullptr) {
+            std::memset(output_buffer, 0, expected_size);
+            return -1;
+        }
+    }
+
+    auto t_lookup_start = std::chrono::high_resolution_clock::now();
     for (int h = 0; h < num_heads; ++h) {
         if (tables[h] == nullptr) continue;
         const float* table = tables[h];
@@ -303,6 +500,21 @@ int Engram::embedding_lookup(
             }
         }
     }
+    auto t_lookup_end = std::chrono::high_resolution_clock::now();
+    auto t_embed_end = std::chrono::high_resolution_clock::now();
+    if (emb_timing) {
+        emb_timing->emb_lookup_ms = ns(t_lookup_start, t_lookup_end);
+        emb_timing->emb_total_internal_ms = ns(t_embed_start, t_embed_end);
+        double phase_sum = emb_timing->emb_setup_ms + emb_timing->emb_register_ms +
+                          emb_timing->emb_batch_query_ms +
+                          emb_timing->emb_get_into_range_ms +
+                          emb_timing->emb_scatter_ms + emb_timing->emb_unregister_ms +
+                          emb_timing->emb_prep_ms +
+                          emb_timing->emb_batch_get_buffer_ms +
+                          emb_timing->emb_lookup_ms;
+        emb_timing->emb_gap_ms = std::max(
+            0.0, emb_timing->emb_total_internal_ms - phase_sum);
+    }
     return 0;
 }
 
@@ -312,6 +524,14 @@ int Engram::embedding_populate_from_tensors(
     if (embedding_data.size() != embed_keys_.size() ||
         sizes.size() != embed_keys_.size()) {
         return -1;
+    }
+
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        size_t expected =
+            static_cast<size_t>(list_of_N_[i]) * embed_D_ * sizeof(float);
+        if (sizes[i] < expected) {
+            return -1;
+        }
     }
 
     for (size_t i = 0; i < embedding_data.size(); ++i) {
@@ -333,7 +553,7 @@ int Engram::embedding_populate_from_tensors(
 }
 
 // -----------------------------------------------------------------------------
-// Engram: constructor, gating, ShortConv, forward, populate
+// Engram: constructor, query, populate
 // -----------------------------------------------------------------------------
 
 Engram::Engram(int layer_id, const EngramConfig& config,
@@ -363,8 +583,9 @@ Engram::Engram(int layer_id, const EngramConfig& config,
         std::mt19937_64 gen(static_cast<uint64_t>(config.seed + PRIME_1 * lid));
         std::uniform_int_distribution<int64_t> dis(0, half_bound - 1);
         std::vector<int64_t> multipliers;
-        for (int i = 0; i < max_ngram_size_; ++i)
+        for (int i = 0; i < max_ngram_size_; ++i) {
             multipliers.push_back(dis(gen) * 2 + 1);
+        }
         layer_multipliers_[lid] = multipliers;
     }
 
@@ -388,7 +609,9 @@ Engram::Engram(int layer_id, const EngramConfig& config,
 
     const auto& vs = vocab_size_across_layers_[layer_id];
     for (const auto& ngram_sizes : vs) {
-        for (int64_t s : ngram_sizes) list_of_N_.push_back(s);
+        for (int64_t s : ngram_sizes) {
+            list_of_N_.push_back(s);
+        }
     }
     if (list_of_N_.empty()) {
         for (int n = 2; n <= config.max_ngram_size; ++n) {
@@ -404,121 +627,9 @@ Engram::Engram(int layer_id, const EngramConfig& config,
         oss << "engram:l" << layer_id_ << ":h" << h;
         embed_keys_.push_back(oss.str());
     }
-
-    int engram_hidden = (config.max_ngram_size - 1) * config.n_embed_per_ngram;
-    key_proj_weights_.resize(backbone_cfg.hc_mult);
-    for (int i = 0; i < backbone_cfg.hc_mult; ++i) {
-        key_proj_weights_[i].resize(engram_hidden * backbone_cfg.hidden_size);
-        std::mt19937 gen(42 + i);
-        std::normal_distribution<float> d(
-            0.0f, std::sqrt(2.0f / (engram_hidden + backbone_cfg.hidden_size)));
-        for (float& w : key_proj_weights_[i]) w = d(gen);
-    }
-    value_proj_weights_.resize(engram_hidden * backbone_cfg.hidden_size);
-    std::mt19937 gen(43);
-    std::normal_distribution<float> d(
-        0.0f, std::sqrt(2.0f / (engram_hidden + backbone_cfg.hidden_size)));
-    for (float& w : value_proj_weights_) w = d(gen);
 }
 
-void Engram::compute_gates_and_fuse(const float* embeddings,
-                                    const float* hidden_states, int B, int L,
-                                    float* output) const {
-    int hc_mult = backbone_cfg_.hc_mult;
-    int D = backbone_cfg_.hidden_size;
-    int engram_hidden =
-        (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
-
-    std::vector<float> normed_embeddings(B * L * engram_hidden);
-    std::vector<float> normed_hidden(B * L * hc_mult * D);
-    std::vector<float> keys(B * L * hc_mult * D);
-    std::vector<float> gates(B * L * hc_mult);
-    std::vector<float> values(B * L * D);
-
-    rms_norm(embeddings, engram_hidden, 1e-5f, normed_embeddings.data(),
-             B * L * engram_hidden);
-
-    // Normalize hidden states for each hc_mult group (strided: no temp copies)
-    // hidden_states layout: [B, L, hc_mult, D] -> group hc at (i*hc_mult+hc)*D
-    const int hidden_stride = hc_mult * D;
-    for (int hc = 0; hc < hc_mult; ++hc) {
-        const float* src = hidden_states + hc * D;
-        float* dst = normed_hidden.data() + hc * D;
-        rms_norm_strided(src, D, hidden_stride, B * L, 1e-5f, dst,
-                        hidden_stride);
-    }
-
-    // Compute keys for each hc_mult group
-    for (int hc = 0; hc < hc_mult; ++hc) {
-        // Use temporary buffer for linear projection output
-        std::vector<float> key_hc(B * L * D);
-        std::memset(key_hc.data(), 0, B * L * D * sizeof(float));
-        linear_proj(normed_embeddings.data(), key_proj_weights_[hc].data(),
-                    engram_hidden, D, B * L * engram_hidden, key_hc.data());
-        rms_norm(key_hc.data(), D, 1e-5f, key_hc.data(), B * L * D);
-
-        // Write keys to correct positions in keys array
-        for (int i = 0; i < B * L; ++i) {
-            float* dst = keys.data() + (i * hc_mult + hc) * D;
-            const float* src = key_hc.data() + i * D;
-            std::memcpy(dst, src, D * sizeof(float));
-        }
-
-        // Compute gates
-        for (int i = 0; i < B * L; ++i) {
-            float dot = 0.0f;
-            const float* k = keys.data() + (i * hc_mult + hc) * D;
-            const float* q = normed_hidden.data() + (i * hc_mult + hc) * D;
-            for (int j = 0; j < D; ++j) dot += k[j] * q[j];
-            float g = dot / std::sqrt(static_cast<float>(D));
-            float sign = (g >= 0) ? 1.0f : -1.0f;
-            g = std::sqrt(std::max(std::abs(g), 1e-6f)) * sign;
-            gates[i * hc_mult + hc] = 1.0f / (1.0f + std::exp(-g));
-        }
-    }
-
-    std::memset(values.data(), 0, B * L * D * sizeof(float));
-    linear_proj(normed_embeddings.data(), value_proj_weights_.data(),
-                engram_hidden, D, B * L * engram_hidden, values.data());
-
-    for (int b = 0; b < B; ++b) {
-        for (int l = 0; l < L; ++l) {
-            for (int hc = 0; hc < hc_mult; ++hc) {
-                float g = gates[(b * L + l) * hc_mult + hc];
-                const float* v = values.data() + (b * L + l) * D;
-                float* out = output + ((b * L + l) * hc_mult + hc) * D;
-                for (int d = 0; d < D; ++d) out[d] = g * v[d];
-            }
-        }
-    }
-}
-
-void Engram::apply_short_conv(const float* input, int B, int L,
-                              float* output) const {
-    int hc_mult = backbone_cfg_.hc_mult;
-    int D = backbone_cfg_.hidden_size;
-    int total_C = hc_mult * D;
-
-    std::vector<float> normed(B * L * total_C);
-    // Normalize each hc_mult group separately (strided: no temp copies)
-    // input layout: [B, L, hc_mult, D] -> group hc at (i*hc_mult+hc)*D
-    const int hidden_stride = hc_mult * D;
-    for (int hc = 0; hc < hc_mult; ++hc) {
-        const float* src = input + hc * D;
-        float* dst = normed.data() + hc * D;
-        rms_norm_strided(src, D, hidden_stride, B * L, 1e-5f, dst,
-                        hidden_stride);
-    }
-
-    std::vector<float> conv_out(B * L * total_C);
-    depthwise_conv1d(normed.data(), B, L, total_C, config_.kernel_size,
-                     config_.max_ngram_size, conv_out.data());
-    silu(conv_out.data(), B * L * total_C);
-
-    for (int i = 0; i < B * L * total_C; ++i) {
-        output[i] = input[i] + conv_out[i];
-    }
-}
+Engram::~Engram() { release_internal_workspace(); }
 
 size_t Engram::get_embedding_tables_workspace_size() const {
     size_t total = 0;
@@ -528,87 +639,244 @@ size_t Engram::get_embedding_tables_workspace_size() const {
     return total;
 }
 
-size_t Engram::get_forward_workspace_size(int B, int L) const {
-    int engram_hidden =
-        (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
-    int hc_mult = backbone_cfg_.hc_mult;
-    int D = backbone_cfg_.hidden_size;
-    size_t emb_floats = static_cast<size_t>(B) * L * engram_hidden;
-    size_t gated_floats = static_cast<size_t>(B) * L * hc_mult * D;
-    return (emb_floats + gated_floats) * sizeof(float);
+std::vector<size_t> Engram::get_query_table_buffer_sizes(int B, int L) const {
+    const int64_t max_rows_per_head =
+        std::max<int64_t>(1, static_cast<int64_t>(B) * L);
+    const size_t row_bytes = static_cast<size_t>(embed_D_) * sizeof(float);
+
+    std::vector<size_t> sizes;
+    sizes.reserve(list_of_N_.size());
+    for (int64_t N_h : list_of_N_) {
+        const int64_t rows = std::min<int64_t>(N_h, max_rows_per_head);
+        sizes.push_back(static_cast<size_t>(rows) * row_bytes);
+    }
+    return sizes;
 }
 
-int Engram::forward(const void* hidden_states, size_t hidden_states_size,
-                    const std::vector<std::vector<int64_t>>& input_ids,
-                    void* output, size_t output_size, void* workspace,
-                    size_t workspace_size) const {
-    if (hidden_states == nullptr || output == nullptr) return -1;
+size_t Engram::get_query_workspace_size(int B, int L) const {
+    size_t total = 0;
+    for (size_t sz : get_query_table_buffer_sizes(B, L)) {
+        total += sz;
+    }
+    return total;
+}
+
+int Engram::ensure_internal_workspace(int B, int L) const {
+    if (store_ == nullptr) return -1;
+
+    const std::vector<size_t> table_sizes = get_query_table_buffer_sizes(B, L);
+    const size_t required_bytes = std::accumulate(
+        table_sizes.begin(), table_sizes.end(), static_cast<size_t>(0));
+
+    bool reuse_existing =
+        internal_workspace_registered_ &&
+        internal_workspace_.size() >= required_bytes &&
+        internal_table_sizes_.size() == table_sizes.size();
+    if (reuse_existing) {
+        for (size_t i = 0; i < table_sizes.size(); ++i) {
+            if (internal_table_sizes_[i] < table_sizes[i]) {
+                reuse_existing = false;
+                break;
+            }
+        }
+    }
+    if (reuse_existing) return 0;
+
+    release_internal_workspace();
+
+    internal_workspace_.assign(required_bytes, 0);
+    internal_table_buffers_.clear();
+    internal_table_sizes_ = table_sizes;
+    internal_table_buffers_.reserve(table_sizes.size());
+
+    char* base = internal_workspace_.data();
+    for (size_t sz : table_sizes) {
+        internal_table_buffers_.push_back(base);
+        base += sz;
+    }
+
+    for (size_t i = 0; i < internal_table_buffers_.size(); ++i) {
+        int ret =
+            store_->register_buffer(internal_table_buffers_[i], table_sizes[i]);
+        if (ret != 0) {
+            for (size_t j = 0; j < i; ++j) {
+                store_->unregister_buffer(internal_table_buffers_[j]);
+            }
+            internal_workspace_.clear();
+            internal_table_buffers_.clear();
+            internal_table_sizes_.clear();
+            internal_workspace_registered_ = false;
+            return -1;
+        }
+    }
+
+    internal_workspace_registered_ = true;
+    return 0;
+}
+
+void Engram::release_internal_workspace() const {
+    if (store_ != nullptr && internal_workspace_registered_) {
+        for (void* buf : internal_table_buffers_) {
+            store_->unregister_buffer(buf);
+        }
+    }
+    internal_workspace_registered_ = false;
+    internal_workspace_.clear();
+    internal_table_buffers_.clear();
+    internal_table_sizes_.clear();
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Engram::get_query_results()
+    const {
+    if (store_ == nullptr) return {};
+
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(query_result_cache_mu_);
+        if (query_result_cache_valid_ &&
+            cached_query_results_.size() == embed_keys_.size()) {
+            bool cache_valid = true;
+            for (const auto& result : cached_query_results_) {
+                if (result.lease_timeout <= now) {
+                    cache_valid = false;
+                    break;
+                }
+            }
+            if (cache_valid) {
+                std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+                query_results.reserve(cached_query_results_.size());
+                for (const auto& result : cached_query_results_) {
+                    query_results.emplace_back(result);
+                }
+                return query_results;
+            }
+        }
+    }
+
+    auto query_results = store_->batch_query(embed_keys_);
+    {
+        std::lock_guard<std::mutex> lock(query_result_cache_mu_);
+        cached_query_results_.clear();
+        query_result_cache_valid_ = false;
+        bool can_cache = (query_results.size() == embed_keys_.size());
+        if (can_cache) {
+            cached_query_results_.reserve(query_results.size());
+            for (const auto& result : query_results) {
+                if (!result) {
+                    can_cache = false;
+                    break;
+                }
+                cached_query_results_.push_back(result.value());
+            }
+        }
+        if (can_cache) {
+            query_result_cache_valid_ = true;
+        } else {
+            cached_query_results_.clear();
+        }
+    }
+    return query_results;
+}
+
+void Engram::invalidate_query_result_cache() const {
+    std::lock_guard<std::mutex> lock(query_result_cache_mu_);
+    cached_query_results_.clear();
+    query_result_cache_valid_ = false;
+}
+
+std::vector<std::vector<std::vector<int64_t>>> Engram::hash_input_ids(
+    const std::vector<std::vector<int64_t>>& input_ids) const {
+    return hash_(input_ids, layer_id_);
+}
+
+std::vector<int64_t> Engram::get_table_vocab_sizes() const {
+    return list_of_N_;
+}
+
+std::vector<std::string> Engram::get_store_keys() const {
+    return embed_keys_;
+}
+
+int Engram::get_num_heads() const {
+    return static_cast<int>(list_of_N_.size());
+}
+
+int Engram::get_embedding_dim() const {
+    return embed_D_;
+}
+
+int Engram::query_embeddings(
+    const std::vector<std::vector<int64_t>>& input_ids, void* output,
+    size_t output_size, void* workspace, size_t workspace_size,
+    QueryTiming* out_timing) const {
+    if (output == nullptr) return -1;
     if (store_ == nullptr) return -1;
 
     int B = static_cast<int>(input_ids.size());
     if (B == 0) return -1;
     int L = static_cast<int>(input_ids[0].size());
-    int hc_mult = backbone_cfg_.hc_mult;
-    int D = backbone_cfg_.hidden_size;
 
-    size_t expected = static_cast<size_t>(B) * L * hc_mult * D * sizeof(float);
-    if (hidden_states_size < expected || output_size < expected) return -1;
+    size_t expected =
+        static_cast<size_t>(B) * L * list_of_N_.size() * embed_D_ * sizeof(float);
+    if (output_size < expected) return -1;
 
-    int engram_hidden =
-        (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
-    size_t emb_sz = static_cast<size_t>(B) * L * engram_hidden * sizeof(float);
-    size_t required_ws = get_forward_workspace_size(B, L);
-    size_t tables_ws = get_embedding_tables_workspace_size();
-    size_t full_ws = required_ws + tables_ws;
-
-    float* embeddings_buffer = nullptr;
-    float* gated_output = nullptr;
+    std::unique_lock<std::mutex> internal_workspace_lock;
     std::vector<void*> table_buffers;
     std::vector<size_t> table_sizes;
-    std::vector<float> embeddings_vec;
-    std::vector<float> gated_vec;
-
-    if (workspace != nullptr && workspace_size >= full_ws) {
-        char* base = static_cast<char*>(workspace);
-        embeddings_buffer = static_cast<float*>(workspace);
-        gated_output = reinterpret_cast<float*>(base + emb_sz);
-        char* tables_base = base + required_ws;
-        for (size_t h = 0; h < list_of_N_.size(); ++h) {
-            size_t sz =
-                static_cast<size_t>(list_of_N_[h]) * embed_D_ * sizeof(float);
-            table_buffers.push_back(tables_base);
-            table_sizes.push_back(sz);
-            tables_base += sz;
+    bool buffers_are_pre_registered = false;
+    const size_t query_workspace_bytes = get_query_workspace_size(B, L);
+    const bool caller_workspace_ready =
+        (workspace != nullptr && workspace_size >= query_workspace_bytes);
+    if (store_ != nullptr) {
+        if (caller_workspace_ready) {
+            internal_workspace_lock = std::unique_lock<std::mutex>(
+                internal_workspace_mu_, std::try_to_lock);
+        } else {
+            internal_workspace_lock =
+                std::unique_lock<std::mutex>(internal_workspace_mu_);
         }
-    } else if (workspace != nullptr && workspace_size >= required_ws) {
-        embeddings_buffer = static_cast<float*>(workspace);
-        gated_output = static_cast<float*>(workspace) + (emb_sz / sizeof(float));
-    } else {
-        embeddings_vec.resize(B * L * engram_hidden);
-        gated_vec.resize(B * L * hc_mult * D);
-        embeddings_buffer = embeddings_vec.data();
-        gated_output = gated_vec.data();
+        if (internal_workspace_lock.owns_lock() &&
+            ensure_internal_workspace(B, L) == 0) {
+            table_buffers = internal_table_buffers_;
+            table_sizes = internal_table_sizes_;
+            buffers_are_pre_registered = true;
+        }
     }
 
+    if (table_buffers.empty() && caller_workspace_ready) {
+        char* tables_base = static_cast<char*>(workspace);
+        table_sizes = get_query_table_buffer_sizes(B, L);
+        table_buffers.reserve(table_sizes.size());
+        for (size_t sz : table_sizes) {
+            table_buffers.push_back(tables_base);
+            tables_base += sz;
+        }
+    }
+
+    auto t_hash_start = std::chrono::high_resolution_clock::now();
     auto hash_ids = hash_(input_ids, layer_id_);
+    auto t_hash_end = std::chrono::high_resolution_clock::now();
 
     const std::vector<void*>* tbl_bufs =
         table_buffers.empty() ? nullptr : &table_buffers;
     const std::vector<size_t>* tbl_szs =
         table_sizes.empty() ? nullptr : &table_sizes;
-    if (embedding_lookup(hash_ids, embeddings_buffer, emb_sz, tbl_bufs,
-                        tbl_szs) != 0)
+
+    auto t_lookup_start = std::chrono::high_resolution_clock::now();
+    if (embedding_lookup(hash_ids, output, output_size, tbl_bufs, tbl_szs,
+                         buffers_are_pre_registered, out_timing) != 0) {
         return -1;
+    }
+    auto t_lookup_end = std::chrono::high_resolution_clock::now();
 
-    compute_gates_and_fuse(embeddings_buffer,
-                           static_cast<const float*>(hidden_states), B, L,
-                           gated_output);
-
-    apply_short_conv(gated_output, B, L, static_cast<float*>(output));
-
-    const float* h = static_cast<const float*>(hidden_states);
-    float* out = static_cast<float*>(output);
-    for (int i = 0; i < B * L * hc_mult * D; ++i) out[i] += h[i];
+    if (out_timing != nullptr) {
+        using namespace std::chrono;
+        out_timing->hash_ms =
+            1e-6 * duration_cast<nanoseconds>(t_hash_end - t_hash_start).count();
+        out_timing->store_read_ms =
+            1e-6 * duration_cast<nanoseconds>(t_lookup_end - t_lookup_start)
+                       .count();
+    }
 
     return 0;
 }
@@ -617,7 +885,9 @@ int Engram::populate_store_from_buffers(
     const std::vector<void*>& embedding_buffers,
     const std::vector<size_t>& buffer_sizes) {
     if (store_ == nullptr) return -1;
-    return embedding_populate_from_tensors(embedding_buffers, buffer_sizes);
+    int ret = embedding_populate_from_tensors(embedding_buffers, buffer_sizes);
+    if (ret == 0) invalidate_query_result_cache();
+    return ret;
 }
 
 }  // namespace engram
