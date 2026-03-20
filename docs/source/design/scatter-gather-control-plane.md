@@ -83,6 +83,23 @@ For Engram, the planner receives a logical request and produces one or more bina
 SG descriptors. Other workloads may build descriptors directly and bypass the
 planner.
 
+## What Is Already Implemented
+
+The current Engram branch already ships a working vertical slice of this design
+for cross-node sparse reads. Concretely, it now has:
+
+- a binary request format for remote gather descriptors
+- a binary doorbell and ACK format on top of the transfer-engine notify path
+- a consumer-side descriptor ring with registered slots
+- a producer-side executor that reads descriptors, gathers rows into staging
+  buffers, and writes the packed result back
+- an Engram-side planner that groups work by remote endpoint and emits those
+  descriptors
+
+So this document is no longer purely aspirational. The remaining work is mostly
+about hardening and generalizing the current Engram-first path into a reusable
+Mooncake substrate.
+
 ## Binary SG protocol
 
 The binary SG protocol is the long-term common descriptor format used by Mooncake's
@@ -274,8 +291,7 @@ The implementation should be done in phases so each step is measurable.
 - replace the notify path's JSON envelope with a binary notify envelope
 - keep current request and reply structure for compatibility
 
-This phase does not solve the whole problem, but it gives a lower-overhead notify
-substrate that later phases can reuse.
+Status: implemented in the current branch.
 
 ### Phase 1: binary SG descriptor
 
@@ -283,6 +299,9 @@ substrate that later phases can reuse.
   descriptors and binary completions
 - keep the current notify submit path temporarily
 - measure how much latency is removed by eliminating JSON planning payloads
+
+Status: implemented in the current Engram path, although still scoped to
+Engram's request shape rather than a fully public generic API.
 
 ### Phase 2: descriptor ring + tiny doorbell
 
@@ -294,6 +313,10 @@ substrate that later phases can reuse.
 This is the main architectural step needed to attack the remaining control-send
 latency.
 
+Status: the current Engram path already uses registered descriptor slots plus a
+small doorbell. Completion is still ACK-based rather than a general completion
+queue.
+
 ### Phase 3: Engram planner
 
 - add a logical Engram planner that can build descriptors on the requester side
@@ -301,10 +324,14 @@ latency.
   stable enough
 - evaluate whether planner-side compression further reduces descriptor size
 
+Status: implemented for the current Engram query path.
+
 ### Phase 4: generic API exposure
 
 - expose the scatter-gather substrate as a general Mooncake capability
 - keep Engram as the first workload-specific planner built on top
+
+Status: not done yet.
 
 ## Failure handling and lifecycle
 
@@ -322,21 +349,18 @@ meant to become a generic substrate.
 
 ## Current implementation status
 
-This document describes the target architecture.
+The current implementation should be read as "Engram-first, substrate-second":
 
-The first development step on this branch is to introduce a binary notify
-envelope in the transfer-engine notify path. That is a transport foundation step:
+- the full producer-side remote-gather path exists and is used by Engram
+- the descriptor ring is owned by the Engram instance rather than by a general
+  Mooncake SG service
+- completion still uses per-request ACK handling instead of a general completion
+  queue
+- failure handling and backpressure semantics are sufficient for the current
+  path, but not yet documented as a reusable public contract
 
-- it keeps the current API shape
-- it removes JSON from the notify envelope itself
-- it prepares the notify path to later carry binary SG submissions and doorbells
-
-The later phases still need to be implemented:
-
-- binary SG descriptor for remote gather requests
-- descriptor ring or request pool
-- tiny doorbell submit path
-- Engram planner
+So the design direction is now proven by code, but the final generic API and
+runtime contract still need to be extracted and stabilized.
 
 ## Relationship to Engram
 

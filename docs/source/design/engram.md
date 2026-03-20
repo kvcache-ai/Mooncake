@@ -298,6 +298,65 @@ This keeps large descriptors off the control socket, keeps the data path on the
 existing transfer primitives, and makes the mechanism reusable for other sparse
 scatter/gather workloads beyond Engram.
 
+### Cross-Node Operating Conditions
+
+The remote-gather path is opportunistic rather than mandatory. Today it is used
+only when all of the following are true:
+
+- the store is live and the Engram instance still owns that store handle
+- the active transfer protocol is RDMA
+- `MC_ENGRAM_REMOTE_GATHER` is not disabled
+- the consumer can provision descriptor-ring slots large enough for the current
+  request shape
+
+If any of those conditions is not met, `query()` still follows the same API and
+falls back to the existing range-read or bulk-fetch path. In other words, remote
+gather is an optimization layer, not a separate query contract.
+
+The producer side also relies on the Engram object remaining alive while it owns
+registered control/data buffers and its background notify loop. The recommended
+lifecycle remains:
+
+1. populate/query through `Engram`
+2. stop using that instance
+3. destroy the `Engram` object
+4. close the backing store/client
+
+The destructor is defensive and attempts to clean up even if the caller gets the
+order wrong, but the safe production rule is still "destroy Engram first, close
+store second".
+
+### Cross-Node Tuning Knobs
+
+The current implementation exposes a few environment variables for capacity and
+polling control:
+
+- `MC_ENGRAM_REMOTE_GATHER`
+  - default: enabled
+  - set to `0` / `false` / `off` to force the legacy cross-node fallback path
+- `MC_ENGRAM_SG_RING_SLOT_BYTES`
+  - default: `256 KiB`
+  - base descriptor-slot size reserved in the consumer-side request ring
+- `MC_ENGRAM_SG_RING_SLOTS`
+  - default: `64`
+  - number of descriptor slots kept in the request ring
+- `MC_ENGRAM_SG_RING_MAX_SLOT_BYTES`
+  - default: `1 MiB`
+  - upper bound when a large request forces slot growth
+- `MC_ENGRAM_REMOTE_GATHER_HOT_POLLS`
+  - default: `64`
+  - how many immediate notify polls the producer-side service will do before it
+    falls back to the normal sleep interval
+
+Practical guidance:
+
+- increase slot bytes or max slot bytes when one sparse query touches many
+  merged ranges per remote node
+- increase slot count when many queries may be in flight concurrently from the
+  same consumer
+- leave hot polls low unless you are specifically chasing control-plane tail
+  latency and can afford extra CPU busy-polling
+
 ## Current Limits and Follow-up Opportunities
 
 The current implementation is intentionally minimal and correct for the data path, but there is still room to improve:
@@ -319,7 +378,10 @@ The current implementation is intentionally minimal and correct for the data pat
 
 5. **Remote / cross-node query path**
    - The current biggest win comes from the same-node local-direct path.
-   - Cross-node queries still rely on range reads or bulk fetch, so this is the next important place to optimize if we need microsecond-class latency beyond single-node access.
+   - Cross-node queries now have a producer-side remote-gather path, but they
+     still have more control-plane and staging overhead than the same-node fast
+     path. This remains the next important place to optimize if we need
+     microsecond-class latency beyond single-node access.
 
 6. **Explore finer-grained object layouts**
    - Today each head is one object.
@@ -327,15 +389,19 @@ The current implementation is intentionally minimal and correct for the data pat
 
 ## Next-Generation Cross-Node Path
 
-For cross-node sparse reads, the next stage is no longer a small tweak to the
-current JSON notify path. The planned direction is:
+The current branch already implements an Engram-specific vertical slice of the
+new control plane: binary descriptors, descriptor-ring submission, small
+doorbells, and producer-side gather execution.
 
-- a generic binary scatter-gather descriptor format
-- descriptor ring or request-pool based submission
-- a tiny doorbell instead of sending the full descriptor through the control socket
-- an Engram-specific planner on top of the generic substrate
+The next stage is to generalize and harden that path:
 
-That work is tracked in the dedicated design document:
+- extract the scatter-gather substrate into a reusable Mooncake capability
+- replace per-request ACK handling with a cleaner generic completion model
+- formalize slot ownership, timeout, and peer-restart semantics as a public
+  contract
+- keep Engram as the first planner built on top of that shared substrate
+
+The architectural details are tracked in the dedicated design document:
 
 - [Scatter-Gather Control Plane for Engram and Beyond](./scatter-gather-control-plane.md)
 

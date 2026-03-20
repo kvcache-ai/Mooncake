@@ -291,8 +291,21 @@ output = engram.query(input_ids, workspace=None)
 - queries the corresponding rows from Mooncake Store
 - tries the same-node local-direct path first when the tables are mounted locally
 - otherwise prefers a range-read path backed by reusable scratch buffers
+- on RDMA cross-node reads, may use the remote-gather control plane to have the
+  producer gather rows and write them back into the caller scratch space
 - may reuse an internal registered workspace even when `workspace=None`
 - falls back to `batch_get_buffer()` when the access pattern is too fragmented or a bulk fetch is cheaper
+
+**Cross-node control-plane knobs:**
+
+- `MC_ENGRAM_REMOTE_GATHER`: enable or disable the RDMA remote-gather path
+- `MC_ENGRAM_SG_RING_SLOT_BYTES`: base descriptor-slot size for remote-gather requests
+- `MC_ENGRAM_SG_RING_SLOTS`: number of request-ring slots kept per Engram instance
+- `MC_ENGRAM_SG_RING_MAX_SLOT_BYTES`: upper bound when a single request needs a larger slot
+- `MC_ENGRAM_REMOTE_GATHER_HOT_POLLS`: producer-side hot-poll budget before sleeping
+
+If remote gather is disabled or cannot be provisioned for the current request,
+`query()` transparently falls back to the existing range-read/bulk-fetch path.
 
 #### populate_store_from_buffers()
 
