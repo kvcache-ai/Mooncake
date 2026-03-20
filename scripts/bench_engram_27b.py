@@ -299,8 +299,8 @@ def main():
 
     print("\n" + "=" * 60)
     print("Embedding lookup breakdown (store_read) - identify bottlenecks")
-    print("  range path: setup, register, batch_query, get_into_range, scatter, unregister, prep")
-    print("  batch path: setup, batch_query, batch_get_buffer (when range reads are too fragmented)")
+    print("  local path: setup, batch_query, lookup")
+    print("  remote path: setup, register, batch_query, prep, remote_fetch, scatter, unregister")
     print("-" * 60)
     for r in results:
         d = r.get("emb_detail", {})
@@ -311,17 +311,21 @@ def main():
         scatter = d.get("scatter_ms", 0)
         unreg = d.get("unregister_ms", 0)
         prep = d.get("prep_ms", 0)
-        batch_get = d.get("batch_get_buffer_ms", 0)
+        remote_fetch = d.get("remote_fetch_ms", 0)
         lookup = d.get("lookup_ms", 0)
         gap = d.get("gap_ms", 0)
-        total_emb = setup + reg + qry + get + scatter + unreg + prep + batch_get + lookup
+        total_emb = (
+            setup + reg + qry + get + scatter + unreg + prep +
+            remote_fetch + lookup
+        )
         internal = d.get("_total_internal_ms", 0)
         store_read = r["mean_store_read_ms"]
         print(
             f"  B={r['batch_size']:3d}: setup={setup:.2f} register={reg:.2f} batch_query={qry:.2f} "
             f"get_into_range={get:.2f} scatter={scatter:.2f} "
             f"unregister={unreg:.2f} prep={prep:.2f} "
-            f"batch_get_buffer={batch_get:.2f} lookup={lookup:.2f} gap={gap:.2f}"
+            f"remote_fetch={remote_fetch:.2f} "
+            f"lookup={lookup:.2f} gap={gap:.2f}"
         )
         print(
             f"       phases_sum={total_emb:.2f} internal={internal:.2f} store_read={store_read:.2f} "

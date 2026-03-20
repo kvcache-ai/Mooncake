@@ -222,337 +222,245 @@ int Engram::embedding_lookup(
         use_zero_copy = false;
     }
 
-    double acc_get_ms = 0, acc_scatter_ms = 0;
+    double acc_scatter_ms = 0, acc_lookup_ms = 0;
     if (use_zero_copy) {
-        // Range-read path: one batch_query up front, then per-head offset reads
-        // into reusable scratch buffers.
-        if (!have_query_results) {
-            for (int h = 0; h < num_heads; ++h) {
-                for (int b = 0; b < B; ++b) {
-                    for (int l = 0; l < L; ++l) {
-                        std::memset(
-                            output +
-                                (b * L * num_heads + l * num_heads + h) *
-                                    embed_D_,
-                            0, embed_D_ * sizeof(float));
-                    }
-                }
-            }
+        struct RowRef {
+            int64_t idx;
+            size_t output_offset;
+        };
+        struct PackedRange {
+            int64_t start;
+            int64_t end;
+            size_t buffer_offset;
+            size_t ref_begin;
+            size_t ref_end;
+        };
+
+        auto zero_output = [&]() { std::memset(output_buffer, 0, expected_size); };
+
+        if (!have_query_results || store_->client_ == nullptr) {
+            zero_output();
             if (!buffers_are_pre_registered) {
-                for (int h : registered_indices)
+                for (int h : registered_indices) {
                     store_->unregister_buffer((*table_buffers)[h]);
+                }
             }
             return -1;
         }
 
+        std::vector<std::vector<RowRef>> head_refs(num_heads);
+        std::vector<std::vector<PackedRange>> packed_ranges(num_heads);
         int total_ranges = 0;
-        size_t total_requested_bytes = 0;
-        const size_t total_table_bytes = get_embedding_tables_workspace_size();
-        std::vector<std::vector<std::pair<int64_t, int64_t>>> head_ranges(
-            num_heads);
+        bool prep_ok = true;
+        char* workspace_base = static_cast<char*>((*table_buffers)[0]);
+
         auto t_prep_start = std::chrono::high_resolution_clock::now();
         for (int h = 0; h < num_heads; ++h) {
-            if (!query_results[h]) continue;
+            if (tables[h] != nullptr) {
+                continue;
+            }
+            if (!query_results[h]) {
+                prep_ok = false;
+                break;
+            }
+
+            auto& refs = head_refs[h];
+            refs.reserve(static_cast<size_t>(B) * L);
             int64_t vocab_size_h = list_of_N_[h];
-            std::set<int64_t> unique_idx;
             for (int b = 0; b < B; ++b) {
                 for (int l = 0; l < L; ++l) {
                     int64_t idx = hash_ids[b][l][h];
                     if (idx < 0) idx = 0;
                     if (idx >= vocab_size_h) idx = vocab_size_h - 1;
-                    unique_idx.insert(idx);
+                    refs.push_back(RowRef{
+                        idx,
+                        static_cast<size_t>(
+                            (b * L * num_heads + l * num_heads + h) *
+                            embed_D_),
+                    });
                 }
             }
-            if (unique_idx.empty()) continue;
-            std::vector<std::pair<int64_t, int64_t>> ranges;
-            int64_t range_start = *unique_idx.begin();
-            int64_t range_end = range_start + 1;
-            for (auto it = std::next(unique_idx.begin()); it != unique_idx.end();
-                 ++it) {
-                if (*it == range_end) {
-                    range_end++;
-                } else {
-                    ranges.emplace_back(range_start, range_end);
-                    range_start = *it;
-                    range_end = range_start + 1;
-                }
+            if (refs.empty()) {
+                continue;
             }
-            ranges.emplace_back(range_start, range_end);
-            head_ranges[h] = std::move(ranges);
-            total_ranges += static_cast<int>(head_ranges[h].size());
-            for (const auto& r : head_ranges[h]) {
-                total_requested_bytes +=
-                    static_cast<size_t>(r.second - r.first) * row_bytes;
+
+            std::sort(refs.begin(), refs.end(),
+                      [](const RowRef& lhs, const RowRef& rhs) {
+                          if (lhs.idx != rhs.idx) return lhs.idx < rhs.idx;
+                          return lhs.output_offset < rhs.output_offset;
+                      });
+
+            size_t head_cursor = 0;
+            size_t ref_begin = 0;
+            while (ref_begin < refs.size()) {
+                int64_t range_start = refs[ref_begin].idx;
+                int64_t last_idx = range_start;
+                size_t ref_end = ref_begin + 1;
+                while (ref_end < refs.size()) {
+                    int64_t idx = refs[ref_end].idx;
+                    if (idx == last_idx) {
+                        ++ref_end;
+                        continue;
+                    }
+                    if (idx == last_idx + 1) {
+                        last_idx = idx;
+                        ++ref_end;
+                        continue;
+                    }
+                    break;
+                }
+
+                int64_t range_end = last_idx + 1;
+                size_t read_size =
+                    static_cast<size_t>(range_end - range_start) * row_bytes;
+                if (head_cursor + read_size > (*table_sizes)[h]) {
+                    prep_ok = false;
+                    break;
+                }
+
+                packed_ranges[h].push_back(PackedRange{
+                    range_start,
+                    range_end,
+                    head_cursor,
+                    ref_begin,
+                    ref_end,
+                });
+                head_cursor += read_size;
+                total_ranges++;
+                ref_begin = ref_end;
+            }
+
+            if (!prep_ok) {
+                break;
             }
         }
         auto t_prep_end = std::chrono::high_resolution_clock::now();
 
-        constexpr int kRangeThreshold = 256;
-        const bool prefer_range =
-            total_ranges > 0 && total_ranges <= kRangeThreshold &&
-            total_requested_bytes * 2 < total_table_bytes;
-        if (!prefer_range) {
-            struct PackedRange {
-                int64_t start;
-                int64_t end;
-                size_t buffer_offset;
-            };
+        auto t_batch_start = std::chrono::high_resolution_clock::now();
+        bool zero_copy_ok = prep_ok;
+        if (zero_copy_ok && total_ranges > 0) {
+            std::vector<
+                std::pair<Replica::Descriptor,
+                          std::vector<std::tuple<size_t, size_t, size_t>>>>
+                key_ranges;
+            key_ranges.reserve(num_heads);
 
-            std::vector<std::vector<PackedRange>> packed_ranges(num_heads);
-            std::vector<std::string> batch_keys;
-            std::vector<size_t> batch_dest_offsets;
-            std::vector<size_t> batch_src_offsets;
-            std::vector<size_t> batch_sizes;
-            batch_keys.reserve(total_ranges);
-            batch_dest_offsets.reserve(total_ranges);
-            batch_src_offsets.reserve(total_ranges);
-            batch_sizes.reserve(total_ranges);
-
-            char* workspace_base = static_cast<char*>((*table_buffers)[0]);
-            bool batch_ranges_ok = true;
             for (int h = 0; h < num_heads; ++h) {
-                if (!query_results[h]) {
-                    batch_ranges_ok = false;
+                if (tables[h] != nullptr || packed_ranges[h].empty()) {
+                    continue;
+                }
+
+                const QueryResult& qr = query_results[h].value();
+                auto replica_res = store_->client_->GetPreferredReplica(
+                    qr.replicas);
+                if (!replica_res || !replica_res.value().is_memory_replica()) {
+                    zero_copy_ok = false;
                     break;
                 }
+
                 char* head_base = static_cast<char*>((*table_buffers)[h]);
                 size_t head_base_offset =
                     static_cast<size_t>(head_base - workspace_base);
-                size_t head_cursor = 0;
-                for (const auto& range : head_ranges[h]) {
+                std::vector<std::tuple<size_t, size_t, size_t>> ranges;
+                ranges.reserve(packed_ranges[h].size());
+                for (const auto& range : packed_ranges[h]) {
                     size_t read_size =
-                        static_cast<size_t>(range.second - range.first) *
+                        static_cast<size_t>(range.end - range.start) *
                         row_bytes;
-                    if (head_cursor + read_size > (*table_sizes)[h]) {
-                        batch_ranges_ok = false;
-                        break;
-                    }
-                    packed_ranges[h].push_back(
-                        {range.first, range.second, head_cursor});
-                    batch_keys.push_back(embed_keys_[h]);
-                    batch_dest_offsets.push_back(head_base_offset + head_cursor);
-                    batch_src_offsets.push_back(
-                        static_cast<size_t>(range.first) * row_bytes);
-                    batch_sizes.push_back(read_size);
-                    head_cursor += read_size;
+                    ranges.emplace_back(
+                        head_base_offset + range.buffer_offset,
+                        static_cast<size_t>(range.start) * row_bytes,
+                        read_size);
                 }
-                if (!batch_ranges_ok) {
-                    break;
-                }
+                key_ranges.emplace_back(replica_res.value(), std::move(ranges));
             }
 
-            auto t_batch_start = std::chrono::high_resolution_clock::now();
-            std::vector<int64_t> batch_results;
-            if (batch_ranges_ok) {
-                batch_results = store_->batch_get_buffer_ranges(
-                    batch_keys, workspace_base, batch_dest_offsets,
-                    batch_src_offsets, batch_sizes);
-                if (batch_results.size() != batch_sizes.size()) {
-                    batch_ranges_ok = false;
-                } else {
-                    for (size_t i = 0; i < batch_results.size(); ++i) {
-                        if (batch_results[i] < 0 ||
-                            static_cast<size_t>(batch_results[i]) <
-                                batch_sizes[i]) {
-                            batch_ranges_ok = false;
-                            break;
-                        }
-                    }
-                }
+            if (zero_copy_ok && !key_ranges.empty()) {
+                ErrorCode err = store_->client_->BatchTransferReadRanges(
+                    workspace_base, key_ranges);
+                zero_copy_ok = (err == ErrorCode::OK);
             }
-            auto t_batch_end = std::chrono::high_resolution_clock::now();
-
-            auto t_scatter_start = std::chrono::high_resolution_clock::now();
-            if (batch_ranges_ok) {
-                for (int h = 0; h < num_heads; ++h) {
-                    float* buf = static_cast<float*>((*table_buffers)[h]);
-                    int64_t vocab_size_h = list_of_N_[h];
-                    for (const auto& range : packed_ranges[h]) {
-                        for (int b = 0; b < B; ++b) {
-                            for (int l = 0; l < L; ++l) {
-                                int64_t idx = hash_ids[b][l][h];
-                                if (idx < 0) idx = 0;
-                                if (idx >= vocab_size_h) idx = vocab_size_h - 1;
-                                if (idx >= range.start && idx < range.end) {
-                                    const float* src =
-                                        reinterpret_cast<const float*>(
-                                            reinterpret_cast<const char*>(buf) +
-                                            range.buffer_offset) +
-                                        static_cast<size_t>(idx - range.start) *
-                                            embed_D_;
-                                    float* dst =
-                                        output +
-                                        (b * L * num_heads + l * num_heads + h) *
-                                            embed_D_;
-                                    std::memcpy(dst, src,
-                                                embed_D_ * sizeof(float));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                std::memset(output_buffer, 0, expected_size);
-            }
-            auto t_scatter_end = std::chrono::high_resolution_clock::now();
-
-            auto t_unreg_start = std::chrono::high_resolution_clock::now();
-            if (!buffers_are_pre_registered) {
-                for (int h : registered_indices)
-                    store_->unregister_buffer((*table_buffers)[h]);
-            }
-            auto t_unreg_end = std::chrono::high_resolution_clock::now();
-            if (emb_timing) {
-                emb_timing->emb_register_ms = ns(t_register_start, t_register_end);
-                emb_timing->emb_prep_ms = ns(t_prep_start, t_prep_end);
-                emb_timing->emb_scatter_ms =
-                    ns(t_scatter_start, t_scatter_end);
-                emb_timing->emb_unregister_ms =
-                    buffers_are_pre_registered ? 0
-                                               : ns(t_unreg_start, t_unreg_end);
-                emb_timing->emb_batch_get_buffer_ms =
-                    ns(t_batch_start, t_batch_end);
-                auto t_embed_end = std::chrono::high_resolution_clock::now();
-                emb_timing->emb_total_internal_ms =
-                    ns(t_embed_start, t_embed_end);
-                double phase_sum = emb_timing->emb_setup_ms +
-                                   emb_timing->emb_register_ms +
-                                   emb_timing->emb_batch_query_ms +
-                                   emb_timing->emb_get_into_range_ms +
-                                   emb_timing->emb_scatter_ms +
-                                   emb_timing->emb_unregister_ms +
-                                   emb_timing->emb_prep_ms +
-                                   emb_timing->emb_batch_get_buffer_ms +
-                                   emb_timing->emb_lookup_ms;
-                emb_timing->emb_gap_ms = std::max(
-                    0.0, emb_timing->emb_total_internal_ms - phase_sum);
-            }
-            return batch_ranges_ok ? 0 : -1;
         }
-        if (use_zero_copy) {
-        struct HeadResult {
-            double get_ms;
-            double scatter_ms;
-            bool ok;
-        };
+        auto t_batch_end = std::chrono::high_resolution_clock::now();
 
-        auto process_head = [&](int h) -> HeadResult {
-            double head_get_ms = 0, head_scatter_ms = 0;
-            if (!query_results[h]) {
-                for (int b = 0; b < B; ++b) {
-                    for (int l = 0; l < L; ++l) {
-                        std::memset(
-                            output +
-                                (b * L * num_heads + l * num_heads + h) *
-                                    embed_D_,
-                            0, embed_D_ * sizeof(float));
+        auto t_scatter_start = std::chrono::high_resolution_clock::now();
+        if (zero_copy_ok) {
+            for (int h = 0; h < num_heads; ++h) {
+                if (tables[h] != nullptr || packed_ranges[h].empty()) {
+                    continue;
+                }
+
+                float* buf = static_cast<float*>((*table_buffers)[h]);
+                const auto& refs = head_refs[h];
+                for (const auto& range : packed_ranges[h]) {
+                    const float* range_base =
+                        reinterpret_cast<const float*>(
+                            reinterpret_cast<const char*>(buf) +
+                            range.buffer_offset);
+                    for (size_t i = range.ref_begin; i < range.ref_end; ++i) {
+                        const auto& ref = refs[i];
+                        const float* src =
+                            range_base +
+                            static_cast<size_t>(ref.idx - range.start) *
+                                embed_D_;
+                        float* dst = output + ref.output_offset;
+                        std::memcpy(dst, src, row_bytes);
                     }
                 }
-                return {head_get_ms, head_scatter_ms, false};
             }
-            int64_t vocab_size_h = list_of_N_[h];
-            const auto& ranges = head_ranges[h];
-            if (ranges.empty()) {
-                return {head_get_ms, head_scatter_ms, true};
-            }
+        } else {
+            zero_output();
+        }
+        auto t_scatter_end = std::chrono::high_resolution_clock::now();
 
-            float* buf = static_cast<float*>((*table_buffers)[h]);
-            size_t buf_bytes = (*table_sizes)[h];
-            const QueryResult& qr = query_results[h].value();
-            bool ok = true;
-            for (const auto& r : ranges) {
-                int64_t start = r.first;
-                int64_t end = r.second;
-                size_t src_offset = static_cast<size_t>(start) * row_bytes;
-                size_t read_size =
-                    static_cast<size_t>(end - start) * row_bytes;
-                if (read_size > buf_bytes) {
-                    ok = false;
-                    break;
+        auto t_lookup_start = std::chrono::high_resolution_clock::now();
+        if (zero_copy_ok) {
+            for (int h = 0; h < num_heads; ++h) {
+                if (tables[h] == nullptr) {
+                    continue;
                 }
-                auto t_get_start = std::chrono::high_resolution_clock::now();
-                int64_t ret = store_->get_into_range_with_query_result(
-                    embed_keys_[h], qr, buf, 0, src_offset, read_size);
-                auto t_get_end = std::chrono::high_resolution_clock::now();
-                head_get_ms += ns(t_get_start, t_get_end);
-                if (ret < 0 || static_cast<size_t>(ret) < read_size) {
-                    ok = false;
-                    break;
-                }
-                auto t_scatter_start =
-                    std::chrono::high_resolution_clock::now();
+
+                const float* table = tables[h];
+                int64_t vocab_size_h = list_of_N_[h];
                 for (int b = 0; b < B; ++b) {
                     for (int l = 0; l < L; ++l) {
                         int64_t idx = hash_ids[b][l][h];
                         if (idx < 0) idx = 0;
                         if (idx >= vocab_size_h) idx = vocab_size_h - 1;
-                        if (idx >= start && idx < end) {
-                            size_t off =
-                                static_cast<size_t>(idx - start) * embed_D_;
-                            float* dst =
-                                output +
-                                (b * L * num_heads + l * num_heads + h) *
-                                    embed_D_;
-                            std::memcpy(dst, buf + off,
-                                        embed_D_ * sizeof(float));
-                        }
-                    }
-                }
-                auto t_scatter_end =
-                    std::chrono::high_resolution_clock::now();
-                head_scatter_ms += ns(t_scatter_start, t_scatter_end);
-            }
-            if (!ok) {
-                for (int b = 0; b < B; ++b) {
-                    for (int l = 0; l < L; ++l) {
-                        std::memset(
+                        float* dst =
                             output +
-                                (b * L * num_heads + l * num_heads + h) *
-                                    embed_D_,
-                            0, embed_D_ * sizeof(float));
+                            (b * L * num_heads + l * num_heads + h) *
+                                embed_D_;
+                        const float* src =
+                            table + static_cast<size_t>(idx) * embed_D_;
+                        std::memcpy(dst, src, row_bytes);
                     }
                 }
-            }
-            return {head_get_ms, head_scatter_ms, ok};
-        };
-
-        const bool parallelize_heads = total_ranges > num_heads * 2;
-        bool zero_copy_ok = true;
-        if (parallelize_heads) {
-            std::vector<std::future<HeadResult>> futures;
-            futures.reserve(num_heads);
-            for (int h = 0; h < num_heads; ++h) {
-                futures.push_back(
-                    std::async(std::launch::async, process_head, h));
-            }
-            for (int h = 0; h < num_heads; ++h) {
-                auto result = futures[h].get();
-                acc_get_ms = std::max(acc_get_ms, result.get_ms);
-                acc_scatter_ms = std::max(acc_scatter_ms, result.scatter_ms);
-                zero_copy_ok = zero_copy_ok && result.ok;
-            }
-        } else {
-            for (int h = 0; h < num_heads; ++h) {
-                auto result = process_head(h);
-                acc_get_ms += result.get_ms;
-                acc_scatter_ms += result.scatter_ms;
-                zero_copy_ok = zero_copy_ok && result.ok;
             }
         }
+        auto t_lookup_end = std::chrono::high_resolution_clock::now();
+
+        acc_scatter_ms = ns(t_scatter_start, t_scatter_end);
+        acc_lookup_ms = ns(t_lookup_start, t_lookup_end);
+
         auto t_unreg_start = std::chrono::high_resolution_clock::now();
         if (!buffers_are_pre_registered) {
-            for (int h : registered_indices)
+            for (int h : registered_indices) {
                 store_->unregister_buffer((*table_buffers)[h]);
+            }
         }
         auto t_unreg_end = std::chrono::high_resolution_clock::now();
+
         if (emb_timing) {
             emb_timing->emb_register_ms = ns(t_register_start, t_register_end);
-            emb_timing->emb_get_into_range_ms = acc_get_ms;
-            emb_timing->emb_scatter_ms = acc_scatter_ms;
             emb_timing->emb_prep_ms = ns(t_prep_start, t_prep_end);
+            emb_timing->emb_scatter_ms = acc_scatter_ms;
+            emb_timing->emb_lookup_ms = acc_lookup_ms;
             emb_timing->emb_unregister_ms =
                 buffers_are_pre_registered ? 0
                                            : ns(t_unreg_start, t_unreg_end);
+            emb_timing->emb_remote_fetch_ms =
+                ns(t_batch_start, t_batch_end);
             auto t_embed_end = std::chrono::high_resolution_clock::now();
             emb_timing->emb_total_internal_ms =
                 ns(t_embed_start, t_embed_end);
@@ -563,17 +471,16 @@ int Engram::embedding_lookup(
                                emb_timing->emb_scatter_ms +
                                emb_timing->emb_unregister_ms +
                                emb_timing->emb_prep_ms +
-                               emb_timing->emb_batch_get_buffer_ms +
+                               emb_timing->emb_remote_fetch_ms +
                                emb_timing->emb_lookup_ms;
             emb_timing->emb_gap_ms =
                 std::max(0.0, emb_timing->emb_total_internal_ms - phase_sum);
         }
+
         if (!zero_copy_ok) {
-            std::memset(output_buffer, 0, expected_size);
             return -1;
         }
         return 0;
-        }
     }
     if (!use_zero_copy) {
         bool need_fetch = false;
@@ -590,7 +497,7 @@ int Engram::embedding_lookup(
             if (buffers.size() != embed_keys_.size()) {
                 auto t_batch_end = std::chrono::high_resolution_clock::now();
                 if (emb_timing)
-                    emb_timing->emb_batch_get_buffer_ms =
+                    emb_timing->emb_remote_fetch_ms =
                         ns(t_batch_start, t_batch_end);
                 return -1;
             }
@@ -605,7 +512,7 @@ int Engram::embedding_lookup(
             }
             auto t_batch_end = std::chrono::high_resolution_clock::now();
             if (emb_timing)
-                emb_timing->emb_batch_get_buffer_ms =
+                emb_timing->emb_remote_fetch_ms =
                     ns(t_batch_start, t_batch_end);
         }
     }
@@ -644,7 +551,7 @@ int Engram::embedding_lookup(
                           emb_timing->emb_get_into_range_ms +
                           emb_timing->emb_scatter_ms + emb_timing->emb_unregister_ms +
                           emb_timing->emb_prep_ms +
-                          emb_timing->emb_batch_get_buffer_ms +
+                          emb_timing->emb_remote_fetch_ms +
                           emb_timing->emb_lookup_ms;
         emb_timing->emb_gap_ms = std::max(
             0.0, emb_timing->emb_total_internal_ms - phase_sum);

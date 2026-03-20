@@ -57,7 +57,7 @@ class Engram {
         double emb_scatter_ms = 0;
         double emb_unregister_ms = 0;
         double emb_prep_ms = 0;     /* unique_idx + range_merge */
-        double emb_batch_get_buffer_ms = 0;  /* when using batch_get_buffer path */
+        double emb_remote_fetch_ms = 0;    /* remote data transfer or bulk fetch */
         double emb_lookup_ms = 0;   /* memcpy from tables to output */
         double emb_total_internal_ms = 0;  /* wall time inside embedding_lookup (for verification) */
         double emb_gap_ms = 0;      /* unaccounted: internal - sum(phases), for debugging */

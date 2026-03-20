@@ -241,8 +241,7 @@ void bind_engram(py::module& m) {
                 emb_detail["scatter_ms"] = timing.emb_scatter_ms;
                 emb_detail["unregister_ms"] = timing.emb_unregister_ms;
                 emb_detail["prep_ms"] = timing.emb_prep_ms;
-                emb_detail["batch_get_buffer_ms"] =
-                    timing.emb_batch_get_buffer_ms;
+                emb_detail["remote_fetch_ms"] = timing.emb_remote_fetch_ms;
                 emb_detail["lookup_ms"] = timing.emb_lookup_ms;
                 emb_detail["_total_internal_ms"] =
                     timing.emb_total_internal_ms;
