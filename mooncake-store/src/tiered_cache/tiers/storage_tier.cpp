@@ -367,7 +367,7 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
     // Try to cast to BucketStorageBackend
     auto* bucket_backend =
-        static_cast<BucketStorageBackend*>(storage_backend_.get());
+        dynamic_cast<BucketStorageBackend*>(storage_backend_.get());
     if (!bucket_backend) {
         LOG(WARNING) << "Storage backend is not BucketStorageBackend, "
                         "bucket eviction not supported";

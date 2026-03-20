@@ -12,6 +12,7 @@
 
 #include "data_manager.h"
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "utils.h"
@@ -61,8 +62,7 @@ class DataManagerTest : public ::testing::Test {
         tiered_backend_ = std::make_unique<TieredBackend>();
         // transfer_engine_ is nullptr when initializing tiered_backend_
         // only for local access test
-        auto init_result =
-            tiered_backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
+        auto init_result = InitTieredBackendForTest(*tiered_backend_, config);
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 

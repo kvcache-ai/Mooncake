@@ -10,6 +10,7 @@
 
 #include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 #include "types.h"
 
 #ifdef USE_ASCEND_CACHE_TIER
@@ -403,7 +404,7 @@ TEST_F(AscendTierTest, TieredBackendAscendTierInit) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_TRUE(result.has_value());
 
@@ -440,7 +441,7 @@ TEST_F(AscendTierTest, TieredBackendMixedTiers) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     EXPECT_TRUE(result.has_value());
 
@@ -479,8 +480,7 @@ TEST_F(AscendTierTest, TieredBackendAllocateOnAscend) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -507,8 +507,7 @@ TEST_F(AscendTierTest, TieredBackendWriteToAscend) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -543,8 +542,7 @@ TEST_F(AscendTierTest, AscendTierCompleteLifecycle) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     const std::string key = "ascend_lifecycle_key";
 
@@ -597,8 +595,7 @@ TEST_F(AscendTierTest, CopyAscendToDramWithVerification) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // 1. Allocate on Ascend tier
     auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
@@ -856,8 +853,7 @@ TEST_F(AscendTierTest, CopyBetweenAscendTiersSameDevice) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    ASSERT_TRUE(
-        backend.Init(config, nullptr, nullptr, nullptr, nullptr).has_value());
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
 
     // Allocate first buffer
     auto alloc_result1 = backend.Allocate(SMALL_DATA_SIZE);
@@ -1016,7 +1012,7 @@ TEST_F(AscendTierTest, AscendTierNotAvailable) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto result = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto result = InitTieredBackendForTest(backend, config);
 
     // Should fail because ASCEND_NPU is not supported
     EXPECT_FALSE(result.has_value());

@@ -8,6 +8,7 @@
 
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 #include "storage_backend.h"
 #include "allocator.h"
 #include "utils.h"
@@ -17,15 +18,19 @@ namespace mooncake::test {
 
 class StorageTierTest : public ::testing::Test {
    protected:
-    void SetUp() override {
+    static void SetUpTestSuite() {
         google::InitGoogleLogging("StorageTierTest");
         FLAGS_logtostderr = true;
+    }
+
+    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
+
+    void SetUp() override {
         unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
     }
 
     void TearDown() override {
         unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
-        google::ShutdownGoogleLogging();
     }
 
     std::unique_ptr<char[]> CreateTestBuffer(size_t size) {
@@ -102,54 +107,58 @@ TEST_F(StorageTierTest, StorageTierBasic) {
     Json::Value config;
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
-    TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
-    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+    {
+        TieredBackend backend;
+        auto init_res = InitTieredBackendForTest(backend, config);
+        ASSERT_TRUE(init_res.has_value())
+            << "Init failed: " << init_res.error();
 
-    // Verify tier created
-    auto tier_views = backend.GetTierViews();
-    ASSERT_EQ(tier_views.size(), 1);
-    EXPECT_EQ(tier_views[0].type, MemoryType::NVME);
+        // Verify tier created
+        auto tier_views = backend.GetTierViews();
+        ASSERT_EQ(tier_views.size(), 1);
+        EXPECT_EQ(tier_views[0].type, MemoryType::NVME);
 
-    // 1. Allocate
-    size_t data_size = 1024;
-    auto alloc_result = backend.Allocate(data_size);
-    ASSERT_TRUE(alloc_result.has_value());
-    AllocationHandle handle = alloc_result.value();
+        // 1. Allocate
+        size_t data_size = 1024;
+        auto alloc_result = backend.Allocate(data_size);
+        ASSERT_TRUE(alloc_result.has_value());
+        AllocationHandle handle = alloc_result.value();
 
-    // 2. Write
-    auto test_buffer = CreateTestBuffer(data_size);
-    DataSource source;
-    source.buffer =
-        std::make_unique<TempDRAMBuffer>(std::move(test_buffer), data_size);
-    source.type = MemoryType::DRAM;
+        // 2. Write
+        auto test_buffer = CreateTestBuffer(data_size);
+        DataSource source;
+        source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(test_buffer), data_size);
+        source.type = MemoryType::DRAM;
 
-    auto write_result = backend.Write(source, handle);
-    ASSERT_TRUE(write_result.has_value())
-        << "Write failed: " << write_result.error();
+        auto write_result = backend.Write(source, handle);
+        ASSERT_TRUE(write_result.has_value())
+            << "Write failed: " << write_result.error();
 
-    // 3. Commit
-    auto commit_result = backend.Commit("storage_key", handle);
-    ASSERT_TRUE(commit_result.has_value());
+        // 3. Commit
+        auto commit_result = backend.Commit("storage_key", handle);
+        ASSERT_TRUE(commit_result.has_value());
 
-    // 4. Flush
-    auto tier = backend.GetTier(handle->loc.tier->GetTierId());
-    const_cast<CacheTier*>(tier)->Flush();
+        // 4. Flush
+        auto tier = backend.GetTier(handle->loc.tier->GetTierId());
+        const_cast<CacheTier*>(tier)->Flush();
 
-    // 5. Get (Verify)
-    auto get_result = backend.Get("storage_key");
-    ASSERT_TRUE(get_result.has_value());
+        // 5. Get (Verify)
+        auto get_result = backend.Get("storage_key");
+        ASSERT_TRUE(get_result.has_value());
 
-    // Verify file exists on disk
-    bool found = false;
-    for (const auto& entry :
-         fs::recursive_directory_iterator("/tmp/mooncake_test_storage")) {
-        if (entry.path().filename() == "storage_key") {
-            found = true;
-            break;
+        // Verify file exists on disk
+        bool found = false;
+        for (const auto& entry :
+             fs::recursive_directory_iterator("/tmp/mooncake_test_storage")) {
+            if (entry.path().filename() == "storage_key") {
+                found = true;
+                break;
+            }
         }
+        EXPECT_TRUE(found)
+            << "File 'storage_key' not found in storage directory";
     }
-    EXPECT_TRUE(found) << "File 'storage_key' not found in storage directory";
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_storage");
@@ -178,37 +187,41 @@ TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
     Json::Value config;
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
-    TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr);
-    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+    {
+        TieredBackend backend;
+        auto init_res = InitTieredBackendForTest(backend, config);
+        ASSERT_TRUE(init_res.has_value())
+            << "Init failed: " << init_res.error();
 
-    auto oversized_alloc = backend.Allocate(2048);
-    EXPECT_FALSE(oversized_alloc.has_value())
-        << "allocation larger than configured local buffer pool should fail";
+        auto oversized_alloc = backend.Allocate(2048);
+        EXPECT_FALSE(oversized_alloc.has_value())
+            << "allocation larger than configured local buffer pool should "
+               "fail";
 
-    auto alloc_result = backend.Allocate(1024);
-    ASSERT_TRUE(alloc_result.has_value())
-        << "allocation within local buffer pool should succeed";
-    AllocationHandle handle = alloc_result.value();
+        auto alloc_result = backend.Allocate(1024);
+        ASSERT_TRUE(alloc_result.has_value())
+            << "allocation within local buffer pool should succeed";
+        AllocationHandle handle = alloc_result.value();
 
-    auto test_buffer = CreateTestBuffer(1024);
-    DataSource source;
-    source.buffer =
-        std::make_unique<TempDRAMBuffer>(std::move(test_buffer), 1024);
-    source.type = MemoryType::DRAM;
+        auto test_buffer = CreateTestBuffer(1024);
+        DataSource source;
+        source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(test_buffer), 1024);
+        source.type = MemoryType::DRAM;
 
-    auto write_result = backend.Write(source, handle);
-    ASSERT_TRUE(write_result.has_value())
-        << "Write failed: " << write_result.error();
-    ASSERT_TRUE(backend.Commit("local_buffer_key", handle).has_value());
+        auto write_result = backend.Write(source, handle);
+        ASSERT_TRUE(write_result.has_value())
+            << "Write failed: " << write_result.error();
+        ASSERT_TRUE(backend.Commit("local_buffer_key", handle).has_value());
 
-    auto tier = backend.GetTier(handle->loc.tier->GetTierId());
-    ASSERT_NE(tier, nullptr);
-    ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+        auto tier = backend.GetTier(handle->loc.tier->GetTierId());
+        ASSERT_NE(tier, nullptr);
+        ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
 
-    auto recycled_alloc = backend.Allocate(1024);
-    EXPECT_TRUE(recycled_alloc.has_value())
-        << "staging pool should recycle memory after flush";
+        auto recycled_alloc = backend.Allocate(1024);
+        EXPECT_TRUE(recycled_alloc.has_value())
+            << "staging pool should recycle memory after flush";
+    }
 
     fs::remove_all("/tmp/mooncake_test_local_buffer_pool");
 }
@@ -236,24 +249,28 @@ TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
     Json::Value config;
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
-    TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr);
-    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+    {
+        TieredBackend backend;
+        auto init_res = InitTieredBackendForTest(backend, config);
+        ASSERT_TRUE(init_res.has_value())
+            << "Init failed: " << init_res.error();
 
-    auto handle1 = backend.Allocate(1024);
-    ASSERT_TRUE(handle1.has_value());
-    auto handle2 = backend.Allocate(1024);
-    ASSERT_TRUE(handle2.has_value());
+        auto handle1 = backend.Allocate(1024);
+        ASSERT_TRUE(handle1.has_value());
+        auto handle2 = backend.Allocate(1024);
+        ASSERT_TRUE(handle2.has_value());
 
-    auto over_capacity = backend.Allocate(1);
-    EXPECT_FALSE(over_capacity.has_value())
-        << "uncommitted staging allocations should count against tier capacity";
+        auto over_capacity = backend.Allocate(1);
+        EXPECT_FALSE(over_capacity.has_value())
+            << "uncommitted staging allocations should count against tier "
+               "capacity";
 
-    handle1 = nullptr;
+        handle1 = nullptr;
 
-    auto recovered = backend.Allocate(1024);
-    EXPECT_TRUE(recovered.has_value())
-        << "releasing an uncommitted handle should restore storage capacity";
+        auto recovered = backend.Allocate(1024);
+        EXPECT_TRUE(recovered.has_value()) << "releasing an uncommitted handle "
+                                              "should restore storage capacity";
+    }
 
     fs::remove_all("/tmp/mooncake_test_capacity_accounting");
 }
@@ -283,7 +300,7 @@ TEST_F(StorageTierTest,
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     auto backend = std::make_unique<TieredBackend>();
-    auto init_res = backend->Init(config, nullptr, nullptr);
+    auto init_res = InitTieredBackendForTest(*backend, config);
     ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
 
     constexpr size_t kDataSize = 1024;
@@ -368,7 +385,7 @@ TEST_F(StorageTierTest, StorageTierBucket) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto init_res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(init_res.has_value());
 
     // Allocate and Write multiple small items
@@ -443,14 +460,17 @@ TEST_F(StorageTierTest, BucketBackendRejectsOffloadWhenPhysicalSpaceTooLow) {
     bucket_config.bucket_size_limit =
         static_cast<int64_t>(space_info.available + 1);
 
-    BucketStorageBackend backend(config, bucket_config);
-    ASSERT_TRUE(backend.Init());
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
 
-    auto enable_res = backend.IsEnableOffloading();
-    ASSERT_TRUE(enable_res.has_value());
-    EXPECT_FALSE(enable_res.value())
-        << "backend should reject offload when the next bucket cannot fit on "
-           "the filesystem";
+        auto enable_res = backend.IsEnableOffloading();
+        ASSERT_TRUE(enable_res.has_value());
+        EXPECT_FALSE(enable_res.value())
+            << "backend should reject offload when the next bucket cannot fit "
+               "on "
+               "the filesystem";
+    }
 
     fs::remove_all(test_dir);
 }
@@ -476,71 +496,76 @@ TEST_F(StorageTierTest, BucketEviction) {
     bucket_config.bucket_size_limit = 1024 * 1024;
     bucket_config.bucket_keys_limit = 10;
 
-    BucketStorageBackend backend(config, bucket_config);
-    ASSERT_TRUE(backend.Init());
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
 
-    // Create test data
-    std::unordered_map<std::string, std::vector<Slice>> batch;
-    std::vector<char> data(1024, 'A');
-    batch["key1"] = {Slice{data.data(), data.size()}};
-    batch["key2"] = {Slice{data.data(), data.size()}};
-    batch["key3"] = {Slice{data.data(), data.size()}};
+        // Create test data
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        std::vector<char> data(1024, 'A');
+        batch["key1"] = {Slice{data.data(), data.size()}};
+        batch["key2"] = {Slice{data.data(), data.size()}};
+        batch["key3"] = {Slice{data.data(), data.size()}};
 
-    auto offload_res = backend.BatchOffload(batch, nullptr);
-    ASSERT_TRUE(offload_res.has_value());
-    int64_t bucket_id = offload_res.value();
+        auto offload_res = backend.BatchOffload(batch, nullptr);
+        ASSERT_TRUE(offload_res.has_value());
+        int64_t bucket_id = offload_res.value();
 
-    LOG(INFO) << "Created bucket: " << bucket_id;
+        LOG(INFO) << "Created bucket: " << bucket_id;
 
-    // Verify keys exist
-    auto exist_res = backend.IsExist("key1");
-    ASSERT_TRUE(exist_res.has_value());
-    EXPECT_TRUE(exist_res.value());
+        // Verify keys exist
+        auto exist_res = backend.IsExist("key1");
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_TRUE(exist_res.value());
 
-    // Mark two keys as deleted (66% fragmentation)
-    auto mark_res = backend.MarkKeyDeleted("key1");
-    ASSERT_TRUE(mark_res.has_value());
-    mark_res = backend.MarkKeyDeleted("key2");
-    ASSERT_TRUE(mark_res.has_value());
+        // Mark two keys as deleted (66% fragmentation)
+        auto mark_res = backend.MarkKeyDeleted("key1");
+        ASSERT_TRUE(mark_res.has_value());
+        mark_res = backend.MarkKeyDeleted("key2");
+        ASSERT_TRUE(mark_res.has_value());
 
-    LOG(INFO) << "Marked key1 and key2 as deleted";
+        LOG(INFO) << "Marked key1 and key2 as deleted";
 
-    // Select bucket for eviction (should select the fragmented bucket)
-    auto select_res = backend.SelectBucketForEviction();
-    ASSERT_TRUE(select_res.has_value());
-    EXPECT_EQ(select_res.value(), bucket_id)
-        << "Should select the fragmented bucket";
+        // Select bucket for eviction (should select the fragmented bucket)
+        auto select_res = backend.SelectBucketForEviction();
+        ASSERT_TRUE(select_res.has_value());
+        EXPECT_EQ(select_res.value(), bucket_id)
+            << "Should select the fragmented bucket";
 
-    LOG(INFO) << "Selected bucket for eviction: " << select_res.value();
+        LOG(INFO) << "Selected bucket for eviction: " << select_res.value();
 
-    // Evict the bucket
-    auto evict_res = backend.EvictBucket(bucket_id);
-    ASSERT_TRUE(evict_res.has_value());
-    size_t freed_size = evict_res.value();
-    EXPECT_GT(freed_size, 0) << "Should have freed some space";
+        // Evict the bucket
+        auto evict_res = backend.EvictBucket(bucket_id);
+        ASSERT_TRUE(evict_res.has_value());
+        size_t freed_size = evict_res.value();
+        EXPECT_GT(freed_size, 0) << "Should have freed some space";
 
-    LOG(INFO) << "Successfully evicted bucket, freed " << freed_size
-              << " bytes";
+        LOG(INFO) << "Successfully evicted bucket, freed " << freed_size
+                  << " bytes";
 
-    // Verify all keys are gone
-    exist_res = backend.IsExist("key1");
-    ASSERT_TRUE(exist_res.has_value());
-    EXPECT_FALSE(exist_res.value()) << "key1 should not exist after eviction";
+        // Verify all keys are gone
+        exist_res = backend.IsExist("key1");
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value())
+            << "key1 should not exist after eviction";
 
-    exist_res = backend.IsExist("key2");
-    ASSERT_TRUE(exist_res.has_value());
-    EXPECT_FALSE(exist_res.value()) << "key2 should not exist after eviction";
+        exist_res = backend.IsExist("key2");
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value())
+            << "key2 should not exist after eviction";
 
-    exist_res = backend.IsExist("key3");
-    ASSERT_TRUE(exist_res.has_value());
-    EXPECT_FALSE(exist_res.value()) << "key3 should not exist after eviction";
+        exist_res = backend.IsExist("key3");
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value())
+            << "key3 should not exist after eviction";
 
-    // Physical deletion is asynchronous; verify eventual removal instead of
-    // checking synchronously on the eviction path.
-    EXPECT_TRUE(WaitForNoFilesWithExtension(
-        "/tmp/mooncake_test_bucket_eviction", ".bucket"));
-    EXPECT_TRUE(WaitForNoFilesWithExtension(
-        "/tmp/mooncake_test_bucket_eviction", ".meta"));
+        // Physical deletion is asynchronous; verify eventual removal instead of
+        // checking synchronously on the eviction path.
+        EXPECT_TRUE(WaitForNoFilesWithExtension(
+            "/tmp/mooncake_test_bucket_eviction", ".bucket"));
+        EXPECT_TRUE(WaitForNoFilesWithExtension(
+            "/tmp/mooncake_test_bucket_eviction", ".meta"));
+    }
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_bucket_eviction");
@@ -572,64 +597,66 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
     Json::Value config;
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
-    TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
-    ASSERT_TRUE(init_res.has_value());
+    {
+        TieredBackend backend;
+        auto init_res = InitTieredBackendForTest(backend, config);
+        ASSERT_TRUE(init_res.has_value());
 
-    // Fill up the tier with data (~20KB)
-    std::vector<std::string> keys;
-    for (int i = 0; i < 20; ++i) {
-        std::string key = "key_" + std::to_string(i);
-        keys.push_back(key);
+        // Fill up the tier with data (~20KB)
+        std::vector<std::string> keys;
+        for (int i = 0; i < 20; ++i) {
+            std::string key = "key_" + std::to_string(i);
+            keys.push_back(key);
 
-        auto alloc_result = backend.Allocate(1024);  // 1KB each
+            auto alloc_result = backend.Allocate(1024);  // 1KB each
+            ASSERT_TRUE(alloc_result.has_value())
+                << "Failed to allocate for " << key;
+            AllocationHandle handle = alloc_result.value();
+
+            auto test_buffer = CreateTestBuffer(1024);
+            DataSource source;
+            source.buffer =
+                std::make_unique<TempDRAMBuffer>(std::move(test_buffer), 1024);
+            source.type = MemoryType::DRAM;
+
+            auto write_result = backend.Write(source, handle);
+            ASSERT_TRUE(write_result.has_value());
+
+            auto commit_result = backend.Commit(key, handle);
+            ASSERT_TRUE(commit_result.has_value());
+        }
+
+        // Flush to persist to disk
+        auto tier_views = backend.GetTierViews();
+        ASSERT_FALSE(tier_views.empty());
+        auto tier = backend.GetTier(tier_views[0].id);
+        const_cast<CacheTier*>(tier)->Flush();
+
+        LOG(INFO) << "Filled tier with 20 keys, usage=" << tier_views[0].usage
+                  << ", capacity=" << tier_views[0].capacity;
+
+        // Now try to allocate more data that exceeds capacity
+        // This should trigger automatic bucket eviction
+        auto alloc_result = backend.Allocate(5 * 1024);  // 5KB
         ASSERT_TRUE(alloc_result.has_value())
-            << "Failed to allocate for " << key;
-        AllocationHandle handle = alloc_result.value();
+            << "Should succeed after automatic eviction";
 
-        auto test_buffer = CreateTestBuffer(1024);
-        DataSource source;
-        source.buffer =
-            std::make_unique<TempDRAMBuffer>(std::move(test_buffer), 1024);
-        source.type = MemoryType::DRAM;
+        LOG(INFO) << "Successfully allocated after auto-eviction";
 
-        auto write_result = backend.Write(source, handle);
-        ASSERT_TRUE(write_result.has_value());
+        // The evicted keys should no longer be in the storage backend
+        // (they were removed from the bucket that was evicted)
+        // Note: We can't use backend.Get() because it might return from
+        // pending_batch Instead, verify that bucket files were deleted
+        EXPECT_TRUE(WaitForNoFilesWithExtension(
+            "/tmp/mooncake_test_auto_eviction", ".bucket"));
+        EXPECT_TRUE(WaitForNoFilesWithExtension(
+            "/tmp/mooncake_test_auto_eviction", ".meta"));
 
-        auto commit_result = backend.Commit(key, handle);
-        ASSERT_TRUE(commit_result.has_value());
+        int bucket_files_count = CountFilesWithExtension(
+            "/tmp/mooncake_test_auto_eviction", ".bucket");
+        LOG(INFO) << "After eviction, " << bucket_files_count
+                  << " bucket files remain";
     }
-
-    // Flush to persist to disk
-    auto tier_views = backend.GetTierViews();
-    ASSERT_FALSE(tier_views.empty());
-    auto tier = backend.GetTier(tier_views[0].id);
-    const_cast<CacheTier*>(tier)->Flush();
-
-    LOG(INFO) << "Filled tier with 20 keys, usage=" << tier_views[0].usage
-              << ", capacity=" << tier_views[0].capacity;
-
-    // Now try to allocate more data that exceeds capacity
-    // This should trigger automatic bucket eviction
-    auto alloc_result = backend.Allocate(5 * 1024);  // 5KB
-    ASSERT_TRUE(alloc_result.has_value())
-        << "Should succeed after automatic eviction";
-
-    LOG(INFO) << "Successfully allocated after auto-eviction";
-
-    // The evicted keys should no longer be in the storage backend
-    // (they were removed from the bucket that was evicted)
-    // Note: We can't use backend.Get() because it might return from
-    // pending_batch Instead, verify that bucket files were deleted
-    EXPECT_TRUE(WaitForNoFilesWithExtension("/tmp/mooncake_test_auto_eviction",
-                                            ".bucket"));
-    EXPECT_TRUE(WaitForNoFilesWithExtension("/tmp/mooncake_test_auto_eviction",
-                                            ".meta"));
-
-    int bucket_files_count =
-        CountFilesWithExtension("/tmp/mooncake_test_auto_eviction", ".bucket");
-    LOG(INFO) << "After eviction, " << bucket_files_count
-              << " bucket files remain";
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_auto_eviction");

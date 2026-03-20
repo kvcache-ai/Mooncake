@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 #include <fstream>
 #include <chrono>
 #include <thread>
@@ -186,7 +187,7 @@ class SchedulerIntegrationTest : public ::testing::Test {
 
 TEST_F(SchedulerIntegrationTest, TestPromotion) {
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     // 1. Identify IDs
@@ -257,7 +258,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUCacheThrashing) {
     // 20MB (40 keys * 512KB)
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -379,7 +380,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUPromotionBudget) {
     config_["scheduler"]["low_watermark"] = 0.7;
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -486,7 +487,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     config_["scheduler"]["stats_snapshot_limit"] = 10;
 
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -601,7 +602,7 @@ TEST_F(SchedulerIntegrationTest, LRUPreCopyEnablesFastReclaimInAsyncMode) {
     config_["scheduler"]["stats_snapshot_limit"] = 16;
 
     TieredBackend backend;
-    auto init_res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto init_res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(init_res.has_value());
 
     auto views = backend.GetTierViews();
@@ -710,7 +711,7 @@ class ConcurrencyTest : public ::testing::Test {
         config["tiers"] = tiers;
 
         backend_ = std::make_unique<TieredBackend>();
-        auto res = backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
+        auto res = InitTieredBackendForTest(*backend_, config);
         ASSERT_TRUE(res.has_value());
 
         // Identify Tiers
@@ -880,7 +881,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
 
     TieredBackend be;
     ASSERT_TRUE(
-        be.Init(config, nullptr, counting_cb, nullptr, nullptr).has_value());
+        InitTieredBackendForTest(be, config, nullptr, counting_cb).has_value());
 
     auto views = be.GetTierViews();
     UUID fast_id, slow_id;
@@ -914,7 +915,7 @@ TEST_F(ConcurrencyTest, CASFailureNoCallbackInvoked) {
 // Concurrent flush + delete stress test (validates UAF fix)
 TEST_F(SchedulerIntegrationTest, ConcurrentFlushDeleteStress) {
     TieredBackend backend;
-    auto res = backend.Init(config_, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config_);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -976,7 +977,7 @@ TEST_F(SchedulerIntegrationTest, StorageTierCapacityLimit) {
     config["tiers"] = tiers;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -1048,7 +1049,7 @@ TEST_F(SchedulerIntegrationTest, SyncEvictionMode) {
     config["scheduler"] = scheduler;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();
@@ -1161,7 +1162,7 @@ TEST_F(SchedulerIntegrationTest, SingleTierEviction) {
     config["scheduler"] = scheduler;
 
     TieredBackend backend;
-    auto res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto res = InitTieredBackendForTest(backend, config);
     ASSERT_TRUE(res.has_value());
 
     auto views = backend.GetTierViews();

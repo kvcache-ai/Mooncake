@@ -21,6 +21,7 @@
 #include "data_manager.h"
 #include "peer_client.h"
 #include "tiered_cache/tiered_backend.h"
+#include "utils/common.h"
 #include "transfer_engine.h"
 #include "types.h"
 #include "utils.h"
@@ -77,8 +78,7 @@ class PeerClientPerfTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto init_result =
-            tiered_backend_->Init(config, nullptr, nullptr, nullptr, nullptr);
+        auto init_result = InitTieredBackendForTest(*tiered_backend_, config);
         ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
@@ -525,8 +525,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
-        auto backend_rc = tiered_backend_->Init(config, transfer_engine_.get(),
-                                                nullptr, nullptr, nullptr);
+        auto backend_rc = InitTieredBackendForTest(*tiered_backend_, config,
+                                                   transfer_engine_.get());
         ASSERT_TRUE(backend_rc.has_value())
             << "Failed to initialize TieredBackend";
 
