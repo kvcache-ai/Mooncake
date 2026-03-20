@@ -436,8 +436,10 @@ tl::expected<FileStorage::AllocatedBatch, ErrorCode> FileStorage::AllocateBatch(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     AllocatedBatch result;
     for (size_t i = 0; i < keys.size(); ++i) {
-        assert(sizes[i] <= kMaxSliceSize);
-        auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+        assert(sizes[i] >= 0);
+        assert(static_cast<uint64_t>(sizes[i]) <= kMaxSliceSize);
+        auto alloc_result =
+            client_buffer_allocator_->allocate(static_cast<size_t>(sizes[i]));
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate slice buffer, size = " << sizes[i]
                        << ", key = " << keys[i];

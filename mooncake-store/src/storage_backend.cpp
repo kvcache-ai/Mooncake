@@ -1188,7 +1188,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
     if (!fs::exists(root)) {
-        meta_scanned_.store(true, std::memory_order_acquire);
+        meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
 
@@ -1261,7 +1261,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         }
     }
 
-    meta_scanned_.store(true, std::memory_order_acquire);
+    meta_scanned_.store(true, std::memory_order_release);
     return {};
 }
 
