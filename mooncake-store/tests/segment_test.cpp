@@ -161,9 +161,9 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 // MountSegmentDuplicate Tests:
 // 1. MountSegment with the same segment id. The second mount operation return
 // SEGMENT_ALREADY_EXISTS.
-// 2. MountSegment with different segment id and the same segment name should be
-// considered as different segments. Validate the status of SegmentManager use
-// ValidateMountedSegments function.
+// 2. MountSegment with different segment id and the same segment name from the
+// same client should still be allowed. Validate the status of SegmentManager
+// with ValidateMountedSegments.
 TEST_F(SegmentTest, MountSegmentDuplicate) {
     SegmentManager segment_manager;
     // Create a valid segment and client ID
@@ -203,6 +203,33 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     std::vector<Segment> segments = {segment, segment2};
     std::vector<UUID> client_ids = {client_id, client_id};
     ValidateMountedSegments(segment_manager, segments, client_ids);
+}
+
+TEST_F(SegmentTest, MountSegmentRejectsSameNameFromDifferentClient) {
+    SegmentManager segment_manager;
+
+    Segment segment1;
+    segment1.id = generate_uuid();
+    segment1.name = "test_segment";
+    segment1.size = 1024 * 1024 * 16;
+    segment1.base = 0x100000000;
+
+    Segment segment2;
+    segment2.id = generate_uuid();
+    segment2.name = segment1.name;
+    segment2.size = segment1.size;
+    segment2.base = segment1.base + segment1.size;
+
+    UUID client_id1 = generate_uuid();
+    UUID client_id2 = generate_uuid();
+
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountSegment(segment1, client_id1),
+              ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment2, client_id2),
+              ErrorCode::SEGMENT_ALREADY_EXISTS);
+
+    ValidateMountedSegment(segment_manager, segment1, client_id1);
 }
 
 // UnmountSegmentSuccess:

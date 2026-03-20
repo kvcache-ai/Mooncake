@@ -27,6 +27,17 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
+    auto existing_client_it =
+        segment_manager_->client_by_name_.find(segment.name);
+    if (existing_client_it != segment_manager_->client_by_name_.end() &&
+        existing_client_it->second != client_id) {
+        LOG(ERROR) << "segment_name=" << segment.name
+                   << ", error=segment_name_in_use"
+                   << ", existing_client_id=" << existing_client_it->second
+                   << ", new_client_id=" << client_id;
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+
     // Check if cxl storage is enable
     if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
         LOG(INFO) << "Start Mounting CXL Segment.";
