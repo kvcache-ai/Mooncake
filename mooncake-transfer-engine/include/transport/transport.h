@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <iostream>
 #include <memory>
 #include <queue>
@@ -57,6 +58,8 @@ class Transport {
 
     struct TransferRequest {
         enum OpCode { READ, WRITE };
+        static constexpr uint64_t kNoTaskGroup =
+            std::numeric_limits<uint64_t>::max();
 
         OpCode opcode;
         void *source;
@@ -64,6 +67,7 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        uint64_t task_group_id = kNoTaskGroup;
     };
 
     enum TransferStatusEnum {
@@ -303,6 +307,8 @@ class Transport {
 #else
         const TransferRequest *request = nullptr;
 #endif
+        // Optional grouped transfer requests that should complete as one task.
+        std::vector<TransferRequest> request_group;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {

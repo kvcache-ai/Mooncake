@@ -648,13 +648,16 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
     void* dest_buffer,
     const std::vector<std::pair<
         Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
-        key_ranges) {
+        key_ranges,
+    bool enable_task_grouping) {
     std::vector<TransferRequest> requests;
     size_t total_ranges = 0;
     for (const auto& [_, ranges] : key_ranges) {
         total_ranges += ranges.size();
     }
     requests.reserve(total_ranges);
+    size_t grouped_task_count = 0;
+    uint64_t next_task_group_id = 0;
 
     for (const auto& [replica, ranges] : key_ranges) {
         if (!replica.is_memory_replica()) {
@@ -674,6 +677,10 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
         }
         uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
         char* dest_base = static_cast<char*>(dest_buffer);
+        const uint64_t task_group_id =
+            enable_task_grouping ? next_task_group_id++
+                                 : TransferRequest::kNoTaskGroup;
+        bool group_has_request = false;
 
         for (const auto& [dest_offset, src_offset, size] : ranges) {
             if (size == 0) continue;
@@ -683,7 +690,12 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
             request.target_id = seg;
             request.target_offset = base_address + src_offset;
             request.length = size;
+            request.task_group_id = task_group_id;
             requests.emplace_back(request);
+            group_has_request = true;
+        }
+        if (group_has_request) {
+            grouped_task_count++;
         }
     }
 
@@ -691,7 +703,8 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
         return TransferFuture(std::make_shared<EmptyOperationState>());
     }
 
-    auto future = submitTransfer(requests);
+    auto future = submitTransfer(
+        requests, enable_task_grouping ? grouped_task_count : 0);
     if (future && transfer_metric_) {
         size_t total_bytes = 0;
         for (const auto& request : requests) {
@@ -746,9 +759,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
-    const size_t batch_size = requests.size();
+    std::vector<TransferRequest>& requests, size_t batch_task_count) {
+    // Allocate batch ID using the actual logical task count when callers
+    // intentionally group multiple requests into one transfer task.
+    const size_t batch_size =
+        batch_task_count == 0 ? requests.size() : batch_task_count;
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";

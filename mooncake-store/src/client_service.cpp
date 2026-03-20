@@ -1179,8 +1179,8 @@ ErrorCode Client::BatchTransferReadRanges(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
-    auto future =
-        transfer_submitter_->submitBatchReadRanges(dest_buffer, key_ranges);
+    auto future = transfer_submitter_->submitBatchReadRanges(
+        dest_buffer, key_ranges, protocol_ == "rdma");
     if (!future) {
         LOG(ERROR) << "Failed to submit batch read ranges";
         return ErrorCode::TRANSFER_FAIL;

@@ -421,7 +421,8 @@ class TransferSubmitter {
         const std::vector<
             std::pair<Replica::Descriptor,
                       std::vector<std::tuple<size_t, size_t, size_t>>>>&
-            key_ranges);
+            key_ranges,
+        bool enable_task_grouping = false);
 
    private:
     TransferEngine& engine_;
@@ -482,7 +483,8 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        size_t batch_task_count = 0);
 };
 
 }  // namespace mooncake

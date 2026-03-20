@@ -104,30 +104,80 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+    std::vector<Transport*> entry_transports;
+    entry_transports.reserve(entries.size());
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        auto status = selectTransport(request, transport);
+        if (!status.ok()) return status;
+        assert(transport);
+        entry_transports.push_back(transport);
+    }
+
+    auto can_group_request = [&](size_t index) {
+        return entries[index].task_group_id != TransferRequest::kNoTaskGroup &&
+               dynamic_cast<RdmaTransport*>(entry_transports[index]) != nullptr;
+    };
+
+    size_t grouped_task_count = 0;
+    for (size_t index = 0; index < entries.size();) {
+        grouped_task_count++;
+        if (!can_group_request(index)) {
+            ++index;
+            continue;
+        }
+
+        const uint64_t task_group_id = entries[index].task_group_id;
+        const auto* transport = entry_transports[index];
+        ++index;
+        while (index < entries.size() &&
+               entries[index].task_group_id == task_group_id &&
+               entry_transports[index] == transport &&
+               can_group_request(index)) {
+            ++index;
+        }
+    }
+
+    if (batch_desc.task_list.size() + grouped_task_count > batch_desc.batch_size) {
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
     }
 
     size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+    batch_desc.task_list.resize(task_id + grouped_task_count);
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
+    for (size_t entry_index = 0; entry_index < entries.size();) {
+        auto* transport = entry_transports[entry_index];
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.request_group.clear();
+        task.request = nullptr;
+
+        if (can_group_request(entry_index)) {
+            const uint64_t task_group_id = entries[entry_index].task_group_id;
+            while (entry_index < entries.size() &&
+                   entries[entry_index].task_group_id == task_group_id &&
+                   entry_transports[entry_index] == transport &&
+                   can_group_request(entry_index)) {
+                task.request_group.push_back(entries[entry_index]);
+                ++entry_index;
+            }
+            if (!task.request_group.empty()) {
+                task.request = &task.request_group.front();
+            }
+        } else {
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
+            task.request =
+                const_cast<Transport::TransferRequest*>(&entries[entry_index]);
 #else
-        task.request = &request;
+            task.request = &entries[entry_index];
 #endif
-        ++task_id;
+            ++entry_index;
+        }
         submit_tasks[transport].push_back(&task);
+        ++task_id;
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
