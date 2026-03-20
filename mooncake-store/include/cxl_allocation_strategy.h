@@ -37,6 +37,13 @@ class CxlAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
+        // CXL is a global shared memory segment, only single replica is
+        // supported
+        if (replica_num > 1) {
+            LOG(WARNING) << "CXL allocation only supports single replica, "
+                         << "requested " << replica_num << " will be ignored.";
+        }
+
         if (preferred_segments.empty()) {
             LOG(ERROR) << "Preferred_segments is empty.";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -65,7 +72,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
         }
 
         std::vector<Replica> replicas;
-        replicas.reserve(replica_num);
+        replicas.reserve(1);
 
         auto buffer = cxl_allocator->allocate(slice_length);
         if (!buffer) {
@@ -76,8 +83,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
         replicas.emplace_back(std::move(buffer), StorageLevel::CXL,
                               ReplicaStatus::PROCESSING);
 
-        VLOG(1) << "Successfully allocated " << replicas.size()
-                << " CXL replica.";
+        VLOG(1) << "Successfully allocated one CXL replica.";
         return replicas;
     }
 

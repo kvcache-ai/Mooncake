@@ -67,10 +67,12 @@ func NewP2PStore(metadataConnString string, localServerName string, nicPriorityM
 		return nil, err
 	}
 
+	proto := "rdma"
 	if len(nicPriorityMatrix) == 0 {
-		err = transfer.installTransport("tcp", nicPriorityMatrix)
+		proto = "tcp"
+		err = transfer.installTransport(proto, nicPriorityMatrix)
 	} else {
-		err = transfer.installTransport("rdma", nicPriorityMatrix)
+		err = transfer.installTransport(proto, nicPriorityMatrix)
 	}
 	if err != nil {
 		metadata.Close()
@@ -81,7 +83,7 @@ func NewP2PStore(metadataConnString string, localServerName string, nicPriorityM
 		metadataConnString: metadataConnString,
 		localServerName:    localServerName,
 		catalog:            NewCatalog(),
-		memory:             NewRegisteredMemory(transfer, MAX_CHUNK_SIZE),
+		memory:             NewRegisteredMemory(transfer, MAX_CHUNK_SIZE, proto),
 		metadata:           metadata,
 		transfer:           transfer,
 	}

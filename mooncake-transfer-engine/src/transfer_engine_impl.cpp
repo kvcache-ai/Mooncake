@@ -536,17 +536,17 @@ int TransferEngineImpl::unregisterLocalMemory(
             return -1;
         }
 
-        std::vector<void*> unregisted_buffer_addrs;
+        std::vector<void*> unregistered_buffer_addrs;
         for (const auto& buffer : buffer_list) {
             int ret = transport->unregisterLocalMemory(buffer.addr,
                                                        buffer.update_metadata);
             if (ret) {
-                unregisted_buffer_addrs.push_back(buffer.addr);
+                unregistered_buffer_addrs.push_back(buffer.addr);
             }
         }
 
         std::unique_lock<std::shared_mutex> lock(mutex_);
-        for (auto& buffer : unregisted_buffer_addrs) {
+        for (auto& buffer : unregistered_buffer_addrs) {
             for (auto it = local_memory_regions_.begin();
                  it != local_memory_regions_.end(); ++it) {
                 if (it->addr == buffer) {
@@ -555,7 +555,7 @@ int TransferEngineImpl::unregisterLocalMemory(
                 }
             }
         }
-        unregisted_buffer_addrs.clear();
+        unregistered_buffer_addrs.clear();
     }
     return 0;
 }

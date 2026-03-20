@@ -795,6 +795,7 @@ struct TransferOnCudaContext {
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
+    std::string proto;
 };
 
 /**
@@ -810,7 +811,7 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
     auto *ctx = reinterpret_cast<TransferOnCudaContext *>(data);
 
     auto status =
-        ctx->engine->submitTransfer(ctx->batch_id, ctx->requests, proto_);
+        ctx->engine->submitTransfer(ctx->batch_id, ctx->requests, ctx->proto);
     if (!status.ok()) {
         LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
                    << " | BatchID: " << ctx->batch_id;
@@ -912,7 +913,7 @@ void TransferEnginePy::batchTransferOnCuda(
 
     auto batch_id = engine_->allocateBatchID(batch_size);
     auto *ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
-                                          total_bytes};
+                                          total_bytes, proto_};
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err =

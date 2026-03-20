@@ -966,9 +966,10 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     return results;
 }
 
-auto MasterService::EvictDiskReplica(
-    const UUID& client_id, const std::string& key,
-    ReplicaType replica_type) -> tl::expected<void, ErrorCode> {
+auto MasterService::EvictDiskReplica(const UUID& client_id,
+                                     const std::string& key,
+                                     ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found_for_eviction";
@@ -1418,8 +1419,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key,
-                           bool force) -> tl::expected<void, ErrorCode> {
+auto MasterService::Remove(const std::string& key, bool force)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
@@ -1455,8 +1456,8 @@ auto MasterService::Remove(const std::string& key,
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern,
-                                  bool force) -> tl::expected<long, ErrorCode> {
+auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
+    -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
 

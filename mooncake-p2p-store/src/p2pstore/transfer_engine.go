@@ -85,18 +85,22 @@ func (engine *TransferEngine) Close() {
 	C.destroyTransferEngine(engine.engine)
 }
 
-func (engine *TransferEngine) registerLocalMemory(addr uintptr, length uint64, location string) error {
+func (engine *TransferEngine) registerLocalMemory(addr uintptr, length uint64, location string, proto string) error {
 	locationCStr := C.CString(location)
+	protoCStr := C.CString(proto)
 	defer C.free(unsafe.Pointer(locationCStr))
-	ret := C.registerLocalMemory(engine.engine, unsafe.Pointer(addr), C.size_t(length), locationCStr, 1)
+	defer C.free(unsafe.Pointer(protoCStr))
+	ret := C.registerLocalMemory(engine.engine, unsafe.Pointer(addr), C.size_t(length), locationCStr, 1, protoCStr)
 	if ret < 0 {
 		return ErrTransferEngine
 	}
 	return nil
 }
 
-func (engine *TransferEngine) unregisterLocalMemory(addr uintptr) error {
-	ret := C.unregisterLocalMemory(engine.engine, unsafe.Pointer(addr))
+func (engine *TransferEngine) unregisterLocalMemory(addr uintptr, proto string) error {
+	protoCStr := C.CString(proto)
+	defer C.free(unsafe.Pointer(protoCStr))
+	ret := C.unregisterLocalMemory(engine.engine, unsafe.Pointer(addr), protoCStr)
 	if ret < 0 {
 		return ErrTransferEngine
 	}
