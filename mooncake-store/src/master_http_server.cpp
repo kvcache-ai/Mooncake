@@ -44,9 +44,8 @@ void MasterHttpServer::RegisterHandlers() {
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "application/json");
             auto* svc = service_.load(std::memory_order_acquire);
-            const char* body = svc
-                ? R"({"status":"ok","role":"leader"})"
-                : R"({"status":"ok","role":"follower"})";
+            const char* body = svc ? R"({"status":"ok","role":"leader"})"
+                                   : R"({"status":"ok","role":"follower"})";
             resp.set_status_and_content(status_type::ok, body);
         });
 
@@ -83,8 +82,7 @@ void MasterHttpServer::RegisterHandlers() {
 
     // /query_key -- gated on service_
     http_server_.set_http_handler<GET>(
-        "/query_key",
-        [this](coro_http_request& req, coro_http_response& resp) {
+        "/query_key", [this](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             auto* svc = service_.load(std::memory_order_acquire);
             if (!svc) {
@@ -223,8 +221,7 @@ void MasterHttpServer::RegisterHandlers() {
                 }
             }
 
-            resp.add_header("Content-Type",
-                            "application/json; charset=utf-8");
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
 
             if (keys.empty()) {
                 resp.set_status_and_content(
@@ -280,8 +277,8 @@ void MasterHttpServer::RegisterHandlers() {
 
             if (results.size() != keys.size()) {
                 LOG(WARNING)
-                    << "BatchGetReplicaList size mismatch: keys="
-                    << keys.size() << " results=" << results.size();
+                    << "BatchGetReplicaList size mismatch: keys=" << keys.size()
+                    << " results=" << results.size();
             }
 
             resp.set_status_and_content(status_type::ok, std::move(ss));
