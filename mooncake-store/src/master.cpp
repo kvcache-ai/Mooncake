@@ -712,7 +712,11 @@ int main(int argc, char* argv[]) {
             mooncake::WrappedMasterServiceConfig(master_config, version));
 
         http_server.SetService(&wrapped_master_service);
-        http_server.Start();
+        if (!http_server.Start()) {
+            LOG(ERROR) << "Failed to start HTTP server on port "
+                       << master_config.metrics_port;
+            return 1;
+        }
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();

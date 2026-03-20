@@ -1,7 +1,6 @@
 #include "master_http_server.h"
 
 #include <sstream>
-#include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 
 #include "master_metric_manager.h"
@@ -16,9 +15,15 @@ MasterHttpServer::MasterHttpServer(uint16_t port, size_t thread_num)
 
 MasterHttpServer::~MasterHttpServer() { Stop(); }
 
-void MasterHttpServer::Start() {
-    http_server_.async_start();
+bool MasterHttpServer::Start() {
+    auto ec = http_server_.async_start();
+    if (ec.hasResult()) {
+        LOG(ERROR) << "Failed to start HTTP server on port "
+                   << http_server_.port() << ": " << ec.result().value();
+        return false;
+    }
     LOG(INFO) << "HTTP server started on port " << http_server_.port();
+    return true;
 }
 
 void MasterHttpServer::Stop() { http_server_.stop(); }
@@ -199,9 +204,11 @@ void MasterHttpServer::RegisterHandlers() {
         [this](coro_http_request& req, coro_http_response& resp) {
             auto* svc = service_.load(std::memory_order_acquire);
             if (!svc) {
-                resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                resp.set_status_and_content(status_type::service_unavailable,
-                                            "STANDBY");
+                resp.add_header("Content-Type",
+                                "application/json; charset=utf-8");
+                resp.set_status_and_content(
+                    status_type::service_unavailable,
+                    R"({"success":false,"error":"STANDBY"})");
                 return;
             }
             auto keys_view = req.get_query_value("keys");

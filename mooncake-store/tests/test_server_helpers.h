@@ -125,7 +125,9 @@ class InProcMaster {
             http_server_ = std::make_unique<MasterHttpServer>(
                 static_cast<uint16_t>(http_metrics_port_));
             http_server_->SetService(wrapped_.get());
-            http_server_->Start();
+            if (!http_server_->Start()) {
+                return false;
+            }
 
             auto ec = server_->async_start();
             if (ec.hasResult()) {

@@ -119,7 +119,11 @@ int MasterServiceSupervisor::Start() {
     // /health is always responsive; other endpoints gate on service_ != null.
     MasterHttpServer http_server(
         static_cast<uint16_t>(config_.metrics_port));
-    http_server.Start();
+    if (!http_server.Start()) {
+        LOG(ERROR) << "Failed to start HTTP health server on port "
+                   << config_.metrics_port;
+        return -1;
+    }
 
     while (true) {
         LOG(INFO) << "Init master service...";

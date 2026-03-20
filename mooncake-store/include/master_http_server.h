@@ -17,7 +17,7 @@ class MasterHttpServer {
     MasterHttpServer(const MasterHttpServer&) = delete;
     MasterHttpServer& operator=(const MasterHttpServer&) = delete;
 
-    void Start();
+    bool Start();
     void Stop();
 
     void SetService(WrappedMasterService* service);
