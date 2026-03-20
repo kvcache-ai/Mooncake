@@ -805,6 +805,41 @@ int Engram::get_embedding_dim() const {
     return embed_D_;
 }
 
+int Engram::remove_from_store(bool force) {
+    if (store_ == nullptr) {
+        return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    }
+
+    constexpr int kObjectNotFound =
+        static_cast<int>(ErrorCode::OBJECT_NOT_FOUND);
+    int removed = 0;
+    int first_error = 0;
+
+    for (const auto& key : embed_keys_) {
+        int exists = store_->isExist(key);
+        if (exists < 0) {
+            if (first_error == 0) first_error = exists;
+            continue;
+        }
+        if (exists == 0) {
+            continue;
+        }
+
+        int rc = store_->remove(key, force);
+        if (rc == 0) {
+            removed++;
+            continue;
+        }
+        if (rc == kObjectNotFound) {
+            continue;
+        }
+        if (first_error == 0) first_error = rc;
+    }
+
+    invalidate_query_result_cache();
+    return first_error != 0 ? first_error : removed;
+}
+
 int Engram::query_embeddings(
     const std::vector<std::vector<int64_t>>& input_ids, void* output,
     size_t output_size, void* workspace, size_t workspace_size,

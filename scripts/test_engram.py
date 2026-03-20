@@ -199,6 +199,18 @@ class TestStorePopulateAndQuery(EngramTestBase):
         self.assertIn("store_read_ms", timing)
         self.assertIn("embedding_lookup", timing)
 
+    def test_remove_from_store(self):
+        _, _, engram = self.create_engram()
+        self.populate_store(engram)
+
+        removed = engram.remove_from_store(force=True)
+        self.assertEqual(removed, engram.get_num_heads())
+
+        for key in engram.get_store_keys():
+            self.assertEqual(self.store.is_exist(key), 0)
+
+        self.assertEqual(engram.remove_from_store(force=True), 0)
+
 
 class TestErrorHandling(EngramTestBase):
     def test_populate_rejects_wrong_table_shape(self):

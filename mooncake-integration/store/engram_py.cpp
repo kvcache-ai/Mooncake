@@ -63,6 +63,20 @@ void bind_engram(py::module& m) {
         .def("get_num_heads", &Engram::get_num_heads)
         .def("get_embedding_dim", &Engram::get_embedding_dim)
         .def(
+            "remove_from_store",
+            [](Engram& self, bool force) {
+                int ret = self.remove_from_store(force);
+                if (ret < 0) {
+                    throw std::runtime_error(
+                        "remove_from_store failed, rc=" +
+                        std::to_string(ret));
+                }
+                return ret;
+            },
+            py::arg("force") = false,
+            "Remove all Mooncake Store tables owned by this Engram layer. "
+            "Returns the number of removed head tables; missing keys are ignored.")
+        .def(
             py::init([](int layer_id, const EngramConfig& cfg,
                         const BackboneConfig& bb, py::object store_obj) {
                 std::shared_ptr<PyClient> store = nullptr;

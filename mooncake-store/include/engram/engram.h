@@ -91,6 +91,12 @@ class Engram {
     std::vector<std::string> get_store_keys() const;
     int get_num_heads() const;
     int get_embedding_dim() const;
+    /**
+     * Remove all head tables owned by this Engram layer from Mooncake Store.
+     * Missing keys are ignored. Returns the number of removed tables on
+     * success, or a negative error code on failure.
+     */
+    int remove_from_store(bool force = false);
 
     /**
      * Populate Store with embedding tensors.
