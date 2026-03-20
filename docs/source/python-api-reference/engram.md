@@ -91,11 +91,10 @@ print(hash_ids.shape)  # (2, 4, num_heads)
 output = engram.query(input_ids)
 print(output.shape)  # (2, 4, num_heads, embed_dim)
 
-# Optional: provide a workspace and get timing breakdowns.
+# Optional: provide a caller-managed scratch workspace.
 ws_bytes = engram.get_query_workspace_size(len(input_ids), len(input_ids[0]))
 workspace = np.empty(ws_bytes, dtype=np.uint8)
-output, timing = engram.query_with_timing(input_ids, workspace)
-print(timing["hash_ms"], timing["store_read_ms"])
+output = engram.query(input_ids, workspace)
 
 # Optional: remove this layer's Engram tables from Mooncake Store.
 removed = engram.remove_from_store()
@@ -175,8 +174,12 @@ Engram(
 - `config`: Engram configuration
 - `backbone_cfg`: Backbone configuration kept for API compatibility
 - `store`: Mooncake Store instance
-  - Required for `populate_store_from_buffers()`, `query()`, and `query_with_timing()`
+  - Required for `populate_store_from_buffers()` and `query()`
   - Optional when you only need `hash_input_ids()` and metadata helpers such as `get_table_vocab_sizes()`
+  - Lifecycle note: destroy the `Engram` instance before calling `store.close()`
+    so its background services and registered buffers can be released cleanly;
+    the destructor is best-effort defensive, but the recommended order is still
+    `del engram` first, then `store.close()`
 
 #### get_num_heads()
 
@@ -240,7 +243,7 @@ Returns the workspace size in bytes needed for temporary embedding-table buffers
 bytes_needed = engram.get_query_workspace_size(B, L)
 ```
 
-Returns the workspace size in bytes for `query()` / `query_with_timing()`.
+Returns the workspace size in bytes for `query()`.
 
 This is the batch-dependent scratch size for the query path. It is based on the number of rows that can be touched by the current `B x L` request, so it is often much smaller than `get_embedding_tables_workspace_size()`.
 
@@ -290,34 +293,6 @@ output = engram.query(input_ids, workspace=None)
 - otherwise prefers a range-read path backed by reusable scratch buffers
 - may reuse an internal registered workspace even when `workspace=None`
 - falls back to `batch_get_buffer()` when the access pattern is too fragmented or a bulk fetch is cheaper
-
-#### query_with_timing()
-
-```python
-output, timing = engram.query_with_timing(input_ids, workspace=None)
-```
-
-Same functionality as `query()`, but also returns a timing dictionary.
-
-**Top-level timing keys:**
-
-- `hash_ms`
-- `store_read_ms`
-- `embedding_lookup`
-
-**Nested `embedding_lookup` keys:**
-
-- `setup_ms`
-- `register_ms`
-- `batch_query_ms`
-- `get_into_range_ms`
-- `scatter_ms`
-- `unregister_ms`
-- `prep_ms`
-- `remote_fetch_ms`
-- `lookup_ms`
-- `_total_internal_ms`
-- `gap_ms`
 
 #### populate_store_from_buffers()
 

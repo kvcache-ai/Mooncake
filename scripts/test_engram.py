@@ -192,12 +192,9 @@ class TestStorePopulateAndQuery(EngramTestBase):
         input_ids = [[1, 2, 3, 4]]
         ws_bytes = engram.get_query_workspace_size(len(input_ids), len(input_ids[0]))
         workspace = np.empty(ws_bytes, dtype=np.uint8)
-        output, timing = engram.query_with_timing(input_ids, workspace)
+        output = engram.query(input_ids, workspace)
 
         self.assertEqual(output.shape, (1, 4, engram.get_num_heads(), engram.get_embedding_dim()))
-        self.assertIn("hash_ms", timing)
-        self.assertIn("store_read_ms", timing)
-        self.assertIn("embedding_lookup", timing)
 
     def test_remove_from_store(self):
         _, _, engram = self.create_engram()

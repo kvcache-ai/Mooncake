@@ -283,6 +283,21 @@ Engram data has a very specific access pattern:
 
 That combination makes Mooncake a good fit, because Mooncake is optimized for batched metadata resolution, remote object access, registered buffers, and efficient data movement.
 
+## Cross-Node Control Plane
+
+Cross-node sparse queries now use a producer-side remote-gather path instead of
+issuing many tiny reads directly from the consumer. The flow is:
+
+- the consumer plans per-node sparse ranges and packs them into a compact binary request
+- the request is written into a pre-registered descriptor slot
+- a small doorbell notify tells the remote producer which slot to fetch
+- the producer gathers rows into staging buffers and writes the packed result back
+- a small completion ACK tells the consumer that the remote work has finished
+
+This keeps large descriptors off the control socket, keeps the data path on the
+existing transfer primitives, and makes the mechanism reusable for other sparse
+scatter/gather workloads beyond Engram.
+
 ## Current Limits and Follow-up Opportunities
 
 The current implementation is intentionally minimal and correct for the data path, but there is still room to improve:
@@ -310,12 +325,26 @@ The current implementation is intentionally minimal and correct for the data pat
    - Today each head is one object.
    - For some workloads, row-block layouts or hot/cold partitioning may reduce remote read amplification further.
 
+## Next-Generation Cross-Node Path
+
+For cross-node sparse reads, the next stage is no longer a small tweak to the
+current JSON notify path. The planned direction is:
+
+- a generic binary scatter-gather descriptor format
+- descriptor ring or request-pool based submission
+- a tiny doorbell instead of sending the full descriptor through the control socket
+- an Engram-specific planner on top of the generic substrate
+
+That work is tracked in the dedicated design document:
+
+- [Scatter-Gather Control Plane for Engram and Beyond](./scatter-gather-control-plane.md)
+
 ## Validation
 
 The current implementation is validated with:
 
 - `scripts/test_engram.py` for API/correctness coverage
-- `scripts/bench_engram_27b.py` for one-token batch-size sweeps and timing breakdowns
+- `scripts/bench_engram_27b.py` for one-token batch-size latency and throughput sweeps
 
 Operationally, benchmark/test environments must be cleaned before launching a new master or client. A stale `mooncake_master` can cause bind failures and invalidate measurements.
 
