@@ -1213,9 +1213,9 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
         return ERR_METADATA;
     }
-    int ret = handshake_plugin_->sendNotify(
-        peer_location.ip_or_host_name, peer_location.rpc_port, local_desc,
-        peer_desc);
+    int ret = handshake_plugin_->sendNotify(peer_location.ip_or_host_name,
+                                            peer_location.rpc_port, local_desc,
+                                            peer_desc);
     if (ret) return ret;
     if (peer_desc.notify_msg.empty()) {
         LOG(ERROR) << "Notify rejected by " << peer_server_name << ": "

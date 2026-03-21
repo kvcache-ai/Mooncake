@@ -51,10 +51,9 @@ struct HandShakePlugin {
     // peer endpoint's attributes
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
                      const Json::Value &local, Json::Value &peer) = 0;
-    virtual int sendNotify(
-        std::string ip_or_host_name, uint16_t rpc_port,
-        const TransferMetadata::NotifyDesc &local,
-        TransferMetadata::NotifyDesc &peer) = 0;
+    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
+                           const TransferMetadata::NotifyDesc &local,
+                           TransferMetadata::NotifyDesc &peer) = 0;
     virtual int sendProbe(std::string ip_or_host_name, uint16_t rpc_port,
                           const Json::Value &local, Json::Value &peer) = 0;
     // Exchange metadata with remote peer.

@@ -64,15 +64,17 @@ class DummyClient : public PyClient {
         override;
 
     int64_t get_into_range(const std::string &key, void *buffer,
-                           size_t dst_offset, size_t src_offset, size_t size)
-        override;
+                           size_t dst_offset, size_t src_offset,
+                           size_t size) override;
 
     std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) override;
 
-    int64_t get_into_range_with_query_result(
-        const std::string &key, const QueryResult &query_result, void *buffer,
-        size_t dst_offset, size_t src_offset, size_t size) override;
+    int64_t get_into_range_with_query_result(const std::string &key,
+                                             const QueryResult &query_result,
+                                             void *buffer, size_t dst_offset,
+                                             size_t src_offset,
+                                             size_t size) override;
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,

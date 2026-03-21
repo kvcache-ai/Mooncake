@@ -549,13 +549,11 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
         TransferStrategy strategy = selectStrategy(handle, slices);
 
         if (strategy == TransferStrategy::LOCAL_MEMCPY) {
-            future =
-                submitMemcpyOperation(handle, slices, TransferRequest::READ,
-                                     src_offset);
+            future = submitMemcpyOperation(handle, slices,
+                                           TransferRequest::READ, src_offset);
         } else if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-            future = submitTransferEngineOperation(handle, slices,
-                                                  TransferRequest::READ,
-                                                  src_offset);
+            future = submitTransferEngineOperation(
+                handle, slices, TransferRequest::READ, src_offset);
         } else {
             LOG(ERROR) << "Range read only supports LOCAL_MEMCPY or "
                           "TRANSFER_ENGINE, got: "
@@ -677,9 +675,9 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
         }
         uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
         char* dest_base = static_cast<char*>(dest_buffer);
-        const uint64_t task_group_id =
-            enable_task_grouping ? next_task_group_id++
-                                 : TransferRequest::kNoTaskGroup;
+        const uint64_t task_group_id = enable_task_grouping
+                                           ? next_task_group_id++
+                                           : TransferRequest::kNoTaskGroup;
         bool group_has_request = false;
 
         for (const auto& [dest_offset, src_offset, size] : ranges) {
@@ -703,8 +701,8 @@ std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
         return TransferFuture(std::make_shared<EmptyOperationState>());
     }
 
-    auto future = submitTransfer(
-        requests, enable_task_grouping ? grouped_task_count : 0);
+    auto future =
+        submitTransfer(requests, enable_task_grouping ? grouped_task_count : 0);
     if (future && transfer_metric_) {
         size_t total_bytes = 0;
         for (const auto& request : requests) {

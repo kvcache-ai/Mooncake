@@ -1784,7 +1784,8 @@ PYBIND11_MODULE(store, m) {
             // The caller (engram_py.cpp) will extract it
             // Use unique_ptr for RAII: if py::capsule throws, the pointer is
             // freed; otherwise release() transfers ownership to the capsule.
-            auto ptr = std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
+            auto ptr =
+                std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
             std::shared_ptr<PyClient> *raw_ptr = ptr.get();
             py::object cap = py::capsule(raw_ptr, [](void *p) {
                 delete static_cast<std::shared_ptr<PyClient> *>(p);

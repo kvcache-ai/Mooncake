@@ -999,9 +999,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_http_server();
 
-    auto client =
-        std::atomic_exchange_explicit(&client_, std::shared_ptr<Client>{},
-                                      std::memory_order_acq_rel);
+    auto client = std::atomic_exchange_explicit(
+        &client_, std::shared_ptr<Client>{}, std::memory_order_acq_rel);
     if (!client) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
@@ -3170,12 +3169,12 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 int64_t RealClient::get_into_range(const std::string &key, void *buffer,
                                    size_t dst_offset, size_t src_offset,
                                    size_t size) {
-    return to_py_ret(get_into_range_internal(key, buffer, dst_offset,
-                                             src_offset, size));
+    return to_py_ret(
+        get_into_range_internal(key, buffer, dst_offset, src_offset, size));
 }
 
-std::vector<tl::expected<QueryResult, ErrorCode>>
-RealClient::batch_query(const std::vector<std::string> &keys) {
+std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
+    const std::vector<std::string> &keys) {
     if (!client_) {
         return std::vector<tl::expected<QueryResult, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -3207,8 +3206,7 @@ RealClient::get_into_range_with_query_result_internal(
     }
     std::vector<Slice> slices;
     slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
-    auto get_result =
-        client_->Get(key, query_result, slices, src_offset);
+    auto get_result = client_->Get(key, query_result, slices, src_offset);
     if (!get_result) return tl::unexpected(get_result.error());
     return static_cast<int64_t>(size);
 }
@@ -4052,11 +4050,13 @@ RealClient::get_into_ranges_shm_helper(
         &prepared.valid_fragments);
 }
 
-std::vector<BatchQueryResultItem>
-RealClient::batch_query_dummy_helper(const std::vector<std::string> &keys) {
+std::vector<BatchQueryResultItem> RealClient::batch_query_dummy_helper(
+    const std::vector<std::string> &keys) {
     if (!client_) {
         return std::vector<BatchQueryResultItem>(
-            keys.size(), BatchQueryResultItem{static_cast<int>(ErrorCode::INVALID_PARAMS), {}, 0});
+            keys.size(),
+            BatchQueryResultItem{
+                static_cast<int>(ErrorCode::INVALID_PARAMS), {}, 0});
     }
     auto results = client_->BatchQuery(keys);
     std::vector<BatchQueryResultItem> items;
@@ -4064,11 +4064,13 @@ RealClient::batch_query_dummy_helper(const std::vector<std::string> &keys) {
     auto now = std::chrono::steady_clock::now();
     for (const auto &r : results) {
         if (r) {
-            auto lease_ttl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                r->lease_timeout - now).count();
+            auto lease_ttl_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    r->lease_timeout - now)
+                    .count();
             if (lease_ttl_ms < 0) lease_ttl_ms = 0;
             items.push_back({0, std::vector<Replica::Descriptor>(r->replicas),
-                            static_cast<uint64_t>(lease_ttl_ms)});
+                             static_cast<uint64_t>(lease_ttl_ms)});
         } else {
             items.push_back({toInt(r.error()), {}, 0});
         }
@@ -4095,7 +4097,7 @@ RealClient::get_into_range_with_query_result_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto lease_timeout = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(query_item.lease_ttl_ms);
+                         std::chrono::milliseconds(query_item.lease_ttl_ms);
     std::vector<Replica::Descriptor> replicas = query_item.replicas;
     QueryResult qr(std::move(replicas), lease_timeout);
     return get_into_range_with_query_result_internal(key, qr, real_buffer, 0,

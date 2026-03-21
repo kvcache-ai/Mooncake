@@ -33,8 +33,7 @@ constexpr size_t kDefaultRequestRingSlotSize = 256 * 1024;
 constexpr size_t kDefaultRequestRingSlotCount = 64;
 constexpr size_t kDefaultRequestRingMaxSlotSize = 1024 * 1024;
 constexpr size_t kRemoteGatherFixedHeaderBytes =
-    sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t) +
-    sizeof(uint16_t);
+    sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint16_t);
 constexpr size_t kRemoteGatherHeadHeaderMinBytes = 5;
 constexpr size_t kRemoteGatherRangeMinBytes = 2;
 
@@ -66,8 +65,8 @@ size_t load_size_env(const char* name, size_t default_value) {
     errno = 0;
     unsigned long long parsed = std::strtoull(value, &end, 10);
     if (errno != 0 || end == value || *end != '\0' || parsed == 0) {
-        LOG(WARNING) << "Invalid " << name << "=" << value
-                     << ", using default " << default_value;
+        LOG(WARNING) << "Invalid " << name << "=" << value << ", using default "
+                     << default_value;
         return default_value;
     }
     return static_cast<size_t>(parsed);
@@ -133,7 +132,8 @@ size_t varuint_size(uint64_t value) {
     return bytes;
 }
 
-bool read_wire_varuint(std::string_view input, size_t& offset, uint64_t& value) {
+bool read_wire_varuint(std::string_view input, size_t& offset,
+                       uint64_t& value) {
     value = 0;
     unsigned shift = 0;
     while (offset < input.size() && shift <= 63) {
@@ -347,11 +347,11 @@ void radix_sort_by_u64_key(std::vector<T>& values, std::vector<T>& scratch,
 
 size_t estimate_remote_gather_head_request_bytes(
     const RemoteGatherHeadRequest& head) {
-    size_t encoded_bytes = varuint_size(static_cast<uint64_t>(head.head_index)) +
-                           varuint_size(head.ranges.size()) +
-                           varuint_size(head.src_buffer.size_) +
-                           varuint_size(head.src_buffer.buffer_address_) +
-                           varuint_size(head.dst_buffer.buffer_address_);
+    size_t encoded_bytes =
+        varuint_size(static_cast<uint64_t>(head.head_index)) +
+        varuint_size(head.ranges.size()) + varuint_size(head.src_buffer.size_) +
+        varuint_size(head.src_buffer.buffer_address_) +
+        varuint_size(head.dst_buffer.buffer_address_);
     int64_t prev_end = 0;
     for (const auto& range : head.ranges) {
         if (range.start_row < prev_end || range.rows <= 0) {
@@ -365,13 +365,14 @@ size_t estimate_remote_gather_head_request_bytes(
     return encoded_bytes;
 }
 
-size_t estimate_remote_gather_request_bytes(const RemoteGatherRequest& request) {
-    size_t encoded_bytes = kRemoteGatherFixedHeaderBytes +
-                           sizeof(request.request_id) +
-                           varuint_size(request.row_bytes) +
-                           varuint_size(request.heads.size());
+size_t estimate_remote_gather_request_bytes(
+    const RemoteGatherRequest& request) {
+    size_t encoded_bytes =
+        kRemoteGatherFixedHeaderBytes + sizeof(request.request_id) +
+        varuint_size(request.row_bytes) + varuint_size(request.heads.size());
     for (const auto& head : request.heads) {
-        const size_t head_bytes = estimate_remote_gather_head_request_bytes(head);
+        const size_t head_bytes =
+            estimate_remote_gather_head_request_bytes(head);
         if (head_bytes == 0) {
             return 0;
         }
@@ -422,8 +423,10 @@ bool encode_remote_gather_request_to_buffer(const RemoteGatherRequest& request,
             if (range.start_row < prev_end || range.rows <= 0) {
                 return false;
             }
-            const uint64_t gap = static_cast<uint64_t>(range.start_row - prev_end);
-            if (!append_wire_buffer_varuint(out, capacity, encoded_bytes, gap) ||
+            const uint64_t gap =
+                static_cast<uint64_t>(range.start_row - prev_end);
+            if (!append_wire_buffer_varuint(out, capacity, encoded_bytes,
+                                            gap) ||
                 !append_wire_buffer_varuint(
                     out, capacity, encoded_bytes,
                     static_cast<uint64_t>(range.rows))) {
@@ -513,8 +516,7 @@ bool decode_remote_gather_request_v2(std::string_view input, size_t offset,
     uint64_t row_bytes = 0;
     uint64_t head_count = 0;
     if (!read_wire_varuint(input, offset, row_bytes) ||
-        !read_wire_varuint(input, offset, head_count) ||
-        row_bytes == 0 ||
+        !read_wire_varuint(input, offset, head_count) || row_bytes == 0 ||
         row_bytes > std::numeric_limits<uint32_t>::max() ||
         head_count > std::numeric_limits<size_t>::max()) {
         return false;
@@ -534,7 +536,8 @@ bool decode_remote_gather_request_v2(std::string_view input, size_t offset,
             !read_wire_varuint(input, offset, src_buffer_size) ||
             !read_wire_varuint(input, offset, src_buffer_address) ||
             !read_wire_varuint(input, offset, dst_buffer_address) ||
-            head_index > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+            head_index >
+                static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
             return false;
         }
 
@@ -556,10 +559,10 @@ bool decode_remote_gather_request_v2(std::string_view input, size_t offset,
                 !read_wire_varuint(input, offset, rows) || rows == 0) {
                 return false;
             }
-            if (gap >
-                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
-                rows >
-                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            if (gap > static_cast<uint64_t>(
+                          std::numeric_limits<int64_t>::max()) ||
+                rows > static_cast<uint64_t>(
+                           std::numeric_limits<int64_t>::max()) ||
                 total_rows >
                     static_cast<uint64_t>(std::numeric_limits<size_t>::max()) /
                         request.row_bytes ||
@@ -570,9 +573,8 @@ bool decode_remote_gather_request_v2(std::string_view input, size_t offset,
                 return false;
             }
 
-            if (next_start_row >
-                std::numeric_limits<int64_t>::max() -
-                    static_cast<int64_t>(gap)) {
+            if (next_start_row > std::numeric_limits<int64_t>::max() -
+                                     static_cast<int64_t>(gap)) {
                 return false;
             }
             next_start_row += static_cast<int64_t>(gap);
@@ -619,10 +621,12 @@ bool decode_remote_gather_request(std::string_view input,
         return false;
     }
     if (version == 1) {
-        return decode_remote_gather_request_v1(input, offset, request_id, request);
+        return decode_remote_gather_request_v1(input, offset, request_id,
+                                               request);
     }
     if (version == 2) {
-        return decode_remote_gather_request_v2(input, offset, request_id, request);
+        return decode_remote_gather_request_v2(input, offset, request_id,
+                                               request);
     }
     return false;
 }
@@ -767,7 +771,8 @@ void Engram::hash_flat_(
 
             for (int n = 2; n <= max_ngram_size_; ++n) {
                 const int shift = n - 1;
-                const int64_t prev_token = (l >= shift) ? row[l - shift] : pad_id_;
+                const int64_t prev_token =
+                    (l >= shift) ? row[l - shift] : pad_id_;
                 mix ^= (prev_token * multipliers[shift]);
 
                 const auto& ngram_vocab_sizes = head_vocab_sizes[n - 2];
@@ -781,8 +786,9 @@ void Engram::hash_flat_(
                     flat_hash_ids[token_hash_base + head_index] = idx;
                     if (head_refs != nullptr) {
                         (*head_refs)[head_index].push_back(LookupRowRef{
-                            idx, token_output_base +
-                                     static_cast<size_t>(head_index) * embed_D_});
+                            idx,
+                            token_output_base +
+                                static_cast<size_t>(head_index) * embed_D_});
                     }
                 }
                 head_base += n_head_per_ngram_;
@@ -802,15 +808,13 @@ int Engram::ensure_request_ring(size_t min_slot_size) const {
         return -1;
     }
 
-    const size_t configured_slot_size =
-        load_size_env("MC_ENGRAM_SG_RING_SLOT_BYTES",
-                      kDefaultRequestRingSlotSize);
+    const size_t configured_slot_size = load_size_env(
+        "MC_ENGRAM_SG_RING_SLOT_BYTES", kDefaultRequestRingSlotSize);
     size_t slot_size = configured_slot_size;
     const size_t slot_count =
         load_size_env("MC_ENGRAM_SG_RING_SLOTS", kDefaultRequestRingSlotCount);
-    size_t max_slot_size =
-        load_size_env("MC_ENGRAM_SG_RING_MAX_SLOT_BYTES",
-                      kDefaultRequestRingMaxSlotSize);
+    size_t max_slot_size = load_size_env("MC_ENGRAM_SG_RING_MAX_SLOT_BYTES",
+                                         kDefaultRequestRingMaxSlotSize);
     if (max_slot_size != 0) {
         max_slot_size = std::max(max_slot_size, configured_slot_size);
     }
@@ -891,7 +895,8 @@ int Engram::ensure_request_ring(size_t min_slot_size) const {
 
 void Engram::release_request_ring() const {
     std::lock_guard<std::mutex> lock(request_ring_mu_);
-    if (store_ != nullptr && request_ring_registered_ && store_->has_live_client()) {
+    if (store_ != nullptr && request_ring_registered_ &&
+        store_->has_live_client()) {
         for (void* buf : request_ring_buffers_) {
             store_->unregister_buffer(buf);
         }
@@ -912,14 +917,12 @@ int Engram::ensure_remote_gather_workspace(
         return -1;
     }
 
-    const size_t required_bytes =
-        std::accumulate(head_sizes.begin(), head_sizes.end(),
-                        static_cast<size_t>(0));
+    const size_t required_bytes = std::accumulate(
+        head_sizes.begin(), head_sizes.end(), static_cast<size_t>(0));
 
     std::lock_guard<std::mutex> lock(remote_gather_workspace_mu_);
-    bool reuse_existing =
-        remote_gather_workspace_registered_ &&
-        remote_gather_workspace_.size() >= required_bytes;
+    bool reuse_existing = remote_gather_workspace_registered_ &&
+                          remote_gather_workspace_.size() >= required_bytes;
     if (reuse_existing) {
         remote_gather_buffer_sizes_ = head_sizes;
         remote_gather_buffers_.clear();
@@ -1078,8 +1081,8 @@ void Engram::remote_gather_service_loop() {
         int rc = client->GetTransferNotifies(notifies);
         finish_remote_gather_poll(client_state);
         if (rc != 0) {
-            LOG_EVERY_N(WARNING, 100) << "remote_gather_get_notifies_failed rc="
-                                      << rc;
+            LOG_EVERY_N(WARNING, 100)
+                << "remote_gather_get_notifies_failed rc=" << rc;
             hot_polls_remaining = 0;
             std::unique_lock<std::mutex> lock(client_state->mu);
             client_state->cv.wait_for(lock, kRemoteGatherPollInterval, [&] {
@@ -1148,7 +1151,8 @@ void Engram::remote_gather_service_loop() {
                 } else {
                     AllocatedBuffer::Descriptor descriptor_src;
                     descriptor_src.size_ = doorbell.descriptor_bytes;
-                    descriptor_src.buffer_address_ = doorbell.slot_buffer_address;
+                    descriptor_src.buffer_address_ =
+                        doorbell.slot_buffer_address;
                     descriptor_src.protocol_ = store_protocol_;
                     descriptor_src.transport_endpoint_ = reply_agent;
                     void* descriptor_dst = nullptr;
@@ -1230,8 +1234,10 @@ void Engram::remote_gather_service_loop() {
                             size_t range_bytes =
                                 static_cast<size_t>(range.rows) * row_bytes;
                             size_t src_offset =
-                                static_cast<size_t>(range.start_row) * row_bytes;
-                            if (src_offset + range_bytes > head.src_buffer.size_) {
+                                static_cast<size_t>(range.start_row) *
+                                row_bytes;
+                            if (src_offset + range_bytes >
+                                head.src_buffer.size_) {
                                 valid_request = false;
                                 ack.error = "source range out of bounds";
                                 break;
@@ -1327,8 +1333,7 @@ void Engram::remote_gather_service_loop() {
                         reply_agent, kRemoteGatherAckName, ack_payload);
                     if (notify_rc != 0) {
                         LOG(WARNING) << "remote_gather_send_ack_failed req="
-                                     << ack.request_id
-                                     << " rc=" << notify_rc;
+                                     << ack.request_id << " rc=" << notify_rc;
                     }
                 }
             }
@@ -1345,12 +1350,10 @@ int Engram::embedding_lookup(
     const std::vector<int64_t>& flat_hash_ids, int B, int L,
     void* output_buffer, size_t output_size,
     const std::vector<void*>* table_buffers,
-    const std::vector<size_t>* table_sizes,
-    bool buffers_are_pre_registered,
+    const std::vector<size_t>* table_sizes, bool buffers_are_pre_registered,
     std::vector<std::vector<LookupRowRef>>* prepared_head_refs) const {
     if (store_ == nullptr) return -1;
-    if (flat_hash_ids.empty() || B <= 0 || L <= 0)
-        return -1;
+    if (flat_hash_ids.empty() || B <= 0 || L <= 0) return -1;
 
     const int num_heads = static_cast<int>(list_of_N_.size());
     if (flat_hash_ids.size() !=
@@ -1377,10 +1380,9 @@ int Engram::embedding_lookup(
         const int64_t max_rows_per_head =
             std::max<int64_t>(1, static_cast<int64_t>(B) * L);
         for (int h = 0; h < num_heads; ++h) {
-            size_t required =
-                static_cast<size_t>(
-                    std::min<int64_t>(list_of_N_[h], max_rows_per_head)) *
-                row_bytes;
+            size_t required = static_cast<size_t>(std::min<int64_t>(
+                                  list_of_N_[h], max_rows_per_head)) *
+                              row_bytes;
             if ((*table_sizes)[h] < required) {
                 use_zero_copy = false;
                 break;
@@ -1396,7 +1398,8 @@ int Engram::embedding_lookup(
 
     if (use_zero_copy && !buffers_are_pre_registered) {
         for (int h = 0; h < num_heads; ++h) {
-            int ret = store_->register_buffer((*table_buffers)[h], (*table_sizes)[h]);
+            int ret =
+                store_->register_buffer((*table_buffers)[h], (*table_sizes)[h]);
             if (ret != 0) {
                 for (int j : registered_indices)
                     store_->unregister_buffer((*table_buffers)[j]);
@@ -1418,9 +1421,8 @@ int Engram::embedding_lookup(
                 }
                 size_t table_bytes =
                     static_cast<size_t>(list_of_N_[h]) * row_bytes;
-                auto local_ptr =
-                    client->ResolveLocalMemoryAddress(query_results[h].value(),
-                                                      table_bytes);
+                auto local_ptr = client->ResolveLocalMemoryAddress(
+                    query_results[h].value(), table_bytes);
                 if (local_ptr) {
                     tables[h] = static_cast<const float*>(local_ptr.value());
                 }
@@ -1440,7 +1442,9 @@ int Engram::embedding_lookup(
     }
 
     if (use_zero_copy) {
-        auto zero_output = [&]() { std::memset(output_buffer, 0, expected_size); };
+        auto zero_output = [&]() {
+            std::memset(output_buffer, 0, expected_size);
+        };
 
         if (!have_query_results || client == nullptr) {
             zero_output();
@@ -1502,10 +1506,10 @@ int Engram::embedding_lookup(
             }
 
             packed_ranges[h].reserve(refs.size());
-            radix_sort_by_u64_key(
-                refs, row_ref_sort_scratch, [](const LookupRowRef& ref) {
-                    return static_cast<uint64_t>(ref.idx);
-                });
+            radix_sort_by_u64_key(refs, row_ref_sort_scratch,
+                                  [](const LookupRowRef& ref) {
+                                      return static_cast<uint64_t>(ref.idx);
+                                  });
 
             size_t head_cursor = 0;
             size_t ref_begin = 0;
@@ -1587,56 +1591,57 @@ int Engram::embedding_lookup(
             };
 
             const std::string& local_agent = local_agent_name_;
-            const uint32_t request_row_bytes =
-                static_cast<uint32_t>(row_bytes);
+            const uint32_t request_row_bytes = static_cast<uint32_t>(row_bytes);
             const size_t request_base_estimate_bytes =
                 kRemoteGatherFixedHeaderBytes + sizeof(uint64_t) +
                 varuint_size(request_row_bytes) + 1;
-            auto fit_head_chunk = [&](int head_index,
-                                      const AllocatedBuffer::Descriptor& src_desc,
-                                      uintptr_t dst_buffer_address,
-                                      const auto& head_ranges,
-                                      size_t range_begin,
-                                      size_t available_bytes) {
-                const size_t head_index_bytes =
-                    varuint_size(static_cast<uint64_t>(head_index));
-                const size_t src_size_bytes = varuint_size(src_desc.size_);
-                const size_t src_addr_bytes =
-                    varuint_size(src_desc.buffer_address_);
-                const size_t dst_addr_bytes =
-                    varuint_size(dst_buffer_address);
-                size_t range_payload_bytes = 0;
-                size_t best_encoded_bytes = 0;
-                size_t best_range_count = 0;
-                int64_t prev_end = 0;
+            auto fit_head_chunk =
+                [&](int head_index, const AllocatedBuffer::Descriptor& src_desc,
+                    uintptr_t dst_buffer_address, const auto& head_ranges,
+                    size_t range_begin, size_t available_bytes) {
+                    const size_t head_index_bytes =
+                        varuint_size(static_cast<uint64_t>(head_index));
+                    const size_t src_size_bytes = varuint_size(src_desc.size_);
+                    const size_t src_addr_bytes =
+                        varuint_size(src_desc.buffer_address_);
+                    const size_t dst_addr_bytes =
+                        varuint_size(dst_buffer_address);
+                    size_t range_payload_bytes = 0;
+                    size_t best_encoded_bytes = 0;
+                    size_t best_range_count = 0;
+                    int64_t prev_end = 0;
 
-                while (range_begin + best_range_count < head_ranges.size()) {
-                    const auto& range = head_ranges[range_begin + best_range_count];
-                    if (range.end <= range.start || range.start < prev_end) {
-                        return std::pair<size_t, size_t>(0, 0);
+                    while (range_begin + best_range_count <
+                           head_ranges.size()) {
+                        const auto& range =
+                            head_ranges[range_begin + best_range_count];
+                        if (range.end <= range.start ||
+                            range.start < prev_end) {
+                            return std::pair<size_t, size_t>(0, 0);
+                        }
+                        const uint64_t row_gap =
+                            static_cast<uint64_t>(range.start - prev_end);
+                        const uint64_t row_count =
+                            static_cast<uint64_t>(range.end - range.start);
+                        const size_t candidate_payload_bytes =
+                            range_payload_bytes + varuint_size(row_gap) +
+                            varuint_size(row_count);
+                        const size_t candidate_encoded_bytes =
+                            head_index_bytes +
+                            varuint_size(best_range_count + 1) +
+                            src_size_bytes + src_addr_bytes + dst_addr_bytes +
+                            candidate_payload_bytes;
+                        if (candidate_encoded_bytes > available_bytes) {
+                            break;
+                        }
+                        range_payload_bytes = candidate_payload_bytes;
+                        best_encoded_bytes = candidate_encoded_bytes;
+                        ++best_range_count;
+                        prev_end = range.end;
                     }
-                    const uint64_t row_gap =
-                        static_cast<uint64_t>(range.start - prev_end);
-                    const uint64_t row_count =
-                        static_cast<uint64_t>(range.end - range.start);
-                    const size_t candidate_payload_bytes =
-                        range_payload_bytes + varuint_size(row_gap) +
-                        varuint_size(row_count);
-                    const size_t candidate_encoded_bytes =
-                        head_index_bytes + varuint_size(best_range_count + 1) +
-                        src_size_bytes + src_addr_bytes + dst_addr_bytes +
-                        candidate_payload_bytes;
-                    if (candidate_encoded_bytes > available_bytes) {
-                        break;
-                    }
-                    range_payload_bytes = candidate_payload_bytes;
-                    best_encoded_bytes = candidate_encoded_bytes;
-                    ++best_range_count;
-                    prev_end = range.end;
-                }
-                return std::pair<size_t, size_t>(best_range_count,
-                                                 best_encoded_bytes);
-            };
+                    return std::pair<size_t, size_t>(best_range_count,
+                                                     best_encoded_bytes);
+                };
             auto start_remote_request = [&](const std::string& remote_agent) {
                 size_t request_index = remote_requests.size();
                 remote_requests.push_back(RemoteEndpointRequest{
@@ -1664,9 +1669,9 @@ int Engram::embedding_lookup(
                     break;
                 }
 
-                const auto& src_desc =
-                    replica_res.value().get_memory_descriptor()
-                        .buffer_descriptor;
+                const auto& src_desc = replica_res.value()
+                                           .get_memory_descriptor()
+                                           .buffer_descriptor;
                 if (src_desc.transport_endpoint_.empty()) {
                     remote_request_build_ok = false;
                     break;
@@ -1707,10 +1712,9 @@ int Engram::embedding_lookup(
                     std::lock_guard<std::mutex> lock(request_ring_mu_);
                     request_slot_bytes = request_ring_slot_size_;
                 }
-                if (request_slot_bytes <
-                    request_base_estimate_bytes +
-                        kRemoteGatherHeadHeaderMinBytes +
-                        kRemoteGatherRangeMinBytes) {
+                if (request_slot_bytes < request_base_estimate_bytes +
+                                             kRemoteGatherHeadHeaderMinBytes +
+                                             kRemoteGatherRangeMinBytes) {
                     remote_request_build_ok = false;
                 }
             }
@@ -1720,9 +1724,9 @@ int Engram::embedding_lookup(
                     continue;
                 }
 
-                const auto& src_desc =
-                    selected_remote_replicas[h].get_memory_descriptor()
-                        .buffer_descriptor;
+                const auto& src_desc = selected_remote_replicas[h]
+                                           .get_memory_descriptor()
+                                           .buffer_descriptor;
                 size_t head_bytes = 0;
                 const auto& head_ranges = packed_ranges[h];
                 for (const auto& range : head_ranges) {
@@ -1749,17 +1753,15 @@ int Engram::embedding_lookup(
                         request_slot_bytes > request.estimated_bytes
                             ? request_slot_bytes - request.estimated_bytes
                             : 0;
-                    if (available_bytes <
-                        kRemoteGatherHeadHeaderMinBytes +
-                            kRemoteGatherRangeMinBytes) {
+                    if (available_bytes < kRemoteGatherHeadHeaderMinBytes +
+                                              kRemoteGatherRangeMinBytes) {
                         request_index =
                             start_remote_request(src_desc.transport_endpoint_);
                         auto& next_request = remote_requests[request_index];
                         available_bytes =
                             request_slot_bytes - next_request.estimated_bytes;
-                        if (available_bytes <
-                            kRemoteGatherHeadHeaderMinBytes +
-                                kRemoteGatherRangeMinBytes) {
+                        if (available_bytes < kRemoteGatherHeadHeaderMinBytes +
+                                                  kRemoteGatherRangeMinBytes) {
                             remote_request_build_ok = false;
                             break;
                         }
@@ -1774,11 +1776,11 @@ int Engram::embedding_lookup(
                     const size_t chunk_begin_offset =
                         head_ranges[next_range].buffer_offset;
                     const auto [range_count, head_encoded_bytes] =
-                        fit_head_chunk(
-                            h, src_desc,
-                            reinterpret_cast<uintptr_t>(head_base +
-                                                        chunk_begin_offset),
-                            head_ranges, next_range, available_bytes);
+                        fit_head_chunk(h, src_desc,
+                                       reinterpret_cast<uintptr_t>(
+                                           head_base + chunk_begin_offset),
+                                       head_ranges, next_range,
+                                       available_bytes);
                     if (range_count == 0 || head_encoded_bytes == 0) {
                         remote_request_build_ok = false;
                         break;
@@ -1809,7 +1811,8 @@ int Engram::embedding_lookup(
                 }
             }
 
-            if (zero_copy_ok && remote_request_build_ok && !remote_requests.empty()) {
+            if (zero_copy_ok && remote_request_build_ok &&
+                !remote_requests.empty()) {
                 pending_request_ids.reserve(remote_requests.size());
                 unsent_request_ids.reserve(remote_requests.size());
 
@@ -1930,9 +1933,8 @@ int Engram::embedding_lookup(
                     }
                     std::unordered_map<uint64_t, RemoteGatherAck> ack_map;
                     ack_map.reserve(pending_request_ids.size());
-                    const auto deadline =
-                        std::chrono::steady_clock::now() +
-                        kRemoteGatherAckTimeout;
+                    const auto deadline = std::chrono::steady_clock::now() +
+                                          kRemoteGatherAckTimeout;
 
                     while (ack_map.size() < pending_request_ids.size()) {
                         std::vector<uint64_t> ready_request_ids;
@@ -1985,8 +1987,7 @@ int Engram::embedding_lookup(
                                                (!remote_client_state
                                                      ->poll_in_progress &&
                                                 remote_client_state
-                                                        ->service_threads ==
-                                                    0);
+                                                        ->service_threads == 0);
                                     });
                             } else {
                                 remote_client_state->poll_in_progress = true;
@@ -2011,13 +2012,13 @@ int Engram::embedding_lookup(
                                 continue;
                             }
                             RemoteGatherAck ack;
-                            if (!decode_remote_gather_ack(
-                                    notify.notify_msg, ack)) {
+                            if (!decode_remote_gather_ack(notify.notify_msg,
+                                                          ack)) {
                                 continue;
                             }
                             if (remote_client_state != nullptr) {
-                                enqueue_remote_gather_ack(
-                                    remote_client_state, std::move(ack));
+                                enqueue_remote_gather_ack(remote_client_state,
+                                                          std::move(ack));
                             } else {
                                 ack_map[ack.request_id] = std::move(ack);
                                 release_request_slot(ack.request_id);
@@ -2108,10 +2109,9 @@ int Engram::embedding_lookup(
                 float* buf = static_cast<float*>((*table_buffers)[h]);
                 const auto& refs = (*head_refs)[h];
                 for (const auto& range : packed_ranges[h]) {
-                    const float* range_base =
-                        reinterpret_cast<const float*>(
-                            reinterpret_cast<const char*>(buf) +
-                            range.buffer_offset);
+                    const float* range_base = reinterpret_cast<const float*>(
+                        reinterpret_cast<const char*>(buf) +
+                        range.buffer_offset);
                     for (size_t i = range.ref_begin; i < range.ref_end; ++i) {
                         const auto& ref = refs[i];
                         const float* src =
@@ -2142,8 +2142,7 @@ int Engram::embedding_lookup(
                         if (idx >= vocab_size_h) idx = vocab_size_h - 1;
                         float* dst =
                             output +
-                            (b * L * num_heads + l * num_heads + h) *
-                                embed_D_;
+                            (b * L * num_heads + l * num_heads + h) * embed_D_;
                         const float* src =
                             table + static_cast<size_t>(idx) * embed_D_;
                         std::memcpy(dst, src, row_bytes);
@@ -2179,11 +2178,9 @@ int Engram::embedding_lookup(
             }
             for (int h = 0; h < num_heads; ++h) {
                 if (buffers[h] &&
-                    buffers[h]->size() >=
-                        static_cast<size_t>(list_of_N_[h]) * embed_D_ *
-                            sizeof(float)) {
-                    tables[h] =
-                        static_cast<const float*>(buffers[h]->ptr());
+                    buffers[h]->size() >= static_cast<size_t>(list_of_N_[h]) *
+                                              embed_D_ * sizeof(float)) {
+                    tables[h] = static_cast<const float*>(buffers[h]->ptr());
                 }
             }
         }
@@ -2378,10 +2375,9 @@ int Engram::ensure_internal_workspace(int B, int L) const {
     const size_t required_bytes = std::accumulate(
         table_sizes.begin(), table_sizes.end(), static_cast<size_t>(0));
 
-    bool reuse_existing =
-        internal_workspace_registered_ &&
-        internal_workspace_.size() >= required_bytes &&
-        internal_table_sizes_.size() == table_sizes.size();
+    bool reuse_existing = internal_workspace_registered_ &&
+                          internal_workspace_.size() >= required_bytes &&
+                          internal_table_sizes_.size() == table_sizes.size();
     if (reuse_existing) {
         for (size_t i = 0; i < table_sizes.size(); ++i) {
             if (internal_table_sizes_[i] < table_sizes[i]) {
@@ -2512,8 +2508,7 @@ std::vector<std::vector<std::vector<int64_t>>> Engram::hash_input_ids(
         std::vector<std::vector<int64_t>>(L, std::vector<int64_t>(num_heads)));
     for (int b = 0; b < B; ++b) {
         for (int l = 0; l < L; ++l) {
-            const size_t offset =
-                (static_cast<size_t>(b) * L + l) * num_heads;
+            const size_t offset = (static_cast<size_t>(b) * L + l) * num_heads;
             std::copy_n(flat_hash_ids.begin() + offset, num_heads,
                         result[b][l].begin());
         }
@@ -2525,17 +2520,13 @@ std::vector<int64_t> Engram::get_table_vocab_sizes() const {
     return list_of_N_;
 }
 
-std::vector<std::string> Engram::get_store_keys() const {
-    return embed_keys_;
-}
+std::vector<std::string> Engram::get_store_keys() const { return embed_keys_; }
 
 int Engram::get_num_heads() const {
     return static_cast<int>(list_of_N_.size());
 }
 
-int Engram::get_embedding_dim() const {
-    return embed_D_;
-}
+int Engram::get_embedding_dim() const { return embed_D_; }
 
 int Engram::remove_from_store(bool force) {
     if (store_ == nullptr) {
@@ -2572,9 +2563,9 @@ int Engram::remove_from_store(bool force) {
     return first_error != 0 ? first_error : removed;
 }
 
-int Engram::query_embeddings(
-    const std::vector<std::vector<int64_t>>& input_ids, void* output,
-    size_t output_size, void* workspace, size_t workspace_size) const {
+int Engram::query_embeddings(const std::vector<std::vector<int64_t>>& input_ids,
+                             void* output, size_t output_size, void* workspace,
+                             size_t workspace_size) const {
     if (output == nullptr || store_ == nullptr) {
         return -1;
     }

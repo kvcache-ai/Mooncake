@@ -518,9 +518,8 @@ Status RdmaTransport::submitTransferTask(
                                      retry_cnt++)) {
                         continue;
                     }
-                    assert(device_id >= 0 &&
-                           static_cast<size_t>(device_id) <
-                               context_list_.size());
+                    assert(device_id >= 0 && static_cast<size_t>(device_id) <
+                                                 context_list_.size());
                     auto &context = context_list_[device_id];
                     assert(context.get());
                     if (!context->active()) continue;
@@ -535,14 +534,17 @@ Status RdmaTransport::submitTransferTask(
                 if (!found_device) {
                     auto source_addr = slice->source_addr;
                     for (auto &entry : slices_to_post) {
-                        for (auto s : entry.second) getSliceCache().deallocate(s);
+                        for (auto s : entry.second)
+                            getSliceCache().deallocate(s);
                     }
                     LOG(ERROR) << "Memory region not registered by any active "
                                   "device(s): "
                                << source_addr;
                     return Status::AddressNotRegistered(
-                        "Memory region not registered by any active device(s): " +
-                        std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+                        "Memory region not registered by any active "
+                        "device(s): " +
+                        std::to_string(
+                            reinterpret_cast<uintptr_t>(source_addr)));
                 }
 
                 auto &context = context_list_[device_id];

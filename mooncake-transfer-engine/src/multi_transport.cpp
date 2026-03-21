@@ -138,7 +138,8 @@ Status MultiTransport::submitTransfer(
         }
     }
 
-    if (batch_desc.task_list.size() + grouped_task_count > batch_desc.batch_size) {
+    if (batch_desc.task_list.size() + grouped_task_count >
+        batch_desc.batch_size) {
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
     }

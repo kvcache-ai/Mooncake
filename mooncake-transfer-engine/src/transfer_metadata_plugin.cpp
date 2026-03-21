@@ -1065,8 +1065,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                      TransferMetadata::NotifyDesc &peer_notify) {
         std::lock_guard<std::mutex> guard(connection->mu);
         if (connection->fd < 0) {
-            int ret =
-                connectNotifyConnection(ip_or_host_name, rpc_port, connection->fd);
+            int ret = connectNotifyConnection(ip_or_host_name, rpc_port,
+                                              connection->fd);
             if (ret) {
                 return ret;
             }
@@ -1077,9 +1077,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             LOG(ERROR) << "SocketHandShakePlugin: failed to encode notify";
             return ERR_MALFORMED_JSON;
         }
-        int ret = writeStringGathered(connection->fd,
-                                      HandShakeRequestType::Notify,
-                                      request_payload);
+        int ret = writeStringGathered(
+            connection->fd, HandShakeRequestType::Notify, request_payload);
         if (ret) {
             closeNotifyConnection(*connection);
             LOG(ERROR)
@@ -1101,7 +1100,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         if (!decodeNotifyWirePayload(json_str, peer_notify)) {
             closeNotifyConnection(*connection);
-            LOG(ERROR) << "SocketHandShakePlugin: failed to decode notify reply";
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to decode notify reply";
             return ERR_MALFORMED_JSON;
         }
         return 0;
@@ -1158,8 +1158,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return entry;
     }
 
-    int connectNotifyConnection(
-        const std::string &ip_or_host_name, uint16_t rpc_port, int &conn_fd) {
+    int connectNotifyConnection(const std::string &ip_or_host_name,
+                                uint16_t rpc_port, int &conn_fd) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -1250,8 +1250,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     LOG(ERROR)
                         << "SocketHandShakePlugin: failed to decode notify "
                            "message from "
-                        << peer_hostname << ", payload length: "
-                        << json_str.size();
+                        << peer_hostname
+                        << ", payload length: " << json_str.size();
                     break;
                 }
             } else {
@@ -1295,17 +1295,16 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             std::string response_payload;
             if (type == HandShakeRequestType::Notify) {
                 if (!encodeNotifyWirePayload(local_notify, response_payload)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to encode notify reply";
+                    LOG(ERROR) << "SocketHandShakePlugin: failed to encode "
+                                  "notify reply";
                     break;
                 }
             } else {
                 response_payload = Json::FastWriter{}.write(local);
             }
-            int ret =
-                (type == HandShakeRequestType::Notify)
-                    ? writeStringGathered(conn_fd, type, response_payload)
-                    : writeString(conn_fd, type, response_payload);
+            int ret = (type == HandShakeRequestType::Notify)
+                          ? writeStringGathered(conn_fd, type, response_payload)
+                          : writeString(conn_fd, type, response_payload);
             if (ret) {
                 LOG(ERROR) << "SocketHandShakePlugin: failed to send message: "
                               "malformed json format, check tcp connection";

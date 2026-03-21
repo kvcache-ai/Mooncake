@@ -1047,11 +1047,10 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     return results;
 }
 
-std::vector<tl::expected<QueryResult, ErrorCode>>
-DummyClient::batch_query(const std::vector<std::string>& keys) {
-    auto rpc_result =
-        invoke_rpc<&RealClient::batch_query_dummy_helper,
-                   std::vector<BatchQueryResultItem>>(keys);
+std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
+    const std::vector<std::string>& keys) {
+    auto rpc_result = invoke_rpc<&RealClient::batch_query_dummy_helper,
+                                 std::vector<BatchQueryResultItem>>(keys);
     if (!rpc_result) {
         return std::vector<tl::expected<QueryResult, ErrorCode>>(
             keys.size(), tl::unexpected(rpc_result.error()));
@@ -1066,7 +1065,7 @@ DummyClient::batch_query(const std::vector<std::string>& keys) {
                 now + std::chrono::milliseconds(item.lease_ttl_ms);
             results.emplace_back(
                 QueryResult(std::vector<Replica::Descriptor>(item.replicas),
-                           lease_timeout));
+                            lease_timeout));
         } else {
             results.emplace_back(
                 tl::unexpected(static_cast<ErrorCode>(item.error_code)));
@@ -1080,13 +1079,13 @@ int64_t DummyClient::get_into_range_with_query_result(
     size_t dst_offset, size_t src_offset, size_t size) {
     auto now = std::chrono::steady_clock::now();
     auto lease_ttl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           query_result.lease_timeout - now)
-                           .count();
+                            query_result.lease_timeout - now)
+                            .count();
     if (lease_ttl_ms < 0) lease_ttl_ms = 0;
     BatchQueryResultItem item{
         0,
         std::vector<Replica::Descriptor>(query_result.replicas.begin(),
-                                        query_result.replicas.end()),
+                                         query_result.replicas.end()),
         static_cast<uint64_t>(lease_ttl_ms)};
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
     auto result =
@@ -1103,10 +1102,9 @@ int64_t DummyClient::get_into_range(const std::string& key, void* buffer,
                                     size_t dst_offset, size_t src_offset,
                                     size_t size) {
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
-    auto result =
-        invoke_rpc<&RealClient::get_into_range_shm_helper,
-                   tl::expected<int64_t, ErrorCode>>(key, buf_addr, dst_offset,
-                                                   src_offset, size, client_id_);
+    auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
+                             tl::expected<int64_t, ErrorCode>>(
+        key, buf_addr, dst_offset, src_offset, size, client_id_);
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }

@@ -224,8 +224,7 @@ TEST_F(SegmentTest, MountSegmentRejectsSameNameFromDifferentClient) {
     UUID client_id2 = generate_uuid();
 
     auto segment_access = segment_manager.getSegmentAccess();
-    ASSERT_EQ(segment_access.MountSegment(segment1, client_id1),
-              ErrorCode::OK);
+    ASSERT_EQ(segment_access.MountSegment(segment1, client_id1), ErrorCode::OK);
     ASSERT_EQ(segment_access.MountSegment(segment2, client_id2),
               ErrorCode::SEGMENT_ALREADY_EXISTS);
 

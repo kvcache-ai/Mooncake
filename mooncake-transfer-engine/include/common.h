@@ -420,8 +420,8 @@ static inline int writeStringGathered(int fd, const HandShakeRequestType type,
             PLOG(ERROR) << "Socket writev failed";
             return ERR_SOCKET;
         } else if (rc == 0) {
-            LOG(ERROR) << "Socket writev returned 0 while sending "
-                       << remaining << " bytes";
+            LOG(ERROR) << "Socket writev returned 0 while sending " << remaining
+                       << " bytes";
             return ERR_SOCKET;
         }
 

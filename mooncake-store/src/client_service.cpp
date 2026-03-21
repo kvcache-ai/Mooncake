@@ -1234,8 +1234,8 @@ ErrorCode Client::BatchTransferReadBuffers(
         return ErrorCode::OK;
     }
 
-    auto future = transfer_submitter_->submit_batch(
-        replicas, all_slices, TransferRequest::READ);
+    auto future = transfer_submitter_->submit_batch(replicas, all_slices,
+                                                    TransferRequest::READ);
     if (!future) {
         LOG(ERROR) << "BatchTransferReadBuffers: failed to submit transfers";
         return ErrorCode::TRANSFER_FAIL;
@@ -1288,8 +1288,8 @@ ErrorCode Client::BatchTransferWriteBuffers(
         return ErrorCode::OK;
     }
 
-    auto future = transfer_submitter_->submit_batch(
-        replicas, all_slices, TransferRequest::WRITE);
+    auto future = transfer_submitter_->submit_batch(replicas, all_slices,
+                                                    TransferRequest::WRITE);
     if (!future) {
         LOG(ERROR) << "BatchTransferWriteBuffers: failed to submit transfers";
         return ErrorCode::TRANSFER_FAIL;

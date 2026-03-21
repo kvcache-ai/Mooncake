@@ -250,8 +250,8 @@ class PyClient {
      * @return bytes read on success, negative on error
      */
     virtual int64_t get_into_range(const std::string &key, void *buffer,
-                                  size_t dst_offset, size_t src_offset,
-                                  size_t size) = 0;
+                                   size_t dst_offset, size_t src_offset,
+                                   size_t size) = 0;
 
     /**
      * Batch query replica metadata for keys (one round-trip to master).

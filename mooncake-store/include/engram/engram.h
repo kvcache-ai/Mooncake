@@ -35,9 +35,9 @@ class Engram {
     ~Engram();
 
     /**
-     * Return workspace size in bytes for embedding table buffers (zero-copy get).
-     * When workspace includes this size, query_embeddings() uses batch_get_into
-     * for zero-copy RDMA transfer.
+     * Return workspace size in bytes for embedding table buffers (zero-copy
+     * get). When workspace includes this size, query_embeddings() uses
+     * batch_get_into for zero-copy RDMA transfer.
      */
     size_t get_embedding_tables_workspace_size() const;
 
@@ -196,14 +196,15 @@ class Engram {
     void remote_gather_service_loop();
 
     // Embedding lookup / populate
-    // table_buffers/sizes: optional for zero-copy; when valid, use batch_get_into
-    int embedding_lookup(
-        const std::vector<int64_t>& flat_hash_ids, int B, int L,
-        void* output_buffer, size_t output_size,
-        const std::vector<void*>* table_buffers = nullptr,
-        const std::vector<size_t>* table_sizes = nullptr,
-        bool buffers_are_pre_registered = false,
-        std::vector<std::vector<LookupRowRef>>* prepared_head_refs = nullptr) const;
+    // table_buffers/sizes: optional for zero-copy; when valid, use
+    // batch_get_into
+    int embedding_lookup(const std::vector<int64_t>& flat_hash_ids, int B,
+                         int L, void* output_buffer, size_t output_size,
+                         const std::vector<void*>* table_buffers = nullptr,
+                         const std::vector<size_t>* table_sizes = nullptr,
+                         bool buffers_are_pre_registered = false,
+                         std::vector<std::vector<LookupRowRef>>*
+                             prepared_head_refs = nullptr) const;
     int embedding_populate_from_tensors(
         const std::vector<void*>& embedding_data,
         const std::vector<size_t>& sizes);

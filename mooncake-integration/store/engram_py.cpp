@@ -67,15 +67,15 @@ void bind_engram(py::module& m) {
             [](Engram& self, bool force) {
                 int ret = self.remove_from_store(force);
                 if (ret < 0) {
-                    throw std::runtime_error(
-                        "remove_from_store failed, rc=" +
-                        std::to_string(ret));
+                    throw std::runtime_error("remove_from_store failed, rc=" +
+                                             std::to_string(ret));
                 }
                 return ret;
             },
             py::arg("force") = false,
             "Remove all Mooncake Store tables owned by this Engram layer. "
-            "Returns the number of removed head tables; missing keys are ignored.")
+            "Returns the number of removed head tables; missing keys are "
+            "ignored.")
         .def(
             py::init([](int layer_id, const EngramConfig& cfg,
                         const BackboneConfig& bb, py::object store_obj) {
@@ -88,9 +88,10 @@ void bind_engram(py::module& m) {
                             std::string type_name =
                                 py::str(store_obj.get_type().attr("__name__"));
                             if (type_name == "MooncakeDistributedStore") {
-                                py::module store_mod = py::module::import("store");
-                                py::object helper_func =
-                                    store_mod.attr("_get_pyclient_from_wrapper");
+                                py::module store_mod =
+                                    py::module::import("store");
+                                py::object helper_func = store_mod.attr(
+                                    "_get_pyclient_from_wrapper");
                                 py::object capsule = helper_func(store_obj);
                                 if (!capsule.is_none()) {
                                     std::shared_ptr<PyClient>* ptr =
@@ -179,16 +180,17 @@ void bind_engram(py::module& m) {
                     }
                 }
 
-                int ret = self.query_embeddings(
-                    input_ids_vec, out_buf.ptr, out_buf.size * sizeof(float),
-                    ws_ptr, ws_size);
+                int ret = self.query_embeddings(input_ids_vec, out_buf.ptr,
+                                                out_buf.size * sizeof(float),
+                                                ws_ptr, ws_size);
                 if (ret != 0) {
                     throw std::runtime_error("Engram query failed");
                 }
                 return output;
             },
             py::arg("input_ids"), py::arg("workspace") = py::none(),
-            "Query embeddings from Mooncake Store. Returns [B, L, num_heads, embed_D].")
+            "Query embeddings from Mooncake Store. Returns [B, L, num_heads, "
+            "embed_D].")
         .def(
             "populate_store_from_buffers",
             [](Engram& self, py::list embedding_buffers) {
@@ -210,10 +212,10 @@ void bind_engram(py::module& m) {
                         throw std::runtime_error(
                             "embedding_buffers must be NumPy arrays");
                     }
-                    auto arr = py::array_t<float,
-                                           py::array::c_style |
-                                               py::array::forcecast>::ensure(
-                        buf);
+                    auto arr =
+                        py::array_t<float,
+                                    py::array::c_style |
+                                        py::array::forcecast>::ensure(buf);
                     if (!arr) {
                         throw std::runtime_error(
                             "embedding_buffers must be float32 arrays");

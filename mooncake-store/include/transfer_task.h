@@ -454,8 +454,7 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code,
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
 
     /**
@@ -464,8 +463,7 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code,
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
 
     std::optional<TransferFuture> submitMemoryReadOperation(
@@ -483,8 +481,7 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests,
-        size_t batch_task_count = 0);
+        std::vector<TransferRequest>& requests, size_t batch_task_count = 0);
 };
 
 }  // namespace mooncake

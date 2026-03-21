@@ -608,7 +608,8 @@ class Client {
                                  const std::string& name,
                                  const std::string& notify_msg);
 
-    int GetTransferNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
+    int GetTransferNotifies(
+        std::vector<TransferMetadata::NotifyDesc>& notifies);
     const std::string& GetProtocol() const { return protocol_; }
 
    private:
