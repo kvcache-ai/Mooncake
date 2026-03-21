@@ -65,6 +65,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt update -y
+        sudo apt install -y ninja-build
         sudo bash -x dependencies.sh -y
         df -h
       shell: bash
@@ -73,7 +74,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. \
+        cmake -G Ninja .. \
           -DUSE_ETCD=ON \
           -DUSE_REDIS=ON \
           -DUSE_HTTP=ON \
@@ -96,8 +97,8 @@ jobs:
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
-        make -j4
-        sudo make install
+        cmake --build .
+        sudo cmake --install .
         df -h
       shell: bash
 

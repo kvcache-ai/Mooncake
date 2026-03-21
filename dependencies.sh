@@ -103,6 +103,7 @@ echo -e "${YELLOW}This may take a few minutes...${NC}"
 
 SYSTEM_PACKAGES="build-essential \
                   cmake \
+                  ninja-build \
                   git \
                   wget \
                   unzip \
