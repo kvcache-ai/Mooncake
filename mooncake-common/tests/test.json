@@ -3,6 +3,11 @@
     "testFloat": 4.15,
     "testString": "Hello, World",
     "testBoolean": false,
+    "legacyDurationMs": 5000,
+    "durationSeconds": "5s",
+    "durationMinutes": "30m",
+    "durationHours": "1H",
+    "durationWhitespace": " 7 m ",
     "testObject": {
         "nestedInteger": 1000,
         "nestedString": "Nested Hello, World"

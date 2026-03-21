@@ -977,6 +977,17 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     return {};
 }
 
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(EvictDiskReplica(client_id, key, replica_type));
+    }
+    return results;
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,

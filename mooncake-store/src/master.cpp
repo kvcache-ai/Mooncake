@@ -10,6 +10,7 @@
 
 #include "default_config.h"
 #include "environ.h"
+#include "duration_utils.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
@@ -21,6 +22,42 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
+static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
+              "Update kDefaultKvLeaseTtlFlagValue when "
+              "DEFAULT_DEFAULT_KV_LEASE_TTL changes");
+static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
+              "Update kDefaultKvSoftPinTtlFlagValue when "
+              "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
+
+constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
+constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
+
+namespace {
+
+bool ValidateDurationFlag(const char* flagname, const std::string& value) {
+    uint64_t parsed_value = 0;
+    std::string error;
+    if (!mooncake::ParseDurationMs(value, &parsed_value, &error)) {
+        LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+                   << ". " << error;
+        return false;
+    }
+    return true;
+}
+
+uint64_t ParseDurationFlagOrDie(const char* flag_name,
+                                const std::string& value) {
+    uint64_t parsed_value = 0;
+    std::string error;
+    if (!mooncake::ParseDurationMs(value, &parsed_value, &error)) {
+        LOG(FATAL) << "Invalid value for --" << flag_name << ": " << value
+                   << ". " << error;
+    }
+    return parsed_value;
+}
+
+}  // namespace
+
 DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
@@ -29,13 +66,17 @@ DEFINE_int32(
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
-DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
-              "Default lease time for kv objects");
-DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
-              "Default soft pin ttl for kv objects");
+DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
+              "Default lease time for kv objects. Supports raw milliseconds "
+              "or duration strings with ms, s, m, or h suffixes");
+DEFINE_string(default_kv_soft_pin_ttl, kDefaultKvSoftPinTtlFlagValue,
+              "Default soft pin TTL for kv objects. Supports raw milliseconds "
+              "or duration strings with ms, s, m, or h suffixes");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
+DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
+DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when storage space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -169,12 +210,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
-    default_config.GetUInt64("default_kv_lease_ttl",
-                             &master_config.default_kv_lease_ttl,
-                             FLAGS_default_kv_lease_ttl);
-    default_config.GetUInt64("default_kv_soft_pin_ttl",
-                             &master_config.default_kv_soft_pin_ttl,
-                             FLAGS_default_kv_soft_pin_ttl);
+    default_config.GetDurationMs("default_kv_lease_ttl",
+                                 &master_config.default_kv_lease_ttl,
+                                 mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL);
+    default_config.GetDurationMs("default_kv_soft_pin_ttl",
+                                 &master_config.default_kv_soft_pin_ttl,
+                                 mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
@@ -357,12 +398,14 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.default_kv_lease_ttl = FLAGS_default_kv_lease_ttl;
+        master_config.default_kv_lease_ttl = ParseDurationFlagOrDie(
+            "default_kv_lease_ttl", FLAGS_default_kv_lease_ttl);
     }
     if ((google::GetCommandLineFlagInfo("default_kv_soft_pin_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.default_kv_soft_pin_ttl = FLAGS_default_kv_soft_pin_ttl;
+        master_config.default_kv_soft_pin_ttl = ParseDurationFlagOrDie(
+            "default_kv_soft_pin_ttl", FLAGS_default_kv_soft_pin_ttl);
     }
     if ((google::GetCommandLineFlagInfo("allow_evict_soft_pinned_objects",
                                         &info) &&
@@ -398,7 +441,7 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
-    if ((google::GetCommandLineFlagInfo("client_live_ttl_sec", &info) &&
+    if ((google::GetCommandLineFlagInfo("client_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;

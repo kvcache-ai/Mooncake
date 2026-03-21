@@ -1653,6 +1653,11 @@ tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     return master_client_.EvictDiskReplica(key, replica_type);
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    return master_client_.BatchEvictDiskReplica(keys, replica_type);
+}
+
 std::vector<int> Client::GetNicNumaNodes() const {
     std::set<int> nodes;
     if (!transfer_engine_) return {};
@@ -2107,14 +2112,18 @@ void Client::PutToLocalFile(const std::string& key,
             return;
         }
 
-        // Notify master about any evicted disk replicas
-        for (const auto& evicted_key : store_result.value()) {
-            auto evict_result =
-                master_client_.EvictDiskReplica(evicted_key, replica_type);
-            if (!evict_result) {
-                LOG(WARNING)
-                    << "Failed to notify master about evicted key: "
-                    << evicted_key << ", error: " << evict_result.error();
+        // Notify master about any evicted disk replicas (batch)
+        if (!store_result.value().empty()) {
+            const auto& evicted_keys = store_result.value();
+            auto evict_results = master_client_.BatchEvictDiskReplica(
+                evicted_keys, replica_type);
+            for (size_t i = 0; i < evict_results.size(); ++i) {
+                if (!evict_results[i]) {
+                    LOG(WARNING)
+                        << "Failed to notify master about evicted key: "
+                        << evicted_keys[i]
+                        << ", error: " << evict_results[i].error();
+                }
             }
         }
 

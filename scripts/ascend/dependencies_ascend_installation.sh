@@ -65,7 +65,10 @@ if command -v apt-get &> /dev/null; then
             pkg-config \
             patchelf \
             mpich \
-            libmpich-dev
+            libmpich-dev \
+            libzstd-dev \
+            libxxhash-dev \
+            libmsgpack-dev
     apt purge -y openmpi-bin libopenmpi-dev || true
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
@@ -83,7 +86,9 @@ elif command -v yum &> /dev/null; then
             libcurl-devel \
             jsoncpp-devel \
             mpich \
-            mpich-devel
+            mpich-devel \
+            zstd-devel \
+            xxhash-devel
     # Install yaml-cpp
     cd "$TARGET_DIR"
     clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
@@ -92,6 +97,17 @@ elif command -v yum &> /dev/null; then
     mkdir -p build && cd build
     cmake ..
     make -j$(nproc)
+    make install
+    cd ../..
+
+    # Install msgpack-c
+    clone_repo_if_not_exists "msgpack" "https://github.com/msgpack/msgpack-c.git"
+    cd msgpack-c || exit
+    git checkout cpp-7.0.0
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j
     make install
     cd ../..
 else
@@ -116,9 +132,3 @@ make install
 cd ../..
 
 echo -e "yalantinglibs installed successfully."
-
-# Add the so package to the environment variables
-cp libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
-
-# Pip install whl
-pip install mooncake_transfer_engine*.whl --force

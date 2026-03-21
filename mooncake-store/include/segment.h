@@ -217,7 +217,7 @@ class SegmentView {
     explicit SegmentView(const SegmentManager* segment_manager)
         : segment_manager_(segment_manager) {}
 
-    ErrorCode GetSegment(std::shared_ptr<BufferAllocatorBase> allocator,
+    ErrorCode GetSegment(const std::shared_ptr<BufferAllocatorBase>& allocator,
                          Segment& segment) const;
 
     ErrorCode GetMountedSegment(const UUID& segment_id,

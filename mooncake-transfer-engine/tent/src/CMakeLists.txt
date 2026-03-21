@@ -8,6 +8,10 @@ target_include_directories(tent_interface
 )
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
+if (TARGET asio_shared)
+    target_link_libraries(tent_interface INTERFACE asio_shared)
+endif()
+
 # CUDA
 find_package(CUDAToolkit)
 if (CUDAToolkit_FOUND)
@@ -38,6 +42,7 @@ if (IBVERBS_LIB AND IBVERBS_INCLUDE)
     message(STATUS "RDMA: Enabled")
     target_compile_definitions(tent_interface INTERFACE USE_RDMA)
     target_include_directories(tent_interface INTERFACE ${IBVERBS_INCLUDE})
+    target_link_libraries(tent_interface INTERFACE ${IBVERBS_LIB})
 else()
     message(STATUS "RDMA: Disabled")
 endif()

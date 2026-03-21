@@ -10,6 +10,10 @@
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <transfer_engine.h>
 
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
@@ -59,7 +63,7 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 
 class MooncakeWorker {
    public:
-    explicit MooncakeWorker();
+    explicit MooncakeWorker(int cuda_device_index = -1);
 
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
@@ -78,16 +82,20 @@ class MooncakeWorker {
         const std::function<void(void* src, size_t pos, size_t realSize)>&
             bufferToTensor);
 
-    void startWorker();
+    void Start();
 
-    void stopWorker() { running_ = false; }
+    void Stop() { running_ = false; }
 
    private:
+    void startWorker();
+
     static constexpr size_t kNumTasks_ = 4;
 
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
 
     bool running_ = false;
+    std::atomic<bool> started_{false};
+    int cuda_device_index_;
 
     Task *tasks_, *tasks_device_;
     bool hasCallback_[kNumTasks_]{};
@@ -95,6 +103,26 @@ class MooncakeWorker {
 
     int cpuTaskCount = 0;
     int cudaTaskCount = 0;
+};
+
+class MooncakeWorkerManager {
+   public:
+    static MooncakeWorkerManager& GetInstance() {
+        // leaky singleton to avoid destructor fiasco problem
+        static MooncakeWorkerManager* manager = new MooncakeWorkerManager;
+        return *manager;
+    }
+
+    std::shared_ptr<MooncakeWorker> GetCPUWorker();
+    std::shared_ptr<MooncakeWorker> GetCUDAWorker(int cuda_device_index);
+
+   private:
+    std::shared_ptr<MooncakeWorker> GetWorker(int worker_id);
+    static constexpr int CPUWorkerID = -1;
+    std::mutex manager_mutex_;
+    // Keep workers alive for the entire process lifetime because their
+    // detached threads must not outlive the MooncakeWorker object.
+    std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
 
 }  // namespace mooncake

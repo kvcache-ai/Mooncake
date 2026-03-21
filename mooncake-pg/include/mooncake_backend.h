@@ -152,7 +152,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
    private:
     static TransferEngine* engine_;
-    static MooncakeWorker* worker_;
+    std::shared_ptr<MooncakeWorker> worker_;
     static bool engineInitialized_;
     static int backendIndex_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;

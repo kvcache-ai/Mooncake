@@ -53,6 +53,16 @@ class EtcdHelper {
                                      EtcdRevisionId& revision_id);
 
     /*
+     * @brief Batch create key-value pairs in a single transaction.
+     *        Fails if any key already exists.
+     * @param keys: The vector of keys.
+     * @param values: The vector of values.
+     * @return: Error code.
+     */
+    static ErrorCode BatchCreate(const std::vector<std::string>& keys,
+                                 const std::vector<std::string>& values);
+
+    /*
      * @brief Grant a lease from the etcd.
      * @param lease_ttl: The ttl of the lease, in seconds.
      * @param lease_id: Output param, the lease id.

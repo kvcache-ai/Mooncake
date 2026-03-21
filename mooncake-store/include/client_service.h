@@ -235,6 +235,9 @@ class Client {
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
+
     /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
