@@ -69,7 +69,7 @@ jobs:
         echo "Building..."
         cd build
         cmake --build . -j$(nproc)
-        sudo cmake --install .
+        cmake --install .
         echo "Mooncake installed successfully."
 
     - name: Run Hixl Mooncake Store Test
