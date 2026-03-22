@@ -1,0 +1,7 @@
+{
+  "workload": "cache_miss_heavy",
+  "total_requests": 20,
+  "avg_latency_ms": 101.4,
+  "p50_latency_ms": 101.2,
+  "p99_latency_ms": 108.6
+}

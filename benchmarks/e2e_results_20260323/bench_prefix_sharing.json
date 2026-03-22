@@ -1,0 +1,9 @@
+{
+  "workload": "prefix_sharing",
+  "total_requests": 20,
+  "concurrent_workers": 4,
+  "avg_latency_ms": 213.8,
+  "p50_latency_ms": 149.4,
+  "p99_latency_ms": 406.0,
+  "total_time_s": 0.41
+}

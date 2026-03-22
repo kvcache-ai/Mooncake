@@ -1,0 +1,8 @@
+{
+  "workload": "multi_turn_conversation",
+  "total_requests": 20,
+  "avg_latency_ms": 566.2,
+  "p50_latency_ms": 45.5,
+  "p99_latency_ms": 7533.9,
+  "avg_throughput_tok_s": 155.1
+}

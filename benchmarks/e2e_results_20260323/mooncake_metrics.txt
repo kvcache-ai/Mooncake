@@ -1,0 +1,252 @@
+# HELP master_allocated_bytes Total memory bytes currently allocated across all segments
+# TYPE master_allocated_bytes gauge
+master_allocated_bytes 24383488
+# HELP master_total_capacity_bytes Total memory capacity across all mounted segments
+# TYPE master_total_capacity_bytes gauge
+master_total_capacity_bytes 4294967296
+# HELP segment_allocated_bytes Total memory bytes currently allocated of the segment
+# TYPE segment_allocated_bytes gauge
+segment_allocated_bytes{segment="localhost:14104"} 24383488
+# HELP segment_total_capacity_bytes Total memory capacity of the mounted segment
+# TYPE segment_total_capacity_bytes gauge
+segment_total_capacity_bytes{segment="localhost:14104"} 4294967296
+# HELP master_allocated_file_size_bytes Total bytes currently allocated for file storage in 3fs/nfs
+# TYPE master_allocated_file_size_bytes gauge
+master_allocated_file_size_bytes 0
+# HELP master_total_file_capacity_bytes Total capacity for file storage in 3fs/nfs
+# TYPE master_total_file_capacity_bytes gauge
+master_total_file_capacity_bytes 0
+# HELP master_key_count Total number of keys managed by the master
+# TYPE master_key_count gauge
+master_key_count 63
+# HELP master_soft_pin_key_count Total number of soft-pinned keys managed by the master
+# TYPE master_soft_pin_key_count gauge
+master_soft_pin_key_count 0
+# HELP master_active_clients Total number of active clients
+# TYPE master_active_clients gauge
+master_active_clients 1
+# HELP master_value_size_bytes Distribution of object value sizes
+# TYPE master_value_size_bytes histogram
+master_value_size_bytes_bucket{le="4096.000000"} 2
+master_value_size_bytes_bucket{le="65536.000000"} 2
+master_value_size_bytes_bucket{le="262144.000000"} 2
+master_value_size_bytes_bucket{le="1048576.000000"} 64
+master_value_size_bytes_bucket{le="4194304.000000"} 64
+master_value_size_bytes_bucket{le="16777216.000000"} 64
+master_value_size_bytes_bucket{le="67108864.000000"} 64
+master_value_size_bytes_bucket{le="+Inf"} 64
+master_value_size_bytes_sum 24383488
+master_value_size_bytes_count 64
+# HELP master_exist_key_requests_total Total number of ExistKey requests received
+# TYPE master_exist_key_requests_total counter
+master_exist_key_requests_total 1
+# HELP master_exist_key_failures_total Total number of failed ExistKey requests
+# TYPE master_exist_key_failures_total counter
+master_exist_key_failures_total 0
+# HELP master_put_start_requests_total Total number of PutStart requests received
+# TYPE master_put_start_requests_total counter
+master_put_start_requests_total 1
+# HELP master_put_start_failures_total Total number of failed PutStart requests
+# TYPE master_put_start_failures_total counter
+master_put_start_failures_total 0
+# HELP master_put_end_requests_total Total number of PutEnd requests received
+# TYPE master_put_end_requests_total counter
+master_put_end_requests_total 1
+# HELP master_put_end_failures_total Total number of failed PutEnd requests
+# TYPE master_put_end_failures_total counter
+master_put_end_failures_total 0
+# HELP master_put_revoke_requests_total Total number of PutRevoke requests received
+# TYPE master_put_revoke_requests_total counter
+master_put_revoke_requests_total 0
+# HELP master_put_revoke_failures_total Total number of failed PutRevoke requests
+# TYPE master_put_revoke_failures_total counter
+master_put_revoke_failures_total 0
+# HELP master_get_replica_list_requests_total Total number of GetReplicaList requests received
+# TYPE master_get_replica_list_requests_total counter
+master_get_replica_list_requests_total 1
+# HELP master_get_replica_list_failures_total Total number of failed GetReplicaList requests
+# TYPE master_get_replica_list_failures_total counter
+master_get_replica_list_failures_total 0
+# HELP master_get_replica_list_by_regex_requests_total Total number of GetReplicaListByRegex requests received
+# TYPE master_get_replica_list_by_regex_requests_total counter
+master_get_replica_list_by_regex_requests_total 0
+# HELP master_get_replica_list_by_regex_failures_total Total number of failed GetReplicaListByRegex requests
+# TYPE master_get_replica_list_by_regex_failures_total counter
+master_get_replica_list_by_regex_failures_total 0
+# HELP master_remove_requests_total Total number of Remove requests received
+# TYPE master_remove_requests_total counter
+master_remove_requests_total 0
+# HELP master_remove_failures_total Total number of failed Remove requests
+# TYPE master_remove_failures_total counter
+master_remove_failures_total 0
+# HELP master_remove_by_regex_requests_total Total number of RemoveByRegex requests received
+# TYPE master_remove_by_regex_requests_total counter
+master_remove_by_regex_requests_total 0
+# HELP master_remove_by_regex_failures_total Total number of failed RemoveByRegex requests
+# TYPE master_remove_by_regex_failures_total counter
+master_remove_by_regex_failures_total 0
+# HELP master_remove_all_requests_total Total number of Remove all requests received
+# TYPE master_remove_all_requests_total counter
+master_remove_all_requests_total 0
+# HELP master_remove_all_failures_total Total number of failed Remove all requests
+# TYPE master_remove_all_failures_total counter
+master_remove_all_failures_total 0
+# HELP master_mount_segment_requests_total Total number of MountSegment requests received
+# TYPE master_mount_segment_requests_total counter
+master_mount_segment_requests_total 1
+# HELP master_mount_segment_failures_total Total number of failed MountSegment requests
+# TYPE master_mount_segment_failures_total counter
+master_mount_segment_failures_total 0
+# HELP master_unmount_segment_requests_total Total number of UnmountSegment requests received
+# TYPE master_unmount_segment_requests_total counter
+master_unmount_segment_requests_total 0
+# HELP master_unmount_segment_failures_total Total number of failed UnmountSegment requests
+# TYPE master_unmount_segment_failures_total counter
+master_unmount_segment_failures_total 0
+# HELP master_remount_segment_requests_total Total number of RemountSegment requests received
+# TYPE master_remount_segment_requests_total counter
+master_remount_segment_requests_total 1
+# HELP master_remount_segment_failures_total Total number of failed RemountSegment requests
+# TYPE master_remount_segment_failures_total counter
+master_remount_segment_failures_total 0
+# HELP master_ping_requests_total Total number of ping requests received
+# TYPE master_ping_requests_total counter
+master_ping_requests_total 19
+# HELP master_ping_failures_total Total number of failed ping requests
+# TYPE master_ping_failures_total counter
+master_ping_failures_total 0
+# HELP master_copy_start_requests_total Total number of CopyStart requests received
+# TYPE master_copy_start_requests_total counter
+master_copy_start_requests_total 0
+# HELP master_copy_start_failures_total Total number of failed CopyStart requests
+# TYPE master_copy_start_failures_total counter
+master_copy_start_failures_total 0
+# HELP master_copy_end_requests_total Total number of CopyEnd requests received
+# TYPE master_copy_end_requests_total counter
+master_copy_end_requests_total 0
+# HELP master_copy_end_failures_total Total number of failed CopyEnd requests
+# TYPE master_copy_end_failures_total counter
+master_copy_end_failures_total 0
+# HELP master_copy_revoke_requests_total Total number of CopyRevoke requests received
+# TYPE master_copy_revoke_requests_total counter
+master_copy_revoke_requests_total 0
+# HELP master_copy_revoke_failures_total Total number of failed CopyRevoke requests
+# TYPE master_copy_revoke_failures_total counter
+master_copy_revoke_failures_total 0
+# HELP master_move_start_requests_total Total number of MoveStart requests received
+# TYPE master_move_start_requests_total counter
+master_move_start_requests_total 0
+# HELP master_move_start_failures_total Total number of failed MoveStart requests
+# TYPE master_move_start_failures_total counter
+master_move_start_failures_total 0
+# HELP master_move_end_requests_total Total number of MoveEnd requests received
+# TYPE master_move_end_requests_total counter
+master_move_end_requests_total 0
+# HELP master_move_end_failures_total Total number of failed MoveEnd requests
+# TYPE master_move_end_failures_total counter
+master_move_end_failures_total 0
+# HELP master_move_revoke_requests_total Total number of MoveRevoke requests received
+# TYPE master_move_revoke_requests_total counter
+master_move_revoke_requests_total 0
+# HELP master_move_revoke_failures_total Total number of failed MoveRevoke requests
+# TYPE master_move_revoke_failures_total counter
+master_move_revoke_failures_total 0
+# HELP master_evict_disk_replica_requests_total Total number of EvictDiskReplica requests received
+# TYPE master_evict_disk_replica_requests_total counter
+master_evict_disk_replica_requests_total 0
+# HELP master_evict_disk_replica_failures_total Total number of failed EvictDiskReplica requests
+# TYPE master_evict_disk_replica_failures_total counter
+master_evict_disk_replica_failures_total 0
+# HELP master_create_copy_task_requests_total Total number of Copy requests received
+# TYPE master_create_copy_task_requests_total counter
+master_create_copy_task_requests_total 0
+# HELP master_create_copy_task_failures_total Total number of failed Copy requests
+# TYPE master_create_copy_task_failures_total counter
+master_create_copy_task_failures_total 0
+# HELP master_create_move_task_requests_total Total number of Move requests received
+# TYPE master_create_move_task_requests_total counter
+master_create_move_task_requests_total 0
+# HELP master_create_move_task_failures_total Total number of failed Move requests
+# TYPE master_create_move_task_failures_total counter
+master_create_move_task_failures_total 0
+# HELP master_update_task_requests_total Total number of MarkTaskToComplete requests received
+# TYPE master_update_task_requests_total counter
+master_update_task_requests_total 0
+# HELP master_update_task_failures_total Total number of failed MarkTaskToComplete requests
+# TYPE master_update_task_failures_total counter
+master_update_task_failures_total 0
+# HELP master_query_task_requests_total Total number of QueryTask requests received
+# TYPE master_query_task_requests_total counter
+master_query_task_requests_total 0
+# HELP master_query_task_failures_total Total number of failed QueryTask requests
+# TYPE master_query_task_failures_total counter
+master_query_task_failures_total 0
+# HELP master_fetch_tasks_requests_total Total number of FetchTasks requests received
+# TYPE master_fetch_tasks_requests_total counter
+master_fetch_tasks_requests_total 19
+# HELP master_fetch_tasks_failures_total Total number of failed FetchTasks requests
+# TYPE master_fetch_tasks_failures_total counter
+master_fetch_tasks_failures_total 0
+# HELP master_batch_exist_key_requests_total Total number of BatchExistKey requests received
+# TYPE master_batch_exist_key_requests_total counter
+master_batch_exist_key_requests_total 30
+# HELP master_batch_exist_key_failures_total Total number of failed BatchExistKey requests
+# TYPE master_batch_exist_key_failures_total counter
+master_batch_exist_key_failures_total 0
+# HELP master_batch_query_ip_requests_total Total number of BatchQueryIp requests received
+# TYPE master_batch_query_ip_requests_total counter
+master_batch_query_ip_requests_total 0
+# HELP master_batch_query_ip_failures_total Total number of failed BatchQueryIp requests
+# TYPE master_batch_query_ip_failures_total counter
+master_batch_query_ip_failures_total 0
+# HELP master_batch_replica_clear_requests_total Total number of BatchReplicaClear requests received
+# TYPE master_batch_replica_clear_requests_total counter
+master_batch_replica_clear_requests_total 0
+# HELP master_batch_replica_clear_failures_total Total number of failed BatchReplicaClear requests
+# TYPE master_batch_replica_clear_failures_total counter
+master_batch_replica_clear_failures_total 0
+# HELP master_batch_get_replica_list_requests_total Total number of BatchGetReplicaList requests received
+# TYPE master_batch_get_replica_list_requests_total counter
+master_batch_get_replica_list_requests_total 0
+# HELP master_batch_get_replica_list_failures_total Total number of failed BatchGetReplicaList requests
+# TYPE master_batch_get_replica_list_failures_total counter
+master_batch_get_replica_list_failures_total 0
+# HELP master_batch_put_start_requests_total Total number of BatchPutStart requests received
+# TYPE master_batch_put_start_requests_total counter
+master_batch_put_start_requests_total 30
+# HELP master_batch_put_start_failures_total Total number of failed BatchPutStart requests
+# TYPE master_batch_put_start_failures_total counter
+master_batch_put_start_failures_total 0
+# HELP master_batch_put_end_requests_total Total number of BatchPutEnd requests received
+# TYPE master_batch_put_end_requests_total counter
+master_batch_put_end_requests_total 30
+# HELP master_batch_put_end_failures_total Total number of failed BatchPutEnd requests
+# TYPE master_batch_put_end_failures_total counter
+master_batch_put_end_failures_total 0
+# HELP master_batch_put_revoke_requests_total Total number of BatchPutRevoke requests received
+# TYPE master_batch_put_revoke_requests_total counter
+master_batch_put_revoke_requests_total 0
+# HELP master_batch_put_revoke_failures_total Total number of failed BatchPutRevoke requests
+# TYPE master_batch_put_revoke_failures_total counter
+master_batch_put_revoke_failures_total 0
+# HELP master_successful_evictions_total Total number of successful eviction operations
+# TYPE master_successful_evictions_total counter
+master_successful_evictions_total 0
+# HELP master_attempted_evictions_total Total number of attempted eviction operations
+# TYPE master_attempted_evictions_total counter
+master_attempted_evictions_total 0
+# HELP master_evicted_key_count Total number of keys evicted
+# TYPE master_evicted_key_count counter
+master_evicted_key_count 0
+# HELP master_evicted_size_bytes Total bytes of evicted objects
+# TYPE master_evicted_size_bytes counter
+master_evicted_size_bytes 0
+# HELP master_put_start_discard_cnt Total number of discarded PutStart operations
+# TYPE master_put_start_discard_cnt counter
+master_put_start_discard_cnt 0
+# HELP master_put_start_release_cnt Total number of released PutStart operations
+# TYPE master_put_start_release_cnt counter
+master_put_start_release_cnt 0
+# HELP master_put_start_discarded_staging_size Total size of memory replicas in discarded but not yet released PutStart operations
+# TYPE master_put_start_discarded_staging_size gauge
+master_put_start_discarded_staging_size 0

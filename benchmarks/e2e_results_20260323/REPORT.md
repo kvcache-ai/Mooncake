@@ -1,0 +1,19 @@
+# End-to-End Benchmark Report
+
+**Environment:**
+- GPU: GPU 0: NVIDIA A40 (UUID: GPU-34b26b5b-39e4-227a-f2fc-e0c04abfbd72)
+- Model: /home/user/chaomei/models/Qwen2.5-0.5B-Instruct
+
+## Workload Results
+
+| Workload | Requests | Avg Latency | P50 | P99 | Throughput |
+|----------|----------|-------------|-----|-----|------------|
+| multi_turn_conversation | 20 | 566.2ms | 45.5ms | 7533.9ms | 155.1 tok/s |
+| prefix_sharing | 20 | 213.8ms | 149.4ms | 406.0ms | N/A tok/s |
+| cache_miss_heavy | 20 | 101.4ms | 101.2ms | 108.6ms | N/A tok/s |
+
+## Mooncake Store Optimizations Active
+- Counting Bloom Filter (4-bit counters, eviction-aware Remove)
+- Prefix-Aware Radix Tree Index (LongestPrefixMatch)
+- S3-FIFO Eviction Strategy (3-queue design)
+- Adaptive Cache Scheduler (EWMA workload classification)
