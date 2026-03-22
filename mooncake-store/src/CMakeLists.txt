@@ -129,7 +129,10 @@ target_link_libraries(
   mooncake_store
   PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
          ${EXTRA_LIBS} asio_shared
-  PRIVATE transfer_engine)
+)
+if(WITH_TE)
+  target_link_libraries(mooncake_store PRIVATE transfer_engine)
+endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
@@ -178,6 +181,7 @@ target_link_libraries(
           cachelib_memory_allocator
           pthread
           ibverbs
+          numa
           mooncake_common
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
