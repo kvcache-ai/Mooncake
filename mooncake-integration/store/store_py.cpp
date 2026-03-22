@@ -1574,6 +1574,19 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    // Object data type classification
+    py::enum_<ObjectDataType>(m, "ObjectDataType")
+        .value("UNKNOWN", ObjectDataType::UNKNOWN)
+        .value("KVCACHE", ObjectDataType::KVCACHE)
+        .value("TENSOR", ObjectDataType::TENSOR)
+        .value("WEIGHT", ObjectDataType::WEIGHT)
+        .value("SAMPLE", ObjectDataType::SAMPLE)
+        .value("ACTIVATION", ObjectDataType::ACTIVATION)
+        .value("GRADIENT", ObjectDataType::GRADIENT)
+        .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
+        .value("METADATA", ObjectDataType::METADATA)
+        .export_values();
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1585,6 +1598,7 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
