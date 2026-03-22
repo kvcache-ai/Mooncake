@@ -34,6 +34,8 @@ endfunction()
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
+add_store_test(s3fifo_eviction_test s3fifo_eviction_test.cpp)
+add_store_test(bloom_filter_test bloom_filter_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
