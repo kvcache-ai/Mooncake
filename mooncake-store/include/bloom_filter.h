@@ -42,8 +42,10 @@ class BloomFilter {
 
     /// Add a key to the filter. Lock-free, safe to call concurrently.
     void Add(const std::string& key) {
+        size_t h1 = std::hash<std::string>{}(key);
+        size_t h2 = fnv1a(key);
         for (size_t i = 0; i < num_hashes_; ++i) {
-            size_t bit = nthHash(i, key) % num_bits_;
+            size_t bit = (h1 + i * h2) % num_bits_;
             size_t word_idx = bit / 64;
             size_t bit_idx = bit % 64;
             bits_[word_idx].fetch_or(uint64_t(1) << bit_idx,
@@ -55,8 +57,13 @@ class BloomFilter {
     /// Returns false  → key is DEFINITELY not present (skip shard lock).
     /// Returns true   → key MIGHT be present (proceed to normal lookup).
     bool MayContain(const std::string& key) const {
+        // Compute both base hashes once, then derive k hashes via
+        // h(i) = h1 + i*h2 (Kirsch-Mitzenmacher optimization).
+        // This reduces per-key cost from O(k * |key|) to O(2 * |key|).
+        size_t h1 = std::hash<std::string>{}(key);
+        size_t h2 = fnv1a(key);
         for (size_t i = 0; i < num_hashes_; ++i) {
-            size_t bit = nthHash(i, key) % num_bits_;
+            size_t bit = (h1 + i * h2) % num_bits_;
             size_t word_idx = bit / 64;
             size_t bit_idx = bit % 64;
             if (!(bits_[word_idx].load(std::memory_order_relaxed) &
