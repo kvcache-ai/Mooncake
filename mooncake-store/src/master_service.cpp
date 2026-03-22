@@ -1755,6 +1755,23 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
+
+        // Adaptive cache scheduling: periodically adjust eviction parameters
+        // based on observed workload patterns (hit rate, access frequency).
+        auto schedule_result = adaptive_scheduler_.Schedule();
+        if (schedule_result.has_value()) {
+            auto& output = schedule_result.value();
+            eviction_high_watermark_ratio_ = output.eviction_high_watermark;
+            eviction_ratio_ = output.eviction_ratio;
+            default_kv_soft_pin_ttl_ = output.soft_pin_ttl_ms;
+            LOG(INFO) << "[ADAPTIVE-SCHED] mode="
+                      << AdaptiveCacheScheduler::ModeToString(output.mode)
+                      << " hit_rate=" << adaptive_scheduler_.getEwmaHitRate()
+                      << " watermark=" << output.eviction_high_watermark
+                      << " evict_ratio=" << output.eviction_ratio
+                      << " soft_pin_ttl=" << output.soft_pin_ttl_ms << "ms";
+        }
+
         double used_ratio =
             MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||

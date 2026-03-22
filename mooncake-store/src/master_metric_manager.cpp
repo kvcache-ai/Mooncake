@@ -1079,6 +1079,18 @@ void MasterMetricManager::inc_eviction_success(int64_t key_count,
 
 void MasterMetricManager::inc_eviction_fail() { eviction_attempts_.inc(); }
 
+int64_t MasterMetricManager::get_total_get_nums() {
+    return total_get_nums_.value();
+}
+
+int64_t MasterMetricManager::get_mem_cache_hit_nums() {
+    return mem_cache_hit_nums_.value();
+}
+
+int64_t MasterMetricManager::get_file_cache_hit_nums() {
+    return file_cache_hit_nums_.value();
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }

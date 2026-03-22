@@ -18,6 +18,7 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "adaptive_cache_scheduler.h"
 #include "allocation_strategy.h"
 #include "bloom_filter.h"
 #include "master_metric_manager.h"
@@ -815,14 +816,18 @@ class MasterService {
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
-    const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    uint64_t default_kv_soft_pin_ttl_;        // in milliseconds (mutable for adaptive scheduler)
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
     std::atomic<bool> need_eviction_{
         false};  // Set to trigger eviction when not enough space left
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    double eviction_ratio_;                 // in range [0.0, 1.0]
+    double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+
+    // Adaptive cache scheduler: dynamically tunes eviction parameters
+    // based on workload patterns (hit rate, access frequency).
+    AdaptiveCacheScheduler adaptive_scheduler_;
 
     // Eviction thread related members
     std::thread eviction_thread_;

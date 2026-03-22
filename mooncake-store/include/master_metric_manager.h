@@ -209,6 +209,11 @@ class MasterMetricManager {
     int64_t get_batch_put_revoke_items();
     int64_t get_batch_put_revoke_failed_items();
 
+    // Cache Hit Metrics Getters (for adaptive cache scheduling)
+    int64_t get_total_get_nums();
+    int64_t get_mem_cache_hit_nums();
+    int64_t get_file_cache_hit_nums();
+
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
     void inc_eviction_fail();  // not a single object is evicted
