@@ -76,7 +76,16 @@ class AdaptiveCacheScheduler {
         WorkloadMode mode;
     };
 
-    explicit AdaptiveCacheScheduler(const SchedulerConfig& config = {})
+    AdaptiveCacheScheduler()
+        : config_(),
+          current_mode_(WorkloadMode::MIXED),
+          ewma_mem_hit_rate_(0.5),
+          ewma_get_rate_(0.0),
+          last_total_gets_(0),
+          last_mem_hits_(0),
+          last_schedule_time_(std::chrono::steady_clock::now()) {}
+
+    explicit AdaptiveCacheScheduler(const SchedulerConfig& config)
         : config_(config),
           current_mode_(WorkloadMode::MIXED),
           ewma_mem_hit_rate_(0.5),
