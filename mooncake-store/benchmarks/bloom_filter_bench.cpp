@@ -144,16 +144,19 @@ int main(int argc, char** argv) {
         mooncake::MasterClient prefill_client(mooncake::generate_uuid());
         prefill_client.Connect(FLAGS_master_server);
 
+        mooncake::ReplicateConfig config;
+        config.replica_num = 1;
         for (uint64_t i = 0; i < FLAGS_num_prefill_keys;) {
             std::vector<std::string> keys;
-            std::vector<uint64_t> sizes;
+            std::vector<std::vector<uint64_t>> slice_lengths;
             uint64_t batch = std::min(FLAGS_batch_size,
                                        FLAGS_num_prefill_keys - i);
             for (uint64_t j = 0; j < batch; j++) {
                 keys.push_back("bench_key_" + std::to_string(i + j));
-                sizes.push_back(FLAGS_value_size);
+                slice_lengths.push_back({FLAGS_value_size});
             }
-            auto put_results = prefill_client.BatchPutStart(keys, sizes);
+            auto put_results =
+                prefill_client.BatchPutStart(keys, slice_lengths, config);
             std::vector<std::string> started_keys;
             for (size_t k = 0; k < put_results.size(); k++) {
                 if (put_results[k].has_value()) {
