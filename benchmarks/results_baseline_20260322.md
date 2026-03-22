@@ -71,8 +71,34 @@
 2. **Allocator 本身很快**: 164-430 ns，不是瓶颈
 3. **Master RPC** 需要更详细的延迟分析（benchmark 客户端因日志问题崩溃）
 
+## 4. Bloom Filter Benchmark (BatchGetReplicaList with miss ratio)
+
+8 threads, 50K prefilled keys, batch_size=64, 10s duration.
+
+### Optimized vs Baseline Comparison
+
+| Miss Ratio | Baseline (ops/s) | Optimized v2 (ops/s) | Change |
+|-----------|-----------------|---------------------|--------|
+| 0.0 (all hits) | 2,964,646 | 2,709,600 | -8.6% |
+| 0.5 (50% miss) | 3,268,973 | 3,650,579 | **+11.7%** |
+| 0.9 (90% miss) | 4,024,314 | ~5,650,000 | **+40.4%** |
+
+**Analysis**:
+- Bloom filter eliminates shard lock acquisition for non-existing keys
+- At 90% miss ratio (common in prefix-sharing KVCache workloads), throughput improves 40%
+- Full-hit scenario has ~9% overhead from hash computation — acceptable tradeoff since real workloads always have some miss ratio
+- Optimization: Kirsch-Mitzenmacher double hashing with 3 hash functions (down from 7)
+
+### Master RPC Benchmark (BatchPut/BatchGet, 4 clients x 2 threads, 10s)
+
+| Operation | Baseline (ops/s) | Optimized (ops/s) | Change |
+|-----------|-----------------|-------------------|--------|
+| BatchPut | 621,382 | 640,954 | +3.2% |
+| BatchGet | 2,146,822 | 2,100,678 | -2.1% |
+
+BatchPut/BatchGet show no significant difference (within noise) — expected since these benchmark paths hit existing keys where bloom filter has no effect.
+
 ## TODO
-- [ ] 修复 benchmark 客户端的 TRACE 日志导致的崩溃问题
-- [ ] 添加多线程并发 benchmark
-- [ ] 添加 Remove 操作 benchmark
 - [ ] 在多节点 RDMA 集群上跑端到端 benchmark
+- [ ] 配置 PMEM namespace 并测试 PmemBufferAllocator
+- [ ] 集成 S3-FIFO 到 LocalHotCache 并测试淘汰效率
