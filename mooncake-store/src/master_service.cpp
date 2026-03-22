@@ -273,6 +273,8 @@ void MasterService::ClearInvalidHandles() {
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
+                bloom_filter_.Remove(it->first);
+                prefix_index_.Remove(it->first);
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -718,6 +720,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
             shard->processing_keys.erase(key);
+            bloom_filter_.Remove(key);
+            prefix_index_.Remove(key);
             shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -838,6 +842,9 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     // Register key in bloom filter for fast ExistKey lookups
     bloom_filter_.Add(key);
+
+    // Register key in prefix radix tree for prefix-aware matching
+    prefix_index_.Insert(key);
 
     return {};
 }
@@ -1507,6 +1514,8 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                bloom_filter_.Remove(it->first);
+                prefix_index_.Remove(it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1549,6 +1558,8 @@ long MasterService::RemoveAll(bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                bloom_filter_.Remove(it->first);
+                prefix_index_.Remove(it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1835,6 +1846,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata.IsValid()) {
+                bloom_filter_.Remove(it->first);
+                prefix_index_.Remove(it->first);
                 shard->metadata.erase(it);
             }
             key_it = shard->processing_keys.erase(key_it);
@@ -1857,6 +1870,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid()) {
                 // All replicas of this object are discarded, just
                 // remove the whole object.
+                bloom_filter_.Remove(it->first);
+                prefix_index_.Remove(it->first);
                 shard->metadata.erase(it);
             }
 
@@ -1910,6 +1925,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         // Check whether the object is still valid.
         if (!metadata.IsValid()) {
+            bloom_filter_.Remove(metadata_it->first);
+            prefix_index_.Remove(metadata_it->first);
             shard->metadata.erase(metadata_it);
         }
 
@@ -2758,6 +2775,8 @@ void MasterService::RestoreState() {
                                                       .time_since_epoch())
                                                   .count())
                                         : "null");
+                            bloom_filter_.Remove(it->first);
+                            prefix_index_.Remove(it->first);
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
@@ -2963,6 +2982,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.size *
                         evict_replicas(it->second);  // Erase memory replicas
                     if (it->second.IsValid() == false) {
+                        bloom_filter_.Remove(it->first);
+                        prefix_index_.Remove(it->first);
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
@@ -3023,6 +3044,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             evict_replicas(
                                 it->second);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
+                            bloom_filter_.Remove(it->first);
+                            prefix_index_.Remove(it->first);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -3072,6 +3095,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             evict_replicas(
                                 it->second);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
+                            bloom_filter_.Remove(it->first);
+                            prefix_index_.Remove(it->first);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;

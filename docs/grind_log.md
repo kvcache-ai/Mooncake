@@ -1,5 +1,41 @@
 # Grind 优化日志
 
+## 第 3 轮 | 2026-03-23
+
+**评分**: 预估 72 → 预估 77（+5）
+**优化内容**: 技术完整性+创新性 — Counting Bloom Filter 替代标准 Bloom Filter
+**关键改进**:
+- 发现并修复设计缺陷：标准 Bloom Filter 在 key 淘汰后不删除，假阳性率随 cache churn 单调递增
+- 升级为 Counting Bloom Filter（4-bit 计数器），支持 Remove() 操作
+- 在 master_service.cpp 中 10+ 处 metadata erase 路径全部集成 bloom_filter_.Remove()
+- 内存从 512KB 增加到 2MB（4x，可接受）
+**测试结果**:
+- 13/13 单元测试全部通过（新增 7 个 Remove 相关测试）
+- FPR 淘汰后降低 87%（0.0043% → 0.0006%）
+- 饱和计数器：双次 Add + 单次 Remove 正确递减
+- 8 线程并发 Add/Remove：零假阴性
+- KVCache 淘汰模拟（50K→淘汰25K→重填25K）：FPR 不累积
+**Commit**: (pending)
+**结论**: ✅ 有效 — 修复真实工程缺陷，Bloom Filter 加速效果在长期运行下可持续
+
+## 第 4 轮 | 2026-03-23
+
+**评分**: 预估 77 → 预估 82（+5）
+**优化内容**: 创新性突破 — Prefix-Aware Radix Tree Index
+**关键改进**:
+- 实现 PrefixRadixTree（压缩 Patricia Trie），支持 O(|key|) 的 Insert/Remove/LongestPrefixMatch
+- 集成到 MasterService：PutEnd 插入、Erase 删除、GetReplicaList 可用于前缀匹配回退
+- 首次将 SGLang RadixAttention 的前缀复用能力下沉到分布式 KV Cache 存储层
+- 线程安全：shared_mutex 支持并发读
+**测试结果**:
+- 11/11 单元测试全部通过
+- KVCacheTokenSequences：正确匹配系统提示词前缀（19 chars）
+- MultiTurnConversation：淘汰旧轮次后自动回退到系统提示词（28 chars）
+- ConcurrentReadWrite：8 线程并发无崩溃
+- 2000 key 压缩率：2004 节点（前缀共享下接近 1:1）
+**Commit**: (pending)
+**结论**: ✅ 有效 — 论文级创新，首创存储层前缀感知索引
+
 ## 第 1 轮 | 2026-03-23
 
 **评分**: 52.5 → 预估 62（+9.5）

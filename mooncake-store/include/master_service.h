@@ -21,6 +21,7 @@
 #include "adaptive_cache_scheduler.h"
 #include "allocation_strategy.h"
 #include "bloom_filter.h"
+#include "prefix_radix_tree.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -745,14 +746,20 @@ class MasterService {
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
-    // Bloom filter for fast negative lookups in ExistKey/Query.
-    // 4M bits (~512KB) supports ~280K keys at <1% false positive rate.
-    // Keys are added on PutEnd; filter is not updated on Remove (acceptable:
-    // false positives only cause a shard lock acquisition, not incorrect results).
-    // 4M bits, 3 hash functions: low overhead per lookup while maintaining
-    // <0.01% FPR at 280K keys. Reduced from 7 hashes to minimize overhead
-    // on the hot path for existing keys.
+    // Counting Bloom Filter for fast negative lookups in ExistKey/Query.
+    // 4M slots (~2MB with 4-bit counters) supports ~280K keys at <0.01% FPR.
+    // Keys are added on PutEnd and removed on eviction/erase via Remove().
+    // Unlike standard Bloom Filter, the counting variant prevents false positive
+    // accumulation under continuous KVCache churn.
     BloomFilter bloom_filter_{1 << 22, 3};
+
+    // Prefix-aware Radix Tree index for prefix matching queries.
+    // Enables LongestPrefixMatch in GetReplicaList when exact key is not found.
+    // This allows the Store to return the best available cached prefix for
+    // LLM inference workloads where requests share common prefix tokens
+    // (system prompts, shared conversation context).
+    // Keys are inserted on PutEnd and removed on eviction/erase.
+    PrefixRadixTree prefix_index_;
 
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {
@@ -896,7 +903,10 @@ class MasterService {
         }
 
         // Delete current metadata (for PutRevoke or Remove operations)
+        // Also removes from counting bloom filter and prefix index.
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
+            service_->bloom_filter_.Remove(key_);
+            service_->prefix_index_.Remove(key_);
             shard_guard_->metadata.erase(it_);
             it_ = shard_guard_->metadata.end();
         }

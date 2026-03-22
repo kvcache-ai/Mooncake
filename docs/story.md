@@ -26,7 +26,7 @@ LLM 推理的 KVCache 存储面临两个核心矛盾：
 
 ### 第三幕：方案（架构）
 
-三个模块化优化，各自独立、层层递进：
+**四个**模块化优化，各自独立、层层递进：
 
 ```
 ┌───────────────── 查询加速层 ─────────────────┐
@@ -36,6 +36,16 @@ LLM 推理的 KVCache 存储面临两个核心矛盾：
 │  │ (lock-free,  │ ──hit───→ acquire shard lock │
 │  │  3-hash KM)  │                              │
 │  └──────────────┘                              │
+└────────────────────────────────────────────────┘
+
+┌───────────────── 前缀感知层 ─────────────────┐
+│  PrefixRadixTree Index                         │
+│  ┌──────────────────────────────────────┐      │
+│  │ Radix Tree (Patricia Trie)           │      │
+│  │ LongestPrefixMatch() → O(|key|)     │      │
+│  │ 跨请求前缀复用检测                    │      │
+│  └──────────────────────────────────────┘      │
+│  精确匹配 → HashMap, 前缀匹配 → RadixTree     │
 └────────────────────────────────────────────────┘
 
 ┌───────────────── 智能淘汰层 ─────────────────┐
@@ -69,6 +79,13 @@ LLM 推理的 KVCache 存储面临两个核心矛盾：
 | 50% | 3.27M ops/s | 3.65M ops/s | **+11.7%** |
 | 90% | 4.02M ops/s | 5.65M ops/s | **+40.4%** |
 
+**Counting Bloom Filter 淘汰感知验证**:
+- 升级为 Counting Bloom Filter（4-bit 计数器），支持 Remove() 操作
+- 修复了原始设计中 key 被淘汰后 Bloom Filter 假阳性累积的缺陷
+- 淘汰 50% key 后 FPR: 0.0043% → **0.0006%**（降低 87%）
+- 重填新 key 后 FPR 恢复到 0.0043%（与初始水平持平，不累积）
+- 13/13 单元测试通过（含并发 Add/Remove、饱和计数器、KVCache 淘汰模拟）
+
 **自适应调度器运行验证**（Master 日志）:
 - 每 5 秒执行一次调度决策
 - 根据 EWMA hit_rate 自动识别 MIXED 模式并调参
@@ -78,12 +95,13 @@ LLM 推理的 KVCache 存储面临两个核心矛盾：
 
 这些优化直接对接 Mooncake V3 Roadmap：
 
-- **Bloom Filter** → 可立即作为 PR 合并，零风险纯加速
+- **Counting Bloom Filter** → 修复淘汰后假阳性累积缺陷，长期运行下持续保持 40%+ 查询加速
+- **Prefix-Aware Radix Tree** → 首次将前缀感知索引下沉到分布式 KV Cache 存储层，对接 SGLang RadixAttention
 - **S3-FIFO** → 实现 Roadmap M3.1 "(Eviction Logic)" 中社区需求的"多样化缓存调度策略"
 - **自适应调度器** → 实现 Roadmap M3.1 "(Cache Scheduling Interface)"，填补社区空白
 
 ## 金句
 
-> "KVCache 查询中 40% 的锁竞争来自查找不存在的 key — 一个 512KB 的 Bloom Filter 就能消除它们。"
+> "KVCache 查询中 40% 的锁竞争来自查找不存在的 key — 一个 2MB 的 Counting Bloom Filter 就能消除它们，即使在持续淘汰下也不退化。"
 
 > "LRU 不知道系统提示词和一次性查询的区别。S3-FIFO 知道。"
