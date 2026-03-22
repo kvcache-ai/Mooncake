@@ -33,3 +33,10 @@ add_executable(bloom_filter_bench bloom_filter_bench.cpp)
 target_link_libraries(
   bloom_filter_bench PRIVATE mooncake_store cachelib_memory_allocator
                               gflags::gflags glog::glog pthread)
+
+# Adaptive scheduler benchmark: simulates LLM workload phases
+# (PREFIX_HEAVY → SCAN_HEAVY → MIXED) and verifies scheduler mode transitions
+add_executable(adaptive_scheduler_bench adaptive_scheduler_bench.cpp)
+target_link_libraries(
+  adaptive_scheduler_bench PRIVATE mooncake_store cachelib_memory_allocator
+                                    gflags::gflags glog::glog pthread)
