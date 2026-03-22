@@ -630,10 +630,15 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    MasterMetricManager::instance().inc_total_get_nums();
+
+    // Bloom filter fast path: skip shard lock if key definitely not present
+    if (!bloom_filter_.MayContain(key)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, key);
-
-    MasterMetricManager::instance().inc_total_get_nums();
 
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";

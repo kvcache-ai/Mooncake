@@ -27,3 +27,9 @@ add_executable(allocation_strategy_bench allocation_strategy_bench.cpp)
 target_link_libraries(
   allocation_strategy_bench PRIVATE mooncake_store cachelib_memory_allocator
                                     gflags::gflags glog::glog pthread)
+
+# Bloom filter benchmark: tests ExistKey/GetReplicaList with varying miss ratios
+add_executable(bloom_filter_bench bloom_filter_bench.cpp)
+target_link_libraries(
+  bloom_filter_bench PRIVATE mooncake_store cachelib_memory_allocator
+                              gflags::gflags glog::glog pthread)
