@@ -14,7 +14,7 @@ namespace mooncake {
 class BloomFilterTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("BloomFilterTest");
+        // google::InitGoogleLogging called by gtest_main
     }
 };
 

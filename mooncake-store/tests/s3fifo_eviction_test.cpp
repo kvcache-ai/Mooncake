@@ -14,7 +14,7 @@ namespace mooncake {
 class S3FIFOEvictionTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        google::InitGoogleLogging("S3FIFOEvictionTest");
+        // google::InitGoogleLogging called by gtest_main
     }
 };
 
