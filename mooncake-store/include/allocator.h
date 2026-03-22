@@ -26,6 +26,7 @@ class AllocatedBuffer {
    public:
     friend class CachelibBufferAllocator;
     friend class OffsetBufferAllocator;
+    friend class PmemBufferAllocator;
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
@@ -231,6 +232,70 @@ class OffsetBufferAllocator
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 
     friend class Serializer<OffsetBufferAllocator>;
+};
+
+/**
+ * PmemBufferAllocator manages memory allocation on persistent memory (PMEM)
+ * devices using the OffsetAllocator strategy.
+ *
+ * PMEM is mapped via mmap on a DAX device (/dev/pmemX) or a regular file
+ * (for development/testing). The mapped region is registered with the
+ * Transfer Engine for RDMA access, enabling zero-copy remote reads.
+ *
+ * Storage tier hierarchy: GPU (L1) → DRAM (L2) → PMEM (L2.5) → SSD (L3)
+ *
+ * When used with TieredEvictionStrategy, objects evicted from DRAM segments
+ * are demoted to PMEM rather than being discarded, providing a warm cache
+ * layer with ~10x lower latency than SSD and ~3x the capacity of DRAM.
+ *
+ * Usage:
+ *   // Real PMEM (DAX device):
+ *   auto alloc = PmemBufferAllocator("pmem0", "/dev/pmem0", size, endpoint);
+ *   // Development (tmpfs/file-backed):
+ *   auto alloc = PmemBufferAllocator("pmem0", "/tmp/pmem_sim", size, endpoint);
+ */
+class PmemBufferAllocator
+    : public BufferAllocatorBase,
+      public std::enable_shared_from_this<PmemBufferAllocator> {
+   public:
+    /**
+     * @param segment_name Logical name for this PMEM segment
+     * @param pmem_path Path to PMEM DAX device or file for simulation
+     * @param size Size in bytes to map
+     * @param transport_endpoint Transfer Engine endpoint for RDMA registration
+     */
+    PmemBufferAllocator(std::string segment_name, const std::string& pmem_path,
+                        size_t size, std::string transport_endpoint);
+
+    ~PmemBufferAllocator() override;
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
+    void deallocate(AllocatedBuffer* handle) override;
+
+    size_t capacity() const override { return total_size_; }
+    size_t size() const override { return cur_size_.load(); }
+    std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+    size_t getLargestFreeRegion() const override;
+
+    /// Get the base address of the mmap'd PMEM region
+    void* getBaseAddr() const { return base_addr_; }
+
+    /// Check if backed by real PMEM DAX device (vs file simulation)
+    bool isRealPmem() const { return is_dax_; }
+
+   private:
+    const std::string segment_name_;
+    void* base_addr_{nullptr};
+    size_t total_size_{0};
+    std::atomic_size_t cur_size_{0};
+    const std::string transport_endpoint_;
+    int fd_{-1};
+    bool is_dax_{false};
+
+    std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 };
 
 // The main difference is that it allocates real memory and returns it, while

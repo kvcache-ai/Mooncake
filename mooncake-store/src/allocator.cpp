@@ -1,7 +1,18 @@
 // buffer_allocator.cpp
 #include "allocator.h"
 
+#include <fcntl.h>
 #include <glog/logging.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+// MAP_SHARED_VALIDATE and MAP_SYNC may not be available on older kernels
+#ifndef MAP_SHARED_VALIDATE
+#define MAP_SHARED_VALIDATE 0x03
+#endif
+#ifndef MAP_SYNC
+#define MAP_SYNC 0x80000
+#endif
 
 #include <memory>
 
@@ -396,6 +407,158 @@ void SimpleAllocator::deallocate(void* ptr, size_t size) {
         LOG(ERROR) << "deallocation_exception error=" << e.what();
     } catch (...) {
         LOG(ERROR) << "deallocation_unknown_exception";
+    }
+}
+
+// ============================================================================
+// PmemBufferAllocator
+// ============================================================================
+
+PmemBufferAllocator::PmemBufferAllocator(std::string segment_name,
+                                         const std::string& pmem_path,
+                                         size_t size,
+                                         std::string transport_endpoint)
+    : segment_name_(std::move(segment_name)),
+      total_size_(size),
+      transport_endpoint_(std::move(transport_endpoint)) {
+    LOG(INFO) << "initializing_pmem_buffer_allocator segment_name="
+              << segment_name_ << " pmem_path=" << pmem_path
+              << " size=" << size;
+
+    // Detect if path is a DAX device
+    is_dax_ = (pmem_path.find("/dev/pmem") != std::string::npos ||
+               pmem_path.find("/dev/dax") != std::string::npos);
+
+    if (is_dax_) {
+        // Open DAX device directly
+        fd_ = open(pmem_path.c_str(), O_RDWR);
+        if (fd_ < 0) {
+            LOG(ERROR) << "failed_to_open_dax_device path=" << pmem_path
+                       << " errno=" << errno;
+            throw std::runtime_error("Failed to open DAX device: " +
+                                     pmem_path);
+        }
+        // MAP_SYNC ensures write-back persistence on DAX
+        base_addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                          MAP_SHARED_VALIDATE | MAP_SYNC, fd_, 0);
+        if (base_addr_ == MAP_FAILED) {
+            // Fallback without MAP_SYNC (kernel < 4.15 or non-DAX)
+            LOG(WARNING) << "MAP_SYNC not supported, falling back to MAP_SHARED";
+            base_addr_ =
+                mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        }
+    } else {
+        // File-backed simulation mode (for development/testing)
+        fd_ = open(pmem_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd_ < 0) {
+            LOG(ERROR) << "failed_to_create_pmem_file path=" << pmem_path
+                       << " errno=" << errno;
+            throw std::runtime_error("Failed to create PMEM file: " +
+                                     pmem_path);
+        }
+        if (ftruncate(fd_, size) != 0) {
+            close(fd_);
+            LOG(ERROR) << "failed_to_truncate_pmem_file size=" << size;
+            throw std::runtime_error("Failed to truncate PMEM file");
+        }
+        base_addr_ =
+            mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    }
+
+    if (base_addr_ == MAP_FAILED || base_addr_ == nullptr) {
+        if (fd_ >= 0) close(fd_);
+        LOG(ERROR) << "mmap_failed path=" << pmem_path << " size=" << size;
+        throw std::runtime_error("Failed to mmap PMEM region");
+    }
+
+    LOG(INFO) << "pmem_mmap_success base_addr="
+              << reinterpret_cast<void*>(base_addr_) << " size=" << size
+              << " is_dax=" << is_dax_;
+
+    // Initialize offset allocator on the mmap'd region
+    auto base = reinterpret_cast<uintptr_t>(base_addr_);
+    uint64_t init_capacity = size / 4096;
+    init_capacity = std::max(init_capacity, static_cast<uint64_t>(1024));
+    init_capacity = std::min(init_capacity, static_cast<uint64_t>(64 * 1024));
+    uint64_t max_capacity = size / 1024;
+    max_capacity = std::max(max_capacity, static_cast<uint64_t>(1024 * 1024));
+    max_capacity =
+        std::min(max_capacity, static_cast<uint64_t>(64 * 1024 * 1024));
+
+    offset_allocator_ = offset_allocator::OffsetAllocator::create(
+        base, size, static_cast<uint32_t>(init_capacity),
+        static_cast<uint32_t>(max_capacity));
+    if (!offset_allocator_) {
+        munmap(base_addr_, total_size_);
+        if (fd_ >= 0) close(fd_);
+        throw std::runtime_error("Failed to create offset allocator for PMEM");
+    }
+
+    LOG(INFO) << "pmem_buffer_allocator_initialized segment=" << segment_name_
+              << " capacity=" << (size / (1024 * 1024)) << " MB"
+              << " is_dax=" << is_dax_;
+}
+
+PmemBufferAllocator::~PmemBufferAllocator() {
+    MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
+                                                           cur_size_);
+    if (base_addr_ && base_addr_ != MAP_FAILED) {
+        munmap(base_addr_, total_size_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
+    LOG(INFO) << "pmem_buffer_allocator_destroyed segment=" << segment_name_;
+}
+
+std::unique_ptr<AllocatedBuffer> PmemBufferAllocator::allocate(size_t size) {
+    if (!offset_allocator_) {
+        LOG(ERROR) << "pmem_allocator_not_initialized";
+        return nullptr;
+    }
+
+    try {
+        auto allocation_handle = offset_allocator_->allocate(size);
+        if (!allocation_handle) {
+            VLOG(1) << "pmem_allocation_failed size=" << size
+                    << " segment=" << segment_name_
+                    << " current_size=" << cur_size_;
+            return nullptr;
+        }
+
+        void* buffer_ptr = allocation_handle->ptr();
+        auto allocated_buffer = std::make_unique<AllocatedBuffer>(
+            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
+
+        cur_size_.fetch_add(size);
+        MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
+                                                               size);
+        return allocated_buffer;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "pmem_allocation_exception error=" << e.what();
+        return nullptr;
+    }
+}
+
+void PmemBufferAllocator::deallocate(AllocatedBuffer* handle) {
+    try {
+        size_t freed_size = handle->size();
+        handle->offset_handle_.reset();
+        cur_size_.fetch_sub(freed_size);
+        MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
+                                                               freed_size);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "pmem_deallocation_exception error=" << e.what();
+    }
+}
+
+size_t PmemBufferAllocator::getLargestFreeRegion() const {
+    if (!offset_allocator_) return 0;
+    try {
+        auto report = offset_allocator_->storageReport();
+        return report.largestFreeRegion;
+    } catch (...) {
+        return 0;
     }
 }
 
