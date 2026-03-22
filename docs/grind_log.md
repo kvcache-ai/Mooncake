@@ -1,5 +1,20 @@
 # Grind 优化日志
 
+## 第 5 轮 | 2026-03-23
+
+**评分**: 预估 82 → 预估 85（+3）
+**优化内容**: 热路径极致优化 — Deferred Lease + Hash Reuse
+**关键改进**:
+- **Deferred Lease Grant**: GetReplicaList/ExistKey 不再获取 per-object SpinLock，改为 atomic bool 标记。淘汰线程定期 FlushDeferredLease()。消除读路径上的写竞争和 cache line bouncing
+- **Hash Computation Reuse**: MayContainWithHash() 返回 std::hash 值，复用于 shard 索引计算。每次 Get 省一次完整 hash 计算
+- ExistKey 也同步优化（hash reuse + deferred lease）
+**测试结果**:
+- 24/24 单元测试全部通过（Bloom Filter 13 + Radix Tree 11）
+- Concurrent MayContain(miss): 14.5M → 16.5M ops/s (+13%)
+- Radix Tree LPM: 2.96M → 3.18M ops/s (+7%)
+**Commit**: (pending)
+**结论**: ✅ 有效 — 读路径零锁化，hash 复用减少冗余计算
+
 ## 第 3 轮 | 2026-03-23
 
 **评分**: 预估 72 → 预估 77（+5）

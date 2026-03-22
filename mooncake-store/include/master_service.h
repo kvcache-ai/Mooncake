@@ -511,6 +511,11 @@ class MasterService {
         const std::chrono::system_clock::time_point put_start_time;
         const size_t size;
 
+        // Deferred lease touch: set by GetReplicaList (lock-free), flushed
+        // by eviction thread. Eliminates SpinLock acquisition on the read
+        // hot path — a single atomic store replaces lock+write+unlock.
+        mutable std::atomic<bool> recently_accessed{false};
+
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
@@ -662,6 +667,22 @@ class MasterService {
             }
         }
 
+        /// Mark as recently accessed (lock-free, used by GetReplicaList).
+        /// The eviction thread calls FlushDeferredLease() to convert this
+        /// flag into an actual lease extension.
+        void TouchDeferred() const {
+            recently_accessed.store(true, std::memory_order_relaxed);
+        }
+
+        /// Flush deferred access: if recently_accessed is set, grant a lease
+        /// and clear the flag. Called by eviction thread (holds shard lock).
+        void FlushDeferredLease(const uint64_t ttl,
+                                const uint64_t soft_ttl) const {
+            if (recently_accessed.exchange(false, std::memory_order_relaxed)) {
+                GrantLease(ttl, soft_ttl);
+            }
+        }
+
         // Check if the lease has expired
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);
@@ -796,6 +817,11 @@ class MasterService {
     // Helper to get shard index from key
     size_t getShardIndex(const std::string& key) const {
         return std::hash<std::string>{}(key) % kNumShards;
+    }
+
+    // Helper to get shard index from precomputed hash (avoids recomputation)
+    size_t getShardIndexFromHash(size_t hash) const {
+        return hash % kNumShards;
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
@@ -993,6 +1019,16 @@ class MasterService {
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)),
+              processing_it_(shard_guard_->processing_keys.find(key)) {}
+
+        // Constructor with precomputed hash (avoids redundant std::hash call)
+        MetadataAccessorRO(const MasterService* service, const std::string& key,
+                           size_t precomputed_hash)
+            : service_(service),
+              key_(key),
+              shard_idx_(service_->getShardIndexFromHash(precomputed_hash)),
               shard_guard_(service_, shard_idx_),
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)) {}

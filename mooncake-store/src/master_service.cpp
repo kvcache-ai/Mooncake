@@ -343,13 +343,14 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
-    // Bloom filter fast path: if key is definitely not present, skip shard lock
-    if (!bloom_filter_.MayContain(key)) {
+    // Bloom filter fast path with hash reuse for shard index
+    size_t key_hash = 0;
+    if (!bloom_filter_.MayContainWithHash(key, key_hash)) {
         return false;
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key);
+    MetadataAccessorRO accessor(this, key, key_hash);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
@@ -357,9 +358,8 @@ auto MasterService::ExistKey(const std::string& key)
 
     const auto& metadata = accessor.Get();
     if (metadata.HasReplica(&Replica::fn_is_completed)) {
-        // Grant a lease to the object as it may be further used by the
-        // client.
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        // Deferred lease: mark as recently accessed (lock-free).
+        metadata.TouchDeferred();
         return true;
     }
 
@@ -634,13 +634,16 @@ auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MasterMetricManager::instance().inc_total_get_nums();
 
-    // Bloom filter fast path: skip shard lock if key definitely not present
-    if (!bloom_filter_.MayContain(key)) {
+    // Bloom filter fast path: skip shard lock if key definitely not present.
+    // MayContainWithHash returns the std::hash value for free, which we reuse
+    // for shard indexing — saving one full std::hash computation per Get.
+    size_t key_hash = 0;
+    if (!bloom_filter_.MayContainWithHash(key, key_hash)) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key);
+    MetadataAccessorRO accessor(this, key, key_hash);
 
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -665,9 +668,10 @@ auto MasterService::GetReplicaList(const std::string& key)
         MasterMetricManager::instance().inc_file_cache_hit_nums();
     }
     MasterMetricManager::instance().inc_valid_get_nums();
-    // Grant a lease to the object so it will not be removed
-    // when the client is reading it.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    // Deferred lease: mark as recently accessed (lock-free atomic store).
+    // The eviction thread will flush this into an actual lease extension,
+    // avoiding SpinLock acquisition on the read hot path.
+    metadata.TouchDeferred();
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_);
@@ -2931,6 +2935,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // ideally how many object should be evicted in this shard
         const long ideal_evict_num =
             std::ceil(object_count * evict_ratio_target) - evicted_count;
+
+        // Flush deferred lease grants: convert recently_accessed flags into
+        // actual lease extensions before checking for eviction candidates.
+        // This ensures that objects accessed since the last eviction cycle
+        // are not prematurely evicted.
+        for (auto& [key, meta] : shard->metadata) {
+            meta.FlushDeferredLease(default_kv_lease_ttl_,
+                                    default_kv_soft_pin_ttl_);
+        }
 
         std::vector<std::chrono::system_clock::time_point>
             candidates;  // can be removed

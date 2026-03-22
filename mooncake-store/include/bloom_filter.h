@@ -101,6 +101,21 @@ class BloomFilter {
         return true;
     }
 
+    /// Check if a key might be in the filter, with precomputed hash output.
+    /// Avoids redundant std::hash computation when the caller also needs
+    /// the hash for shard indexing. Returns the std::hash value via out_hash.
+    bool MayContainWithHash(const std::string& key, size_t& out_hash) const {
+        out_hash = std::hash<std::string>{}(key);
+        size_t h2 = fnv1a(key);
+        for (size_t i = 0; i < num_hashes_; ++i) {
+            size_t slot = (out_hash + i * h2) % num_slots_;
+            if (counters_[slot].load(std::memory_order_relaxed) == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// Reset the filter. NOT thread-safe — caller must ensure exclusive access.
     void Reset() {
         for (auto& c : counters_) {
