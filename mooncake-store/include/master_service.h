@@ -19,6 +19,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "bloom_filter.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -742,6 +743,12 @@ class MasterService {
             GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
+
+    // Bloom filter for fast negative lookups in ExistKey/Query.
+    // 4M bits (~512KB) supports ~280K keys at <1% false positive rate.
+    // Keys are added on PutEnd; filter is not updated on Remove (acceptable:
+    // false positives only cause a shard lock acquisition, not incorrect results).
+    BloomFilter bloom_filter_{1 << 22, 7};
 
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {

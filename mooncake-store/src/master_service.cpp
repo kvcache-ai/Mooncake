@@ -341,6 +341,11 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
+    // Bloom filter fast path: if key is definitely not present, skip shard lock
+    if (!bloom_filter_.MayContain(key)) {
+        return false;
+    }
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
@@ -825,6 +830,10 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+
+    // Register key in bloom filter for fast ExistKey lookups
+    bloom_filter_.Add(key);
+
     return {};
 }
 
