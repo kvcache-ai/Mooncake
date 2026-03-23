@@ -28,6 +28,7 @@ set(MOONCAKE_STORE_SOURCES
     serialize/serializer.cpp
     serialize/serializer_backend.cpp
     ha/ha_backend_factory.cpp
+    ha/serializer_snapshot_store.cpp
     ha/etcd_leader_coordinator.cpp
     ha/master_service_supervisor.cpp
     ha/redis_leader_coordinator.cpp

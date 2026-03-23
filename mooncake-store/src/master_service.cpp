@@ -14,6 +14,7 @@
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "types.h"
+#include "ha/serializer_snapshot_store.h"
 #include "serialize/serializer.hpp"
 #include "serialize/serializer_backend.h"
 #include "utils/zstd_util.h"
@@ -74,6 +75,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
             auto backend_type =
                 ParseSnapshotBackendType(config.snapshot_backend_type);
             snapshot_backend_ = SerializerBackend::Create(backend_type);
+            snapshot_store_ = std::make_unique<ha::SerializerSnapshotStore>(
+                snapshot_backend_.get());
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot backend: " << e.what();
             throw std::runtime_error(
@@ -2172,6 +2175,13 @@ void MasterService::HandleChildExit(pid_t pid, int status,
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
+        auto* snapshot_store = GetSnapshotStore();
+        if (!snapshot_backend_ || !snapshot_store) {
+            return tl::make_unexpected(
+                SerializationError(ErrorCode::PERSISTENT_FAIL,
+                                   "snapshot backend is not initialized"));
+        }
+
         SNAP_LOG_INFO(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
@@ -2317,17 +2327,20 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
         }
 
-        // Update latest marker (atomic operation)
-        // Format: protocol_type|version|20230801_123456_000
+        // Publish snapshot catalog entry and advance the latest marker.
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        auto latest_update_result =
-            snapshot_backend_->UploadString(latest_path, latest_content);
-        if (!latest_update_result) {
+        ha::SnapshotDescriptor descriptor;
+        descriptor.snapshot_id = snapshot_id;
+        descriptor.manifest_key = manifest_path;
+        descriptor.object_prefix = path_prefix;
+        auto publish_result = snapshot_store->Publish(descriptor);
+        if (publish_result != ErrorCode::OK) {
             SNAP_LOG_ERROR(
-                "[Snapshot] latest update failed, snapshot_id={}, file={}",
-                snapshot_id, latest_path);
+                "[Snapshot] latest update failed, snapshot_id={}, file={}, "
+                "code={}",
+                snapshot_id, latest_path, toString(publish_result));
             if (use_snapshot_backup_dir_) {
                 auto save_path = fs::path(snapshot_backup_dir_) /
                                  SNAPSHOT_BACKUP_SAVE_DIR /
@@ -2418,45 +2431,28 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
 
 void MasterService::CleanupOldSnapshot(int keep_count,
                                        const std::string& snapshot_id) {
-    // 1. List all state directories
-    std::string prefix = SNAPSHOT_ROOT + "/";
-    std::vector<std::string> all_objects;
-    auto list_result =
-        snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
-    if (!list_result) {
+    auto* snapshot_store = GetSnapshotStore();
+    if (!snapshot_store) {
         SNAP_LOG_ERROR(
-            "[Snapshot] error=list failed, prefix={}, snapshot_id={}", prefix,
+            "[Snapshot] snapshot store is not initialized, "
+            "snapshot_id={}",
             snapshot_id);
         return;
     }
 
-    // 2. Extract all timestamp directories (by finding directory structure)
-    std::set<std::string> snapshot_dirs;
-    std::regex state_dir_regex(
-        "^" + prefix + R"((\d{8}_\d{6}_\d{3})/)");  // Match directory structure
-
-    // Extract directory names by finding paths of all objects
-    for (const auto& object_key : all_objects) {
-        std::smatch match;
-        if (std::regex_search(object_key, match, state_dir_regex)) {
-            snapshot_dirs.insert(match[1].str());  // Extract timestamp part
-        }
+    auto list_result = snapshot_store->List(0);
+    if (!list_result) {
+        SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
+                       snapshot_id, toString(list_result.error()));
+        return;
     }
 
-    // 3. Convert to vector and sort by timestamp (descending, newest first)
-    std::vector<std::string> sorted_snapshot_dirs(snapshot_dirs.begin(),
-                                                  snapshot_dirs.end());
-    std::sort(sorted_snapshot_dirs.begin(), sorted_snapshot_dirs.end(),
-              std::greater<>());
+    const auto& snapshots = list_result.value();
 
-    // 4. Delete old states exceeding retention count
-    if (static_cast<int>(sorted_snapshot_dirs.size()) > keep_count) {
-        for (int i = keep_count;
-             i < static_cast<int>(sorted_snapshot_dirs.size()); i++) {
-            std::string old_state_dir = sorted_snapshot_dirs[i];
+    if (static_cast<int>(snapshots.size()) > keep_count) {
+        for (int i = keep_count; i < static_cast<int>(snapshots.size()); i++) {
+            const std::string& old_state_dir = snapshots[i].snapshot_id;
 
-            // Fault tolerance: skip if same as current snapshot_id to avoid
-            // accidental deletion
             if (old_state_dir == snapshot_id) {
                 SNAP_LOG_WARN(
                     "[Snapshot] Skipping deletion of current snapshot "
@@ -2466,17 +2462,12 @@ void MasterService::CleanupOldSnapshot(int keep_count,
                 continue;
             }
 
-            std::string old_state_prefix = prefix + old_state_dir + "/";
-
-            // Delete the entire old state directory (regardless of
-            // manifest.json existence)
-            auto delete_result =
-                snapshot_backend_->DeleteObjectsWithPrefix(old_state_prefix);
-            if (!delete_result) {
+            auto delete_result = snapshot_store->Delete(old_state_dir);
+            if (delete_result != ErrorCode::OK) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Failed to delete old state directory {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
+                    "snapshot_id={}, code={}",
+                    old_state_dir, snapshot_id, toString(delete_result));
             } else {
                 SNAP_LOG_INFO(
                     "[Snapshot] Successfully deleted old state directory {}, "
@@ -2489,42 +2480,42 @@ void MasterService::CleanupOldSnapshot(int keep_count,
 
 void MasterService::RestoreState() {
     try {
+        auto* snapshot_store = GetSnapshotStore();
+        if (!snapshot_backend_ || !snapshot_store) {
+            LOG(ERROR) << "[Restore] Snapshot backend is not initialized, "
+                       << "starting fresh";
+            return;
+        }
+
         auto now = std::chrono::system_clock::now();
 
         LOG(INFO) << "[Restore] Backend info: "
                   << snapshot_backend_->GetConnectionInfo();
-        // 1. Read latest.txt file to get the latest state ID
-        std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
-        std::string latest_content;
-        if (!snapshot_backend_->DownloadString(latest_path, latest_content)) {
+        // 1. Resolve the latest snapshot from the snapshot catalog.
+        auto latest_result = snapshot_store->GetLatest();
+        if (!latest_result) {
+            LOG(ERROR) << "[Restore] Failed to load latest snapshot: "
+                       << toString(latest_result.error()) << ", starting fresh";
+            return;
+        }
+        if (!latest_result.value().has_value()) {
             LOG(ERROR)
                 << "[Restore] No previous snapshot found, starting fresh";
             return;
         }
 
-        // Trim leading and trailing whitespace
-        latest_content.erase(0, latest_content.find_first_not_of(" \t\r\n"));
-        latest_content.erase(latest_content.find_last_not_of(" \t\r\n") + 1);
-
-        if (latest_content.empty()) {
-            LOG(ERROR)
-                << "[Restore] Latest snapshot file is empty, starting fresh";
-            return;
+        const auto& latest_snapshot = latest_result.value().value();
+        const std::string& state_id = latest_snapshot.snapshot_id;
+        std::string path_prefix = latest_snapshot.object_prefix;
+        if (path_prefix.empty()) {
+            path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
         }
-
-        // Validate snapshot ID format
-        static const std::regex snapshot_id_regex(R"(^\d{8}_\d{6}_\d{3}$)");
-        if (!std::regex_match(latest_content, snapshot_id_regex)) {
-            LOG(ERROR) << "[Restore] Invalid snapshot ID format: "
-                       << latest_content << ", starting fresh";
-            return;
-        }
-
-        std::string state_id = latest_content;
-        std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
 
         // 2. Download manifest.txt to parse protocol version info
-        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        std::string manifest_path = latest_snapshot.manifest_key;
+        if (manifest_path.empty()) {
+            manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        }
         std::string manifest_content;
         if (!snapshot_backend_->DownloadString(manifest_path,
                                                manifest_content)) {
@@ -2556,8 +2547,8 @@ void MasterService::RestoreState() {
             version = parts[1];
         } else {
             // Invalid format
-            LOG(ERROR) << "[Restore] Invalid latest snapshot format: "
-                       << latest_content;
+            LOG(ERROR) << "[Restore] Invalid snapshot manifest format: "
+                       << manifest_content;
             return;
         }
 
@@ -2826,6 +2817,14 @@ void MasterService::RestoreState() {
     } catch (...) {
         LOG(ERROR) << "[Restore] Unknown exception during state restoration";
     }
+}
+
+ha::SnapshotStore* MasterService::GetSnapshotStore() {
+    if (!snapshot_store_ && snapshot_backend_) {
+        snapshot_store_ = std::make_unique<ha::SerializerSnapshotStore>(
+            snapshot_backend_.get());
+    }
+    return snapshot_store_.get();
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,

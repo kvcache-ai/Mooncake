@@ -55,6 +55,8 @@ add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
+add_store_test(serializer_snapshot_store_test
+               serializer_snapshot_store_test.cpp)
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_backend_test local_file_backend_test.cpp)
 add_store_test(file_util_test file_util_test.cpp)
