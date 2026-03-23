@@ -196,7 +196,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
-    const size_t num_qp_per_rank = USE_QP_COUNT / num_ranks;
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -556,7 +556,7 @@ combine(void* combined_x, int32_t* active_ranks,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
-    const size_t num_qp_per_rank = USE_QP_COUNT / num_ranks;
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
