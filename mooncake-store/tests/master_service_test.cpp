@@ -4321,7 +4321,7 @@ TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
         << "Hard-pinned object was evicted, but it should never be";
 
     // Explicit Remove should still work on hard-pinned objects
-    auto remove_result = service_->Remove("pinned_model");
+    auto remove_result = service_->Remove("pinned_model", /*force=*/true);
     ASSERT_TRUE(remove_result.has_value());
     auto exist_result = service_->ExistKey("pinned_model");
     ASSERT_TRUE(exist_result.has_value());
