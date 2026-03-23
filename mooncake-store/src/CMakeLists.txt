@@ -13,7 +13,6 @@ set(MOONCAKE_STORE_SOURCES
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp
-    ha_helper.cpp
     segment.cpp
     transfer_task.cpp
     rpc_service.cpp
@@ -28,6 +27,9 @@ set(MOONCAKE_STORE_SOURCES
     file_storage.cpp
     serialize/serializer.cpp
     serialize/serializer_backend.cpp
+    ha/ha_backend_factory.cpp
+    ha/etcd_leader_coordinator.cpp
+    ha/master_service_supervisor.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
