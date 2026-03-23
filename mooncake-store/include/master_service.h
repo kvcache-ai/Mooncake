@@ -247,6 +247,17 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Batch evict disk replicas for multiple keys.
+     * @param client_id The client performing the eviction
+     * @param keys The object keys whose disk replicas were evicted
+     * @param replica_type DISK or LOCAL_DISK
+     * @return Per-key results (OK or error code)
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type);
+
+    /**
      * @brief Start a copy operation
      *
      * This will allocate replica buffers to copy to.

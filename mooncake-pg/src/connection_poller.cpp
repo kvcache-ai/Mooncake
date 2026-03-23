@@ -1,6 +1,8 @@
 #include <c10/util/Exception.h>
 #include <connection_poller.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
+#include <cuda_alike.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <atomic>
@@ -9,12 +11,37 @@
 #include <thread>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include "mooncake_worker.cuh"
 
 namespace mooncake {
+
+// Same check as nvlink_transport.cpp and mooncake_ep_buffer.cpp.
+// On MNNVL clusters all GPUs support fabric mem handles, meaning
+// NVLink transport can only access cuMemCreate(FABRIC) memory
+// cross-node -- CPU heap buffers are invisible to remote peers.
+static bool supportFabricMem() {
+    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+
+    bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
+    if (!fabric_enabled) return false;
+
+    int num_devices = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess || num_devices == 0) return false;
+
+    for (int dev = 0; dev < num_devices; ++dev) {
+        int supported = 0;
+        cuDeviceGetAttribute(
+            &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
+        if (!supported) return false;
+    }
+    return true;
+}
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      uint64_t* local2global_rank_map,
+                                     std::string location,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
                                      std::shared_ptr<P2PProxy> p2p_proxy,
@@ -26,16 +53,26 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
       store_(std::move(store)),
       meta_(std::move(meta)),
       p2p_proxy_(std::move(p2p_proxy)),
-      engine_(engine) {
+      engine_(engine),
+      skip_warmup_(supportFabricMem()) {
+    if (skip_warmup_) {
+        // On MNNVL clusters, CPU heap buffers aren't fabric-accessible so
+        // remote NVLink writes to them will fail. The fabric topology already
+        // guarantees connectivity, so we skip the warmup handshake entirely.
+        warmup_send_region_ = nullptr;
+        warmup_recv_region_ = nullptr;
+        return;
+    }
+
     warmup_send_region_ = new int32_t[kMaxNumRanks];
     warmup_send_region_[0] = 1;
     int rc = engine_->registerLocalMemory(
-        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), location);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_->registerLocalMemory(
-        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+    rc = engine_->registerLocalMemory(warmup_recv_region_,
+                                      kMaxNumRanks * sizeof(int32_t), location);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 }
 
@@ -46,10 +83,14 @@ ConnectionContext::~ConnectionContext() {
         }
     }
 
-    engine_->unregisterLocalMemory(warmup_send_region_);
-    engine_->unregisterLocalMemory(warmup_recv_region_);
-    delete[] warmup_send_region_;
-    delete[] warmup_recv_region_;
+    if (warmup_send_region_) {
+        engine_->unregisterLocalMemory(warmup_send_region_);
+        delete[] warmup_send_region_;
+    }
+    if (warmup_recv_region_) {
+        engine_->unregisterLocalMemory(warmup_recv_region_);
+        delete[] warmup_recv_region_;
+    }
 }
 
 void ConnectionContext::waitUntilAllConnected() {
@@ -138,7 +179,19 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             memcpy(&meta_->segmentInfos[pollingRank], buffer_data.data(),
                    sizeof(SegmentInfo));
 
-            if (pollingRank <= rank_) {
+            if (skip_warmup_) {
+                // MNNVL: fabric guarantees connectivity, skip warmup write
+                // since CPU heap buffers aren't fabric-accessible anyway.
+                meta_->peerConnected[pollingRank] = true;
+                global_peerConnected_[globalPollingRank] = true;
+                peerState.state = PeerConnectionState::CONNECTED;
+                {
+                    std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+                    totalConnectedPeers_.fetch_add(1,
+                                                   std::memory_order_release);
+                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                }
+            } else if (pollingRank <= rank_) {
                 // Send a warmup request to establish connections
                 auto batchID = engine_->allocateBatchID(1);
                 engine_->submitTransfer(

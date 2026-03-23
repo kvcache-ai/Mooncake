@@ -86,7 +86,7 @@ docker_launch(){
     fi
     local relative_path=${TEST_RUN_DIR#$BASE_DIR}
     local cleaned_path=${relative_path#/}
-    pip_cmd=$(append_str "${pip_cmd}" "pip install /test_run/$cleaned_path/whls/$mooncake_whl_file")
+    pip_cmd=$(append_str "${pip_cmd}" "pip install --force-reinstall /test_run/$cleaned_path/whls/$mooncake_whl_file")
 
     # Check if sglang-router is needed and missing
     if [[ "$registry_addr" == *"sglang"* ]]; then

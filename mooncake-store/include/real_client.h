@@ -398,7 +398,7 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> put_internal(
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config = ReplicateConfig{},
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
     tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
@@ -436,16 +436,17 @@ class RealClient : public PyClient {
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> put_parts_internal(
-        const std::string &key, std::vector<std::span<const char>> values,
+        const std::string &key,
+        const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{},
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
     tl::expected<void, ErrorCode> put_batch_internal(
         const std::vector<std::string> &keys,
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{},
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
     tl::expected<void, ErrorCode> remove_internal(const std::string &key,
@@ -467,12 +468,12 @@ class RealClient : public PyClient {
 
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
