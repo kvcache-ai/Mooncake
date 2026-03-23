@@ -170,6 +170,7 @@ int RdmaEndPoint::deconstruct() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
+    peer_qp_num_list_.clear();
 
     // Destroy notification QP
     if (notify_qp_) {
@@ -208,6 +209,8 @@ int RdmaEndPoint::deconstruct() {
     slice_queue_.clear();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
+    peer_server_name_.clear();
+    peer_nic_name_.clear();
     status_ = EP_UNINIT;
     return 0;
 }
@@ -316,6 +319,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             return Status::InternalError(
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
+        peer_qp_num_list_ = qp_num;
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -341,9 +345,9 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     RWSpinlock::WriteGuard guard(lock_);
     if (status_ == EP_READY) {
         // Idempotency check: if the incoming bootstrap is from the same peer
-        // and has the same number of QPs as we already have connected, this is
-        // a duplicate request (e.g. from a concurrent connect() on the
-        // initiator that released its lock during Phase 2).  Re-using the
+        // and carries the same peer QP list as the established connection,
+        // this is a duplicate request (e.g. from a concurrent connect() on
+        // the initiator that released its lock during Phase 2). Re-using the
         // existing connection is safe and avoids resetting QPs that may
         // already have in-flight RDMA operations.
         auto incoming_peer_server =
@@ -352,7 +356,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             getNicNameFromNicPath(peer_desc.local_nic_path);
         if (incoming_peer_server == peer_server_name_ &&
             incoming_peer_nic == peer_nic_name_ &&
-            peer_desc.qp_num.size() == qp_list_.size()) {
+            peer_desc.qp_num == peer_qp_num_list_) {
             LOG(INFO) << "Endpoint already established with " << peer_nic_name_
                       << " of " << peer_server_name_
                       << " (duplicate bootstrap, reusing connection)";
@@ -404,6 +408,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         return Status::InternalError(
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
+    peer_qp_num_list_ = peer_desc.qp_num;
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -430,6 +435,7 @@ int RdmaEndPoint::reset() {
 int RdmaEndPoint::resetUnlocked() {
     if (status_ != EP_READY) return 0;
     status_ = EP_RESET;
+    peer_qp_num_list_.clear();
     resetInflightSlices();
 
     if (notify_qp_) {
