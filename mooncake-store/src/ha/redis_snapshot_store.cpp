@@ -1,10 +1,7 @@
 #include "ha/backends/redis/redis_snapshot_store.h"
 
-#include <algorithm>
 #include <cctype>
-#include <chrono>
-#include <cstdlib>
-#include <cstring>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -13,6 +10,8 @@
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
+
+#include "ha/backends/redis/redis_client_helper.h"
 
 namespace mooncake {
 namespace ha {
@@ -98,10 +97,6 @@ tl::expected<long long, ErrorCode> ParseSnapshotScore(
 
 #ifdef STORE_USE_REDIS
 
-constexpr auto kRedisDefaultPort = 6379;
-constexpr auto kRedisConnectTimeout = std::chrono::seconds(3);
-constexpr auto kRedisCommandTimeout = std::chrono::seconds(3);
-
 constexpr char kPublishSnapshotScript[] = R"LUA(
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
 redis.call('SET', KEYS[2], ARGV[2])
@@ -121,186 +116,6 @@ if latest == ARGV[1] then
 end
 return 1
 )LUA";
-
-struct RedisEndpoint {
-    std::string host;
-    int port = kRedisDefaultPort;
-};
-
-struct RedisContextDeleter {
-    void operator()(redisContext* context) const {
-        if (context != nullptr) {
-            redisFree(context);
-        }
-    }
-};
-
-using RedisContextPtr = std::unique_ptr<redisContext, RedisContextDeleter>;
-
-struct RedisReplyDeleter {
-    void operator()(redisReply* reply) const {
-        if (reply != nullptr) {
-            freeReplyObject(reply);
-        }
-    }
-};
-
-using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
-
-bool IsStringReply(const redisReply* reply) {
-    return reply != nullptr && (reply->type == REDIS_REPLY_STRING ||
-                                reply->type == REDIS_REPLY_STATUS);
-}
-
-tl::expected<int, ErrorCode> ParsePositiveInt(std::string_view text,
-                                              int min_value, int max_value) {
-    if (text.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    try {
-        const auto parsed = std::stoll(std::string(text));
-        if (parsed < min_value || parsed > max_value) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        return static_cast<int>(parsed);
-    } catch (const std::exception&) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-}
-
-tl::expected<int, ErrorCode> ResolveRedisDbIndex() {
-    const char* raw_db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (raw_db_index == nullptr || std::strlen(raw_db_index) == 0) {
-        return 0;
-    }
-    return ParsePositiveInt(raw_db_index, 0, 255);
-}
-
-tl::expected<RedisEndpoint, ErrorCode> ParseRedisEndpoint(
-    std::string_view connstring) {
-    constexpr std::string_view kRedisScheme = "redis://";
-    if (connstring.substr(0, kRedisScheme.size()) == kRedisScheme) {
-        connstring.remove_prefix(kRedisScheme.size());
-    }
-
-    const auto slash_pos = connstring.find('/');
-    if (slash_pos != std::string_view::npos) {
-        if (slash_pos + 1 != connstring.size()) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        connstring = connstring.substr(0, slash_pos);
-    }
-
-    if (connstring.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    RedisEndpoint endpoint;
-    if (connstring.front() == '[') {
-        const auto bracket_pos = connstring.find(']');
-        if (bracket_pos == std::string_view::npos || bracket_pos == 1) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
-        endpoint.host = std::string(connstring.substr(1, bracket_pos - 1));
-        const auto remainder = connstring.substr(bracket_pos + 1);
-        if (remainder.empty()) {
-            return endpoint;
-        }
-        if (remainder.front() != ':') {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto port = ParsePositiveInt(remainder.substr(1), 1, 65535);
-        if (!port) {
-            return tl::make_unexpected(port.error());
-        }
-        endpoint.port = port.value();
-        return endpoint;
-    }
-
-    const auto colon_pos = connstring.rfind(':');
-    if (colon_pos == std::string_view::npos) {
-        endpoint.host = std::string(connstring);
-        return endpoint;
-    }
-
-    if (connstring.find(':') != colon_pos) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    endpoint.host = std::string(connstring.substr(0, colon_pos));
-    if (endpoint.host.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto port = ParsePositiveInt(connstring.substr(colon_pos + 1), 1, 65535);
-    if (!port) {
-        return tl::make_unexpected(port.error());
-    }
-    endpoint.port = port.value();
-    return endpoint;
-}
-
-std::string SanitizeHashTagComponent(std::string component) {
-    if (!component.empty() && component.back() == '/') {
-        component.pop_back();
-    }
-    std::replace(component.begin(), component.end(), '{', '_');
-    std::replace(component.begin(), component.end(), '}', '_');
-    return component;
-}
-
-tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
-    const std::string& connstring) {
-    auto endpoint = ParseRedisEndpoint(connstring);
-    if (!endpoint) {
-        return tl::make_unexpected(endpoint.error());
-    }
-
-    timeval timeout{
-        .tv_sec = static_cast<time_t>(kRedisConnectTimeout.count()),
-        .tv_usec = 0,
-    };
-    RedisContextPtr context(redisConnectWithTimeout(endpoint->host.c_str(),
-                                                    endpoint->port, timeout));
-    if (context == nullptr || context->err != 0) {
-        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
-    }
-
-    timeval command_timeout{
-        .tv_sec = static_cast<time_t>(kRedisCommandTimeout.count()),
-        .tv_usec = 0,
-    };
-    if (redisSetTimeout(context.get(), command_timeout) != REDIS_OK) {
-        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
-    }
-
-    const char* password = std::getenv("MC_REDIS_PASSWORD");
-    if (password != nullptr && std::strlen(password) > 0) {
-        RedisReplyPtr auth_reply(static_cast<redisReply*>(redisCommand(
-            context.get(), "AUTH %b", password, std::strlen(password))));
-        if (auth_reply == nullptr || auth_reply->type == REDIS_REPLY_ERROR) {
-            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
-        }
-    }
-
-    auto db_index = ResolveRedisDbIndex();
-    if (!db_index) {
-        return tl::make_unexpected(db_index.error());
-    }
-    if (db_index.value() != 0) {
-        RedisReplyPtr select_reply(static_cast<redisReply*>(
-            redisCommand(context.get(), "SELECT %d", db_index.value())));
-        if (select_reply == nullptr ||
-            select_reply->type == REDIS_REPLY_ERROR) {
-            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
-        }
-    }
-
-    return context;
-}
-
 #endif  // STORE_USE_REDIS
 
 }  // namespace
