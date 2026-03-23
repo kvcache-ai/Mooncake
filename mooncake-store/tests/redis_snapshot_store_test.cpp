@@ -1,18 +1,14 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <string>
-#include <string_view>
-#include <utility>
 #include <vector>
 
 #include <hiredis/hiredis.h>
 
 #include "ha/backends/redis/redis_snapshot_store.h"
+#include "redis_test_utils.h"
 #include "serialize/serializer_backend.h"
 #include "types.h"
 
@@ -22,102 +18,6 @@ DEFINE_string(redis_endpoint, "",
               "Redis endpoint for snapshot catalog integration tests");
 
 namespace {
-
-constexpr auto kRedisDefaultPort = 6379;
-
-struct RedisContextDeleter {
-    void operator()(redisContext* context) const {
-        if (context != nullptr) {
-            redisFree(context);
-        }
-    }
-};
-
-using RedisContextPtr = std::unique_ptr<redisContext, RedisContextDeleter>;
-
-struct RedisReplyDeleter {
-    void operator()(redisReply* reply) const {
-        if (reply != nullptr) {
-            freeReplyObject(reply);
-        }
-    }
-};
-
-using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
-
-std::pair<std::string, int> ParseRedisEndpointForTest(
-    const std::string& endpoint) {
-    std::string normalized = endpoint;
-    constexpr std::string_view kRedisScheme = "redis://";
-    if (std::string_view(normalized).starts_with(kRedisScheme)) {
-        normalized.erase(0, kRedisScheme.size());
-    }
-    if (normalized.empty()) {
-        return {"", kRedisDefaultPort};
-    }
-
-    const auto colon_pos = normalized.rfind(':');
-    if (colon_pos == std::string::npos || normalized.find(':') != colon_pos) {
-        return {normalized, kRedisDefaultPort};
-    }
-    return {normalized.substr(0, colon_pos),
-            std::stoi(normalized.substr(colon_pos + 1))};
-}
-
-RedisContextPtr ConnectRedisForTest(const std::string& endpoint) {
-    auto [host, port] = ParseRedisEndpointForTest(endpoint);
-    if (host.empty()) {
-        return RedisContextPtr(nullptr);
-    }
-
-    timeval timeout{3, 0};
-    RedisContextPtr context(
-        redisConnectWithTimeout(host.c_str(), port, timeout));
-    if (context == nullptr || context->err != 0) {
-        return RedisContextPtr(nullptr);
-    }
-
-    const char* password = std::getenv("MC_REDIS_PASSWORD");
-    if (password != nullptr && std::strlen(password) > 0) {
-        RedisReplyPtr auth_reply(static_cast<redisReply*>(redisCommand(
-            context.get(), "AUTH %b", password, std::strlen(password))));
-        if (auth_reply == nullptr || auth_reply->type == REDIS_REPLY_ERROR) {
-            return RedisContextPtr(nullptr);
-        }
-    }
-
-    const char* db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (db_index != nullptr && std::strlen(db_index) > 0 &&
-        std::string_view(db_index) != "0") {
-        RedisReplyPtr select_reply(static_cast<redisReply*>(
-            redisCommand(context.get(), "SELECT %s", db_index)));
-        if (select_reply == nullptr ||
-            select_reply->type == REDIS_REPLY_ERROR) {
-            return RedisContextPtr(nullptr);
-        }
-    }
-
-    return context;
-}
-
-std::string SanitizeHashTagComponent(std::string component) {
-    if (!component.empty() && component.back() == '/') {
-        component.pop_back();
-    }
-    std::replace(component.begin(), component.end(), '{', '_');
-    std::replace(component.begin(), component.end(), '}', '_');
-    return component;
-}
-
-std::string BuildLatestKey(const std::string& cluster_namespace) {
-    const auto hash_tag = SanitizeHashTagComponent(cluster_namespace);
-    return "mooncake-store/{" + hash_tag + "}/snapshot/latest";
-}
-
-std::string BuildIndexKey(const std::string& cluster_namespace) {
-    const auto hash_tag = SanitizeHashTagComponent(cluster_namespace);
-    return "mooncake-store/{" + hash_tag + "}/snapshot/index";
-}
 
 class FakePayloadBackend final : public SerializerBackend {
    public:
@@ -193,13 +93,17 @@ class RedisSnapshotStoreTest : public ::testing::Test {
         if (FLAGS_redis_endpoint.empty()) {
             return;
         }
-        auto redis = ConnectRedisForTest(FLAGS_redis_endpoint);
-        ASSERT_NE(redis, nullptr);
-        const auto latest_key = BuildLatestKey(cluster_namespace_);
-        const auto index_key = BuildIndexKey(cluster_namespace_);
-        RedisReplyPtr reply(static_cast<redisReply*>(redisCommand(
-            redis.get(), "DEL %b %b", latest_key.data(), latest_key.size(),
-            index_key.data(), index_key.size())));
+        auto redis =
+            mooncake::testing::ConnectRedisForTest(FLAGS_redis_endpoint);
+        ASSERT_TRUE(redis.has_value());
+        const auto latest_key =
+            mooncake::testing::BuildRedisSnapshotLatestKey(cluster_namespace_);
+        const auto index_key =
+            mooncake::testing::BuildRedisSnapshotIndexKey(cluster_namespace_);
+        mooncake::testing::RedisReplyPtr reply(
+            static_cast<redisReply*>(redisCommand(
+                redis->get(), "DEL %b %b", latest_key.data(), latest_key.size(),
+                index_key.data(), index_key.size())));
         ASSERT_NE(reply, nullptr);
         ASSERT_NE(reply->type, REDIS_REPLY_ERROR);
     }
