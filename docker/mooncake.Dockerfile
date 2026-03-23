@@ -28,6 +28,7 @@ RUN apt-get update && \
         ca-certificates \
         curl \
         git \
+        ninja-build \
         python3 \
         python3-dev \
         python3-pip \
@@ -44,7 +45,7 @@ RUN bash dependencies.sh -y
 # Configure & build Mooncake
 RUN mkdir -p build && \
     cd build && \
-    cmake .. \
+    cmake -G Ninja .. \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=ON \
@@ -53,7 +54,7 @@ RUN mkdir -p build && \
         -DSTORE_USE_ETCD=ON \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    cmake --build . -j"$(nproc)"
+    cmake --build .
 
 # Build nvlink allocator to make wheel self-contained for CUDA paths
 RUN export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \

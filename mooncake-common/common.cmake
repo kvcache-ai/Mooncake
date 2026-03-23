@@ -40,6 +40,9 @@ add_definitions(-DCONFIG_ERDMA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Memory-aware build parallelism (compile vs. link job pools)
+include(${CMAKE_CURRENT_LIST_DIR}/limit_jobs.cmake)
+
 option(ENABLE_SCCACHE "Whether to open sccache" OFF)
 if (ENABLE_SCCACHE)
   find_program(SCCACHE sccache REQUIRED)
