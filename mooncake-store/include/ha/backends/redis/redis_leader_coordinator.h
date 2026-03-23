@@ -80,7 +80,8 @@ class RedisLeaderCoordinator final : public LeaderCoordinator {
     LeadershipSession renew_session_;
     OwnerToken renew_owner_token_;
     bool renew_stopped_ = false;
-    bool renew_shutdown_requested_ = false;
+    bool renew_stop_requested_ = false;
+    bool shutdown_requested_ = false;
     ErrorCode renew_result_ = ErrorCode::OK;
 
     LeadershipLostCallback leadership_monitor_callback_;

@@ -253,5 +253,41 @@ TEST_F(HighAvailabilityTest, RedisLeadershipMonitorIgnoresExplicitRelease) {
     EXPECT_FALSE(callback_fired->load());
 }
 
+TEST_F(HighAvailabilityTest, RedisCanRestartRenewAfterExplicitRelease) {
+    if (FLAGS_redis_endpoint.empty()) {
+        GTEST_SKIP() << "Redis endpoint is not configured";
+    }
+
+    const auto cluster_namespace =
+        MakeRedisTestClusterNamespace("restart-renew");
+    auto coordinator =
+        CreateRedisCoordinatorOrNull(FLAGS_redis_endpoint, cluster_namespace);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto first_acquire = coordinator->TryAcquireLeadership("127.0.0.1:9933");
+    ASSERT_TRUE(first_acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, first_acquire->status);
+    ASSERT_TRUE(first_acquire->session.has_value());
+
+    auto first_renew = coordinator->RenewLeadership(*first_acquire->session);
+    ASSERT_TRUE(first_renew.has_value());
+    ASSERT_TRUE(first_renew.value());
+
+    ASSERT_EQ(ErrorCode::OK,
+              coordinator->ReleaseLeadership(*first_acquire->session));
+
+    auto second_acquire = coordinator->TryAcquireLeadership("127.0.0.1:9944");
+    ASSERT_TRUE(second_acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, second_acquire->status);
+    ASSERT_TRUE(second_acquire->session.has_value());
+
+    auto second_renew = coordinator->RenewLeadership(*second_acquire->session);
+    ASSERT_TRUE(second_renew.has_value());
+    ASSERT_TRUE(second_renew.value());
+
+    ASSERT_EQ(ErrorCode::OK,
+              coordinator->ReleaseLeadership(*second_acquire->session));
+}
+
 }  // namespace testing
 }  // namespace mooncake

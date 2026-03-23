@@ -550,11 +550,7 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
     std::thread thread_to_join;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        auto err = ConnectLocked();
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
-        }
-        if (renew_shutdown_requested_) {
+        if (shutdown_requested_) {
             return false;
         }
 
@@ -571,6 +567,10 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
                 return true;
             }
         } else {
+            auto err = ConnectLocked();
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
             bool renewed = false;
             err = RenewLeadershipOnceLocked(session, renewed);
             if (err != ErrorCode::OK) {
@@ -583,7 +583,7 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
             renew_session_ = session;
             renew_owner_token_ = session.owner_token;
             renew_stopped_ = false;
-            renew_shutdown_requested_ = false;
+            renew_stop_requested_ = false;
             renew_result_ = ErrorCode::OK;
             ClearLeadershipMonitorStateLocked();
             renew_thread_ = std::thread([this, session]() {
@@ -595,12 +595,13 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
 
                 while (true) {
                     std::unique_lock<std::mutex> lock(state_mutex_);
-                    if (renew_cv_.wait_for(
-                            lock, renew_interval, [this, &session] {
-                                return renew_shutdown_requested_ ||
-                                       renew_owner_token_ !=
-                                           session.owner_token;
-                            })) {
+                    if (renew_cv_.wait_for(lock, renew_interval,
+                                           [this, &session] {
+                                               return shutdown_requested_ ||
+                                                      renew_stop_requested_ ||
+                                                      renew_owner_token_ !=
+                                                          session.owner_token;
+                                           })) {
                         break;
                     }
 
@@ -631,7 +632,7 @@ tl::expected<bool, ErrorCode> RedisLeaderCoordinator::RenewLeadership(
                     std::lock_guard<std::mutex> lock(state_mutex_);
                     renew_result_ = renew_result;
                     renew_stopped_ = true;
-                    if (!renew_shutdown_requested_ &&
+                    if (!shutdown_requested_ && !renew_stop_requested_ &&
                         renew_owner_token_ == leadership_monitor_owner_token_) {
                         monitor_armed = leadership_monitor_armed_;
                         on_leadership_lost =
@@ -706,7 +707,7 @@ RedisLeaderCoordinator::StartLeadershipMonitor(
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
-    if (renew_shutdown_requested_) {
+    if (shutdown_requested_) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (renew_owner_token_ != session.owner_token ||
@@ -740,7 +741,7 @@ ErrorCode RedisLeaderCoordinator::ReleaseLeadership(
             return ErrorCode::INVALID_PARAMS;
         }
 
-        renew_shutdown_requested_ = true;
+        renew_stop_requested_ = true;
         renew_cv_.notify_all();
         if (renew_thread_.joinable()) {
             thread_to_join = std::move(renew_thread_);
@@ -979,7 +980,8 @@ ErrorCode RedisLeaderCoordinator::ShutdownRenewThread() {
     OwnerToken owner_token_to_release;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        renew_shutdown_requested_ = true;
+        shutdown_requested_ = true;
+        renew_stop_requested_ = true;
         renew_cv_.notify_all();
         if (renew_thread_.joinable()) {
             thread_to_join = std::move(renew_thread_);
