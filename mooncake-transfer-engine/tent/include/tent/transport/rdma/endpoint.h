@@ -177,6 +177,7 @@ class RdmaEndPoint {
 
     std::string peer_server_name_;
     std::string peer_nic_name_;
+    std::vector<uint32_t> peer_qp_num_list_;
     std::atomic<int>* endpoints_count_;
 
     // Notification QP (one per endpoint for control plane operations)

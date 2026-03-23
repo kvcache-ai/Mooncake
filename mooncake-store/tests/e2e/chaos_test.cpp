@@ -8,6 +8,7 @@
 
 #include "client_wrapper.h"
 #include "e2e_utils.h"
+#include "ha/ha_backend_factory.h"
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"
@@ -24,6 +25,25 @@ constexpr int client_port_base = 12888;
 namespace mooncake {
 namespace testing {
 
+namespace {
+
+std::shared_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
+    const std::string& endpoints) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = endpoints,
+        .cluster_namespace = "",
+    };
+    auto coordinator = ha::CreateLeaderCoordinator(spec);
+    if (!coordinator) {
+        return nullptr;
+    }
+    return std::shared_ptr<ha::LeaderCoordinator>(
+        std::move(coordinator.value()));
+}
+
+}  // namespace
+
 class ChaosTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -36,10 +56,9 @@ class ChaosTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata URL: " << FLAGS_engine_meta_url;
 
-        master_view_helper_ = std::make_shared<MasterViewHelper>();
-        EXPECT_EQ(master_view_helper_->ConnectToEtcd(FLAGS_etcd_endpoints),
-                  ErrorCode::OK)
-            << "Failed to connect to etcd";
+        leader_coordinator_ = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+        ASSERT_TRUE(leader_coordinator_ != nullptr)
+            << "Failed to create HA leader coordinator";
     }
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
@@ -84,10 +103,11 @@ class ChaosTest : public ::testing::Test {
 
     static void GetLeaderIndex(int& leader_index) {
         // Find out the leader
-        std::string master_address;
-        ViewVersionId version;
-        ASSERT_EQ(master_view_helper_->GetMasterView(master_address, version),
-                  ErrorCode::OK);
+        auto current_view = leader_coordinator_->ReadCurrentView();
+        ASSERT_TRUE(current_view.has_value());
+        ASSERT_TRUE(current_view.value().has_value());
+        const std::string& master_address =
+            current_view.value()->leader_address;
 
         // Validate master address format: should be ip:port
         size_t colon_pos = master_address.find(':');
@@ -120,7 +140,7 @@ class ChaosTest : public ::testing::Test {
         sleep(DEFAULT_CLIENT_LIVE_TTL_SEC + 5);
     }
 
-    static std::shared_ptr<MasterViewHelper> master_view_helper_;
+    static std::shared_ptr<ha::LeaderCoordinator> leader_coordinator_;
 
     // Instance members for master management
     std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
@@ -128,7 +148,7 @@ class ChaosTest : public ::testing::Test {
     int leader_index_;
 };
 
-std::shared_ptr<MasterViewHelper> ChaosTest::master_view_helper_ = nullptr;
+std::shared_ptr<ha::LeaderCoordinator> ChaosTest::leader_coordinator_ = nullptr;
 
 // Verify the system failover after the leader is killed.
 TEST_F(ChaosTest, LeaderKilledFailover) {
