@@ -54,8 +54,17 @@ inline std::string ResolveTestHABackendConnstring() {
     return ::FLAGS_etcd_endpoints;
 }
 
+inline std::string NormalizeConnstringScheme(const std::string& connstring) {
+    const auto scheme_pos = connstring.find("://");
+    if (scheme_pos == std::string::npos || scheme_pos == 0) {
+        return connstring;
+    }
+    return connstring.substr(scheme_pos + 3);
+}
+
 inline std::string BuildTestMasterServerEntry() {
-    return ::FLAGS_ha_backend_type + "://" + ResolveTestHABackendConnstring();
+    return ::FLAGS_ha_backend_type + "://" +
+           NormalizeConnstringScheme(ResolveTestHABackendConnstring());
 }
 
 }  // namespace testing

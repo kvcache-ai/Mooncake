@@ -5,9 +5,12 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <string>
 
+#ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
+#endif
 #include "ha/ha_backend_factory.h"
 #include "high_availability_test_fixture.h"
 #include "types.h"
@@ -92,6 +95,8 @@ std::unique_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
 }
 
 }  // namespace
+
+#ifdef STORE_USE_ETCD
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
@@ -241,6 +246,8 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     watch_thread.join();
 }
 
+#endif
+
 TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
@@ -308,6 +315,8 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
               coordinator->ReleaseLeadership(*reacquire->session));
 }
 
+#ifdef STORE_USE_ETCD
+
 TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
@@ -345,6 +354,8 @@ TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
     ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
 }
 
+#endif
+
 TEST_F(HighAvailabilityTest, LeadershipMonitorIgnoresExplicitRelease) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
@@ -374,6 +385,8 @@ TEST_F(HighAvailabilityTest, LeadershipMonitorIgnoresExplicitRelease) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
     EXPECT_FALSE(callback_fired->load());
 }
+
+#ifdef STORE_USE_ETCD
 
 TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
@@ -460,6 +473,8 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
     EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
               EtcdHelper::Get(k3.c_str(), k3.size(), dummy_val, rev));
 }
+
+#endif
 
 }  // namespace testing
 

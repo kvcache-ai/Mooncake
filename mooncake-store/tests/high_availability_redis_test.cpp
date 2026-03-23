@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <memory>
 #include <string>
@@ -83,8 +84,17 @@ std::pair<std::string, int> ParseRedisEndpointForTest(
     if (colon_pos == std::string::npos || normalized.find(':') != colon_pos) {
         return {normalized, kRedisDefaultPort};
     }
-    return {normalized.substr(0, colon_pos),
-            std::stoi(normalized.substr(colon_pos + 1))};
+    const auto host = normalized.substr(0, colon_pos);
+    const auto port_str = normalized.substr(colon_pos + 1);
+    try {
+        const auto port = std::stoi(port_str);
+        if (port <= 0 || port > 65535) {
+            return {"", kRedisDefaultPort};
+        }
+        return {host, port};
+    } catch (const std::exception&) {
+        return {"", kRedisDefaultPort};
+    }
 }
 
 RedisContextPtr ConnectRedisForTest(const std::string& endpoint) {
@@ -197,10 +207,15 @@ TEST_F(HighAvailabilityTest, RedisLeadershipMonitorReportsDeletedView) {
     ASSERT_TRUE(renew.value());
 
     std::promise<ha::LeadershipLossReason> loss_promise;
+    auto loss_reported = std::make_shared<std::atomic<bool>>(false);
     auto loss_future = loss_promise.get_future();
     auto monitor = coordinator->StartLeadershipMonitor(
-        session, [&loss_promise](ha::LeadershipLossReason reason) {
-            loss_promise.set_value(reason);
+        session,
+        [&loss_promise, loss_reported](ha::LeadershipLossReason reason) {
+            bool expected = false;
+            if (loss_reported->compare_exchange_strong(expected, true)) {
+                loss_promise.set_value(reason);
+            }
         });
     ASSERT_TRUE(monitor.has_value());
 

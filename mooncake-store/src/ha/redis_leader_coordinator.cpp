@@ -94,6 +94,17 @@ class RedisLeadershipMonitorHandle final : public LeadershipMonitorHandle {
     std::shared_ptr<std::atomic<bool>> armed_;
 };
 
+timeval ToTimeval(std::chrono::microseconds duration) {
+    const auto seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(duration);
+    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+        duration - seconds);
+    return timeval{
+        .tv_sec = static_cast<time_t>(seconds.count()),
+        .tv_usec = static_cast<suseconds_t>(micros.count()),
+    };
+}
+
 struct RedisEndpoint {
     std::string host;
     int port = kRedisDefaultPort;
@@ -360,11 +371,12 @@ bool RedisLeaderCoordinator::IsSameViewVersion(
 #else
 
 RedisLeaderCoordinator::RedisLeaderCoordinator(const HABackendSpec& spec)
-    : spec_(spec),
-      master_view_key_(
-          BuildMasterViewKey(ResolveClusterNamespace(spec.cluster_namespace))),
-      view_version_key_(BuildViewVersionKey(
-          ResolveClusterNamespace(spec.cluster_namespace))) {}
+    : spec_(spec) {
+    const auto resolved_namespace =
+        ResolveClusterNamespace(spec.cluster_namespace);
+    master_view_key_ = BuildMasterViewKey(resolved_namespace);
+    view_version_key_ = BuildViewVersionKey(resolved_namespace);
+}
 
 RedisLeaderCoordinator::~RedisLeaderCoordinator() {
     auto err = ShutdownRenewThread();
@@ -826,9 +838,9 @@ ErrorCode RedisLeaderCoordinator::ConnectLocked() {
         return db_index.error();
     }
 
-    timeval connect_timeout;
-    connect_timeout.tv_sec = static_cast<long>(kRedisConnectTimeout.count());
-    connect_timeout.tv_usec = 0;
+    const auto connect_timeout =
+        ToTimeval(std::chrono::duration_cast<std::chrono::microseconds>(
+            kRedisConnectTimeout));
     context_ = redisConnectWithTimeout(endpoint->host.c_str(), endpoint->port,
                                        connect_timeout);
     if (context_ == nullptr) {
@@ -844,9 +856,9 @@ ErrorCode RedisLeaderCoordinator::ConnectLocked() {
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    timeval command_timeout;
-    command_timeout.tv_sec = static_cast<long>(kRedisCommandTimeout.count());
-    command_timeout.tv_usec = 0;
+    const auto command_timeout =
+        ToTimeval(std::chrono::duration_cast<std::chrono::microseconds>(
+            kRedisCommandTimeout));
     if (redisSetTimeout(context_, command_timeout) != REDIS_OK) {
         LOG(WARNING) << "Failed to set Redis command timeout for "
                      << endpoint->host << ':' << endpoint->port;
