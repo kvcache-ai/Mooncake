@@ -97,6 +97,7 @@ else()
     FATAL_ERROR
       "xxHash library/header not found. Please install xxhash (development headers) and try again."
   )
+endif()
 
 # Find libcurl for HuggingFace connector
 find_package(CURL REQUIRED)
