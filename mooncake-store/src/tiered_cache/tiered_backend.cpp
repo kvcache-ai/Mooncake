@@ -297,10 +297,19 @@ tl::expected<void, ErrorCode> TieredBackend::MountSegment(
     return {};
 }
 
-bool TieredBackend::AllocateInternalRaw(size_t size,
-                                        std::optional<UUID> preferred_tier,
-                                        TieredLocation* out_loc) {
-    if (!out_loc) return false;
+tl::expected<void, ErrorCode> TieredBackend::AllocateInternalRaw(
+    size_t size, std::optional<UUID> preferred_tier, TieredLocation* out_loc) {
+    if (!out_loc) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ErrorCode last_error = ErrorCode::NO_AVAILABLE_HANDLE;
+    auto remember_error = [&last_error](ErrorCode error) {
+        if (last_error == ErrorCode::NO_AVAILABLE_HANDLE &&
+            error != ErrorCode::NO_AVAILABLE_HANDLE) {
+            last_error = error;
+        }
+    };
 
     // Try preferred tier first
     if (preferred_tier.has_value()) {
@@ -309,8 +318,9 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
             auto alloc_result = it->second->Allocate(size, out_loc->data);
             if (alloc_result) {
                 out_loc->tier = it->second;
-                return true;
+                return {};
             }
+            remember_error(alloc_result.error());
         }
     }
 
@@ -325,10 +335,11 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         auto alloc_result = tier->Allocate(size, out_loc->data);
         if (alloc_result) {
             out_loc->tier = tier;
-            return true;
+            return {};
         }
+        remember_error(alloc_result.error());
     }
-    return false;
+    return tl::make_unexpected(last_error);
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
@@ -355,7 +366,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         }
 
         // Failed - try sync eviction if available
-        if (scheduler_) {
+        if (scheduler_ &&
+            alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
             bool evicted =
                 scheduler_->OnAllocationFailure(*preferred_tier, size);
             if (evicted) {
@@ -371,17 +383,19 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
             }
         }
 
-        LOG(ERROR) << "Strict allocation failed on tier " << *preferred_tier;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        LOG(ERROR) << "Strict allocation failed on tier " << *preferred_tier
+                   << ", error: " << alloc_result.error();
+        return tl::make_unexpected(alloc_result.error());
     }
 
     // Non-strict mode: try preferred tier + fallback (fast path)
-    if (AllocateInternalRaw(size, preferred_tier, &loc)) {
+    auto alloc_result = AllocateInternalRaw(size, preferred_tier, &loc);
+    if (alloc_result) {
         return std::make_shared<AllocationEntry>(this, std::move(loc));
     }
 
     // All tiers failed - try sync eviction if enabled
-    if (scheduler_) {
+    if (scheduler_ && alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
         // Determine which tier to evict from
         UUID evict_tier_id;
         if (preferred_tier.has_value()) {
@@ -400,15 +414,17 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         bool evicted = scheduler_->OnAllocationFailure(evict_tier_id, size);
         if (evicted) {
             // Retry allocation after eviction
-            if (AllocateInternalRaw(size, preferred_tier, &loc)) {
+            alloc_result = AllocateInternalRaw(size, preferred_tier, &loc);
+            if (alloc_result) {
                 LOG(INFO) << "Allocation succeeded after sync eviction";
                 return std::make_shared<AllocationEntry>(this, std::move(loc));
             }
         }
     }
 
-    LOG(ERROR) << "Failed to allocate " << size << " bytes";
-    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    LOG(ERROR) << "Failed to allocate " << size
+               << " bytes, error: " << alloc_result.error();
+    return tl::make_unexpected(alloc_result.error());
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,

@@ -239,8 +239,9 @@ class TieredBackend {
     std::vector<UUID> GetSortedTiers() const;
 
     // Low-level allocation logic
-    bool AllocateInternalRaw(size_t size, std::optional<UUID> preferred_tier,
-                             TieredLocation* out_loc);
+    tl::expected<void, ErrorCode> AllocateInternalRaw(
+        size_t size, std::optional<UUID> preferred_tier,
+        TieredLocation* out_loc);
 
    private:
     // Map from tier ID to the actual CacheTier instance.

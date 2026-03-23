@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -9,6 +10,8 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <string_view>
+#include "mutex.h"
 #include "tiered_cache/scheduler/scheduler_policy.h"
 #include "tiered_cache/scheduler/stats_collector.h"
 #include "types.h"
@@ -97,9 +100,37 @@ class ClientScheduler {
         std::vector<UUID> current_locations;
     };
 
-    void TrackReplicaLocked(const std::string& key, UUID tier_id,
-                            size_t size_bytes);
-    void RemoveReplicaLocked(const std::string& key,
+    struct KeyCacheShard {
+        mutable std::mutex mutex;
+        std::unordered_map<std::string, CachedKeyState> key_cache
+            GUARDED_BY(mutex);
+        std::unordered_map<UUID, std::unordered_set<std::string>>
+            tier_resident_keys GUARDED_BY(mutex);
+    };
+
+    static constexpr size_t kKeyCacheShardCount = 16;
+
+    static size_t KeyCacheShardIndex(std::string_view key);
+    KeyCacheShard& GetKeyCacheShard(std::string_view key);
+    const KeyCacheShard& GetKeyCacheShard(std::string_view key) const;
+
+    size_t EstimateActiveKeyReserve(const AccessStats& access_stats,
+                                    std::optional<UUID> pinned_tier_id) const;
+    void AppendHotKeys(const AccessStats& access_stats,
+                       std::vector<KeyContext>& active_keys,
+                       std::unordered_set<std::string>& seen_keys) const;
+    void AppendPinnedTierKeys(UUID pinned_tier_id,
+                              std::vector<KeyContext>& active_keys,
+                              std::unordered_set<std::string>& seen_keys) const;
+    std::optional<KeyContext> BuildKeyContextLocked(
+        const std::string& key, const CachedKeyState& state,
+        const AccessStats& access_stats,
+        const AccessStatEntry* stat_entry = nullptr) const;
+    size_t GetCachedKeySize(const std::string& key) const;
+
+    void TrackReplicaLocked(KeyCacheShard& shard, const std::string& key,
+                            UUID tier_id, size_t size_bytes);
+    bool RemoveReplicaLocked(KeyCacheShard& shard, const std::string& key,
                              std::optional<UUID> tier_id);
 
    private:
@@ -114,10 +145,7 @@ class ClientScheduler {
     std::unordered_map<UUID, CacheTier*> tiers_;
 
     // Scheduler-side metadata cache to avoid full backend scans each cycle
-    std::mutex key_cache_mutex_;
-    std::unordered_map<std::string, CachedKeyState> key_cache_;
-    std::unordered_map<UUID, std::unordered_set<std::string>>
-        tier_resident_keys_;
+    std::array<KeyCacheShard, kKeyCacheShardCount> key_cache_shards_;
     std::optional<UUID> fast_tier_id_;
 
     // Configuration

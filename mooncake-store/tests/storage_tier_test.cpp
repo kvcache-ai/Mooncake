@@ -197,6 +197,7 @@ TEST_F(StorageTierTest, StorageTierUsesConfiguredLocalBufferPool) {
         EXPECT_FALSE(oversized_alloc.has_value())
             << "allocation larger than configured local buffer pool should "
                "fail";
+        EXPECT_EQ(oversized_alloc.error(), ErrorCode::BUFFER_OVERFLOW);
 
         auto alloc_result = backend.Allocate(1024);
         ASSERT_TRUE(alloc_result.has_value())
@@ -264,6 +265,7 @@ TEST_F(StorageTierTest, StorageTierCapacityCountsUncommittedStaging) {
         EXPECT_FALSE(over_capacity.has_value())
             << "uncommitted staging allocations should count against tier "
                "capacity";
+        EXPECT_EQ(over_capacity.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
         handle1 = nullptr;
 

@@ -6,6 +6,7 @@
 #include "tiered_cache/scheduler/simple_policy.h"
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <unordered_set>
 #include <glog/logging.h>
 
@@ -129,17 +130,18 @@ void ClientScheduler::OnAccess(const std::string& key) {
 
 void ClientScheduler::OnCommit(const std::string& key, UUID tier_id,
                                size_t size_bytes) {
-    std::lock_guard<std::mutex> lock(key_cache_mutex_);
-    TrackReplicaLocked(key, tier_id, size_bytes);
+    auto& shard = GetKeyCacheShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    TrackReplicaLocked(shard, key, tier_id, size_bytes);
 }
 
 void ClientScheduler::OnDelete(const std::string& key,
                                std::optional<UUID> tier_id) {
     bool remove_stats = false;
     {
-        std::lock_guard<std::mutex> lock(key_cache_mutex_);
-        RemoveReplicaLocked(key, tier_id);
-        remove_stats = !tier_id.has_value() || key_cache_.count(key) == 0;
+        auto& shard = GetKeyCacheShard(key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        remove_stats = RemoveReplicaLocked(shard, key, tier_id);
     }
 
     if (remove_stats && stats_collector_) {
@@ -215,52 +217,84 @@ std::unordered_map<UUID, TierStats> ClientScheduler::CollectTierStats() const {
 
 std::vector<KeyContext> ClientScheduler::BuildActiveKeys(
     const AccessStats& access_stats, std::optional<UUID> pinned_tier_id) {
+    const size_t reserved_size =
+        EstimateActiveKeyReserve(access_stats, pinned_tier_id);
     std::vector<KeyContext> active_keys;
     std::unordered_set<std::string> seen_keys;
+    active_keys.reserve(reserved_size);
+    seen_keys.reserve(reserved_size);
 
-    {
-        std::lock_guard<std::mutex> lock(key_cache_mutex_);
+    AppendHotKeys(access_stats, active_keys, seen_keys);
+    if (pinned_tier_id.has_value()) {
+        AppendPinnedTierKeys(pinned_tier_id.value(), active_keys, seen_keys);
+    }
+    return active_keys;
+}
 
-        size_t reserved_size = access_stats.hot_keys.size();
-        if (pinned_tier_id.has_value()) {
-            auto resident_it = tier_resident_keys_.find(pinned_tier_id.value());
-            if (resident_it != tier_resident_keys_.end()) {
-                reserved_size += resident_it->second.size();
-            }
+size_t ClientScheduler::KeyCacheShardIndex(std::string_view key) {
+    return std::hash<std::string_view>{}(key) % kKeyCacheShardCount;
+}
+
+ClientScheduler::KeyCacheShard& ClientScheduler::GetKeyCacheShard(
+    std::string_view key) {
+    return key_cache_shards_[KeyCacheShardIndex(key)];
+}
+
+const ClientScheduler::KeyCacheShard& ClientScheduler::GetKeyCacheShard(
+    std::string_view key) const {
+    return key_cache_shards_[KeyCacheShardIndex(key)];
+}
+
+size_t ClientScheduler::EstimateActiveKeyReserve(
+    const AccessStats& access_stats, std::optional<UUID> pinned_tier_id) const {
+    size_t reserved_size = access_stats.hot_keys.size();
+    if (!pinned_tier_id.has_value()) {
+        return reserved_size;
+    }
+
+    for (const auto& shard : key_cache_shards_) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto resident_it =
+            shard.tier_resident_keys.find(pinned_tier_id.value());
+        if (resident_it != shard.tier_resident_keys.end()) {
+            reserved_size += resident_it->second.size();
+        }
+    }
+
+    return reserved_size;
+}
+
+void ClientScheduler::AppendHotKeys(
+    const AccessStats& access_stats, std::vector<KeyContext>& active_keys,
+    std::unordered_set<std::string>& seen_keys) const {
+    for (const auto& stat_entry : access_stats.hot_keys) {
+        const auto& shard = GetKeyCacheShard(stat_entry.key);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto cache_it = shard.key_cache.find(stat_entry.key);
+        if (cache_it == shard.key_cache.end()) {
+            continue;
         }
 
-        active_keys.reserve(reserved_size);
-        seen_keys.reserve(reserved_size);
-
-        for (const auto& stat_entry : access_stats.hot_keys) {
-            auto cache_it = key_cache_.find(stat_entry.key);
-            if (cache_it == key_cache_.end() ||
-                cache_it->second.current_locations.empty()) {
-                continue;
-            }
-
-            KeyContext key_ctx;
-            key_ctx.key = stat_entry.key;
-            key_ctx.current_locations = cache_it->second.current_locations;
-            key_ctx.size_bytes = cache_it->second.size_bytes;
-
-            if (access_stats.metric == AccessStatMetric::kRecentHeat) {
-                key_ctx.recent_heat_score = stat_entry.recent_heat_score;
-            } else if (access_stats.metric == AccessStatMetric::kRecencyRank) {
-                key_ctx.recency_rank = stat_entry.recency_rank;
-            }
-
-            seen_keys.insert(stat_entry.key);
-            active_keys.push_back(std::move(key_ctx));
+        auto key_ctx = BuildKeyContextLocked(stat_entry.key, cache_it->second,
+                                             access_stats, &stat_entry);
+        if (!key_ctx.has_value()) {
+            continue;
         }
 
-        if (!pinned_tier_id.has_value()) {
-            return active_keys;
-        }
+        seen_keys.insert(stat_entry.key);
+        active_keys.push_back(std::move(key_ctx.value()));
+    }
+}
 
-        auto resident_it = tier_resident_keys_.find(pinned_tier_id.value());
-        if (resident_it == tier_resident_keys_.end()) {
-            return active_keys;
+void ClientScheduler::AppendPinnedTierKeys(
+    UUID pinned_tier_id, std::vector<KeyContext>& active_keys,
+    std::unordered_set<std::string>& seen_keys) const {
+    const AccessStats empty_stats{};
+    for (const auto& shard : key_cache_shards_) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto resident_it = shard.tier_resident_keys.find(pinned_tier_id);
+        if (resident_it == shard.tier_resident_keys.end()) {
+            continue;
         }
 
         for (const auto& key : resident_it->second) {
@@ -268,28 +302,58 @@ std::vector<KeyContext> ClientScheduler::BuildActiveKeys(
                 continue;
             }
 
-            auto cache_it = key_cache_.find(key);
-            if (cache_it == key_cache_.end() ||
-                cache_it->second.current_locations.empty()) {
+            auto cache_it = shard.key_cache.find(key);
+            if (cache_it == shard.key_cache.end()) {
                 continue;
             }
 
-            active_keys.push_back(KeyContext{
-                key,
-                0.0,
-                0,
-                cache_it->second.current_locations,
-                cache_it->second.size_bytes,
-            });
+            auto key_ctx =
+                BuildKeyContextLocked(key, cache_it->second, empty_stats);
+            if (!key_ctx.has_value()) {
+                continue;
+            }
+
+            seen_keys.insert(key);
+            active_keys.push_back(std::move(key_ctx.value()));
         }
     }
-
-    return active_keys;
 }
 
-void ClientScheduler::TrackReplicaLocked(const std::string& key, UUID tier_id,
+std::optional<KeyContext> ClientScheduler::BuildKeyContextLocked(
+    const std::string& key, const CachedKeyState& state,
+    const AccessStats& access_stats, const AccessStatEntry* stat_entry) const {
+    if (state.current_locations.empty()) {
+        return std::nullopt;
+    }
+
+    KeyContext key_ctx;
+    key_ctx.key = key;
+    key_ctx.current_locations = state.current_locations;
+    key_ctx.size_bytes = state.size_bytes;
+    if (stat_entry != nullptr) {
+        if (access_stats.metric == AccessStatMetric::kRecentHeat) {
+            key_ctx.recent_heat_score = stat_entry->recent_heat_score;
+        } else if (access_stats.metric == AccessStatMetric::kRecencyRank) {
+            key_ctx.recency_rank = stat_entry->recency_rank;
+        }
+    }
+    return key_ctx;
+}
+
+size_t ClientScheduler::GetCachedKeySize(const std::string& key) const {
+    const auto& shard = GetKeyCacheShard(key);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto key_it = shard.key_cache.find(key);
+    if (key_it == shard.key_cache.end() || key_it->second.size_bytes == 0) {
+        return 1;
+    }
+    return key_it->second.size_bytes;
+}
+
+void ClientScheduler::TrackReplicaLocked(KeyCacheShard& shard,
+                                         const std::string& key, UUID tier_id,
                                          size_t size_bytes) {
-    auto& state = key_cache_[key];
+    auto& state = shard.key_cache[key];
     state.size_bytes = size_bytes;
 
     const auto existing_it = std::find(state.current_locations.begin(),
@@ -298,25 +362,26 @@ void ClientScheduler::TrackReplicaLocked(const std::string& key, UUID tier_id,
         state.current_locations.push_back(tier_id);
     }
 
-    tier_resident_keys_[tier_id].insert(key);
+    shard.tier_resident_keys[tier_id].insert(key);
 }
 
-void ClientScheduler::RemoveReplicaLocked(const std::string& key,
+bool ClientScheduler::RemoveReplicaLocked(KeyCacheShard& shard,
+                                          const std::string& key,
                                           std::optional<UUID> tier_id) {
-    auto cache_it = key_cache_.find(key);
-    if (cache_it == key_cache_.end()) {
-        return;
+    auto cache_it = shard.key_cache.find(key);
+    if (cache_it == shard.key_cache.end()) {
+        return true;
     }
 
     if (!tier_id.has_value()) {
         for (const auto& resident_tier : cache_it->second.current_locations) {
-            auto resident_it = tier_resident_keys_.find(resident_tier);
-            if (resident_it != tier_resident_keys_.end()) {
+            auto resident_it = shard.tier_resident_keys.find(resident_tier);
+            if (resident_it != shard.tier_resident_keys.end()) {
                 resident_it->second.erase(key);
             }
         }
-        key_cache_.erase(cache_it);
-        return;
+        shard.key_cache.erase(cache_it);
+        return true;
     }
 
     auto& current_locations = cache_it->second.current_locations;
@@ -325,14 +390,16 @@ void ClientScheduler::RemoveReplicaLocked(const std::string& key,
                     tier_id.value()),
         current_locations.end());
 
-    auto resident_it = tier_resident_keys_.find(tier_id.value());
-    if (resident_it != tier_resident_keys_.end()) {
+    auto resident_it = shard.tier_resident_keys.find(tier_id.value());
+    if (resident_it != shard.tier_resident_keys.end()) {
         resident_it->second.erase(key);
     }
 
     if (current_locations.empty()) {
-        key_cache_.erase(cache_it);
+        shard.key_cache.erase(cache_it);
+        return true;
     }
+    return false;
 }
 
 void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
@@ -384,15 +451,7 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
                               << action.key;
                 } else if (res.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                     // Insufficient space - mark tier for eviction
-                    size_t key_size = 1;
-                    {
-                        std::lock_guard<std::mutex> lock(key_cache_mutex_);
-                        auto key_it = key_cache_.find(action.key);
-                        if (key_it != key_cache_.end() &&
-                            key_it->second.size_bytes > 0) {
-                            key_size = key_it->second.size_bytes;
-                        }
-                    }
+                    const size_t key_size = GetCachedKeySize(action.key);
                     VLOG(2) << "Transfer skipped due to insufficient space for "
                                "key: "
                             << action.key << ", will trigger eviction";
