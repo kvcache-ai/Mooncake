@@ -2,6 +2,9 @@
 
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
+# asio_shared must be linked explicitly for executables: ASIO_SEPARATE_COMPILATION mode requires
+# that any binary using ASIO symbols links against the shared asio implementation directly.
+# Libraries (tent_metrics, tent_interface) get it transitively; executables need it explicit.
 target_link_libraries(tent_metrics_example PRIVATE tent_metrics tent_common asio_shared glog ibverbs)
 target_include_directories(tent_metrics_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
