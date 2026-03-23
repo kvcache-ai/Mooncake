@@ -407,6 +407,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
         const std::string& key, ReplicaType replica_type);
 
+    /**
+     * @brief Batch notify master that disk replicas were evicted locally.
+     * @param keys The evicted object keys
+     * @param replica_type DISK or LOCAL_DISK
+     * @return Per-key results (RPC_FAIL on transport error, else per-key
+     * status)
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplica(const std::vector<std::string>& keys,
+                          ReplicaType replica_type);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations
