@@ -518,7 +518,7 @@ class MasterService {
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
         mutable bool hard_pinned GUARDED_BY(lock){false};  // hard pin:
-                                                            // never evicted
+                                                           // never evicted
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),

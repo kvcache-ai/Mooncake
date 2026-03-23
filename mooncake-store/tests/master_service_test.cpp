@@ -4313,8 +4313,7 @@ TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
     }
 
     // Wait for leases to expire and eviction to kick in
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(kv_lease_ttl + 500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
 
     // Hard-pinned object must still be there
     auto get_result = service_->GetReplicaList("pinned_model");
@@ -4391,8 +4390,7 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
     }
 
     // Let leases expire, trigger eviction
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(kv_lease_ttl + 500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
 
     // Hard-pinned always survives
     ASSERT_TRUE(service_->GetReplicaList("hard_pinned").has_value())
@@ -4404,9 +4402,8 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
 
 TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
     // Objects created without with_hard_pin should not be hard-pinned
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(5000)
-                              .build();
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(5000).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
@@ -4420,9 +4417,8 @@ TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
     config.replica_num = 1;
     ASSERT_TRUE(
         service_->PutStart(client_id, "normal_key", 1024, config).has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, "normal_key", ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, "normal_key", ReplicaType::MEMORY)
+                    .has_value());
 
     // Put with hard_pin
     ReplicateConfig hp_config;
