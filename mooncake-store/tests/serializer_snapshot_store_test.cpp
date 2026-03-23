@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ha/serializer_snapshot_store.h"
@@ -12,6 +13,10 @@ namespace mooncake::test {
 
 class FakeSerializerBackend final : public SerializerBackend {
    public:
+    void SetDownloadStringError(std::string error) {
+        download_string_error_ = std::move(error);
+    }
+
     tl::expected<void, std::string> UploadBuffer(
         const std::string& key, const std::vector<uint8_t>& buffer) override {
         objects_[key] = std::string(buffer.begin(), buffer.end());
@@ -36,6 +41,9 @@ class FakeSerializerBackend final : public SerializerBackend {
 
     tl::expected<void, std::string> DownloadString(const std::string& key,
                                                    std::string& data) override {
+        if (!download_string_error_.empty()) {
+            return tl::make_unexpected(download_string_error_);
+        }
         auto iter = objects_.find(key);
         if (iter == objects_.end()) {
             return tl::make_unexpected("object not found");
@@ -68,9 +76,14 @@ class FakeSerializerBackend final : public SerializerBackend {
         return {};
     }
 
+    bool IsNotFoundError(const std::string& error) const override {
+        return error == "object not found";
+    }
+
     std::string GetConnectionInfo() const override { return "fake://snapshot"; }
 
    private:
+    std::string download_string_error_;
     std::unordered_map<std::string, std::string> objects_;
 };
 
@@ -114,6 +127,14 @@ TEST_F(SerializerSnapshotStoreTest, GetLatestReturnsEmptyWhenMarkerMissing) {
     auto latest = store_.GetLatest();
     ASSERT_TRUE(latest.has_value());
     EXPECT_FALSE(latest->has_value());
+}
+
+TEST_F(SerializerSnapshotStoreTest, GetLatestReturnsErrorOnBackendReadFailure) {
+    backend_.SetDownloadStringError("permission denied");
+
+    auto latest = store_.GetLatest();
+    ASSERT_FALSE(latest.has_value());
+    EXPECT_EQ(latest.error(), ErrorCode::PERSISTENT_FAIL);
 }
 
 TEST_F(SerializerSnapshotStoreTest, GetLatestTrimsWhitespaceMarker) {

@@ -107,7 +107,10 @@ SerializerSnapshotStore::GetLatest() {
     auto get_result =
         backend_->DownloadString(BuildLatestKey(), latest_snapshot_id);
     if (!get_result) {
-        return std::optional<SnapshotDescriptor>();
+        if (backend_->IsNotFoundError(get_result.error())) {
+            return std::optional<SnapshotDescriptor>();
+        }
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
     latest_snapshot_id = TrimAsciiWhitespace(std::move(latest_snapshot_id));

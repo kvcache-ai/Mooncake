@@ -118,6 +118,15 @@ class SerializerBackend {
         const std::string& prefix, std::vector<std::string>& object_keys) = 0;
 
     /**
+     * @brief Tell whether an error means the target object is missing
+     * @param error Backend-specific error string
+     * @return true when the error represents a missing object
+     */
+    virtual bool IsNotFoundError(const std::string& error) const {
+        return false;
+    }
+
+    /**
      * @brief Get connection/configuration info (for logging)
      * @return Connection info string
      */
@@ -161,6 +170,8 @@ class S3Backend : public SerializerBackend {
     tl::expected<void, std::string> ListObjectsWithPrefix(
         const std::string& prefix,
         std::vector<std::string>& object_keys) override;
+
+    bool IsNotFoundError(const std::string& error) const override;
 
     std::string GetConnectionInfo() const override;
 
@@ -213,6 +224,8 @@ class LocalFileBackend : public SerializerBackend {
     tl::expected<void, std::string> ListObjectsWithPrefix(
         const std::string& prefix,
         std::vector<std::string>& object_keys) override;
+
+    bool IsNotFoundError(const std::string& error) const override;
 
     std::string GetConnectionInfo() const override;
 
