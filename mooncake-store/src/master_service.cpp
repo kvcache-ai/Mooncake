@@ -13,6 +13,7 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
+#include "ha/backends/redis/redis_snapshot_store.h"
 #include "types.h"
 #include "ha/serializer_snapshot_store.h"
 #include "serialize/serializer.hpp"
@@ -38,6 +39,27 @@ static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
+namespace {
+
+enum class SnapshotCatalogBackendKind {
+    kSerializer,
+    kRedis,
+};
+
+tl::expected<SnapshotCatalogBackendKind, std::string>
+ParseSnapshotCatalogBackendKind(std::string_view backend_type) {
+    if (backend_type.empty() || backend_type == "serializer") {
+        return SnapshotCatalogBackendKind::kSerializer;
+    }
+    if (backend_type == "redis") {
+        return SnapshotCatalogBackendKind::kRedis;
+    }
+    return tl::make_unexpected("unknown snapshot catalog backend type: " +
+                               std::string(backend_type));
+}
+
+}  // namespace
+
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -49,6 +71,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      ha_backend_connstring_(config.ha_backend_connstring),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
@@ -64,6 +87,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       snapshot_retention_count_(config.snapshot_retention_count),
+      snapshot_catalog_backend_type_(config.snapshot_catalog_backend_type),
+      snapshot_catalog_backend_connstring_(
+          config.snapshot_catalog_backend_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
@@ -75,8 +101,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
             auto backend_type =
                 ParseSnapshotBackendType(config.snapshot_backend_type);
             snapshot_backend_ = SerializerBackend::Create(backend_type);
-            snapshot_store_ = std::make_unique<ha::SerializerSnapshotStore>(
-                snapshot_backend_.get());
+            snapshot_store_ = CreateSnapshotStore();
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot backend: " << e.what();
             throw std::runtime_error(
@@ -152,6 +177,41 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+}
+
+std::unique_ptr<ha::SnapshotStore> MasterService::CreateSnapshotStore() {
+    auto backend_kind =
+        ParseSnapshotCatalogBackendKind(snapshot_catalog_backend_type_);
+    if (!backend_kind) {
+        throw std::invalid_argument(backend_kind.error());
+    }
+
+    switch (backend_kind.value()) {
+        case SnapshotCatalogBackendKind::kSerializer:
+            return std::make_unique<ha::SerializerSnapshotStore>(
+                snapshot_backend_.get());
+        case SnapshotCatalogBackendKind::kRedis: {
+#ifndef STORE_USE_REDIS
+            throw std::invalid_argument(
+                "redis snapshot catalog backend is unavailable in the current "
+                "build");
+#else
+            const auto connstring =
+                !snapshot_catalog_backend_connstring_.empty()
+                    ? snapshot_catalog_backend_connstring_
+                    : ha_backend_connstring_;
+            if (connstring.empty()) {
+                throw std::invalid_argument(
+                    "redis snapshot catalog backend requires a connection "
+                    "string");
+            }
+            return std::make_unique<ha::backends::redis::RedisSnapshotStore>(
+                snapshot_backend_.get(), connstring, cluster_id_);
+#endif
+        }
+    }
+
+    throw std::invalid_argument("unknown snapshot catalog backend type");
 }
 
 MasterService::~MasterService() {
@@ -2821,8 +2881,7 @@ void MasterService::RestoreState() {
 
 ha::SnapshotStore* MasterService::GetSnapshotStore() {
     if (!snapshot_store_ && snapshot_backend_) {
-        snapshot_store_ = std::make_unique<ha::SerializerSnapshotStore>(
-            snapshot_backend_.get());
+        snapshot_store_ = CreateSnapshotStore();
     }
     return snapshot_store_.get();
 }

@@ -32,6 +32,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/etcd_leader_coordinator.cpp
     ha/master_service_supervisor.cpp
     ha/redis_leader_coordinator.cpp
+    ha/redis_snapshot_store.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
