@@ -66,13 +66,19 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
 
     warmup_send_region_ = new int32_t[kMaxNumRanks];
     warmup_send_region_[0] = 1;
-    int rc = engine_->registerLocalMemory(
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[meta_->protocol].emplace_back(
         warmup_send_region_, kMaxNumRanks * sizeof(int32_t), location);
+    int rc = engine_->registerLocalMemory(buffer_map);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_->registerLocalMemory(warmup_recv_region_,
-                                      kMaxNumRanks * sizeof(int32_t), location);
+    buffer_map.clear();
+    buffer_map[meta_->protocol].emplace_back(
+        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), location);
+    rc = engine_->registerLocalMemory(buffer_map);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 }
 
@@ -84,11 +90,19 @@ ConnectionContext::~ConnectionContext() {
     }
 
     if (warmup_send_region_) {
-        engine_->unregisterLocalMemory(warmup_send_region_);
+        std::unordered_map<std::string,
+                           std::vector<TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[meta_->protocol].emplace_back(warmup_send_region_);
+        engine_->unregisterLocalMemory(buffer_map);
         delete[] warmup_send_region_;
     }
     if (warmup_recv_region_) {
-        engine_->unregisterLocalMemory(warmup_recv_region_);
+        std::unordered_map<std::string,
+                           std::vector<TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[meta_->protocol].emplace_back(warmup_recv_region_);
+        engine_->unregisterLocalMemory(buffer_map);
         delete[] warmup_recv_region_;
     }
 }
@@ -194,6 +208,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             } else if (pollingRank <= rank_) {
                 // Send a warmup request to establish connections
                 auto batchID = engine_->allocateBatchID(1);
+                std::string proto = meta_->protocol;
                 engine_->submitTransfer(
                     batchID,
                     {TransferRequest{
@@ -204,7 +219,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                             meta_->segmentInfos[pollingRank].warmup_buffer[1] +
                             rank_ * sizeof(int32_t),
                         .length = sizeof(int32_t),
-                    }});
+                    }},
+                    proto);
                 peerState.warmupBatchId = batchID;
                 peerState.state = PeerConnectionState::WAITING_WARMUP_TRANSFER;
             } else {

@@ -1609,7 +1609,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
 
 void Client::DispatchProtocols(const std::vector<std::string>& protocols) {
     for (const auto& protocol : protocols) {
-        if (protocol == "tcp" || protocol == "rdma") {
+        if (protocol == "tcp" || protocol == "rdma" || protocol == "ascend" ||
+            protocol == "ubshmem" || protocol == "efa") {
             level_protocols_[StorageLevel::RAM] = protocol;
         } else if (protocol == "cxl") {
             level_protocols_[StorageLevel::CXL] = protocol;

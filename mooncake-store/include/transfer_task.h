@@ -451,7 +451,7 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests, std::string proto = "");
+        std::vector<TransferRequest>& requests, std::string proto);
 };
 
 }  // namespace mooncake

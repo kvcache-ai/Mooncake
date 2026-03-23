@@ -468,14 +468,17 @@ bool P2PProxy::StepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task) {
     bool did_work = false;
     if (!task.transfer_batch_id_.has_value()) {
         const BatchID batch_id = engine_->allocateBatchID(1);
+        std::string proto = meta_->protocol;
         engine_->submitTransfer(
-            batch_id, {TransferRequest{
-                          .opcode = TransferRequest::WRITE,
-                          .source = task.source_,
-                          .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                          .target_offset = task.target_offset_,
-                          .length = task.chunk_bytes_,
-                      }});
+            batch_id,
+            {TransferRequest{
+                .opcode = TransferRequest::WRITE,
+                .source = task.source_,
+                .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                .target_offset = task.target_offset_,
+                .length = task.chunk_bytes_,
+            }},
+            proto);
         task.transfer_batch_id_ = batch_id;
         did_work = true;
     }
@@ -545,14 +548,17 @@ bool P2PProxy::StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity) {
         GetRemoteCtrlRecvHeadOffset(op_ctx.peer_rank_);
 
     const BatchID batch_id = engine_->allocateBatchID(1);
+    std::string proto = meta_->protocol;
     engine_->submitTransfer(
-        batch_id, {TransferRequest{
-                      .opcode = TransferRequest::WRITE,
-                      .source = head_source,
-                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                      .target_offset = remote_head_offset,
-                      .length = sizeof(uint32_t),
-                  }});
+        batch_id,
+        {TransferRequest{
+            .opcode = TransferRequest::WRITE,
+            .source = head_source,
+            .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+            .target_offset = remote_head_offset,
+            .length = sizeof(uint32_t),
+        }},
+        proto);
     op_ctx.head_update_batch_id_ = batch_id;
     did_work = true;
 
@@ -700,14 +706,17 @@ bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
     void* tail_source = static_cast<void*>(&local_ctrl->tail.value);
 
     const BatchID batch_id = engine_->allocateBatchID(1);
+    std::string proto = meta_->protocol;
     engine_->submitTransfer(
-        batch_id, {TransferRequest{
-                      .opcode = TransferRequest::WRITE,
-                      .source = tail_source,
-                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                      .target_offset = remote_tail_offset,
-                      .length = sizeof(uint32_t),
-                  }});
+        batch_id,
+        {TransferRequest{
+            .opcode = TransferRequest::WRITE,
+            .source = tail_source,
+            .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+            .target_offset = remote_tail_offset,
+            .length = sizeof(uint32_t),
+        }},
+        proto);
     op_ctx.tail_update_batch_id_ = batch_id;
     did_work = true;
 

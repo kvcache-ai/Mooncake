@@ -30,7 +30,8 @@ import "unsafe"
 type BatchID int64
 
 type TransferEngine struct {
-	engine C.transfer_engine_t
+	engine   C.transfer_engine_t
+	protocol string
 }
 
 func NewTransferEngine(metadataConnString string,
@@ -48,7 +49,8 @@ func NewTransferEngine(metadataConnString string,
 		return nil, ErrTransferEngine
 	}
 	return &TransferEngine{
-		engine: native_engine,
+		engine:   native_engine,
+		protocol: "tcp",
 	}, nil
 }
 
@@ -68,6 +70,7 @@ func (engine *TransferEngine) installTransport(protocol string, topologyMatrix s
 	if xport == nil {
 		return ErrTransferEngine
 	}
+	engine.protocol = protocol
 	return nil
 }
 
@@ -147,7 +150,9 @@ func (engine *TransferEngine) submitTransfer(batchID BatchID, requests []Transfe
 		}
 	}
 
-	ret := C.submitTransfer(engine.engine, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)))
+	protocolCStr := C.CString(engine.protocol)
+	defer C.free(unsafe.Pointer(protocolCStr))
+	ret := C.submitTransfer(engine.engine, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)), protocolCStr)
 	if ret != 0 {
 		return ErrTransferEngine
 	}

@@ -140,11 +140,12 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                   struct transfer_request *entries, size_t count);
+                   struct transfer_request *entries, size_t count,
+                   char *protocol);
 
 int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
-                             notify_msg_t notify_msg);
+                             notify_msg_t notify_msg, char *protocol);
 
 notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size);
 

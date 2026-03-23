@@ -175,12 +175,12 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         // Mount segment for test_client_ as well
         for (auto& protocol : test_client_->GetLevelProtocols()) {
             if (protocol.first == StorageLevel::RAM) {
-                test_client_segment_ptr_ =
+                test_client_ram_segment_ptr_ =
                     allocate_buffer_allocator_memory(FLAGS_segment_size);
-                LOG_ASSERT(test_client_segment_ptr_);
+                LOG_ASSERT(test_client_ram_segment_ptr_);
 
                 auto test_client_mount_result = test_client_->MountSegment(
-                    test_client_segment_ptr_, FLAGS_segment_size,
+                    test_client_ram_segment_ptr_, FLAGS_segment_size,
                     protocol.second);
                 if (!test_client_mount_result.has_value()) {
                     LOG(ERROR)
@@ -188,7 +188,7 @@ class ClientIntegrationTestCxl : public ::testing::Test {
                         << toString(test_client_mount_result.error());
                 }
                 client_segment_ptrs_[test_client_.get()].emplace_back(
-                    reinterpret_cast<uintptr_t>(test_client_segment_ptr_),
+                    reinterpret_cast<uintptr_t>(test_client_ram_segment_ptr_),
                     FLAGS_segment_size);
             } else if (protocol.first == StorageLevel::CXL) {
                 size_t cxl_dev_size = 0;
@@ -205,13 +205,13 @@ class ClientIntegrationTestCxl : public ::testing::Test {
                            "(required for CXL protocol)";
                     return;
                 }
-                test_client_ram_buffer_size_ = cxl_dev_size;
-                test_client_segment_ptr_ = test_client_->GetBaseAddr();
+                test_client_cxl_buffer_size_ = cxl_dev_size;
+                test_client_cxl_segment_ptr_ = test_client_->GetBaseAddr();
 
-                LOG_ASSERT(test_client_segment_ptr_);
+                LOG_ASSERT(test_client_cxl_segment_ptr_);
 
                 auto test_client_mount_result = test_client_->MountSegment(
-                    test_client_segment_ptr_, test_client_ram_buffer_size_,
+                    test_client_cxl_segment_ptr_, test_client_cxl_buffer_size_,
                     protocol.second);
                 if (!test_client_mount_result.has_value()) {
                     LOG(ERROR)
@@ -219,8 +219,8 @@ class ClientIntegrationTestCxl : public ::testing::Test {
                         << toString(test_client_mount_result.error());
                 }
                 client_segment_ptrs_[test_client_.get()].emplace_back(
-                    reinterpret_cast<uintptr_t>(test_client_segment_ptr_),
-                    test_client_ram_buffer_size_);
+                    reinterpret_cast<uintptr_t>(test_client_cxl_segment_ptr_),
+                    test_client_cxl_buffer_size_);
             }
         }
     }
@@ -270,6 +270,13 @@ class ClientIntegrationTestCxl : public ::testing::Test {
                     }
                 }
             }
+            client_segment_ptrs_.clear();
+        }
+
+        // Free RAM segment memory
+        if (test_client_ram_segment_ptr_) {
+            free(test_client_ram_segment_ptr_);
+            test_client_ram_segment_ptr_ = nullptr;
         }
     }
 
@@ -282,8 +289,9 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     static std::unordered_map<Client*,
                               std::vector<std::pair<uintptr_t, size_t>>>
         client_segment_ptrs_;
-    static void* test_client_segment_ptr_;
-    static size_t test_client_ram_buffer_size_;
+    static void* test_client_ram_segment_ptr_;
+    static void* test_client_cxl_segment_ptr_;
+    static size_t test_client_cxl_buffer_size_;
     static uint64_t default_kv_lease_ttl_;
     static InProcMaster master_;
     static std::string master_address_;
@@ -295,10 +303,11 @@ class ClientIntegrationTestCxl : public ::testing::Test {
 
 // Static members initialization
 std::shared_ptr<Client> ClientIntegrationTestCxl::test_client_ = nullptr;
-void* ClientIntegrationTestCxl::test_client_segment_ptr_ = nullptr;
+void* ClientIntegrationTestCxl::test_client_ram_segment_ptr_ = nullptr;
+void* ClientIntegrationTestCxl::test_client_cxl_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTestCxl::client_buffer_allocator_ = nullptr;
-size_t ClientIntegrationTestCxl::test_client_ram_buffer_size_ = 0;
+size_t ClientIntegrationTestCxl::test_client_cxl_buffer_size_ = 0;
 uint64_t ClientIntegrationTestCxl::default_kv_lease_ttl_ = 0;
 std::vector<std::string> ClientIntegrationTestCxl::protocols = {};
 std::unordered_map<Client*, std::vector<std::pair<uintptr_t, size_t>>>

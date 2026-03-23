@@ -194,6 +194,7 @@ MooncakeBackend::MooncakeBackend(
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
     meta_ = std::make_shared<TransferGroupMeta>();
+    meta_->protocol = protocol_;
     connection_ctx_ = std::make_shared<ConnectionContext>(
         backendIndex_, rank, size, local2global_rank_map_, location, store,
         meta_, p2p_proxy_, engine_);
