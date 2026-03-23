@@ -484,12 +484,13 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin)
+            bool enable_soft_pin, bool enable_hard_pin = false)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
+              hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
@@ -516,6 +517,8 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
+        mutable bool hard_pinned GUARDED_BY(lock){false};  // hard pin:
+                                                            // never evicted
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -682,6 +685,12 @@ class MasterService {
         bool IsSoftPinned(std::chrono::system_clock::time_point& now) const {
             SpinLocker locker(&lock);
             return soft_pin_timeout && now < *soft_pin_timeout;
+        }
+
+        // Check if is hard pinned (never evicted by eviction policy)
+        bool IsHardPinned() const {
+            SpinLocker locker(&lock);
+            return hard_pinned;
         }
 
         // Check if the metadata is valid
@@ -897,7 +906,8 @@ class MasterService {
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
-                    std::vector<Replica> replicas, bool enable_soft_pin) {
+                    std::vector<Replica> replicas, bool enable_soft_pin,
+                    bool enable_hard_pin = false) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -905,7 +915,8 @@ class MasterService {
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin));
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin));
             it_ = result.first;
         }
 
