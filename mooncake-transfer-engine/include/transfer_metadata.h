@@ -74,6 +74,7 @@ class TransferMetadata {
         std::string deviceIp;
         uint64_t devicePort;
         uint64_t pid;
+        std::vector<std::string> endpoints;
     };
 
     using SegmentID = uint64_t;

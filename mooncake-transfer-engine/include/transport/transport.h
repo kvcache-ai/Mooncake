@@ -147,6 +147,7 @@ class Transport {
                 uint64_t dest_addr;
                 void *handle;
                 int64_t start_time;
+                int32_t engine_id;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
