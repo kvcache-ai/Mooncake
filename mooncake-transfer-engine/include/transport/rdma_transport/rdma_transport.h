@@ -82,8 +82,8 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
                                       bool force_sequential);
 
+   public:
     // TRANSFER
-
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries) override;
 

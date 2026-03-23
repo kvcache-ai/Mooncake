@@ -2,11 +2,14 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
+#include <future>
+#include <memory>
 #include <string>
 
 #include "etcd_helper.h"
-#include "ha_helper.h"
+#include "ha/ha_backend_factory.h"
 #include "types.h"
 
 namespace mooncake {
@@ -67,6 +70,28 @@ class HighAvailabilityTest : public ::testing::Test {
 };
 
 bool HighAvailabilityTest::etcd_available_ = false;
+
+namespace {
+
+ha::HABackendSpec MakeEtcdBackendSpec(const std::string& endpoints) {
+    return ha::HABackendSpec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = endpoints,
+        .cluster_namespace = "",
+    };
+}
+
+std::unique_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
+    const std::string& endpoints) {
+    auto coordinator =
+        ha::CreateLeaderCoordinator(MakeEtcdBackendSpec(endpoints));
+    if (!coordinator) {
+        return nullptr;
+    }
+    return std::move(coordinator.value());
+}
+
+}  // namespace
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     // == Test grant lease, create kv and get kv ==
@@ -136,6 +161,22 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     ASSERT_EQ(future.get(), ErrorCode::ETCD_CTX_CANCELLED);
     keep_alive_thread.join();
 
+    // == Test explicit lease revoke ==
+    lease_ttl = 10;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
+    std::string revoke_key =
+        FLAGS_etcd_test_key_prefix + std::string("revoke_key");
+    std::string revoke_value = "revoke_value";
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::CreateWithLease(
+                  revoke_key.c_str(), revoke_key.size(), revoke_value.c_str(),
+                  revoke_value.size(), lease_id, version));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(lease_id));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ASSERT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              EtcdHelper::Get(revoke_key.c_str(), revoke_key.size(),
+                              revoke_value, version));
+
     // == Test watch key and cancel watch ==
     lease_ttl = 2;
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
@@ -197,34 +238,125 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
 }
 
 TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
-    MasterViewHelper mv_helper;
-    mv_helper.ConnectToEtcd(FLAGS_etcd_endpoints);
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
     std::string master_address = "0.0.0.0:8888";
-    ViewVersionId version = 0;
 
     // Initially, the master view is not set
-    ASSERT_NE(ErrorCode::OK, mv_helper.GetMasterView(master_address, version));
+    auto current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_FALSE(current_view.value().has_value());
 
-    // Elect and keep leader
-    EtcdLeaseId lease_id = 0;
-    mv_helper.ElectLeader(master_address, version, lease_id);
-    std::thread keep_alive_thread([&]() { mv_helper.KeepLeader(lease_id); });
+    auto acquire = coordinator->TryAcquireLeadership(master_address);
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
 
     // Check the master view is correctly set
-    std::string get_master_address;
-    ASSERT_EQ(ErrorCode::OK,
-              mv_helper.GetMasterView(get_master_address, version));
-    ASSERT_EQ(get_master_address, master_address);
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_TRUE(current_view.value().has_value());
+    ASSERT_EQ(current_view.value()->leader_address, master_address);
+    ASSERT_EQ(current_view.value()->view_version, session.view.view_version);
+
+    auto no_change = coordinator->WaitForViewChange(
+        session.view.view_version, std::chrono::milliseconds(200));
+    ASSERT_TRUE(no_change.has_value());
+    ASSERT_FALSE(no_change->changed);
+    ASSERT_TRUE(no_change->timed_out);
 
     // Check the master view does not change
     std::this_thread::sleep_for(
         std::chrono::seconds(ETCD_MASTER_VIEW_LEASE_TTL + 2));
-    ASSERT_EQ(ErrorCode::OK,
-              mv_helper.GetMasterView(get_master_address, version));
-    ASSERT_EQ(get_master_address, master_address);
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_TRUE(current_view.value().has_value());
+    ASSERT_EQ(current_view.value()->leader_address, master_address);
+    ASSERT_EQ(current_view.value()->view_version, session.view.view_version);
 
-    EtcdHelper::CancelKeepAlive(lease_id);
-    keep_alive_thread.join();
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+
+    auto released = coordinator->WaitForViewChange(session.view.view_version,
+                                                   std::chrono::seconds(2));
+    ASSERT_TRUE(released.has_value());
+    ASSERT_TRUE(released->changed);
+    ASSERT_FALSE(released->current_view.has_value());
+
+    current_view = coordinator->ReadCurrentView();
+    ASSERT_TRUE(current_view.has_value());
+    ASSERT_FALSE(current_view.value().has_value());
+
+    auto reacquire = coordinator->TryAcquireLeadership("0.0.0.0:9999");
+    ASSERT_TRUE(reacquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, reacquire->status);
+    ASSERT_TRUE(reacquire->session.has_value());
+    ASSERT_EQ(ErrorCode::OK,
+              coordinator->ReleaseLeadership(*reacquire->session));
+}
+
+TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:7777");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    std::promise<ha::LeadershipLossReason> loss_promise;
+    auto loss_future = loss_promise.get_future();
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [&loss_promise](ha::LeadershipLossReason reason) {
+            loss_promise.set_value(reason);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    const auto lease_id =
+        static_cast<EtcdLeaseId>(std::stoll(session.owner_token));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::CancelKeepAlive(lease_id));
+    ASSERT_EQ(loss_future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(ha::LeadershipLossReason::kLostLeadership, loss_future.get());
+
+    monitor.value()->Stop();
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+}
+
+TEST_F(HighAvailabilityTest, LeadershipMonitorIgnoresExplicitRelease) {
+    auto coordinator = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+    ASSERT_NE(coordinator, nullptr);
+
+    auto acquire = coordinator->TryAcquireLeadership("0.0.0.0:6666");
+    ASSERT_TRUE(acquire.has_value());
+    ASSERT_EQ(ha::AcquireLeadershipStatus::ACQUIRED, acquire->status);
+    ASSERT_TRUE(acquire->session.has_value());
+    const auto session = *acquire->session;
+
+    auto renew = coordinator->RenewLeadership(session);
+    ASSERT_TRUE(renew.has_value());
+    ASSERT_TRUE(renew.value());
+
+    auto callback_fired = std::make_shared<std::atomic<bool>>(false);
+    auto monitor = coordinator->StartLeadershipMonitor(
+        session, [callback_fired](ha::LeadershipLossReason) {
+            callback_fired->store(true);
+        });
+    ASSERT_TRUE(monitor.has_value());
+
+    ASSERT_EQ(ErrorCode::OK, coordinator->ReleaseLeadership(session));
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    EXPECT_FALSE(callback_fired->load());
 }
 
 TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
@@ -293,7 +425,6 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
     // CreateWithLease & DeleteRange
     int64_t lease_ttl = 10;
     EtcdLeaseId lease_id;
-    EtcdRevisionId lease_rev;
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
 
     // Use DeleteRange to clear k1-k3

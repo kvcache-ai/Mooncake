@@ -975,3 +975,13 @@ When to bump the version:
 * **Major version (X.0.0)**: For breaking API changes, major architectural changes, or significant new features that affect backward compatibility
 * **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
 * **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API
+
+
+---
+
+:::{toctree}
+:caption: Related Design Docs
+:maxdepth: 1
+
+ssd-offload
+:::
