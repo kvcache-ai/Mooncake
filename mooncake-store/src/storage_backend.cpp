@@ -21,6 +21,49 @@
 
 namespace mooncake {
 
+namespace {
+
+std::string MakeTemporaryBucketPath(const std::string& path) {
+    return path + ".tmp";
+}
+
+bool IsBucketTemporaryFile(const std::filesystem::path& path) {
+    if (path.extension() != ".tmp") {
+        return false;
+    }
+
+    const auto base_extension = path.stem().extension().string();
+    return base_extension == ".bucket" || base_extension == ".meta";
+}
+
+void RemoveFileIfExists(const std::filesystem::path& path,
+                        const char* failure_context) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return;
+    }
+
+    std::filesystem::remove(path, ec);
+    if (ec) {
+        LOG(ERROR) << failure_context << ": " << path
+                   << ", error: " << ec.message();
+    }
+}
+
+tl::expected<void, ErrorCode> RenameBucketFile(const std::string& from,
+                                               const std::string& to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to rename bucket file from " << from << " to "
+                   << to << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+}  // namespace
+
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
         LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
@@ -564,15 +607,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     return {};
 }
 
-void StorageBackend::RemoveFile(const std::string& path) {
+tl::expected<void, ErrorCode> StorageBackend::RemoveFile(
+    const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if
-    // used in multi-thread environment Check if the file exists before
-    // attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the
-    // corresponding file it will be fixed in the next version
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(50));  // sleep for 50 us
 
     // For 3FS mode, use original logic (no queue tracking)
     if (!IsEvictionEnabled()) {
@@ -582,27 +619,39 @@ void StorageBackend::RemoveFile(const std::string& path) {
             if (ec) {
                 LOG(ERROR) << "Failed to delete file: " << path
                            << ", error: " << ec.message();
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
             }
         }
-        return;
+        return {};
     }
 
     // Eviction-enabled logic (local mode)
     uint64_t file_size = 0;
+    bool should_release_space = false;
     std::error_code ec;
     {
         std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
         auto map_it = file_queue_map_.find(path);
         if (map_it != file_queue_map_.end()) {
             file_size = map_it->second->size;
-        } else {
-            lock.unlock();
-            LOG(WARNING) << "File not found in tracking queue, assuming it's "
-                            "already removed or untracked: "
-                         << path;
-            return;
+            should_release_space = true;
         }
     }
+
+    if (!should_release_space) {
+        file_size = fs::file_size(path, ec);
+        if (ec == std::errc::no_such_file_or_directory) {
+            return {};
+        }
+        if (ec) {
+            LOG(ERROR) << "Failed to query file size before deletion: " << path
+                       << ", error: " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        should_release_space = true;
+    }
+
+    ec.clear();
 
     if (fs::remove(path, ec)) {
         LOG(INFO) << "Successfully removed file: " << path;
@@ -610,13 +659,16 @@ void StorageBackend::RemoveFile(const std::string& path) {
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(ERROR) << "Failed to remove file: " << path
                        << ", Error: " << ec.message();
-            return;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
     }
 
     RemoveFileFromWriteQueue(path);
 
-    ReleaseSpace(file_size);
+    if (should_release_space) {
+        ReleaseSpace(file_size);
+    }
+    return {};
 }
 
 void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
@@ -1074,6 +1126,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler) {
+    MutexLocker scan_lock(&scan_mutex_);
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1179,21 +1232,81 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
     return is_enable_offloading;
 }
 
+tl::expected<void, ErrorCode> StorageBackendAdaptor::MarkKeyDeleted(
+    const std::string& key) {
+    namespace fs = std::filesystem;
+    MutexLocker scan_lock(&scan_mutex_);
+
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend adaptor is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const std::string path = ResolvePath(key);
+    std::error_code ec;
+    if (!fs::exists(path, ec)) {
+        if (ec) {
+            LOG(ERROR) << "Failed to stat file for key deletion: key=" << key
+                       << ", path=" << path << ", error: " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        }
+        return {};
+    }
+
+    const uint64_t file_size = fs::file_size(path, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to get file size before deletion: key=" << key
+                   << ", path=" << path << ", error: " << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    auto remove_result = storage_backend_->RemoveFile(path);
+    if (!remove_result) {
+        LOG(ERROR) << "Failed to remove file for key deletion: key=" << key
+                   << ", path=" << path << ", error: " << remove_result.error();
+        return remove_result;
+    }
+
+    MutexLocker lock(&mutex_);
+    if (total_keys > 0) {
+        total_keys--;
+    }
+    if (total_size >= static_cast<int64_t>(file_size)) {
+        total_size -= static_cast<int64_t>(file_size);
+    } else {
+        LOG(WARNING) << "Per-key physical accounting underflow on delete: key="
+                     << key << ", tracked_bytes=" << total_size
+                     << ", file_bytes=" << file_size;
+        total_size = 0;
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
+    MutexLocker scan_lock(&scan_mutex_);
 
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
     if (!fs::exists(root)) {
+        {
+            MutexLocker lock(&mutex_);
+            total_keys = 0;
+            total_size = 0;
+        }
         meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
 
+    meta_scanned_.store(false, std::memory_order_release);
+
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metas;
+    int64_t scanned_total_keys = 0;
+    int64_t scanned_total_size = 0;
 
     auto flush = [&]() -> tl::expected<void, ErrorCode> {
         if (keys.empty()) return {};
@@ -1203,8 +1316,6 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         metas.clear();
         return {};
     };
-
-    MutexLocker lock(&mutex_);
 
     std::error_code ec_root;
     for (auto it1 = fs::directory_iterator(root, ec_root);
@@ -1241,8 +1352,8 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 KVEntry kv;
                 struct_pb::from_pb(kv, buf);
 
-                total_keys++;
-                total_size += buf.size();
+                scanned_total_keys++;
+                scanned_total_size += static_cast<int64_t>(buf.size());
 
                 keys.emplace_back(std::move(kv.key));
                 metas.emplace_back(StorageObjectMetadata{
@@ -1261,6 +1372,11 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         }
     }
 
+    {
+        MutexLocker lock(&mutex_);
+        total_keys = scanned_total_keys;
+        total_size = scanned_total_size;
+    }
     meta_scanned_.store(true, std::memory_order_release);
     return {};
 }
@@ -1339,7 +1455,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     SharedMutexLocker lock(&mutex_);
-    total_size_ += bucket->data_size + bucket->meta_size;
+    physical_used_bytes_ += bucket->data_size + bucket->meta_size;
     object_bucket_map_.reserve(object_bucket_map_.size() + bucket->keys.size());
     for (size_t i = 0; i < bucket->keys.size(); ++i) {
         object_bucket_map_.emplace(bucket->keys[i], std::move(metadatas[i]));
@@ -1433,7 +1549,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
-        total_size_ = 0;
+        physical_used_bytes_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
         for (const auto& entry :
              fs::recursive_directory_iterator(storage_path_)) {
@@ -1507,8 +1623,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
-                total_size_ += metadata_it->second->data_size +
-                               metadata_it->second->meta_size;
+                physical_used_bytes_ += metadata_it->second->data_size +
+                                        metadata_it->second->meta_size;
                 for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
                     object_bucket_map_.emplace(
                         metadata_it->second->keys[i],
@@ -1522,6 +1638,36 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 bucket_valid_keys_[bucket_id] =
                     metadata_it->second->keys.size();
             }
+        }
+
+        uint64_t stale_tmp_files_count = 0;
+        uint64_t stale_tmp_space_freed = 0;
+        for (const auto& entry :
+             fs::recursive_directory_iterator(storage_path_)) {
+            if (!entry.is_regular_file() ||
+                !IsBucketTemporaryFile(entry.path())) {
+                continue;
+            }
+
+            std::error_code cleanup_ec;
+            const uint64_t file_size = entry.file_size(cleanup_ec);
+            if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
+                stale_tmp_files_count++;
+                stale_tmp_space_freed += file_size;
+                LOG(WARNING) << "Removed stale temporary bucket file: "
+                             << entry.path().string() << " (size: " << file_size
+                             << " bytes)";
+            } else if (cleanup_ec) {
+                LOG(ERROR) << "Failed to remove stale temporary bucket file: "
+                           << entry.path().string()
+                           << ", error: " << cleanup_ec.message();
+            }
+        }
+
+        if (stale_tmp_files_count > 0) {
+            LOG(INFO) << "Temporary bucket cleanup completed: removed "
+                      << stale_tmp_files_count << " stale file(s), freed "
+                      << stale_tmp_space_freed << " bytes";
         }
 
         // Clean up orphaned bucket files (.bucket files without corresponding
@@ -1583,7 +1729,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         }
 
         auto init_space_result =
-            space_manager_.Init(static_cast<uint64_t>(total_size_));
+            space_manager_.Init(static_cast<uint64_t>(physical_used_bytes_));
         if (!init_space_result) {
             return init_space_result;
         }
@@ -1700,7 +1846,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
 tl::expected<OffloadMetadata, ErrorCode>
 BucketStorageBackend::GetStoreMetadata() {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    OffloadMetadata metadata(object_bucket_map_.size(), total_size_);
+    OffloadMetadata metadata(object_bucket_map_.size(), physical_used_bytes_);
     return metadata;
 }
 
@@ -1778,12 +1924,9 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
                 continue;
             }
             freed_size += obj_it->second.data_size;
-            total_size_ -= obj_it->second.data_size;
             object_bucket_map_.erase(obj_it);
         }
 
-        // Metadata remains counted until the bucket itself is evicted.
-        total_size_ -= bucket_meta->meta_size;
         data_bytes = static_cast<uint64_t>(bucket_meta->data_size);
         meta_bytes = static_cast<uint64_t>(bucket_meta->meta_size);
         queued_delete_bytes = data_bytes + meta_bytes;
@@ -1811,8 +1954,8 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
         std::move(data_path_res.value()), std::move(meta_path_res.value())});
 
     LOG(INFO) << "Evicted bucket " << bucket_id << " with " << key_count
-              << " keys, freed " << freed_size
-              << " bytes and scheduled async file deletion";
+              << " keys, released " << freed_size
+              << " live bytes and scheduled async file deletion";
 
     return freed_size;
 }
@@ -1837,8 +1980,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(
         bucket_valid_it->second--;
     }
 
-    // Remove from object_bucket_map_
-    total_size_ -= obj_it->second.data_size;
+    // Remove from object_bucket_map_. Physical bytes remain accounted until
+    // async bucket deletion unlinks the underlying files.
     object_bucket_map_.erase(obj_it);
 
     return {};
@@ -1989,6 +2132,19 @@ void BucketStorageBackend::BucketDeletionWorker() {
             released_bytes += task.meta_bytes;
         }
         space_manager_.Release(released_bytes);
+        if (released_bytes > 0) {
+            SharedMutexLocker lock(&mutex_);
+            if (physical_used_bytes_ >= static_cast<int64_t>(released_bytes)) {
+                physical_used_bytes_ -= static_cast<int64_t>(released_bytes);
+            } else {
+                LOG(WARNING)
+                    << "Bucket physical accounting underflow on async delete: "
+                    << "bucket_id=" << task.bucket_id
+                    << ", tracked_bytes=" << physical_used_bytes_
+                    << ", released_bytes=" << released_bytes;
+                physical_used_bytes_ = 0;
+            }
+        }
 
         pending_deletion_count_.fetch_sub(1, std::memory_order_acq_rel);
         pending_deletion_bytes_.fetch_sub(task.queued_bytes,
@@ -2189,84 +2345,108 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         space_manager_.Release(reserved_size);
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto bucket_data_path = bucket_data_path_res.value();
-    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: "
-                   << bucket_data_path;
-        space_manager_.Release(reserved_size);
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-    auto file = std::move(open_file_result.value());
+    const std::string bucket_data_path = bucket_data_path_res.value();
+    const std::string bucket_data_tmp_path =
+        MakeTemporaryBucketPath(bucket_data_path);
 
-    auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
-    if (!write_result) {
-        LOG(ERROR) << "vector_write failed for: " << bucket_id
-                   << ", error: " << write_result.error();
+    auto bucket_meta_path_res = GetBucketMetadataPath(bucket_id);
+    if (!bucket_meta_path_res) {
+        LOG(ERROR) << "Failed to get bucket metadata path, bucket_id="
+                   << bucket_id;
         space_manager_.Release(reserved_size);
-        return tl::make_unexpected(write_result.error());
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (static_cast<int64_t>(write_result.value()) !=
-        bucket_metadata->data_size) {
-        LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
-                   << ", expected: " << bucket_metadata->data_size
-                   << ", got: " << write_result.value();
-        space_manager_.Release(reserved_size);
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    const std::string bucket_meta_path = bucket_meta_path_res.value();
+    const std::string bucket_meta_tmp_path =
+        MakeTemporaryBucketPath(bucket_meta_path);
+
+    auto cleanup_failed_write = [&]() {
+        RemoveFileIfExists(bucket_data_tmp_path,
+                           "Failed to clean up temporary bucket data file");
+        RemoveFileIfExists(bucket_meta_tmp_path,
+                           "Failed to clean up temporary bucket metadata file");
+        RemoveFileIfExists(bucket_data_path,
+                           "Failed to clean up finalized bucket data file");
+        RemoveFileIfExists(bucket_meta_path,
+                           "Failed to clean up finalized bucket metadata file");
+    };
+
+    {
+        auto open_file_result = OpenFile(bucket_data_tmp_path, FileMode::Write);
+        if (!open_file_result) {
+            LOG(ERROR) << "Failed to open file for bucket writing: "
+                       << bucket_data_tmp_path;
+            cleanup_failed_write();
+            space_manager_.Release(reserved_size);
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        auto file = std::move(open_file_result.value());
+
+        auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
+        if (!write_result) {
+            LOG(ERROR) << "vector_write failed for: " << bucket_id
+                       << ", error: " << write_result.error();
+            cleanup_failed_write();
+            space_manager_.Release(reserved_size);
+            return tl::make_unexpected(write_result.error());
+        }
+        if (static_cast<int64_t>(write_result.value()) !=
+            bucket_metadata->data_size) {
+            LOG(ERROR) << "Write size mismatch for: " << bucket_data_tmp_path
+                       << ", expected: " << bucket_metadata->data_size
+                       << ", got: " << write_result.value();
+            cleanup_failed_write();
+            space_manager_.Release(reserved_size);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
     }
+
     auto store_bucket_metadata_result =
-        StoreBucketMetadata(bucket_id, serialized_metadata);
+        StoreBucketMetadata(bucket_meta_tmp_path, serialized_metadata);
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
-
-        // Clean up the bucket file to prevent orphans
-        std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
-                            "write failure: "
-                         << bucket_data_path;
-        } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
-                          "failure: "
-                       << bucket_data_path << ", error: " << ec.message();
-        }
-
-        auto meta_path_res = GetBucketMetadataPath(bucket_id);
-        if (meta_path_res) {
-            ec.clear();
-            fs::remove(meta_path_res.value(), ec);
-        }
+        cleanup_failed_write();
         space_manager_.Release(reserved_size);
-
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    auto rename_data_result =
+        RenameBucketFile(bucket_data_tmp_path, bucket_data_path);
+    if (!rename_data_result) {
+        cleanup_failed_write();
+        space_manager_.Release(reserved_size);
+        return rename_data_result;
+    }
+
+    auto rename_meta_result =
+        RenameBucketFile(bucket_meta_tmp_path, bucket_meta_path);
+    if (!rename_meta_result) {
+        cleanup_failed_write();
+        space_manager_.Release(reserved_size);
+        return rename_meta_result;
     }
     return {};
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
-    int64_t id, const std::string& serialized_metadata) {
-    auto meta_path_res = GetBucketMetadataPath(id);
-    if (!meta_path_res) {
-        LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
+    const std::string& metadata_path, const std::string& serialized_metadata) {
+    auto open_file_result = OpenFile(metadata_path, FileMode::Write);
     if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
+        LOG(ERROR) << "Failed to open file for bucket writing: "
+                   << metadata_path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
     auto write_result =
         file->write(serialized_metadata, serialized_metadata.size());
     if (!write_result) {
-        LOG(ERROR) << "Write failed for: " << meta_path
+        LOG(ERROR) << "Write failed for: " << metadata_path
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
     if (write_result.value() != serialized_metadata.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
+        LOG(ERROR) << "Write size mismatch for: " << metadata_path
                    << ", expected: " << serialized_metadata.size()
                    << ", got: " << write_result.value();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);

@@ -204,9 +204,11 @@ class StorageTier : public CacheTier {
         nullptr, &StorageTier::FreeStagingMemory};
     size_t staging_buffer_capacity_ = 0;
 
-    // Capacity tracking
+    // Live persisted value bytes. This excludes backend metadata and any
+    // bucket files already unlinked from the cache namespace but still pending
+    // async physical deletion.
     size_t capacity_ = 0;
-    std::atomic<size_t> persisted_size_{0};
+    std::atomic<size_t> persisted_live_data_bytes_{0};
 };
 
 }  // namespace mooncake

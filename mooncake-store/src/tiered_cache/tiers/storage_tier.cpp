@@ -171,7 +171,7 @@ tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
         LOG(WARNING) << "Requested staging buffer exceeds configured local "
                         "buffer pool: requested="
                      << size << ", pool_capacity=" << staging_buffer_capacity_;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
 
     auto staging_handle = staging_allocator_->allocate(size);
@@ -181,7 +181,7 @@ tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
                      << staging_allocator_->getLargestFreeRegion()
                      << ", pool_capacity=" << staging_buffer_capacity_
                      << ", pool_usage=" << staging_allocator_->size();
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
 
     data.buffer = std::make_unique<StorageBuffer>(std::move(staging_handle),
@@ -221,8 +221,9 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
 
     // Not in pending batch — update persisted accounting if needed
     if (staging->IsPersisted()) {
-        persisted_size_.fetch_sub(size, std::memory_order_acq_rel);
-        VLOG(1) << "Freed persisted data for key " << key << ", size=" << size;
+        persisted_live_data_bytes_.fetch_sub(size, std::memory_order_acq_rel);
+        VLOG(1) << "Freed persisted live data for key " << key
+                << ", size=" << size;
 
         // Mark key as deleted for fragmentation tracking
         if (storage_backend_) {
@@ -331,7 +332,7 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
             kv.second->Persist();  // Releases staging memory
             kv.second->SetFlushing(false);
         }
-        persisted_size_.fetch_add(batch_total_size);
+        persisted_live_data_bytes_.fetch_add(batch_total_size);
     }
     flush_cv_.notify_all();
 
@@ -351,11 +352,12 @@ size_t StorageTier::GetCapacity() const {
 }
 
 size_t StorageTier::GetUsage() const {
-    // Total usage = persisted bytes on disk + all bytes currently reserved from
-    // the staging pool, including uncommitted allocations.
+    // Total usage = live bytes already persisted in the backend + all bytes
+    // currently reserved from the staging pool, including uncommitted
+    // allocations.
     const size_t staging_usage =
         staging_allocator_ ? staging_allocator_->size() : 0;
-    return persisted_size_.load() + staging_usage;
+    return persisted_live_data_bytes_.load() + staging_usage;
 }
 
 tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
@@ -397,8 +399,10 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
         total_freed = evict_res.value();
 
-        // Update persisted_size_ to reflect the freed space
-        persisted_size_.fetch_sub(total_freed, std::memory_order_acq_rel);
+        // Update live persisted bytes to reflect cache-visible space freed by
+        // eviction.
+        persisted_live_data_bytes_.fetch_sub(total_freed,
+                                             std::memory_order_acq_rel);
 
         LOG(INFO) << "Evicted 1 bucket, freed " << total_freed << " bytes";
         return total_freed;
@@ -434,8 +438,9 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         total_freed += freed;
         attempts++;
 
-        // Update persisted_size_ to reflect the freed space
-        persisted_size_.fetch_sub(freed, std::memory_order_acq_rel);
+        // Update live persisted bytes to reflect cache-visible space freed by
+        // eviction.
+        persisted_live_data_bytes_.fetch_sub(freed, std::memory_order_acq_rel);
 
         LOG(INFO) << "Evicted bucket " << bucket_id << ", freed " << freed
                   << " bytes (total: " << total_freed << "/" << target_free_size

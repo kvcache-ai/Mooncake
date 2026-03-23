@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <thread>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
@@ -27,6 +30,19 @@ class StorageBackendTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
         LOG(INFO) << "Clear test data...";
         fs::remove_all(data_path);
+    }
+
+    bool WaitForPathRemoved(
+        const fs::path& path,
+        std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!fs::exists(path)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return !fs::exists(path);
     }
 };
 
@@ -384,6 +400,35 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(is_exist.value());
 }
 
+TEST_F(StorageBackendTest, TemporaryBucketFilesAreCleanedDuringInit) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    const std::string stale_bucket_tmp = data_path + "/123.bucket.tmp";
+    const std::string stale_meta_tmp = data_path + "/123.meta.tmp";
+
+    {
+        std::ofstream bucket_tmp(stale_bucket_tmp, std::ios::binary);
+        ASSERT_TRUE(bucket_tmp.is_open());
+        bucket_tmp << "stale bucket payload";
+    }
+    {
+        std::ofstream meta_tmp(stale_meta_tmp, std::ios::binary);
+        ASSERT_TRUE(meta_tmp.is_open());
+        meta_tmp << "stale metadata payload";
+    }
+
+    ASSERT_TRUE(fs::exists(stale_bucket_tmp));
+    ASSERT_TRUE(fs::exists(stale_meta_tmp));
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    EXPECT_FALSE(fs::exists(stale_bucket_tmp));
+    EXPECT_FALSE(fs::exists(stale_meta_tmp));
+}
+
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     FileStorageConfig cfg;
 
@@ -680,6 +725,175 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
                                it->second.size);
             EXPECT_EQ(loaded, value);
         }
+    }
+}
+
+TEST_F(StorageBackendTest, BucketStoreMetadataTracksPhysicalBytes) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::string value1(1024, 'a');
+    std::string value2(1024, 'b');
+    std::string value3(1024, 'c');
+    std::unordered_map<std::string, std::vector<Slice>> batch = {
+        {"key1", {Slice{value1.data(), value1.size()}}},
+        {"key2", {Slice{value2.data(), value2.size()}}},
+        {"key3", {Slice{value3.data(), value3.size()}}},
+    };
+
+    auto offload_res = backend.BatchOffload(batch, nullptr);
+    ASSERT_TRUE(offload_res);
+    const int64_t bucket_id = offload_res.value();
+
+    auto metadata_before = backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata_before);
+    EXPECT_EQ(metadata_before->total_keys, 3);
+    EXPECT_GT(metadata_before->total_size, 0);
+    const int64_t physical_bytes_before = metadata_before->total_size;
+
+    ASSERT_TRUE(backend.MarkKeyDeleted("key1"));
+    ASSERT_TRUE(backend.MarkKeyDeleted("key2"));
+
+    auto metadata_after_mark = backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata_after_mark);
+    EXPECT_EQ(metadata_after_mark->total_keys, 1);
+    EXPECT_EQ(metadata_after_mark->total_size, physical_bytes_before);
+
+    auto evict_res = backend.EvictBucket(bucket_id);
+    ASSERT_TRUE(evict_res);
+    EXPECT_EQ(evict_res.value(), value3.size());
+
+    EXPECT_TRUE(WaitForPathRemoved(fs::path(data_path) /
+                                   (std::to_string(bucket_id) + ".bucket")));
+    EXPECT_TRUE(WaitForPathRemoved(fs::path(data_path) /
+                                   (std::to_string(bucket_id) + ".meta")));
+
+    auto metadata_after_delete = backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata_after_delete);
+    EXPECT_EQ(metadata_after_delete->total_keys, 0);
+    EXPECT_EQ(metadata_after_delete->total_size, 0);
+}
+
+TEST_F(StorageBackendTest, AdaptorMarkKeyDeletedReclaimsPhysicalBytes) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.total_keys_limit = 16;
+    cfg.total_size_limit = 1 << 20;
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_mark_deleted";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string value(4096, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> batch_object = {
+        {"delete-me", {Slice{value.data(), value.size()}}},
+    };
+    auto offload_res = adaptor.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_res);
+
+    FileStorageConfig strict_cfg = cfg;
+    strict_cfg.total_keys_limit = 0;
+    strict_cfg.total_size_limit = 1;
+
+    {
+        StorageBackendAdaptor strict_before(strict_cfg, file_per_key_config);
+        ASSERT_TRUE(strict_before.Init());
+        ASSERT_TRUE(strict_before.ScanMeta(
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+        auto enable_before = strict_before.IsEnableOffloading();
+        ASSERT_TRUE(enable_before);
+        EXPECT_FALSE(enable_before.value());
+    }
+
+    auto exist_before = adaptor.IsExist("delete-me");
+    ASSERT_TRUE(exist_before);
+    EXPECT_TRUE(exist_before.value());
+
+    ASSERT_TRUE(adaptor.MarkKeyDeleted("delete-me"));
+
+    auto exist_after = adaptor.IsExist("delete-me");
+    ASSERT_TRUE(exist_after);
+    EXPECT_FALSE(exist_after.value());
+
+    {
+        StorageBackendAdaptor strict_after(strict_cfg, file_per_key_config);
+        ASSERT_TRUE(strict_after.Init());
+
+        std::vector<std::string> scan_keys;
+        ASSERT_TRUE(
+            strict_after.ScanMeta([&](const std::vector<std::string>& keys,
+                                      std::vector<StorageObjectMetadata>&) {
+                scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+                return ErrorCode::OK;
+            }));
+        EXPECT_TRUE(scan_keys.empty());
+
+        auto enable_after = strict_after.IsEnableOffloading();
+        ASSERT_TRUE(enable_after);
+        EXPECT_TRUE(enable_after.value());
+    }
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaIsIdempotent) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.total_keys_limit = 16;
+    cfg.total_size_limit = 1 << 20;
+    cfg.scanmeta_iterator_keys_limit = 8;
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_idempotent_scan";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::string value1(128, 'a');
+    std::string value2(256, 'b');
+    std::unordered_map<std::string, std::vector<Slice>> batch_object = {
+        {"scan-key-1", {Slice{value1.data(), value1.size()}}},
+        {"scan-key-2", {Slice{value2.data(), value2.size()}}},
+    };
+
+    auto offload_res = adaptor.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_res);
+
+    auto enable_after_write = adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_after_write);
+    EXPECT_TRUE(enable_after_write.value());
+
+    for (int scan_round = 0; scan_round < 2; ++scan_round) {
+        std::vector<std::string> scan_keys;
+        ASSERT_TRUE(adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                         std::vector<StorageObjectMetadata>&) {
+            scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+            return ErrorCode::OK;
+        }));
+        EXPECT_EQ(scan_keys.size(), 2);
+
+        auto enable_after_scan = adaptor.IsEnableOffloading();
+        ASSERT_TRUE(enable_after_scan);
+        EXPECT_TRUE(enable_after_scan.value());
     }
 }
 

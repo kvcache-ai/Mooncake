@@ -38,6 +38,8 @@ struct BucketMetadata {
 YLT_REFL(BucketMetadata, data_size, keys, metadatas);
 
 struct OffloadMetadata {
+    // `total_keys` tracks live keys reachable through the backend.
+    // `total_size` tracks backend-accounted used bytes.
     int64_t total_keys;
     int64_t total_size;
     OffloadMetadata(std::size_t keys, int64_t size)
@@ -137,10 +139,12 @@ class StorageBackendInterface {
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
     /**
-     * @brief Mark a key as deleted (for fragmentation tracking in bucket mode).
+     * @brief Mark a key as deleted.
      * @param key The object key that was deleted
      * @return tl::expected<void, ErrorCode> indicating operation status
-     * @note This is a no-op for FilePerKey backend
+     * @note FilePerKey physically removes the file and updates physical
+     * accounting. Bucket backend removes the live mapping but defers physical
+     * reclaim to bucket eviction.
      */
     virtual tl::expected<void, ErrorCode> MarkKeyDeleted(
         const std::string& key) {
@@ -351,7 +355,7 @@ class StorageBackend {
      * @brief Deletes the physical file associated with the given object key
      * @param path Path to the file to remove
      */
-    void RemoveFile(const std::string& path);
+    tl::expected<void, ErrorCode> RemoveFile(const std::string& path);
 
     /**
      * @brief Removes objects from the storage backend whose keys match a regex
@@ -550,6 +554,9 @@ class StorageBackendAdaptor : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
+    tl::expected<void, ErrorCode> MarkKeyDeleted(
+        const std::string& key) override;
+
    private:
     const FilePerKeyConfig file_per_key_config_;
 
@@ -563,6 +570,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
 
+    mutable Mutex scan_mutex_;
     mutable Mutex mutex_;
 
     int64_t total_keys GUARDED_BY(mutex_);
@@ -703,8 +711,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     /**
      * @brief Retrieves the global metadata of the store.
-     * @return On success: `tl::expected` containing a `StoreMetadata`
-     * object. On failure: an error code.
+     * @return On success: `tl::expected` containing live key count and
+     * backend-accounted used bytes. On failure: an error code.
      */
     tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
 
@@ -745,7 +753,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
-        int64_t bucket_id, const std::string& serialized_metadata);
+        const std::string& metadata_path,
+        const std::string& serialized_metadata);
 
     tl::expected<std::string, ErrorCode> SerializeBucketMetadata(
         const std::shared_ptr<BucketMetadata>& bucket_metadata);
@@ -812,12 +821,12 @@ class BucketStorageBackend : public StorageBackendInterface {
      * metadata members:
      * - object_bucket_map_: maps object keys to bucket IDs
      * - buckets_: ordered map of bucket ID to bucket metadata
-     * - total_size_: cumulative data size of all stored objects
+     * - physical_used_bytes_: physical bytes still present on local storage
      */
     mutable SharedMutex mutex_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
-    int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    int64_t physical_used_bytes_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
