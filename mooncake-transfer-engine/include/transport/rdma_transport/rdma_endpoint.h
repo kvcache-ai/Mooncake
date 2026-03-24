@@ -54,6 +54,7 @@ class RdmaEndPoint {
                   size_t max_wr = 256, size_t max_inline = 64);
 
    private:
+    void reinit();
     int deconstruct();
 
    public:

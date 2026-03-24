@@ -80,6 +80,11 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     return 0;
 }
 
+void RdmaEndPoint::reinit() {
+    status_.store(INITIALIZING, std::memory_order_relaxed);
+    active_ = true;
+}
+
 int RdmaEndPoint::deconstruct() {
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (ibv_destroy_qp(qp_list_[i])) {
@@ -283,6 +288,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         }
 
         // Reconstruct with same parameters as original construction
+        reinit();
         ret = construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
                         max_inline_bytes);
         if (ret) {
