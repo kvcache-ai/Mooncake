@@ -28,7 +28,8 @@ TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
 
     std::string local_hostname = "127.0.0.1:18011";
     std::string master_addr = master.master_address();
-    const auto ping_before = MasterMetricManager::instance().get_ping_requests();
+    const auto ping_before =
+        MasterMetricManager::instance().get_ping_requests();
 
     auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
                                      std::nullopt, master_addr);
@@ -67,15 +68,15 @@ TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatAfterLocalDiskMount) {
     ASSERT_TRUE(std::filesystem::create_directories(tmp_dir));
 
     InProcMaster master;
-    ASSERT_TRUE(master.Start(
-        InProcMasterConfigBuilder()
-            .set_root_fs_dir(tmp_dir.string())
-            .set_enable_offload(true)
-            .build()));
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_root_fs_dir(tmp_dir.string())
+                                 .set_enable_offload(true)
+                                 .build()));
 
     std::string local_hostname = "127.0.0.1:18012";
     std::string master_addr = master.master_address();
-    const auto ping_before = MasterMetricManager::instance().get_ping_requests();
+    const auto ping_before =
+        MasterMetricManager::instance().get_ping_requests();
 
     auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
                                      std::nullopt, master_addr);

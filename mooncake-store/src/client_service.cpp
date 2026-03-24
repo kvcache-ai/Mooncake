@@ -320,9 +320,8 @@ void Client::LeaderMonitorThreadMain() {
             }
         }
 
-        auto view_change =
-            leader_coordinator_->WaitForViewChange(known_version,
-                                                   kViewChangeTimeout);
+        auto view_change = leader_coordinator_->WaitForViewChange(
+            known_version, kViewChangeTimeout);
         if (!view_change) {
             LOG(WARNING) << "Failed to wait for leader view change: "
                          << toString(view_change.error());
