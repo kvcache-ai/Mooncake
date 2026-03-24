@@ -740,12 +740,17 @@ class MooncakeStorePyWrapper {
             // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
                 size_t original_idx = processed_indices[i];
+                bool all_ok = true;
                 for (int j = 0; j < tp_size; ++j) {
                     int res = chunk_results[i * tp_size + j];
                     if (res != 0) {
                         final_results[original_idx] = res;  // First error wins
+                        all_ok = false;
                         break;
                     }
+                }
+                if (all_ok) {
+                    final_results[original_idx] = 0;
                 }
             }
 
