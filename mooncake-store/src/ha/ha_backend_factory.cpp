@@ -1,6 +1,7 @@
 #include "ha/ha_backend_factory.h"
 
 #include "ha/backends/etcd/etcd_leader_coordinator.h"
+#include "ha/backends/redis/redis_leader_coordinator.h"
 
 namespace mooncake {
 namespace ha {
@@ -19,7 +20,15 @@ CreateLeaderCoordinator(const HABackendSpec& spec) {
             }
             return std::unique_ptr<LeaderCoordinator>(std::move(coordinator));
         }
-        case HABackendType::REDIS:
+        case HABackendType::REDIS: {
+            auto coordinator =
+                std::make_unique<backends::redis::RedisLeaderCoordinator>(spec);
+            auto err = coordinator->Connect();
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+            return std::unique_ptr<LeaderCoordinator>(std::move(coordinator));
+        }
         case HABackendType::K8S:
             return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }

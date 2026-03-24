@@ -16,6 +16,8 @@
 // Define flags
 USE_engine_flags;
 FLAG_etcd_endpoints;
+FLAG_ha_backend_type;
+FLAG_ha_backend_connstring;
 FLAG_master_path;
 FLAG_client_path;
 FLAG_out_dir;
@@ -30,11 +32,11 @@ namespace testing {
 
 namespace {
 
-std::shared_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
-    const std::string& endpoints) {
+std::shared_ptr<ha::LeaderCoordinator> CreateLeaderCoordinatorOrNull(
+    ha::HABackendType backend_type, const std::string& connstring) {
     ha::HABackendSpec spec{
-        .type = ha::HABackendType::ETCD,
-        .connstring = endpoints,
+        .type = backend_type,
+        .connstring = connstring,
         .cluster_namespace = "",
     };
     auto coordinator = ha::CreateLeaderCoordinator(spec);
@@ -43,6 +45,14 @@ std::shared_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
     }
     return std::shared_ptr<ha::LeaderCoordinator>(
         std::move(coordinator.value()));
+}
+
+tl::expected<ha::HABackendType, ErrorCode> ParseConfiguredHABackendType() {
+    auto backend_type = ha::ParseHABackendType(FLAGS_ha_backend_type);
+    if (!backend_type.has_value()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return backend_type.value();
 }
 
 }  // namespace
@@ -62,7 +72,11 @@ class ChaosRandTest : public ::testing::Test {
         LOG(INFO) << "Random seed: " << FLAGS_rand_seed;
         srand(FLAGS_rand_seed);
 
-        leader_coordinator_ = CreateEtcdCoordinatorOrNull(FLAGS_etcd_endpoints);
+        auto backend_type = ParseConfiguredHABackendType();
+        ASSERT_TRUE(backend_type.has_value())
+            << "Invalid HA backend type: " << FLAGS_ha_backend_type;
+        leader_coordinator_ = CreateLeaderCoordinatorOrNull(
+            backend_type.value(), ResolveTestHABackendConnstring());
         ASSERT_TRUE(leader_coordinator_ != nullptr)
             << "Failed to create HA leader coordinator";
     }
@@ -74,8 +88,7 @@ class ChaosRandTest : public ::testing::Test {
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
             host_name,              // Local hostname
             FLAGS_engine_meta_url,  // Metadata connection string
-            FLAGS_protocol, FLAGS_device_name,
-            "etcd://" + FLAGS_etcd_endpoints);
+            FLAGS_protocol, FLAGS_device_name, BuildTestMasterServerEntry());
         EXPECT_TRUE(client_opt.has_value()) << "Failed to create client";
         if (!client_opt.has_value()) {
             return nullptr;
@@ -84,7 +97,7 @@ class ChaosRandTest : public ::testing::Test {
     }
 
     static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
+        sleep(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC * 3);
         auto current_view = leader_coordinator_->ReadCurrentView();
         EXPECT_TRUE(current_view.has_value()) << "Failed to read leader view";
     }
@@ -123,11 +136,17 @@ TEST_F(ChaosRandTest, RandomMasterCrashWithSmallValue) {
     // Start masters
     std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
         masters;
+    MasterRunnerConfig master_config{
+        .enable_ha = true,
+        .ha_backend_type = FLAGS_ha_backend_type,
+        .ha_backend_connstring = FLAGS_ha_backend_connstring,
+        .etcd_endpoints = FLAGS_etcd_endpoints,
+    };
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(
             std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
+                FLAGS_master_path, master_config, master_port_base + i, i,
+                FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
@@ -253,11 +272,17 @@ TEST_F(ChaosRandTest, RandomMasterCrashWithLargeValue) {
     // Start masters
     std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
         masters;
+    MasterRunnerConfig master_config{
+        .enable_ha = true,
+        .ha_backend_type = FLAGS_ha_backend_type,
+        .ha_backend_connstring = FLAGS_ha_backend_connstring,
+        .etcd_endpoints = FLAGS_etcd_endpoints,
+    };
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(
             std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
+                FLAGS_master_path, master_config, master_port_base + i, i,
+                FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 

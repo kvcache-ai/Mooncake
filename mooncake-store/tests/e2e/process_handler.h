@@ -21,6 +21,13 @@ inline const char* const TEST_MOUNT_FAILURE_STR = "[TEST_MOUNT_FAILURE]";
 inline const char* const TEST_UNMOUNT_SUCCESS_STR = "[TEST_UNMOUNT_SUCCESS]";
 inline const char* const TEST_UNMOUNT_FAILURE_STR = "[TEST_UNMOUNT_FAILURE]";
 
+struct MasterRunnerConfig {
+    bool enable_ha = true;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
+    std::string etcd_endpoints;
+};
+
 /**
  * @brief A wrapper for the master process.
  *
@@ -39,6 +46,9 @@ class MasterProcessHandler {
      */
     MasterProcessHandler(const std::string& path,
                          const std::string& etcd_endpoints, const int port,
+                         const int index, const std::string& out_dir);
+    MasterProcessHandler(const std::string& path,
+                         const MasterRunnerConfig& config, const int port,
                          const int index, const std::string& out_dir);
     ~MasterProcessHandler();
 
@@ -64,8 +74,8 @@ class MasterProcessHandler {
     pid_t master_pid_{0};
     // The path to the master executable.
     std::string master_path_;
-    // The etcd endpoints.
-    std::string etcd_endpoints_;
+    // The startup configuration for the master process.
+    MasterRunnerConfig config_;
     // The port of the master process.
     int port_;
     // The index of the master, used to name the log file.

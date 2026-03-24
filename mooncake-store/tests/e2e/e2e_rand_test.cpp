@@ -14,6 +14,8 @@
 
 USE_engine_flags;
 FLAG_etcd_endpoints;
+FLAG_ha_backend_type;
+FLAG_ha_backend_connstring;
 FLAG_master_path;
 FLAG_out_dir;
 FLAG_rand_seed;
@@ -48,8 +50,7 @@ class E2ERandTest : public ::testing::Test {
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
             host_name,              // Local hostname
             FLAGS_engine_meta_url,  // Metadata connection string
-            FLAGS_protocol, FLAGS_device_name,
-            "etcd://" + FLAGS_etcd_endpoints);
+            FLAGS_protocol, FLAGS_device_name, BuildTestMasterServerEntry());
         EXPECT_TRUE(client_opt.has_value()) << "Failed to create client";
         if (!client_opt.has_value()) {
             return nullptr;
@@ -58,7 +59,7 @@ class E2ERandTest : public ::testing::Test {
     }
 
     static void WaitMasterViewChange() {
-        sleep(ETCD_MASTER_VIEW_LEASE_TTL * 3);
+        sleep(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC * 3);
     }
 };
 
@@ -101,11 +102,17 @@ TEST_F(E2ERandTest, RandomSequentialDeletePutGet) {
     // Start masters
     std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
         masters;
+    MasterRunnerConfig master_config{
+        .enable_ha = true,
+        .ha_backend_type = FLAGS_ha_backend_type,
+        .ha_backend_connstring = FLAGS_ha_backend_connstring,
+        .etcd_endpoints = FLAGS_etcd_endpoints,
+    };
     for (int i = 0; i < master_num; ++i) {
         masters.emplace_back(
             std::make_unique<mooncake::testing::MasterProcessHandler>(
-                FLAGS_master_path, FLAGS_etcd_endpoints, master_port_base + i,
-                i, FLAGS_out_dir));
+                FLAGS_master_path, master_config, master_port_base + i, i,
+                FLAGS_out_dir));
         ASSERT_TRUE(masters.back()->start());
     }
 
