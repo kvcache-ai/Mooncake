@@ -20,7 +20,6 @@ namespace mooncake {
 inline constexpr size_t kP2PBufferSize = 1u << 20;
 inline constexpr size_t kP2PNumSlots = 8;
 inline constexpr size_t kP2PSlotSize = kP2PBufferSize / kP2PNumSlots;
-inline constexpr size_t kP2PTotalBufferSize = kP2PBufferSize * kMaxNumRanks;
 
 struct alignas(64) AtomicHeadTail {
     uint32_t load(
