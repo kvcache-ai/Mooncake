@@ -1786,58 +1786,61 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         return tl::unexpected(check_result.error());
     }
 
-    EnsureStorageControlPlaneStarted();
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        // Check if the segment overlaps with any existing segment
+        for (auto& it : mounted_segments_) {
+            auto& mtseg = it.second;
+            uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
+            uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
+            uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
+            uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
+            if (std::max(l1, l2) < std::min(r1, r2)) {
+                LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
+                           << " size1=" << mtseg.size << " base2=" << buffer
+                           << " size2=" << size;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
 
-    // Check if the segment overlaps with any existing segment
-    for (auto& it : mounted_segments_) {
-        auto& mtseg = it.second;
-        uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
-        uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
-        uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
-        uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
-        if (std::max(l1, l2) < std::min(r1, r2)) {
-            LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
-                       << " size1=" << mtseg.size << " base2=" << buffer
-                       << " size2=" << size;
+        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+                                                       location, true, true);
+        if (rc != 0) {
+            LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                       << " size=" << size << ", error=" << rc;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+
+        // Build segment with logical name; attach TE endpoint for transport
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = local_hostname_;
+        segment.base = reinterpret_cast<uintptr_t>(buffer);
+        segment.size = size;
+        segment.protocol = protocol;
+        // For P2P handshake mode, publish the actual transport endpoint that
+        // was negotiated by the transfer engine. Otherwise, keep the logical
+        // hostname so metadata backends (HTTP/etcd/redis) can resolve the
+        // segment by name.
+        if (metadata_connstring_ == P2PHANDSHAKE) {
+            segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
+        } else {
+            segment.te_endpoint = local_hostname_;
+        }
+
+        auto mount_result = master_client_.MountSegment(segment);
+        if (!mount_result) {
+            ErrorCode err = mount_result.error();
+            LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                       << " size=" << size << ", error=" << err;
+            return tl::unexpected(err);
+        }
+
+        mounted_segments_[segment.id] = segment;
     }
 
-    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                   location, true, true);
-    if (rc != 0) {
-        LOG(ERROR) << "register_local_memory_failed base=" << buffer
-                   << " size=" << size << ", error=" << rc;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Build segment with logical name; attach TE endpoint for transport
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = local_hostname_;
-    segment.base = reinterpret_cast<uintptr_t>(buffer);
-    segment.size = size;
-    segment.protocol = protocol;
-    // For P2P handshake mode, publish the actual transport endpoint that was
-    // negotiated by the transfer engine. Otherwise, keep the logical hostname
-    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
-    if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
-    } else {
-        segment.te_endpoint = local_hostname_;
-    }
-
-    auto mount_result = master_client_.MountSegment(segment);
-    if (!mount_result) {
-        ErrorCode err = mount_result.error();
-        LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
-                   << " size=" << size << ", error=" << err;
-        return tl::unexpected(err);
-    }
-
-    mounted_segments_[segment.id] = segment;
+    EnsureStorageControlPlaneStarted();
     return {};
 }
 
@@ -1938,15 +1941,16 @@ void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     bool enable_offloading) {
-    EnsureStorageControlPlaneStarted();
-
     auto response =
         master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
 
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
                    << response.error();
+        return response;
     }
+
+    EnsureStorageControlPlaneStarted();
     return response;
 }
 
