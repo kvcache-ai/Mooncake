@@ -49,6 +49,9 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     cq_outstanding_ = (volatile int *)cq->cq_context;
 
     max_wr_depth_ = (int)max_wr_depth;
+    max_sge_per_wr_ = max_sge_per_wr;
+    max_inline_bytes_ = max_inline_bytes;
+
     wr_depth_list_ = new volatile int[num_qp_list];
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
@@ -182,9 +185,9 @@ int RdmaEndPoint::setupConnectionsByActive() {
     // Re-acquire lock after RPC to finalize state transition
     RWSpinlock::WriteGuard guard(lock_);
 
-    // Handle simultaneous open: if the peer initiates a connection during our RPC
-    // and it is passively established in setupConnectionsByPassive, simply reuse the 
-    // existing endpoint.
+    // Handle simultaneous open: if the peer initiates a connection during our
+    // RPC and it is passively established in setupConnectionsByPassive, simply
+    // reuse the existing endpoint.
     if (connected()) {
         if (peer_qp_num_list_ == peer_desc.qp_num) {
             return 0;
@@ -253,17 +256,49 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             local_desc.qp_num = qpNum();
             return 0;
         }
-        // Different peer (e.g., peer restarted), disconnect and reconnect
+        // Different peer (e.g., peer restarted)
         LOG(WARNING) << "Re-establish connection: " << toString();
+
+        // If ERDMA is defined, keep the same logic as before.
+#ifdef CONFIG_ERDMA
+        // Save original construction parameters
+        size_t num_qp = qp_list_.size();
+        auto max_wr_depth = max_wr_depth_;
+        auto max_sge_per_wr = max_sge_per_wr_;
+        auto max_inline_bytes = max_inline_bytes_;
+
+        // Deconstruct and reconstruct to get fresh QPs (same as delete+create)
+        int ret = deconstruct();
+        if (ret) {
+            LOG(ERROR) << "Failed to deconstruct endpoint: " << ret;
+            return ret;
+        }
+
+        // Get CQ from context for reconstruction
+        ibv_cq *cq = context_.cq();
+        if (!cq) {
+            LOG(ERROR) << "No CQ available for endpoint reconstruction";
+            return ERR_ENDPOINT;
+        }
+
+        // Reconstruct with same parameters as original construction
+        ret = construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
+                        max_inline_bytes);
+        if (ret) {
+            LOG(ERROR) << "Failed to reconstruct endpoint: " << ret;
+            return ret;
+        }
+#else
         disconnectUnlocked();
+#endif
     }
 
-    // Handle simultaneous open: if the state is CONNECTING, we can safely proceed to
-    // establish the connection on this same endpoint. Because we're holding the lock, 
-    // even if there are already Active RPCs sent to the same peer nic path
-    // by setupConnectionsByActive, it will be blocked after the RPC return.
-    // Once the lock is released, they will simply observe the CONNECTED state
-    // and safely reuse the QP.
+    // Handle simultaneous open: if the state is CONNECTING, we can safely
+    // proceed to establish the connection on this same endpoint. Because we're
+    // holding the lock, even if there are already Active RPCs sent to the same
+    // peer nic path by setupConnectionsByActive, it will be blocked after the
+    // RPC return. Once the lock is released, they will simply observe the
+    // CONNECTED state and safely reuse the QP.
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {

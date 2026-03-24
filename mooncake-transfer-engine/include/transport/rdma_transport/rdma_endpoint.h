@@ -137,6 +137,8 @@ class RdmaEndPoint {
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;
+    size_t max_sge_per_wr_;
+    size_t max_inline_bytes_;
 
     volatile bool active_;
     volatile int *cq_outstanding_;
