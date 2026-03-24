@@ -1896,6 +1896,26 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::SelectBucketForEviction()
     return oldest_bucket;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+BucketStorageBackend::GetBucketLiveKeys(int64_t bucket_id) const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+
+    auto bucket_it = buckets_.find(bucket_id);
+    if (bucket_it == buckets_.end()) {
+        LOG(ERROR) << "Bucket " << bucket_id << " not found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    std::vector<std::string> live_keys;
+    live_keys.reserve(bucket_it->second->keys.size());
+    for (const auto& key : bucket_it->second->keys) {
+        if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
+            live_keys.push_back(key);
+        }
+    }
+    return live_keys;
+}
+
 tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
     int64_t bucket_id) {
     size_t freed_size = 0;

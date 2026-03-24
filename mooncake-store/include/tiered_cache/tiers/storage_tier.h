@@ -81,6 +81,12 @@ class StorageBuffer : public BufferBase {
         return is_on_disk_.load(std::memory_order_acquire);
     }
 
+    void MarkEvicted() { is_evicted_.store(true, std::memory_order_release); }
+
+    bool IsEvicted() const {
+        return is_evicted_.load(std::memory_order_acquire);
+    }
+
     void SetFlushing(bool flushing) {
         is_flushing_.store(flushing, std::memory_order_release);
     }
@@ -91,6 +97,9 @@ class StorageBuffer : public BufferBase {
 
     // Read data to destination buffer (handles staging vs disk transparently).
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
+        if (is_evicted_.load(std::memory_order_acquire)) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             if (!is_on_disk_.load(std::memory_order_acquire)) {
@@ -122,6 +131,7 @@ class StorageBuffer : public BufferBase {
     std::string key_;
     std::atomic<bool> is_on_disk_{false};
     std::atomic<bool> is_flushing_{false};
+    std::atomic<bool> is_evicted_{false};
     size_t size_ = 0;
 };
 

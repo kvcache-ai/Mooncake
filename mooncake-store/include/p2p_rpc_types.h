@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -92,13 +93,29 @@ struct RemoveReplicaRequest {
 YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id);
 
 /**
- * @brief Request to remove replicas from multiple segments in one call
+ * @brief Mutation type for batched replica metadata updates.
  */
-struct BatchRemoveReplicaRequest {
-    std::string key;
-    UUID client_id;
-    std::vector<UUID> segment_ids;
+enum class ReplicaMutationType : uint8_t {
+    REMOVE = 0,
 };
-YLT_REFL(BatchRemoveReplicaRequest, key, client_id, segment_ids);
+
+/**
+ * @brief One replica mutation entry in a batch request.
+ */
+struct ReplicaMutation {
+    ReplicaMutationType type = ReplicaMutationType::REMOVE;
+    std::string key;
+    UUID segment_id;
+};
+YLT_REFL(ReplicaMutation, type, key, segment_id);
+
+/**
+ * @brief Request to mutate multiple replicas in one call.
+ */
+struct BatchReplicaMutationRequest {
+    UUID client_id;
+    std::vector<ReplicaMutation> mutations;
+};
+YLT_REFL(BatchReplicaMutationRequest, client_id, mutations);
 
 }  // namespace mooncake

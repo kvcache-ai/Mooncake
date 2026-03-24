@@ -87,6 +87,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
     AddReplicaCallback add_replica_callback,
     RemoveReplicaCallback remove_replica_callback,
+    BatchReplicaMutationCallback batch_replica_mutation_callback,
     SegmentSyncCallback segment_sync_callback) {
     // Initialize DataCopier
     try {
@@ -100,6 +101,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     // Register callback for syncing metadata to Master
     add_replica_callback_ = add_replica_callback;
     remove_replica_callback_ = remove_replica_callback;
+    batch_replica_mutation_callback_ = batch_replica_mutation_callback;
     // Register callback for segment lifecycle synchronization with Master
     segment_sync_callback_ = segment_sync_callback;
 
@@ -771,6 +773,113 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         scheduler_->OnDelete(key, std::nullopt);
     }
     return tl::expected<void, ErrorCode>{};
+}
+
+tl::expected<void, ErrorCode> TieredBackend::DeleteBatchFromEviction(
+    const std::vector<std::string>& keys, const UUID& tier_id) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (keys.empty()) {
+        return {};
+    }
+
+    if (batch_replica_mutation_callback_) {
+        auto results = batch_replica_mutation_callback_(tier_id, keys);
+        if (results.size() != keys.size()) {
+            LOG(ERROR) << "Batch replica mutation callback returned "
+                          "unexpected result count: expected="
+                       << keys.size() << ", actual=" << results.size();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i].has_value()) {
+                LOG(ERROR) << "Failed to batch delete key " << keys[i]
+                           << " in tier " << tier_id
+                           << " for Master, error_code=" << results[i].error();
+                return tl::make_unexpected(results[i].error());
+            }
+        }
+    }
+
+    std::vector<AllocationHandle> detached_handles;
+    std::vector<std::string> deleted_keys;
+    detached_handles.reserve(keys.size());
+    deleted_keys.reserve(keys.size());
+
+    for (const auto& key : keys) {
+        bool found_tier = false;
+        bool need_cleanup = false;
+
+        {
+            std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+            auto it = metadata_index_.find(key);
+            if (it == metadata_index_.end()) {
+                VLOG(1) << "Skip missing key during bucket eviction: " << key;
+                continue;
+            }
+
+            auto entry = it->second;
+            std::unique_lock<std::shared_mutex> entry_write_lock(entry->mutex);
+            auto tier_it = entry->replicas.end();
+            for (auto it = entry->replicas.begin(); it != entry->replicas.end();
+                 ++it) {
+                if (it->first == tier_id) {
+                    tier_it = it;
+                    break;
+                }
+            }
+
+            if (tier_it == entry->replicas.end()) {
+                VLOG(1) << "Skip missing tier during bucket eviction: key="
+                        << key << ", tier_id=" << tier_id;
+                continue;
+            }
+
+            detached_handles.push_back(tier_it->second);
+            entry->replicas.erase(tier_it);
+            entry->version++;
+            found_tier = true;
+            need_cleanup = entry->replicas.empty();
+        }
+
+        if (need_cleanup) {
+            std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
+            auto it = metadata_index_.find(key);
+            if (it != metadata_index_.end()) {
+                auto entry = it->second;
+                std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+                if (entry->replicas.empty()) {
+                    metadata_index_.erase(it);
+                }
+            }
+        }
+
+        if (found_tier) {
+            deleted_keys.push_back(key);
+        }
+    }
+
+    for (const auto& handle : detached_handles) {
+        if (!handle || !handle->loc.data.buffer) {
+            continue;
+        }
+        auto* storage_buffer =
+            dynamic_cast<StorageBuffer*>(handle->loc.data.buffer.get());
+        if (storage_buffer) {
+            storage_buffer->MarkEvicted();
+        }
+    }
+
+    if (scheduler_) {
+        for (const auto& key : deleted_keys) {
+            scheduler_->OnDelete(key, tier_id);
+        }
+    }
+
+    return {};
 }
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(

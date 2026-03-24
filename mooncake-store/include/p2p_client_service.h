@@ -176,6 +176,12 @@ class P2PClientService final : public ClientService {
     RemoveReplicaCallback BuildRemoveReplicaCallback();
 
     /**
+     * @brief build batch replica mutation callback.
+     *        used by SSD bucket eviction to batch-sync replica metadata.
+     */
+    BatchReplicaMutationCallback BuildBatchReplicaMutationCallback();
+
+    /**
      * @brief build segment sync callback.
      *        when tier add/remove segment, call master to mount/unmount segment
      */
@@ -195,14 +201,12 @@ class P2PClientService final : public ClientService {
                                                     const UUID& tier_id);
 
     /**
-     * @brief handle batch DELETE: notify master to remove replicas from
-     *        multiple segments in one RPC call
-     * @param key Key to remove
-     * @param segment_ids Vector of segment IDs to remove (it will be moved)
-     * @return Vector of ErrorCode results for each segment
+     * @brief handle batch metadata mutations in one RPC call.
+     * @param mutations Mutation list; it will be moved into the request.
+     * @return Vector of ErrorCode results for each mutation.
      */
-    std::vector<tl::expected<void, ErrorCode>> SyncBatchRemoveReplica(
-        const std::string& key, std::vector<UUID> segment_ids);
+    std::vector<tl::expected<void, ErrorCode>> SyncBatchMutateReplica(
+        std::vector<ReplicaMutation> mutations);
 
     /**
      * @brief Collect tier info from DataManager and build P2P Segments.

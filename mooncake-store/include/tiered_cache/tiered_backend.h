@@ -93,6 +93,14 @@ using RemoveReplicaCallback = std::function<tl::expected<void, ErrorCode>(
     enum REMOVE_CALLBACK_TYPE type)>;
 
 /**
+ * @brief Callback for removing replicas for multiple keys in one tier.
+ * Used by SSD bucket eviction to batch-sync logical deletions to Master.
+ */
+using BatchReplicaMutationCallback =
+    std::function<std::vector<tl::expected<void, ErrorCode>>(
+        const UUID& tier_id, const std::vector<std::string>& keys)>;
+
+/**
  * @brief Callback for segment lifecycle synchronization.
  * Invoked when a tier is created (mount=true) or destroyed (mount=false).
  * The callback should register/unregister the segment with Master.
@@ -125,6 +133,7 @@ class TieredBackend {
         Json::Value root, TransferEngine* engine,
         AddReplicaCallback add_replica_callback,
         RemoveReplicaCallback remove_replica_callback,
+        BatchReplicaMutationCallback batch_replica_mutation_callback,
         SegmentSyncCallback segment_sync_callback);
 
     // --- Client-Centric Operations ---
@@ -194,6 +203,14 @@ class TieredBackend {
     tl::expected<void, ErrorCode> Delete(
         const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
+    /**
+     * @brief Remove replicas from one tier without invoking tier Free().
+     * Used by bucket eviction, where the storage tier reclaims the bucket as a
+     * whole after metadata has been detached from the cache namespace.
+     */
+    tl::expected<void, ErrorCode> DeleteBatchFromEviction(
+        const std::vector<std::string>& keys, const UUID& tier_id);
+
     // --- Composite Operations ---
 
     tl::expected<void, ErrorCode> CopyData(
@@ -261,6 +278,7 @@ class TieredBackend {
     // Callbacks for metadata synchronization with Master
     AddReplicaCallback add_replica_callback_;
     RemoveReplicaCallback remove_replica_callback_;
+    BatchReplicaMutationCallback batch_replica_mutation_callback_;
     // Callback for segment lifecycle synchronization with Master
     SegmentSyncCallback segment_sync_callback_;
 

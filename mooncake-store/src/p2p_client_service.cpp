@@ -143,11 +143,13 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     auto add_replica_callback = BuildAddReplicaCallback();
     auto remove_replica_callback = BuildRemoveReplicaCallback();
+    auto batch_replica_mutation_callback = BuildBatchReplicaMutationCallback();
     auto segment_sync_callback = BuildSegmentSyncCallback();
 
     auto init_result = tiered_backend->Init(
         config.tiered_backend_config, transfer_engine_.get(),
-        add_replica_callback, remove_replica_callback, segment_sync_callback);
+        add_replica_callback, remove_replica_callback,
+        batch_replica_mutation_callback, segment_sync_callback);
     if (!init_result) {
         LOG(ERROR) << "Failed to init TieredBackend: " << init_result.error();
         return init_result.error();
@@ -159,12 +161,13 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         [this](const std::string& key, std::optional<UUID> tier_id) {
             if (!tier_id) {
                 auto tier_views = data_manager_->GetTierViews();
-                std::vector<UUID> segment_ids;
-                segment_ids.reserve(tier_views.size());
+                std::vector<ReplicaMutation> mutations;
+                mutations.reserve(tier_views.size());
                 for (const auto& tv : tier_views) {
-                    segment_ids.push_back(tv.id);
+                    mutations.push_back(ReplicaMutation{
+                        ReplicaMutationType::REMOVE, key, tv.id});
                 }
-                SyncBatchRemoveReplica(key, std::move(segment_ids));
+                SyncBatchMutateReplica(std::move(mutations));
             } else {
                 SyncRemoveReplica(key, *tier_id);
             }
@@ -201,6 +204,20 @@ RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
         };
 }
 
+BatchReplicaMutationCallback
+P2PClientService::BuildBatchReplicaMutationCallback() {
+    return [this](const UUID& tier_id, const std::vector<std::string>& keys)
+               -> std::vector<tl::expected<void, ErrorCode>> {
+        std::vector<ReplicaMutation> mutations;
+        mutations.reserve(keys.size());
+        for (const auto& key : keys) {
+            mutations.push_back(
+                ReplicaMutation{ReplicaMutationType::REMOVE, key, tier_id});
+        }
+        return SyncBatchMutateReplica(std::move(mutations));
+    };
+}
+
 tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
     const std::string& key, const UUID& tier_id, size_t size) {
     AddReplicaRequest req;
@@ -235,17 +252,19 @@ tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-P2PClientService::SyncBatchRemoveReplica(const std::string& key,
-                                         std::vector<UUID> segment_ids) {
-    BatchRemoveReplicaRequest req;
-    req.key = key;
+P2PClientService::SyncBatchMutateReplica(
+    std::vector<ReplicaMutation> mutations) {
+    BatchReplicaMutationRequest req;
     req.client_id = client_id_;
-    req.segment_ids = std::move(segment_ids);
-    auto results = master_client_.BatchRemoveReplica(req);
+    req.mutations = std::move(mutations);
+
+    auto results = master_client_.BatchMutateReplica(req);
     for (size_t i = 0; i < results.size(); i++) {
         if (!results[i]) {
-            LOG(ERROR) << "Failed to remove replica for key: " << key
-                       << ", segment_id: " << req.segment_ids[i]
+            LOG(ERROR) << "Failed to mutate replica for key: "
+                       << req.mutations[i].key
+                       << ", segment_id: " << req.mutations[i].segment_id
+                       << ", type: " << static_cast<int>(req.mutations[i].type)
                        << ", error: " << results[i].error();
         }
     }

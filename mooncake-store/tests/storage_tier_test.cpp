@@ -28,10 +28,14 @@ class StorageTierTest : public ::testing::Test {
 
     void SetUp() override {
         unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
     }
 
     void TearDown() override {
         unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
     }
 
     std::unique_ptr<char[]> CreateTestBuffer(size_t size) {
@@ -585,6 +589,8 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
            "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
            "/tmp/mooncake_test_auto_eviction", 1);
+    setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "5", 1);
+    setenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "8192", 1);
 
     // Create a TieredBackend with small capacity (20KB)
     std::string json_config_str = R"({
@@ -602,7 +608,19 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        std::vector<std::vector<std::string>> deleted_batches;
+        BatchReplicaMutationCallback batch_replica_mutation_callback =
+            [&deleted_batches](const UUID& tier_id,
+                               const std::vector<std::string>& keys) {
+                static_cast<void>(tier_id);
+                deleted_batches.push_back(keys);
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    keys.size(), tl::expected<void, ErrorCode>{});
+            };
+
+        auto init_res =
+            InitTieredBackendForTest(backend, config, nullptr, nullptr, nullptr,
+                                     batch_replica_mutation_callback);
         ASSERT_TRUE(init_res.has_value());
 
         // Fill up the tier with data (~20KB)
@@ -645,6 +663,22 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
             << "Should succeed after automatic eviction";
 
         LOG(INFO) << "Successfully allocated after auto-eviction";
+        ASSERT_FALSE(deleted_batches.empty())
+            << "bucket eviction should batch-sync keys before reclaim";
+
+        bool saw_multi_key_batch = false;
+        for (const auto& batch : deleted_batches) {
+            if (batch.size() > 1) {
+                saw_multi_key_batch = true;
+            }
+            for (const auto& key : batch) {
+                EXPECT_FALSE(backend.Exist(key))
+                    << "evicted key should be removed from tiered metadata: "
+                    << key;
+            }
+        }
+        EXPECT_TRUE(saw_multi_key_batch)
+            << "bucket eviction should notify master with batched keys";
 
         // The evicted keys should no longer be in the storage backend
         // (they were removed from the bucket that was evicted)

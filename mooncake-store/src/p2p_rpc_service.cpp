@@ -18,7 +18,7 @@ void RegisterP2PRpcService(
     server.register_handler<&mooncake::WrappedP2PMasterService::RemoveReplica>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedP2PMasterService::BatchRemoveReplica>(
+        &mooncake::WrappedP2PMasterService::BatchMutateReplica>(
         &wrapped_master_service);
 }
 
@@ -50,24 +50,25 @@ tl::expected<void, ErrorCode> WrappedP2PMasterService::RemoveReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-WrappedP2PMasterService::BatchRemoveReplica(
-    const BatchRemoveReplicaRequest& req) {
-    ScopedVLogTimer timer(1, "BatchRemoveReplica");
-    const size_t total_requests = req.segment_ids.size();
-    timer.LogRequest("key=", req.key, "segment_count=", total_requests);
+WrappedP2PMasterService::BatchMutateReplica(
+    const BatchReplicaMutationRequest& req) {
+    ScopedVLogTimer timer(1, "BatchMutateReplica");
+    const size_t total_requests = req.mutations.size();
+    timer.LogRequest("mutation_count=", total_requests);
     MasterMetricManager::instance().inc_batch_remove_replica_requests(
         total_requests);
 
-    auto results = master_service_.BatchRemoveReplica(req);
+    auto results = master_service_.BatchMutateReplica(req);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchRemoveReplica failed for key '" << req.key
-                       << "', segment_id: " << req.segment_ids[i] << ": "
-                       << toString(error);
+            LOG(ERROR) << "BatchMutateReplica failed for key '"
+                       << req.mutations[i].key
+                       << "', segment_id: " << req.mutations[i].segment_id
+                       << ": " << toString(error);
         }
     }
 

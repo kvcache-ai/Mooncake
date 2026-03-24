@@ -271,36 +271,45 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     return {};
 }
 
-auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
+auto P2PMasterService::BatchMutateReplica(
+    const BatchReplicaMutationRequest& req)
     -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(req.segment_ids.size());
+    results.reserve(req.mutations.size());
 
     RemoveReplicaRequest single_req;
-    single_req.key = req.key;
     single_req.client_id = req.client_id;
-    for (const auto& segment_id : req.segment_ids) {
-        single_req.segment_id = segment_id;
+    for (const auto& mutation : req.mutations) {
+        if (mutation.type != ReplicaMutationType::REMOVE) {
+            LOG(ERROR) << "unsupported replica mutation type"
+                       << ", key: " << mutation.key
+                       << ", segment_id: " << mutation.segment_id
+                       << ", type: " << static_cast<int>(mutation.type);
+            results.push_back(tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED));
+            continue;
+        }
+
+        single_req.key = mutation.key;
+        single_req.segment_id = mutation.segment_id;
         auto result = RemoveReplica(single_req);
         if (!result.has_value()) {
             if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                // This may happen if the object is removed by another thread
-                LOG(INFO) << "object not found when batch remove replica"
-                          << ", key: " << req.key
+                LOG(INFO) << "object not found when batch mutate replica"
+                          << ", key: " << mutation.key
                           << ", client_id: " << req.client_id
-                          << ", segment_id: " << segment_id;
+                          << ", segment_id: " << mutation.segment_id;
                 results.push_back({});
             } else if (result.error() == ErrorCode::REPLICA_NOT_FOUND) {
-                // This may happen if the replica is removed by another thread
-                LOG(INFO) << "replica not found when batch remove replica"
-                          << ", key: " << req.key
+                LOG(INFO) << "replica not found when batch mutate replica"
+                          << ", key: " << mutation.key
                           << ", client_id: " << req.client_id
-                          << ", segment_id: " << segment_id;
+                          << ", segment_id: " << mutation.segment_id;
                 results.push_back({});
             } else {
-                LOG(ERROR) << "failed to remove replica" << ", key: " << req.key
+                LOG(ERROR) << "failed to mutate replica"
+                           << ", key: " << mutation.key
                            << ", client_id: " << req.client_id
-                           << ", segment_id: " << segment_id
+                           << ", segment_id: " << mutation.segment_id
                            << ", error: " << toString(result.error());
                 results.push_back(tl::make_unexpected(result.error()));
             }

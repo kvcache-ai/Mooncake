@@ -443,6 +443,40 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaPartial) {
     EXPECT_EQ(1, get_res.value().replicas.size());
 }
 
+TEST_F(P2PMasterServiceTest, BatchMutateReplicaMixedPatterns) {
+    auto service = CreateService();
+    auto seg1 = MakeP2PSegment("seg1");
+    auto seg2 = MakeP2PSegment("seg2");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg1, seg2}, "127.0.0.1", 50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg1.id);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg2.id);
+    AddReplicaHelper(*service, "key2", 1024, client_id, seg1.id);
+    AddReplicaHelper(*service, "key3", 1024, client_id, seg2.id);
+
+    BatchReplicaMutationRequest req;
+    req.client_id = client_id;
+    req.mutations = {
+        ReplicaMutation{ReplicaMutationType::REMOVE, "key1", seg1.id},
+        ReplicaMutation{ReplicaMutationType::REMOVE, "key1", seg2.id},
+        ReplicaMutation{ReplicaMutationType::REMOVE, "key2", seg1.id},
+        ReplicaMutation{ReplicaMutationType::REMOVE, "key3", seg2.id},
+    };
+
+    auto results = service->BatchMutateReplica(req);
+    ASSERT_EQ(results.size(), req.mutations.size());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    for (const auto& key : {"key1", "key2", "key3"}) {
+        auto get_res = service->GetReplicaList(key);
+        EXPECT_FALSE(get_res.has_value());
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
+    }
+}
+
 TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
     auto service = CreateService();
     auto seg = MakeP2PSegment();
