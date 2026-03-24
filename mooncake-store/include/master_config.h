@@ -794,6 +794,7 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<bool> enable_offload;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
@@ -810,6 +811,7 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<bool> enable_offload_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
@@ -838,6 +840,11 @@ class InProcMasterConfigBuilder {
 
     InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
         default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_enable_offload(bool enable) {
+        enable_offload_ = enable;
         return *this;
     }
 
@@ -890,6 +897,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.enable_offload = enable_offload_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
