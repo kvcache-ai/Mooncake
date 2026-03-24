@@ -18,6 +18,8 @@
 
 #include <cassert>
 #include <cstddef>
+#include <chrono>
+#include <thread>
 
 #include "common.h"
 #include "config.h"
@@ -80,9 +82,33 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     return 0;
 }
 
-void RdmaEndPoint::reinit() {
+int RdmaEndPoint::reconstruct() {
+    // Save original construction parameters
+    size_t num_qp = qp_list_.size();
+    auto max_wr_depth = max_wr_depth_;
+    auto max_sge_per_wr = max_sge_per_wr_;
+    auto max_inline_bytes = max_inline_bytes_;
+
+    // Deconstruct and reconstruct to get fresh QPs (same as delete+create)
+    int ret = deconstruct();
+    if (ret) {
+        LOG(ERROR) << "Failed to deconstruct endpoint: " << ret;
+        return ret;
+    }
+
+    // Get CQ from context for reconstruction
+    ibv_cq *cq = context_.cq();
+    if (!cq) {
+        LOG(ERROR) << "No CQ available for endpoint reconstruction";
+        return ERR_ENDPOINT;
+    }
+
+    // Reconstruct with same parameters as original construction
     status_.store(INITIALIZING, std::memory_order_relaxed);
     active_ = true;
+
+    return construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
+                     max_inline_bytes);
 }
 
 int RdmaEndPoint::deconstruct() {
@@ -104,6 +130,7 @@ int RdmaEndPoint::deconstruct() {
         }
     }
     qp_list_.clear();
+    peer_qp_num_list_.clear();
     delete[] wr_depth_list_;
     return 0;
 }
@@ -171,8 +198,20 @@ int RdmaEndPoint::setupConnectionsByActive() {
         LOG(INFO) << "Another thread is already performing the endpoint "
                      "handshake, waiting for it to complete";
         uint64_t start_time = getCurrentTimeInNano();
+        uint32_t spin_count = 0;
+        uint32_t sleep_us = kWaitExistingHandshakeInitialSleepUs;
         while (status_.load(std::memory_order_acquire) == CONNECTING) {
-            PAUSE();
+            if (spin_count < kWaitExistingHandshakeSpinCount) {
+                PAUSE();
+            } else {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(sleep_us));
+                uint32_t next = sleep_us * 2;
+                sleep_us = next > kWaitExistingHandshakeMaxSleepUs
+                               ? kWaitExistingHandshakeMaxSleepUs
+                               : next;
+            }
+            ++spin_count;
             // Prevent infinite wait with a 10-second timeout
             if (getCurrentTimeInNano() - start_time >
                 kWaitExistingHandshakeTimeoutNano) {
@@ -197,6 +236,22 @@ int RdmaEndPoint::setupConnectionsByActive() {
     if (connected()) {
         if (peer_qp_num_list_ == peer_desc.qp_num) {
             return 0;
+        }
+
+        // This mismatch scenario should be rare. It may occur when a peer
+        // first sends us an Active RPC and establishes a connection,
+        // then restarts, and eventually accepts and responds to our
+        // Active RPC.
+        LOG(WARNING) << "Peer QP list mismatch on connected endpoint, "
+                        "re-establishing connection: "
+                     << toString();
+
+        int ret = disconnectForReestablish();
+        if (ret) {
+            LOG(ERROR)
+                << "Failed to disconnect endpoint for re-establish connection: "
+                << ret;
+            return ret;
         }
     }
 
@@ -265,39 +320,13 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         // Different peer (e.g., peer restarted)
         LOG(WARNING) << "Re-establish connection: " << toString();
 
-        // If ERDMA is defined, keep the same logic as before.
-#ifdef CONFIG_ERDMA
-        // Save original construction parameters
-        size_t num_qp = qp_list_.size();
-        auto max_wr_depth = max_wr_depth_;
-        auto max_sge_per_wr = max_sge_per_wr_;
-        auto max_inline_bytes = max_inline_bytes_;
-
-        // Deconstruct and reconstruct to get fresh QPs (same as delete+create)
-        int ret = deconstruct();
+        int ret = disconnectForReestablish();
         if (ret) {
-            LOG(ERROR) << "Failed to deconstruct endpoint: " << ret;
+            LOG(ERROR)
+                << "Failed to disconnect endpoint for re-establish connection: "
+                << ret;
             return ret;
         }
-
-        // Get CQ from context for reconstruction
-        ibv_cq *cq = context_.cq();
-        if (!cq) {
-            LOG(ERROR) << "No CQ available for endpoint reconstruction";
-            return ERR_ENDPOINT;
-        }
-
-        // Reconstruct with same parameters as original construction
-        reinit();
-        ret = construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
-                        max_inline_bytes);
-        if (ret) {
-            LOG(ERROR) << "Failed to reconstruct endpoint: " << ret;
-            return ret;
-        }
-#else
-        disconnectUnlocked();
-#endif
     }
 
     // Handle simultaneous open: if the state is CONNECTING, we can safely
@@ -357,6 +386,16 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
 void RdmaEndPoint::disconnect() {
     RWSpinlock::WriteGuard guard(lock_);
     disconnectUnlocked();
+}
+
+int RdmaEndPoint::disconnectForReestablish() {
+    // If ERDMA is defined, keep the same logic as before.
+#ifdef CONFIG_ERDMA
+    return reconstruct();
+#else
+    disconnectUnlocked();
+    return 0;
+#endif
 }
 
 void RdmaEndPoint::disconnectUnlocked() {

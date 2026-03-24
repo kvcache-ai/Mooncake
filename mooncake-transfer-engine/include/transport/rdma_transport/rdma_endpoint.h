@@ -54,7 +54,7 @@ class RdmaEndPoint {
                   size_t max_wr = 256, size_t max_inline = 64);
 
    private:
-    void reinit();
+    int reconstruct();
     int deconstruct();
 
    public:
@@ -96,6 +96,10 @@ class RdmaEndPoint {
     // reconnect
     void disconnect();
 
+    // During disconnect for reestablishing, behaviors can be different
+    // when CONFIG_ERDMA is defined.
+    int disconnectForReestablish();
+
     // Destroy QPs before CQs (in RDMA Context)
     int destroyQP();
 
@@ -129,6 +133,9 @@ class RdmaEndPoint {
    private:
     static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =
         10 * 1000000000ull;  // 10 seconds
+    static constexpr uint32_t kWaitExistingHandshakeSpinCount = 500;
+    static constexpr uint32_t kWaitExistingHandshakeInitialSleepUs = 50;
+    static constexpr uint32_t kWaitExistingHandshakeMaxSleepUs = 2000;
 
     RdmaContext &context_;
     std::atomic<Status> status_;
