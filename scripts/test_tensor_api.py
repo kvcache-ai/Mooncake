@@ -754,8 +754,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                     rank_buffers[rank]['ptrs'],
                     rank_buffers[rank]['sizes'],
                     tp_rank=rank,
-                    tp_size=tp_size,
-                    split_dim=split_dim
+                    tp_size=tp_size
                 )
                 self.assertEqual(len(res), batch_size)
                 all_res.append(res)
