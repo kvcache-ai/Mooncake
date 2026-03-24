@@ -1,6 +1,5 @@
 #pragma once
 
-#include <bits/stdint-uintn.h>
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>

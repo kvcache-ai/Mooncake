@@ -15,8 +15,6 @@
 #ifndef MULTI_TRANSFER_ENGINE_IMPL_H_
 #define MULTI_TRANSFER_ENGINE_IMPL_H_
 
-#include <asm-generic/errno-base.h>
-#include <bits/stdint-uintn.h>
 #include <limits.h>
 #include <string.h>
 

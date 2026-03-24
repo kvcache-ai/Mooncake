@@ -33,16 +33,11 @@ def _elastic_worker(rank, num_processes, signals):
             signals["extend"] = 1
 
         backend = dist.group.WORLD._get_backend(torch.device("cpu"))
-        while True:
-            num_synced_ranks = pg.get_num_synced_ranks(backend)
-            if num_synced_ranks == num_processes:
-                break
-            # Simulate ongoing operations
-            tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cpu")
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            assert tensor.item() == sum(range(1, world_size + 1))
-
         # Extend world
+        # Note: `extend_group_size_to` is non-blocking. Blocking will only
+        # occur at the first communication if some peers have not yet connected.
+        # This allows overlapping other operations between the group expansion
+        # and the first communication call.
         pg.extend_group_size_to(backend, num_processes)
     else:
         while "extend" not in signals:

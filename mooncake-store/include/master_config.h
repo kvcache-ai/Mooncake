@@ -29,6 +29,8 @@ struct MasterConfig {
 
     bool enable_ha;
     bool enable_offload;
+    std::string ha_backend_type;
+    std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
     std::string cluster_id;
@@ -94,6 +96,8 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -148,7 +152,12 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = config.ha_backend_connstring;
         etcd_endpoints = config.etcd_endpoints;
+        if (ha_backend_connstring.empty()) {
+            ha_backend_connstring = etcd_endpoints;
+        }
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;

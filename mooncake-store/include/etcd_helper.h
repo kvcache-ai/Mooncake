@@ -71,6 +71,13 @@ class EtcdHelper {
     static ErrorCode GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id);
 
     /*
+     * @brief Revoke a lease in etcd immediately.
+     * @param lease_id: The lease id to revoke.
+     * @return: Error code.
+     */
+    static ErrorCode RevokeLease(EtcdLeaseId lease_id);
+
+    /*
      * @brief Watch a key until it is deleted. This is a blocking function.
      * @param key: The key to watch.
      * @param key_size: The size of the key in bytes.
@@ -101,6 +108,14 @@ class EtcdHelper {
      * @return: Error code.
      */
     static ErrorCode CancelKeepAlive(EtcdLeaseId lease_id);
+
+    /*
+     * @brief Wait until a keep alive context is registered and cancellable.
+     * @param lease_id: The lease id to wait for.
+     * @param timeout_ms: Wait timeout in milliseconds.
+     * @return: Error code.
+     */
+    static ErrorCode WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms);
 
     /*
      * @brief Put a key-value pair to etcd.

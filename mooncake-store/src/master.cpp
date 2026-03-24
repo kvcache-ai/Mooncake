@@ -10,7 +10,7 @@
 
 #include "default_config.h"
 #include "duration_utils.h"
-#include "ha_helper.h"
+#include "ha/master_service_supervisor.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -105,6 +105,11 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
 DEFINE_bool(enable_ha, false,
             "Enable high availability, which depends on etcd");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_string(ha_backend_type, "etcd",
+              "HA backend type, e.g. etcd | redis | k8s");
+DEFINE_string(ha_backend_connstring, "",
+              "HA backend connection string. If unset, fallback to "
+              "etcd_endpoints for backward compatibility");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
@@ -183,6 +188,19 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+namespace {
+
+std::string ResolveHABackendConnstring(
+    const mooncake::MasterConfig& master_config) {
+    if (!master_config.ha_backend_connstring.empty()) {
+        return master_config.ha_backend_connstring;
+    }
+    return master_config.etcd_endpoints;
+}
+
+}  // namespace
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -231,6 +249,11 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_ha);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
+    default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
+                             FLAGS_ha_backend_type);
+    default_config.GetString("ha_backend_connstring",
+                             &master_config.ha_backend_connstring,
+                             FLAGS_ha_backend_connstring);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -435,6 +458,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_offload = FLAGS_enable_offload;
     }
+    if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_backend_type = FLAGS_ha_backend_type;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_backend_connstring", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_backend_connstring = FLAGS_ha_backend_connstring;
+    }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -633,13 +666,26 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
 
-    if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
-        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
+    const std::string ha_backend_connstring =
+        ResolveHABackendConnstring(master_config);
+    if (master_config.enable_ha && ha_backend_connstring.empty()) {
+        LOG(FATAL) << "HA backend connection string must be set when "
+                   << "enable_ha is true";
         return 1;
     }
-    if (!master_config.enable_ha && !master_config.etcd_endpoints.empty()) {
+    if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
+                                     !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
-            << "Etcd endpoints are set but will not be used in non-HA mode";
+            << "HA backend connection string is set but will not be used in "
+            << "non-HA mode";
+    }
+    if (!master_config.ha_backend_connstring.empty() &&
+        !master_config.etcd_endpoints.empty() &&
+        master_config.ha_backend_connstring != master_config.etcd_endpoints) {
+        LOG(WARNING) << "Both ha_backend_connstring and etcd_endpoints are "
+                     << "set. Using ha_backend_connstring="
+                     << master_config.ha_backend_connstring
+                     << " for HA coordinator setup";
     }
     if (master_config.memory_allocator != "cachelib" &&
         master_config.memory_allocator != "offset") {
@@ -668,6 +714,8 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
+        << ", ha_backend_type=" << master_config.ha_backend_type
+        << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
@@ -731,7 +779,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
-        mooncake::MasterServiceSupervisor supervisor(
+        mooncake::ha::MasterServiceSupervisor supervisor(
             mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();
     } else {
