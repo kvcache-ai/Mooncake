@@ -20,6 +20,7 @@
 #include "client_buffer.hpp"
 #include "config.h"
 #include "mutex.h"
+#include "replica.h"
 #include "types.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -200,11 +201,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_offload) {
-    this->protocol = protocol;
+    std::stringstream ss(protocol);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) {
+            this->protocols.push_back(item);
+        }
+    }
     this->ipc_socket_path_ = ipc_socket_path;
-    const bool should_use_hugepage = use_hugepage_ &&
-                                     this->protocol != "ascend" &&
-                                     this->protocol != "ubshmem";
+    bool has_ascend = std::find(this->protocols.begin(), this->protocols.end(),
+                                "ascend") != this->protocols.end();
+    bool has_ubshmem = std::find(this->protocols.begin(), this->protocols.end(),
+                                 "ubshmem") != this->protocols.end();
+    const bool should_use_hugepage =
+        use_hugepage_ && !has_ascend && !has_ubshmem;
 
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
@@ -227,7 +237,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr =
             hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
         auto client_opt = mooncake::Client::Create(
-            this->local_hostname, metadata_server, protocol, device_name,
+            this->local_hostname, metadata_server, this->protocols, device_name,
             master_server_addr, transfer_engine);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
@@ -256,8 +266,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             this->local_rpc_addr =
                 hostname + ":" + std::to_string(local_rpc_port);
             auto client_opt = mooncake::Client::Create(
-                this->local_hostname, metadata_server, protocol, device_name,
-                master_server_addr, transfer_engine);
+                this->local_hostname, metadata_server, this->protocols,
+                device_name, master_server_addr, transfer_engine);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -286,9 +296,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
+    auto level_protocols = client_->GetLevelProtocols();
+    std::string ram_proto;
+    bool has_ram_level = false;
+
+    for (auto &level_protocol : level_protocols) {
+        if (level_protocol.first == StorageLevel::RAM) {
+            ram_proto = level_protocol.second;
+            has_ram_level = true;
+            break;
+        }
+    }
+
+    std::string proto_to_use;
+    if (has_ram_level) {
+        proto_to_use = ram_proto;
+    }
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage);
-    if (local_buffer_size > 0 && protocol != "cxl") {
+        local_buffer_size, proto_to_use, should_use_hugepage);
+
+    // Only register local memory for RAM level protocols
+    if (local_buffer_size > 0 && has_ram_level) {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
         auto result = client_->RegisterLocalMemory(
@@ -299,6 +327,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(result.error());
             return tl::unexpected(result.error());
         }
+    } else if (local_buffer_size > 0) {
+        LOG(INFO)
+            << "No RAM storage level found, skip registering local memory";
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -306,111 +337,120 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
     // mapped_shms.
-    if (protocol == "cxl") {
-        size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
-            char *end = nullptr;
-            unsigned long long val = strtoull(env, &end, 10);
-            if (end != env && *end == '\0')
-                cxl_dev_size = static_cast<size_t>(val);
-        } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
 
-        void *ptr = client_->GetBaseAddr();
-        LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
-                  << ptr;
-        auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
-        if (!mount_result.has_value()) {
-            LOG(ERROR) << "Failed to mount segment: "
-                       << toString(mount_result.error());
-            return tl::unexpected(mount_result.error());
-        }
-
-    } else {
-        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-        uint64_t total_glbseg_size = global_segment_size;  // For logging
-        uint64_t current_glbseg_size = 0;                  // For logging
-
-        // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
-        // and distribute global_segment across them for full NIC utilization.
-        std::vector<int> seg_numa_nodes;
-        if (!ipc_socket_path_.empty() && protocol == "rdma") {
-            seg_numa_nodes = client_->GetNicNumaNodes();
-            if (seg_numa_nodes.size() > 1) {
-                std::string nodes_str;
-                for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
-                    if (i) nodes_str += ",";
-                    nodes_str += std::to_string(seg_numa_nodes[i]);
-                }
-                LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
-                          << nodes_str << "]";
+    for (auto &level_protocol : level_protocols) {
+        if (level_protocol.first == StorageLevel::CXL) {
+            size_t cxl_dev_size = 0;
+            const char *env = std::getenv("MC_CXL_DEV_SIZE");
+            if (env) {
+                char *end = nullptr;
+                unsigned long long val = strtoull(env, &end, 10);
+                if (end != env && *end == '\0')
+                    cxl_dev_size = static_cast<size_t>(val);
             } else {
-                seg_numa_nodes.clear();
-            }
-        }
-
-        while (global_segment_size > 0) {
-            size_t segment_size = std::min(global_segment_size, max_mr_size);
-            global_segment_size -= segment_size;
-            current_glbseg_size += segment_size;
-            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                      << current_glbseg_size << " of " << total_glbseg_size;
-
-            size_t mapped_size = segment_size;
-            void *ptr = nullptr;
-            std::string seg_location = kWildcardLocation;
-
-            if (!seg_numa_nodes.empty()) {
-                // NUMA-segmented allocation: contiguous VMA, per-region binding
-                size_t page_sz = should_use_hugepage
-                                     ? get_hugepage_size_from_env()
-                                     : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * seg_numa_nodes.size());
-                ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
-                                                    page_sz);
-                seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
-            } else if (should_use_hugepage) {
-                mapped_size =
-                    align_up(segment_size, get_hugepage_size_from_env());
-                ptr = allocate_buffer_mmap_memory(mapped_size,
-                                                  get_hugepage_size_from_env());
-            } else {
-                ptr = allocate_buffer_allocator_memory(segment_size,
-                                                       this->protocol);
-            }
-
-            if (!ptr) {
-                LOG(ERROR) << "Failed to allocate segment memory";
+                LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
-                ascend_segment_ptrs_.emplace_back(
-                    ptr, AscendSegmentDeleter{this->protocol});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
-                // NUMA-segmented or hugepage: track as mmap allocation for
-                // munmap cleanup
-                hugepage_segment_ptrs_.emplace_back(
-                    ptr, HugepageSegmentDeleter{mapped_size});
-            } else {
-                segment_ptrs_.emplace_back(ptr);
-            }
+
+            void *ptr = client_->GetBaseAddr();
+            LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
+                      << ptr;
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, cxl_dev_size, level_protocol.second);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
             }
-        }
-        if (total_glbseg_size == 0) {
-            LOG(INFO) << "Global segment size is 0, skip mounting segment";
+
+        } else if (level_protocol.first == StorageLevel::RAM) {
+            auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
+            uint64_t total_glbseg_size = global_segment_size;  // For logging
+            uint64_t current_glbseg_size = 0;                  // For logging
+
+            // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
+            // and distribute global_segment across them for full NIC
+            // utilization.
+            std::vector<int> seg_numa_nodes;
+            if (!ipc_socket_path_.empty() && level_protocol.second == "rdma") {
+                seg_numa_nodes = client_->GetNicNumaNodes();
+                if (seg_numa_nodes.size() > 1) {
+                    std::string nodes_str;
+                    for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
+                        if (i) nodes_str += ",";
+                        nodes_str += std::to_string(seg_numa_nodes[i]);
+                    }
+                    LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
+                              << nodes_str << "]";
+                } else {
+                    seg_numa_nodes.clear();
+                }
+            }
+
+            while (global_segment_size > 0) {
+                size_t segment_size =
+                    std::min(global_segment_size, max_mr_size);
+                global_segment_size -= segment_size;
+                current_glbseg_size += segment_size;
+                LOG(INFO) << "Mounting RAM segment: " << segment_size
+                          << " bytes, " << current_glbseg_size << " of "
+                          << total_glbseg_size;
+
+                size_t mapped_size = segment_size;
+                void *ptr = nullptr;
+                std::string seg_location = kWildcardLocation;
+
+                if (!seg_numa_nodes.empty()) {
+                    // NUMA-segmented allocation: contiguous VMA, per-region
+                    // binding
+                    size_t page_sz = should_use_hugepage
+                                         ? get_hugepage_size_from_env()
+                                         : static_cast<size_t>(getpagesize());
+                    mapped_size =
+                        align_up(segment_size, page_sz * seg_numa_nodes.size());
+                    ptr = allocate_buffer_numa_segments(
+                        mapped_size, seg_numa_nodes, page_sz);
+                    seg_location =
+                        buildSegmentsLocation(page_sz, seg_numa_nodes);
+                } else if (should_use_hugepage) {
+                    mapped_size =
+                        align_up(segment_size, get_hugepage_size_from_env());
+                    ptr = allocate_buffer_mmap_memory(
+                        mapped_size, get_hugepage_size_from_env());
+                } else {
+                    ptr = allocate_buffer_allocator_memory(
+                        segment_size, level_protocol.second);
+                }
+
+                if (!ptr) {
+                    LOG(ERROR) << "Failed to allocate segment memory";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                if (level_protocol.second == "ascend" ||
+                    level_protocol.second == "ubshmem") {
+                    ascend_segment_ptrs_.emplace_back(
+                        ptr, AscendSegmentDeleter{level_protocol.second});
+                } else if (!seg_numa_nodes.empty() && should_use_hugepage) {
+                    // NUMA-segmented or hugepage: track as mmap allocation for
+                    // munmap cleanup
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    segment_ptrs_.emplace_back(ptr);
+                }
+                auto mount_result = client_->MountSegment(
+                    ptr, mapped_size, level_protocol.second, seg_location);
+                if (!mount_result.has_value()) {
+                    LOG(ERROR) << "Failed to mount segment: "
+                               << toString(mount_result.error());
+                    return tl::unexpected(mount_result.error());
+                }
+            }
+            if (total_glbseg_size == 0) {
+                LOG(INFO) << "Global segment size is 0, skip mounting segment";
+            }
         }
     }
-
     // Start IPC server to accept FD from dummy clients
     if (!ipc_socket_path_.empty()) {
         if (start_ipc_server() != 0) {
@@ -536,9 +576,21 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Validate protocol is supported
-    if (protocol != "tcp" && protocol != "rdma") {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << protocol
-                   << ", must be 'tcp' or 'rdma'";
+    std::stringstream ss(protocol);
+    std::string item;
+    bool has_valid_protocol = false;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) {
+            if (item != "tcp" && item != "rdma" && item != "cxl") {
+                LOG(ERROR) << "Invalid " << CONFIG_KEY_PROTOCOL << ": " << item
+                           << ", must be 'tcp', 'rdma' or 'cxl'";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            has_valid_protocol = true;
+        }
+    }
+    if (!has_valid_protocol) {
+        LOG(ERROR) << "No valid protocol specified";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -582,14 +634,28 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
-        protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
-        if (!unregister_result) {
-            LOG(WARNING)
-                << "Failed to unregister client local buffer on tear down: "
-                << toString(unregister_result.error());
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+        auto level_protocols = client_->GetLevelProtocols();
+        std::string ram_proto;
+        bool has_ram_level = false;
+        for (const auto &level_proto : level_protocols) {
+            if (level_proto.first == StorageLevel::RAM) {
+                ram_proto = level_proto.second;
+                has_ram_level = true;
+                break;
+            }
+        }
+        if (!has_ram_level) {
+            LOG(WARNING) << "No RAM storage level found, skip unregistering "
+                            "client local buffer";
+        } else {
+            auto unregister_result = client_->unregisterLocalMemory(
+                client_buffer_allocator_->getBase(), true);
+            if (!unregister_result) {
+                LOG(WARNING)
+                    << "Failed to unregister client local buffer on tear down: "
+                    << toString(unregister_result.error());
+            }
         }
     }
     // Reset all resources
@@ -600,7 +666,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
-    protocol = "";
+    protocols.clear();
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto shm_it = shm_contexts_.begin();
     while (shm_it != shm_contexts_.end()) {
@@ -1124,7 +1190,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
         context.client_buffer_allocator =
-            ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
+            ClientBufferAllocator::create(shm_buffer, shm_size);
     }
 
     context.mapped_shms.push_back(std::move(shm));

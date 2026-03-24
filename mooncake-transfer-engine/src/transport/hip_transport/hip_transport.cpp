@@ -410,7 +410,7 @@ int HipTransport::install(std::string &local_server_name,
     if (!desc) return ERR_MEMORY;
 
     desc->name = local_server_name_;
-    desc->protocol = "hip";
+    desc->protocol.push_back("hip");
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -652,6 +652,7 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
+        desc.protocol = "hip";
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
         return metadata_->addLocalMemoryBuffer(desc, true);
     }

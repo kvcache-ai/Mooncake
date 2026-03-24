@@ -166,6 +166,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
     uint64_t local2global_rank_map_[kMaxNumRanks];
+    std::string protocol_;
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than

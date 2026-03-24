@@ -103,8 +103,9 @@ TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     AllocatorManager allocator_manager;
 
     size_t slice_length = 100;
+    ReplicateConfig config;
     auto result =
-        strategy_->Allocate(allocator_manager, slice_length, 1, {}, {});
+        strategy_->Allocate(allocator_manager, slice_length, 1, {}, {}, config);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -115,8 +116,9 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
 
     size_t slice_length = 100;
     std::vector<std::string> preferred_segments = {"preferred_segment"};
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length, 1,
-                                      preferred_segments, {});
+                                      preferred_segments, {}, config);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -132,9 +134,10 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {"preferred"};
+    ReplicateConfig config;
 
     auto result = strategy_->Allocate(allocator_manager, slice_length, 1,
-                                      preferred_segments, {});
+                                      preferred_segments, {}, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 1);
     ASSERT_FALSE(result.value().empty());
@@ -158,9 +161,9 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentNotFound) {
 
     size_t slice_length = 1024;
     std::vector<std::string> preferred_segments = {"nonexistent"};
-
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length, 1,
-                                      preferred_segments, {});
+                                      preferred_segments, {}, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 1);
 
@@ -183,9 +186,9 @@ TEST_P(AllocationStrategyParameterizedTest, SingleSliceAllocation) {
     allocator_manager.addAllocator("segment2", allocator2);
 
     size_t slice_length = 1024;
-
+    ReplicateConfig config;
     auto result =
-        strategy_->Allocate(allocator_manager, slice_length, 1, {}, {});
+        strategy_->Allocate(allocator_manager, slice_length, 1, {}, {}, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 1);
 
@@ -208,9 +211,9 @@ TEST_P(AllocationStrategyParameterizedTest, MultipleReplicasAllocation) {
     allocator_manager.addAllocator("segment3", allocator3);
 
     size_t slice_length = 1024;
-
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length, 3, {},
-                                      {});  // Request 3 replicas
+                                      {}, config);  // Request 3 replicas
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 3);
 
@@ -249,10 +252,11 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     // before the test is done
     std::vector<std::vector<Replica>> results;
     // Allocate multiple times to fill up the preferred allocator
+    ReplicateConfig config;
     for (int i = 0; i < 4; ++i) {
         size_t large_slice = 15 * 1024 * 1024;  // 15MB
-        auto large_result = strategy_->Allocate(allocator_manager, large_slice,
-                                                1, preferred_segments, {});
+        auto large_result = strategy_->Allocate(
+            allocator_manager, large_slice, 1, preferred_segments, {}, config);
         ASSERT_TRUE(large_result.has_value());
         auto last_desc = large_result.value()[0].get_descriptor();
         ASSERT_TRUE(last_desc.is_memory_replica());
@@ -265,7 +269,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     // Now try to allocate more than remaining space in preferred segment
     size_t small_slice = 5 * 1024 * 1024;  // 5MB
     auto result = strategy_->Allocate(allocator_manager, small_slice, 1,
-                                      preferred_segments, {});
+                                      preferred_segments, {}, config);
     ASSERT_TRUE(result.has_value());
     auto small_desc = result.value()[0].get_descriptor();
     ASSERT_TRUE(small_desc.is_memory_replica());
@@ -291,16 +295,18 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     std::vector<std::vector<Replica>> results;
     // Allocate 8 times to use 120MB total
     for (int i = 0; i < 8; ++i) {
-        auto result =
-            strategy_->Allocate(allocator_manager, large_slice, 1, {}, {});
+        ReplicateConfig config;
+        auto result = strategy_->Allocate(allocator_manager, large_slice, 1, {},
+                                          {}, config);
         ASSERT_TRUE(result.has_value());
         results.emplace_back(std::move(result.value()));
     }
 
     // Try to allocate more than remaining space
     size_t impossible_slice = 5 * 1024 * 1024;  // 5MB (more than remaining)
-    auto result =
-        strategy_->Allocate(allocator_manager, impossible_slice, 1, {}, {});
+    ReplicateConfig config;
+    auto result = strategy_->Allocate(allocator_manager, impossible_slice, 1,
+                                      {}, {}, config);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -313,8 +319,9 @@ TEST_P(AllocationStrategyParameterizedTest, ZeroSizeAllocation) {
     allocator_manager.addAllocator("segment1", allocator);
 
     size_t zero_slice = 0;
-
-    auto result = strategy_->Allocate(allocator_manager, zero_slice, 1, {}, {});
+    ReplicateConfig config;
+    auto result =
+        strategy_->Allocate(allocator_manager, zero_slice, 1, {}, {}, config);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -327,8 +334,9 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
     allocator_manager.addAllocator("segment1", allocator);
 
     size_t huge_slice = 100 * 1024 * 1024;  // 100MB (larger than 64MB capacity)
-
-    auto result = strategy_->Allocate(allocator_manager, huge_slice, 1, {}, {});
+    ReplicateConfig config;
+    auto result =
+        strategy_->Allocate(allocator_manager, huge_slice, 1, {}, {}, config);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -344,9 +352,9 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     allocator_manager.addAllocator("segment1", allocator);
 
     size_t slice_length = 1024;
-
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length, 0, {},
-                                      {});  // Invalid: 0 replicas
+                                      {}, config);  // Invalid: 0 replicas
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -364,10 +372,10 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     allocator_manager.addAllocator("segment2", allocator2);
 
     size_t slice_length = 1024;
-
+    ReplicateConfig config;
     auto result = strategy_->Allocate(
-        allocator_manager, slice_length, 5, {},
-        {});  // Request 5 replicas, but only 2 segments available
+        allocator_manager, slice_length, 5, {}, {},
+        config);  // Request 5 replicas, but only 2 segments available
     // With best-effort semantics, should succeed with available replicas
     EXPECT_TRUE(result.has_value());
     // Should get 2 replicas (limited by number of segments)
@@ -409,8 +417,9 @@ TEST_P(AllocationStrategyParameterizedTest,
     std::vector<std::string> preferred_segments = {
         "preferred1", "preferred2"};  // Multiple preferred segments
 
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length, 2,
-                                      preferred_segments, {});
+                                      preferred_segments, {}, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 2);
 
@@ -440,9 +449,10 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
     size_t slice_length = 1024;
     std::set<std::string> excluded_segments = {"segment1", "segment3"};
 
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length,
                                       3,  // Requires 3 replicas
-                                      {}, excluded_segments);
+                                      {}, excluded_segments, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 2);  // Only 2 replicas should be allocated
 
@@ -470,8 +480,9 @@ TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
     size_t slice_length = 1024;
     std::set<std::string> excluded_segments = {"segment1"};
 
+    ReplicateConfig config;
     auto result = strategy_->Allocate(allocator_manager, slice_length, 1, {},
-                                      excluded_segments);
+                                      excluded_segments, config);
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -495,9 +506,11 @@ TEST_P(AllocationStrategyParameterizedTest,
     std::set<std::string> excluded_segments = {
         "segment1"};  // Exclude a different segment
 
-    auto result = strategy_->Allocate(allocator_manager, slice_length,
-                                      3,  // Requires 3 replicas
-                                      preferred_segments, excluded_segments);
+    ReplicateConfig config;
+    auto result =
+        strategy_->Allocate(allocator_manager, slice_length,
+                            3,  // Requires 3 replicas
+                            preferred_segments, excluded_segments, config);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value().size(), 3);
 
@@ -536,9 +549,11 @@ TEST_P(AllocationStrategyParameterizedTest,
     std::set<std::string> excluded_segments = {
         "segment1"};  // Exclude the preferred
 
-    auto result = strategy_->Allocate(allocator_manager, slice_length,
-                                      3,  // Requires 3 replicas
-                                      preferred_segments, excluded_segments);
+    ReplicateConfig config;
+    auto result =
+        strategy_->Allocate(allocator_manager, slice_length,
+                            3,  // Requires 3 replicas
+                            preferred_segments, excluded_segments, config);
     ASSERT_TRUE(result.has_value());  // Should still succeed by falling back to
                                       // other segments
     EXPECT_EQ(result.value().size(), 2);  // Only 2 replicas should be allocated
@@ -731,8 +746,10 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
 
     // Do allocations.
     auto start = std::chrono::steady_clock::now();
+    ReplicateConfig config;
     for (size_t i = 0; i < kNumAllocations; i++) {
-        auto result = strategy_->Allocate(allocator_manager, kAllocationSize);
+        auto result = strategy_->Allocate(allocator_manager, kAllocationSize, 1,
+                                          {}, {}, config);
         ASSERT_TRUE(result.has_value());
         ASSERT_EQ(result.value().size(), 1);
         replicas.emplace_back(std::move(result.value()));

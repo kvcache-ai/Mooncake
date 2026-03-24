@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include <unordered_map>
 
 namespace mooncake {
 
@@ -50,13 +51,13 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
                     cudaGetErrorString(get_device_error));
         cuda_device_index_ = current_device;
     }
-    AllocateResources();
 }
 
 P2PProxy::~P2PProxy() { ReleaseResources(); }
 
 void P2PProxy::BindMeta(const std::shared_ptr<TransferGroupMeta>& meta) {
     meta_ = meta;
+    AllocateResources();
 }
 
 void P2PProxy::AllocateResources() {
@@ -68,19 +69,27 @@ void P2PProxy::AllocateResources() {
         return;
     }
 
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    std::string proto = meta_->protocol;
+
     if (is_cpu_) {
         resources_.send_buffer_ = std::malloc(kP2PTotalBufferSize);
         TORCH_CHECK(resources_.send_buffer_ != nullptr,
                     "Failed to allocate CPU P2P send buffer");
-        int rc = engine_->registerLocalMemory(resources_.send_buffer_,
-                                              kP2PTotalBufferSize, location_);
+        buffer_map[proto].emplace_back(resources_.send_buffer_,
+                                       kP2PTotalBufferSize, location_);
+        int rc = engine_->registerLocalMemory(buffer_map);
         TORCH_CHECK(rc == 0, "Failed to register CPU P2P send buffer");
 
         resources_.recv_buffer_ = std::malloc(kP2PTotalBufferSize);
         TORCH_CHECK(resources_.recv_buffer_ != nullptr,
                     "Failed to allocate CPU P2P recv buffer");
-        rc = engine_->registerLocalMemory(resources_.recv_buffer_,
-                                          kP2PTotalBufferSize, location_);
+        buffer_map.clear();
+        buffer_map[proto].emplace_back(resources_.recv_buffer_,
+                                       kP2PTotalBufferSize, location_);
+        rc = engine_->registerLocalMemory(buffer_map);
         TORCH_CHECK(rc == 0, "Failed to register CPU P2P recv buffer");
     } else {
         SetCudaDeviceIfNeeded(
@@ -90,15 +99,18 @@ void P2PProxy::AllocateResources() {
             cudaMalloc(&resources_.send_buffer_, kP2PTotalBufferSize);
         TORCH_CHECK(err == cudaSuccess,
                     "Failed to allocate CUDA P2P send buffer");
-        int rc = engine_->registerLocalMemory(resources_.send_buffer_,
-                                              kP2PTotalBufferSize, location_);
+        buffer_map[proto].emplace_back(resources_.send_buffer_,
+                                       kP2PTotalBufferSize, location_);
+        int rc = engine_->registerLocalMemory(buffer_map);
         TORCH_CHECK(rc == 0, "Failed to register CUDA P2P send buffer");
 
         err = cudaMalloc(&resources_.recv_buffer_, kP2PTotalBufferSize);
         TORCH_CHECK(err == cudaSuccess,
                     "Failed to allocate CUDA P2P recv buffer");
-        rc = engine_->registerLocalMemory(resources_.recv_buffer_,
-                                          kP2PTotalBufferSize, location_);
+        buffer_map.clear();
+        buffer_map[proto].emplace_back(resources_.recv_buffer_,
+                                       kP2PTotalBufferSize, location_);
+        rc = engine_->registerLocalMemory(buffer_map);
         TORCH_CHECK(rc == 0, "Failed to register CUDA P2P recv buffer");
     }
 
@@ -151,14 +163,18 @@ void P2PProxy::AllocateResources() {
         }
     }
 
-    int rc = engine_->registerLocalMemory(resources_.ctrl_send_region_,
-                                          kMaxNumRanks * sizeof(P2PControlSlot),
-                                          location_);
+    buffer_map.clear();
+    buffer_map[proto].emplace_back(resources_.ctrl_send_region_,
+                                   kMaxNumRanks * sizeof(P2PControlSlot),
+                                   location_);
+    int rc = engine_->registerLocalMemory(buffer_map);
     TORCH_CHECK(rc == 0, "Failed to register P2P ctrl send region");
 
-    rc = engine_->registerLocalMemory(resources_.ctrl_recv_region_,
-                                      kMaxNumRanks * sizeof(P2PControlSlot),
-                                      location_);
+    buffer_map.clear();
+    buffer_map[proto].emplace_back(resources_.ctrl_recv_region_,
+                                   kMaxNumRanks * sizeof(P2PControlSlot),
+                                   location_);
+    rc = engine_->registerLocalMemory(buffer_map);
     TORCH_CHECK(rc == 0, "Failed to register P2P ctrl recv region");
 }
 
@@ -242,21 +258,31 @@ void P2PProxy::ReleaseResources() {
     if (!engine_) {
         return;
     }
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    std::string proto = meta_->protocol;
 
     if (resources_.ctrl_send_region_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.ctrl_send_region_);
+        buffer_map.clear();
+        buffer_map[proto].emplace_back(resources_.ctrl_send_region_);
+        engine_->unregisterLocalMemory(buffer_map);
         delete[] resources_.ctrl_send_region_;
         resources_.ctrl_send_region_ = nullptr;
     }
 
     if (resources_.ctrl_recv_region_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.ctrl_recv_region_);
+        buffer_map.clear();
+        buffer_map[proto].emplace_back(resources_.ctrl_recv_region_);
+        engine_->unregisterLocalMemory(buffer_map);
         delete[] resources_.ctrl_recv_region_;
         resources_.ctrl_recv_region_ = nullptr;
     }
 
     if (resources_.send_buffer_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.send_buffer_);
+        buffer_map.clear();
+        buffer_map[proto].emplace_back(resources_.send_buffer_);
+        engine_->unregisterLocalMemory(buffer_map);
         if (is_cpu_) {
             std::free(resources_.send_buffer_);
         } else {
@@ -266,7 +292,9 @@ void P2PProxy::ReleaseResources() {
     }
 
     if (resources_.recv_buffer_ != nullptr) {
-        engine_->unregisterLocalMemory(resources_.recv_buffer_);
+        buffer_map.clear();
+        buffer_map[proto].emplace_back(resources_.recv_buffer_);
+        engine_->unregisterLocalMemory(buffer_map);
         if (is_cpu_) {
             std::free(resources_.recv_buffer_);
         } else {
@@ -468,14 +496,17 @@ bool P2PProxy::StepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task) {
     bool did_work = false;
     if (!task.transfer_batch_id_.has_value()) {
         const BatchID batch_id = engine_->allocateBatchID(1);
+        std::string proto = meta_->protocol;
         engine_->submitTransfer(
-            batch_id, {TransferRequest{
-                          .opcode = TransferRequest::WRITE,
-                          .source = task.source_,
-                          .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                          .target_offset = task.target_offset_,
-                          .length = task.chunk_bytes_,
-                      }});
+            batch_id,
+            {TransferRequest{
+                .opcode = TransferRequest::WRITE,
+                .source = task.source_,
+                .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                .target_offset = task.target_offset_,
+                .length = task.chunk_bytes_,
+            }},
+            proto);
         task.transfer_batch_id_ = batch_id;
         did_work = true;
     }
@@ -545,14 +576,17 @@ bool P2PProxy::StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity) {
         GetRemoteCtrlRecvHeadOffset(op_ctx.peer_rank_);
 
     const BatchID batch_id = engine_->allocateBatchID(1);
+    std::string proto = meta_->protocol;
     engine_->submitTransfer(
-        batch_id, {TransferRequest{
-                      .opcode = TransferRequest::WRITE,
-                      .source = head_source,
-                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                      .target_offset = remote_head_offset,
-                      .length = sizeof(uint32_t),
-                  }});
+        batch_id,
+        {TransferRequest{
+            .opcode = TransferRequest::WRITE,
+            .source = head_source,
+            .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+            .target_offset = remote_head_offset,
+            .length = sizeof(uint32_t),
+        }},
+        proto);
     op_ctx.head_update_batch_id_ = batch_id;
     did_work = true;
 
@@ -700,14 +734,17 @@ bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
     void* tail_source = static_cast<void*>(&local_ctrl->tail.value);
 
     const BatchID batch_id = engine_->allocateBatchID(1);
+    std::string proto = meta_->protocol;
     engine_->submitTransfer(
-        batch_id, {TransferRequest{
-                      .opcode = TransferRequest::WRITE,
-                      .source = tail_source,
-                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                      .target_offset = remote_tail_offset,
-                      .length = sizeof(uint32_t),
-                  }});
+        batch_id,
+        {TransferRequest{
+            .opcode = TransferRequest::WRITE,
+            .source = tail_source,
+            .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+            .target_offset = remote_tail_offset,
+            .length = sizeof(uint32_t),
+        }},
+        proto);
     op_ctx.tail_update_batch_id_ = batch_id;
     did_work = true;
 

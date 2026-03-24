@@ -30,7 +30,8 @@ import "unsafe"
 type BatchID int64
 
 type TransferEngine struct {
-	engine C.transfer_engine_t
+	engine   C.transfer_engine_t
+	protocol string
 }
 
 func NewTransferEngine(metadataConnString string,
@@ -48,7 +49,8 @@ func NewTransferEngine(metadataConnString string,
 		return nil, ErrTransferEngine
 	}
 	return &TransferEngine{
-		engine: native_engine,
+		engine:   native_engine,
+		protocol: "tcp",
 	}, nil
 }
 
@@ -68,6 +70,7 @@ func (engine *TransferEngine) installTransport(protocol string, topologyMatrix s
 	if xport == nil {
 		return ErrTransferEngine
 	}
+	engine.protocol = protocol
 	return nil
 }
 
@@ -85,18 +88,22 @@ func (engine *TransferEngine) Close() {
 	C.destroyTransferEngine(engine.engine)
 }
 
-func (engine *TransferEngine) registerLocalMemory(addr uintptr, length uint64, location string) error {
+func (engine *TransferEngine) registerLocalMemory(addr uintptr, length uint64, location string, proto string) error {
 	locationCStr := C.CString(location)
+	protoCStr := C.CString(proto)
 	defer C.free(unsafe.Pointer(locationCStr))
-	ret := C.registerLocalMemory(engine.engine, unsafe.Pointer(addr), C.size_t(length), locationCStr, 1)
+	defer C.free(unsafe.Pointer(protoCStr))
+	ret := C.registerLocalMemory(engine.engine, unsafe.Pointer(addr), C.size_t(length), locationCStr, 1, protoCStr)
 	if ret < 0 {
 		return ErrTransferEngine
 	}
 	return nil
 }
 
-func (engine *TransferEngine) unregisterLocalMemory(addr uintptr) error {
-	ret := C.unregisterLocalMemory(engine.engine, unsafe.Pointer(addr))
+func (engine *TransferEngine) unregisterLocalMemory(addr uintptr, proto string) error {
+	protoCStr := C.CString(proto)
+	defer C.free(unsafe.Pointer(protoCStr))
+	ret := C.unregisterLocalMemory(engine.engine, unsafe.Pointer(addr), protoCStr)
 	if ret < 0 {
 		return ErrTransferEngine
 	}
@@ -143,7 +150,9 @@ func (engine *TransferEngine) submitTransfer(batchID BatchID, requests []Transfe
 		}
 	}
 
-	ret := C.submitTransfer(engine.engine, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)))
+	protocolCStr := C.CString(engine.protocol)
+	defer C.free(unsafe.Pointer(protocolCStr))
+	ret := C.submitTransfer(engine.engine, C.batch_id_t(batchID), &requestSlice[0], C.size_t(len(requests)), protocolCStr)
 	if ret != 0 {
 		return ErrTransferEngine
 	}

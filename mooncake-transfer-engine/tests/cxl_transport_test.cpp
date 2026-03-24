@@ -72,6 +72,9 @@ class CXLTransportTest : public ::testing::Test {
     mooncake::Transport::SegmentID segment_id;
     std::shared_ptr<TransferMetadata::SegmentDesc> segment_desc;
     const size_t kDataLength = 4 * 1024;
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
 
    protected:
     void SetUp() override {
@@ -104,12 +107,15 @@ class CXLTransportTest : public ::testing::Test {
         cxl_xport = dynamic_cast<CxlTransport *>(xport);
         base_addr = (uint8_t *)cxl_xport->getCxlBaseAddr();
         addr = (uint8_t *)allocateMemoryPool(kDataLength, 0, false);
-        int rc = engine->registerLocalMemory(base_addr + offset_1, len);
+
+        buffer_map[FLAGS_protocol].emplace_back(base_addr + offset_1, len);
+        int rc = engine->registerLocalMemory(buffer_map);
         ASSERT_EQ(rc, 0);
 
         segment_id = engine->openSegment(FLAGS_local_server_name.c_str());
         // bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
+        buffer_map.clear();
     }
 
     void TearDown() override {
@@ -136,8 +142,8 @@ TEST_F(CXLTransportTest, MultiWrite) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = offset_1;
-        // s = xport->submitTransfer(batch_id, {entry});
-        s = engine->submitTransfer(batch_id, {entry});
+        // s = xport->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         LOG_ASSERT(s.ok());
 
         bool completed = false;
@@ -171,8 +177,8 @@ TEST_F(CXLTransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = offset_2;
-        // s = xport->submitTransfer(batch_id, {entry});
-        s = engine->submitTransfer(batch_id, {entry});
+        // s = xport->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         LOG_ASSERT(s.ok());
 
         bool completed = false;
@@ -207,8 +213,8 @@ TEST_F(CXLTransportTest, MultipleRead) {
         entry.target_id = segment_id;
         entry.target_offset = offset_2;
         Status s;
-        // s = xport->submitTransfer(batch_id, {entry});
-        s = engine->submitTransfer(batch_id, {entry});
+        // s = xport->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
         ASSERT_EQ(s, Status::OK());
 
         bool completed = false;
@@ -230,7 +236,8 @@ TEST_F(CXLTransportTest, MultipleRead) {
 
         freeMemoryPool(src, kDataLength);
     }
-    engine->unregisterLocalMemory(addr);
+    buffer_map[FLAGS_protocol].emplace_back(addr);
+    engine->unregisterLocalMemory(buffer_map);
 }
 
 }  // namespace mooncake

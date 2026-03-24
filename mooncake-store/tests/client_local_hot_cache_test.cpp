@@ -177,9 +177,10 @@ class LocalHotCacheTest : public ::testing::Test {
     // Helper to create client with common parameters
     std::optional<std::shared_ptr<Client>> CreateTestClient(
         const std::string& hostname) {
+        std::vector<std::string> protocols = {"tcp"};
         return Client::Create(hostname,
                               "P2PHANDSHAKE",  // use in-proc metadata server
-                              "tcp", std::nullopt,
+                              protocols, std::nullopt,
                               master_address_);  // master server address
     }
 

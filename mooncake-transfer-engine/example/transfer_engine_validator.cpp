@@ -29,6 +29,7 @@
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "transport/cxl_transport/cxl_transport.h"
 
 #include "cuda_alike.h"
 #ifdef USE_CUDA
@@ -60,7 +61,11 @@ static void checkCudaError(cudaError_t result, const char *message) {
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
 
+#ifdef USE_CXL
+static int buffer_num = 1;
+#else
 static int buffer_num = NR_SOCKETS;
+#endif
 
 DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
@@ -69,7 +74,7 @@ DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|hip");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|hip|cxl");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -190,12 +195,18 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
         entry.source = (uint8_t *)(addr) +
                        FLAGS_block_size * (i * FLAGS_threads + thread_id);
         entry.target_id = handle;
-        entry.target_offset =
-            remote_base + FLAGS_block_size * (i * FLAGS_threads + thread_id);
+        if (FLAGS_protocol == "cxl") {
+            entry.target_offset =
+                0 + FLAGS_block_size * (i * FLAGS_threads + thread_id);
+        } else {
+            entry.target_offset =
+                remote_base +
+                FLAGS_block_size * (i * FLAGS_threads + thread_id);
+        }
         requests.emplace_back(entry);
     }
 
-    s = engine->submitTransfer(batch_id, requests);
+    s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
     if (!s.ok()) LOG(ERROR) << s.ToString();
     LOG_ASSERT(s.ok());
     for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
@@ -405,6 +416,8 @@ int initiator() {
             xport = engine->installTransport("nvlink_intra", nullptr);
         } else if (FLAGS_protocol == "hip") {
             xport = engine->installTransport("hip", nullptr);
+        } else if (FLAGS_protocol == "cxl") {
+            xport = engine->installTransport("cxl", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -412,7 +425,11 @@ int initiator() {
     }
 
     std::vector<void *> addr;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)) && \
+    !defined(USE_CXL)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
@@ -444,22 +461,24 @@ int initiator() {
             name_prefix = "cpu:";
             name_suffix = i;
         }
-        int rc = engine->registerLocalMemory(
+        buffer_map[FLAGS_protocol].emplace_back(
             addr[i], FLAGS_buffer_size,
             name_prefix + std::to_string(name_suffix));
-        LOG_ASSERT(!rc);
     }
 #else
     LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     addr.resize(buffer_num);
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu: " + std::to_string(i));
     }
 #endif
 
+    if (FLAGS_protocol != "cxl") {
+        int rc = engine->registerLocalMemory(buffer_map);
+        LOG_ASSERT(!rc);
+    }
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
     std::vector<std::thread> workers(FLAGS_threads);
@@ -487,9 +506,8 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
-
+    engine->unregisterLocalMemory(buffer_map);
     for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 
@@ -514,25 +532,31 @@ int target() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
+    Transport *xport = nullptr;
     if (!FLAGS_auto_discovery) {
         if (FLAGS_protocol == "rdma") {
             auto nic_priority_matrix = loadNicPriorityMatrix();
             void **args = (void **)malloc(2 * sizeof(void *));
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
-            engine->installTransport("rdma", args);
+            xport = engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "tcp") {
-            engine->installTransport("tcp", nullptr);
+            xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
-            engine->installTransport("nvlink", nullptr);
+            xport = engine->installTransport("nvlink", nullptr);
         } else if (FLAGS_protocol == "hip") {
-            engine->installTransport("hip", nullptr);
+            xport = engine->installTransport("hip", nullptr);
+        } else if (FLAGS_protocol == "cxl") {
+            xport = engine->installTransport("cxl", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
     }
 
     std::vector<void *> addr;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     if (FLAGS_use_vram) {
         int gpu_num;
@@ -565,25 +589,33 @@ int target() {
             name_prefix = "cpu:";
             name_suffix = i;
         }
-        int rc = engine->registerLocalMemory(
+        buffer_map[FLAGS_protocol].emplace_back(
             addr[i], FLAGS_buffer_size,
             name_prefix + std::to_string(name_suffix));
-        LOG_ASSERT(!rc);
     }
 #else
     LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     addr.resize(buffer_num);
-    for (int i = 0; i < buffer_num; ++i) {
-        addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+    if (FLAGS_protocol == "cxl") {
+#ifdef USE_CXL
+        CxlTransport *derivedPtr = dynamic_cast<CxlTransport *>(xport);
+        buffer_map[FLAGS_protocol].emplace_back(derivedPtr->getCxlBaseAddr(),
+                                                FLAGS_buffer_size);
+#endif
+    } else {
+        for (int i = 0; i < buffer_num; ++i) {
+            addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
+            buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                    "cpu:" + std::to_string(i));
+        }
     }
 #endif
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 
     while (target_running) sleep(1);
+    engine->unregisterLocalMemory(buffer_map);
     for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 

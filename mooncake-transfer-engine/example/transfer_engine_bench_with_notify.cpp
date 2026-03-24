@@ -226,7 +226,8 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         TransferMetadata::NotifyDesc notify;
         notify.name = "agent1";
         notify.notify_msg = "notification" + std::to_string(transfer_count);
-        s = engine->submitTransferWithNotify(batch_id, requests, notify);
+        s = engine->submitTransferWithNotify(batch_id, requests, notify,
+                                             FLAGS_protocol);
         if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
@@ -329,24 +330,28 @@ int initiator() {
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(
+            addr[i], FLAGS_buffer_size, name_prefix + std::to_string(i));
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu:" + std::to_string(i));
     }
 #endif
+
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
@@ -378,9 +383,8 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
-
+    engine->unregisterLocalMemory(buffer_map);
     for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 
@@ -425,24 +429,28 @@ int target() {
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             name_prefix + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(
+            addr[i], FLAGS_buffer_size, name_prefix + std::to_string(i));
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             "cpu:" + std::to_string(i));
-        LOG_ASSERT(!rc);
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu:" + std::to_string(i));
     }
 #endif
+
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
@@ -455,8 +463,8 @@ int target() {
         }
         notifies.clear();
     }
+    engine->unregisterLocalMemory(buffer_map);
     for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 

@@ -30,10 +30,11 @@ type RegisteredMemory struct {
 	bufferList   []BufferHandle
 	mu           sync.Mutex
 	maxChunkSize uint64
+	proto        string
 }
 
-func NewRegisteredMemory(transferEngine *TransferEngine, maxChunkSize uint64) *RegisteredMemory {
-	return &RegisteredMemory{engine: transferEngine, maxChunkSize: maxChunkSize}
+func NewRegisteredMemory(transferEngine *TransferEngine, maxChunkSize uint64, proto string) *RegisteredMemory {
+	return &RegisteredMemory{engine: transferEngine, maxChunkSize: maxChunkSize, proto: proto}
 }
 
 // Register memory region [addr, addr + length]. If the address has been registered, the reference count is incremented.
@@ -78,7 +79,7 @@ func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize ui
 		go func(offset, chunkSize uint64) {
 			defer wg.Done()
 			baseAddr := addr + uintptr(offset)
-			err := memory.engine.registerLocalMemory(baseAddr, chunkSize, location)
+			err := memory.engine.registerLocalMemory(baseAddr, chunkSize, location, memory.proto)
 			if err != nil {
 				select {
 				case errChan <- err:
@@ -99,7 +100,7 @@ func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize ui
 
 	if err := <-errChan; err != nil {
 		for _, baseAddr := range successfulTasks {
-			unregisterErr := memory.engine.unregisterLocalMemory(baseAddr)
+			unregisterErr := memory.engine.unregisterLocalMemory(baseAddr, memory.proto)
 			if unregisterErr != nil {
 				log.Println("cascading error:", unregisterErr)
 			}
@@ -139,7 +140,7 @@ func (memory *RegisteredMemory) Remove(addr uintptr, length uint64, maxShardSize
 		wg.Add(1)
 		go func(offset uint64) {
 			defer wg.Done()
-			err := memory.engine.unregisterLocalMemory(addr + uintptr(offset))
+			err := memory.engine.unregisterLocalMemory(addr + uintptr(offset), memory.proto)
 			if err != nil {
 				select {
 				case errChan <- err:

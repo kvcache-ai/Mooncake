@@ -322,7 +322,7 @@ int UBShmemTransport::install(std::string &local_server_name,
     if (!desc) return ERR_MEMORY;
 
     desc->name = local_server_name_;
-    desc->protocol = "ubshmem";
+    desc->protocol.push_back("ubshmem");
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -632,6 +632,7 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
+        desc.protocol = "ubshmem";
         desc.shm_name = serializeBinaryData((const void *)&export_handle_raw,
                                             sizeof(aclrtMemFabricHandle));
         return metadata_->addLocalMemoryBuffer(desc, true);

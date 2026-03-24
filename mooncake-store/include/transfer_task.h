@@ -364,9 +364,10 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
-    explicit TransferSubmitter(TransferEngine& engine,
-                               std::shared_ptr<StorageBackend>& backend,
-                               TransferMetric* transfer_metric = nullptr);
+    explicit TransferSubmitter(
+        TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+        TransferMetric* transfer_metric = nullptr,
+        std::unordered_map<StorageLevel, std::string> level_protocols = {});
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -394,7 +395,8 @@ class TransferSubmitter {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batched_slices,
+        StorageLevel storage_level = StorageLevel::RAM);
 
    private:
     TransferEngine& engine_;
@@ -402,6 +404,8 @@ class TransferSubmitter {
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
     TransferMetric* transfer_metric_;
+    // Store Level
+    std::unordered_map<StorageLevel, std::string> level_protocols_;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -433,8 +437,8 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        std::string& proto);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
@@ -447,7 +451,7 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests, std::string proto);
 };
 
 }  // namespace mooncake

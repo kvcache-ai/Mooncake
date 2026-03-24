@@ -83,15 +83,25 @@ int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {
 }
 
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
-                        const char *location, int remote_accessible) {
+                        const char *location, int remote_accessible,
+                        const char *proto) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->registerLocalMemory(addr, length, location,
-                                       remote_accessible, true);
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[proto].emplace_back(addr, length, location, remote_accessible,
+                                   true);
+    return native->registerLocalMemory(buffer_map);
 }
 
-int unregisterLocalMemory(transfer_engine_t engine, void *addr) {
+int unregisterLocalMemory(transfer_engine_t engine, void *addr,
+                          const char *proto) {
     TransferEngine *native = (TransferEngine *)engine;
-    return native->unregisterLocalMemory(addr);
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[proto].emplace_back(addr);
+    return native->unregisterLocalMemory(buffer_map);
 }
 
 int registerLocalMemoryBatch(transfer_engine_t engine,
@@ -123,7 +133,8 @@ batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
 }
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                   struct transfer_request *entries, size_t count) {
+                   struct transfer_request *entries, size_t count,
+                   char *protocol) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -135,14 +146,15 @@ int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
         native_entries[index].target_offset = entries[index].target_offset;
         native_entries[index].length = entries[index].length;
     }
-    Status s =
-        native->submitTransfer((Transport::BatchID)batch_id, native_entries);
+    std::string proto_str(protocol);
+    Status s = native->submitTransfer((Transport::BatchID)batch_id,
+                                      native_entries, proto_str);
     return (int)s.code();
 }
 
 int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
-                             notify_msg_t notify_msg) {
+                             notify_msg_t notify_msg, char *protocol) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<Transport::TransferRequest> native_entries;
     native_entries.resize(count);
@@ -157,8 +169,10 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
     TransferMetadata::NotifyDesc native_notify_msg;
     native_notify_msg.name = notify_msg.name;
     native_notify_msg.notify_msg = notify_msg.msg;
-    Status s = native->submitTransferWithNotify(
-        (Transport::BatchID)batch_id, native_entries, native_notify_msg);
+    std::string proto_str(protocol);
+    Status s = native->submitTransferWithNotify((Transport::BatchID)batch_id,
+                                                native_entries,
+                                                native_notify_msg, proto_str);
     return (int)s.code();
 }
 

@@ -98,7 +98,8 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 }
 
 Status MultiTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
+    BatchID batch_id, const std::vector<TransferRequest> &entries,
+    std::string &proto) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(
@@ -112,7 +113,7 @@ Status MultiTransport::submitTransfer(
         submit_tasks;
     for (auto &request : entries) {
         Transport *transport = nullptr;
-        auto status = selectTransport(request, transport);
+        auto status = selectTransport(request, transport, proto);
         if (!status.ok()) return status;
         assert(transport);
         auto &task = batch_desc.task_list[task_id];
@@ -341,26 +342,37 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 }
 
 Status MultiTransport::selectTransport(const TransferRequest &entry,
-                                       Transport *&transport) {
+                                       Transport *&transport,
+                                       std::string &preferred_proto) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
-    auto proto = target_segment_desc->protocol;
+    auto protos = target_segment_desc->protocol;
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
     // - Initiator side uses heterogeneous_rdma_transport
-    if (target_segment_desc->protocol == "rdma") {
-        proto = "ascend";
+    // if (target_segment_desc->protocol == "rdma") {
+    //     proto = "ascend";
+    // }
+    if (preferred_proto == "rdma" &&
+        std::find(protos.begin(), protos.end(), "rdma") != protos.end()) {
+        preferred_proto = "ascend";
     }
 #endif
-    if (!transport_map_.count(proto)) {
-        return Status::NotSupportedTransport("Transport " + proto +
+    if (std::find(protos.begin(), protos.end(), preferred_proto) ==
+            protos.end() ||
+        !transport_map_.count(preferred_proto)) {
+        return Status::NotSupportedTransport("Transport " + preferred_proto +
                                              " not installed");
     }
-    transport = transport_map_[proto].get();
+    // if (!transport_map_.count(proto)) {
+    //     return Status::NotSupportedTransport("Transport " + proto +
+    //                                          " not installed");
+    // }
+    transport = transport_map_[preferred_proto].get();
     return Status::OK();
 }
 

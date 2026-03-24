@@ -26,7 +26,23 @@ class MasterMetricManager {
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
-    double get_global_mem_used_ratio(void);
+    std::vector<double> get_global_used_ratio(void);
+
+    // DRAM Storage Metrics(global & segment)
+    void inc_allocated_dram_size(const std::string& segment, int64_t val = 1);
+    void dec_allocated_dram_size(const std::string& segment, int64_t val = 1);
+    void reset_allocated_dram_size();
+    void inc_total_dram_capacity(const std::string& segment, int64_t val = 1);
+    void dec_total_dram_capacity(const std::string& segment, int64_t val = 1);
+    void reset_total_dram_capacity();
+
+    // CXL Storage Metrics(global & segment)
+    void inc_allocated_cxl_size(const std::string& segment, int64_t val = 1);
+    void dec_allocated_cxl_size(const std::string& segment, int64_t val = 1);
+    void reset_allocated_cxl_size();
+    void inc_total_cxl_capacity(const std::string& segment, int64_t val = 1);
+    void dec_total_cxl_capacity(const std::string& segment, int64_t val = 1);
+    void reset_total_cxl_capacity();
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
@@ -59,11 +75,31 @@ class MasterMetricManager {
     void dec_total_mem_capacity(int64_t val = 1);
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
-    double get_segment_mem_used_ratio(const std::string& segment);
+    std::vector<double> get_segment_used_ratio(const std::string& segment);
     void reset_segment_allocated_mem_size(const std::string& segment);
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
+
+    // DRAM Storage Metrics
+    void inc_allocated_dram_size(int64_t val = 1);
+    void dec_allocated_dram_size(int64_t val = 1);
+    void inc_total_dram_capacity(int64_t val = 1);
+    void dec_total_dram_capacity(int64_t val = 1);
+    int64_t get_allocated_dram_size();
+    int64_t get_total_dram_capacity();
+    int64_t get_segment_allocated_dram_size(const std::string& segment);
+    int64_t get_segment_total_dram_capacity(const std::string& segment);
+
+    // CXL Storage Metrics
+    void inc_allocated_cxl_size(int64_t val = 1);
+    void dec_allocated_cxl_size(int64_t val = 1);
+    void inc_total_cxl_capacity(int64_t val = 1);
+    void dec_total_cxl_capacity(int64_t val = 1);
+    int64_t get_allocated_cxl_size();
+    int64_t get_total_cxl_capacity();
+    int64_t get_segment_allocated_cxl_size(const std::string& segment);
+    int64_t get_segment_total_cxl_capacity(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -323,6 +359,18 @@ class MasterMetricManager {
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
+
+    // DRAM Storage Metrics
+    ylt::metric::gauge_t dram_allocated_size_;
+    ylt::metric::gauge_t dram_total_capacity_;
+    ylt::metric::dynamic_gauge_1t dram_allocated_size_per_segment_;
+    ylt::metric::dynamic_gauge_1t dram_total_capacity_per_segment_;
+
+    // CXL Storage Metrics
+    ylt::metric::gauge_t cxl_allocated_size_;
+    ylt::metric::gauge_t cxl_total_capacity_;
+    ylt::metric::dynamic_gauge_1t cxl_allocated_size_per_segment_;
+    ylt::metric::dynamic_gauge_1t cxl_total_capacity_per_segment_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;

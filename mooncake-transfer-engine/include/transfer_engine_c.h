@@ -124,9 +124,11 @@ int removeLocalSegment(transfer_engine_t engine, const char *segment_name);
 void destroyTransferEngine(transfer_engine_t engine);
 
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
-                        const char *location, int remote_accessible);
+                        const char *location, int remote_accessible,
+                        const char *proto);
 
-int unregisterLocalMemory(transfer_engine_t engine, void *addr);
+int unregisterLocalMemory(transfer_engine_t engine, void *addr,
+                          const char *proto);
 
 int registerLocalMemoryBatch(transfer_engine_t engine,
                              buffer_entry_t *buffer_list, size_t buffer_len,
@@ -138,11 +140,12 @@ int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
-                   struct transfer_request *entries, size_t count);
+                   struct transfer_request *entries, size_t count,
+                   char *protocol);
 
 int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
                              struct transfer_request *entries, size_t count,
-                             notify_msg_t notify_msg);
+                             notify_msg_t notify_msg, char *protocol);
 
 notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size);
 

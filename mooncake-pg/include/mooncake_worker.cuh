@@ -40,6 +40,7 @@ struct TransferGroupMeta {
     c10::intrusive_ptr<::c10d::Store> store;
     int bufferBaseIndex;
     int backendIndex;
+    std::string protocol;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
 };

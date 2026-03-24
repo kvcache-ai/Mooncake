@@ -29,6 +29,7 @@
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "transport/cxl_transport/cxl_transport.h"
 
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
@@ -77,7 +78,11 @@ static void checkCudaError(cudaError_t result, const char *message) {
 const static int NR_SOCKETS =
     numa_available() == 0 ? numa_num_configured_nodes() : 1;
 
+#ifdef USE_CXL
+static int buffer_num = 1;
+#else
 static int buffer_num = NR_SOCKETS;
+#endif
 
 DEFINE_string(local_server_name, mooncake::getHostname(),
               "Local server name for segment discovery");
@@ -87,8 +92,9 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma",
-              "Transfer protocol: rdma|barex|tcp|efa|nvlink|nvlink_intra|hip");
+DEFINE_string(
+    protocol, "rdma",
+    "Transfer protocol: rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|cxl");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -366,13 +372,18 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             entry.source = (uint8_t *)(addr) +
                            FLAGS_block_size * (i * FLAGS_threads + thread_id);
             entry.target_id = segment_id;
-            entry.target_offset =
-                remote_base +
-                FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            if (FLAGS_protocol == "cxl") {
+                entry.target_offset =
+                    0 + FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            } else {
+                entry.target_offset =
+                    remote_base +
+                    FLAGS_block_size * (i * FLAGS_threads + thread_id);
+            }
             requests.emplace_back(entry);
         }
 
-        s = engine->submitTransfer(batch_id, requests);
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
         if (!s.ok()) LOG(ERROR) << s.ToString();
         LOG_ASSERT(s.ok());
         for (int task_id = 0; task_id < FLAGS_batch_size; ++task_id) {
@@ -466,7 +477,7 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
-               FLAGS_protocol == "ubshmem") {
+               FLAGS_protocol == "ubshmem" || FLAGS_protocol == "cxl") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -489,9 +500,15 @@ int initiator() {
     }
 
     auto addr = allocateBuffers();
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
     for (int i = 0; i < buffer_num; ++i) {
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             getLocationName(i));
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                getLocationName(i));
+    }
+    if (FLAGS_protocol != "cxl") {
+        int rc = engine->registerLocalMemory(buffer_map);
         LOG_ASSERT(!rc);
     }
 
@@ -523,9 +540,10 @@ int initiator() {
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
 
-    for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
+    if (FLAGS_protocol != "cxl") {
+        engine->unregisterLocalMemory(buffer_map);
     }
+
     freeBuffers(addr);
 
     return 0;
@@ -556,20 +574,32 @@ int target() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
-    installTransportFromFlags(engine.get());
+    Transport *xport = installTransportFromFlags(engine.get());
 
-    auto addr = allocateBuffers();
-    for (int i = 0; i < buffer_num; ++i) {
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             getLocationName(i));
-        LOG_ASSERT(!rc);
+    std::vector<void *> addr;
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    if (FLAGS_protocol == "cxl") {
+#ifdef USE_CXL
+        CxlTransport *derivedPtr = dynamic_cast<CxlTransport *>(xport);
+        addr.push_back(derivedPtr->getCxlBaseAddr());
+        buffer_map[FLAGS_protocol].emplace_back(addr[0], FLAGS_buffer_size,
+                                                getLocationName(0));
+#endif
+    } else {
+        addr = allocateBuffers();
+        for (int i = 0; i < buffer_num; ++i) {
+            buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                    getLocationName(i));
+        }
     }
 
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
     while (target_running) sleep(1);
 
-    for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
-    }
+    engine->unregisterLocalMemory(buffer_map);
     freeBuffers(addr);
 
     return 0;
@@ -671,7 +701,7 @@ void initiatorWorker(mooncake::tent::TransferEngine *engine,
             requests.emplace_back(entry);
         }
 
-        auto s = engine->submitTransfer(batch_id, requests);
+        auto s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
         LOG_ASSERT(s.ok()) << "submitTransfer failed: " << s.ToString();
 
         while (true) {

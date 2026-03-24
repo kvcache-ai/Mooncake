@@ -12,6 +12,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "master_metric_manager.h"
+#include "replica.h"
 #include "segment.h"
 #include "types.h"
 #include "serialize/serializer.hpp"
@@ -145,7 +146,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (enable_cxl_) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        // When CXL is enabled:
+        // - RAM storage uses RandomAllocationStrategy (original single-protocol
+        // strategy)
+        // - CXL storage uses CxlAllocationStrategy
+        cxl_allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
@@ -715,6 +720,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
     }
 
+    ReplicateConfig client_config = config;
     // Allocate replicas
     std::vector<Replica> replicas;
     {
@@ -729,9 +735,27 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             preferred_segments = config.preferred_segments;
         }
 
-        auto allocation_result = allocation_strategy_->Allocate(
+        // Select allocation strategy based on preferred_storage_level
+        // - CXL storage level always uses CxlAllocationStrategy
+        // - RAM storage level uses the configured allocation strategy (RANDOM
+        // or FREE_RATIO_FIRST)
+        std::shared_ptr<AllocationStrategy> strategy;
+        if (enable_cxl_) {
+            // When CXL is enabled, choose strategy based on storage level
+            if (config.preferred_storage_level == StorageLevel::CXL) {
+                strategy = cxl_allocation_strategy_;
+            } else if (config.preferred_storage_level == StorageLevel::RAM) {
+                strategy = allocation_strategy_;
+            }
+        } else {
+            // When CXL is not enabled, use the configured RAM allocation
+            // strategy
+            strategy = allocation_strategy_;
+        }
+
+        auto allocation_result = strategy->Allocate(
             allocator_manager, slice_length, config.replica_num,
-            preferred_segments);
+            preferred_segments, std::set<std::string>(), client_config);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key
@@ -1741,20 +1765,21 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
-        if (used_ratio > eviction_high_watermark_ratio_ ||
+        std::vector<double> used_ratios =
+            MasterMetricManager::instance().get_global_used_ratio();
+        if (used_ratios[0] > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
-            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
+            LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratios[0]
                       << " high_watermark=" << eviction_high_watermark_ratio_
                       << " need_eviction=" << need_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
-            double evict_ratio_target = std::max(
-                eviction_ratio_,
-                used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);
+            double evict_ratio_target =
+                std::max(eviction_ratio_, used_ratios[0] -
+                                              eviction_high_watermark_ratio_ +
+                                              eviction_ratio_);
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
-                         used_ratio - eviction_high_watermark_ratio_);
+                         used_ratios[0] - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;

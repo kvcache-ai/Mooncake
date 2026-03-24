@@ -114,7 +114,8 @@ void MooncakeWorker::startWorker() {
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
-                    group->engine->submitTransfer(task.batchID, entries);
+                    std::string proto = group->protocol;
+                    group->engine->submitTransfer(task.batchID, entries, proto);
                     activeTime[i] = clock::now();
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);
@@ -193,7 +194,8 @@ void MooncakeWorker::startWorker() {
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
-                    group->engine->submitTransfer(task.batchID, entries);
+                    std::string proto = group->protocol;
+                    group->engine->submitTransfer(task.batchID, entries, proto);
                     activeTime[i] = clock::now();
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==

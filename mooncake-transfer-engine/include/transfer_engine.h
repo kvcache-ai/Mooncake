@@ -36,6 +36,24 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
+    struct RegisteredBuffer {
+        void* addr;
+        size_t length;
+        std::string location;
+        bool remote_accessible;
+        bool update_metadata;
+
+        RegisteredBuffer(void* addr, size_t length = 0,
+                         std::string location = kWildcardLocation,
+                         bool remote_accessible = true,
+                         bool update_metadata = true)
+            : addr(addr),
+              length(length),
+              location(location),
+              remote_accessible(remote_accessible),
+              update_metadata(update_metadata) {}
+    };
+
     TransferEngine(bool auto_discover = false);
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
@@ -65,12 +83,13 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
-    int registerLocalMemory(void* addr, size_t length,
-                            const std::string& location = kWildcardLocation,
-                            bool remote_accessible = true,
-                            bool update_metadata = true);
+    int registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
 
-    int unregisterLocalMemory(void* addr, bool update_metadata = true);
+    int unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
 
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string& location);
@@ -82,11 +101,13 @@ class TransferEngine {
     Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest>& entries);
+                          const std::vector<TransferRequest>& entries,
+                          std::string& proto);
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
-                                    TransferMetadata::NotifyDesc notify_msg);
+                                    TransferMetadata::NotifyDesc notify_msg,
+                                    std::string& proto);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
