@@ -169,7 +169,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
         while (status_.load(std::memory_order_acquire) == CONNECTING) {
             PAUSE();
             // Prevent infinite wait with a 10-second timeout
-            if (getCurrentTimeInNano() - start_time > 10 * 1000000000ull) {
+            if (getCurrentTimeInNano() - start_time >
+                kWaitExistingHandshakeTimeoutNano) {
                 return ERR_ENDPOINT;
             }
         }

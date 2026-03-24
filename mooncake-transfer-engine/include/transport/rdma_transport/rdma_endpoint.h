@@ -126,6 +126,9 @@ class RdmaEndPoint {
                           std::string *reply_msg = nullptr);
 
    private:
+    static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =
+        10 * 1000000000ull;  // 10 seconds
+
     RdmaContext &context_;
     std::atomic<Status> status_;
 
