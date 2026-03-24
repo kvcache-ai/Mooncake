@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstddef>
 
+#include "common.h"
 #include "config.h"
 
 namespace mooncake {
@@ -111,44 +112,97 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
 }
 
 int RdmaEndPoint::setupConnectionsByActive() {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (connected()) {
-        LOG(INFO) << "Connection has been established";
-        return 0;
-    }
-
-    // loopback mode
-    if (context_.nicPath() == peer_nic_path_) {
-        auto segment_desc =
-            context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        if (segment_desc) {
-            for (auto &nic : segment_desc->devices)
-                if (nic.name == context_.deviceName())
-                    return doSetupConnection(nic.gid, nic.lid, qpNum());
-        }
-        LOG(ERROR) << "Peer NIC " << context_.deviceName()
-                   << " not found in localhost";
-        return ERR_DEVICE_NOT_FOUND;
-    }
-
     HandShakeDesc local_desc, peer_desc;
-    local_desc.local_nic_path = context_.nicPath();
-    local_desc.peer_nic_path = peer_nic_path_;
-    local_desc.qp_num = qpNum();
+    std::string peer_server_name, peer_nic_name;
+    bool do_rpc = false;
 
-    auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
-    auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
-    if (peer_server_name.empty() || peer_nic_name.empty()) {
-        LOG(ERROR) << "Parse peer nic path failed: " << peer_nic_path_;
-        return ERR_INVALID_ARGUMENT;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (connected()) {
+            LOG(INFO) << "Connection has been established";
+            return 0;
+        }
+
+        // loopback mode
+        if (context_.nicPath() == peer_nic_path_) {
+            auto segment_desc =
+                context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+            if (segment_desc) {
+                for (auto &nic : segment_desc->devices)
+                    if (nic.name == context_.deviceName())
+                        return doSetupConnection(nic.gid, nic.lid, qpNum());
+            }
+            LOG(ERROR) << "Peer NIC " << context_.deviceName()
+                       << " not found in localhost";
+            return ERR_DEVICE_NOT_FOUND;
+        }
+
+        // Only proceed with RPC if we are the first to transition from
+        // UNCONNECTED. This prevents duplicate concurrent handshake attempts
+        // from the same endpoint.
+        auto current_status = status_.load(std::memory_order_relaxed);
+        if (current_status == UNCONNECTED) {
+            status_.store(CONNECTING, std::memory_order_relaxed);
+            do_rpc = true;
+
+            peer_server_name = getServerNameFromNicPath(peer_nic_path_);
+            peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
+            if (peer_server_name.empty() || peer_nic_name.empty()) {
+                LOG(ERROR) << "Parse peer nic path failed: " << peer_nic_path_;
+                disconnectUnlocked();
+                return ERR_INVALID_ARGUMENT;
+            }
+
+            local_desc.local_nic_path = context_.nicPath();
+            local_desc.peer_nic_path = peer_nic_path_;
+            local_desc.qp_num = qpNum();
+        }
     }
 
+    if (!do_rpc) {
+        LOG(INFO) << "Another thread is already performing the endpoint "
+                     "handshake, waiting for it to complete";
+        uint64_t start_time = getCurrentTimeInNano();
+        while (status_.load(std::memory_order_acquire) == CONNECTING) {
+            PAUSE();
+            // Prevent infinite wait with a 10-second timeout
+            if (getCurrentTimeInNano() - start_time > 10 * 1000000000ull) {
+                return ERR_ENDPOINT;
+            }
+        }
+        RWSpinlock::ReadGuard guard(lock_);
+        return connected() ? 0 : ERR_ENDPOINT;
+    }
+
+    // Perform the RPC without holding the lock to avoid deadlock and allow
+    // "simultaneous open" handshake handling.
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
-    if (rc) return rc;
+
+    // Re-acquire lock after RPC to finalize state transition
+    RWSpinlock::WriteGuard guard(lock_);
+
+    // Handle simultaneous open: if the peer initiates a connection during our RPC
+    // and it is passively established in setupConnectionsByPassive, simply reuse the 
+    // existing endpoint.
+    if (connected()) {
+        if (peer_qp_num_list_ == peer_desc.qp_num) {
+            return 0;
+        }
+    }
+
+    if (rc) {
+        if (status_.load(std::memory_order_relaxed) == CONNECTING) {
+            disconnectUnlocked();
+        }
+        return rc;
+    }
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Reject the handshake request by peer "
                    << local_desc.peer_nic_path;
+        if (status_.load(std::memory_order_relaxed) == CONNECTING) {
+            disconnectUnlocked();
+        }
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -160,18 +214,31 @@ int RdmaEndPoint::setupConnectionsByActive() {
                    << ", local.peer_nic_path: " << local_desc.peer_nic_path
                    << ", peer.local_nic_path: " << peer_desc.local_nic_path
                    << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
+        if (status_.load(std::memory_order_relaxed) == CONNECTING) {
+            disconnectUnlocked();
+        }
         return ERR_REJECT_HANDSHAKE;
     }
 
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
-            if (nic.name == peer_nic_name)
-                return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
+        for (auto &nic : segment_desc->devices) {
+            if (nic.name == peer_nic_name) {
+                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
+                if (ret != 0 &&
+                    status_.load(std::memory_order_relaxed) == CONNECTING) {
+                    disconnectUnlocked();
+                }
+                return ret;
+            }
+        }
     }
     LOG(ERROR) << "Peer NIC " << peer_nic_name << " not found in "
                << peer_server_name;
+    if (status_.load(std::memory_order_relaxed) == CONNECTING) {
+        disconnectUnlocked();
+    }
     return ERR_DEVICE_NOT_FOUND;
 }
 
@@ -179,9 +246,24 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                             HandShakeDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
+        // If already connected with the same peer QP info, return success
+        if (peer_qp_num_list_ == peer_desc.qp_num) {
+            local_desc.local_nic_path = context_.nicPath();
+            local_desc.peer_nic_path = peer_nic_path_;
+            local_desc.qp_num = qpNum();
+            return 0;
+        }
+        // Different peer (e.g., peer restarted), disconnect and reconnect
         LOG(WARNING) << "Re-establish connection: " << toString();
         disconnectUnlocked();
     }
+
+    // Handle simultaneous open: if the state is CONNECTING, we can safely proceed to
+    // establish the connection on this same endpoint. Because we're holding the lock, 
+    // even if there are already Active RPCs sent to the same peer nic path
+    // by setupConnectionsByActive, it will be blocked after the RPC return.
+    // Once the lock is released, they will simply observe the CONNECTED state
+    // and safely reuse the QP.
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
@@ -209,10 +291,20 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
-            if (nic.name == peer_nic_name)
-                return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
-                                         &local_desc.reply_msg);
+        for (auto &nic : segment_desc->devices) {
+            if (nic.name == peer_nic_name) {
+                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
+                                            &local_desc.reply_msg);
+                if (ret != 0) {
+                    // Restore UNCONNECTED state on failure if we were
+                    // CONNECTING
+                    if (status_.load(std::memory_order_relaxed) == CONNECTING) {
+                        disconnectUnlocked();
+                    }
+                }
+                return ret;
+            }
+        }
     }
     local_desc.reply_msg =
         "Peer nic not found in that server: " + peer_nic_path_;
@@ -244,6 +336,7 @@ void RdmaEndPoint::disconnectUnlocked() {
             wr_depth_list_[i] = 0;
         }
     }
+    peer_qp_num_list_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
 }
 
@@ -346,6 +439,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         if (ret) return ret;
     }
 
+    peer_qp_num_list_ = std::move(peer_qp_num_list);
     status_.store(CONNECTED, std::memory_order_relaxed);
     return 0;
 }

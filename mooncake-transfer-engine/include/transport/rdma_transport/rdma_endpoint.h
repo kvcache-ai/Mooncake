@@ -41,6 +41,7 @@ class RdmaEndPoint {
     enum Status {
         INITIALIZING,
         UNCONNECTED,
+        CONNECTING,
         CONNECTED,
     };
 
@@ -132,6 +133,7 @@ class RdmaEndPoint {
     std::vector<ibv_qp *> qp_list_;
 
     std::string peer_nic_path_;
+    std::vector<uint32_t> peer_qp_num_list_;
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;
