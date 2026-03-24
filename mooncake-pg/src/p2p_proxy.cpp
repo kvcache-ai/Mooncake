@@ -72,13 +72,12 @@ void P2PProxy::AllocateResources() {
     TORCH_CHECK(static_cast<size_t>(size_) <= kMaxNumRanks,
                 "P2PProxy size_ exceeds kMaxNumRanks: ", size_);
 
+    if (size_ == 0) {
+        return;
+    }
+
     const size_t p2p_total_buffer_size =
         kP2PBufferSize * static_cast<size_t>(size_);
-
-    if (p2p_total_buffer_size == 0) {
-        TORCH_CHECK(false, "P2PProxy total buffer size is invalid: ",
-                    p2p_total_buffer_size);
-    }
 
     if (is_cpu_) {
         resources_.send_buffer_ = std::malloc(p2p_total_buffer_size);
