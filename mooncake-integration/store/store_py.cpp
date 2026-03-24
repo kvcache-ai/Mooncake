@@ -701,7 +701,8 @@ class MooncakeStorePyWrapper {
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
         std::vector<size_t> processed_indices;
-        std::vector<int> final_results(base_keys.size(), 0);
+        std::vector<int> final_results(base_keys.size(),
+                                       to_py_ret(ErrorCode::INVALID_PARAMS));
 
         try {
             // Chunking phase (GIL Held)
