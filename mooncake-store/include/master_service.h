@@ -517,8 +517,7 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
-        mutable bool hard_pinned GUARDED_BY(lock){false};  // hard pin:
-                                                           // never evicted
+        const bool hard_pinned{false};          // immutable, set at creation
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -687,11 +686,7 @@ class MasterService {
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
 
-        // Check if is hard pinned (never evicted by eviction policy)
-        bool IsHardPinned() const {
-            SpinLocker locker(&lock);
-            return hard_pinned;
-        }
+        bool IsHardPinned() const { return hard_pinned; }
 
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater

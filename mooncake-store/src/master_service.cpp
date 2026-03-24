@@ -3491,7 +3491,8 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
-                metadata_ptr->soft_pin_timeout.has_value()));
+                metadata_ptr->soft_pin_timeout.has_value(),
+                metadata_ptr->hard_pinned));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
