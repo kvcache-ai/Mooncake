@@ -56,6 +56,8 @@ class ConnectionContext {
 
     std::atomic<int> groupSize_;
 
+    bool isDummy_;
+
     // A mark tracking the group size for which all ranks
     // in [0, establishedGroupSize_) have been successfully
     // connected at least once (they may disconnect afterwards).
@@ -87,7 +89,7 @@ class ConnectionContext {
     std::condition_variable backend_wakeup_cv_;
 
    public:
-    ConnectionContext(int backendIndex, int rank, int size,
+    ConnectionContext(int backendIndex, int rank, int size, bool isDummy,
                       uint64_t* local2global_rank_map, std::string location,
                       c10::intrusive_ptr<::c10d::Store> store,
                       std::shared_ptr<TransferGroupMeta> meta,
@@ -133,6 +135,9 @@ class ConnectionContext {
      */
     void waitUntilAllConnected();
 
+    void bootstrapLocalPeer(const std::string& localServerName,
+                            const SegmentInfo& localRankInfo);
+
     /**
      * @brief Blocks until all newly added ranks in the
      *        extended group are connected.
@@ -148,6 +153,8 @@ class ConnectionContext {
 
     void shutdown();
 
+    void setDummy(bool isDummy) { isDummy_ = isDummy; }
+
     static std::string getServerNameStoreKey(int backendIndex, int rank) {
         return "server_name_" + std::to_string(backendIndex) + "_" +
                std::to_string(rank);
@@ -159,6 +166,11 @@ class ConnectionContext {
     static std::string getExtensionTaskCountStoreKey(int backendIndex,
                                                      int rank) {
         return "extension_task_count_" + std::to_string(backendIndex) + "_" +
+               std::to_string(rank);
+    }
+    static std::string getExtensionActiveRanksStoreKey(int backendIndex,
+                                                       int rank) {
+        return "extension_active_ranks_" + std::to_string(backendIndex) + "_" +
                std::to_string(rank);
     }
 
@@ -194,6 +206,7 @@ class ConnectionPoller {
 
    private:
     ConnectionPoller();
+    void ensureThreadStarted();
     void pollerLoop();
     bool processContext(const std::shared_ptr<ConnectionContext>& ctx);
     bool processPeer(const std::shared_ptr<ConnectionContext>& ctx,
@@ -202,6 +215,7 @@ class ConnectionPoller {
     std::mutex wakeup_mutex_;
     std::condition_variable wakeup_cv_;
     std::thread pollerThread_;
+    std::atomic<bool> pollerThreadStarted_{false};
 
     std::mutex contexts_mutex_;
     std::atomic<uint64_t> contexts_version_{0};

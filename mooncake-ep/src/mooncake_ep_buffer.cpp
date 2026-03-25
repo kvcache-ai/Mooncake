@@ -615,8 +615,11 @@ void MooncakeEpBuffer::update_local_qpns() {
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& remote_keys,
                                const std::vector<int32_t>& remote_qpns,
-                               const std::vector<int32_t>& remote_lids) {
+                               const std::vector<int32_t>& remote_lids,
+                               const std::vector<int>& active_ranks_mask) {
     for (int i = 0; i < USE_QP_COUNT; ++i) {
+        int peer_rank = i * num_ranks / USE_QP_COUNT;
+        if (active_ranks_mask[peer_rank] == 0) continue;
         ibv_ah_attr ah_attr = {
             .dlid = (uint16_t)remote_lids[i],
             .port_num = 0,
@@ -632,6 +635,7 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
         }
     }
     for (int i = 0; i < num_ranks; ++i) {
+        if (active_ranks_mask[i] == 0) continue;
         uint64_t raddr =
             i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
         cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
@@ -646,13 +650,14 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                                  const std::vector<int32_t>& remote_keys,
                                  const std::vector<int32_t>& remote_qpns,
                                  const std::vector<int64_t>& subnet_prefixes,
-                                 const std::vector<int64_t>& interface_ids) {
+                                 const std::vector<int64_t>& interface_ids,
+                                 const std::vector<int>& active_ranks_mask) {
     for (int i = 0; i < USE_QP_COUNT; ++i) {
+        int peer_rank = i * num_ranks / USE_QP_COUNT;
+        if (active_ranks_mask[peer_rank] == 0) continue;
         ibv_gid remote_gid{};
-        remote_gid.global.subnet_prefix =
-            subnet_prefixes[i * num_ranks / USE_QP_COUNT];
-        remote_gid.global.interface_id =
-            interface_ids[i * num_ranks / USE_QP_COUNT];
+        remote_gid.global.subnet_prefix = subnet_prefixes[peer_rank];
+        remote_gid.global.interface_id = interface_ids[peer_rank];
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;
@@ -672,6 +677,7 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         }
     }
     for (int i = 0; i < num_ranks; ++i) {
+        if (active_ranks_mask[i] == 0) continue;
         uint64_t raddr =
             i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
         cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
@@ -701,7 +707,8 @@ std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
 }
 
 void MooncakeEpBuffer::sync_nvlink_ipc_handles(
-    const std::vector<std::vector<int32_t>>& remote_handles) {
+    const std::vector<std::vector<int32_t>>& remote_handles,
+    const std::vector<int>& active_ranks_mask) {
     int device_count = 0;
     CUDA_CHECK(cudaGetDeviceCount(&device_count));
 
@@ -714,6 +721,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         // handle exchange — cuMemSetAccess already granted all devices
         // read/write access during allocation.
         for (int i = 0; i < num_ranks; ++i) {
+            if (active_ranks_mask[i] == 0) continue;
             nvlink_array[i] = 1;
             // Each rank's gdr_buffer is directly accessible; the remote
             // addresses will be exchanged via the RDMA address sync path
@@ -730,6 +738,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         int group_end = std::min(group_start + device_count, num_ranks);
 
         for (int dst_rank = group_start; dst_rank < group_end; ++dst_rank) {
+            if (active_ranks_mask[dst_rank] == 0) continue;
             if (dst_rank == rank) {
                 ipc_peer_ptrs_host[dst_rank] = gdr_buffer;
                 continue;
@@ -789,6 +798,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
 
         p2p_ipc_all_enabled_ = true;
         for (int i = 0; i < num_ranks; ++i) {
+            if (active_ranks_mask[i] == 0) continue;
             if (nvlink_array[i] == 0 || ipc_peer_ptrs_host[i] == nullptr) {
                 p2p_ipc_all_enabled_ = false;
                 break;
