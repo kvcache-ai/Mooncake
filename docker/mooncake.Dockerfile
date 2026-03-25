@@ -31,7 +31,7 @@ RUN apt-get update && \
         ninja-build \
         software-properties-common \
         pkg-config && \
-    add-apt-repository ppa:deadsnakes/ppa && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} \
@@ -40,6 +40,7 @@ RUN apt-get update && \
     curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace

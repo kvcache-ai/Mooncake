@@ -171,8 +171,7 @@ mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
 if command -v python${PYTHON_VERSION} &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip
-    python${PYTHON_VERSION} -m pip install build setuptools wheel auditwheel
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
 elif command -v pip &>/dev/null; then
     pip install --upgrade pip
     pip install build setuptools wheel auditwheel
