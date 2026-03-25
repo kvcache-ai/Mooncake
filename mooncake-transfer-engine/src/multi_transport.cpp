@@ -41,12 +41,11 @@
 #ifdef USE_INTRA_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
-#ifdef USE_MNNVL
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
-#else
-#include "transport/nvlink_transport/nvlink_transport.h"
 #endif
+#ifdef USE_MNNVL
+#include "transport/nvlink_transport/nvlink_transport.h"
 #endif
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
@@ -318,16 +317,15 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     }
 #endif
 
-#ifdef USE_MNNVL
 #ifdef USE_HIP
     else if (std::string(proto) == "hip") {
         transport = new HipTransport();
     }
-#else
+#endif
+#ifdef USE_MNNVL
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
     }
-#endif  // USE_HIP
 #endif  // USE_MNNVL
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {

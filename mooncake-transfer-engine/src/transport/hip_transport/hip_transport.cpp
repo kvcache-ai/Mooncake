@@ -251,6 +251,21 @@ static int setDeviceContext(void *source_ptr, int &device_id) {
 }
 
 static void setupP2PAccess(int num_devices) {
+    auto clearStickyPeerAccessError = [](int src_device, int dst_device) {
+        // hipDeviceEnablePeerAccess may leave hipErrorPeerAccessAlreadyEnabled
+        // in the runtime's last-error slot. Clear it so subsequent PyTorch HIP
+        // calls (for example torch.empty during the next connector init) do not
+        // observe a stale error.
+        hipError_t last_error = hipGetLastError();
+        if (last_error != hipSuccess &&
+            last_error != hipErrorPeerAccessAlreadyEnabled) {
+            LOG(WARNING) << "HipTransport: unexpected sticky HIP error after "
+                            "enabling P2P access from device "
+                         << src_device << " to device " << dst_device << " ("
+                         << hipGetErrorString(last_error) << ")";
+        }
+    };
+
     for (int i = 0; i < num_devices; ++i) {
         if (!checkHip(hipSetDevice(i), "HipTransport: failed to set device")) {
             continue;
@@ -269,8 +284,10 @@ static void setupP2PAccess(int num_devices) {
 
             if (can_access_peer) {
                 hipError_t result = hipDeviceEnablePeerAccess(j, 0);
-                if (result != hipSuccess &&
-                    result != hipErrorPeerAccessAlreadyEnabled) {
+                if (result == hipErrorPeerAccessAlreadyEnabled) {
+                    clearStickyPeerAccessError(i, j);
+                } else if (result != hipSuccess) {
+                    clearStickyPeerAccessError(i, j);
                     LOG(WARNING) << "HipTransport: failed to enable P2P access "
                                     "from device "
                                  << i << " to device " << j << " ("

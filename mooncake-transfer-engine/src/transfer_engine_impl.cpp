@@ -258,7 +258,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
-#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+#elif defined(USE_HIP) || defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
@@ -273,13 +273,22 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
         } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+#if defined(USE_HIP)
+            constexpr const char* kCrossNodeTransport = "hip";
+            constexpr const char* kCrossNodeTransportName = "HIP";
+#else
+            constexpr const char* kCrossNodeTransport = "nvlink";
+            constexpr const char* kCrossNodeTransportName = "NVLink";
+#endif
             Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
+                multi_transports_->installTransport(kCrossNodeTransport, nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
+                LOG(ERROR) << "Failed to install " << kCrossNodeTransportName
+                           << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using cross-node NVLink transport "
+            LOG(INFO) << "Using cross-node " << kCrossNodeTransportName
+                      << " transport "
                       << "(MC_FORCE_MNNVL or no HCA detected)";
         } else {
             Transport* t =

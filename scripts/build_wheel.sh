@@ -285,6 +285,9 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libamdhip64.so* \
+    --exclude libhsa-runtime64.so* \
+    --exclude librocprofiler-register.so* \
     --exclude libc10.so* \
     --exclude libc10_cuda.so* \
     --exclude libtorch.so* \
