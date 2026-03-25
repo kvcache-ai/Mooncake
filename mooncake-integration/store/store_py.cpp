@@ -1744,12 +1744,6 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::vector<size_t>> &all_sizes,
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR)
-                        << "batch_put_from_multi_buffers is not supported for "
-                           "dummy client now";
-                    return std::vector<int>{};
-                }
                 return self.store_->batch_put_from_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
             },
@@ -1766,12 +1760,6 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::vector<size_t>> &all_sizes,
                bool prefer_alloc_in_same_node = false) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR)
-                        << "batch_get_into_multi_buffers is not supported for "
-                           "dummy client now";
-                    return std::vector<int>{};
-                }
                 return self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
                     prefer_alloc_in_same_node);

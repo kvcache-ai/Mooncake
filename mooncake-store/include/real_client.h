@@ -351,12 +351,28 @@ class RealClient : public PyClient {
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes,
-        const UUID &client_id);
+        int32_t device_id, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &dummy_buffers,
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        int32_t device_id, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_alloc_in_same_node, int32_t device_id,
         const UUID &client_id);
 
     // Share mem management for dummy client
@@ -368,6 +384,19 @@ class RealClient : public PyClient {
                                                    const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
+
+    tl::expected<void, ErrorCode> ascend_shm_internal(
+        uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
+        const std::string &shareable_handle_bytes, int32_t device_id,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> ascend_ipc_shm_internal(
+        uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
+        const std::string &ipc_key_bytes, int32_t device_id,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> ascend_unmap_shm_internal(
+        const UUID &client_id);
 
     tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
@@ -550,6 +579,12 @@ class RealClient : public PyClient {
         void *shm_buffer = nullptr;
         size_t shm_size = 0;
         uintptr_t dummy_base_addr = 0;
+        bool is_ascend = false;
+        bool is_ipc = false;
+        // Ascend physical device id from dummy (dummy-real RPC).
+        int32_t device_id = -1;
+        uint64_t vmm_handle = 0;
+        std::string ipc_key_data;
     };
 
     struct ShmContext {
@@ -563,6 +598,23 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+
+    // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
+    bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,
+                                  uint64_t dummy_addr, size_t buf_size,
+                                  const MappedShm *&last_hit_shm,
+                                  void *&out_real) const;
+
+    tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
+        const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
+        const std::vector<size_t> &sizes, const UUID &client_id) const;
+
+    tl::expected<std::vector<std::vector<void *>>, ErrorCode>
+    map_dummy_nested_addrs_to_real_ptrs(
+        const ShmContext &context,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::string> &keys, const UUID &client_id) const;
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
@@ -600,6 +652,10 @@ class RealClient : public PyClient {
 
     void handle_ipc_shm_register(int client_sock);
     void handle_ipc_shm_fd_request(int client_sock);
+
+    void teardown_ascend_shm_buffer(MappedShm &shm);
+    tl::expected<void, ErrorCode> setup_ascend_internal(
+        size_t local_buffer_size);
 };
 
 }  // namespace mooncake
