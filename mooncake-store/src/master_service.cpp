@@ -3492,7 +3492,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->hard_pinned));
+                metadata_ptr->IsHardPinned()));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -3561,8 +3561,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
         }
     }
 
-    // Serialize hard_pinned flag (appended for backward compatibility)
-    packer.pack(metadata.hard_pinned);
+    packer.pack(metadata.IsHardPinned());
 
     return {};
 }
