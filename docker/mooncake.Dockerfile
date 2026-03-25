@@ -22,18 +22,24 @@ ENV PYTHON_VERSION=${PYTHON_VERSION} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
-# Install base build utilities and python bindings
+# Install base build utilities and the requested Python version via deadsnakes PPA
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
         ninja-build \
-        python3 \
-        python3-dev \
-        python3-pip \
-        python-is-python3 \
+        software-properties-common \
         pkg-config && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
