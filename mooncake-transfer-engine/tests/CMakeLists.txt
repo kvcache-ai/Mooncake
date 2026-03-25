@@ -9,7 +9,7 @@ if (USE_HIP)
 endif()
 
 add_executable(rdma_transport_test ${WORKSPACE}/rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine)
+target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags glog::glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
 
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)

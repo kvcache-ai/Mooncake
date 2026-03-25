@@ -14,6 +14,8 @@
 
 #include "memory_location.h"
 
+#include <cstdlib>
+
 #include "cuda_alike.h"
 
 namespace mooncake {
@@ -35,18 +37,21 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          bool only_first_page) {
     std::vector<MemoryLocationEntry> entries;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU)
     cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, start);
+    cudaError_t result = cudaPointerGetAttributes(&attributes, start);
+    // Only short-circuit when the runtime positively confirms device memory.
+    // A pointer-attribute query failure does not imply that the buffer should
+    // be treated as wildcard: host memory may still be resolved accurately by
+    // the CPU/NUMA probe below, and returning "*" here would discard that
+    // topology information and reduce routing precision.
     if (result != cudaSuccess) {
-        LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
-                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        return entries;
-    }
-
-    if (attributes.type == cudaMemoryTypeDevice) {
+        VLOG(1) << "getMemoryLocation: cudaPointerGetAttributes failed for addr="
+                << start << ", len=" << len
+                << ", falling back to CPU/NUMA probe (code: " << result
+                << " - " << cudaGetErrorString(result) << ")";
+    } else if (attributes.type == cudaMemoryTypeDevice) {
         entries.push_back(
             {(uint64_t)start, len, genGpuNodeName(attributes.device)});
         return entries;
