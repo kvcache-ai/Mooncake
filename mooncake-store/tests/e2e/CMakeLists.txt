@@ -65,3 +65,19 @@ target_link_libraries(chaos_rand_test PUBLIC
     pthread
     ${ETCD_WRAPPER_LIB}
 )
+
+add_executable(storage_backend_e2e_test storage_backend_e2e_test.cpp client_wrapper.cpp)
+target_include_directories(storage_backend_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+target_link_libraries(storage_backend_e2e_test PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)

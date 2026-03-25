@@ -151,6 +151,10 @@ class WrappedMasterService {
                                                    const std::string& key,
                                                    ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type);
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;

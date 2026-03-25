@@ -247,6 +247,17 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Batch evict disk replicas for multiple keys.
+     * @param client_id The client performing the eviction
+     * @param keys The object keys whose disk replicas were evicted
+     * @param replica_type DISK or LOCAL_DISK
+     * @return Per-key results (OK or error code)
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type);
+
+    /**
      * @brief Start a copy operation
      *
      * This will allocate replica buffers to copy to.
@@ -473,12 +484,13 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin)
+            bool enable_soft_pin, bool enable_hard_pin = false)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
+              hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
@@ -505,6 +517,7 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
+        const bool hard_pinned{false};          // immutable, set at creation
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -672,6 +685,8 @@ class MasterService {
             SpinLocker locker(&lock);
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
+
+        bool IsHardPinned() const { return hard_pinned; }
 
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
@@ -886,7 +901,8 @@ class MasterService {
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
-                    std::vector<Replica> replicas, bool enable_soft_pin) {
+                    std::vector<Replica> replicas, bool enable_soft_pin,
+                    bool enable_hard_pin = false) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -894,7 +910,8 @@ class MasterService {
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin));
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin));
             it_ = result.first;
         }
 

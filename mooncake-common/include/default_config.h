@@ -71,6 +71,18 @@ class DefaultConfig {
                    uint64_t default_value = 0) const;
 
     /**
+     * @brief GetDurationMs retrieves a duration value from the configuration
+     * and converts it to milliseconds.
+     * @param key The key to look up in the configuration
+     * @param val Pointer to store the retrieved value in milliseconds
+     * @param default_value Default value to return if the key is not found
+     * @note Duration strings may use ms, s, m, or h as suffixes. Bare numbers
+     * are interpreted as milliseconds.
+     */
+    void GetDurationMs(const std::string& key, uint64_t* val,
+                       uint64_t default_value = 0) const;
+
+    /**
      * @brief GetDouble retrieves a double value from the configuration
      * @param key The key to look up in the configuration
      * @param val Pointer to store the retrieved value

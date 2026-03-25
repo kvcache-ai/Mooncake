@@ -826,6 +826,38 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
         });
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchEvictDiskReplica(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "BatchEvictDiskReplica");
+    const size_t total_keys = keys.size();
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys,
+                     ", replica_type=", replica_type);
+    MasterMetricManager::instance().inc_evict_disk_replica_requests();
+
+    auto results =
+        master_service_.BatchEvictDiskReplica(client_id, keys, replica_type);
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
+                         << "] '" << keys[i]
+                         << "': " << toString(results[i].error());
+        }
+    }
+    if (failure_count > 0) {
+        MasterMetricManager::instance().inc_evict_disk_replica_failures();
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return execute_rpc(
@@ -1037,6 +1069,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::EvictDiskReplica>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
         &wrapped_master_service);

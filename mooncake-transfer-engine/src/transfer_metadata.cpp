@@ -243,6 +243,11 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         rankInfoJSON["devicePort"] =
             static_cast<Json::UInt64>(desc.rank_info.devicePort);
         rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
+        Json::Value endpointsJSON(Json::arrayValue);
+        for (const auto &endpoint : desc.rank_info.endpoints) {
+            endpointsJSON.append(endpoint);
+        }
+        rankInfoJSON["endpoints"] = endpointsJSON;
 
         segmentJSON["rank_info"] = rankInfoJSON;
     } else if (segmentJSON["protocol"] == "nvlink" ||
@@ -456,6 +461,14 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
         desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
         desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+        if (rankInfoJSON.isMember("endpoints")) {
+            for (const auto &endpointJSON : rankInfoJSON["endpoints"]) {
+                if (endpointJSON.isString()) {
+                    desc->rank_info.endpoints.push_back(
+                        endpointJSON.asString());
+                }
+            }
+        }
     } else if (desc->protocol == "cxl") {
         desc->cxl_name = segmentJSON["cxl_name"].asString();
         desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();

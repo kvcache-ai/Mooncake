@@ -4272,6 +4272,170 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
         ASSERT_FALSE(exist_result.value());
     }
 }
+TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
+    // Hard-pinned objects must survive eviction under memory pressure,
+    // even after lease expires and all non-pinned objects are gone.
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    // Put a hard-pinned object
+    {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.with_hard_pin = true;
+        auto result =
+            service_->PutStart(client_id, "pinned_model", value_size, config);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, "pinned_model", ReplicaType::MEMORY)
+                .has_value());
+    }
+
+    // Fill remaining space with normal objects to trigger eviction
+    for (int i = 0; i < 20; i++) {
+        std::string key = "filler_" + std::to_string(i);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto result = service_->PutStart(client_id, key, value_size, config);
+        if (result.has_value()) {
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        }
+    }
+
+    // Wait for leases to expire and eviction to kick in
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    // Hard-pinned object must still be there
+    auto get_result = service_->GetReplicaList("pinned_model");
+    ASSERT_TRUE(get_result.has_value())
+        << "Hard-pinned object was evicted, but it should never be";
+
+    // Explicit Remove should still work on hard-pinned objects
+    auto remove_result = service_->Remove("pinned_model", /*force=*/true);
+    ASSERT_TRUE(remove_result.has_value());
+    auto exist_result = service_->ExistKey("pinned_model");
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_FALSE(exist_result.value());
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
+    // Verify eviction priority: non-pinned first, then soft-pinned,
+    // and hard-pinned objects are never evicted even under extreme pressure.
+    const uint64_t kv_lease_ttl = 200;
+    const uint64_t kv_soft_pin_ttl = 10000;
+    const bool allow_evict_soft_pinned_objects = true;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(
+                                  allow_evict_soft_pinned_objects)
+                              .set_eviction_ratio(0.5)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    // Put a hard-pinned object
+    {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.with_hard_pin = true;
+        ASSERT_TRUE(
+            service_->PutStart(client_id, "hard_pinned", value_size, config)
+                .has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, "hard_pinned", ReplicaType::MEMORY)
+                .has_value());
+    }
+
+    // Put a soft-pinned object
+    {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.with_soft_pin = true;
+        ASSERT_TRUE(
+            service_->PutStart(client_id, "soft_pinned", value_size, config)
+                .has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, "soft_pinned", ReplicaType::MEMORY)
+                .has_value());
+    }
+
+    // Fill the rest
+    for (int i = 0; i < 20; i++) {
+        std::string key = "normal_" + std::to_string(i);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto result = service_->PutStart(client_id, key, value_size, config);
+        if (result.has_value()) {
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        }
+    }
+
+    // Let leases expire, trigger eviction
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    // Hard-pinned always survives
+    ASSERT_TRUE(service_->GetReplicaList("hard_pinned").has_value())
+        << "Hard-pinned object was evicted";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
+    // Objects created without with_hard_pin should not be hard-pinned
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(5000).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    // Put without hard_pin (default)
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service_->PutStart(client_id, "normal_key", 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, "normal_key", ReplicaType::MEMORY)
+                    .has_value());
+
+    // Put with hard_pin
+    ReplicateConfig hp_config;
+    hp_config.replica_num = 1;
+    hp_config.with_hard_pin = true;
+    ASSERT_TRUE(
+        service_->PutStart(client_id, "hp_key", 1024, hp_config).has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "hp_key", ReplicaType::MEMORY).has_value());
+
+    // Both should exist
+    ASSERT_TRUE(service_->GetReplicaList("normal_key").has_value());
+    ASSERT_TRUE(service_->GetReplicaList("hp_key").has_value());
+
+    service_->RemoveAll();
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

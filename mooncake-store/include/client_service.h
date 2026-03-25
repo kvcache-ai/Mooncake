@@ -13,7 +13,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "ha_helper.h"
+#include "ha/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
@@ -70,8 +70,8 @@ class Client {
      *        Optional with default auto-discovery. Only required when
      *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
-     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
-     *        HA mode)
+     *        address for non-HA mode, or <backend>://connstring for HA mode,
+     *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -234,6 +234,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    ReplicaType replica_type);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -611,11 +614,22 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
-    MasterViewHelper master_view_helper_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
+    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
+    std::mutex leader_switch_mutex_;
+    std::optional<ha::MasterView> current_master_view_;
+    std::string direct_master_address_;
+    std::thread leader_monitor_thread_;
+    std::atomic<bool> leader_monitor_running_{false};
+    std::thread storage_heartbeat_thread_;
+    std::atomic<bool> storage_heartbeat_running_{false};
+    std::thread task_poll_thread_;
+    std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
-    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LeaderMonitorThreadMain();
+    void StorageHeartbeatThreadMain();
+    void TaskPollThreadMain();
+    void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
 

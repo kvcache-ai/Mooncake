@@ -100,6 +100,7 @@ The data structure details of `ReplicateConfig` are as follows:
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
@@ -688,6 +689,18 @@ There are two startup parameters in `master_service` related to the soft pin mec
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Hard Pin
+
+For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
+
+Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
+
+Key differences from soft pin:
+
+- Hard pin never expires. Soft pin status is removed after a configurable TTL if the object is not accessed.
+- Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
+- Hard pin is immutable once set. Soft pin status is automatically refreshed on access.
+
 ### Zombie Object Cleanup
 
 If a Client crashes or experiences a network failure after sending a `PutStart` request but before it can send the corresponding `PutEnd` or `PutRevoke` request to the Master, the object initiated by `PutStart` enters a "zombie" state—rendering it neither usable nor deletable. The existence of such "zombie objects" not only consumes storage space but also prevents subsequent `Put` operations on the same keys. To mitigate these issues, the Master records the start time of each `PutStart` request and employs two timeout thresholds—`put_start_discard_timeout` and `put_start_release_timeout`—to clean up zombie objects.
@@ -712,6 +725,7 @@ The preferred segment allocation feature is implemented through the `AllocationS
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
@@ -975,3 +989,13 @@ When to bump the version:
 * **Major version (X.0.0)**: For breaking API changes, major architectural changes, or significant new features that affect backward compatibility
 * **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
 * **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API
+
+
+---
+
+:::{toctree}
+:caption: Related Design Docs
+:maxdepth: 1
+
+ssd-offload
+:::

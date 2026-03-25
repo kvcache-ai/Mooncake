@@ -147,6 +147,7 @@ class Transport {
                 uint64_t dest_addr;
                 void *handle;
                 int64_t start_time;
+                int32_t engine_id;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
@@ -237,11 +238,6 @@ class Transport {
             for (uint64_t i = tail_; i != head_; i++) {
                 auto slice = lazy_delete_slices_[i % kLazyDeleteSliceCapacity];
                 delete slice;
-                freed_++;
-            }
-            if (allocated_ != freed_) {
-                LOG(WARNING) << "detected slice leak: allocated " << allocated_
-                             << " freed " << freed_;
             }
         }
 
@@ -249,7 +245,6 @@ class Transport {
             Slice *slice;
 
             if (head_ - tail_ == 0) {
-                allocated_++;
                 slice = new Slice();
                 slice->from_cache = false;
             } else {
@@ -264,7 +259,6 @@ class Transport {
         void deallocate(Slice *slice) {
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
-                freed_++;
                 return;
             }
             lazy_delete_slices_[head_ % kLazyDeleteSliceCapacity] = slice;
@@ -274,7 +268,6 @@ class Transport {
         const static size_t kLazyDeleteSliceCapacity = 4096;
         std::vector<Slice *> lazy_delete_slices_;
         uint64_t head_, tail_;
-        uint64_t allocated_ = 0, freed_ = 0;
     };
 
     struct TransferTask {

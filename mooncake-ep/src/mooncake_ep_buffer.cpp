@@ -62,6 +62,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       device_name(std::move(device_name)),
       comm_stream(at::cuda::getStreamFromPool(true)) {
+    USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
@@ -154,7 +155,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
     CUDA_CHECK(
-        cudaMalloc(&qp_devctxs, MAX_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
+        cudaMalloc(&qp_devctxs, USE_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
 
     // Allocate NVLink P2P arrays
     CUDA_CHECK(cudaMalloc(&nvlink_available, num_ranks * sizeof(int32_t)));
@@ -221,7 +222,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                    x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
-    EP_HOST_ASSERT(MAX_QP_COUNT % num_ranks == 0);
+    EP_HOST_ASSERT(USE_QP_COUNT % num_ranks == 0);
 
     auto num_tokens = static_cast<int>(x.size(0)),
          hidden = static_cast<int>(x.size(1));
@@ -538,7 +539,7 @@ int MooncakeEpBuffer::init_ibgda() {
     }
     // Individual regions (CQ, DBR) will be initialized as needed via async
     // memset.
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    for (int i = 0; i < USE_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
             mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
                                  pd, 16384, 1, comm_stream.stream());
@@ -571,14 +572,14 @@ int MooncakeEpBuffer::init_ibgda() {
 }
 
 void MooncakeEpBuffer::update_local_qpns() {
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    for (int i = 0; i < USE_QP_COUNT; ++i) {
         if (qps[i]) {
             mlx5gda_destroy_qp(ctrl_buf_heap, qps[i]);
             qps[i] = nullptr;
         }
     }
 
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    for (int i = 0; i < USE_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
             mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
                                  pd, 16384, 1, comm_stream.stream());
@@ -615,7 +616,7 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& remote_keys,
                                const std::vector<int32_t>& remote_qpns,
                                const std::vector<int32_t>& remote_lids) {
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    for (int i = 0; i < USE_QP_COUNT; ++i) {
         ibv_ah_attr ah_attr = {
             .dlid = (uint16_t)remote_lids[i],
             .port_num = 0,
@@ -646,12 +647,12 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                                  const std::vector<int32_t>& remote_qpns,
                                  const std::vector<int64_t>& subnet_prefixes,
                                  const std::vector<int64_t>& interface_ids) {
-    for (int i = 0; i < MAX_QP_COUNT; ++i) {
+    for (int i = 0; i < USE_QP_COUNT; ++i) {
         ibv_gid remote_gid{};
         remote_gid.global.subnet_prefix =
-            subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
+            subnet_prefixes[i * num_ranks / USE_QP_COUNT];
         remote_gid.global.interface_id =
-            interface_ids[i * num_ranks / MAX_QP_COUNT];
+            interface_ids[i * num_ranks / USE_QP_COUNT];
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;

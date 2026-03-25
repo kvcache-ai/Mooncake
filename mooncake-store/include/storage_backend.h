@@ -4,8 +4,10 @@
 
 #include <atomic>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,17 +39,21 @@ struct BucketMetadata {
     // Runtime-only fields (not serialized) for safe deletion support
     // Tracks number of in-flight reads to enable safe bucket deletion
     mutable std::atomic<int32_t> inflight_reads_{0};
+    // Last access timestamp in nanoseconds; used by LRU eviction policy.
+    // Updated on every read with relaxed ordering (approximate is sufficient).
+    mutable std::atomic<int64_t> last_access_ns_{0};
 
     // Default constructor
     BucketMetadata() = default;
 
-    // Copy constructor (atomic not copyable, so reset to 0)
+    // Copy constructor (atomics not copyable, so reset to 0)
     BucketMetadata(const BucketMetadata& other)
         : meta_size(other.meta_size),
           data_size(other.data_size),
           keys(other.keys),
           metadatas(other.metadatas),
-          inflight_reads_(0) {}
+          inflight_reads_(0),
+          last_access_ns_(0) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -55,7 +61,8 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
-          inflight_reads_(0) {}
+          inflight_reads_(0),
+          last_access_ns_(0) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -64,7 +71,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
-            // Don't copy inflight_reads_ - it's runtime state
+            // Don't copy runtime state
         }
         return *this;
     }
@@ -76,7 +83,7 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
-            // Don't move inflight_reads_ - it's runtime state
+            // Don't move runtime state
         }
         return *this;
     }
@@ -164,12 +171,25 @@ struct FilePerKeyConfig {
     static FilePerKeyConfig FromEnvironment();
 };
 
+enum class BucketEvictionPolicy {
+    NONE,  // No eviction (default)
+    FIFO,  // Evict oldest bucket first (by creation order)
+    LRU,   // Evict least recently read bucket first
+};
+
 struct BucketBackendConfig {
     int64_t bucket_size_limit =
         256 * kMB;  // Max total size of a single bucket (256 MB)
 
     int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
                                       // bucket, required by bucket backend only
+
+    BucketEvictionPolicy eviction_policy =
+        BucketEvictionPolicy::NONE;  // Eviction strategy
+
+    int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
+                                 // exceeds this threshold (bytes)
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
@@ -232,8 +252,8 @@ class StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::string& evicted_key)> eviction_handler =
-            nullptr) = 0;
+        std::function<void(const std::vector<std::string>& evicted_keys)>
+            eviction_handler = nullptr) = 0;
 
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
@@ -627,8 +647,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::string& evicted_key)> eviction_handler =
-            nullptr) override;
+        std::function<void(const std::vector<std::string>& evicted_keys)>
+            eviction_handler = nullptr) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
@@ -702,8 +722,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::string& evicted_key)> eviction_handler =
-            nullptr) override;
+        std::function<void(const std::vector<std::string>& evicted_keys)>
+            eviction_handler = nullptr) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -875,6 +895,42 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
 
+    // Holds eviction state between PrepareEviction and FinalizeEviction.
+    // PrepareEviction removes buckets from metadata maps and returns this.
+    // FinalizeEviction waits for in-flight reads and deletes the files.
+    struct PendingEviction {
+        std::vector<std::string> keys;  // All keys in evicted buckets
+        std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
+            buckets;  // (bucket_id, metadata) for file deletion
+    };
+
+    /**
+     * @brief Phase 1 of eviction: under exclusive lock, select and remove
+     * oldest buckets (FIFO) until total_size_ + required_size <=
+     * max_total_size. The removed buckets are returned for later file deletion.
+     * Does nothing if eviction_policy == NONE or max_total_size == 0.
+     * @param required_size Size of the incoming bucket to be written.
+     * @return PendingEviction with all keys and bucket metadata removed.
+     */
+    PendingEviction PrepareEviction(int64_t required_size);
+
+    /**
+     * @brief Select the next bucket to evict according to the configured
+     * eviction policy. Must be called with mutex_ held (exclusive).
+     * @return Iterator into buckets_ pointing at the candidate, or
+     *         buckets_.end() if no candidate is available.
+     */
+    std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
+    SelectEvictionCandidate();
+
+    /**
+     * @brief Phase 2 of eviction: wait for in-flight reads on each evicted
+     * bucket to drain, then delete the data and metadata files.
+     * Must be called AFTER master has been notified via eviction_handler.
+     * @param pending The result of a prior PrepareEviction call.
+     */
+    void FinalizeEviction(const PendingEviction& pending);
+
    public:
     /**
      * @brief Get a file instance for external buffer registration
@@ -923,6 +979,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
+    // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
+    // Maintained lazily — reads update last_access_ns_ atomically without
+    // touching this index; SelectEvictionCandidate() repairs stale entries.
+    std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
@@ -969,8 +1029,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
-        std::function<void(const std::string& evicted_key)> eviction_handler =
-            nullptr) override;
+        std::function<void(const std::vector<std::string>& evicted_keys)>
+            eviction_handler = nullptr) override;
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
