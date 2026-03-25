@@ -50,6 +50,7 @@ class Environ {
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     std::string GetCustomTopoJson() const { return custom_topo_json_; }
+    uint64_t GetMaxMrSize() const { return max_mr_size_; }
     std::string GetCxlDevPath() const {
         return GetString("MC_CXL_DEV_PATH", cxl_dev_path_);
     }
@@ -147,6 +148,7 @@ class Environ {
     bool intra_nvlink_;
     bool path_roundrobin_;
     std::string custom_topo_json_;
+    uint64_t max_mr_size_;
     std::string cxl_dev_path_;
     std::string cxl_dev_size_;
     bool disable_gpu_direct_rdma_;

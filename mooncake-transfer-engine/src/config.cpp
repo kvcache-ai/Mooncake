@@ -100,6 +100,11 @@ void loadGlobalConfig(GlobalConfig &config) {
     int retry_cnt = env.GetRetryCnt();
     if (retry_cnt > 0 && retry_cnt < 128) config.retry_cnt = retry_cnt;
 
+    uint64_t max_mr_size = env.GetMaxMrSize();
+    if (max_mr_size > 0) {
+        config.max_mr_size = max_mr_size;
+    }
+
     if (env.GetDisableMetacache()) {
         config.metacache = false;
     }

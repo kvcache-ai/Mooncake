@@ -37,7 +37,7 @@ setup(
                 os.path.join(current_dir, "../mooncake-common/include"),
             ],
             sources=[
-                "../mooncake-integration/ep/ep_py.cpp",
+                "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
                 "src/mooncake_ibgda/mlx5gda.cpp",

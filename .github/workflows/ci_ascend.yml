@@ -68,8 +68,8 @@ jobs:
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         echo "Building..."
         cd build
-        make -j8
-        make install -j8
+        cmake --build . -j$(nproc)
+        cmake --install .
         echo "Mooncake installed successfully."
 
     - name: Run Hixl Mooncake Store Test

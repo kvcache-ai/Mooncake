@@ -615,10 +615,21 @@ class Client {
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
+    std::mutex leader_switch_mutex_;
+    std::optional<ha::MasterView> current_master_view_;
+    std::string direct_master_address_;
+    std::thread leader_monitor_thread_;
+    std::atomic<bool> leader_monitor_running_{false};
+    std::thread storage_heartbeat_thread_;
+    std::atomic<bool> storage_heartbeat_running_{false};
+    std::thread task_poll_thread_;
+    std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
-    void PingThreadMain(std::string current_master_address);
+    ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LeaderMonitorThreadMain();
+    void StorageHeartbeatThreadMain();
+    void TaskPollThreadMain();
+    void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
 

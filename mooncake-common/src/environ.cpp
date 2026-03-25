@@ -82,6 +82,7 @@ Environ::Environ() {
     intra_nvlink_ = GetBool("MC_INTRA_NVLINK", false);
     path_roundrobin_ = GetBool("MC_PATH_ROUNDROBIN", false);
     custom_topo_json_ = GetString("MC_CUSTOM_TOPO_JSON", "");
+    max_mr_size_ = GetSizeT("MC_MAX_MR_SIZE", 0);
     cxl_dev_path_ = GetString("MC_CXL_DEV_PATH", "");
     cxl_dev_size_ = GetString("MC_CXL_DEV_SIZE", "");
     disable_gpu_direct_rdma_ = GetBool("MC_DISABLE_GPU_DIRECT_RDMA", false);

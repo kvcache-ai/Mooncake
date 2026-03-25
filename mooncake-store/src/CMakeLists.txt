@@ -30,6 +30,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/ha_backend_factory.cpp
     ha/etcd_leader_coordinator.cpp
     ha/master_service_supervisor.cpp
+    ha/redis_leader_coordinator.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
@@ -119,21 +120,35 @@ else()
   message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
 
+if(STORE_USE_REDIS)
+  list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
-# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g.,
-# vendor-specific hardware) to targets that don't need it (e.g.,
-# mooncake_master). Targets that need transfer_engine should link it explicitly.
-target_link_libraries(
-  mooncake_store
-  PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
-         ${EXTRA_LIBS} asio_shared
-  PRIVATE transfer_engine)
+if(STORE_USE_REDIS)
+    target_include_directories(mooncake_store PRIVATE
+        ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+endif()
+# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
+# to targets that don't need it (e.g., mooncake_master).
+# Targets that need transfer_engine should link it explicitly.
+target_link_libraries(mooncake_store
+    PUBLIC
+        cachelib_memory_allocator
+        ${ETCD_WRAPPER_LIB}
+        glog::glog
+        gflags::gflags
+        ${EXTRA_LIBS}
+        asio_shared
+    PRIVATE
+        transfer_engine
+)
 if(STORE_USE_ETCD)
-  add_dependencies(mooncake_store build_etcd_wrapper)
+    add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)
