@@ -15,8 +15,7 @@ class ConnectorImporter {
                       std::unique_ptr<DataConnector> connector);
 
     tl::expected<void, ErrorCode> ImportObject(
-        const std::string& external_key,
-        const std::string& store_key,
+        const std::string& external_key, const std::string& store_key,
         const ReplicateConfig& config = ReplicateConfig{});
 
     tl::expected<size_t, ErrorCode> ImportByPrefix(

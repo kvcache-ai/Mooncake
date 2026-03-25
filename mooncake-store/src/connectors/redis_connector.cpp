@@ -83,7 +83,8 @@ tl::expected<void, std::string> RedisConnector::ListObjects(
 
 tl::expected<void, std::string> RedisConnector::DownloadObject(
     const std::string& key, std::vector<uint8_t>& buffer) {
-    redisReply* reply = (redisReply*)redisCommand(context_, "GET %s", key.c_str());
+    redisReply* reply =
+        (redisReply*)redisCommand(context_, "GET %s", key.c_str());
     if (!reply) {
         return tl::make_unexpected("Redis GET failed");
     }

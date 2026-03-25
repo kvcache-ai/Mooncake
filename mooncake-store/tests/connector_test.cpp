@@ -27,7 +27,8 @@ TEST(DataConnectorTest, CreateRedisConnector) {
     setenv("MOONCAKE_REDIS_HOST", "127.0.0.1", 1);
     setenv("MOONCAKE_REDIS_PORT", "6379", 1);
 
-    EXPECT_THROW(DataConnector::Create(ConnectorType::REDIS), std::runtime_error);
+    EXPECT_THROW(DataConnector::Create(ConnectorType::REDIS),
+                 std::runtime_error);
 }
 #endif
 

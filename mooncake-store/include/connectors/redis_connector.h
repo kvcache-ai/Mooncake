@@ -17,8 +17,7 @@ class RedisConnector : public DataConnector {
         std::vector<ExternalObject>& objects) override;
 
     tl::expected<void, std::string> DownloadObject(
-        const std::string& key,
-        std::vector<uint8_t>& buffer) override;
+        const std::string& key, std::vector<uint8_t>& buffer) override;
 
     std::string GetConnectionInfo() const override;
 

@@ -7,7 +7,7 @@
 namespace mooncake {
 
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb,
-                           void* userp) {
+                            void* userp) {
     size_t total_size = size * nmemb;
     auto* buffer = static_cast<std::vector<uint8_t>*>(userp);
     buffer->insert(buffer->end(), static_cast<uint8_t*>(contents),

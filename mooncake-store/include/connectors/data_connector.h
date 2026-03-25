@@ -9,11 +9,7 @@
 
 namespace mooncake {
 
-enum class ConnectorType {
-    OSS = 0,
-    HUGGINGFACE = 1,
-    REDIS = 2
-};
+enum class ConnectorType { OSS = 0, HUGGINGFACE = 1, REDIS = 2 };
 
 struct ExternalObject {
     std::string key;
@@ -26,12 +22,10 @@ class DataConnector {
     virtual ~DataConnector() = default;
 
     virtual tl::expected<void, std::string> ListObjects(
-        const std::string& prefix,
-        std::vector<ExternalObject>& objects) = 0;
+        const std::string& prefix, std::vector<ExternalObject>& objects) = 0;
 
     virtual tl::expected<void, std::string> DownloadObject(
-        const std::string& key,
-        std::vector<uint8_t>& buffer) = 0;
+        const std::string& key, std::vector<uint8_t>& buffer) = 0;
 
     virtual std::string GetConnectionInfo() const = 0;
 
