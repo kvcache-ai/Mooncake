@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Mooncake metadata client manager.")
     parser.add_argument(
         "--master-server-address",
-        default="26.5.36.248:50051",
+        default="localhost:50051",
         help="Master RPC address (default: 26.5.36.248:50051).",
     )
     parser.add_argument(
