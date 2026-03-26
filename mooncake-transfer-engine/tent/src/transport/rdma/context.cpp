@@ -602,8 +602,7 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     MIN(params_->device.max_cqe, device_attr.max_cqe);
     if (params_->device.num_cq_list + 1 > device_attr.max_cq) {
         LOG(ERROR) << "Device " << device_name << " supports at most "
-                   << device_attr.max_cq
-                   << " CQs, but RDMA num_lanes requires "
+                   << device_attr.max_cq << " CQs, but RDMA num_lanes requires "
                    << params_->device.num_cq_list
                    << " data CQs plus 1 notification CQ";
         return -1;

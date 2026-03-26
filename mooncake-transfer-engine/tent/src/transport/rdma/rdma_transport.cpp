@@ -83,8 +83,7 @@ static Status configureLaneCount(std::shared_ptr<Config> conf,
         lane_count = num_workers;
     }
 
-    auto validate_match = [lane_count](int value,
-                                       const char* name) -> Status {
+    auto validate_match = [lane_count](int value, const char* name) -> Status {
         if (value == kUnset || value == lane_count) return Status::OK();
         std::stringstream ss;
         ss << "Inconsistent RDMA lane configuration: " << name << "=" << value
