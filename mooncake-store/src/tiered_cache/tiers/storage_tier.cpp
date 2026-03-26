@@ -316,8 +316,32 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
         }
     }
 
+    auto complete_handler =
+        [&snapshot](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        if (keys.size() != metadatas.size()) {
+            LOG(ERROR) << "Flush complete handler got mismatched metadata: "
+                       << "keys=" << keys.size()
+                       << ", metadatas=" << metadatas.size();
+            return ErrorCode::INTERNAL_ERROR;
+        }
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto it = snapshot.find(keys[i]);
+            if (it == snapshot.end() || !it->second) {
+                LOG(ERROR)
+                    << "Flush complete handler cannot find snapshot key: "
+                    << keys[i];
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            it->second->SetBucketId(metadatas[i].bucket_id);
+        }
+        return ErrorCode::OK;
+    };
+
     // 2. IO without lock
-    auto res = storage_backend_->BatchOffload(batch_to_write, nullptr);
+    auto res = storage_backend_->BatchOffload(batch_to_write, complete_handler);
 
     // 3. Finalize under lock: update state and notify waiters
     {
@@ -389,22 +413,23 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
     auto evict_bucket =
         [&](int64_t bucket_id) -> tl::expected<size_t, ErrorCode> {
-        auto live_keys_res = bucket_backend->GetBucketLiveKeys(bucket_id);
-        if (!live_keys_res) {
-            LOG(ERROR) << "Failed to collect live keys for bucket " << bucket_id
-                       << ": " << live_keys_res.error();
-            return tl::make_unexpected(live_keys_res.error());
+        auto live_tokens_res =
+            bucket_backend->GetBucketLiveReplicaTokens(bucket_id);
+        if (!live_tokens_res) {
+            LOG(ERROR) << "Failed to collect live replicas for bucket "
+                       << bucket_id << ": " << live_tokens_res.error();
+            return tl::make_unexpected(live_tokens_res.error());
         }
 
-        const auto& live_keys = live_keys_res.value();
-        if (!live_keys.empty()) {
+        const auto& live_tokens = live_tokens_res.value();
+        if (!live_tokens.empty()) {
             if (!backend_) {
                 LOG(ERROR) << "StorageTier backend is not initialized";
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
             auto delete_res =
-                backend_->DeleteBatchFromEviction(live_keys, tier_id_);
+                backend_->DeleteBatchFromEviction(live_tokens, tier_id_);
             if (!delete_res) {
                 LOG(ERROR) << "Failed to remove bucket replicas from tiered "
                               "metadata before eviction: bucket_id="

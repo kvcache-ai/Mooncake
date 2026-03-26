@@ -1896,8 +1896,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::SelectBucketForEviction()
     return oldest_bucket;
 }
 
-tl::expected<std::vector<std::string>, ErrorCode>
-BucketStorageBackend::GetBucketLiveKeys(int64_t bucket_id) const {
+tl::expected<std::vector<StorageReplicaEvictionToken>, ErrorCode>
+BucketStorageBackend::GetBucketLiveReplicaTokens(int64_t bucket_id) const {
     SharedMutexLocker lock(&mutex_, shared_lock);
 
     auto bucket_it = buckets_.find(bucket_id);
@@ -1906,14 +1906,19 @@ BucketStorageBackend::GetBucketLiveKeys(int64_t bucket_id) const {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    std::vector<std::string> live_keys;
-    live_keys.reserve(bucket_it->second->keys.size());
+    std::vector<StorageReplicaEvictionToken> live_tokens;
+    live_tokens.reserve(bucket_it->second->keys.size());
     for (const auto& key : bucket_it->second->keys) {
-        if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-            live_keys.push_back(key);
+        auto obj_it = object_bucket_map_.find(key);
+        if (obj_it == object_bucket_map_.end()) {
+            continue;
         }
+        if (obj_it->second.bucket_id != bucket_id) {
+            continue;
+        }
+        live_tokens.push_back(StorageReplicaEvictionToken{key, bucket_id});
     }
-    return live_keys;
+    return live_tokens;
 }
 
 tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
@@ -1941,6 +1946,9 @@ tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
         for (const auto& key : bucket_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it == object_bucket_map_.end()) {
+                continue;
+            }
+            if (obj_it->second.bucket_id != bucket_id) {
                 continue;
             }
             freed_size += obj_it->second.data_size;

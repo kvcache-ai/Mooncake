@@ -89,33 +89,27 @@ struct RemoveReplicaRequest {
     std::string key;
     UUID client_id;
     UUID segment_id;
+    uint64_t replica_generation = 0;
 };
-YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id);
+YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id, replica_generation);
 
 /**
- * @brief Mutation type for batched replica metadata updates.
+ * @brief One replica removal entry in a batch request.
  */
-enum class ReplicaMutationType : uint8_t {
-    REMOVE = 0,
-};
-
-/**
- * @brief One replica mutation entry in a batch request.
- */
-struct ReplicaMutation {
-    ReplicaMutationType type = ReplicaMutationType::REMOVE;
+struct BatchRemoveReplicaItem {
     std::string key;
     UUID segment_id;
+    uint64_t replica_generation = 0;
 };
-YLT_REFL(ReplicaMutation, type, key, segment_id);
+YLT_REFL(BatchRemoveReplicaItem, key, segment_id, replica_generation);
 
 /**
- * @brief Request to mutate multiple replicas in one call.
+ * @brief Request to remove multiple replicas in one call.
  */
-struct BatchReplicaMutationRequest {
+struct BatchRemoveReplicaRequest {
     UUID client_id;
-    std::vector<ReplicaMutation> mutations;
+    std::vector<BatchRemoveReplicaItem> removals;
 };
-YLT_REFL(BatchReplicaMutationRequest, client_id, mutations);
+YLT_REFL(BatchRemoveReplicaRequest, client_id, removals);
 
 }  // namespace mooncake

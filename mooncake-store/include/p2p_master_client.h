@@ -36,10 +36,10 @@ class P2PMasterClient final : public MasterClient {
         const RemoveReplicaRequest& req);
 
     /**
-     * @brief Applies a batch of replica metadata mutations.
+     * @brief Removes replicas from master in one batch RPC.
      */
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchMutateReplica(
-        const BatchReplicaMutationRequest& req);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
+        const BatchRemoveReplicaRequest& req);
 };
 
 }  // namespace mooncake

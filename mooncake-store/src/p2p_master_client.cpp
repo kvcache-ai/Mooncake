@@ -21,8 +21,8 @@ struct RpcNameTraits<&WrappedP2PMasterService::RemoveReplica> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedP2PMasterService::BatchMutateReplica> {
-    static constexpr const char* value = "BatchMutateReplica";
+struct RpcNameTraits<&WrappedP2PMasterService::BatchRemoveReplica> {
+    static constexpr const char* value = "BatchRemoveReplica";
 };
 
 tl::expected<WriteRouteResponse, ErrorCode> P2PMasterClient::GetWriteRoute(
@@ -58,19 +58,19 @@ tl::expected<void, ErrorCode> P2PMasterClient::RemoveReplica(
     return result;
 }
 
-std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchMutateReplica(
-    const BatchReplicaMutationRequest& req) {
-    ScopedVLogTimer timer(1, "P2PMasterClient::BatchMutateReplica");
-    timer.LogRequest("mutation_count=", req.mutations.size());
+std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchRemoveReplica(
+    const BatchRemoveReplicaRequest& req) {
+    ScopedVLogTimer timer(1, "P2PMasterClient::BatchRemoveReplica");
+    timer.LogRequest("removal_count=", req.removals.size());
 
-    auto result = invoke_rpc<&WrappedP2PMasterService::BatchMutateReplica,
+    auto result = invoke_rpc<&WrappedP2PMasterService::BatchRemoveReplica,
                              std::vector<tl::expected<void, ErrorCode>>>(req);
     if (!result) {
-        LOG(ERROR) << "BatchMutateReplica RPC failed: "
+        LOG(ERROR) << "BatchRemoveReplica RPC failed: "
                    << toString(result.error());
         std::vector<tl::expected<void, ErrorCode>> fallback;
-        fallback.reserve(req.mutations.size());
-        for (size_t i = 0; i < req.mutations.size(); ++i) {
+        fallback.reserve(req.removals.size());
+        for (size_t i = 0; i < req.removals.size(); ++i) {
             fallback.push_back(tl::make_unexpected(result.error()));
         }
         return fallback;

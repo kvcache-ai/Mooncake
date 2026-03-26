@@ -45,12 +45,6 @@ struct TierView {
 };
 
 /**
- * @enum REMOVE_CALLBACK_TYPE
- * @brief The type of metadata synchronization callback.
- */
-enum REMOVE_CALLBACK_TYPE { DELETE = 0, DELETE_ALL = 1 };
-
-/**
  * @struct AllocationEntry
  * @brief The internal state of an allocation.
  * acts as the "Control Block" for the resource.
@@ -60,6 +54,7 @@ enum REMOVE_CALLBACK_TYPE { DELETE = 0, DELETE_ALL = 1 };
 struct AllocationEntry {
     TieredBackend* backend;
     TieredLocation loc;
+    uint64_t replica_generation = 0;
 
     AllocationEntry(TieredBackend* b, TieredLocation&& l)
         : backend(b), loc(std::move(l)) {}
@@ -82,23 +77,24 @@ using AllocationHandle = std::shared_ptr<AllocationEntry>;
  * Returns true if sync succeeds, false otherwise.
  */
 using AddReplicaCallback = std::function<tl::expected<void, ErrorCode>(
-    const std::string& key, const UUID& tier_id, size_t size)>;
+    const std::string& key, const UUID& tier_id, size_t size,
+    uint64_t replica_generation)>;
 
 /**
  * @brief Callback for metadata synchronization when a replica is removed.
  * Returns true if sync succeeds, false otherwise.
  */
 using RemoveReplicaCallback = std::function<tl::expected<void, ErrorCode>(
-    const std::string& key, const UUID& tier_id,
-    enum REMOVE_CALLBACK_TYPE type)>;
+    const std::string& key, const UUID& tier_id, uint64_t replica_generation)>;
 
 /**
  * @brief Callback for removing replicas for multiple keys in one tier.
  * Used by SSD bucket eviction to batch-sync logical deletions to Master.
  */
-using BatchReplicaMutationCallback =
+using BatchRemoveReplicaCallback =
     std::function<std::vector<tl::expected<void, ErrorCode>>(
-        const UUID& tier_id, const std::vector<std::string>& keys)>;
+        const UUID& tier_id,
+        const std::vector<ReplicaRemoveRequest>& requests)>;
 
 /**
  * @brief Callback for segment lifecycle synchronization.
@@ -133,7 +129,7 @@ class TieredBackend {
         Json::Value root, TransferEngine* engine,
         AddReplicaCallback add_replica_callback,
         RemoveReplicaCallback remove_replica_callback,
-        BatchReplicaMutationCallback batch_replica_mutation_callback,
+        BatchRemoveReplicaCallback batch_remove_replica_callback,
         SegmentSyncCallback segment_sync_callback);
 
     // --- Client-Centric Operations ---
@@ -209,6 +205,15 @@ class TieredBackend {
      * whole after metadata has been detached from the cache namespace.
      */
     tl::expected<void, ErrorCode> DeleteBatchFromEviction(
+        const std::vector<StorageReplicaEvictionToken>& tokens,
+        const UUID& tier_id);
+
+    /**
+     * @brief Compatibility wrapper for callers that only have key strings.
+     * This keeps non-storage tests simple while storage bucket eviction uses
+     * explicit replica tokens.
+     */
+    tl::expected<void, ErrorCode> DeleteBatchFromEviction(
         const std::vector<std::string>& keys, const UUID& tier_id);
 
     // --- Composite Operations ---
@@ -248,9 +253,16 @@ class TieredBackend {
     struct MetadataEntry {
         mutable std::shared_mutex mutex;  // Entry-level lock
         std::vector<std::pair<UUID, AllocationHandle>>
-            replicas;          // tier_id -> handle
-        uint64_t version = 0;  // Monotonically increasing version
+            replicas;             // tier_id -> handle
+        uint64_t version = 0;     // Monotonically increasing version
+        uint64_t generation = 0;  // Monotonically increasing incarnation id
+        bool tombstone = false;   // Marks an entry detached from namespace
     };
+
+    std::shared_ptr<MetadataEntry> CreateMetadataEntry();
+    void CleanupTombstonedEntry(const std::string& key,
+                                const std::shared_ptr<MetadataEntry>& entry,
+                                uint64_t generation);
 
     // Get list of Tier IDs sorted by priority (descending)
     std::vector<UUID> GetSortedTiers() const;
@@ -273,12 +285,14 @@ class TieredBackend {
     std::unordered_map<std::string, std::shared_ptr<MetadataEntry>>
         metadata_index_;
     mutable std::shared_mutex map_mutex_;
+    std::atomic<uint64_t> next_entry_generation_{1};
+    std::atomic<uint64_t> next_replica_generation_{1};
 
     std::unique_ptr<DataCopier> data_copier_;
     // Callbacks for metadata synchronization with Master
     AddReplicaCallback add_replica_callback_;
     RemoveReplicaCallback remove_replica_callback_;
-    BatchReplicaMutationCallback batch_replica_mutation_callback_;
+    BatchRemoveReplicaCallback batch_remove_replica_callback_;
     // Callback for segment lifecycle synchronization with Master
     SegmentSyncCallback segment_sync_callback_;
 
@@ -290,6 +304,8 @@ class TieredBackend {
 
     // Destroy flag
     std::atomic<bool> is_destroyed_{false};
+
+    friend class TieredBackendTest;
 };
 
 }  // namespace mooncake

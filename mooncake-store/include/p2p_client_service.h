@@ -176,10 +176,10 @@ class P2PClientService final : public ClientService {
     RemoveReplicaCallback BuildRemoveReplicaCallback();
 
     /**
-     * @brief build batch replica mutation callback.
-     *        used by SSD bucket eviction to batch-sync replica metadata.
+     * @brief build batch remove replica callback.
+     *        used by SSD bucket eviction to batch-sync replica deletions.
      */
-    BatchReplicaMutationCallback BuildBatchReplicaMutationCallback();
+    BatchRemoveReplicaCallback BuildBatchRemoveReplicaCallback();
 
     /**
      * @brief build segment sync callback.
@@ -192,21 +192,23 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<void, ErrorCode> SyncAddReplica(const std::string& key,
                                                  const UUID& tier_id,
-                                                 size_t size);
+                                                 size_t size,
+                                                 uint64_t replica_generation);
 
     /**
      * @brief handle DELETE type callback: notify master to remove replica
      */
-    tl::expected<void, ErrorCode> SyncRemoveReplica(const std::string& key,
-                                                    const UUID& tier_id);
+    tl::expected<void, ErrorCode> SyncRemoveReplica(
+        const std::string& key, const UUID& tier_id,
+        uint64_t replica_generation = 0);
 
     /**
-     * @brief handle batch metadata mutations in one RPC call.
-     * @param mutations Mutation list; it will be moved into the request.
-     * @return Vector of ErrorCode results for each mutation.
+     * @brief handle batch replica removals in one RPC call.
+     * @param removals Removal list; it will be moved into the request.
+     * @return Vector of ErrorCode results for each removal.
      */
-    std::vector<tl::expected<void, ErrorCode>> SyncBatchMutateReplica(
-        std::vector<ReplicaMutation> mutations);
+    std::vector<tl::expected<void, ErrorCode>> SyncBatchRemoveReplica(
+        std::vector<BatchRemoveReplicaItem> removals);
 
     /**
      * @brief Collect tier info from DataManager and build P2P Segments.

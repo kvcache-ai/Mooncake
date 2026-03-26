@@ -68,12 +68,12 @@ inline tl::expected<void, ErrorCode> InitTieredBackendForTest(
     TransferEngine* engine = nullptr,
     AddReplicaCallback add_replica_callback = nullptr,
     RemoveReplicaCallback remove_replica_callback = nullptr,
-    BatchReplicaMutationCallback batch_replica_mutation_callback = nullptr,
+    BatchRemoveReplicaCallback batch_remove_replica_callback = nullptr,
     SegmentSyncCallback segment_sync_callback = nullptr) {
     return backend.Init(std::move(config), engine,
                         std::move(add_replica_callback),
                         std::move(remove_replica_callback),
-                        std::move(batch_replica_mutation_callback),
+                        std::move(batch_remove_replica_callback),
                         std::move(segment_sync_callback));
 }
 }  // namespace mooncake

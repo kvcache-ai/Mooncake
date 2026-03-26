@@ -143,13 +143,13 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     auto add_replica_callback = BuildAddReplicaCallback();
     auto remove_replica_callback = BuildRemoveReplicaCallback();
-    auto batch_replica_mutation_callback = BuildBatchReplicaMutationCallback();
+    auto batch_remove_replica_callback = BuildBatchRemoveReplicaCallback();
     auto segment_sync_callback = BuildSegmentSyncCallback();
 
     auto init_result = tiered_backend->Init(
         config.tiered_backend_config, transfer_engine_.get(),
         add_replica_callback, remove_replica_callback,
-        batch_replica_mutation_callback, segment_sync_callback);
+        batch_remove_replica_callback, segment_sync_callback);
     if (!init_result) {
         LOG(ERROR) << "Failed to init TieredBackend: " << init_result.error();
         return init_result.error();
@@ -161,13 +161,12 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         [this](const std::string& key, std::optional<UUID> tier_id) {
             if (!tier_id) {
                 auto tier_views = data_manager_->GetTierViews();
-                std::vector<ReplicaMutation> mutations;
-                mutations.reserve(tier_views.size());
+                std::vector<BatchRemoveReplicaItem> removals;
+                removals.reserve(tier_views.size());
                 for (const auto& tv : tier_views) {
-                    mutations.push_back(ReplicaMutation{
-                        ReplicaMutationType::REMOVE, key, tv.id});
+                    removals.push_back(BatchRemoveReplicaItem{key, tv.id});
                 }
-                SyncBatchMutateReplica(std::move(mutations));
+                SyncBatchRemoveReplica(std::move(removals));
             } else {
                 SyncRemoveReplica(key, *tier_id);
             }
@@ -176,50 +175,38 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 }
 
 AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
-    return [this](const std::string& key, const UUID& tier_id,
-                  size_t size) -> tl::expected<void, ErrorCode> {
-        return SyncAddReplica(key, tier_id, size);
-    };
+    return
+        [this](const std::string& key, const UUID& tier_id, size_t size,
+               uint64_t replica_generation) -> tl::expected<void, ErrorCode> {
+            return SyncAddReplica(key, tier_id, size, replica_generation);
+        };
 }
 
 RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
     return
-        [this](
-            const std::string& key, const UUID& tier_id,
-            enum REMOVE_CALLBACK_TYPE type) -> tl::expected<void, ErrorCode> {
-            if (type == REMOVE_CALLBACK_TYPE::DELETE) {
-                return SyncRemoveReplica(key, tier_id);
-            } else if (type == REMOVE_CALLBACK_TYPE::DELETE_ALL) {
-                // TODO:
-                // Currently Master does not support deleting all replicas of a
-                // key within a client. The future will be implemented in
-                // future.
-                LOG(ERROR) << "DELETE_ALL callback is not supported"
-                           << ", key: " << key;
-                return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
-            }
-
-            LOG(ERROR) << "Unknown callback type: " << static_cast<int>(type);
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        [this](const std::string& key, const UUID& tier_id,
+               uint64_t replica_generation) -> tl::expected<void, ErrorCode> {
+            return SyncRemoveReplica(key, tier_id, replica_generation);
         };
 }
 
-BatchReplicaMutationCallback
-P2PClientService::BuildBatchReplicaMutationCallback() {
-    return [this](const UUID& tier_id, const std::vector<std::string>& keys)
+BatchRemoveReplicaCallback P2PClientService::BuildBatchRemoveReplicaCallback() {
+    return [this](const UUID& tier_id,
+                  const std::vector<ReplicaRemoveRequest>& requests)
                -> std::vector<tl::expected<void, ErrorCode>> {
-        std::vector<ReplicaMutation> mutations;
-        mutations.reserve(keys.size());
-        for (const auto& key : keys) {
-            mutations.push_back(
-                ReplicaMutation{ReplicaMutationType::REMOVE, key, tier_id});
+        std::vector<BatchRemoveReplicaItem> removals;
+        removals.reserve(requests.size());
+        for (const auto& request : requests) {
+            removals.push_back(BatchRemoveReplicaItem{
+                request.key, tier_id, request.replica_generation});
         }
-        return SyncBatchMutateReplica(std::move(mutations));
+        return SyncBatchRemoveReplica(std::move(removals));
     };
 }
 
 tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
-    const std::string& key, const UUID& tier_id, size_t size) {
+    const std::string& key, const UUID& tier_id, size_t size,
+    uint64_t replica_generation) {
     AddReplicaRequest req;
     req.key = key;
     req.size = size;
@@ -227,6 +214,7 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
     req.replica.segment_id = tier_id;
     req.replica.rpc_port = client_rpc_port_;
     req.replica.ip_address = local_ip_;
+    req.replica.replica_generation = replica_generation;
     auto result = master_client_.AddReplica(req);
     if (!result) {
         LOG(ERROR) << "Failed to add replica for key: " << key
@@ -237,11 +225,12 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
 }
 
 tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
-    const std::string& key, const UUID& tier_id) {
+    const std::string& key, const UUID& tier_id, uint64_t replica_generation) {
     RemoveReplicaRequest req;
     req.key = key;
     req.client_id = client_id_;
     req.segment_id = tier_id;
+    req.replica_generation = replica_generation;
     auto result = master_client_.RemoveReplica(req);
     if (!result) {
         LOG(ERROR) << "Failed to remove replica for key: " << key
@@ -252,19 +241,18 @@ tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-P2PClientService::SyncBatchMutateReplica(
-    std::vector<ReplicaMutation> mutations) {
-    BatchReplicaMutationRequest req;
+P2PClientService::SyncBatchRemoveReplica(
+    std::vector<BatchRemoveReplicaItem> removals) {
+    BatchRemoveReplicaRequest req;
     req.client_id = client_id_;
-    req.mutations = std::move(mutations);
+    req.removals = std::move(removals);
 
-    auto results = master_client_.BatchMutateReplica(req);
+    auto results = master_client_.BatchRemoveReplica(req);
     for (size_t i = 0; i < results.size(); i++) {
         if (!results[i]) {
-            LOG(ERROR) << "Failed to mutate replica for key: "
-                       << req.mutations[i].key
-                       << ", segment_id: " << req.mutations[i].segment_id
-                       << ", type: " << static_cast<int>(req.mutations[i].type)
+            LOG(ERROR) << "Failed to remove replica for key: "
+                       << req.removals[i].key
+                       << ", segment_id: " << req.removals[i].segment_id
                        << ", error: " << results[i].error();
         }
     }
@@ -597,8 +585,8 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
             auto local_result = GetLocal(key, slices);
             if (!local_result) {
                 LOG(WARNING)
-                    << "fail to get local via route"
-                    << ", key: " << key << ", error: " << local_result.error();
+                    << "fail to get local via route" << ", key: " << key
+                    << ", error: " << local_result.error();
                 // Rectify stale local route
                 if (data_manager_.has_value()) {
                     data_manager_->RectifyReadRoute(key, proxy.segment_id);
@@ -657,8 +645,7 @@ tl::expected<void, ErrorCode> P2PClientService::Get(
     auto local_result = GetLocal(object_key, slices);
     if (!local_result) {
         if (local_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            LOG(ERROR) << "Failed to get local data"
-                       << ", key: " << object_key
+            LOG(ERROR) << "Failed to get local data" << ", key: " << object_key
                        << ", error: " << local_result.error();
         }
     } else {
@@ -669,8 +656,7 @@ tl::expected<void, ErrorCode> P2PClientService::Get(
     auto remote_result = GetRemoteViaRoute(object_key, slices);
     if (!remote_result) {
         if (remote_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            LOG(ERROR) << "Failed to get remote data"
-                       << ", key: " << object_key
+            LOG(ERROR) << "Failed to get remote data" << ", key: " << object_key
                        << ", error: " << remote_result.error();
         }
         return remote_result;

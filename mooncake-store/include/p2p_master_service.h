@@ -35,9 +35,9 @@ class P2PMasterService : public MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Apply a batch of replica metadata mutations.
+     * @brief Remove replicas from master in one batch request.
      */
-    auto BatchMutateReplica(const BatchReplicaMutationRequest& req)
+    auto BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
         -> std::vector<tl::expected<void, ErrorCode>>;
 
     std::vector<Replica::Descriptor> FilterReplicas(

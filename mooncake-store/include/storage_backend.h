@@ -725,12 +725,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<int64_t, ErrorCode> SelectBucketForEviction() const;
 
     /**
-     * @brief List live keys currently reachable from a bucket.
+     * @brief List live storage replicas currently reachable from a bucket.
      * @param bucket_id The bucket to inspect.
-     * @return On success: live keys still visible to the cache namespace.
+     * @return On success: bucket-scoped eviction tokens for live replicas.
      */
-    tl::expected<std::vector<std::string>, ErrorCode> GetBucketLiveKeys(
-        int64_t bucket_id) const;
+    tl::expected<std::vector<StorageReplicaEvictionToken>, ErrorCode>
+    GetBucketLiveReplicaTokens(int64_t bucket_id) const;
 
     /**
      * @brief Evict an entire bucket by removing its data and metadata files.

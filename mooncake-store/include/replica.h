@@ -127,14 +127,17 @@ struct LocalDiskReplicaData {
 struct P2PProxyReplicaData {
     P2PProxyReplicaData() = default;
     P2PProxyReplicaData(std::shared_ptr<P2PClientMeta> client,
-                        std::shared_ptr<Segment> segment, uint64_t object_size)
+                        std::shared_ptr<Segment> segment, uint64_t object_size,
+                        uint64_t replica_generation = 0)
         : client(std::move(client)),
           segment(std::move(segment)),
-          object_size(object_size) {}
+          object_size(object_size),
+          replica_generation(replica_generation) {}
 
     std::shared_ptr<const P2PClientMeta> client;
     std::shared_ptr<const Segment> segment;
     uint64_t object_size = 0;
+    uint64_t replica_generation = 0;
 };
 
 struct MemoryDescriptor {
@@ -161,8 +164,9 @@ struct P2PProxyDescriptor {
     std::string ip_address;
     uint16_t rpc_port = 0;
     uint64_t object_size = 0;
+    uint64_t replica_generation = 0;
     YLT_REFL(P2PProxyDescriptor, client_id, segment_id, ip_address, rpc_port,
-             object_size);
+             object_size, replica_generation);
 };
 
 class Replica {
@@ -315,6 +319,7 @@ class Replica {
     }
 
     std::optional<UUID> get_p2p_client_id() const;
+    std::optional<uint64_t> get_p2p_replica_generation() const;
 
     std::shared_ptr<const Segment> get_p2p_segment() const {
         if (!is_p2p_proxy_replica()) return nullptr;

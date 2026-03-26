@@ -1390,7 +1390,7 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     // Pass TransferEngine to TieredBackend so DRAM memory gets registered for
     // RDMA
     auto init_backend_result = rdma_tiered_backend->Init(
-        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr);
+        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_backend_result.has_value())
         << "Failed to initialize TieredBackend";
 
@@ -1552,7 +1552,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
     // Pass TransferEngine to TieredBackend so DRAM memory gets registered for
     // RDMA
     auto init_backend_result = rdma_tiered_backend->Init(
-        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr);
+        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_backend_result.has_value())
         << "Failed to initialize TieredBackend";
 
@@ -1743,7 +1743,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
 
     auto rdma_tiered_backend = std::make_unique<TieredBackend>();
     auto init_backend_result = rdma_tiered_backend->Init(
-        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr);
+        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_backend_result.has_value())
         << "Failed to initialize TieredBackend";
 
@@ -1889,7 +1889,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteData) {
 
     auto rdma_tiered_backend = std::make_unique<TieredBackend>();
     auto init_backend_result = rdma_tiered_backend->Init(
-        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr);
+        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_backend_result.has_value())
         << "Failed to initialize TieredBackend";
 
@@ -2052,7 +2052,7 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
 
     auto rdma_tiered_backend = std::make_unique<TieredBackend>();
     auto init_backend_result = rdma_tiered_backend->Init(
-        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr);
+        config, rdma_transfer_engine.get(), nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_backend_result.has_value())
         << "Failed to initialize TieredBackend";
 

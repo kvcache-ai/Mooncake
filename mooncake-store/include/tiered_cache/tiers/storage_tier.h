@@ -65,6 +65,12 @@ class StorageBuffer : public BufferBase {
 
     void SetKey(const std::string& key) { key_ = key; }
     const std::string& GetKey() const { return key_; }
+    void SetBucketId(int64_t bucket_id) {
+        bucket_id_.store(bucket_id, std::memory_order_release);
+    }
+    int64_t GetBucketId() const {
+        return bucket_id_.load(std::memory_order_acquire);
+    }
 
     // Transition from staging pool -> on disk.
     void Persist() {
@@ -132,6 +138,7 @@ class StorageBuffer : public BufferBase {
     std::atomic<bool> is_on_disk_{false};
     std::atomic<bool> is_flushing_{false};
     std::atomic<bool> is_evicted_{false};
+    std::atomic<int64_t> bucket_id_{kInvalidBucketId};
     size_t size_ = 0;
 };
 
