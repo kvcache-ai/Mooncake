@@ -106,6 +106,44 @@ cmake .. # Auto-detected if hiredis is installed
 cmake .. # HuggingFace connector always available
 ```
 
+## Testing
+
+### Unit Tests
+
+Run basic connector tests:
+```bash
+cd build
+ctest -R connector_e2e_test -V
+```
+
+### Redis E2E Test
+
+To run the Redis end-to-end test with real data:
+
+1. Start Redis:
+```bash
+redis-server --port 6379 &
+```
+
+2. Setup test data:
+```bash
+cd mooncake-store/tests
+bash setup_redis_test_data.sh
+```
+
+3. Run the test:
+```bash
+cd build
+MOONCAKE_REDIS_HOST=127.0.0.1 MOONCAKE_REDIS_PORT=6379 ctest -R connector_e2e_test -V
+```
+
+The test will:
+- Create a Redis connector
+- Generate random test keys
+- Attempt to download data from Redis
+- List objects with prefix matching
+- Verify data integrity
+
 ## Architecture
 
 - **DataConnector**: Abstract base class
