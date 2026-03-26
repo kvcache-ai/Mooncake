@@ -63,15 +63,15 @@ def metadata_hint(metadata_server: str) -> str:
     return ""
 
 
-def query_key_by_http(metadata_server: str, key: str, timeout: float) -> str:
+def query_key_by_http(metadata_server: str, key: str, timeout: float) -> bool:
     url = build_metadata_url(metadata_server, key)
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout):
-            return "true"
+            return True
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return "false"
+            return False
         raise RuntimeError(f"HTTP error {exc.code} for {url}") from exc
     except http.client.RemoteDisconnected as exc:
         raise RuntimeError(
