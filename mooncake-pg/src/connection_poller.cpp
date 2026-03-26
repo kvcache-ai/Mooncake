@@ -72,8 +72,8 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_->registerLocalMemory(warmup_recv_region_,
-                                      kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+    rc = engine_->registerLocalMemory(
+        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 }
 

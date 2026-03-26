@@ -15,7 +15,6 @@ enum WorkerTaskStatus {
 
 static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
 
-
 void MooncakeWorker::Start() {
     bool expected = false;
     if (started_.compare_exchange_strong(expected, true)) {

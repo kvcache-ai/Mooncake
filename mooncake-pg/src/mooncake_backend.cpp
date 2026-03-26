@@ -158,15 +158,17 @@ MooncakeBackend::MooncakeBackend(
                 "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks]{};
-        int rc = engine_->registerLocalMemory(
-            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+        int rc = engine_->registerLocalMemory(cpu_sync_send_region_[i],
+                                              kMaxNumRanks * sizeof(int32_t),
+                                              kWildcardLocation);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks]{};
-        int rc = engine_->registerLocalMemory(
-            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+        int rc = engine_->registerLocalMemory(cpu_sync_recv_region_[i],
+                                              kMaxNumRanks * sizeof(int32_t),
+                                              kWildcardLocation);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
@@ -200,8 +202,8 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, store,
-        meta_, p2p_proxy_, engine_);
+        backendIndex_, rank, size, local2global_rank_map_, store, meta_,
+        p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
