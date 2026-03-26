@@ -176,6 +176,12 @@ class P2PClientService final : public ClientService {
     RemoveReplicaCallback BuildRemoveReplicaCallback();
 
     /**
+     * @brief build batch remove replica callback.
+     *        used by SSD bucket eviction to batch-sync replica deletions.
+     */
+    BatchRemoveReplicaCallback BuildBatchRemoveReplicaCallback();
+
+    /**
      * @brief build segment sync callback.
      *        when tier add/remove segment, call master to mount/unmount segment
      */
@@ -186,23 +192,23 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<void, ErrorCode> SyncAddReplica(const std::string& key,
                                                  const UUID& tier_id,
-                                                 size_t size);
+                                                 size_t size,
+                                                 uint64_t replica_generation);
 
     /**
      * @brief handle DELETE type callback: notify master to remove replica
      */
-    tl::expected<void, ErrorCode> SyncRemoveReplica(const std::string& key,
-                                                    const UUID& tier_id);
+    tl::expected<void, ErrorCode> SyncRemoveReplica(
+        const std::string& key, const UUID& tier_id,
+        uint64_t replica_generation = 0);
 
     /**
-     * @brief handle batch DELETE: notify master to remove replicas from
-     *        multiple segments in one RPC call
-     * @param key Key to remove
-     * @param segment_ids Vector of segment IDs to remove (it will be moved)
-     * @return Vector of ErrorCode results for each segment
+     * @brief handle batch replica removals in one RPC call.
+     * @param removals Removal list; it will be moved into the request.
+     * @return Vector of ErrorCode results for each removal.
      */
     std::vector<tl::expected<void, ErrorCode>> SyncBatchRemoveReplica(
-        const std::string& key, std::vector<UUID> segment_ids);
+        std::vector<BatchRemoveReplicaItem> removals);
 
     /**
      * @brief Collect tier info from DataManager and build P2P Segments.

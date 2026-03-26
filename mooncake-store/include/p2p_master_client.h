@@ -36,7 +36,7 @@ class P2PMasterClient final : public MasterClient {
         const RemoveReplicaRequest& req);
 
     /**
-     * @brief Removes replicas from multiple segments in one call
+     * @brief Removes replicas from master in one batch RPC.
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
         const BatchRemoveReplicaRequest& req);

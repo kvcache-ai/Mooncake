@@ -777,6 +777,64 @@ TEST_F(StorageBackendTest, BucketStoreMetadataTracksPhysicalBytes) {
     EXPECT_EQ(metadata_after_delete->total_size, 0);
 }
 
+TEST_F(StorageBackendTest, EvictOldBucketKeepsRecreatedKeyMapping) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::string old_value(1024, 'a');
+    std::unordered_map<std::string, std::vector<Slice>> old_batch = {
+        {"shared-key", {Slice{old_value.data(), old_value.size()}}},
+    };
+
+    auto old_offload_res = backend.BatchOffload(old_batch, nullptr);
+    ASSERT_TRUE(old_offload_res);
+    const int64_t old_bucket_id = old_offload_res.value();
+
+    ASSERT_TRUE(backend.MarkKeyDeleted("shared-key"));
+
+    std::string new_value(2048, 'b');
+    std::unordered_map<std::string, std::vector<Slice>> new_batch = {
+        {"shared-key", {Slice{new_value.data(), new_value.size()}}},
+    };
+
+    auto new_offload_res = backend.BatchOffload(new_batch, nullptr);
+    ASSERT_TRUE(new_offload_res);
+    const int64_t new_bucket_id = new_offload_res.value();
+    ASSERT_NE(new_bucket_id, old_bucket_id);
+
+    auto old_tokens = backend.GetBucketLiveReplicaTokens(old_bucket_id);
+    ASSERT_TRUE(old_tokens);
+    EXPECT_TRUE(old_tokens->empty());
+
+    auto new_tokens = backend.GetBucketLiveReplicaTokens(new_bucket_id);
+    ASSERT_TRUE(new_tokens);
+    ASSERT_EQ(new_tokens->size(), 1);
+    EXPECT_EQ(new_tokens->front().key, "shared-key");
+    EXPECT_EQ(new_tokens->front().bucket_id, new_bucket_id);
+
+    auto evict_res = backend.EvictBucket(old_bucket_id);
+    ASSERT_TRUE(evict_res);
+    EXPECT_EQ(evict_res.value(), 0);
+
+    EXPECT_TRUE(WaitForPathRemoved(
+        fs::path(data_path) / (std::to_string(old_bucket_id) + ".bucket")));
+    EXPECT_TRUE(WaitForPathRemoved(fs::path(data_path) /
+                                   (std::to_string(old_bucket_id) + ".meta")));
+
+    auto exist_res = backend.IsExist("shared-key");
+    ASSERT_TRUE(exist_res);
+    EXPECT_TRUE(exist_res.value());
+
+    std::unordered_map<std::string, StorageObjectMetadata> metadatas;
+    ASSERT_TRUE(backend.BatchQuery({"shared-key"}, metadatas));
+    ASSERT_EQ(metadatas.size(), 1);
+    EXPECT_EQ(metadatas.at("shared-key").bucket_id, new_bucket_id);
+    EXPECT_EQ(metadatas.at("shared-key").data_size, new_value.size());
+}
+
 TEST_F(StorageBackendTest, AdaptorMarkKeyDeletedReclaimsPhysicalBytes) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -88,17 +89,27 @@ struct RemoveReplicaRequest {
     std::string key;
     UUID client_id;
     UUID segment_id;
+    uint64_t replica_generation = 0;
 };
-YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id);
+YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id, replica_generation);
 
 /**
- * @brief Request to remove replicas from multiple segments in one call
+ * @brief One replica removal entry in a batch request.
+ */
+struct BatchRemoveReplicaItem {
+    std::string key;
+    UUID segment_id;
+    uint64_t replica_generation = 0;
+};
+YLT_REFL(BatchRemoveReplicaItem, key, segment_id, replica_generation);
+
+/**
+ * @brief Request to remove multiple replicas in one call.
  */
 struct BatchRemoveReplicaRequest {
-    std::string key;
     UUID client_id;
-    std::vector<UUID> segment_ids;
+    std::vector<BatchRemoveReplicaItem> removals;
 };
-YLT_REFL(BatchRemoveReplicaRequest, key, client_id, segment_ids);
+YLT_REFL(BatchRemoveReplicaRequest, client_id, removals);
 
 }  // namespace mooncake

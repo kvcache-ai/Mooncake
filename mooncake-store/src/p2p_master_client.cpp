@@ -61,16 +61,16 @@ tl::expected<void, ErrorCode> P2PMasterClient::RemoveReplica(
 std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchRemoveReplica(
     const BatchRemoveReplicaRequest& req) {
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchRemoveReplica");
-    timer.LogRequest("key=", req.key, "segment_count=", req.segment_ids.size());
+    timer.LogRequest("removal_count=", req.removals.size());
 
     auto result = invoke_rpc<&WrappedP2PMasterService::BatchRemoveReplica,
                              std::vector<tl::expected<void, ErrorCode>>>(req);
-
     if (!result) {
         LOG(ERROR) << "BatchRemoveReplica RPC failed: "
                    << toString(result.error());
         std::vector<tl::expected<void, ErrorCode>> fallback;
-        for (size_t i = 0; i < req.segment_ids.size(); i++) {
+        fallback.reserve(req.removals.size());
+        for (size_t i = 0; i < req.removals.size(); ++i) {
             fallback.push_back(tl::make_unexpected(result.error()));
         }
         return fallback;

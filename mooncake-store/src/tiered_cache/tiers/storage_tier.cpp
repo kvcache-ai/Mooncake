@@ -5,6 +5,7 @@
 
 #include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/copier_registry.h"
+#include "tiered_cache/tiered_backend.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -197,6 +198,12 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
     auto* staging = static_cast<StorageBuffer*>(data.buffer.get());
     if (!staging) return {};
 
+    if (staging->IsEvicted()) {
+        VLOG(1) << "Skip free for evicted storage buffer, key="
+                << staging->GetKey();
+        return {};
+    }
+
     size_t size = staging->size();
     std::string key = staging->GetKey();
 
@@ -309,8 +316,32 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
         }
     }
 
+    auto complete_handler =
+        [&snapshot](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        if (keys.size() != metadatas.size()) {
+            LOG(ERROR) << "Flush complete handler got mismatched metadata: "
+                       << "keys=" << keys.size()
+                       << ", metadatas=" << metadatas.size();
+            return ErrorCode::INTERNAL_ERROR;
+        }
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto it = snapshot.find(keys[i]);
+            if (it == snapshot.end() || !it->second) {
+                LOG(ERROR)
+                    << "Flush complete handler cannot find snapshot key: "
+                    << keys[i];
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            it->second->SetBucketId(metadatas[i].bucket_id);
+        }
+        return ErrorCode::OK;
+    };
+
     // 2. IO without lock
-    auto res = storage_backend_->BatchOffload(batch_to_write, nullptr);
+    auto res = storage_backend_->BatchOffload(batch_to_write, complete_handler);
 
     // 3. Finalize under lock: update state and notify waiters
     {
@@ -380,6 +411,45 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
     constexpr int MAX_EVICTION_ATTEMPTS = 10;  // Prevent infinite loop
     int attempts = 0;
 
+    auto evict_bucket =
+        [&](int64_t bucket_id) -> tl::expected<size_t, ErrorCode> {
+        auto live_tokens_res =
+            bucket_backend->GetBucketLiveReplicaTokens(bucket_id);
+        if (!live_tokens_res) {
+            LOG(ERROR) << "Failed to collect live replicas for bucket "
+                       << bucket_id << ": " << live_tokens_res.error();
+            return tl::make_unexpected(live_tokens_res.error());
+        }
+
+        const auto& live_tokens = live_tokens_res.value();
+        if (!live_tokens.empty()) {
+            if (!backend_) {
+                LOG(ERROR) << "StorageTier backend is not initialized";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+
+            auto delete_res =
+                backend_->DeleteBatchFromEviction(live_tokens, tier_id_);
+            if (!delete_res) {
+                LOG(ERROR) << "Failed to remove bucket replicas from tiered "
+                              "metadata before eviction: bucket_id="
+                           << bucket_id << ", error=" << delete_res.error();
+                return tl::make_unexpected(delete_res.error());
+            }
+        }
+
+        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        if (!evict_res) {
+            LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
+                       << evict_res.error();
+            return tl::make_unexpected(evict_res.error());
+        }
+
+        persisted_live_data_bytes_.fetch_sub(evict_res.value(),
+                                             std::memory_order_acq_rel);
+        return evict_res;
+    };
+
     // If target_free_size is 0, evict just one bucket
     if (target_free_size == 0) {
         auto select_res = bucket_backend->SelectBucketForEviction();
@@ -390,20 +460,12 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
-        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        auto evict_res = evict_bucket(bucket_id);
         if (!evict_res) {
-            LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
-                       << evict_res.error();
             return tl::make_unexpected(evict_res.error());
         }
 
         total_freed = evict_res.value();
-
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(total_freed,
-                                             std::memory_order_acq_rel);
-
         LOG(INFO) << "Evicted 1 bucket, freed " << total_freed << " bytes";
         return total_freed;
     }
@@ -425,22 +487,14 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
-        auto evict_res = bucket_backend->EvictBucket(bucket_id);
+        auto evict_res = evict_bucket(bucket_id);
         if (!evict_res) {
-            LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
-                       << evict_res.error();
-            // Continue trying other buckets
-            attempts++;
-            continue;
+            return tl::make_unexpected(evict_res.error());
         }
 
         size_t freed = evict_res.value();
         total_freed += freed;
         attempts++;
-
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(freed, std::memory_order_acq_rel);
 
         LOG(INFO) << "Evicted bucket " << bucket_id << ", freed " << freed
                   << " bytes (total: " << total_freed << "/" << target_free_size

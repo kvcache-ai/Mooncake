@@ -71,12 +71,14 @@ class P2PMasterServiceTest : public ::testing::Test {
     /// Helper to add a replica via AddReplica
     void AddReplicaHelper(P2PMasterService& service, const std::string& key,
                           size_t size, const UUID& client_id,
-                          const UUID& segment_id) {
+                          const UUID& segment_id,
+                          uint64_t replica_generation = 0) {
         AddReplicaRequest req;
         req.key = key;
         req.size = size;
         req.replica.client_id = client_id;
         req.replica.segment_id = segment_id;
+        req.replica.replica_generation = replica_generation;
         auto res = service.AddReplica(req);
         EXPECT_TRUE(res.has_value())
             << "Failed to add replica: " << res.error();
@@ -334,6 +336,103 @@ TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
     EXPECT_EQ(ErrorCode::REPLICA_ALREADY_EXISTS, res2.error());
 }
 
+TEST_F(P2PMasterServiceTest,
+       AddReplicaNewGenerationReplacesSameSegmentReplica) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    AddReplicaRequest req1;
+    req1.key = "key1";
+    req1.size = 1024;
+    req1.replica.client_id = client_id;
+    req1.replica.segment_id = seg.id;
+    req1.replica.replica_generation = 1;
+    ASSERT_TRUE(service->AddReplica(req1).has_value());
+
+    AddReplicaRequest req2 = req1;
+    req2.size = 2048;
+    req2.replica.replica_generation = 2;
+    auto res2 = service->AddReplica(req2);
+    ASSERT_TRUE(res2.has_value());
+
+    auto get_res = service->GetReplicaList("key1");
+    ASSERT_TRUE(get_res.has_value());
+    ASSERT_EQ(1, get_res->replicas.size());
+    const auto& desc = get_res->replicas[0].get_p2p_proxy_descriptor();
+    EXPECT_EQ(2048, desc.object_size);
+    EXPECT_EQ(2, desc.replica_generation);
+}
+
+TEST_F(P2PMasterServiceTest, AddReplicaReplacementBypassesReplicaLimit) {
+    auto service = CreateService(/* max_replicas_per_key= */ 1);
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg.id, 1);
+    AddReplicaHelper(*service, "key1", 2048, client_id, seg.id, 2);
+
+    auto get_res = service->GetReplicaList("key1");
+    ASSERT_TRUE(get_res.has_value());
+    ASSERT_EQ(1, get_res->replicas.size());
+    const auto& desc = get_res->replicas[0].get_p2p_proxy_descriptor();
+    EXPECT_EQ(2048, desc.object_size);
+    EXPECT_EQ(2, desc.replica_generation);
+}
+
+TEST_F(P2PMasterServiceTest, BatchRemoveReplicaSkipsStaleGeneration) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg.id, 1);
+    AddReplicaHelper(*service, "key1", 2048, client_id, seg.id, 2);
+
+    BatchRemoveReplicaRequest req;
+    req.client_id = client_id;
+    req.removals = {BatchRemoveReplicaItem{"key1", seg.id, 1}};
+
+    auto results = service->BatchRemoveReplica(req);
+    ASSERT_EQ(1, results.size());
+    ASSERT_TRUE(results[0].has_value());
+
+    auto get_res = service->GetReplicaList("key1");
+    ASSERT_TRUE(get_res.has_value());
+    ASSERT_EQ(1, get_res->replicas.size());
+    const auto& desc = get_res->replicas[0].get_p2p_proxy_descriptor();
+    EXPECT_EQ(2, desc.replica_generation);
+    EXPECT_EQ(2048, desc.object_size);
+}
+
+TEST_F(P2PMasterServiceTest, RemoveReplicaSkipsStaleGeneration) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg.id, 1);
+    AddReplicaHelper(*service, "key1", 2048, client_id, seg.id, 2);
+
+    RemoveReplicaRequest req;
+    req.key = "key1";
+    req.client_id = client_id;
+    req.segment_id = seg.id;
+    req.replica_generation = 1;
+
+    auto res = service->RemoveReplica(req);
+    ASSERT_TRUE(res.has_value());
+
+    auto get_res = service->GetReplicaList("key1");
+    ASSERT_TRUE(get_res.has_value());
+    ASSERT_EQ(1, get_res->replicas.size());
+    const auto& desc = get_res->replicas[0].get_p2p_proxy_descriptor();
+    EXPECT_EQ(2, desc.replica_generation);
+    EXPECT_EQ(2048, desc.object_size);
+}
+
 TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     auto service = CreateService(/* max_replicas_per_key= */ 2);
     auto seg1 = MakeP2PSegment("seg1");
@@ -441,6 +540,40 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaPartial) {
     auto get_res = service->GetReplicaList("key1");
     ASSERT_TRUE(get_res.has_value());
     EXPECT_EQ(1, get_res.value().replicas.size());
+}
+
+TEST_F(P2PMasterServiceTest, BatchRemoveReplicaMixedPatterns) {
+    auto service = CreateService();
+    auto seg1 = MakeP2PSegment("seg1");
+    auto seg2 = MakeP2PSegment("seg2");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg1, seg2}, "127.0.0.1", 50051);
+
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg1.id);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg2.id);
+    AddReplicaHelper(*service, "key2", 1024, client_id, seg1.id);
+    AddReplicaHelper(*service, "key3", 1024, client_id, seg2.id);
+
+    BatchRemoveReplicaRequest req;
+    req.client_id = client_id;
+    req.removals = {
+        BatchRemoveReplicaItem{"key1", seg1.id},
+        BatchRemoveReplicaItem{"key1", seg2.id},
+        BatchRemoveReplicaItem{"key2", seg1.id},
+        BatchRemoveReplicaItem{"key3", seg2.id},
+    };
+
+    auto results = service->BatchRemoveReplica(req);
+    ASSERT_EQ(results.size(), req.removals.size());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    for (const auto& key : {"key1", "key2", "key3"}) {
+        auto get_res = service->GetReplicaList(key);
+        EXPECT_FALSE(get_res.has_value());
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
+    }
 }
 
 TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {

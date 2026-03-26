@@ -65,6 +65,12 @@ class StorageBuffer : public BufferBase {
 
     void SetKey(const std::string& key) { key_ = key; }
     const std::string& GetKey() const { return key_; }
+    void SetBucketId(int64_t bucket_id) {
+        bucket_id_.store(bucket_id, std::memory_order_release);
+    }
+    int64_t GetBucketId() const {
+        return bucket_id_.load(std::memory_order_acquire);
+    }
 
     // Transition from staging pool -> on disk.
     void Persist() {
@@ -81,6 +87,12 @@ class StorageBuffer : public BufferBase {
         return is_on_disk_.load(std::memory_order_acquire);
     }
 
+    void MarkEvicted() { is_evicted_.store(true, std::memory_order_release); }
+
+    bool IsEvicted() const {
+        return is_evicted_.load(std::memory_order_acquire);
+    }
+
     void SetFlushing(bool flushing) {
         is_flushing_.store(flushing, std::memory_order_release);
     }
@@ -91,6 +103,9 @@ class StorageBuffer : public BufferBase {
 
     // Read data to destination buffer (handles staging vs disk transparently).
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
+        if (is_evicted_.load(std::memory_order_acquire)) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             if (!is_on_disk_.load(std::memory_order_acquire)) {
@@ -122,6 +137,8 @@ class StorageBuffer : public BufferBase {
     std::string key_;
     std::atomic<bool> is_on_disk_{false};
     std::atomic<bool> is_flushing_{false};
+    std::atomic<bool> is_evicted_{false};
+    std::atomic<int64_t> bucket_id_{kInvalidBucketId};
     size_t size_ = 0;
 };
 

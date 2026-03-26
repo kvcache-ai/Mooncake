@@ -14,6 +14,27 @@
 
 namespace mooncake {
 
+namespace {
+
+bool MatchesEvictionToken(const AllocationHandle& handle,
+                          const StorageReplicaEvictionToken& token) {
+    if (token.bucket_id == kInvalidBucketId) {
+        return true;
+    }
+    if (!handle || !handle->loc.data.buffer) {
+        return false;
+    }
+
+    auto* storage_buffer =
+        dynamic_cast<StorageBuffer*>(handle->loc.data.buffer.get());
+    if (!storage_buffer) {
+        return false;
+    }
+    return storage_buffer->GetBucketId() == token.bucket_id;
+}
+
+}  // namespace
+
 AllocationEntry::~AllocationEntry() {
     if (loc.tier) {
         // Keep the tier alive until the final handle has released the buffer.
@@ -22,6 +43,36 @@ AllocationEntry::~AllocationEntry() {
 }
 
 TieredBackend::TieredBackend() = default;
+
+std::shared_ptr<TieredBackend::MetadataEntry>
+TieredBackend::CreateMetadataEntry() {
+    auto entry = std::make_shared<MetadataEntry>();
+    entry->generation =
+        next_entry_generation_.fetch_add(1, std::memory_order_relaxed);
+    return entry;
+}
+
+void TieredBackend::CleanupTombstonedEntry(
+    const std::string& key, const std::shared_ptr<MetadataEntry>& entry,
+    uint64_t generation) {
+    if (!entry) {
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> map_lock(map_mutex_);
+    auto it = metadata_index_.find(key);
+    if (it == metadata_index_.end() || it->second != entry) {
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+    if (!entry->tombstone || !entry->replicas.empty() ||
+        entry->generation != generation) {
+        return;
+    }
+
+    metadata_index_.erase(it);
+}
 
 TieredBackend::~TieredBackend() {
     Stop();
@@ -87,6 +138,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
     AddReplicaCallback add_replica_callback,
     RemoveReplicaCallback remove_replica_callback,
+    BatchRemoveReplicaCallback batch_remove_replica_callback,
     SegmentSyncCallback segment_sync_callback) {
     // Initialize DataCopier
     try {
@@ -100,6 +152,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     // Register callback for syncing metadata to Master
     add_replica_callback_ = add_replica_callback;
     remove_replica_callback_ = remove_replica_callback;
+    batch_remove_replica_callback_ = batch_remove_replica_callback;
     // Register callback for segment lifecycle synchronization with Master
     segment_sync_callback_ = segment_sync_callback;
 
@@ -455,40 +508,23 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     }
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
-    std::shared_ptr<MetadataEntry> entry = nullptr;
-
-    // Try to find existing entry (Global Read Lock)
-    {
-        std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+    // CAS check BEFORE any side effects
+    if (expected_version.has_value()) {
+        std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
         auto it = metadata_index_.find(key);
-        if (it != metadata_index_.end()) {
-            entry = it->second;
-        }
-    }
-
-    // Create if not exists (Global Write Lock)
-    if (!entry) {
-        if (expected_version.has_value()) {
+        if (it == metadata_index_.end()) {
+            VLOG(1) << "CAS Failed for key " << key
+                    << ": key missing before commit";
             return tl::make_unexpected(ErrorCode::CAS_FAILED);
         }
 
-        std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
-        auto it = metadata_index_.find(key);
-        if (it != metadata_index_.end()) {
-            entry = it->second;
-        } else {
-            entry = std::make_shared<MetadataEntry>();
-            metadata_index_[key] = entry;
-        }
-    }
-
-    // CAS check BEFORE any side effects
-    if (expected_version.has_value()) {
+        auto entry = it->second;
         std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
-        if (entry->version != expected_version.value()) {
+        if (entry->tombstone || entry->version != expected_version.value()) {
             VLOG(1) << "CAS Failed for key " << key
                     << ": valid_version=" << entry->version
-                    << ", expected=" << expected_version.value();
+                    << ", expected=" << expected_version.value()
+                    << ", tombstone=" << entry->tombstone;
             return tl::make_unexpected(ErrorCode::CAS_FAILED);
         }
     }
@@ -504,21 +540,12 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     UUID current_tier_id = handle->loc.tier->GetTierId();
     size_t handle_size =
         handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
+    handle->replica_generation =
+        next_replica_generation_.fetch_add(1, std::memory_order_relaxed);
 
-    // Update Entry (Entry Write Lock)
-    {
-        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
-
-        // Re-check version under write lock (another commit may have raced)
-        if (expected_version.has_value() &&
-            entry->version != expected_version.value()) {
-            VLOG(1) << "CAS Failed (re-check) for key " << key;
-            return tl::make_unexpected(ErrorCode::CAS_FAILED);
-        }
-
-        // Insert or replace the handle for this tier
+    auto install_handle = [&](MetadataEntry& entry) {
         bool found = false;
-        for (auto& replica : entry->replicas) {
+        for (auto& replica : entry.replicas) {
             if (replica.first == current_tier_id) {
                 replica.second = handle;
                 found = true;
@@ -527,8 +554,8 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
         }
 
         if (!found) {
-            entry->replicas.emplace_back(current_tier_id, handle);
-            std::sort(entry->replicas.begin(), entry->replicas.end(),
+            entry.replicas.emplace_back(current_tier_id, handle);
+            std::sort(entry.replicas.begin(), entry.replicas.end(),
                       [this](const std::pair<UUID, AllocationHandle>& a,
                              const std::pair<UUID, AllocationHandle>& b) {
                           return tier_info_.at(a.first).priority >
@@ -536,9 +563,80 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
                       });
         }
 
-        // Increment Version on modification
-        entry->version++;
+        entry.tombstone = false;
+        entry.version++;
+    };
+
+    bool committed = false;
+
+    // Fast path: update an existing live entry under the shared map lock.
+    {
+        std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+        auto it = metadata_index_.find(key);
+        if (it != metadata_index_.end()) {
+            auto entry = it->second;
+            std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+            if (!entry->tombstone) {
+                if (expected_version.has_value() &&
+                    entry->version != expected_version.value()) {
+                    VLOG(1) << "CAS Failed (re-check) for key " << key;
+                    return tl::make_unexpected(ErrorCode::CAS_FAILED);
+                }
+
+                install_handle(*entry);
+                committed = true;
+            }
+        }
     }
+
+    if (!committed) {
+        std::unique_lock<std::shared_mutex> map_lock(map_mutex_);
+        auto it = metadata_index_.find(key);
+        std::shared_ptr<MetadataEntry> entry;
+
+        if (it != metadata_index_.end()) {
+            entry = it->second;
+            std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+            if (!entry->tombstone) {
+                if (expected_version.has_value() &&
+                    entry->version != expected_version.value()) {
+                    VLOG(1) << "CAS Failed (re-check) for key " << key;
+                    return tl::make_unexpected(ErrorCode::CAS_FAILED);
+                }
+
+                install_handle(*entry);
+                committed = true;
+            } else {
+                if (expected_version.has_value()) {
+                    return tl::make_unexpected(ErrorCode::CAS_FAILED);
+                }
+
+                auto new_entry = CreateMetadataEntry();
+                {
+                    std::unique_lock<std::shared_mutex> new_entry_lock(
+                        new_entry->mutex);
+                    install_handle(*new_entry);
+                }
+                metadata_index_[key] = new_entry;
+                committed = true;
+            }
+        } else {
+            if (expected_version.has_value()) {
+                return tl::make_unexpected(ErrorCode::CAS_FAILED);
+            }
+
+            auto new_entry = CreateMetadataEntry();
+            {
+                std::unique_lock<std::shared_mutex> entry_lock(
+                    new_entry->mutex);
+                install_handle(*new_entry);
+            }
+            metadata_index_[key] = new_entry;
+            committed = true;
+        }
+    }
+
+    CHECK(committed) << "Commit should have installed the handle";
 
     if (scheduler_) {
         scheduler_->OnCommit(key, current_tier_id, handle_size);
@@ -550,8 +648,9 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     if (add_replica_callback_) {
         size_t data_size =
             handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
-        auto result = add_replica_callback_(key, handle->loc.tier->GetTierId(),
-                                            data_size);
+        auto result =
+            add_replica_callback_(key, handle->loc.tier->GetTierId(), data_size,
+                                  handle->replica_generation);
 
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to Commit key " << key
@@ -570,69 +669,80 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
         LOG(ERROR) << "TieredBackend is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    std::shared_ptr<MetadataEntry> entry = nullptr;
+    AllocationHandle result;
 
-    // Find Entry (Global Read Lock)
     {
-        std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+        std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
         auto it = metadata_index_.find(key);
         if (it == metadata_index_.end()) {
             LOG(ERROR) << "Key not found: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        entry = it->second;
+
+        auto entry = it->second;
+        std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
+
+        if (entry->tombstone) {
+            LOG(ERROR) << "Key not found (tombstoned): " << key;
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+
+        if (out_version) {
+            *out_version = entry->version;
+        }
+
+        if (entry->replicas.empty()) {
+            LOG(ERROR) << "Empty replicas for key: " << key;
+            return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
+        }
+
+        if (tier_id.has_value()) {
+            for (const auto& replica : entry->replicas) {
+                if (replica.first == *tier_id) {
+                    result = replica.second;
+                    break;
+                }
+            }
+            if (!result) {
+                LOG(ERROR) << "Tier not found: " << *tier_id;
+                return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+            }
+        } else {
+            result = entry->replicas.begin()->second;
+        }
     }
 
     if (record_access && scheduler_) {
         scheduler_->OnAccess(key);
     }
 
-    // Read Entry (Entry Read Lock)
-    std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
-
-    // Return current version if requested
-    if (out_version) {
-        *out_version = entry->version;
-    }
-
-    if (entry->replicas.empty()) {
-        LOG(ERROR) << "Empty replicas for key: " << key;
-        return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
-    }
-
-    if (tier_id.has_value()) {
-        for (const auto& replica : entry->replicas) {
-            if (replica.first == *tier_id) {
-                return replica.second;
-            }
-        }
-        LOG(ERROR) << "Tier not found: " << *tier_id;
-        return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
-    }
-
-    // Fallback: Return highest priority replica
-    return entry->replicas.begin()->second;
+    return result;
 }
 
 bool TieredBackend::Exist(const std::string& key,
                           std::optional<UUID> tier_id) const {
-    std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+    std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
     auto it = metadata_index_.find(key);
     if (it == metadata_index_.end()) {
-        return false;  // Key not found
+        return false;
     }
-    if (!tier_id.has_value()) {
-        return true;  // Key exists in backend
-    }
-    // Check specific tier
+
     auto entry = it->second;
     std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+    if (entry->tombstone) {
+        return false;
+    }
+
+    if (!tier_id.has_value()) {
+        return true;
+    }
+
     for (const auto& replica : entry->replicas) {
         if (replica.first == *tier_id) {
-            return true;  // Key exists in target tier
+            return true;
         }
     }
-    return false;  // Key does not exist in target tier
+    return false;
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Delete(
@@ -651,6 +761,8 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 
         bool need_cleanup = false;
         bool found_tier = false;
+        std::shared_ptr<MetadataEntry> cleanup_entry;
+        uint64_t cleanup_generation = 0;
 
         // Optimistic Delete (Global Read Lock + Entry Write Lock)
         // This is fast and allows high concurrency.
@@ -664,6 +776,10 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
             auto entry = it->second;
 
             std::unique_lock<std::shared_mutex> entry_write_lock(entry->mutex);
+            if (entry->tombstone) {
+                LOG(ERROR) << "Key not found: " << key;
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             auto tier_it = entry->replicas.end();
             for (auto it = entry->replicas.begin(); it != entry->replicas.end();
                  ++it) {
@@ -676,7 +792,8 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
             if (tier_it != entry->replicas.end()) {
                 if (remove_replica_callback_) {
                     auto result = remove_replica_callback_(
-                        key, tier_it->second->loc.tier->GetTierId(), DELETE);
+                        key, tier_it->second->loc.tier->GetTierId(),
+                        tier_it->second->replica_generation);
                     if (!result.has_value()) {
                         LOG(ERROR)
                             << "Failed to Delete key " << key << " in Tier "
@@ -694,30 +811,15 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 
             // Mark for cleanup if entry becomes empty
             if (entry->replicas.empty()) {
+                entry->tombstone = true;
                 need_cleanup = true;
+                cleanup_entry = entry;
+                cleanup_generation = entry->generation;
             }
         }  // Read lock released here
 
-        // Retry with Write Lock
-        // If the entry is empty, we upgrade to a global write lock to
-        // remove it. This prevents memory leaks from empty "zombie"
-        // entries.
         if (need_cleanup) {
-            std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
-
-            auto it = metadata_index_.find(key);
-            if (it != metadata_index_.end()) {
-                auto entry = it->second;
-
-                // Double-Check Locking:
-                // Another thread might have added a replica now
-                std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
-
-                if (entry->replicas.empty()) {
-                    // Confirmed empty, safe to remove from global index
-                    metadata_index_.erase(it);
-                }
-            }
+            CleanupTombstonedEntry(key, cleanup_entry, cleanup_generation);
         }
 
         if (found_tier) {
@@ -739,25 +841,56 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
             LOG(ERROR) << "Key not found: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        UUID invalid_id{0, 0};
-        if (remove_replica_callback_) {
-            auto result = remove_replica_callback_(key, invalid_id, DELETE_ALL);
-            if (!result.has_value()) {
-                LOG(ERROR) << "Failed to Delete key " << key
-                           << " for Master, error_code=" << result.error();
-                return tl::make_unexpected(result.error());
-            }
-        }
-
         auto entry = it->second;
 
         {
             std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+            if (entry->tombstone) {
+                LOG(ERROR) << "Key not found: " << key;
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
+
+            if (batch_remove_replica_callback_) {
+                for (const auto& replica : entry->replicas) {
+                    auto results = batch_remove_replica_callback_(
+                        replica.first,
+                        {ReplicaRemoveRequest{
+                            key, replica.second->replica_generation}});
+                    if (results.size() != 1) {
+                        LOG(ERROR) << "Batch remove callback returned "
+                                      "unexpected result count for key "
+                                   << key << ": actual=" << results.size();
+                        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                    }
+                    if (!results[0].has_value()) {
+                        LOG(ERROR)
+                            << "Failed to delete key " << key << " in tier "
+                            << replica.first
+                            << " for Master, error_code=" << results[0].error();
+                        return tl::make_unexpected(results[0].error());
+                    }
+                }
+            } else if (remove_replica_callback_) {
+                for (const auto& replica : entry->replicas) {
+                    auto result = remove_replica_callback_(
+                        key, replica.first, replica.second->replica_generation);
+                    if (!result.has_value()) {
+                        LOG(ERROR)
+                            << "Failed to delete key " << key << " in tier "
+                            << replica.first
+                            << " for Master, error_code=" << result.error();
+                        return tl::make_unexpected(result.error());
+                    }
+                }
+            }
+
             handles_to_free.reserve(entry->replicas.size());
             for (auto& replica : entry->replicas) {
                 handles_to_free.push_back(replica.second);
             }
             entry->replicas.clear();
+            entry->tombstone = true;
+            entry->version++;
         }
 
         // Remove the entry from the global index
@@ -771,6 +904,214 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
         scheduler_->OnDelete(key, std::nullopt);
     }
     return tl::expected<void, ErrorCode>{};
+}
+
+tl::expected<void, ErrorCode> TieredBackend::DeleteBatchFromEviction(
+    const std::vector<std::string>& keys, const UUID& tier_id) {
+    std::vector<StorageReplicaEvictionToken> tokens;
+    tokens.reserve(keys.size());
+    for (const auto& key : keys) {
+        tokens.push_back(StorageReplicaEvictionToken{key, kInvalidBucketId});
+    }
+    return DeleteBatchFromEviction(tokens, tier_id);
+}
+
+tl::expected<void, ErrorCode> TieredBackend::DeleteBatchFromEviction(
+    const std::vector<StorageReplicaEvictionToken>& tokens,
+    const UUID& tier_id) {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (tokens.empty()) {
+        return {};
+    }
+
+    std::vector<ReplicaRemoveRequest> callback_requests;
+    callback_requests.reserve(tokens.size());
+    {
+        std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+        for (const auto& token : tokens) {
+            auto it = metadata_index_.find(token.key);
+            if (it == metadata_index_.end()) {
+                continue;
+            }
+
+            auto entry = it->second;
+            std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+            if (entry->tombstone) {
+                continue;
+            }
+
+            for (const auto& replica : entry->replicas) {
+                if (replica.first == tier_id &&
+                    MatchesEvictionToken(replica.second, token)) {
+                    callback_requests.push_back(ReplicaRemoveRequest{
+                        token.key, replica.second->replica_generation});
+                    break;
+                }
+            }
+        }
+    }
+
+    if (batch_remove_replica_callback_ && !callback_requests.empty()) {
+        auto results =
+            batch_remove_replica_callback_(tier_id, callback_requests);
+        if (results.size() != callback_requests.size()) {
+            LOG(ERROR) << "Batch replica mutation callback returned "
+                          "unexpected result count: expected="
+                       << callback_requests.size()
+                       << ", actual=" << results.size();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i].has_value()) {
+                LOG(ERROR) << "Failed to batch delete key "
+                           << callback_requests[i].key << " in tier " << tier_id
+                           << " for Master, error_code=" << results[i].error();
+                return tl::make_unexpected(results[i].error());
+            }
+        }
+    }
+
+    struct BatchDeleteTarget {
+        std::string key;
+        std::shared_ptr<MetadataEntry> entry;
+        StorageReplicaEvictionToken token;
+    };
+
+    struct CleanupCandidate {
+        std::string key;
+        std::shared_ptr<MetadataEntry> entry;
+        uint64_t generation;
+    };
+
+    std::vector<AllocationHandle> detached_handles;
+    std::vector<std::string> deleted_keys;
+    std::vector<CleanupCandidate> cleanup_candidates;
+    detached_handles.reserve(tokens.size());
+    deleted_keys.reserve(tokens.size());
+    cleanup_candidates.reserve(tokens.size());
+
+    {
+        std::shared_lock<std::shared_mutex> map_lock(map_mutex_);
+        std::vector<BatchDeleteTarget> targets;
+        targets.reserve(tokens.size());
+        for (const auto& token : tokens) {
+            auto it = metadata_index_.find(token.key);
+            if (it == metadata_index_.end()) {
+                VLOG(1) << "Skip missing key during bucket eviction: "
+                        << token.key;
+                continue;
+            }
+            targets.push_back({token.key, it->second, token});
+        }
+
+        if (!targets.empty()) {
+            std::vector<std::shared_ptr<MetadataEntry>> entries_to_lock;
+            entries_to_lock.reserve(targets.size());
+            for (const auto& target : targets) {
+                entries_to_lock.push_back(target.entry);
+            }
+
+            std::sort(entries_to_lock.begin(), entries_to_lock.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          return lhs.get() < rhs.get();
+                      });
+            entries_to_lock.erase(
+                std::unique(entries_to_lock.begin(), entries_to_lock.end()),
+                entries_to_lock.end());
+
+            std::vector<std::unique_lock<std::shared_mutex>> entry_locks;
+            entry_locks.reserve(entries_to_lock.size());
+            for (const auto& entry : entries_to_lock) {
+                entry_locks.emplace_back(entry->mutex);
+            }
+
+            for (const auto& target : targets) {
+                const auto& token = target.token;
+                auto& entry = *target.entry;
+                if (entry.tombstone) {
+                    VLOG(1) << "Skip tombstoned key during bucket eviction: "
+                            << target.key;
+                    continue;
+                }
+
+                auto tier_it = entry.replicas.end();
+                for (auto it = entry.replicas.begin();
+                     it != entry.replicas.end(); ++it) {
+                    if (it->first == tier_id) {
+                        tier_it = it;
+                        break;
+                    }
+                }
+
+                if (tier_it == entry.replicas.end()) {
+                    VLOG(1) << "Skip missing tier during bucket eviction: key="
+                            << target.key << ", tier_id=" << tier_id;
+                    continue;
+                }
+
+                if (!MatchesEvictionToken(tier_it->second, token)) {
+                    VLOG(1) << "Skip mismatched storage replica during bucket "
+                               "eviction: key="
+                            << target.key
+                            << ", expected_bucket_id=" << token.bucket_id;
+                    continue;
+                }
+
+                AllocationHandle detached_handle = tier_it->second;
+                entry.replicas.erase(tier_it);
+                entry.version++;
+
+                if (detached_handle && detached_handle->loc.data.buffer) {
+                    auto* storage_buffer = dynamic_cast<StorageBuffer*>(
+                        detached_handle->loc.data.buffer.get());
+                    if (storage_buffer) {
+                        storage_buffer->MarkEvicted();
+                    }
+                }
+
+                detached_handles.push_back(detached_handle);
+                deleted_keys.push_back(target.key);
+
+                if (entry.replicas.empty()) {
+                    entry.tombstone = true;
+                    cleanup_candidates.push_back(
+                        {target.key, target.entry, entry.generation});
+                }
+            }
+        }
+    }
+
+    if (!cleanup_candidates.empty()) {
+        std::unique_lock<std::shared_mutex> map_lock(map_mutex_);
+        for (const auto& candidate : cleanup_candidates) {
+            auto it = metadata_index_.find(candidate.key);
+            if (it == metadata_index_.end() || it->second != candidate.entry) {
+                continue;
+            }
+
+            std::unique_lock<std::shared_mutex> entry_lock(
+                candidate.entry->mutex);
+            if (!candidate.entry->tombstone ||
+                !candidate.entry->replicas.empty() ||
+                candidate.entry->generation != candidate.generation) {
+                continue;
+            }
+
+            metadata_index_.erase(it);
+        }
+    }
+
+    if (scheduler_) {
+        for (const auto& key : deleted_keys) {
+            scheduler_->OnDelete(key, tier_id);
+        }
+    }
+
+    return {};
 }
 
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
@@ -874,6 +1215,10 @@ std::vector<UUID> TieredBackend::GetReplicaTierIds(
     }
 
     std::shared_lock entry_lock(it->second->mutex);
+    if (it->second->tombstone) {
+        return {};
+    }
+
     std::vector<UUID> tiers;
     tiers.reserve(it->second->replicas.size());
     for (const auto& replica : it->second->replicas) {

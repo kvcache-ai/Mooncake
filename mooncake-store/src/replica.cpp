@@ -12,6 +12,13 @@ std::optional<UUID> Replica::get_p2p_client_id() const {
     return std::nullopt;
 }
 
+std::optional<uint64_t> Replica::get_p2p_replica_generation() const {
+    if (!is_p2p_proxy_replica()) {
+        return std::nullopt;
+    }
+    return std::get<P2PProxyReplicaData>(data_).replica_generation;
+}
+
 Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
     desc.status = status_;
@@ -57,6 +64,7 @@ Replica::Descriptor Replica::get_descriptor() const {
             proxy_desc.segment_id = proxy_data.segment->id;
         }
         proxy_desc.object_size = proxy_data.object_size;
+        proxy_desc.replica_generation = proxy_data.replica_generation;
         desc.descriptor_variant = std::move(proxy_desc);
     }
 
@@ -84,7 +92,8 @@ std::ostream& operator<<(std::ostream& os, const Replica::Descriptor& desc) {
                 os << "type: P2P_PROXY, client: " << d.client_id
                    << ", segment: " << d.segment_id
                    << ", endpoint: " << d.ip_address << ":" << d.rpc_port
-                   << ", size: " << d.object_size;
+                   << ", size: " << d.object_size
+                   << ", generation: " << d.replica_generation;
             }
         },
         desc.descriptor_variant);
@@ -126,7 +135,8 @@ std::ostream& operator<<(std::ostream& os, const Replica& replica) {
                           proxy_data.segment->GetP2PExtra().memory_type);
             }
         }
-        os << ", object_size: " << proxy_data.object_size;
+        os << ", object_size: " << proxy_data.object_size
+           << ", replica_generation: " << proxy_data.replica_generation;
     }
 
     os << " }";

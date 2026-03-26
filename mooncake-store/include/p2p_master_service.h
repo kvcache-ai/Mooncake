@@ -35,7 +35,7 @@ class P2PMasterService : public MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Remove replicas from multiple segments in one call
+     * @brief Remove replicas from master in one batch request.
      */
     auto BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
         -> std::vector<tl::expected<void, ErrorCode>>;

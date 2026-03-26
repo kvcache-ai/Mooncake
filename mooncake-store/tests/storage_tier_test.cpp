@@ -28,10 +28,14 @@ class StorageTierTest : public ::testing::Test {
 
     void SetUp() override {
         unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
     }
 
     void TearDown() override {
         unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        unsetenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
     }
 
     std::unique_ptr<char[]> CreateTestBuffer(size_t size) {
@@ -585,6 +589,8 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
            "bucket_storage_backend", 1);
     setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
            "/tmp/mooncake_test_auto_eviction", 1);
+    setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "5", 1);
+    setenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "8192", 1);
 
     // Create a TieredBackend with small capacity (20KB)
     std::string json_config_str = R"({
@@ -602,7 +608,25 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 
     {
         TieredBackend backend;
-        auto init_res = InitTieredBackendForTest(backend, config);
+        std::vector<std::vector<std::string>> deleted_batches;
+        BatchRemoveReplicaCallback batch_remove_replica_callback =
+            [&deleted_batches](
+                const UUID& tier_id,
+                const std::vector<ReplicaRemoveRequest>& requests) {
+                static_cast<void>(tier_id);
+                std::vector<std::string> keys;
+                keys.reserve(requests.size());
+                for (const auto& request : requests) {
+                    keys.push_back(request.key);
+                }
+                deleted_batches.push_back(keys);
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    requests.size(), tl::expected<void, ErrorCode>{});
+            };
+
+        auto init_res =
+            InitTieredBackendForTest(backend, config, nullptr, nullptr, nullptr,
+                                     batch_remove_replica_callback);
         ASSERT_TRUE(init_res.has_value());
 
         // Fill up the tier with data (~20KB)
@@ -645,6 +669,22 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
             << "Should succeed after automatic eviction";
 
         LOG(INFO) << "Successfully allocated after auto-eviction";
+        ASSERT_FALSE(deleted_batches.empty())
+            << "bucket eviction should batch-sync keys before reclaim";
+
+        bool saw_multi_key_batch = false;
+        for (const auto& batch : deleted_batches) {
+            if (batch.size() > 1) {
+                saw_multi_key_batch = true;
+            }
+            for (const auto& key : batch) {
+                EXPECT_FALSE(backend.Exist(key))
+                    << "evicted key should be removed from tiered metadata: "
+                    << key;
+            }
+        }
+        EXPECT_TRUE(saw_multi_key_batch)
+            << "bucket eviction should notify master with batched keys";
 
         // The evicted keys should no longer be in the storage backend
         // (they were removed from the bucket that was evicted)
@@ -663,6 +703,97 @@ TEST_F(StorageTierTest, AutoEvictionOnCapacityExceeded) {
 
     // Cleanup
     fs::remove_all("/tmp/mooncake_test_auto_eviction");
+}
+
+TEST_F(StorageTierTest, BucketEvictionTokenSkipsRecreatedStorageReplica) {
+    fs::remove_all("/tmp/mooncake_test_bucket_token");
+    fs::create_directories("/tmp/mooncake_test_bucket_token");
+
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_bucket_token", 1);
+    setenv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1", 1);
+    setenv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "4096", 1);
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    {
+        TieredBackend backend;
+        auto init_res = InitTieredBackendForTest(backend, config);
+        ASSERT_TRUE(init_res.has_value())
+            << "Init failed: " << init_res.error();
+
+        auto storage_tier_id = backend.GetTierViews().front().id;
+        auto tier = backend.GetTier(storage_tier_id);
+        ASSERT_NE(tier, nullptr);
+
+        auto alloc_old = backend.Allocate(1024, storage_tier_id);
+        ASSERT_TRUE(alloc_old.has_value());
+        AllocationHandle old_handle = alloc_old.value();
+        auto raw_old = std::make_unique<char[]>(1024);
+        std::memset(raw_old.get(), 0x11, 1024);
+        DataSource old_source;
+        old_source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(raw_old), 1024);
+        old_source.type = MemoryType::DRAM;
+        ASSERT_TRUE(backend.Write(old_source, old_handle).has_value());
+        ASSERT_TRUE(backend.Commit("race_key", old_handle).has_value());
+        ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+
+        auto* old_storage_buffer =
+            dynamic_cast<StorageBuffer*>(old_handle->loc.data.buffer.get());
+        ASSERT_NE(old_storage_buffer, nullptr);
+        ASSERT_NE(old_storage_buffer->GetBucketId(), kInvalidBucketId);
+        int64_t old_bucket_id = old_storage_buffer->GetBucketId();
+
+        auto alloc_new = backend.Allocate(1024, storage_tier_id);
+        ASSERT_TRUE(alloc_new.has_value());
+        AllocationHandle new_handle = alloc_new.value();
+        auto raw_new = std::make_unique<char[]>(1024);
+        std::memset(raw_new.get(), 0x22, 1024);
+        DataSource new_source;
+        new_source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(raw_new), 1024);
+        new_source.type = MemoryType::DRAM;
+        ASSERT_TRUE(backend.Write(new_source, new_handle).has_value());
+        ASSERT_TRUE(backend.Commit("race_key", new_handle).has_value());
+        ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+
+        auto* new_storage_buffer =
+            dynamic_cast<StorageBuffer*>(new_handle->loc.data.buffer.get());
+        ASSERT_NE(new_storage_buffer, nullptr);
+        ASSERT_NE(new_storage_buffer->GetBucketId(), kInvalidBucketId);
+        ASSERT_NE(new_storage_buffer->GetBucketId(), old_bucket_id);
+
+        auto delete_res = backend.DeleteBatchFromEviction(
+            {StorageReplicaEvictionToken{"race_key", old_bucket_id}},
+            storage_tier_id);
+        ASSERT_TRUE(delete_res.has_value());
+
+        auto get_res = backend.Get("race_key", storage_tier_id);
+        ASSERT_TRUE(get_res.has_value())
+            << "old bucket token must not delete recreated storage replica";
+        EXPECT_EQ(get_res.value(), new_handle);
+        auto* visible_storage_buffer = dynamic_cast<StorageBuffer*>(
+            get_res.value()->loc.data.buffer.get());
+        ASSERT_NE(visible_storage_buffer, nullptr);
+        EXPECT_EQ(visible_storage_buffer->GetBucketId(),
+                  new_storage_buffer->GetBucketId());
+    }
+
+    fs::remove_all("/tmp/mooncake_test_bucket_token");
 }
 
 // ============================================================
@@ -693,7 +824,8 @@ TEST_F(StorageTierTest, ConcurrentReadWrite) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    auto init_res = backend.Init(config, nullptr, nullptr, nullptr, nullptr);
+    auto init_res =
+        backend.Init(config, nullptr, nullptr, nullptr, nullptr, nullptr);
     ASSERT_TRUE(init_res.has_value());
 
     // Phase 1: Concurrent writes

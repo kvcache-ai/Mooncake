@@ -53,8 +53,8 @@ std::vector<tl::expected<void, ErrorCode>>
 WrappedP2PMasterService::BatchRemoveReplica(
     const BatchRemoveReplicaRequest& req) {
     ScopedVLogTimer timer(1, "BatchRemoveReplica");
-    const size_t total_requests = req.segment_ids.size();
-    timer.LogRequest("key=", req.key, "segment_count=", total_requests);
+    const size_t total_requests = req.removals.size();
+    timer.LogRequest("removal_count=", total_requests);
     MasterMetricManager::instance().inc_batch_remove_replica_requests(
         total_requests);
 
@@ -65,9 +65,10 @@ WrappedP2PMasterService::BatchRemoveReplica(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchRemoveReplica failed for key '" << req.key
-                       << "', segment_id: " << req.segment_ids[i] << ": "
-                       << toString(error);
+            LOG(ERROR) << "BatchRemoveReplica failed for key '"
+                       << req.removals[i].key
+                       << "', segment_id: " << req.removals[i].segment_id
+                       << ": " << toString(error);
         }
     }
 

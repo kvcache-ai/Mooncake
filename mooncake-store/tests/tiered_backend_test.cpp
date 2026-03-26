@@ -111,6 +111,49 @@ class TieredBackendTest : public ::testing::Test {
 
         return handle;
     }
+
+    std::shared_ptr<TieredBackend::MetadataEntry> FindEntry(
+        TieredBackend& backend, const std::string& key) {
+        std::shared_lock<std::shared_mutex> map_lock(backend.map_mutex_);
+        auto it = backend.metadata_index_.find(key);
+        if (it == backend.metadata_index_.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
+    uint64_t GetEntryGeneration(
+        const std::shared_ptr<TieredBackend::MetadataEntry>& entry) {
+        std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+        return entry->generation;
+    }
+
+    void ForceTombstoneEntry(TieredBackend& backend, const std::string& key) {
+        std::shared_ptr<TieredBackend::MetadataEntry> entry;
+        {
+            std::shared_lock<std::shared_mutex> map_lock(backend.map_mutex_);
+            auto it = backend.metadata_index_.find(key);
+            ASSERT_NE(it, backend.metadata_index_.end());
+            entry = it->second;
+        }
+
+        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+        entry->replicas.clear();
+        entry->version++;
+        entry->tombstone = true;
+    }
+
+    bool IsTombstoned(
+        const std::shared_ptr<TieredBackend::MetadataEntry>& entry) {
+        std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+        return entry->tombstone;
+    }
+
+    void RunCleanup(TieredBackend& backend, const std::string& key,
+                    const std::shared_ptr<TieredBackend::MetadataEntry>& entry,
+                    uint64_t generation) {
+        backend.CleanupTombstonedEntry(key, entry, generation);
+    }
 };
 
 // Test basic DRAM tier initialization
@@ -713,6 +756,38 @@ TEST_F(TieredBackendTest, GetNonExistentKey) {
     EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
+TEST_F(TieredBackendTest, GetTreatsTombstonedEntryAsNotFound) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+    auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle_result =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
+    ASSERT_TRUE(handle_result.has_value());
+    ASSERT_TRUE(
+        backend.Commit("tombstoned_key", handle_result.value()).has_value());
+
+    ForceTombstoneEntry(backend, "tombstoned_key");
+
+    auto get_result = backend.Get("tombstoned_key");
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_FALSE(backend.Exist("tombstoned_key"));
+}
+
 // Test get from specified tier
 TEST_F(TieredBackendTest, GetFromSpecifiedTier) {
     std::string json_config_str = R"({
@@ -963,6 +1038,175 @@ TEST_F(TieredBackendTest, DeleteAllReplicas) {
     auto get_result = backend.Get("delete_all_key");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(TieredBackendTest, DeleteBatchFromEvictionRemovesTierReplicasInBatch) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 536870912,
+                "priority": 100,
+                "allocator_type": "OFFSET"
+            },
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 50,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+    auto high_tier_id = GetTierIdByPriority(backend, 100);
+    auto low_tier_id = GetTierIdByPriority(backend, 50);
+    ASSERT_TRUE(high_tier_id.has_value());
+    ASSERT_TRUE(low_tier_id.has_value());
+
+    auto commit_to_tier = [&](const std::string& key, UUID tier_id) {
+        auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+        auto handle = AllocateAndWrite(backend, SMALL_DATA_SIZE,
+                                       test_buffer.get(), tier_id);
+        ASSERT_TRUE(handle.has_value());
+        ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
+    };
+
+    commit_to_tier("evict_only_1", low_tier_id.value());
+    commit_to_tier("evict_only_2", low_tier_id.value());
+    commit_to_tier("survivor_key", high_tier_id.value());
+    commit_to_tier("survivor_key", low_tier_id.value());
+    commit_to_tier("high_only_key", high_tier_id.value());
+
+    auto delete_result = backend.DeleteBatchFromEviction(
+        std::vector<std::string>{"evict_only_1", "evict_only_2", "survivor_key",
+                                 "high_only_key", "missing_key"},
+        low_tier_id.value());
+    ASSERT_TRUE(delete_result.has_value());
+
+    EXPECT_FALSE(backend.Get("evict_only_1").has_value());
+    EXPECT_FALSE(backend.Get("evict_only_2").has_value());
+    EXPECT_EQ(FindEntry(backend, "evict_only_1"), nullptr);
+    EXPECT_EQ(FindEntry(backend, "evict_only_2"), nullptr);
+
+    auto survivor_high = backend.Get("survivor_key", high_tier_id.value());
+    ASSERT_TRUE(survivor_high.has_value());
+    auto survivor_low = backend.Get("survivor_key", low_tier_id.value());
+    ASSERT_FALSE(survivor_low.has_value());
+    EXPECT_EQ(survivor_low.error(), ErrorCode::TIER_NOT_FOUND);
+
+    auto survivor_default = backend.Get("survivor_key");
+    ASSERT_TRUE(survivor_default.has_value());
+    EXPECT_EQ(survivor_default.value()->loc.tier->GetTierId(),
+              high_tier_id.value());
+
+    auto high_only = backend.Get("high_only_key", high_tier_id.value());
+    ASSERT_TRUE(high_only.has_value());
+    EXPECT_TRUE(backend.Exist("high_only_key"));
+}
+
+TEST_F(TieredBackendTest, CommitReplacesTombstonedEntryWithNewGeneration) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+    auto first_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto first_handle =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, first_buffer.get());
+    ASSERT_TRUE(first_handle.has_value());
+    ASSERT_TRUE(
+        backend.Commit("recreate_key", first_handle.value()).has_value());
+
+    auto old_entry = FindEntry(backend, "recreate_key");
+    ASSERT_TRUE(old_entry);
+    uint64_t old_generation = GetEntryGeneration(old_entry);
+
+    ForceTombstoneEntry(backend, "recreate_key");
+    ASSERT_TRUE(IsTombstoned(old_entry));
+
+    auto second_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto second_handle =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, second_buffer.get());
+    ASSERT_TRUE(second_handle.has_value());
+    ASSERT_TRUE(
+        backend.Commit("recreate_key", second_handle.value()).has_value());
+
+    auto new_entry = FindEntry(backend, "recreate_key");
+    ASSERT_TRUE(new_entry);
+    EXPECT_NE(new_entry.get(), old_entry.get());
+    EXPECT_GT(GetEntryGeneration(new_entry), old_generation);
+
+    auto get_result = backend.Get("recreate_key");
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_EQ(get_result.value(), second_handle.value());
+}
+
+TEST_F(TieredBackendTest, StaleCleanupDoesNotEraseRecreatedEntry) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+    auto first_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto first_handle =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, first_buffer.get());
+    ASSERT_TRUE(first_handle.has_value());
+    ASSERT_TRUE(
+        backend.Commit("cleanup_key", first_handle.value()).has_value());
+
+    auto old_entry = FindEntry(backend, "cleanup_key");
+    ASSERT_TRUE(old_entry);
+    uint64_t old_generation = GetEntryGeneration(old_entry);
+
+    ForceTombstoneEntry(backend, "cleanup_key");
+
+    auto second_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto second_handle =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, second_buffer.get());
+    ASSERT_TRUE(second_handle.has_value());
+    ASSERT_TRUE(
+        backend.Commit("cleanup_key", second_handle.value()).has_value());
+
+    auto recreated_entry = FindEntry(backend, "cleanup_key");
+    ASSERT_TRUE(recreated_entry);
+    ASSERT_NE(recreated_entry.get(), old_entry.get());
+
+    RunCleanup(backend, "cleanup_key", old_entry, old_generation);
+
+    auto final_entry = FindEntry(backend, "cleanup_key");
+    ASSERT_TRUE(final_entry);
+    EXPECT_EQ(final_entry.get(), recreated_entry.get());
+
+    auto get_result = backend.Get("cleanup_key");
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_EQ(get_result.value(), second_handle.value());
 }
 
 // Test delete non-existent key

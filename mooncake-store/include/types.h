@@ -368,6 +368,19 @@ struct StorageObjectMetadata {
              transport_endpoint);
 };
 
+static constexpr int64_t kInvalidBucketId = -1;
+
+struct StorageReplicaEvictionToken {
+    std::string key;
+    int64_t bucket_id = kInvalidBucketId;
+};
+
+struct ReplicaRemoveRequest {
+    std::string key;
+    uint64_t replica_generation = 0;
+    YLT_REFL(ReplicaRemoveRequest, key, replica_generation);
+};
+
 /**
  * @brief object iteration strategy in for-each interface
  */

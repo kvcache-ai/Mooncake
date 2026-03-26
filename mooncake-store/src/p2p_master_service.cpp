@@ -6,6 +6,68 @@
 
 namespace mooncake {
 
+namespace {
+
+enum class ReplicaIdentityMatch {
+    kNone,
+    kExact,
+    kStaleGeneration,
+};
+
+struct ReplicaIdentityProbe {
+    std::optional<size_t> exact_index;
+    std::optional<size_t> stale_index;
+};
+
+auto MatchReplicaIdentity(const Replica& replica, const UUID& client_id,
+                          const UUID& segment_id, uint64_t replica_generation)
+    -> tl::expected<ReplicaIdentityMatch, ErrorCode> {
+    if (!replica.is_p2p_proxy_replica()) {
+        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto replica_segment_id = replica.get_segment_id();
+    auto replica_client_id = replica.get_p2p_client_id();
+    if (!(replica_client_id && replica_segment_id &&
+          *replica_client_id == client_id &&
+          *replica_segment_id == segment_id)) {
+        return ReplicaIdentityMatch::kNone;
+    }
+
+    const uint64_t existing_generation =
+        replica.get_p2p_replica_generation().value_or(0);
+    if (replica_generation != 0 && existing_generation != replica_generation) {
+        return ReplicaIdentityMatch::kStaleGeneration;
+    }
+
+    return ReplicaIdentityMatch::kExact;
+}
+
+auto ProbeReplicaIdentity(const std::vector<Replica>& replicas,
+                          const UUID& client_id, const UUID& segment_id,
+                          uint64_t replica_generation)
+    -> tl::expected<ReplicaIdentityProbe, ErrorCode> {
+    ReplicaIdentityProbe probe;
+    for (size_t index = 0; index < replicas.size(); ++index) {
+        auto match = MatchReplicaIdentity(replicas[index], client_id,
+                                          segment_id, replica_generation);
+        if (!match.has_value()) {
+            return tl::make_unexpected(match.error());
+        }
+
+        if (*match == ReplicaIdentityMatch::kExact && !probe.exact_index) {
+            probe.exact_index = index;
+        } else if (*match == ReplicaIdentityMatch::kStaleGeneration &&
+                   !probe.stale_index) {
+            probe.stale_index = index;
+        }
+    }
+
+    return probe;
+}
+
+}  // namespace
+
 P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
     : MasterService(config),
       max_replicas_per_key_(config.max_replicas_per_key) {
@@ -24,8 +86,7 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
     // 1. filter qualified replicas
     for (const auto& replica : metadata.replicas_) {
         if (!replica.is_p2p_proxy_replica()) {
-            LOG(ERROR) << "invalid replica type"
-                       << ", replica: " << replica;
+            LOG(ERROR) << "invalid replica type" << ", replica: " << replica;
             continue;
         } else if (!replica.get_p2p_client()->is_health()) {
             // The client of the replica might be disconnected, just skip it.
@@ -164,42 +225,45 @@ auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
 
     // Construct Replica from resolved pointers
     Replica new_replica(
-        P2PProxyReplicaData(client, segment_res.value(), req.size),
+        P2PProxyReplicaData(client, segment_res.value(), req.size,
+                            req.replica.replica_generation),
         ReplicaStatus::COMPLETE);
 
     if (accessor->Exists()) {
         auto& metadata = accessor->Get();
-        if (max_replicas_per_key_ > 0 &&
-            metadata.replicas_.size() >= max_replicas_per_key_) {
+        auto probe = ProbeReplicaIdentity(
+            metadata.replicas_, req.replica.client_id, req.replica.segment_id,
+            req.replica.replica_generation);
+        if (!probe.has_value()) {
+            LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
+                       << ", request client_id: " << req.replica.client_id
+                       << ", request segment_id: " << req.replica.segment_id;
+            return tl::make_unexpected(probe.error());
+        }
+
+        if (probe->exact_index.has_value()) {
+            LOG(WARNING) << "replica has existed" << ", key: " << req.key
+                         << ", client_id: " << req.replica.client_id
+                         << ", segment_id: " << req.replica.segment_id;
+            return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
+        }
+
+        if (probe->stale_index.has_value()) {
+            auto& replica = metadata.replicas_[*probe->stale_index];
+            RemoveReplicaFromSegmentIndex(accessor->GetShard(), req.key,
+                                          replica);
+            OnReplicaRemoved(replica);
+            replica = std::move(new_replica);
+            AddReplicaToSegmentIndex(accessor->GetShard(), req.key, replica);
+            OnReplicaAdded(replica);
+            metadata.size_ = req.size;
+        } else if (max_replicas_per_key_ > 0 &&
+                   metadata.replicas_.size() >= max_replicas_per_key_) {
             LOG(WARNING) << "replica num exceeded" << ", key: " << req.key
                          << ", client_id: " << req.replica.client_id
                          << ", segment_id: " << req.replica.segment_id
                          << ", current replica num:" << max_replicas_per_key_;
             return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
-        }
-        // Skip duplicate
-        bool exist = false;
-        for (const auto& replica : metadata.replicas_) {
-            if (!replica.is_p2p_proxy_replica()) {
-                LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
-                           << ", request client_id: " << req.replica.client_id
-                           << ", request segment_id: " << req.replica.segment_id
-                           << ", replica:" << replica;
-                return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
-            }
-            auto seg_id = replica.get_segment_id();
-            auto cli_id = replica.get_p2p_client_id();
-            if (cli_id && seg_id && cli_id == req.replica.client_id &&
-                *seg_id == req.replica.segment_id) {
-                exist = true;
-                break;
-            }
-        }
-        if (exist) {
-            LOG(WARNING) << "replica has existed" << ", key: " << req.key
-                         << ", client_id: " << req.replica.client_id
-                         << ", segment_id: " << req.replica.segment_id;
-            return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
         } else {
             AddReplicaToSegmentIndex(accessor->GetShard(), req.key,
                                      new_replica);
@@ -233,37 +297,35 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     }
 
     auto& metadata = accessor->Get();
-
-    bool removed = false;
-    for (auto it = metadata.replicas_.begin(); it != metadata.replicas_.end();
-         ++it) {
-        if (!it->is_p2p_proxy_replica()) {
-            LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
-                       << ", client_id: " << req.client_id
-                       << ", segment_id: " << req.segment_id
-                       << ", replica: " << *it;
-            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
-        } else {
-            auto seg_id = it->get_segment_id();
-            auto cli_id = it->get_p2p_client_id();
-            if (cli_id && seg_id && cli_id == req.client_id &&
-                *seg_id == req.segment_id) {
-                RemoveReplicaFromSegmentIndex(accessor->GetShard(), req.key,
-                                              *it);
-                OnReplicaRemoved(*it);
-                metadata.replicas_.erase(it);
-                removed = true;
-                break;
-            }
-        }
+    auto probe = ProbeReplicaIdentity(metadata.replicas_, req.client_id,
+                                      req.segment_id, req.replica_generation);
+    if (!probe.has_value()) {
+        LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
+                   << ", client_id: " << req.client_id
+                   << ", segment_id: " << req.segment_id;
+        return tl::make_unexpected(probe.error());
     }
 
-    if (!removed) {
+    if (!probe->exact_index.has_value()) {
+        if (probe->stale_index.has_value()) {
+            LOG(INFO) << "skip stale replica removal" << ", key: " << req.key
+                      << ", client_id: " << req.client_id
+                      << ", segment_id: " << req.segment_id
+                      << ", replica_generation: " << req.replica_generation;
+            return {};
+        }
         LOG(WARNING) << "replica not found" << ", key: " << req.key
                      << ", client_id: " << req.client_id
                      << ", segment_id: " << req.segment_id;
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
-    } else if (metadata.replicas_.empty()) {
+    }
+
+    auto replica_it = metadata.replicas_.begin() + *probe->exact_index;
+    RemoveReplicaFromSegmentIndex(accessor->GetShard(), req.key, *replica_it);
+    OnReplicaRemoved(*replica_it);
+    metadata.replicas_.erase(replica_it);
+
+    if (metadata.replicas_.empty()) {
         OnObjectRemoved(metadata);
         accessor->Erase();
     }
@@ -274,33 +336,33 @@ auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
 auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
     -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(req.segment_ids.size());
+    results.reserve(req.removals.size());
 
     RemoveReplicaRequest single_req;
-    single_req.key = req.key;
     single_req.client_id = req.client_id;
-    for (const auto& segment_id : req.segment_ids) {
-        single_req.segment_id = segment_id;
+    for (const auto& removal : req.removals) {
+        single_req.key = removal.key;
+        single_req.segment_id = removal.segment_id;
+        single_req.replica_generation = removal.replica_generation;
         auto result = RemoveReplica(single_req);
         if (!result.has_value()) {
             if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                // This may happen if the object is removed by another thread
                 LOG(INFO) << "object not found when batch remove replica"
-                          << ", key: " << req.key
+                          << ", key: " << removal.key
                           << ", client_id: " << req.client_id
-                          << ", segment_id: " << segment_id;
+                          << ", segment_id: " << removal.segment_id;
                 results.push_back({});
             } else if (result.error() == ErrorCode::REPLICA_NOT_FOUND) {
-                // This may happen if the replica is removed by another thread
                 LOG(INFO) << "replica not found when batch remove replica"
-                          << ", key: " << req.key
+                          << ", key: " << removal.key
                           << ", client_id: " << req.client_id
-                          << ", segment_id: " << segment_id;
+                          << ", segment_id: " << removal.segment_id;
                 results.push_back({});
             } else {
-                LOG(ERROR) << "failed to remove replica" << ", key: " << req.key
+                LOG(ERROR) << "failed to remove replica"
+                           << ", key: " << removal.key
                            << ", client_id: " << req.client_id
-                           << ", segment_id: " << segment_id
+                           << ", segment_id: " << removal.segment_id
                            << ", error: " << toString(result.error());
                 results.push_back(tl::make_unexpected(result.error()));
             }
@@ -328,8 +390,7 @@ void P2PMasterService::OnReplicaRemoved(const Replica& replica) {
     if (replica.is_p2p_proxy_replica()) {
         auto type = replica.get_p2p_memory_type();
         if (!type) {
-            LOG(ERROR) << "invalid memory type"
-                       << ", replica: " << replica;
+            LOG(ERROR) << "invalid memory type" << ", replica: " << replica;
         } else if (*type == MemoryType::DRAM) {
             MasterMetricManager::instance().dec_mem_cache_nums();
         } else if (*type == MemoryType::NVME) {
@@ -342,8 +403,7 @@ void P2PMasterService::OnReplicaAdded(const Replica& replica) {
     if (replica.is_p2p_proxy_replica()) {
         auto type = replica.get_p2p_memory_type();
         if (!type) {
-            LOG(ERROR) << "invalid memory type"
-                       << ", replica: " << replica;
+            LOG(ERROR) << "invalid memory type" << ", replica: " << replica;
         } else if (*type == MemoryType::DRAM) {
             MasterMetricManager::instance().inc_mem_cache_nums();
         } else if (*type == MemoryType::NVME) {
