@@ -88,7 +88,7 @@ if(STORE_USE_REDIS)
         ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
     target_link_libraries(redis_snapshot_store_test
         PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
-               ${ETCD_WRAPPER_LIB} glog gflags ibverbs gtest gtest_main pthread
+               ${ETCD_WRAPPER_LIB} glog gflags ibverbs gtest pthread
         PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
     add_test(NAME redis_snapshot_store_test COMMAND redis_snapshot_store_test)
 endif()

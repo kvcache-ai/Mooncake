@@ -3,6 +3,7 @@
 #include "master_service.h"
 #include "master_metric_manager.h"
 #include "segment.h"
+#include "ha/snapshot_store.h"
 #include "serialize/serializer_backend.h"
 #include "task_manager.h"
 
@@ -790,6 +791,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         if (!service_->snapshot_backend_) {
             service_->snapshot_backend_ =
                 SerializerBackend::Create(SnapshotBackendType::LOCAL_FILE);
+        }
+        if (!service_->snapshot_store_ && service_->snapshot_backend_) {
+            service_->snapshot_store_ = service_->CreateSnapshotStore();
         }
 
         // Test snapshot and restore functionality for all test cases

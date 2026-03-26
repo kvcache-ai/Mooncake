@@ -41,6 +41,8 @@ static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
 
+constexpr size_t kUnlimitedSnapshotList = 0;
+
 enum class SnapshotCatalogBackendKind {
     kSerializer,
     kRedis,
@@ -2236,7 +2238,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
         auto* snapshot_store = GetSnapshotStore();
-        if (!snapshot_backend_ || !snapshot_store) {
+        if (!snapshot_store) {
             return tl::make_unexpected(
                 SerializationError(ErrorCode::PERSISTENT_FAIL,
                                    "snapshot backend is not initialized"));
@@ -2500,7 +2502,7 @@ void MasterService::CleanupOldSnapshot(int keep_count,
         return;
     }
 
-    auto list_result = snapshot_store->List(0);
+    auto list_result = snapshot_store->List(kUnlimitedSnapshotList);
     if (!list_result) {
         SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
                        snapshot_id, toString(list_result.error()));
@@ -2541,7 +2543,7 @@ void MasterService::CleanupOldSnapshot(int keep_count,
 void MasterService::RestoreState() {
     try {
         auto* snapshot_store = GetSnapshotStore();
-        if (!snapshot_backend_ || !snapshot_store) {
+        if (!snapshot_store) {
             LOG(ERROR) << "[Restore] Snapshot backend is not initialized, "
                        << "starting fresh";
             return;
@@ -2880,9 +2882,6 @@ void MasterService::RestoreState() {
 }
 
 ha::SnapshotStore* MasterService::GetSnapshotStore() {
-    if (!snapshot_store_ && snapshot_backend_) {
-        snapshot_store_ = CreateSnapshotStore();
-    }
     return snapshot_store_.get();
 }
 

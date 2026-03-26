@@ -1,7 +1,6 @@
 #include "ha/serializer_snapshot_store.h"
 
 #include <algorithm>
-#include <cctype>
 #include <set>
 #include <string_view>
 
@@ -9,65 +8,7 @@ namespace mooncake {
 namespace ha {
 
 namespace {
-
-constexpr std::string_view kSnapshotRoot = "mooncake_master_snapshot/";
-constexpr std::string_view kSnapshotLatest = "latest.txt";
-constexpr std::string_view kSnapshotManifest = "manifest.txt";
-
-bool IsDigit(char ch) { return std::isdigit(static_cast<unsigned char>(ch)); }
-
-bool IsValidSnapshotId(std::string_view snapshot_id) {
-    if (snapshot_id.size() != 19) {
-        return false;
-    }
-
-    for (size_t i = 0; i < snapshot_id.size(); ++i) {
-        if (i == 8 || i == 15) {
-            if (snapshot_id[i] != '_') {
-                return false;
-            }
-            continue;
-        }
-
-        if (!IsDigit(snapshot_id[i])) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-std::string TrimAsciiWhitespace(std::string value) {
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.front()))) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.back()))) {
-        value.pop_back();
-    }
-    return value;
-}
-
-std::string BuildSnapshotPrefix(const SnapshotId& snapshot_id) {
-    return std::string(kSnapshotRoot) + snapshot_id + "/";
-}
-
-std::string BuildManifestKey(const SnapshotId& snapshot_id) {
-    return BuildSnapshotPrefix(snapshot_id) + std::string(kSnapshotManifest);
-}
-
-std::string BuildLatestKey() {
-    return std::string(kSnapshotRoot) + std::string(kSnapshotLatest);
-}
-
-SnapshotDescriptor MakeSnapshotDescriptor(const SnapshotId& snapshot_id) {
-    SnapshotDescriptor descriptor;
-    descriptor.snapshot_id = snapshot_id;
-    descriptor.manifest_key = BuildManifestKey(snapshot_id);
-    descriptor.object_prefix = BuildSnapshotPrefix(snapshot_id);
-    return descriptor;
-}
+constexpr size_t kUnlimitedSnapshotList = 0;
 
 ErrorCode ValidateBackend(SerializerBackend* backend) {
     return backend == nullptr ? ErrorCode::INVALID_PARAMS : ErrorCode::OK;
@@ -83,12 +24,12 @@ ErrorCode SerializerSnapshotStore::Publish(const SnapshotDescriptor& snapshot) {
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!IsValidSnapshotId(snapshot.snapshot_id)) {
+    if (!snapshot_store_detail::IsValidSnapshotId(snapshot.snapshot_id)) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto publish_result =
-        backend_->UploadString(BuildLatestKey(), snapshot.snapshot_id);
+    auto publish_result = backend_->UploadString(
+        snapshot_store_detail::BuildLatestKey(), snapshot.snapshot_id);
     if (!publish_result) {
         return ErrorCode::PERSISTENT_FAIL;
     }
@@ -104,8 +45,8 @@ SerializerSnapshotStore::GetLatest() {
     }
 
     std::string latest_snapshot_id;
-    auto get_result =
-        backend_->DownloadString(BuildLatestKey(), latest_snapshot_id);
+    auto get_result = backend_->DownloadString(
+        snapshot_store_detail::BuildLatestKey(), latest_snapshot_id);
     if (!get_result) {
         if (backend_->IsNotFoundError(get_result.error())) {
             return std::optional<SnapshotDescriptor>();
@@ -113,16 +54,17 @@ SerializerSnapshotStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
-    latest_snapshot_id = TrimAsciiWhitespace(std::move(latest_snapshot_id));
+    latest_snapshot_id = snapshot_store_detail::TrimAsciiWhitespace(
+        std::move(latest_snapshot_id));
     if (latest_snapshot_id.empty()) {
         return std::optional<SnapshotDescriptor>();
     }
-    if (!IsValidSnapshotId(latest_snapshot_id)) {
+    if (!snapshot_store_detail::IsValidSnapshotId(latest_snapshot_id)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     return std::optional<SnapshotDescriptor>(
-        MakeSnapshotDescriptor(latest_snapshot_id));
+        snapshot_store_detail::MakeSnapshotDescriptor(latest_snapshot_id));
 }
 
 tl::expected<std::vector<SnapshotDescriptor>, ErrorCode>
@@ -134,26 +76,26 @@ SerializerSnapshotStore::List(size_t limit) {
 
     std::vector<std::string> object_keys;
     auto list_result = backend_->ListObjectsWithPrefix(
-        std::string(kSnapshotRoot), object_keys);
+        std::string(snapshot_store_detail::kSnapshotRoot), object_keys);
     if (!list_result) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
     std::set<SnapshotId, std::greater<>> snapshot_ids;
     for (const auto& object_key : object_keys) {
-        if (object_key.size() <= kSnapshotRoot.size()) {
+        if (object_key.size() <= snapshot_store_detail::kSnapshotRoot.size()) {
             continue;
         }
 
         std::string_view suffix(object_key);
-        suffix.remove_prefix(kSnapshotRoot.size());
+        suffix.remove_prefix(snapshot_store_detail::kSnapshotRoot.size());
         const size_t slash_pos = suffix.find('/');
         if (slash_pos == std::string_view::npos) {
             continue;
         }
 
         const auto snapshot_id = suffix.substr(0, slash_pos);
-        if (!IsValidSnapshotId(snapshot_id)) {
+        if (!snapshot_store_detail::IsValidSnapshotId(snapshot_id)) {
             continue;
         }
 
@@ -169,7 +111,8 @@ SerializerSnapshotStore::List(size_t limit) {
         if (limit != 0 && snapshots.size() >= limit) {
             break;
         }
-        snapshots.emplace_back(MakeSnapshotDescriptor(snapshot_id));
+        snapshots.emplace_back(
+            snapshot_store_detail::MakeSnapshotDescriptor(snapshot_id));
     }
 
     return snapshots;
@@ -180,13 +123,55 @@ ErrorCode SerializerSnapshotStore::Delete(const SnapshotId& snapshot_id) {
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!IsValidSnapshotId(snapshot_id)) {
+    if (!snapshot_store_detail::IsValidSnapshotId(snapshot_id)) {
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto delete_result =
-        backend_->DeleteObjectsWithPrefix(BuildSnapshotPrefix(snapshot_id));
+    auto latest_result = GetLatest();
+    if (!latest_result) {
+        return latest_result.error();
+    }
+
+    std::optional<SnapshotDescriptor> next_latest;
+    const bool deleting_latest =
+        latest_result->has_value() &&
+        latest_result->value().snapshot_id == snapshot_id;
+    if (deleting_latest) {
+        auto list_result = List(kUnlimitedSnapshotList);
+        if (!list_result) {
+            return list_result.error();
+        }
+
+        for (const auto& candidate : list_result.value()) {
+            if (candidate.snapshot_id != snapshot_id) {
+                next_latest = candidate;
+                break;
+            }
+        }
+    }
+
+    auto delete_result = backend_->DeleteObjectsWithPrefix(
+        snapshot_store_detail::BuildSnapshotPrefix(snapshot_id));
     if (!delete_result) {
+        return ErrorCode::PERSISTENT_FAIL;
+    }
+
+    if (!deleting_latest) {
+        return ErrorCode::OK;
+    }
+
+    if (next_latest.has_value()) {
+        auto publish_result = backend_->UploadString(
+            snapshot_store_detail::BuildLatestKey(), next_latest->snapshot_id);
+        if (!publish_result) {
+            return ErrorCode::PERSISTENT_FAIL;
+        }
+        return ErrorCode::OK;
+    }
+
+    auto clear_result = backend_->DeleteObjectsWithPrefix(
+        snapshot_store_detail::BuildLatestKey());
+    if (!clear_result) {
         return ErrorCode::PERSISTENT_FAIL;
     }
 

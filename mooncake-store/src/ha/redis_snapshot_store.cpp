@@ -1,6 +1,5 @@
 #include "ha/backends/redis/redis_snapshot_store.h"
 
-#include <cctype>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -20,63 +19,9 @@ namespace redis {
 
 namespace {
 
-constexpr std::string_view kSnapshotRoot = "mooncake_master_snapshot/";
-constexpr std::string_view kSnapshotManifest = "manifest.txt";
-
-bool IsDigit(char ch) { return std::isdigit(static_cast<unsigned char>(ch)); }
-
-bool IsValidSnapshotId(std::string_view snapshot_id) {
-    if (snapshot_id.size() != 19) {
-        return false;
-    }
-
-    for (size_t i = 0; i < snapshot_id.size(); ++i) {
-        if (i == 8 || i == 15) {
-            if (snapshot_id[i] != '_') {
-                return false;
-            }
-            continue;
-        }
-
-        if (!IsDigit(snapshot_id[i])) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-std::string TrimAsciiWhitespace(std::string value) {
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.front()))) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() &&
-           std::isspace(static_cast<unsigned char>(value.back()))) {
-        value.pop_back();
-    }
-    return value;
-}
-
-std::string BuildSnapshotPrefix(const SnapshotId& snapshot_id) {
-    return std::string(kSnapshotRoot) + snapshot_id + "/";
-}
-
-std::string BuildManifestKey(const SnapshotId& snapshot_id) {
-    return BuildSnapshotPrefix(snapshot_id) + std::string(kSnapshotManifest);
-}
-
-SnapshotDescriptor MakeSnapshotDescriptor(const SnapshotId& snapshot_id) {
-    SnapshotDescriptor descriptor;
-    descriptor.snapshot_id = snapshot_id;
-    descriptor.manifest_key = BuildManifestKey(snapshot_id);
-    descriptor.object_prefix = BuildSnapshotPrefix(snapshot_id);
-    return descriptor;
-}
-
 tl::expected<long long, ErrorCode> ParseSnapshotScore(
     std::string_view snapshot_id) {
-    if (!IsValidSnapshotId(snapshot_id)) {
+    if (!snapshot_store_detail::IsValidSnapshotId(snapshot_id)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -170,7 +115,8 @@ std::string RedisSnapshotStore::BuildIndexKey(
 #else
 
 ErrorCode RedisSnapshotStore::Publish(const SnapshotDescriptor& snapshot) {
-    if (!IsValidSnapshotId(snapshot.snapshot_id) || connstring_.empty()) {
+    if (!snapshot_store_detail::IsValidSnapshotId(snapshot.snapshot_id) ||
+        connstring_.empty()) {
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -219,17 +165,17 @@ RedisSnapshotStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
-    auto latest_snapshot_id =
-        TrimAsciiWhitespace(std::string(reply->str, reply->len));
+    auto latest_snapshot_id = snapshot_store_detail::TrimAsciiWhitespace(
+        std::string(reply->str, reply->len));
     if (latest_snapshot_id.empty()) {
         return std::optional<SnapshotDescriptor>();
     }
-    if (!IsValidSnapshotId(latest_snapshot_id)) {
+    if (!snapshot_store_detail::IsValidSnapshotId(latest_snapshot_id)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     return std::optional<SnapshotDescriptor>(
-        MakeSnapshotDescriptor(latest_snapshot_id));
+        snapshot_store_detail::MakeSnapshotDescriptor(latest_snapshot_id));
 }
 
 tl::expected<std::vector<SnapshotDescriptor>, ErrorCode>
@@ -263,19 +209,20 @@ RedisSnapshotStore::List(size_t limit) {
         }
 
         const std::string snapshot_id(element->str, element->len);
-        if (!IsValidSnapshotId(snapshot_id)) {
+        if (!snapshot_store_detail::IsValidSnapshotId(snapshot_id)) {
             continue;
         }
 
-        snapshots.emplace_back(MakeSnapshotDescriptor(snapshot_id));
+        snapshots.emplace_back(
+            snapshot_store_detail::MakeSnapshotDescriptor(snapshot_id));
     }
 
     return snapshots;
 }
 
 ErrorCode RedisSnapshotStore::Delete(const SnapshotId& snapshot_id) {
-    if (!IsValidSnapshotId(snapshot_id) || connstring_.empty() ||
-        payload_backend_ == nullptr) {
+    if (!snapshot_store_detail::IsValidSnapshotId(snapshot_id) ||
+        connstring_.empty() || payload_backend_ == nullptr) {
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -293,7 +240,7 @@ ErrorCode RedisSnapshotStore::Delete(const SnapshotId& snapshot_id) {
     }
 
     auto delete_result = payload_backend_->DeleteObjectsWithPrefix(
-        BuildSnapshotPrefix(snapshot_id));
+        snapshot_store_detail::BuildSnapshotPrefix(snapshot_id));
     if (!delete_result) {
         LOG(ERROR) << "Failed to delete snapshot payload after Redis catalog "
                       "update, snapshot_id="

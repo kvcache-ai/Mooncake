@@ -178,6 +178,37 @@ TEST_F(SerializerSnapshotStoreTest, DeleteRemovesSnapshotObjectsByPrefix) {
     EXPECT_EQ(snapshots->at(0).snapshot_id, "20240302_120000_001");
 }
 
+TEST_F(SerializerSnapshotStoreTest, DeleteLatestFallsBackToPreviousSnapshot) {
+    PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
+              "m1");
+    PutObject("mooncake_master_snapshot/20240302_120000_001/manifest.txt",
+              "m2");
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
+
+    ASSERT_EQ(store_.Delete("20240302_120000_001"), ErrorCode::OK);
+
+    auto latest = store_.GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+    EXPECT_EQ(latest->value().snapshot_id, "20240301_120000_001");
+}
+
+TEST_F(SerializerSnapshotStoreTest, DeleteLastSnapshotClearsLatestMarker) {
+    PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
+              "m1");
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+
+    ASSERT_EQ(store_.Delete("20240301_120000_001"), ErrorCode::OK);
+
+    auto latest = store_.GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_FALSE(latest->has_value());
+}
+
 TEST_F(SerializerSnapshotStoreTest, RejectsInvalidSnapshotIds) {
     EXPECT_EQ(store_.Publish(MakeDescriptor("invalid-id")),
               ErrorCode::INVALID_PARAMS);

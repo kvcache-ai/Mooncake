@@ -1062,7 +1062,7 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_catalog_backend_type_;
+    std::string snapshot_catalog_backend_type_{};
     std::string snapshot_catalog_backend_connstring_;
     std::unique_ptr<SerializerBackend> snapshot_backend_;
     std::unique_ptr<ha::SnapshotStore> snapshot_store_;
