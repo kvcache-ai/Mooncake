@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 #include "connection_poller.h"
+#include "memory_location.h"
 #include "mooncake_worker.cuh"
 
 namespace mooncake {
@@ -156,16 +157,16 @@ MooncakeBackend::MooncakeBackend(
     TORCH_CHECK(static_cast<size_t>(size) <= kMaxNumRanks,
                 "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
-        cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
+        cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks]{};
         int rc = engine_->registerLocalMemory(
-            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), location);
+            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
-        cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
+        cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks]{};
         int rc = engine_->registerLocalMemory(
-            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), location);
+            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
@@ -182,6 +183,9 @@ MooncakeBackend::MooncakeBackend(
         worker_ = worker_mgr.GetCPUWorker();
     else
         worker_ = worker_mgr.GetCUDAWorker(cuda_device_index);
+    if (!isCpu_) {
+        preloadReduceKernels();
+    }
     worker_->Start();
 
     p2p_proxy_ = std::make_shared<P2PProxy>(
@@ -196,7 +200,7 @@ MooncakeBackend::MooncakeBackend(
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, location, store,
+        backendIndex_, rank, size, local2global_rank_map_, store,
         meta_, p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
