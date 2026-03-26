@@ -598,13 +598,21 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
 }
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
-    TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
-    return worker_->putTaskCpu(
-        // a non-zero tensorSize is required to ensure the worker task for the
-        // barrier is created
-        c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
-        connection_ctx_, [=](void*, size_t, size_t) {},
-        [=](void*, size_t, size_t) {});
+    if (isCpu_) {
+        return worker_->putTaskCpu(
+            // a non-zero tensorSize is required to ensure the worker task for
+            // the barrier is created
+            c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
+            connection_ctx_, [=](void*, size_t, size_t) {},
+            [=](void*, size_t, size_t) {});
+    } else {
+        auto device_index = at::cuda::current_device();
+        auto stream = c10::cuda::getDefaultCUDAStream(device_index);
+        return worker_->putTaskCuda(
+            c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
+            connection_ctx_, stream, [=](void*, size_t, size_t) {},
+            [=](void*, size_t, size_t) {});
+    }
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
