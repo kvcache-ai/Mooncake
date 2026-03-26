@@ -60,6 +60,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
+void preloadReduceKernels();
 
 class ConnectionContext;
 class MooncakeWorker {

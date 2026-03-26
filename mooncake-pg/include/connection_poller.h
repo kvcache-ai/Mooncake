@@ -88,7 +88,7 @@ class ConnectionContext {
 
    public:
     ConnectionContext(int backendIndex, int rank, int size,
-                      uint64_t* local2global_rank_map, std::string location,
+                      uint64_t* local2global_rank_map,
                       c10::intrusive_ptr<::c10d::Store> store,
                       std::shared_ptr<TransferGroupMeta> meta,
                       std::shared_ptr<P2PProxy> p2p_proxy,

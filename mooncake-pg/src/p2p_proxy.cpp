@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <thread>
+#include "memory_location.h"
 
 namespace mooncake {
 
@@ -161,15 +162,14 @@ void P2PProxy::AllocateResources() {
             }
         }
     }
-
     int rc = engine_->registerLocalMemory(resources_.ctrl_send_region_,
                                           kMaxNumRanks * sizeof(P2PControlSlot),
-                                          location_);
+                                          kWildcardLocation);
     TORCH_CHECK(rc == 0, "Failed to register P2P ctrl send region");
 
     rc = engine_->registerLocalMemory(resources_.ctrl_recv_region_,
                                       kMaxNumRanks * sizeof(P2PControlSlot),
-                                      location_);
+                                      kWildcardLocation);
     TORCH_CHECK(rc == 0, "Failed to register P2P ctrl recv region");
 }
 
