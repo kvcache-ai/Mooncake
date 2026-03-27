@@ -30,6 +30,10 @@
 #include "task_manager.h"
 
 namespace mooncake {
+namespace ha {
+class SnapshotStore;
+}
+
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
@@ -427,7 +431,9 @@ class MasterService {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
+    std::unique_ptr<ha::SnapshotStore> CreateSnapshotStore();
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
+    ha::SnapshotStore* GetSnapshotStore();
 
     // Restore master state
     void RestoreState();
@@ -1017,6 +1023,8 @@ class MasterService {
 
     const bool enable_offload_;
 
+    const std::string ha_backend_connstring_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
@@ -1043,7 +1051,10 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_catalog_backend_type_{};
+    std::string snapshot_catalog_backend_connstring_;
     std::unique_ptr<SerializerBackend> snapshot_backend_;
+    std::unique_ptr<ha::SnapshotStore> snapshot_store_;
     mutable std::shared_mutex snapshot_mutex_;
 
     // Discarded replicas management

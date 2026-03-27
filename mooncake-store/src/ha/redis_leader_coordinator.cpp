@@ -1,6 +1,5 @@
 #include "ha/backends/redis/redis_leader_coordinator.h"
 
-#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <cstdlib>
@@ -17,6 +16,8 @@
 #endif
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/backends/redis/redis_client_helper.h"
+
 namespace mooncake {
 namespace ha {
 namespace backends {
@@ -26,9 +27,6 @@ namespace {
 
 #ifdef STORE_USE_REDIS
 
-constexpr auto kRedisDefaultPort = 6379;
-constexpr auto kRedisConnectTimeout = std::chrono::seconds(3);
-constexpr auto kRedisCommandTimeout = std::chrono::seconds(3);
 constexpr auto kViewChangePollInterval = std::chrono::milliseconds(200);
 constexpr auto kMinimumRenewInterval = std::chrono::milliseconds(200);
 constexpr auto kRedisLeaseTtl =
@@ -93,137 +91,6 @@ class RedisLeadershipMonitorHandle final : public LeadershipMonitorHandle {
    private:
     std::shared_ptr<std::atomic<bool>> armed_;
 };
-
-timeval ToTimeval(std::chrono::microseconds duration) {
-    const auto seconds =
-        std::chrono::duration_cast<std::chrono::seconds>(duration);
-    const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
-        duration - seconds);
-    return timeval{
-        .tv_sec = static_cast<time_t>(seconds.count()),
-        .tv_usec = static_cast<suseconds_t>(micros.count()),
-    };
-}
-
-struct RedisEndpoint {
-    std::string host;
-    int port = kRedisDefaultPort;
-};
-
-struct RedisReplyDeleter {
-    void operator()(redisReply* reply) const {
-        if (reply != nullptr) {
-            freeReplyObject(reply);
-        }
-    }
-};
-
-using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
-
-bool IsStringReply(const redisReply* reply) {
-    return reply != nullptr && (reply->type == REDIS_REPLY_STRING ||
-                                reply->type == REDIS_REPLY_STATUS);
-}
-
-tl::expected<int, ErrorCode> ParsePositiveInt(std::string_view text,
-                                              int min_value, int max_value) {
-    if (text.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    try {
-        const auto parsed = std::stoll(std::string(text));
-        if (parsed < min_value || parsed > max_value) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        return static_cast<int>(parsed);
-    } catch (const std::exception&) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-}
-
-tl::expected<int, ErrorCode> ResolveRedisDbIndex() {
-    const char* raw_db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (raw_db_index == nullptr || std::strlen(raw_db_index) == 0) {
-        return 0;
-    }
-    return ParsePositiveInt(raw_db_index, 0, 255);
-}
-
-tl::expected<RedisEndpoint, ErrorCode> ParseRedisEndpoint(
-    std::string_view connstring) {
-    constexpr std::string_view kRedisScheme = "redis://";
-    if (connstring.substr(0, kRedisScheme.size()) == kRedisScheme) {
-        connstring.remove_prefix(kRedisScheme.size());
-    }
-
-    const auto slash_pos = connstring.find('/');
-    if (slash_pos != std::string_view::npos) {
-        if (slash_pos + 1 != connstring.size()) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        connstring = connstring.substr(0, slash_pos);
-    }
-
-    if (connstring.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    RedisEndpoint endpoint;
-    if (connstring.front() == '[') {
-        const auto bracket_pos = connstring.find(']');
-        if (bracket_pos == std::string_view::npos || bracket_pos == 1) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
-        endpoint.host = std::string(connstring.substr(1, bracket_pos - 1));
-        const auto remainder = connstring.substr(bracket_pos + 1);
-        if (remainder.empty()) {
-            return endpoint;
-        }
-        if (remainder.front() != ':') {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto port = ParsePositiveInt(remainder.substr(1), 1, 65535);
-        if (!port) {
-            return tl::make_unexpected(port.error());
-        }
-        endpoint.port = port.value();
-        return endpoint;
-    }
-
-    const auto colon_pos = connstring.rfind(':');
-    if (colon_pos == std::string_view::npos) {
-        endpoint.host = std::string(connstring);
-        return endpoint;
-    }
-
-    if (connstring.find(':') != colon_pos) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    endpoint.host = std::string(connstring.substr(0, colon_pos));
-    if (endpoint.host.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto port = ParsePositiveInt(connstring.substr(colon_pos + 1), 1, 65535);
-    if (!port) {
-        return tl::make_unexpected(port.error());
-    }
-    endpoint.port = port.value();
-    return endpoint;
-}
-
-std::string SanitizeHashTagComponent(std::string component) {
-    if (!component.empty() && component.back() == '/') {
-        component.pop_back();
-    }
-    std::replace(component.begin(), component.end(), '{', '_');
-    std::replace(component.begin(), component.end(), '}', '_');
-    return component;
-}
-
 tl::expected<std::string, ErrorCode> GetReplyString(const redisReply* reply) {
     if (!IsStringReply(reply) || reply->str == nullptr) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -825,71 +692,19 @@ ErrorCode RedisLeaderCoordinator::ConnectLocked() {
         return ErrorCode::OK;
     }
 
-    auto endpoint = ParseRedisEndpoint(spec_.connstring);
-    if (!endpoint) {
-        LOG(ERROR) << "Invalid Redis HA backend connstring: "
-                   << spec_.connstring;
-        return endpoint.error();
-    }
-
-    auto db_index = ResolveRedisDbIndex();
-    if (!db_index) {
-        LOG(ERROR) << "Invalid MC_REDIS_DB_INDEX value";
-        return db_index.error();
-    }
-
-    const auto connect_timeout =
-        ToTimeval(std::chrono::duration_cast<std::chrono::microseconds>(
-            kRedisConnectTimeout));
-    context_ = redisConnectWithTimeout(endpoint->host.c_str(), endpoint->port,
-                                       connect_timeout);
-    if (context_ == nullptr) {
-        LOG(WARNING) << "Redis connect failed for " << endpoint->host << ':'
-                     << endpoint->port;
-        connected_ = false;
-        return ErrorCode::INTERNAL_ERROR;
-    }
-    if (context_->err != 0) {
-        LOG(WARNING) << "Redis connect failed for " << endpoint->host << ':'
-                     << endpoint->port << ": " << context_->errstr;
-        DisconnectLocked();
-        return ErrorCode::INTERNAL_ERROR;
-    }
-
-    const auto command_timeout =
-        ToTimeval(std::chrono::duration_cast<std::chrono::microseconds>(
-            kRedisCommandTimeout));
-    if (redisSetTimeout(context_, command_timeout) != REDIS_OK) {
-        LOG(WARNING) << "Failed to set Redis command timeout for "
-                     << endpoint->host << ':' << endpoint->port;
-        DisconnectLocked();
-        return ErrorCode::INTERNAL_ERROR;
-    }
-
-    const char* password = std::getenv("MC_REDIS_PASSWORD");
-    if (password != nullptr && std::strlen(password) > 0) {
-        auto* raw_reply = static_cast<redisReply*>(
-            redisCommand(context_, "AUTH %b", password, std::strlen(password)));
-        RedisReplyPtr reply(raw_reply);
-        if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
-            LOG(WARNING) << "Redis AUTH failed for " << endpoint->host << ':'
-                         << endpoint->port;
-            DisconnectLocked();
-            return ErrorCode::INTERNAL_ERROR;
+    auto context = ConnectRedis(spec_.connstring, ErrorCode::INTERNAL_ERROR);
+    if (!context) {
+        if (context.error() == ErrorCode::INVALID_PARAMS) {
+            LOG(ERROR) << "Invalid Redis HA backend configuration";
+        } else {
+            LOG(WARNING) << "Failed to connect Redis HA backend";
         }
+        DisconnectLocked();
+        return context.error();
     }
 
-    if (db_index.value() != 0) {
-        auto* raw_reply = static_cast<redisReply*>(
-            redisCommand(context_, "SELECT %d", db_index.value()));
-        RedisReplyPtr reply(raw_reply);
-        if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
-            LOG(WARNING) << "Redis SELECT failed for db=" << db_index.value();
-            DisconnectLocked();
-            return ErrorCode::INTERNAL_ERROR;
-        }
-    }
-
+    DisconnectLocked();
+    context_ = context->release();
     connected_ = true;
     return ErrorCode::OK;
 }

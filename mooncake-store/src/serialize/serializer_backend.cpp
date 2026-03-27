@@ -1,8 +1,12 @@
 #include "serialize/serializer_backend.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <string_view>
 
 #include <fmt/format.h>
 #include <glog/logging.h>
@@ -43,6 +47,20 @@ std::unique_ptr<SerializerBackend> SerializerBackend::Create(
 // ============================================================================
 
 #ifdef HAVE_AWS_SDK
+
+namespace {
+
+bool ContainsAsciiInsensitive(std::string_view haystack,
+                              std::string_view needle) {
+    return std::search(
+               haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+               [](char lhs, char rhs) {
+                   return std::tolower(static_cast<unsigned char>(lhs)) ==
+                          std::tolower(static_cast<unsigned char>(rhs));
+               }) != haystack.end();
+}
+
+}  // namespace
 
 class S3Backend::Impl {
    public:
@@ -93,6 +111,13 @@ tl::expected<void, std::string> S3Backend::DeleteObjectsWithPrefix(
 tl::expected<void, std::string> S3Backend::ListObjectsWithPrefix(
     const std::string& prefix, std::vector<std::string>& object_keys) {
     return impl_->s3_helper_.ListObjectsWithPrefix(prefix, object_keys);
+}
+
+bool S3Backend::IsNotFoundError(const std::string& error) const {
+    return ContainsAsciiInsensitive(error, "nosuchkey") ||
+           ContainsAsciiInsensitive(error, "not found") ||
+           ContainsAsciiInsensitive(error, "does not exist") ||
+           ContainsAsciiInsensitive(error, "404");
 }
 
 std::string S3Backend::GetConnectionInfo() const {
@@ -463,6 +488,10 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
     VLOG(1) << "Listed " << object_keys.size()
             << " objects with prefix: " << prefix;
     return {};
+}
+
+bool LocalFileBackend::IsNotFoundError(const std::string& error) const {
+    return error.starts_with("File not found:");
 }
 
 std::string LocalFileBackend::GetConnectionInfo() const {

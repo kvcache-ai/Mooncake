@@ -8,14 +8,13 @@
 #include <future>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <thread>
-#include <utility>
 
 #include <hiredis/hiredis.h>
 
 #include "ha/ha_backend_factory.h"
 #include "high_availability_test_fixture.h"
+#include "redis_test_utils.h"
 #include "types.h"
 
 namespace mooncake {
@@ -47,94 +46,6 @@ std::unique_ptr<ha::LeaderCoordinator> CreateRedisCoordinatorOrNull(
 
 std::string MakeRedisTestClusterNamespace(const std::string& suffix) {
     return "ha-redis-test-" + suffix + "-" + UuidToString(generate_uuid());
-}
-
-struct RedisContextDeleter {
-    void operator()(redisContext* context) const {
-        if (context != nullptr) {
-            redisFree(context);
-        }
-    }
-};
-
-using RedisContextPtr = std::unique_ptr<redisContext, RedisContextDeleter>;
-
-struct RedisReplyDeleter {
-    void operator()(redisReply* reply) const {
-        if (reply != nullptr) {
-            freeReplyObject(reply);
-        }
-    }
-};
-
-using RedisReplyPtr = std::unique_ptr<redisReply, RedisReplyDeleter>;
-
-std::pair<std::string, int> ParseRedisEndpointForTest(
-    const std::string& endpoint) {
-    constexpr int kRedisDefaultPort = 6379;
-    std::string normalized = endpoint;
-    constexpr std::string_view kRedisScheme = "redis://";
-    if (std::string_view(normalized).starts_with(kRedisScheme)) {
-        normalized.erase(0, kRedisScheme.size());
-    }
-    if (normalized.empty()) {
-        return {"", kRedisDefaultPort};
-    }
-    const auto colon_pos = normalized.rfind(':');
-    if (colon_pos == std::string::npos || normalized.find(':') != colon_pos) {
-        return {normalized, kRedisDefaultPort};
-    }
-    const auto host = normalized.substr(0, colon_pos);
-    const auto port_str = normalized.substr(colon_pos + 1);
-    try {
-        const auto port = std::stoi(port_str);
-        if (port <= 0 || port > 65535) {
-            return {"", kRedisDefaultPort};
-        }
-        return {host, port};
-    } catch (const std::exception&) {
-        return {"", kRedisDefaultPort};
-    }
-}
-
-RedisContextPtr ConnectRedisForTest(const std::string& endpoint) {
-    auto [host, port] = ParseRedisEndpointForTest(endpoint);
-    if (host.empty()) {
-        return RedisContextPtr(nullptr);
-    }
-
-    timeval timeout{3, 0};
-    RedisContextPtr context(
-        redisConnectWithTimeout(host.c_str(), port, timeout));
-    if (context == nullptr || context->err != 0) {
-        return RedisContextPtr(nullptr);
-    }
-
-    const char* password = std::getenv("MC_REDIS_PASSWORD");
-    if (password != nullptr && std::strlen(password) > 0) {
-        RedisReplyPtr auth_reply(static_cast<redisReply*>(redisCommand(
-            context.get(), "AUTH %b", password, std::strlen(password))));
-        if (auth_reply == nullptr || auth_reply->type == REDIS_REPLY_ERROR) {
-            return RedisContextPtr(nullptr);
-        }
-    }
-
-    const char* db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (db_index != nullptr && std::strlen(db_index) > 0 &&
-        std::string_view(db_index) != "0") {
-        RedisReplyPtr select_reply(static_cast<redisReply*>(
-            redisCommand(context.get(), "SELECT %s", db_index)));
-        if (select_reply == nullptr ||
-            select_reply->type == REDIS_REPLY_ERROR) {
-            return RedisContextPtr(nullptr);
-        }
-    }
-
-    return context;
-}
-
-std::string BuildRedisMasterViewKey(const std::string& cluster_namespace) {
-    return "mooncake-store/{" + cluster_namespace + "}/master_view";
 }
 
 }  // namespace
@@ -220,10 +131,10 @@ TEST_F(HighAvailabilityTest, RedisLeadershipMonitorReportsDeletedView) {
     ASSERT_TRUE(monitor.has_value());
 
     auto redis = ConnectRedisForTest(FLAGS_redis_endpoint);
-    ASSERT_NE(redis, nullptr);
+    ASSERT_TRUE(redis.has_value());
     const auto master_view_key = BuildRedisMasterViewKey(cluster_namespace);
     RedisReplyPtr delete_reply(static_cast<redisReply*>(
-        redisCommand(redis.get(), "DEL %b", master_view_key.data(),
+        redisCommand(redis->get(), "DEL %b", master_view_key.data(),
                      master_view_key.size())));
     ASSERT_NE(delete_reply, nullptr);
     ASSERT_NE(delete_reply->type, REDIS_REPLY_ERROR);
