@@ -195,10 +195,18 @@ tl::expected<RedisContextPtr, ErrorCode> ConnectRedis(
         return tl::make_unexpected(connection_error);
     }
 
+    const char* username = std::getenv("MC_REDIS_USERNAME");
     const char* password = std::getenv("MC_REDIS_PASSWORD");
     if (password != nullptr && std::strlen(password) > 0) {
-        RedisReplyPtr reply(static_cast<redisReply*>(redisCommand(
-            context.get(), "AUTH %b", password, std::strlen(password))));
+        RedisReplyPtr reply;
+        if (username != nullptr && std::strlen(username) > 0) {
+            reply.reset(static_cast<redisReply*>(redisCommand(
+                context.get(), "AUTH %b %b", username, std::strlen(username),
+                password, std::strlen(password))));
+        } else {
+            reply.reset(static_cast<redisReply*>(redisCommand(
+                context.get(), "AUTH %b", password, std::strlen(password))));
+        }
         if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
             return tl::make_unexpected(connection_error);
         }
