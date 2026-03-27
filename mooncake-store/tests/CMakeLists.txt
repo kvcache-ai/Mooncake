@@ -1,5 +1,6 @@
 function(add_store_test name)
   add_executable(${name} ${ARGN})
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
@@ -16,6 +17,7 @@ endfunction()
 
 function(add_hot_standby_ut_test name)
   add_executable(${name} ${ARGN})
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
@@ -37,7 +39,7 @@ add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
-               master_service_ssd_test_for_snapshot.cpp)
+               ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
@@ -55,14 +57,16 @@ add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
-add_store_test(serializer_snapshot_store_test
-               serializer_snapshot_store_test.cpp)
+add_store_test(embedded_snapshot_catalog_store_test
+               ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp)
 add_store_test(zstd_util_test zstd_util_test.cpp)
-add_store_test(local_file_backend_test local_file_backend_test.cpp)
+add_store_test(local_file_snapshot_object_store_test
+               ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
 add_store_test(file_util_test file_util_test.cpp)
-add_store_test(snapshot_child_process_test snapshot_child_process_test.cpp)
+add_store_test(snapshot_child_process_test
+               ha/snapshot/snapshot_child_process_test.cpp)
 add_store_test(master_service_test_for_snapshot
-               master_service_test_for_snapshot.cpp)
+               ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
@@ -74,23 +78,28 @@ add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_subdirectory(e2e)
 
-add_executable(high_availability_test high_availability_test.cpp)
+add_executable(high_availability_test ha/leadership/high_availability_test.cpp)
+target_include_directories(high_availability_test PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR})
 if(STORE_USE_REDIS)
     target_sources(high_availability_test PRIVATE
-        high_availability_redis_test.cpp)
+        ha/leadership/backends/redis/high_availability_redis_test.cpp)
     target_include_directories(high_availability_test PRIVATE
         ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
     target_link_libraries(high_availability_test PRIVATE
         ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 
-    add_executable(redis_snapshot_store_test redis_snapshot_store_test.cpp)
-    target_include_directories(redis_snapshot_store_test PRIVATE
+    add_executable(redis_snapshot_catalog_store_test
+                   ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
+    target_include_directories(redis_snapshot_catalog_store_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
         ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-    target_link_libraries(redis_snapshot_store_test
+    target_link_libraries(redis_snapshot_catalog_store_test
         PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
                ${ETCD_WRAPPER_LIB} glog gflags ibverbs gtest pthread
         PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
-    add_test(NAME redis_snapshot_store_test COMMAND redis_snapshot_store_test)
+    add_test(NAME redis_snapshot_catalog_store_test
+             COMMAND redis_snapshot_catalog_store_test)
 endif()
 target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD OR STORE_USE_REDIS)

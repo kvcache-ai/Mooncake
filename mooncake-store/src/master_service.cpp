@@ -13,14 +13,14 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
-#include "ha/backends/redis/redis_snapshot_store.h"
+#include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
+#include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
+#include "ha/snapshot/object/snapshot_object_store.h"
 #include "types.h"
-#include "ha/serializer_snapshot_store.h"
 #include "serialize/serializer.hpp"
-#include "serialize/serializer_backend.h"
+#include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
-#include "utils/snapshot_logger.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -44,20 +44,21 @@ namespace {
 constexpr size_t kUnlimitedSnapshotList = 0;
 
 enum class SnapshotCatalogBackendKind {
-    kSerializer,
+    kEmbedded,
     kRedis,
 };
 
-tl::expected<SnapshotCatalogBackendKind, std::string>
-ParseSnapshotCatalogBackendKind(std::string_view backend_type) {
-    if (backend_type.empty() || backend_type == "serializer") {
-        return SnapshotCatalogBackendKind::kSerializer;
+tl::expected<SnapshotCatalogBackendKind, std::string> ParseSnapshotCatalogKind(
+    std::string_view store_type) {
+    if (store_type.empty() || store_type == "embedded" ||
+        store_type == "payload") {
+        return SnapshotCatalogBackendKind::kEmbedded;
     }
-    if (backend_type == "redis") {
+    if (store_type == "redis") {
         return SnapshotCatalogBackendKind::kRedis;
     }
-    return tl::make_unexpected("unknown snapshot catalog backend type: " +
-                               std::string(backend_type));
+    return tl::make_unexpected("unknown snapshot catalog store type: " +
+                               std::string(store_type));
 }
 
 }  // namespace
@@ -89,9 +90,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       snapshot_retention_count_(config.snapshot_retention_count),
-      snapshot_catalog_backend_type_(config.snapshot_catalog_backend_type),
-      snapshot_catalog_backend_connstring_(
-          config.snapshot_catalog_backend_connstring),
+      snapshot_catalog_store_type_(config.snapshot_catalog_store_type),
+      snapshot_catalog_store_connstring_(
+          config.snapshot_catalog_store_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
@@ -100,14 +101,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_cxl_(config.enable_cxl) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
-            auto backend_type =
-                ParseSnapshotBackendType(config.snapshot_backend_type);
-            snapshot_backend_ = SerializerBackend::Create(backend_type);
-            snapshot_store_ = CreateSnapshotStore();
+            auto object_store_type =
+                ParseSnapshotObjectStoreType(config.snapshot_object_store_type);
+            snapshot_object_store_ =
+                SnapshotObjectStore::Create(object_store_type);
+            snapshot_catalog_store_ = CreateSnapshotCatalogStore();
         } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to create snapshot backend: " << e.what();
+            LOG(ERROR) << "Failed to create snapshot stores: " << e.what();
             throw std::runtime_error(
-                fmt::format("Failed to create snapshot backend: {}", e.what()));
+                fmt::format("Failed to create snapshot stores: {}", e.what()));
         }
         if (!snapshot_backup_dir_.empty()) {
             use_snapshot_backup_dir_ = true;
@@ -181,39 +183,40 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 }
 
-std::unique_ptr<ha::SnapshotStore> MasterService::CreateSnapshotStore() {
-    auto backend_kind =
-        ParseSnapshotCatalogBackendKind(snapshot_catalog_backend_type_);
-    if (!backend_kind) {
-        throw std::invalid_argument(backend_kind.error());
+std::unique_ptr<ha::SnapshotCatalogStore>
+MasterService::CreateSnapshotCatalogStore() {
+    auto catalog_kind = ParseSnapshotCatalogKind(snapshot_catalog_store_type_);
+    if (!catalog_kind) {
+        throw std::invalid_argument(catalog_kind.error());
     }
 
-    switch (backend_kind.value()) {
-        case SnapshotCatalogBackendKind::kSerializer:
-            return std::make_unique<ha::SerializerSnapshotStore>(
-                snapshot_backend_.get());
+    switch (catalog_kind.value()) {
+        case SnapshotCatalogBackendKind::kEmbedded:
+            return std::make_unique<
+                ha::backends::embedded::EmbeddedSnapshotCatalogStore>(
+                snapshot_object_store_.get());
         case SnapshotCatalogBackendKind::kRedis: {
 #ifndef STORE_USE_REDIS
             throw std::invalid_argument(
-                "redis snapshot catalog backend is unavailable in the current "
+                "redis snapshot catalog store is unavailable in the current "
                 "build");
 #else
-            const auto connstring =
-                !snapshot_catalog_backend_connstring_.empty()
-                    ? snapshot_catalog_backend_connstring_
-                    : ha_backend_connstring_;
+            const auto connstring = !snapshot_catalog_store_connstring_.empty()
+                                        ? snapshot_catalog_store_connstring_
+                                        : ha_backend_connstring_;
             if (connstring.empty()) {
                 throw std::invalid_argument(
-                    "redis snapshot catalog backend requires a connection "
+                    "redis snapshot catalog store requires a connection "
                     "string");
             }
-            return std::make_unique<ha::backends::redis::RedisSnapshotStore>(
-                snapshot_backend_.get(), connstring, cluster_id_);
+            return std::make_unique<
+                ha::backends::redis::RedisSnapshotCatalogStore>(
+                snapshot_object_store_.get(), connstring, cluster_id_);
 #endif
         }
     }
 
-    throw std::invalid_argument("unknown snapshot catalog backend type");
+    throw std::invalid_argument("unknown snapshot catalog store type");
 }
 
 MasterService::~MasterService() {
@@ -2237,11 +2240,11 @@ void MasterService::HandleChildExit(pid_t pid, int status,
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
-        auto* snapshot_store = GetSnapshotStore();
-        if (!snapshot_store) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::PERSISTENT_FAIL,
-                                   "snapshot backend is not initialized"));
+        auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+        if (!snapshot_catalog_store) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                "snapshot catalog store is not initialized"));
         }
 
         SNAP_LOG_INFO(
@@ -2303,13 +2306,13 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         bool upload_success = true;
         std::string error_msg;
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
-                      snapshot_backend_->GetConnectionInfo());
+                      snapshot_object_store_->GetConnectionInfo());
 
         // Upload metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         auto upload_result =
-            UploadSnapshotFile(serialized_metadata, metadata_path,
-                               SNAPSHOT_METADATA_FILE, snapshot_id);
+            UploadSnapshotPayloadFile(serialized_metadata, metadata_path,
+                                      SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] metadata upload failed, snapshot_id={}, "
@@ -2326,8 +2329,9 @@ tl::expected<void, SerializationError> MasterService::PersistState(
 
         // Upload segment
         std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result = UploadSnapshotFile(serialized_segment, segment_path,
-                                           SNAPSHOT_SEGMENTS_FILE, snapshot_id);
+        upload_result =
+            UploadSnapshotPayloadFile(serialized_segment, segment_path,
+                                      SNAPSHOT_SEGMENTS_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] segment upload failed, snapshot_id={}, "
@@ -2344,9 +2348,9 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         // Upload task manager
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
-        upload_result =
-            UploadSnapshotFile(serialized_task_manager, task_manager_path,
-                               SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
+        upload_result = UploadSnapshotPayloadFile(
+            serialized_task_manager, task_manager_path,
+            SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] task_manager upload failed, snapshot_id={}, "
@@ -2368,8 +2372,8 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                         SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
                                             manifest_content.end());
-        upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
-                                           SNAPSHOT_MANIFEST_FILE, snapshot_id);
+        upload_result = UploadSnapshotPayloadFile(
+            manifest_bytes, manifest_path, SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] manifest upload failed, snapshot_id={}, "
@@ -2397,7 +2401,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         descriptor.snapshot_id = snapshot_id;
         descriptor.manifest_key = manifest_path;
         descriptor.object_prefix = path_prefix;
-        auto publish_result = snapshot_store->Publish(descriptor);
+        auto publish_result = snapshot_catalog_store->Publish(descriptor);
         if (publish_result != ErrorCode::OK) {
             SNAP_LOG_ERROR(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}, "
@@ -2450,14 +2454,14 @@ tl::expected<void, SerializationError> MasterService::PersistState(
     return {};
 }
 
-tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
+tl::expected<void, SerializationError> MasterService::UploadSnapshotPayloadFile(
     const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
     SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}",
                   local_filename, path, snapshot_id);
 
     std::string error_msg;
-    auto upload_result = snapshot_backend_->UploadBuffer(path, data);
+    auto upload_result = snapshot_object_store_->UploadBuffer(path, data);
     if (!upload_result) {
         SNAP_LOG_ERROR(
             "[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
@@ -2493,16 +2497,16 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
 
 void MasterService::CleanupOldSnapshot(int keep_count,
                                        const std::string& snapshot_id) {
-    auto* snapshot_store = GetSnapshotStore();
-    if (!snapshot_store) {
+    auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+    if (!snapshot_catalog_store) {
         SNAP_LOG_ERROR(
-            "[Snapshot] snapshot store is not initialized, "
+            "[Snapshot] snapshot catalog store is not initialized, "
             "snapshot_id={}",
             snapshot_id);
         return;
     }
 
-    auto list_result = snapshot_store->List(kUnlimitedSnapshotList);
+    auto list_result = snapshot_catalog_store->List(kUnlimitedSnapshotList);
     if (!list_result) {
         SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
                        snapshot_id, toString(list_result.error()));
@@ -2524,15 +2528,15 @@ void MasterService::CleanupOldSnapshot(int keep_count,
                 continue;
             }
 
-            auto delete_result = snapshot_store->Delete(old_state_dir);
+            auto delete_result = snapshot_catalog_store->Delete(old_state_dir);
             if (delete_result != ErrorCode::OK) {
                 SNAP_LOG_ERROR(
-                    "[Snapshot] Failed to delete old state directory {}, "
+                    "[Snapshot] Failed to delete old snapshot {}, "
                     "snapshot_id={}, code={}",
                     old_state_dir, snapshot_id, toString(delete_result));
             } else {
                 SNAP_LOG_INFO(
-                    "[Snapshot] Successfully deleted old state directory {}, "
+                    "[Snapshot] Successfully deleted old snapshot {}, "
                     "snapshot_id={}",
                     old_state_dir, snapshot_id);
             }
@@ -2542,19 +2546,19 @@ void MasterService::CleanupOldSnapshot(int keep_count,
 
 void MasterService::RestoreState() {
     try {
-        auto* snapshot_store = GetSnapshotStore();
-        if (!snapshot_store) {
-            LOG(ERROR) << "[Restore] Snapshot backend is not initialized, "
-                       << "starting fresh";
+        auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+        if (!snapshot_catalog_store) {
+            LOG(ERROR) << "[Restore] Snapshot catalog store is not "
+                          "initialized, starting fresh";
             return;
         }
 
         auto now = std::chrono::system_clock::now();
 
         LOG(INFO) << "[Restore] Backend info: "
-                  << snapshot_backend_->GetConnectionInfo();
+                  << snapshot_object_store_->GetConnectionInfo();
         // 1. Resolve the latest snapshot from the snapshot catalog.
-        auto latest_result = snapshot_store->GetLatest();
+        auto latest_result = snapshot_catalog_store->GetLatest();
         if (!latest_result) {
             LOG(ERROR) << "[Restore] Failed to load latest snapshot: "
                        << toString(latest_result.error()) << ", starting fresh";
@@ -2579,8 +2583,8 @@ void MasterService::RestoreState() {
             manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         }
         std::string manifest_content;
-        if (!snapshot_backend_->DownloadString(manifest_path,
-                                               manifest_content)) {
+        if (!snapshot_object_store_->DownloadString(manifest_path,
+                                                    manifest_content)) {
             LOG(ERROR) << "[Restore] Failed to download manifest file: "
                        << manifest_path << " , starting fresh";
             return;
@@ -2635,8 +2639,8 @@ void MasterService::RestoreState() {
         // 3. Download metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
-        auto download_result =
-            snapshot_backend_->DownloadBuffer(metadata_path, metadata_content);
+        auto download_result = snapshot_object_store_->DownloadBuffer(
+            metadata_path, metadata_content);
         if (!download_result) {
             LOG(ERROR) << "[Restore] Failed to download metadata file: "
                        << metadata_path << "error=" << download_result.error();
@@ -2658,8 +2662,8 @@ void MasterService::RestoreState() {
         // 4. Download segments
         std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         std::vector<uint8_t> segments_content;
-        download_result =
-            snapshot_backend_->DownloadBuffer(segments_path, segments_content);
+        download_result = snapshot_object_store_->DownloadBuffer(
+            segments_path, segments_content);
         if (!download_result) {
             LOG(ERROR) << "Failed to download segments file: " << segments_path
                        << " error=" << download_result.error();
@@ -2681,7 +2685,7 @@ void MasterService::RestoreState() {
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
         std::vector<uint8_t> task_manager_content;
-        download_result = snapshot_backend_->DownloadBuffer(
+        download_result = snapshot_object_store_->DownloadBuffer(
             task_manager_path, task_manager_content);
         if (!download_result) {
             LOG(ERROR) << "Failed to download task manager file: "
@@ -2881,8 +2885,8 @@ void MasterService::RestoreState() {
     }
 }
 
-ha::SnapshotStore* MasterService::GetSnapshotStore() {
-    return snapshot_store_.get();
+ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
+    return snapshot_catalog_store_.get();
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,

@@ -10,7 +10,7 @@
 
 #include "default_config.h"
 #include "duration_utils.h"
-#include "ha/master_service_supervisor.h"
+#include "ha/leadership/master_service_supervisor.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -167,13 +167,22 @@ DEFINE_uint32(snapshot_retention_count,
               mooncake::DEFAULT_SNAPSHOT_RETENTION_COUNT,
               "Number of recent snapshots to keep (older snapshots will be "
               "automatically deleted)");
-DEFINE_string(snapshot_backend_type, "",
-              "Snapshot storage backend type: 'local' for local filesystem, "
+DEFINE_string(snapshot_object_store_type, "",
+              "Snapshot object store type: 'local' for local filesystem, "
               "'s3' for S3 storage");
+DEFINE_string(snapshot_payload_store_type, "",
+              "Deprecated alias of --snapshot_object_store_type");
+DEFINE_string(snapshot_payload_backend_type, "",
+              "Deprecated alias of --snapshot_object_store_type");
+DEFINE_string(snapshot_catalog_store_type, "",
+              "Snapshot catalog store type: ''/'embedded' or 'redis' "
+              "('payload' is kept as a deprecated alias)");
 DEFINE_string(snapshot_catalog_backend_type, "",
-              "Snapshot catalog backend type: ''/'serializer' or 'redis'");
+              "Deprecated alias of --snapshot_catalog_store_type");
+DEFINE_string(snapshot_catalog_store_connstring, "",
+              "Optional connection string for snapshot catalog store");
 DEFINE_string(snapshot_catalog_backend_connstring, "",
-              "Optional connection string for snapshot catalog backend");
+              "Deprecated alias of --snapshot_catalog_store_connstring");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -311,15 +320,36 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("snapshot_retention_count",
                              &master_config.snapshot_retention_count,
                              FLAGS_snapshot_retention_count);
-    default_config.GetString("snapshot_backend_type",
-                             &master_config.snapshot_backend_type,
-                             FLAGS_snapshot_backend_type);
-    default_config.GetString("snapshot_catalog_backend_type",
-                             &master_config.snapshot_catalog_backend_type,
-                             FLAGS_snapshot_catalog_backend_type);
-    default_config.GetString("snapshot_catalog_backend_connstring",
-                             &master_config.snapshot_catalog_backend_connstring,
-                             FLAGS_snapshot_catalog_backend_connstring);
+    default_config.GetString("snapshot_object_store_type",
+                             &master_config.snapshot_object_store_type,
+                             FLAGS_snapshot_object_store_type);
+    if (master_config.snapshot_object_store_type.empty()) {
+        default_config.GetString("snapshot_payload_store_type",
+                                 &master_config.snapshot_object_store_type,
+                                 master_config.snapshot_object_store_type);
+    }
+    if (master_config.snapshot_object_store_type.empty()) {
+        default_config.GetString("snapshot_payload_backend_type",
+                                 &master_config.snapshot_object_store_type,
+                                 master_config.snapshot_object_store_type);
+    }
+    default_config.GetString("snapshot_catalog_store_type",
+                             &master_config.snapshot_catalog_store_type,
+                             FLAGS_snapshot_catalog_store_type);
+    if (master_config.snapshot_catalog_store_type.empty()) {
+        default_config.GetString("snapshot_catalog_backend_type",
+                                 &master_config.snapshot_catalog_store_type,
+                                 master_config.snapshot_catalog_store_type);
+    }
+    default_config.GetString("snapshot_catalog_store_connstring",
+                             &master_config.snapshot_catalog_store_connstring,
+                             FLAGS_snapshot_catalog_store_connstring);
+    if (master_config.snapshot_catalog_store_connstring.empty()) {
+        default_config.GetString(
+            "snapshot_catalog_backend_connstring",
+            &master_config.snapshot_catalog_store_connstring,
+            master_config.snapshot_catalog_store_connstring);
+    }
     default_config.GetUInt32("max_total_finished_tasks",
                              &master_config.max_total_finished_tasks,
                              FLAGS_max_total_finished_tasks);
@@ -620,24 +650,86 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
     }
-    if ((google::GetCommandLineFlagInfo("snapshot_backend_type", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_backend_type = FLAGS_snapshot_backend_type;
+    bool use_snapshot_object_store_flag = false;
+    bool use_snapshot_payload_store_flag = false;
+    bool use_snapshot_payload_backend_flag = false;
+    if (google::GetCommandLineFlagInfo("snapshot_object_store_type", &info) &&
+        !info.is_default) {
+        use_snapshot_object_store_flag = true;
     }
-    if ((google::GetCommandLineFlagInfo("snapshot_catalog_backend_type",
-                                        &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_catalog_backend_type =
+    if (google::GetCommandLineFlagInfo("snapshot_payload_store_type", &info) &&
+        !info.is_default) {
+        use_snapshot_payload_store_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_payload_backend_type",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_payload_backend_flag = true;
+    }
+    if (use_snapshot_object_store_flag) {
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_object_store_type;
+    } else if (use_snapshot_payload_store_flag) {
+        LOG(WARNING) << "--snapshot_payload_store_type is deprecated; use "
+                     << "--snapshot_object_store_type instead";
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_payload_store_type;
+    } else if (use_snapshot_payload_backend_flag) {
+        LOG(WARNING) << "--snapshot_payload_backend_type is deprecated; use "
+                     << "--snapshot_object_store_type instead";
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_payload_backend_type;
+    } else if (!conf_set) {
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_object_store_type;
+    }
+    bool use_snapshot_catalog_store_flag = false;
+    bool use_snapshot_catalog_backend_flag = false;
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_store_type", &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_store_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_backend_type",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_backend_flag = true;
+    }
+    if (use_snapshot_catalog_store_flag) {
+        master_config.snapshot_catalog_store_type =
+            FLAGS_snapshot_catalog_store_type;
+    } else if (use_snapshot_catalog_backend_flag) {
+        LOG(WARNING) << "--snapshot_catalog_backend_type is deprecated; use "
+                     << "--snapshot_catalog_store_type instead";
+        master_config.snapshot_catalog_store_type =
             FLAGS_snapshot_catalog_backend_type;
+    } else if (!conf_set) {
+        master_config.snapshot_catalog_store_type =
+            FLAGS_snapshot_catalog_store_type;
     }
-    if ((google::GetCommandLineFlagInfo("snapshot_catalog_backend_connstring",
-                                        &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_catalog_backend_connstring =
+    bool use_snapshot_catalog_store_connstring_flag = false;
+    bool use_snapshot_catalog_backend_connstring_flag = false;
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_store_connstring",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_store_connstring_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_backend_connstring",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_backend_connstring_flag = true;
+    }
+    if (use_snapshot_catalog_store_connstring_flag) {
+        master_config.snapshot_catalog_store_connstring =
+            FLAGS_snapshot_catalog_store_connstring;
+    } else if (use_snapshot_catalog_backend_connstring_flag) {
+        LOG(WARNING)
+            << "--snapshot_catalog_backend_connstring is deprecated; use "
+            << "--snapshot_catalog_store_connstring instead";
+        master_config.snapshot_catalog_store_connstring =
             FLAGS_snapshot_catalog_backend_connstring;
+    } else if (!conf_set) {
+        master_config.snapshot_catalog_store_connstring =
+            FLAGS_snapshot_catalog_store_connstring;
     }
 }
 
@@ -778,9 +870,10 @@ int main(int argc, char* argv[]) {
         << ", snapshot_interval_seconds="
         << master_config.snapshot_interval_seconds
         << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
-        << ", snapshot_backend_type=" << master_config.snapshot_backend_type
-        << ", snapshot_catalog_backend_type="
-        << master_config.snapshot_catalog_backend_type
+        << ", snapshot_object_store_type="
+        << master_config.snapshot_object_store_type
+        << ", snapshot_catalog_store_type="
+        << master_config.snapshot_catalog_store_type
         << ", snapshot_retention_count="
         << master_config.snapshot_retention_count
         << ", max_retry_attempts=" << master_config.max_retry_attempts

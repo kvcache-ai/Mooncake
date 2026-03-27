@@ -26,14 +26,16 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
-    serialize/serializer_backend.cpp
-    ha/ha_backend_factory.cpp
-    ha/serializer_snapshot_store.cpp
-    ha/etcd_leader_coordinator.cpp
-    ha/master_service_supervisor.cpp
-    ha/redis_client_helper.cpp
-    ha/redis_leader_coordinator.cpp
-    ha/redis_snapshot_store.cpp
+    ha/leadership/leader_coordinator_factory.cpp
+    ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
+    ha/common/redis/redis_connection.cpp
+    ha/leadership/backends/redis/redis_leader_coordinator.cpp
+    ha/leadership/master_service_supervisor.cpp
+    ha/snapshot/object/snapshot_object_store.cpp
+    ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
+    ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
+    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
+    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
