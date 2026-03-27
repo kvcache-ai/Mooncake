@@ -36,10 +36,10 @@ sudo apt-get install -y \
     libibverbs-dev \
     libboost-all-dev \
     libcurl4-openssl-dev \
-    libyaml-cpp-dev \
     libgtest-dev \
-    libxxhash-dev \
     libmsgpack-dev \
+    libxxhash-dev \
+    libyaml-cpp-dev \
     pybind11-dev \
     python3-dev
 
