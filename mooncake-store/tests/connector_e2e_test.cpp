@@ -120,7 +120,8 @@ TEST_F(RedisConnectorE2ETest, ListObjectsWithPrefix) {
     auto result = connector->ListObjects("mooncake_test_*", objects);
 
     if (result) {
-        LOG(INFO) << "Found " << objects.size() << " objects with prefix 'mooncake_test_*'";
+        LOG(INFO) << "Found " << objects.size()
+                  << " objects with prefix 'mooncake_test_*'";
         for (const auto& obj : objects) {
             LOG(INFO) << "  - " << obj.key;
         }
