@@ -58,17 +58,17 @@ struct MasterConfig {
     uint64_t snapshot_child_timeout_seconds;
     uint32_t snapshot_retention_count;
 
-    // Snapshot payload storage backend type: "local" or "s3", required when
+    // Snapshot object store type: "local" or "s3", required when
     // snapshot or restore is enabled
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
 
-    // Snapshot catalog backend type: ""/"serializer" or "redis". Empty keeps
-    // the existing serializer-backed catalog behavior.
-    std::string snapshot_catalog_backend_type;
+    // Snapshot catalog store type: ""/"embedded" or "redis". Empty keeps the
+    // embedded catalog behavior. "payload" remains a deprecated alias.
+    std::string snapshot_catalog_store_type;
 
-    // Optional connection string for snapshot catalog backend. When empty, the
+    // Optional connection string for snapshot catalog store. When empty, the
     // implementation may fall back to a backend-specific default.
-    std::string snapshot_catalog_backend_connstring;
+    std::string snapshot_catalog_store_connstring;
 
     // Task manager configuration
     uint32_t max_total_finished_tasks;
@@ -132,9 +132,9 @@ class MasterServiceSupervisorConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
-    std::string snapshot_catalog_backend_type;
-    std::string snapshot_catalog_backend_connstring;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -191,10 +191,10 @@ class MasterServiceSupervisorConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
-        snapshot_catalog_backend_type = config.snapshot_catalog_backend_type;
-        snapshot_catalog_backend_connstring =
-            config.snapshot_catalog_backend_connstring;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -285,9 +285,9 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
-    std::string snapshot_catalog_backend_type;
-    std::string snapshot_catalog_backend_connstring;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -359,10 +359,10 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
-        snapshot_catalog_backend_type = config.snapshot_catalog_backend_type;
-        snapshot_catalog_backend_connstring =
-            config.snapshot_catalog_backend_connstring;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -410,10 +410,10 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
-        snapshot_catalog_backend_type = config.snapshot_catalog_backend_type;
-        snapshot_catalog_backend_connstring =
-            config.snapshot_catalog_backend_connstring;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -462,9 +462,9 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type_;
-    std::string snapshot_catalog_backend_type_;
-    std::string snapshot_catalog_backend_connstring_;
+    std::string snapshot_object_store_type_;
+    std::string snapshot_catalog_store_type_;
+    std::string snapshot_catalog_store_connstring_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -605,22 +605,43 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_snapshot_backend_type(
+    MasterServiceConfigBuilder& set_snapshot_object_store_type(
         const std::string& type) {
-        snapshot_backend_type_ = type;
+        snapshot_object_store_type_ = type;
+        return *this;
+    }
+
+    // Deprecated compatibility shims for older tests and call sites.
+    MasterServiceConfigBuilder& set_snapshot_payload_store_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_payload_backend_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_type(
+        const std::string& type) {
+        snapshot_catalog_store_type_ = type;
         return *this;
     }
 
     MasterServiceConfigBuilder& set_snapshot_catalog_backend_type(
         const std::string& type) {
-        snapshot_catalog_backend_type_ = type;
+        return set_snapshot_catalog_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_connstring(
+        const std::string& connstring) {
+        snapshot_catalog_store_connstring_ = connstring;
         return *this;
     }
 
     MasterServiceConfigBuilder& set_snapshot_catalog_backend_connstring(
         const std::string& connstring) {
-        snapshot_catalog_backend_connstring_ = connstring;
-        return *this;
+        return set_snapshot_catalog_store_connstring(connstring);
     }
 
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
@@ -717,9 +738,9 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
-    std::string snapshot_catalog_backend_type;
-    std::string snapshot_catalog_backend_connstring;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -766,10 +787,10 @@ class MasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
-        snapshot_catalog_backend_type = config.snapshot_catalog_backend_type;
-        snapshot_catalog_backend_connstring =
-            config.snapshot_catalog_backend_connstring;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -819,10 +840,10 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_retention_count = snapshot_retention_count_;
-    config.snapshot_backend_type = snapshot_backend_type_;
-    config.snapshot_catalog_backend_type = snapshot_catalog_backend_type_;
-    config.snapshot_catalog_backend_connstring =
-        snapshot_catalog_backend_connstring_;
+    config.snapshot_object_store_type = snapshot_object_store_type_;
+    config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
+    config.snapshot_catalog_store_connstring =
+        snapshot_catalog_store_connstring_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =

@@ -87,15 +87,23 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     }
 
     RedisStoragePlugin(const std::string &metadata_uri,
-                       const std::string &password, const uint8_t &db_index)
+                       const std::string &username, const std::string &password,
+                       const uint8_t &db_index)
         : RedisStoragePlugin(metadata_uri) {
         if (!client_) {
             return;
         }
 
         if (!password.empty()) {
-            auto *reply = static_cast<redisReply *>(
-                redisCommand(client_, "AUTH %s", password.c_str()));
+            redisReply *reply = nullptr;
+            if (!username.empty()) {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b %b", username.data(), username.size(),
+                    password.data(), password.size()));
+            } else {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b", password.data(), password.size()));
+            }
             if (!reply || reply->type == REDIS_REPLY_ERROR) {
                 LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
                            << metadata_uri_;
@@ -542,6 +550,9 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
+        const char *username = std::getenv("MC_REDIS_USERNAME");
+        std::string username_str = username ? username : "";
+
         const char *password = std::getenv("MC_REDIS_PASSWORD");
         std::string password_str = password ? password : "";
 
@@ -563,8 +574,8 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
             }
         }
 
-        return std::make_shared<RedisStoragePlugin>(parsed_conn_string.second,
-                                                    password_str, db_index);
+        return std::make_shared<RedisStoragePlugin>(
+            parsed_conn_string.second, username_str, password_str, db_index);
     }
 #endif  // USE_REDIS
 

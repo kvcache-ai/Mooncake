@@ -13,7 +13,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "ha/leader_coordinator.h"
+#include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
