@@ -10,6 +10,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <mutex>
+#include <condition_variable>
 
 #include "allocator.h"
 #include "centralized_client_service.h"
@@ -19,8 +21,7 @@
 
 // Configuration flags
 DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "erdma_0",
-              "Device name to use, valid if protocol=rdma");
+DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_string(master_address, "localhost:50051", "Address of master server");
 DEFINE_int32(num_threads, 8, "Number of concurrent worker threads");
 DEFINE_int32(test_operation_nums, 100, "Number of operations per thread");
@@ -53,6 +54,15 @@ std::shared_ptr<ClientService> g_client = nullptr;
 std::unique_ptr<SimpleAllocator> g_client_buffer_allocator = nullptr;
 void* g_segment_ptr = nullptr;
 size_t g_ram_buffer_size = 0;
+
+// Synchronization primitives for coordinated start
+std::mutex g_sync_mutex;
+std::condition_variable g_sync_cv;
+int g_ready_threads_count = 0;
+int g_put_done_count = 0;
+bool g_start_signal_flag = false;
+bool g_get_start_signal_flag = false;
+std::condition_variable g_put_sync_cv;
 
 // Performance measurement structures
 struct OperationResult {
@@ -111,18 +121,22 @@ void cleanup_segment() {
 }
 
 bool initialize_client() {
+    std::optional<std::string> device_names;
+    if (!FLAGS_device_name.empty()) {
+        device_names = FLAGS_device_name;
+    }
     std::optional<std::shared_ptr<ClientService>> client_opt;
 
     if (FLAGS_client_type == "P2P") {
         auto config = ClientConfigBuilder::build_p2p_real_client(
             FLAGS_local_hostname, FLAGS_metadata_connection_string,
-            FLAGS_protocol, std::nullopt, FLAGS_master_address,
+            FLAGS_protocol, device_names, FLAGS_master_address,
             FLAGS_tiered_backend_config);
         client_opt = ClientService::Create(config);
     } else {
         auto config = ClientConfigBuilder::build_centralized_real_client(
             FLAGS_local_hostname, FLAGS_metadata_connection_string,
-            FLAGS_protocol, std::nullopt, FLAGS_master_address);
+            FLAGS_protocol, device_names, FLAGS_master_address);
         client_opt = ClientService::Create(config);
     }
 
@@ -180,6 +194,9 @@ std::string generate_key(int thread_id, uint64_t operation_id) {
 
 void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
                    ThreadStats& stats) {
+    // Reserve memory for operations to avoid reallocations during benchmark
+    stats.operations.reserve(FLAGS_test_operation_nums * 2);
+
     // Allocate thread-local buffer
     void* write_buffer = g_client_buffer_allocator->allocate(FLAGS_value_size);
     if (!write_buffer) {
@@ -209,6 +226,27 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
 
     std::vector<std::string> stored_keys;  // Track keys for GET operations
 
+    // Warmup phase: Establish RPC/RDMA connections before measuring latency
+    std::string warmup_key = "warmup_" + std::to_string(thread_id);
+    auto warmup_start = std::chrono::high_resolution_clock::now();
+    auto warmup_res = g_client->Put(warmup_key.data(), slices, config);
+    auto warmup_end = std::chrono::high_resolution_clock::now();
+    LOG(INFO) << "Thread " << thread_id << " warmup put completed in "
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     warmup_end - warmup_start)
+                     .count()
+              << " us. Success: " << warmup_res.has_value();
+
+    // Signal ready and wait for all threads
+    {
+        std::unique_lock<std::mutex> lock(g_sync_mutex);
+        g_ready_threads_count++;
+        if (g_ready_threads_count == FLAGS_num_threads) {
+            g_sync_cv.notify_all();
+        }
+        g_sync_cv.wait(lock, [] { return g_start_signal_flag; });
+    }
+
     // Phase 1: Perform PUT operations
     for (int i = 0; i < FLAGS_test_operation_nums && !stop_flag.load(); ++i) {
         std::string key = generate_key(thread_id, i);
@@ -232,6 +270,16 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
         }
 
         stats.total_operations++;
+    }
+
+    // Completion signal of PUT phase and wait for threads to start GET phase
+    {
+        std::unique_lock<std::mutex> lock(g_sync_mutex);
+        g_put_done_count++;
+        if (g_put_done_count == FLAGS_num_threads) {
+            g_put_sync_cv.notify_all();
+        }
+        g_put_sync_cv.wait(lock, [] { return g_get_start_signal_flag; });
     }
 
     // Phase 2: Perform GET operations on the stored keys
@@ -269,9 +317,9 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
 }
 
 void calculate_percentiles(std::vector<double>& latencies, double& p50,
-                           double& p90, double& p95, double& p99) {
+                           double& p70, double& p90, double& p95, double& p99) {
     if (latencies.empty()) {
-        p50 = p90 = p95 = p99 = 0.0;
+        p50 = p70 = p90 = p95 = p99 = 0.0;
         return;
     }
 
@@ -282,13 +330,15 @@ void calculate_percentiles(std::vector<double>& latencies, double& p50,
     // percentile calculation This avoids integer division order issues and
     // ensures correct indices
     p50 = latencies[static_cast<size_t>(std::ceil((size * 0.50) - 1))];
+    p70 = latencies[static_cast<size_t>(std::ceil((size * 0.70) - 1))];
     p90 = latencies[static_cast<size_t>(std::ceil((size * 0.90) - 1))];
     p95 = latencies[static_cast<size_t>(std::ceil((size * 0.95) - 1))];
     p99 = latencies[static_cast<size_t>(std::ceil((size * 0.99) - 1))];
 }
 
 void print_results(const std::vector<ThreadStats>& thread_stats,
-                   double duration_s) {
+                   double put_duration_s, double get_duration_s) {
+    double total_duration_s = put_duration_s + get_duration_s;
     // Aggregate statistics
     uint64_t total_ops = 0;
     uint64_t successful_ops = 0;
@@ -318,30 +368,33 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
     }
 
     // Calculate percentiles
-    double all_p50, all_p90, all_p95, all_p99;
-    double put_p50, put_p90, put_p95, put_p99;
-    double get_p50, get_p90, get_p95, get_p99;
+    double all_p50, all_p70, all_p90, all_p95, all_p99;
+    double put_p50, put_p70, put_p90, put_p95, put_p99;
+    double get_p50, get_p70, get_p90, get_p95, get_p99;
 
-    calculate_percentiles(all_latencies, all_p50, all_p90, all_p95, all_p99);
-    calculate_percentiles(put_latencies, put_p50, put_p90, put_p95, put_p99);
-    calculate_percentiles(get_latencies, get_p50, get_p90, get_p95, get_p99);
+    calculate_percentiles(all_latencies, all_p50, all_p70, all_p90, all_p95,
+                          all_p99);
+    calculate_percentiles(put_latencies, put_p50, put_p70, put_p90, put_p95,
+                          put_p99);
+    calculate_percentiles(get_latencies, get_p50, get_p70, get_p90, get_p95,
+                          get_p99);
 
-    // Calculate throughput
-    double ops_per_second = successful_ops / duration_s;
-    double put_ops_per_second = total_put_ops / duration_s;
-    double get_ops_per_second = total_get_ops / duration_s;
+    // Calculate throughput using phase-specific durations
+    double put_ops_per_second = total_put_ops / put_duration_s;
+    double get_ops_per_second = total_get_ops / get_duration_s;
+    double total_ops_per_second = successful_ops / total_duration_s;
 
     // Calculate data throughput separately for PUT and GET operations
     double put_data_throughput_mb_s =
-        (total_put_ops * FLAGS_value_size) / (duration_s * 1024 * 1024);
+        (total_put_ops * FLAGS_value_size) / (put_duration_s * 1024 * 1024);
     double get_data_throughput_mb_s =
-        (total_get_ops * FLAGS_value_size) / (duration_s * 1024 * 1024);
-    double total_data_throughput_mb_s =
-        put_data_throughput_mb_s + get_data_throughput_mb_s;
+        (total_get_ops * FLAGS_value_size) / (get_duration_s * 1024 * 1024);
 
     // Print results
     LOG(INFO) << "=== Benchmark Results ===";
-    LOG(INFO) << "Test Duration: " << duration_s << " seconds";
+    LOG(INFO) << "Total Test Duration: " << total_duration_s << " seconds";
+    LOG(INFO) << "PUT Duration: " << put_duration_s << " seconds";
+    LOG(INFO) << "GET Duration: " << get_duration_s << " seconds";
     LOG(INFO) << "Threads: " << FLAGS_num_threads;
     LOG(INFO) << "Key Size: 128 bytes";
     LOG(INFO) << "Value Size: " << FLAGS_value_size << " bytes";
@@ -356,25 +409,24 @@ void print_results(const std::vector<ThreadStats>& thread_stats,
               << "%";
     LOG(INFO) << "";
     LOG(INFO) << "=== Throughput ===";
-    LOG(INFO) << "Total Operations/sec: " << ops_per_second;
+    LOG(INFO) << "Total Operations/sec: " << total_ops_per_second;
     LOG(INFO) << "PUT Operations/sec: " << put_ops_per_second;
     LOG(INFO) << "GET Operations/sec: " << get_ops_per_second;
-    LOG(INFO) << "Total Data Throughput (MB/s): " << total_data_throughput_mb_s;
     LOG(INFO) << "PUT Data Throughput (MB/s): " << put_data_throughput_mb_s;
     LOG(INFO) << "GET Data Throughput (MB/s): " << get_data_throughput_mb_s;
     LOG(INFO) << "";
     LOG(INFO) << "=== Latency (microseconds) ===";
-    LOG(INFO) << "All Operations - P50: " << all_p50 << ", P90: " << all_p90
-              << ", P95: " << all_p95 << ", P99: " << all_p99;
 
     if (!put_latencies.empty()) {
-        LOG(INFO) << "PUT Operations - P50: " << put_p50 << ", P90: " << put_p90
-                  << ", P95: " << put_p95 << ", P99: " << put_p99;
+        LOG(INFO) << "PUT Operations - P50: " << put_p50 << ", P70: " << put_p70
+                  << ", P90: " << put_p90 << ", P95: " << put_p95
+                  << ", P99: " << put_p99;
     }
 
     if (!get_latencies.empty()) {
-        LOG(INFO) << "GET Operations - P50: " << get_p50 << ", P90: " << get_p90
-                  << ", P95: " << get_p95 << ", P99: " << get_p99;
+        LOG(INFO) << "GET Operations - P50: " << get_p50 << ", P70: " << get_p70
+                  << ", P90: " << get_p90 << ", P95: " << get_p95
+                  << ", P99: " << get_p99;
     }
 }
 
@@ -420,28 +472,61 @@ int main(int argc, char** argv) {
               << FLAGS_test_operation_nums << " operations each";
 
     // Start worker threads
-    auto start_time = std::chrono::high_resolution_clock::now();
-
     for (int i = 0; i < FLAGS_num_threads; ++i) {
         workers.emplace_back(worker_thread, i, std::ref(stop_flag),
                              std::ref(thread_stats[i]));
     }
 
-    // Wait for all threads to complete (they will finish after completing their
-    // operations)
+    // Wait for all workers to finish warming up
+    {
+        std::unique_lock<std::mutex> lock(g_sync_mutex);
+        g_sync_cv.wait(
+            lock, [&] { return g_ready_threads_count == FLAGS_num_threads; });
+    }
+
+    // Wait for all workers to finish PUT phase
+    auto put_start_time = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_sync_mutex);
+        g_start_signal_flag = true;
+    }
+    g_sync_cv.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lock(g_sync_mutex);
+        g_put_sync_cv.wait(
+            lock, [&] { return g_put_done_count == FLAGS_num_threads; });
+    }
+    auto put_end_time = std::chrono::high_resolution_clock::now();
+
+    // Start Phase 2: GET
+    auto get_start_time = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_sync_mutex);
+        g_get_start_signal_flag = true;
+    }
+    g_put_sync_cv.notify_all();
+
+    // Wait for all threads to complete
     for (auto& worker : workers) {
         worker.join();
     }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double actual_duration_s =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
-                                                              start_time)
+    auto get_end_time = std::chrono::high_resolution_clock::now();
+
+    double put_duration_s =
+        std::chrono::duration_cast<std::chrono::milliseconds>(put_end_time -
+                                                              put_start_time)
+            .count() /
+        1000.0;
+    double get_duration_s =
+        std::chrono::duration_cast<std::chrono::milliseconds>(get_end_time -
+                                                              get_start_time)
             .count() /
         1000.0;
 
     // Print results
-    print_results(thread_stats, actual_duration_s);
+    print_results(thread_stats, put_duration_s, get_duration_s);
 
     // Cleanup
     cleanup_segment();
