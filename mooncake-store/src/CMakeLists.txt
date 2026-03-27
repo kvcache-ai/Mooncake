@@ -35,9 +35,6 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
-    connectors/data_connector.cpp
-    connectors/connector_importer.cpp
-    connectors/huggingface_connector.cpp
     oplog_manager.cpp
     etcd_oplog_store.cpp
     oplog_watcher.cpp
@@ -45,6 +42,9 @@ set(MOONCAKE_STORE_SOURCES
     hot_standby_service.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
+    connectors/data_connector.cpp
+    connectors/connector_importer.cpp
+    connectors/huggingface_connector.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -72,6 +72,7 @@ set(EXTRA_LIBS ${ZSTD_LIBRARY})
 # If AWS SDK is found, add it to EXTRA_LIBS
 if(HAVE_AWS_SDK)
   list(APPEND EXTRA_LIBS ${AWSSDK_LINK_LIBRARIES})
+  list(APPEND MOONCAKE_STORE_SOURCES connectors/oss_connector.cpp)
   add_definitions(-DHAVE_AWS_SDK)
   list(APPEND MOONCAKE_STORE_SOURCES connectors/oss_connector.cpp)
   if(AWS_S3_LIB AND AWS_CORE_LIB)
