@@ -124,6 +124,17 @@ struct P2PClientConfig : RealClientConfigBase {
 
     // Parsed custom tiered backend configuration
     Json::Value tiered_backend_config;
+
+    // Number of key lock shards for DataManager.
+    // Higher values reduce contention of key.
+    size_t lock_shard_count = 1024;
+
+    // RouteCache configuration
+    // each size of route entry is about 240B:
+    // Aligned Node(64B) + hash_bucket(8B) + Key(assume 64B)
+    // + P2PRouteData(each item is 96B and count is 8B)
+    size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
+    uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
 };
 
 // ============================================================================
@@ -178,6 +189,9 @@ class ClientConfigBuilder {
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "",
         uint16_t client_rpc_port = 12345, uint32_t rpc_thread_num = 2,
+        size_t lock_shard_count = 1024,
+        size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
+        uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
         const std::map<std::string, std::string>& labels = {}) {
         P2PClientConfig config;
         fill_real_client_config_base(
@@ -186,6 +200,9 @@ class ClientConfigBuilder {
             ipc_socket_path, labels);
         config.client_rpc_port = client_rpc_port;
         config.rpc_thread_num = rpc_thread_num;
+        config.lock_shard_count = lock_shard_count;
+        config.route_cache_max_memory_bytes = route_cache_max_memory_bytes;
+        config.route_cache_ttl_ms = route_cache_ttl_ms;
 
         Json::Value tiered_config;
         std::string actual_json = tiered_backend_config_json;

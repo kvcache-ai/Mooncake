@@ -35,7 +35,8 @@ class DataManager {
      * with Client)
      */
     DataManager(std::unique_ptr<TieredBackend> tiered_backend,
-                std::shared_ptr<TransferEngine> transfer_engine);
+                 std::shared_ptr<TransferEngine> transfer_engine,
+                 size_t lock_shard_count = 1024);
 
     /**
      * @brief Graceful stop: delegates to TieredBackend::Stop().
@@ -112,9 +113,9 @@ class DataManager {
      * @param key Object key to write
      * @param src_buffers Source buffers on remote client (Client A)
      * @param tier_id Optional tier ID (nullopt = use default tier selection)
-     * @return ErrorCode indicating success or failure
+     * @return UUID of the tier (segment) where data was written, or ErrorCode
      */
-    tl::expected<void, ErrorCode> WriteRemoteData(
+    tl::expected<UUID, ErrorCode> WriteRemoteData(
         const std::string& key,
         const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);

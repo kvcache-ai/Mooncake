@@ -56,7 +56,7 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     return {};
 }
 
-tl::expected<void, ErrorCode> ClientRpcService::WriteRemoteData(
+tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     const RemoteWriteRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::WriteRemoteData");
     timer.LogRequest("key=", request.key,
@@ -96,7 +96,7 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRemoteData(
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
-    return {};
+    return result;
 }
 
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,

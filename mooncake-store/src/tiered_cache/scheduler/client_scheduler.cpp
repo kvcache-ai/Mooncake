@@ -131,7 +131,7 @@ void ClientScheduler::OnAccess(const std::string& key) {
 void ClientScheduler::OnCommit(const std::string& key, UUID tier_id,
                                size_t size_bytes) {
     auto& shard = GetKeyCacheShard(key);
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    MutexLocker lock(&shard.mutex);
     TrackReplicaLocked(shard, key, tier_id, size_bytes);
 }
 
@@ -140,7 +140,7 @@ void ClientScheduler::OnDelete(const std::string& key,
     bool remove_stats = false;
     {
         auto& shard = GetKeyCacheShard(key);
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        MutexLocker lock(&shard.mutex);
         remove_stats = RemoveReplicaLocked(shard, key, tier_id);
     }
 
@@ -253,7 +253,7 @@ size_t ClientScheduler::EstimateActiveKeyReserve(
     }
 
     for (const auto& shard : key_cache_shards_) {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        MutexLocker lock(&shard.mutex);
         auto resident_it =
             shard.tier_resident_keys.find(pinned_tier_id.value());
         if (resident_it != shard.tier_resident_keys.end()) {
@@ -269,7 +269,7 @@ void ClientScheduler::AppendHotKeys(
     std::unordered_set<std::string>& seen_keys) const {
     for (const auto& stat_entry : access_stats.hot_keys) {
         const auto& shard = GetKeyCacheShard(stat_entry.key);
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        MutexLocker lock(&shard.mutex);
         auto cache_it = shard.key_cache.find(stat_entry.key);
         if (cache_it == shard.key_cache.end()) {
             continue;
@@ -291,7 +291,7 @@ void ClientScheduler::AppendPinnedTierKeys(
     std::unordered_set<std::string>& seen_keys) const {
     const AccessStats empty_stats{};
     for (const auto& shard : key_cache_shards_) {
-        std::lock_guard<std::mutex> lock(shard.mutex);
+        MutexLocker lock(&shard.mutex);
         auto resident_it = shard.tier_resident_keys.find(pinned_tier_id);
         if (resident_it == shard.tier_resident_keys.end()) {
             continue;
@@ -342,7 +342,7 @@ std::optional<KeyContext> ClientScheduler::BuildKeyContextLocked(
 
 size_t ClientScheduler::GetCachedKeySize(const std::string& key) const {
     const auto& shard = GetKeyCacheShard(key);
-    std::lock_guard<std::mutex> lock(shard.mutex);
+    MutexLocker lock(&shard.mutex);
     auto key_it = shard.key_cache.find(key);
     if (key_it == shard.key_cache.end() || key_it->second.size_bytes == 0) {
         return 1;

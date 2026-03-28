@@ -10,6 +10,7 @@
 #include "client_rpc_service.h"
 #include "peer_client.h"
 #include "p2p_master_client.h"
+#include "route_cache.h"
 
 namespace mooncake {
 
@@ -244,12 +245,12 @@ class P2PClientService final : public ClientService {
                                              std::vector<Slice>& slices);
 
     /**
-     * @brief Get data from a remote node via Master's read route.
-     * Gets replica list from Master, then uses PeerClient to read.
+     * @brief Get data from a remote node via a list of proxy descriptors.
+     * Iterates through the list; stops, returns the slice of proxies from the successful one to the end.
      */
     tl::expected<void, ErrorCode> GetRemoteViaRoute(
         const std::string& key, std::vector<Slice>& slices,
-        const std::vector<Replica::Descriptor>& replicas);
+        const std::vector<P2PProxyDescriptor>& proxies, bool is_cached_proxies);
 
     /**
      * @brief Query Master for replica list and calculate total object size.
@@ -277,6 +278,9 @@ class P2PClientService final : public ClientService {
     // Each PeerClient instance maintains its own fixed-size connection pool.
     std::mutex peer_clients_mutex_;
     std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
+
+    // Route cache for reducing Master query pressure
+    std::optional<RouteCache> route_cache_;
 };
 
 }  // namespace mooncake

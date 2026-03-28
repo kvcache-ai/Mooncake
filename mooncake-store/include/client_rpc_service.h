@@ -45,9 +45,10 @@ class ClientRpcService {
      * @brief Write remote data: Client A requests Client B to write data from A
      * @param request RemoteWriteRequest containing key, source buffers, and
      * target_tier_id
-     * @return ErrorCode indicating success or failure
+     * @return UUID containing the route descriptor of the
+     *         written replica, or ErrorCode
      */
-    tl::expected<void, ErrorCode> WriteRemoteData(
+    tl::expected<UUID, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
 
    private:

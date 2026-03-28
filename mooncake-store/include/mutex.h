@@ -205,6 +205,14 @@ class SCOPED_CAPABILITY MutexLocker {
     // Acquire mu, implicitly acquire *this and associate it with mu.
     MutexLocker(Mutex* mu) ACQUIRE(mu) : mut(mu), locked(true) { mu->lock(); }
 
+    // Constructor without immediate locking.
+    MutexLocker(Mutex* mu, bool lock_now) : mut(mu), locked(false) {
+        if (lock_now) {
+            mut->lock();
+            locked = true;
+        }
+    }
+
     // Release *this and all associated mutexes, if they are still held.
     ~MutexLocker() RELEASE() {
         if (locked) {

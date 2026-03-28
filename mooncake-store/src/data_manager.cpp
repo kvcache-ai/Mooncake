@@ -19,10 +19,11 @@
 namespace mooncake {
 
 DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
-                         std::shared_ptr<TransferEngine> transfer_engine)
+                         std::shared_ptr<TransferEngine> transfer_engine,
+                         size_t lock_shard_count)
     : tiered_backend_(std::move(tiered_backend)),
       transfer_engine_(transfer_engine),
-      lock_shard_count_(GetEnvOr<size_t>("MOONCAKE_DM_LOCK_SHARD_COUNT", 1024)),
+      lock_shard_count_(lock_shard_count > 0 ? lock_shard_count : 1024),
       lock_shards_(lock_shard_count_) {
     if (!tiered_backend_) {
         LOG(FATAL) << "TieredBackend cannot be null";
@@ -32,7 +33,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
     }
 
     LOG(INFO) << "DataManager initialized with " << lock_shard_count_
-              << " lock shards (configured via MOONCAKE_DM_LOCK_SHARD_COUNT)";
+              << " lock shards";
 }
 
 tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
@@ -153,7 +154,7 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     return TransferDataToRemote(handle, dest_buffers);
 }
 
-tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
+tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     const std::string& key, const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteRemoteData");
@@ -212,7 +213,7 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
 
     timer.LogResponse("error_code=", ErrorCode::OK,
                       "transferred_bytes=", total_size);
-    return {};
+    return handle->loc.tier->GetTierId();
 }
 
 // If user attempt to access data in this client by read route

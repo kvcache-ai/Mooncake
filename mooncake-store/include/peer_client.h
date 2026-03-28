@@ -20,13 +20,13 @@ class PeerClient {
     async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncReadRemoteData(
         const RemoteReadRequest& request);
 
-    async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+    async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
     AsyncWriteRemoteData(const RemoteWriteRequest& request);
 
     // --- Sync single-key interfaces ---
     tl::expected<void, ErrorCode> ReadRemoteData(
         const RemoteReadRequest& request);
-    tl::expected<void, ErrorCode> WriteRemoteData(
+    tl::expected<UUID, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
 
    private:

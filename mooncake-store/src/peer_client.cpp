@@ -52,7 +52,7 @@ PeerClient::AsyncReadRemoteData(const RemoteReadRequest& request) {
     co_return result->result();
 }
 
-async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
 PeerClient::AsyncWriteRemoteData(const RemoteWriteRequest& request) {
     if (!client_pool_) {
         co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -83,7 +83,7 @@ tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(
     return async_simple::coro::syncAwait(AsyncReadRemoteData(request));
 }
 
-tl::expected<void, ErrorCode> PeerClient::WriteRemoteData(
+tl::expected<UUID, ErrorCode> PeerClient::WriteRemoteData(
     const RemoteWriteRequest& request) {
     return async_simple::coro::syncAwait(AsyncWriteRemoteData(request));
 }

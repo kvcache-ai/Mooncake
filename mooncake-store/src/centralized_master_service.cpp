@@ -1215,12 +1215,12 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
     for (size_t i = 0; i < kNumShards; ++i) {
         auto& shard = GetShard(i);
         auto& c_shard = static_cast<CentralizedMetadataShard&>(shard);
-        MutexLocker lock(&shard.mutex);
+        MutexLocker lock(&c_shard.mutex);
 
         auto it = c_shard.processing_keys.begin();
         while (it != c_shard.processing_keys.end()) {
-            auto meta_it = shard.metadata.find(*it);
-            if (meta_it == shard.metadata.end()) {
+            auto meta_it = c_shard.metadata.find(*it);
+            if (meta_it == c_shard.metadata.end()) {
                 // Key in processing set but not in metadata -> dangling
                 it = c_shard.processing_keys.erase(it);
             } else {
@@ -1239,7 +1239,7 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
 
                 if (replicas.empty()) {
                     OnObjectRemoved(metadata);
-                    shard.metadata.erase(meta_it);
+                    c_shard.metadata.erase(meta_it);
                     it = c_shard.processing_keys.erase(it);
                 } else {
                     ++it;

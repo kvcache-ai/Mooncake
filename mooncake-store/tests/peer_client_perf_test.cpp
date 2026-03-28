@@ -220,7 +220,7 @@ class PeerClientPerfTest : public ::testing::Test {
                 requests.push_back(MakeWriteRequest(i));
             }
 
-            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>>
                 tasks;
             tasks.reserve(n);
             for (size_t i = 0; i < n; ++i) {
@@ -709,7 +709,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
                 requests.push_back(MakeRdmaWriteRequest(i, data_size));
             }
 
-            std::vector<async_simple::coro::Lazy<tl::expected<void, ErrorCode>>>
+            std::vector<async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>>
                 tasks;
             tasks.reserve(n);
             for (size_t i = 0; i < n; ++i) {

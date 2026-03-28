@@ -25,6 +25,11 @@ DEFINE_string(deployment_mode, "Centralization",
               "Client type: 'Centralization' or 'P2P'");
 DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
 DEFINE_uint32(rpc_thread_num, 16, "Number of threads for P2P RPC service");
+DEFINE_uint64(lock_shard_count, 1024,
+              "Number of key lock shards for DataManager");
+DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
+DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
+              "TTL for RouteCache entries in ms");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -82,7 +87,10 @@ int main(int argc, char* argv[]) {
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
                 static_cast<uint16_t>(FLAGS_client_rpc_port),
-                static_cast<uint32_t>(FLAGS_rpc_thread_num));
+                static_cast<uint32_t>(FLAGS_rpc_thread_num),
+                FLAGS_lock_shard_count,
+                string_to_byte_size(FLAGS_route_cache_max_memory),
+                FLAGS_route_cache_ttl_ms);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

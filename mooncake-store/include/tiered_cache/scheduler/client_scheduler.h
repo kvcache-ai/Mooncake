@@ -101,7 +101,7 @@ class ClientScheduler {
     };
 
     struct KeyCacheShard {
-        mutable std::mutex mutex;
+        mutable Mutex mutex;
         std::unordered_map<std::string, CachedKeyState> key_cache
             GUARDED_BY(mutex);
         std::unordered_map<UUID, std::unordered_set<std::string>>
@@ -129,9 +129,10 @@ class ClientScheduler {
     size_t GetCachedKeySize(const std::string& key) const;
 
     void TrackReplicaLocked(KeyCacheShard& shard, const std::string& key,
-                            UUID tier_id, size_t size_bytes);
+                            UUID tier_id, size_t size_bytes)
+        REQUIRES(shard.mutex);
     bool RemoveReplicaLocked(KeyCacheShard& shard, const std::string& key,
-                             std::optional<UUID> tier_id);
+                             std::optional<UUID> tier_id) REQUIRES(shard.mutex);
 
    private:
     TieredBackend* backend_;

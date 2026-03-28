@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
+#include "mutex.h"
 
 #include "client_metric.h"
 #include "ha_helper.h"
@@ -434,7 +435,7 @@ class ClientService {
     class InflightRequestGuard {
        public:
         explicit InflightRequestGuard(ClientService* client)
-            : client_(client), valid_(false), lock_(client_->running_rw_mtx_) {
+            : client_(client), valid_(false), lock_(&client_->running_rw_mtx_, shared_lock) {
             valid_ = client_->is_running_;
         }
         ~InflightRequestGuard() = default;
@@ -449,7 +450,7 @@ class ClientService {
        private:
         ClientService* client_;
         bool valid_;
-        std::shared_lock<std::shared_mutex> lock_;
+        SharedMutexLocker lock_;
     };
 
     /**
@@ -466,7 +467,7 @@ class ClientService {
      * @return true if successfully marked, false if already shutting down.
      */
     bool MarkShuttingDown() {
-        std::unique_lock<std::shared_mutex> lock(running_rw_mtx_);
+        SharedMutexLocker lock(&running_rw_mtx_);
         if (!is_running_) return false;
         is_running_ = false;
         return true;
@@ -520,8 +521,8 @@ class ClientService {
     ViewVersionId view_version_{0};
 
     // Shutdown protection
-    std::shared_mutex running_rw_mtx_;
-    bool is_running_{false} GUARDED_BY(running_rw_mtx_);
+    SharedMutex running_rw_mtx_;
+    bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
 };
 
 }  // namespace mooncake
