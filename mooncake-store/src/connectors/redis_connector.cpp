@@ -65,15 +65,46 @@ tl::expected<void, std::string> RedisConnector::ListObjects(
     do {
         redisReply* reply = (redisReply*)redisCommand(
             context_, "SCAN %lu MATCH %s", cursor, pattern.c_str());
-        if (!reply || reply->type != REDIS_REPLY_ARRAY) {
-            std::string error = reply ? "invalid reply" : "null reply";
-            if (reply) freeReplyObject(reply);
+        if (!reply) {
+            return tl::make_unexpected("null reply");
+        }
+
+        if (reply->type == REDIS_REPLY_ERROR) {
+            std::string error =
+                reply->str ? std::string("Redis SCAN error: ") + reply->str
+                           : "Redis SCAN error";
+            freeReplyObject(reply);
             return tl::make_unexpected(error);
         }
 
-        cursor = std::stoul(reply->element[0]->str);
+        if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2 ||
+            !reply->element[0] || !reply->element[1] ||
+            reply->element[0]->type != REDIS_REPLY_STRING ||
+            !reply->element[0]->str ||
+            reply->element[1]->type != REDIS_REPLY_ARRAY) {
+            freeReplyObject(reply);
+            return tl::make_unexpected("invalid SCAN reply structure");
+        }
+
+        try {
+            cursor = std::stoul(reply->element[0]->str);
+        } catch (const std::exception&) {
+            std::string cursor_str = reply->element[0]->str
+                                         ? reply->element[0]->str
+                                         : "";
+            freeReplyObject(reply);
+            return tl::make_unexpected(
+                "invalid cursor value in SCAN reply: " + cursor_str);
+        }
+
         for (size_t i = 0; i < reply->element[1]->elements; ++i) {
-            objects.push_back({reply->element[1]->element[i]->str, 0, ""});
+            redisReply* key_reply = reply->element[1]->element[i];
+            if (!key_reply || key_reply->type != REDIS_REPLY_STRING ||
+                !key_reply->str) {
+                freeReplyObject(reply);
+                return tl::make_unexpected("invalid key entry in SCAN reply");
+            }
+            objects.push_back({key_reply->str, 0, ""});
         }
         freeReplyObject(reply);
     } while (cursor != 0);
