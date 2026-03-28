@@ -625,6 +625,7 @@ int TransferEnginePy::getBatchTransferStatus(
     while (!timeout_table.empty() && !failed_or_timeout) {
         for (auto &entry : timeout_table) {
             auto batch_desc = reinterpret_cast<BatchDesc *>(entry.first);
+            auto start_timestamp = batch_desc->start_timestamp;
             Status s = engine_->getBatchTransferStatus(entry.first, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -637,9 +638,9 @@ int TransferEnginePy::getBatchTransferStatus(
                 LOG(INFO) << "Sync data transfer timeout";
             }
             auto current_ts = getCurrentTimeInNano();
-            if (current_ts - batch_desc->start_timestamp > entry.second) {
+            if (current_ts - start_timestamp > entry.second) {
                 LOG(INFO) << "Sync batch data transfer timeout after "
-                          << current_ts - batch_desc->start_timestamp << "ns";
+                          << current_ts - start_timestamp << "ns";
                 failed_or_timeout = true;
             }
         }
