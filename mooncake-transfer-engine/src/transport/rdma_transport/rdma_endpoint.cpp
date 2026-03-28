@@ -212,9 +212,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                : next;
             }
             ++spin_count;
-            // Prevent infinite wait with a 10-second timeout
+            // Prevent infinite wait with a timeout
             if (getCurrentTimeInNano() - start_time >
                 kWaitExistingHandshakeTimeoutNano) {
+                // Timeout while waiting for another thread's handshake.
+                // The QP state on this endpoint may have changed; therefore,
+                // reset the connection so that subsequent callers can retry.
+                RWSpinlock::WriteGuard write_guard(lock_);
+                resetConnection("wait existing handshake timeout");
                 return ERR_ENDPOINT;
             }
         }
@@ -227,6 +232,21 @@ int RdmaEndPoint::setupConnectionsByActive() {
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
 
+    // We should check the RPC return code before comparing `peer_qp_num_list_`
+    // with `peer_desc.qp_num`, since a failed RPC may result in an
+    // invalid `peer_desc.qp_num`.
+    //
+    // If the RPC is failed, even if the state is CONNECTED, (which means
+    // it is handled by setupConnectionsByPassive in another thread during the
+    // RPC, or "simultaneous open"), we should resetConnection to be safe.
+    // Because we're not sure whether the peer needs a connection
+    // re-establishment. (We don't know `peer_desc.qp_num`)
+    if (rc) {
+        RWSpinlock::WriteGuard write_guard(lock_);
+        resetConnection("handshake RPC failure");
+        return rc;
+    }
+
     // Re-acquire lock after RPC to finalize state transition
     RWSpinlock::WriteGuard guard(lock_);
 
@@ -235,6 +255,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     // reuse the existing endpoint.
     if (connected()) {
         if (peer_qp_num_list_ == peer_desc.qp_num) {
+            LOG(INFO) << "Received same peer QP numbers, reusing connection.";
             return 0;
         }
 
@@ -246,27 +267,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
                         "re-establishing connection: "
                      << toString();
 
-        int ret = disconnectForReestablish();
-        if (ret) {
-            LOG(ERROR)
-                << "Failed to disconnect endpoint for re-establish connection: "
-                << ret;
-            return ret;
-        }
+        int ret = resetConnection("re-establishing connection (active)");
+        if (ret) return ret;
     }
 
-    if (rc) {
-        if (status_.load(std::memory_order_relaxed) == CONNECTING) {
-            disconnectUnlocked();
-        }
-        return rc;
-    }
     if (!peer_desc.reply_msg.empty()) {
-        LOG(ERROR) << "Reject the handshake request by peer "
+        LOG(ERROR) << "Rejected handshake request by peer "
                    << local_desc.peer_nic_path;
-        if (status_.load(std::memory_order_relaxed) == CONNECTING) {
-            disconnectUnlocked();
-        }
+        disconnectUnlocked();
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -278,9 +286,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                    << ", local.peer_nic_path: " << local_desc.peer_nic_path
                    << ", peer.local_nic_path: " << peer_desc.local_nic_path
                    << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
-        if (status_.load(std::memory_order_relaxed) == CONNECTING) {
-            disconnectUnlocked();
-        }
+        disconnectUnlocked();
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -290,9 +296,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
         for (auto &nic : segment_desc->devices) {
             if (nic.name == peer_nic_name) {
                 int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
-                if (ret != 0 &&
-                    status_.load(std::memory_order_relaxed) == CONNECTING) {
-                    disconnectUnlocked();
+                if (ret != 0) {
+                    resetConnection("failed connection setup (active)");
                 }
                 return ret;
             }
@@ -300,9 +305,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     }
     LOG(ERROR) << "Peer NIC " << peer_nic_name << " not found in "
                << peer_server_name;
-    if (status_.load(std::memory_order_relaxed) == CONNECTING) {
-        disconnectUnlocked();
-    }
+    disconnectUnlocked();
     return ERR_DEVICE_NOT_FOUND;
 }
 
@@ -315,26 +318,24 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             local_desc.local_nic_path = context_.nicPath();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
+            LOG(INFO) << "Received same peer QP numbers, reusing connection.";
             return 0;
         }
         // Different peer (e.g., peer restarted)
         LOG(WARNING) << "Re-establish connection: " << toString();
 
-        int ret = disconnectForReestablish();
-        if (ret) {
-            LOG(ERROR)
-                << "Failed to disconnect endpoint for re-establish connection: "
-                << ret;
-            return ret;
-        }
+        int ret = resetConnection("re-establishing connection (passive)");
+        if (ret) return ret;
     }
 
-    // Handle simultaneous open: if the state is CONNECTING, we can safely
-    // proceed to establish the connection on this same endpoint. Because we're
-    // holding the lock, even if there are already Active RPCs sent to the same
-    // peer nic path by setupConnectionsByActive, it will be blocked after the
-    // RPC return. Once the lock is released, they will simply observe the
-    // CONNECTED state and safely reuse the QP.
+    // At this point, the state can only be UNCONNECTED or CONNECTING.
+    // Even if the state is CONNECTING, we can still safely proceed to
+    // establish the connection on this same endpoint. Because we're holding
+    // the lock, even if there are already Active RPCs sent to the same
+    // peer nic path by setupConnectionsByActive on another thread, it will
+    // be blocked after the RPC return. Once the lock is released,
+    // they will simply observe the CONNECTED state and safely reuse the QP.
+    // This inherently handles simultaneous open.
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
@@ -367,11 +368,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                 int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
                                             &local_desc.reply_msg);
                 if (ret != 0) {
-                    // Restore UNCONNECTED state on failure if we were
-                    // CONNECTING
-                    if (status_.load(std::memory_order_relaxed) == CONNECTING) {
-                        disconnectUnlocked();
-                    }
+                    resetConnection("failed connection setup (passive)");
                 }
                 return ret;
             }
@@ -388,23 +385,20 @@ void RdmaEndPoint::disconnect() {
     disconnectUnlocked();
 }
 
-int RdmaEndPoint::disconnectForReestablish() {
-    // If ERDMA is defined, keep the same logic as before.
-#ifdef CONFIG_ERDMA
-    return reconstruct();
-#else
-    disconnectUnlocked();
-    return 0;
-#endif
-}
+int RdmaEndPoint::disconnectUnlocked() {
+    auto curr_status = status_.load(std::memory_order_acquire);
+    if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
 
-void RdmaEndPoint::disconnectUnlocked() {
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RESET;
+    int ret = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (ret) PLOG(ERROR) << "Failed to modify QP to RESET";
+        int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+        if (curr_ret) {
+            PLOG(ERROR) << "Failed to modify QP to RESET";
+            ret = ERR_ENDPOINT;
+        }
         // After resetting QP, the wr_depth_list_ won't change
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
@@ -419,6 +413,27 @@ void RdmaEndPoint::disconnectUnlocked() {
     }
     peer_qp_num_list_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);
+    return ret;
+}
+
+int RdmaEndPoint::resetConnection(const std::string &reason) {
+    auto curr_status = status_.load(std::memory_order_acquire);
+    if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
+
+#ifdef CONFIG_ERDMA
+    int ret = reconstruct();
+#else
+    int ret = disconnectUnlocked();
+#endif
+
+    if (ret) {
+        LOG(ERROR) << "Failed to reset the endpoint (reason: " << reason
+                   << "): error=" << ret;
+    } else {
+        LOG(INFO) << "Successfully reset the endpoint (reason: " << reason
+                  << ").";
+    }
+    return ret;
 }
 
 const std::string RdmaEndPoint::toString() const {
