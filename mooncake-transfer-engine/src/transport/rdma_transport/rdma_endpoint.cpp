@@ -427,10 +427,10 @@ int RdmaEndPoint::resetConnection(const std::string &reason) {
 #endif
 
     if (ret) {
-        LOG(ERROR) << "Failed to reset the endpoint (reason: " << reason
+        LOG(ERROR) << "Failed to reset the endpoint (triggered by: " << reason
                    << "): error=" << ret;
     } else {
-        LOG(INFO) << "Successfully reset the endpoint (reason: " << reason
+        LOG(INFO) << "Successfully reset the endpoint (triggered by: " << reason
                   << ").";
     }
     return ret;
