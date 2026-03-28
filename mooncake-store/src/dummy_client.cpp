@@ -643,8 +643,8 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
-    const std::vector<std::vector<size_t>>& all_sizes, bool prefer_same_node,
-    const ReadRouteConfig& config) {
+    const std::vector<std::vector<size_t>>& all_sizes,
+    bool aggregate_same_segment_task, const ReadRouteConfig& config) {
     // TODO: implement this function
     std::vector<int> vec(keys.size(), -1);
     return vec;

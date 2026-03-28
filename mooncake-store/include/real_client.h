@@ -132,7 +132,8 @@ class RealClient : public PyClient {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        bool prefer_same_node, const ReadRouteConfig& config = {}) override;
+        bool aggregate_same_segment_task,
+        const ReadRouteConfig& config = {}) override;
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -352,7 +353,7 @@ class RealClient : public PyClient {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        bool prefer_same_node, const ReadRouteConfig& config = {});
+        bool aggregate_same_segment_task, const ReadRouteConfig& config = {});
 
     tl::expected<void, ErrorCode> put_from_internal(const std::string& key,
                                                     void* buffer, size_t size,

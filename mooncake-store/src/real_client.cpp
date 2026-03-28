@@ -834,56 +834,16 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Query the object info
-    auto query_result = client_service_->Query(key, config);
-    if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return nullptr;
+    auto result = client_service_->Get(key, client_buffer_allocator, config);
+    if (!result) {
+        if (result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+            result.error() != ErrorCode::REPLICA_IS_NOT_READY) {
+            LOG(ERROR) << "Get failed for key: " << key
+                       << " with error: " << toString(result.error());
         }
-        LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(query_result.error());
         return nullptr;
     }
-
-    const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value()->replicas;
-    if (replica_list.empty()) {
-        LOG(ERROR) << "Empty replica list for key: " << key;
-        return nullptr;
-    }
-
-    const auto& replica = replica_list[0];
-    uint64_t total_length = calculate_total_size(replica);
-
-    if (total_length == 0) {
-        return nullptr;
-    }
-
-    // Allocate buffer using the new allocator
-    auto alloc_result = client_buffer_allocator->allocate(total_length);
-    if (!alloc_result) {
-        LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
-        return nullptr;
-    }
-
-    auto& buffer_handle = *alloc_result;
-
-    // Create slices for the allocated buffer
-    std::vector<Slice> slices;
-    allocateSlices(slices, replica, buffer_handle.ptr());
-
-    // Get the object data
-    auto get_result = client_service_->Get(key, *query_result.value(), slices);
-    if (!get_result) {
-        LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(get_result.error());
-        return nullptr;
-    }
-
-    // Create BufferHandle with the allocated memory
-    // The buffer will be managed by the BufferHandle's shared_ptr
-    return std::make_shared<BufferHandle>(std::move(buffer_handle));
+    return result.value();
 }
 
 // Implementation of get_buffer method
@@ -958,92 +918,18 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys,
         return final_results;
     }
 
-    // 1. Query metadata for all keys
-    auto query_results = client_service_->BatchQuery(keys, config);
-
-    // 2. Prepare for batch get: filter valid keys and prepare buffers
-    struct KeyOp {
-        size_t original_index;
-        std::string key;
-        std::unique_ptr<QueryResult> query_result;
-        std::unique_ptr<BufferHandle> buffer_handle;
-        std::vector<Slice> slices;
-    };
-    std::vector<KeyOp> valid_ops;
-    valid_ops.reserve(keys.size());
+    auto results =
+        client_service_->BatchGet(keys, client_buffer_allocator_, config);
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        const auto& key = keys[i];
-
-        if (!query_results[i]) {
-            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
-                query_results[i].error() != ErrorCode::REPLICA_IS_NOT_READY) {
-                LOG(ERROR) << "Query failed for key '" << key
-                           << "': " << toString(query_results[i].error());
-            }
-            continue;
-        }
-
-        auto query_result_ptr = std::move(query_results[i].value());
-        if (query_result_ptr->replicas.empty()) {
-            LOG(ERROR) << "Empty replica list for key: " << key;
-            continue;
-        }
-
-        const auto& replica = query_result_ptr->replicas[0];
-        uint64_t total_size = calculate_total_size(replica);
-        if (total_size == 0) {
-            continue;
-        }
-
-        auto alloc_result = client_buffer_allocator_->allocate(total_size);
-        if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate buffer for key: " << key;
-            continue;
-        }
-
-        auto buffer_handle =
-            std::make_unique<BufferHandle>(std::move(*alloc_result));
-        std::vector<Slice> slices;
-        allocateSlices(slices, replica, buffer_handle->ptr());
-
-        valid_ops.emplace_back(
-            KeyOp{.original_index = i,
-                  .key = key,
-                  .query_result = std::move(query_result_ptr),
-                  .buffer_handle = std::move(buffer_handle),
-                  .slices = std::move(slices)});
-    }
-
-    if (valid_ops.empty()) {
-        return final_results;
-    }
-
-    // 3. Execute batch get
-    std::vector<std::string> batch_keys;
-    std::vector<std::unique_ptr<QueryResult>> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    batch_keys.reserve(valid_ops.size());
-    batch_query_results.reserve(valid_ops.size());
-
-    for (auto& op : valid_ops) {
-        batch_keys.push_back(op.key);
-        batch_query_results.push_back(std::move(op.query_result));
-        batch_slices[op.key] = op.slices;
-    }
-
-    auto batch_get_results = client_service_->BatchGet(
-        batch_keys, batch_query_results, batch_slices);
-
-    // 4. Process results and create BufferHandles
-    for (size_t i = 0; i < valid_ops.size(); ++i) {
-        if (batch_get_results[i]) {
-            auto& op = valid_ops[i];
-            final_results[op.original_index] =
-                std::make_shared<BufferHandle>(std::move(*op.buffer_handle));
+        if (results[i]) {
+            final_results[i] = results[i].value();
         } else {
-            LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
-                       << "': " << toString(batch_get_results[i].error());
+            if (results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
+                results[i].error() != ErrorCode::REPLICA_IS_NOT_READY) {
+                LOG(ERROR) << "BatchGet failed for key '" << keys[i]
+                           << "': " << toString(results[i].error());
+            }
         }
     }
 
@@ -1100,52 +986,9 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Step 1: Get object info
-    auto query_result = client_service_->Query(key, config);
-    if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            VLOG(1) << "Object not found for key: " << key;
-            return tl::unexpected(query_result.error());
-        }
-        LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(query_result.error());
-        return tl::unexpected(query_result.error());
-    }
-
-    const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value()->replicas;
-
-    // Calculate total size from replica list
-    if (replica_list.empty()) {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto& replica = replica_list[0];
-    uint64_t total_size = calculate_total_size(replica);
-
-    // Check if user buffer is large enough
-    if (size < total_size) {
-        LOG(ERROR) << "User buffer too small. Required: " << total_size
-                   << ", provided: " << size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Step 2: Split user buffer according to object info and create
-    // slices
-    std::vector<mooncake::Slice> slices;
-    allocateSlices(slices, replica, buffer);
-
-    // Step 3: Read data directly into user buffer
-    auto get_result = client_service_->Get(key, *query_result.value(), slices);
-    if (!get_result) {
-        LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(get_result.error());
-        return tl::unexpected(get_result.error());
-    }
-
-    return static_cast<int64_t>(total_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, size});
+    return client_service_->Get(key, slices, config);
 }
 
 int64_t RealClient::get_into(const std::string& key, void* buffer, size_t size,
@@ -1420,116 +1263,15 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    const size_t num_keys = keys.size();
-    std::vector<tl::expected<int64_t, ErrorCode>> results;
-    results.reserve(num_keys);
-
-    if (num_keys == 0) {
-        return results;
+    if (keys.empty()) {
+        return {};
     }
 
-    // Query metadata for all keys
-    auto query_results = client_service_->BatchQuery(keys);
-
-    // Process each key individually and prepare for batch transfer
-    struct ValidKeyInfo {
-        std::string key;
-        size_t original_index;
-        std::unique_ptr<QueryResult> query_result;
-        std::vector<Slice> slices;
-        uint64_t total_size;
-    };
-
-    std::vector<ValidKeyInfo> valid_operations;
-    valid_operations.reserve(num_keys);
-
-    for (size_t i = 0; i < num_keys; ++i) {
-        const auto& key = keys[i];
-
-        // Handle query failures
-        if (!query_results[i]) {
-            const auto error = query_results[i].error();
-            results.emplace_back(tl::unexpected(error));
-            if (error != ErrorCode::OBJECT_NOT_FOUND &&
-                error != ErrorCode::REPLICA_IS_NOT_READY) {
-                LOG(ERROR) << "Query failed for key '" << key
-                           << "': " << toString(error);
-            }
-            continue;
-        }
-
-        // Validate replica list
-        auto query_result_ptr = std::move(query_results[i].value());
-        if (query_result_ptr->replicas.empty()) {
-            LOG(ERROR) << "Empty replica list for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
-            continue;
-        }
-
-        // Calculate required buffer size
-        const auto& replica = query_result_ptr->replicas[0];
-        uint64_t total_size = calculate_total_size(replica);
-
-        // Validate buffer capacity
-        if (sizes[i] < total_size) {
-            LOG(ERROR) << "Buffer too small for key '" << key
-                       << "': required=" << total_size
-                       << ", available=" << sizes[i];
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-
-        // Create slices for this key's buffer
-        std::vector<Slice> key_slices;
-        allocateSlices(key_slices, replica, buffers[i]);
-
-        // Store operation info for batch processing
-        valid_operations.push_back({.key = key,
-                                    .original_index = i,
-                                    .query_result = std::move(query_result_ptr),
-                                    .slices = std::move(key_slices),
-                                    .total_size = total_size});
-
-        // Set success result (actual bytes transferred)
-        results.emplace_back(static_cast<int64_t>(total_size));
+    std::vector<std::vector<Slice>> batched_slices(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        batched_slices[i].emplace_back(Slice{buffers[i], sizes[i]});
     }
-
-    // Early return if no valid operations
-    if (valid_operations.empty()) {
-        return results;
-    }
-
-    // Prepare batch transfer data structures
-    std::vector<std::string> batch_keys;
-    std::vector<std::unique_ptr<QueryResult>> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-
-    batch_keys.reserve(valid_operations.size());
-    batch_query_results.reserve(valid_operations.size());
-
-    for (auto& op : valid_operations) {
-        batch_keys.push_back(op.key);
-        batch_query_results.push_back(std::move(op.query_result));
-        batch_slices[op.key] = op.slices;
-    }
-
-    // Execute batch transfer
-    const auto batch_get_results = client_service_->BatchGet(
-        batch_keys, batch_query_results, batch_slices);
-
-    // Process transfer results
-    for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto& op = valid_operations[j];
-
-        if (!batch_get_results[j]) {
-            const auto error = batch_get_results[j].error();
-            LOG(ERROR) << "BatchGet failed for key '" << op.key
-                       << "': " << toString(error);
-            results[op.original_index] = tl::unexpected(error);
-        }
-    }
-
-    return results;
+    return client_service_->BatchGet(keys, batched_slices, config);
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
@@ -1702,113 +1444,27 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
 
     const size_t num_keys = keys.size();
-    std::vector<tl::expected<int64_t, ErrorCode>> results;
-    results.reserve(num_keys);
     if (num_keys == 0) {
-        return results;
+        return {};
     }
-    // Query metadata for all keys
-    auto query_results = client_service_->BatchQuery(keys, config);
-    // Process each key individually and prepare for batch transfer
-    struct ValidKeyInfo {
-        std::string key;
-        size_t original_index;
-        std::unique_ptr<QueryResult> query_result;
-        std::vector<Slice> slices;
-        uint64_t total_size;
-    };
 
-    std::vector<ValidKeyInfo> valid_operations;
-    valid_operations.reserve(num_keys);
+    std::vector<std::vector<Slice>> batched_slices(num_keys);
     for (size_t i = 0; i < num_keys; ++i) {
-        const auto& key = keys[i];
-        // Handle query failures
-        if (!query_results[i]) {
-            const auto error = query_results[i].error();
-            results.emplace_back(tl::unexpected(error));
-            if (error != ErrorCode::OBJECT_NOT_FOUND) {
-                LOG(ERROR) << "Query failed for key '" << key
-                           << "': " << toString(error);
-            }
-            continue;
+        const auto& item_buffers = all_buffers[i];
+        const auto& item_sizes = all_sizes[i];
+        if (item_buffers.size() != item_sizes.size()) {
+            LOG(ERROR) << "Buffer/size mismatch for key[ " << i << "]";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                num_keys, tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        // Validate replica list
-        auto query_result_ptr = std::move(query_results[i].value());
-        if (query_result_ptr->replicas.empty()) {
-            LOG(ERROR) << "Empty replica list for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
-            continue;
-        }
-        // Calculate required buffer size
-        const auto& replica = query_result_ptr->replicas[0];
-        uint64_t total_size = calculate_total_size(replica);
-        const auto& sizes = all_sizes[i];
-        uint64_t dst_total_size = 0;
-        for (auto& size : sizes) {
-            dst_total_size += size;
-        }
-        if (dst_total_size < total_size) {
-            LOG(ERROR) << "Buffer too small for key '" << key
-                       << "': required=" << total_size
-                       << ", available=" << dst_total_size;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-        // Create slices for this key's buffer
-        const auto& buffers = all_buffers[i];
-        std::vector<Slice> key_slices;
-        key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica()) {
-            for (size_t j = 0; j < buffers.size(); ++j) {
-                key_slices.emplace_back(Slice{buffers[j], sizes[j]});
-            }
-        } else {
-            LOG(ERROR) << "Invalid replica type for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-
-        valid_operations.push_back({.key = key,
-                                    .original_index = i,
-                                    .query_result = std::move(query_result_ptr),
-                                    .slices = std::move(key_slices),
-                                    .total_size = total_size});
-        // Set success result (actual bytes transferred)
-        results.emplace_back(static_cast<int64_t>(total_size));
-    }
-    // Early return if no valid operations
-    if (valid_operations.empty()) {
-        return results;
-    }
-
-    // Prepare batch transfer data structures
-    std::vector<std::string> batch_keys;
-    std::vector<std::unique_ptr<QueryResult>> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    batch_keys.reserve(valid_operations.size());
-    batch_query_results.reserve(valid_operations.size());
-    for (auto& op : valid_operations) {
-        batch_keys.push_back(op.key);
-        batch_query_results.push_back(std::move(op.query_result));
-        batch_slices[op.key] = op.slices;
-    }
-
-    auto batch_get_results =
-        client_service_->BatchGet(batch_keys, batch_query_results, batch_slices,
-                                  prefer_alloc_in_same_node);
-
-    // Process transfer results
-    for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto& op = valid_operations[j];
-
-        if (!batch_get_results[j]) {
-            const auto error = batch_get_results[j].error();
-            LOG(ERROR) << "BatchGet failed for key '" << op.key
-                       << "': " << toString(error);
-            results[op.original_index] = tl::unexpected(error);
+        for (size_t j = 0; j < item_buffers.size(); ++j) {
+            batched_slices[i].emplace_back(
+                Slice{item_buffers[j], item_sizes[j]});
         }
     }
-    return results;
+
+    return client_service_->BatchGet(keys, batched_slices, config,
+                                     prefer_alloc_in_same_node);
 }
 
 tl::expected<HeartbeatResponse, ErrorCode> RealClient::ping(

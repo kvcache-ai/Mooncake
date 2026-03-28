@@ -386,26 +386,6 @@ ErrorCode ClientService::InitTransferEngine(
     return ErrorCode::OK;
 }
 
-tl::expected<bool, ErrorCode> ClientService::IsExist(const std::string& key) {
-    auto guard = AcquireInflightGuard();
-    if (!guard.is_valid()) {
-        LOG(ERROR) << "client is shutting down";
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
-    }
-    return GetMasterClient().ExistKey(key);
-}
-
-std::vector<tl::expected<bool, ErrorCode>> ClientService::BatchIsExist(
-    const std::vector<std::string>& keys) {
-    auto guard = AcquireInflightGuard();
-    if (!guard.is_valid()) {
-        std::vector<tl::expected<bool, ErrorCode>> results(
-            keys.size(), tl::make_unexpected(ErrorCode::SHUTTING_DOWN));
-        return results;
-    }
-    return GetMasterClient().BatchExistKey(keys);
-}
-
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>

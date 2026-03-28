@@ -311,6 +311,41 @@ CentralizedClientService::BatchQuery(
     return results;
 }
 
+tl::expected<bool, ErrorCode> CentralizedClientService::IsExist(
+    const std::string& key) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    auto result = master_client_.ExistKey(key);
+    if (!result) {
+        LOG(ERROR) << "Failed to query key"
+                   << ", key:" << key << ", error:" << result.error();
+        return tl::unexpected(result.error());
+    }
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+CentralizedClientService::BatchIsExist(const std::vector<std::string>& keys) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return std::vector<tl::expected<bool, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    }
+    auto results = master_client_.BatchExistKey(keys);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            LOG(ERROR) << "Failed to query key"
+                       << ", key:" << keys[i]
+                       << ", error:" << results[i].error();
+        }
+    }
+    return results;
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 CentralizedClientService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
@@ -325,19 +360,304 @@ CentralizedClientService::BatchReplicaClear(
     return result;
 }
 
-tl::expected<void, ErrorCode> CentralizedClientService::Get(
-    const std::string& object_key, std::vector<Slice>& slices) {
-    // First query the object metadata
-    auto query_result = Query(object_key);
-    if (!query_result.has_value()) {
+tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
+CentralizedClientService::Get(const std::string& key,
+                              std::shared_ptr<ClientBufferAllocator> allocator,
+                              const ReadRouteConfig& config) {
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Query to get size first
+    auto query_result = Query(key, config);
+    if (!query_result) {
+        LOG(ERROR) << "Failed to query key"
+                   << ", key:" << key << ", error:" << query_result.error();
         return tl::unexpected(query_result.error());
     }
 
-    // Then use the existing Get method with the query result
-    return Get(object_key, *query_result.value(), slices);
+    const auto& replica_list = query_result.value()->replicas;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // currently, centralization path assumes only one replica
+    const auto& replica = replica_list[0];
+    uint64_t total_size = calculate_total_size(replica);
+    if (total_size == 0) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    // Allocate buffer
+    auto alloc_result = allocator->allocate(total_size);
+    if (!alloc_result) {
+        LOG(ERROR) << "Failed to allocate buffer for get, key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto buffer_handle = std::move(*alloc_result);
+
+    // Create slices for the allocated buffer
+    std::vector<Slice> slices;
+    allocateSlices(slices, replica, buffer_handle.ptr());
+
+    auto get_result = InnerGet(key, *query_result.value(), slices);
+    if (!get_result) {
+        LOG(ERROR) << "Failed to get key"
+                   << ", key:" << key << ", error:" << get_result.error();
+        return tl::unexpected(get_result.error());
+    }
+
+    return std::make_shared<BufferHandle>(std::move(buffer_handle));
 }
 
-tl::expected<void, ErrorCode> CentralizedClientService::Get(
+std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
+CentralizedClientService::BatchGet(
+    const std::vector<std::string>& keys,
+    std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config) {
+    std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        for (auto& r : results) {
+            r = tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return results;
+    }
+
+    // Query all keys
+    auto query_results = BatchQuery(keys, config);
+
+    // Prepare valid operations for batch get
+    struct KeyOp {
+        size_t original_index;
+        std::unique_ptr<QueryResult> query_result;
+        std::unique_ptr<BufferHandle> buffer_handle;
+        std::vector<Slice> slices;
+    };
+    std::vector<KeyOp> valid_ops;
+    valid_ops.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!query_results[i]) {
+            auto error = query_results[i].error();
+            if (error != ErrorCode::OBJECT_NOT_FOUND &&
+                error != ErrorCode::REPLICA_IS_NOT_READY) {
+                LOG(ERROR) << "Query failed for key '" << keys[i]
+                           << "': " << toString(error);
+            }
+            results[i] = tl::unexpected(query_results[i].error());
+            continue;
+        }
+
+        auto query_ptr = std::move(query_results[i].value());
+        if (query_ptr->replicas.empty()) {
+            LOG(ERROR) << "Empty replica list for key: " << keys[i];
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        const auto& replica = query_ptr->replicas[0];
+        uint64_t total_size = calculate_total_size(replica);
+        if (total_size == 0) {
+            LOG(ERROR) << "Empty replica list for key: " << keys[i];
+            results[i] = tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+
+        auto alloc_result = allocator->allocate(total_size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate buffer for key: " << keys[i];
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        auto bh = std::make_unique<BufferHandle>(std::move(*alloc_result));
+        std::vector<Slice> slices;
+        allocateSlices(slices, replica, bh->ptr());
+
+        valid_ops.push_back(
+            {i, std::move(query_ptr), std::move(bh), std::move(slices)});
+    }
+
+    if (valid_ops.empty()) {
+        return results;
+    }
+
+    // Build batch get structures
+    std::vector<std::string> batch_keys;
+    std::vector<std::unique_ptr<QueryResult>> batch_qr;
+    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    batch_keys.reserve(valid_ops.size());
+    batch_qr.reserve(valid_ops.size());
+
+    for (auto& op : valid_ops) {
+        batch_keys.push_back(keys[op.original_index]);
+        batch_qr.push_back(std::move(op.query_result));
+        batch_slices[keys[op.original_index]] = op.slices;
+    }
+
+    auto batch_results = InnerBatchGet(batch_keys, batch_qr, batch_slices);
+
+    for (size_t j = 0; j < valid_ops.size(); ++j) {
+        auto& op = valid_ops[j];
+        if (batch_results[j]) {
+            results[op.original_index] =
+                std::make_shared<BufferHandle>(std::move(*op.buffer_handle));
+        } else {
+            results[op.original_index] =
+                tl::unexpected(batch_results[j].error());
+        }
+    }
+
+    return results;
+}
+
+tl::expected<int64_t, ErrorCode> CentralizedClientService::Get(
+    const std::string& key, std::vector<Slice>& slices,
+    const ReadRouteConfig& config) {
+    // Step 1: Query metadata from master
+    auto query_result = Query(key, config);
+    if (!query_result) {
+        LOG(ERROR) << "Failed to query key: " << key;
+        return tl::unexpected(query_result.error());
+    }
+
+    const auto& replica_list = query_result.value()->replicas;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Step 2: Calculate total size and validate
+    const auto& replica = replica_list[0];
+    uint64_t total_size = calculate_total_size(replica);
+    if (total_size == 0) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    size_t slices_size = ClientService::CalculateSliceSize(slices);
+    if (slices_size < total_size) {
+        LOG(ERROR) << "Buffer too small for key '" << key
+                   << "': required=" << total_size
+                   << ", provided=" << slices_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Step 3: Transfer data
+    auto get_result = InnerGet(key, *query_result.value(), slices);
+    if (!get_result) {
+        return tl::unexpected(get_result.error());
+    }
+
+    return static_cast<int64_t>(total_size);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+CentralizedClientService::BatchGet(
+    const std::vector<std::string>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReadRouteConfig& config, bool aggregate_same_segment_task) {
+    if (keys.size() != batched_slices.size()) {
+        LOG(ERROR) << "Input vector sizes mismatch";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    // Query all keys
+    auto query_results = BatchQuery(keys, config);
+
+    std::vector<tl::expected<int64_t, ErrorCode>> results;
+    results.reserve(keys.size());
+
+    // Prepare valid operations
+    struct ValidOp {
+        size_t original_index;
+        std::unique_ptr<QueryResult> query_result;
+        std::vector<Slice> slices;
+        uint64_t total_size;
+    };
+    std::vector<ValidOp> valid_ops;
+    valid_ops.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!query_results[i]) {
+            auto error = query_results[i].error();
+            results.emplace_back(tl::unexpected(error));
+            if (error != ErrorCode::OBJECT_NOT_FOUND &&
+                error != ErrorCode::REPLICA_IS_NOT_READY) {
+                LOG(ERROR) << "Query failed for key '" << keys[i]
+                           << "': " << toString(error);
+            }
+            continue;
+        }
+
+        // Validate replica list
+        auto query_ptr = std::move(query_results[i].value());
+        if (query_ptr->replicas.empty()) {
+            LOG(ERROR) << "Empty replica list for key: " << keys[i];
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
+            continue;
+        }
+
+        const auto& replica = query_ptr->replicas[0];
+        uint64_t total_size = calculate_total_size(replica);
+        size_t current_slices_size =
+            ClientService::CalculateSliceSize(batched_slices[i]);
+
+        if (current_slices_size < total_size) {
+            LOG(ERROR) << "Buffer too small for key '" << keys[i]
+                       << "': required=" << total_size
+                       << ", available=" << current_slices_size;
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        // Optimistic: set success result now, override on failure
+        results.emplace_back(static_cast<int64_t>(total_size));
+        valid_ops.push_back(
+            {i, std::move(query_ptr), batched_slices[i], total_size});
+    }
+
+    if (valid_ops.empty()) {
+        return results;
+    }
+
+    // Build batch get structures
+    std::vector<std::string> batch_keys;
+    std::vector<std::unique_ptr<QueryResult>> batch_qr;
+    std::unordered_map<std::string, std::vector<Slice>> batch_slices_map;
+    batch_keys.reserve(valid_ops.size());
+    batch_qr.reserve(valid_ops.size());
+
+    for (auto& op : valid_ops) {
+        batch_keys.push_back(keys[op.original_index]);
+        batch_qr.push_back(std::move(op.query_result));
+        batch_slices_map[keys[op.original_index]] = op.slices;
+    }
+
+    auto batch_results = InnerBatchGet(batch_keys, batch_qr, batch_slices_map,
+                                       aggregate_same_segment_task);
+
+    for (size_t j = 0; j < valid_ops.size(); ++j) {
+        if (!batch_results[j]) {
+            const auto error = batch_results[j].error();
+            LOG(ERROR) << "Batch get failed for key '"
+                       << keys[valid_ops[j].original_index]
+                       << "': " << toString(error);
+            results[valid_ops[j].original_index] = tl::unexpected(error);
+        }
+    }
+
+    return results;
+}
+
+tl::expected<void, ErrorCode> CentralizedClientService::InnerGet(
     const std::string& object_key, const QueryResult& query_result,
     std::vector<Slice>& slices) {
     auto guard = AcquireInflightGuard();
@@ -388,60 +708,12 @@ struct BatchGetOperation {
     std::vector<TransferFuture> futures;
 };
 
-std::vector<tl::expected<void, ErrorCode>> CentralizedClientService::BatchGet(
-    const std::vector<std::string>& object_keys,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
-    auto batched_query_results = BatchQuery(object_keys);
-
-    // If any queries failed, return error results immediately for failed
-    // queries
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(object_keys.size());
-
-    std::vector<std::unique_ptr<QueryResult>> valid_query_results;
-    std::vector<size_t> valid_indices;
-    std::vector<std::string> valid_keys;
-
-    for (size_t i = 0; i < batched_query_results.size(); ++i) {
-        if (batched_query_results[i]) {
-            valid_query_results.emplace_back(
-                std::move(batched_query_results[i].value()));
-            valid_indices.emplace_back(i);
-            valid_keys.emplace_back(object_keys[i]);
-            results.emplace_back();  // placeholder for successful results
-        } else {
-            results.emplace_back(
-                tl::unexpected(batched_query_results[i].error()));
-        }
-    }
-
-    // If we have any valid queries, process them
-    if (!valid_keys.empty()) {
-        std::unordered_map<std::string, std::vector<Slice>> valid_slices;
-        for (const auto& key : valid_keys) {
-            auto it = slices.find(key);
-            if (it != slices.end()) {
-                valid_slices[key] = it->second;
-            }
-        }
-
-        auto valid_results =
-            BatchGet(valid_keys, valid_query_results, valid_slices);
-
-        // Merge results back
-        for (size_t i = 0; i < valid_indices.size(); ++i) {
-            results[valid_indices[i]] = valid_results[i];
-        }
-    }
-
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> CentralizedClientService::BatchGet(
+std::vector<tl::expected<void, ErrorCode>>
+CentralizedClientService::InnerBatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<std::unique_ptr<QueryResult>>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool aggregate_same_segment_task) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -474,7 +746,7 @@ std::vector<tl::expected<void, ErrorCode>> CentralizedClientService::BatchGet(
         }
         return results;
     }
-    if (prefer_alloc_in_same_node) {
+    if (aggregate_same_segment_task) {
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 

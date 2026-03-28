@@ -85,34 +85,34 @@ class P2PClientService final : public ClientService {
     BatchQuery(const std::vector<std::string>& object_keys,
                const ReadRouteConfig& config = {}) override;
 
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys) override;
+
     DeploymentMode deployment_mode() const override {
         return DeploymentMode::P2P;
     }
 
-    /**
-     * @brief Retrieves data for a given key in P2P mode.
-     * @param object_key Key to retrieve.
-     * @param query_result Previously queried object metadata.
-     * @param slices Vector of slices to store the data.
-     * @return ErrorCode indicating success/failure.
-     */
-    tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      const QueryResult& query_result,
-                                      std::vector<Slice>& slices) override;
+    tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config = {}) override;
 
-    /**
-     * @brief Batch retrieve data for multiple keys in P2P mode.
-     * @param object_keys Keys to query.
-     * @param query_results Previously queried object metadata for each key.
-     * @param slices Map of object keys to their data slices.
-     * @param prefer_same_node Whether to prefer the same node for retrieval.
-     * @return Vector of ErrorCode results for each key.
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        const std::vector<std::unique_ptr<QueryResult>>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false) override;
+    std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
+    BatchGet(const std::vector<std::string>& keys,
+             std::shared_ptr<ClientBufferAllocator> allocator,
+             const ReadRouteConfig& config = {}) override;
+
+    tl::expected<int64_t, ErrorCode> Get(
+        const std::string& key, std::vector<Slice>& slices,
+        const ReadRouteConfig& config = {}) override;
+
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
+        const std::vector<std::string>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReadRouteConfig& config = {},
+        bool aggregate_same_segment_task = false) override;
 
     /**
      * @brief Mount a memory segment in P2P mode.
@@ -238,15 +238,24 @@ class P2PClientService final : public ClientService {
     /**
      * @brief Get data from local TieredBackend via DataManager.
      */
-    tl::expected<void, ErrorCode> GetLocal(const std::string& key,
-                                           std::vector<Slice>& slices);
+    tl::expected<size_t, ErrorCode> GetLocal(const std::string& key,
+                                             std::vector<Slice>& slices);
 
     /**
      * @brief Get data from a remote node via Master's read route.
      * Gets replica list from Master, then uses PeerClient to read.
      */
-    tl::expected<void, ErrorCode> GetRemoteViaRoute(const std::string& key,
-                                                    std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> GetRemoteViaRoute(
+        const std::string& key, std::vector<Slice>& slices,
+        const std::vector<Replica::Descriptor>& replicas);
+
+    /**
+     * @brief Query Master for replica list and calculate total object size.
+     * @return Pair of (replicas, total_size) on success.
+     */
+    tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>,
+                 ErrorCode>
+    QueryReplicaSize(const std::string& key, const ReadRouteConfig& config);
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.

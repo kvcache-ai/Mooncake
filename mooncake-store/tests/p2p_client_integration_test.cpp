@@ -110,7 +110,10 @@ TEST_F(P2PClientIntegrationTest, PutAndGetLocal) {
     ASSERT_TRUE(query.has_value())
         << "Query failed: " << static_cast<int>(query.error());
 
-    auto get_result = client_->Get(key, *query.value(), get_slices);
+    std::vector<Slice> get_slices_call;
+    get_slices_call.emplace_back(Slice{buf.data(), buf.size()});
+
+    auto get_result = client_->Get(key, get_slices_call);
     ASSERT_TRUE(get_result.has_value())
         << "Get failed: " << static_cast<int>(get_result.error());
 
@@ -296,7 +299,9 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
     auto query = client_->Query(key);
     ASSERT_TRUE(query.has_value());
 
-    auto get = client_->Get(key, *query.value(), get_slices);
+    std::vector<Slice> get_slices_call2;
+    get_slices_call2.emplace_back(Slice{buf.data(), buf.size()});
+    auto get = client_->Get(key, get_slices_call2);
     ASSERT_TRUE(get.has_value());
     EXPECT_EQ(std::string(buf.data(), buf.size()), data1);
 }
@@ -375,7 +380,9 @@ TEST_F(P2PClientIntegrationTest, LargePutGet) {
     auto query = client_->Query(key);
     ASSERT_TRUE(query.has_value());
 
-    auto get = client_->Get(key, *query.value(), get_slices);
+    std::vector<Slice> get_slices_call3;
+    get_slices_call3.emplace_back(Slice{read_buf.data(), read_buf.size()});
+    auto get = client_->Get(key, get_slices_call3);
     ASSERT_TRUE(get.has_value())
         << "Large Get failed: " << static_cast<int>(get.error());
 

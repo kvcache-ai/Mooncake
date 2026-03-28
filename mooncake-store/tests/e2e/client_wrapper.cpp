@@ -99,32 +99,33 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     if (!query_result.has_value()) {
         return query_result.error();
     }
-
-    const std::vector<Replica::Descriptor>& replica_list =
-        query_result.value()->replicas;
-    if (replica_list.empty()) {
-        return ErrorCode::OBJECT_NOT_FOUND;
+    if (query_result.value()->replicas.empty()) {
+        return ErrorCode::INVALID_REPLICA;
     }
 
-    // Create slices
-    const AllocatedBuffer::Descriptor& descriptor =
-        replica_list[0].get_memory_descriptor().buffer_descriptor;
-    SliceGuard slice_guard(descriptor.size_, allocator_);
-
-    // Perform get operation
-    auto get_result =
-        client_->Get(key, *query_result.value(), slice_guard.slices_);
-    ErrorCode error_code =
-        get_result.has_value() ? ErrorCode::OK : get_result.error();
-    if (error_code != ErrorCode::OK) {
-        return error_code;
+    uint64_t total_size =
+        calculate_total_size(query_result.value()->replicas[0]);
+    if (total_size == 0) {
+        value.clear();
+        return ErrorCode::OK;
     }
 
-    // Fill value
-    value.clear();
-    for (const auto& slice : slice_guard.slices_) {
-        value.append(static_cast<const char*>(slice.ptr), slice.size);
+    void* buffer = allocator_->allocate(total_size);
+    if (!buffer) {
+        LOG(ERROR) << "Failed to allocate memory for Get";
+        throw std::runtime_error("Failed to allocate memory for Get");
     }
+
+    std::vector<Slice> get_slices_call;
+    get_slices_call.emplace_back(Slice{buffer, (size_t)total_size});
+    auto get_result = client_->Get(key, get_slices_call);
+    if (!get_result.has_value()) {
+        allocator_->deallocate(buffer, total_size);
+        return get_result.error();
+    }
+
+    value.assign(static_cast<const char*>(buffer), total_size);
+    allocator_->deallocate(buffer, total_size);
     return ErrorCode::OK;
 }
 

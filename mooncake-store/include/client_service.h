@@ -21,8 +21,7 @@
 #include "master_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include "client_config_builder.h"
-
-#include "client_config_builder.h"
+#include "client_buffer.hpp"
 
 namespace mooncake {
 
@@ -128,28 +127,50 @@ class ClientService {
                const ReadRouteConfig& config = {}) = 0;
 
     /**
-     * @brief Transfers data using pre-queried object information
-     * @param object_key Key of the object
-     * @param query_result Previously queried object metadata containing
-     * replicas and lease timeout
-     * @param slices Vector of slices to store the data
-     * @return ErrorCode indicating success/failure
+     * @brief Gets data with memory allocation
+     * @param key Object key
+     * @param allocator Read buffer allocator
+     * @param config Read route config
+     * @return BufferHandle allocated by `allocator` on success.
+     *         ErrorCode on failure.
      */
-    virtual tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                              const QueryResult& query_result,
-                                              std::vector<Slice>& slices) = 0;
+    virtual tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
+        const std::string& key,
+        std::shared_ptr<ClientBufferAllocator> allocator,
+        const ReadRouteConfig& config = {}) = 0;
+
+    virtual std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
+    BatchGet(const std::vector<std::string>& keys,
+             std::shared_ptr<ClientBufferAllocator> allocator,
+             const ReadRouteConfig& config = {}) = 0;
+
     /**
-     * @brief Transfers data using pre-queried object information
-     * @param object_keys Keys of the objects
-     * @param query_results Previously queried object metadata for each key
-     * @param slices Map of object keys to their data slices
-     * @return Vector of ErrorCode results for each object
+     * @brief Gets data without memory allocation
+     * @param key Object key
+     * @param slices Vector of read buffer slices
+     * @param config Read route config
+     * @return Number of bytes read on success. ErrorCode on failure.
      */
-    virtual std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        const std::vector<std::unique_ptr<QueryResult>>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false) = 0;
+    virtual tl::expected<int64_t, ErrorCode> Get(
+        const std::string& key, std::vector<Slice>& slices,
+        const ReadRouteConfig& config = {}) = 0;
+
+    /**
+     * @brief Batch get data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of read buffer slices
+     * @param config Read route config
+     * @param aggregate_same_segment_task
+     * Whether to aggregate read tasks on the same segment .
+     * If false, each key will be generated as a independent task.
+     * Otherwise, the tasks will be aggregated on the same segment.
+     * @return Vector of bytes read on success. ErrorCode on failure.
+     */
+    virtual std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
+        const std::vector<std::string>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReadRouteConfig& config = {},
+        bool aggregate_same_segment_task = false) = 0;
 
     /**
      * @brief Stores data with replication
@@ -241,7 +262,7 @@ class ClientService {
      * @param key Key to check
      * @return True if exists, false if not, or ErrorCode for unexpected errors.
      */
-    virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
     /**
      * @brief Checks if multiple objects exist
@@ -249,7 +270,7 @@ class ClientService {
      * @return Vector of existence results for each key
      */
     virtual std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys) = 0;
 
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {

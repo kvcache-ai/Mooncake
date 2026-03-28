@@ -425,7 +425,7 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
                   .buffer_descriptor.transport_endpoint_,
               segment_provider_client_->GetTransportEndpoint());
 
-    auto get_result = test_client_->Get(key, *query_result.value(), slices);
+    auto get_result = test_client_->Get(key, slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(slices.size(), 1);
@@ -625,14 +625,15 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     start = std::chrono::high_resolution_clock::now();
-    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
+    std::vector<std::vector<Slice>> target_batched_slices;
+    target_batched_slices.reserve(batch_sz);
     for (int i = 0; i < batch_sz; i++) {
         std::vector<Slice> target_slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
         target_slices.emplace_back(
             Slice{target_buffer, test_data_list[i].size()});
-        target_batched_slices.emplace(keys[i], target_slices);
+        target_batched_slices.push_back(std::move(target_slices));
     }
     auto batch_get_results =
         test_client_->BatchGet(keys, target_batched_slices);
@@ -642,18 +643,18 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
     end = std::chrono::high_resolution_clock::now();
     LOG(INFO) << "Time taken for BatchGet: "
               << std::chrono::duration_cast<std::chrono::microseconds>(end -
-                                                                       start)
+                                                                        start)
                      .count()
               << "us";
 
     for (int i = 0; i < batch_sz; i++) {
-        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
+        ASSERT_EQ(target_batched_slices[i][0].size,
                   test_data_list[i].size());
-        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
+        ASSERT_EQ(memcmp(target_batched_slices[i][0].ptr,
                          test_data_list[i].data(), test_data_list[i].size()),
                   0);
         client_buffer_allocator_->deallocate(
-            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+            target_batched_slices[i][0].ptr, test_data_list[i].size());
     }
 }
 

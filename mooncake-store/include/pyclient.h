@@ -51,7 +51,8 @@ class PyClient {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        bool prefer_same_node, const ReadRouteConfig& config = {}) = 0;
+        bool aggregate_same_segment_task,
+        const ReadRouteConfig& config = {}) = 0;
 
     virtual int put_from(const std::string& key, void* buffer, size_t size,
                          const WriteConfig& config) = 0;
