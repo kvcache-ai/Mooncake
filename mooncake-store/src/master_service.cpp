@@ -4444,23 +4444,35 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    ObjectDataType data_type = ObjectDataType::UNKNOWN;
-    const uint32_t old_format_size = 7 + replicas_count;
-    const uint32_t one_extra_format_size = 8 + replicas_count;
-    const uint32_t current_format_size = 9 + replicas_count;
+    // Snapshot compatibility:
+    //   7 + replicas: legacy format
+    //   8 + replicas: either data_type or trailing hard_pinned
+    //   9 + replicas: data_type plus trailing hard_pinned
+    constexpr uint32_t kOldFieldCount = 7;
+    constexpr uint32_t kOneExtraFieldCount = 8;
+    constexpr uint32_t kCurrentFieldCount = 9;
+    const uint32_t total_elements = obj.via.array.size;
+    const bool is_old_format =
+        (total_elements == kOldFieldCount + replicas_count);
+    const bool is_one_extra_format =
+        (total_elements == kOneExtraFieldCount + replicas_count);
+    const bool is_current_format =
+        (total_elements == kCurrentFieldCount + replicas_count);
 
-    if (obj.via.array.size == current_format_size) {
-        data_type =
-            static_cast<ObjectDataType>(array[index++].as<uint8_t>());
-    } else if (obj.via.array.size == one_extra_format_size) {
-        if (array[index].type == msgpack::type::POSITIVE_INTEGER) {
-            data_type =
-                static_cast<ObjectDataType>(array[index++].as<uint8_t>());
-        }
-    } else if (obj.via.array.size != old_format_size) {
+    if (!is_current_format && !is_one_extra_format && !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
+    }
+
+    ObjectDataType data_type = ObjectDataType::UNKNOWN;
+    if (is_current_format) {
+        data_type =
+            static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+    } else if (is_one_extra_format &&
+               array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        data_type =
+            static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     }
 
     // Deserialize replicas

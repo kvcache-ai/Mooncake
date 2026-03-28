@@ -1585,6 +1585,7 @@ PYBIND11_MODULE(store, m) {
         .value("GRADIENT", ObjectDataType::GRADIENT)
         .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
         .value("METADATA", ObjectDataType::METADATA)
+        .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
     // Define the ReplicateConfig class

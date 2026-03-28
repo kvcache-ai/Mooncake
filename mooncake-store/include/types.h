@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -140,7 +141,8 @@ enum class ObjectDataType : uint8_t {
     GRADIENT = 6,
     OPTIMIZER_STATE = 7,
     METADATA = 8,
-    // 9-255 reserved for future types
+    GENERAL = 9,
+    // 10-255 reserved for future types
 };
 
 inline std::ostream& operator<<(std::ostream& os,
@@ -154,7 +156,8 @@ inline std::ostream& operator<<(std::ostream& os,
                      {ObjectDataType::ACTIVATION, "ACTIVATION"},
                      {ObjectDataType::GRADIENT, "GRADIENT"},
                      {ObjectDataType::OPTIMIZER_STATE, "OPTIMIZER_STATE"},
-                     {ObjectDataType::METADATA, "METADATA"}};
+                     {ObjectDataType::METADATA, "METADATA"},
+                     {ObjectDataType::GENERAL, "GENERAL"}};
 
     auto it = type_strings.find(type);
     os << (it != type_strings.end() ? it->second : "UNKNOWN");
