@@ -27,6 +27,10 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl_rt.h"
+#include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
+#endif
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
@@ -35,8 +39,111 @@ DEFINE_int32(http_port, 9300,
              "(only effective when --enable_http_server=true).");
 
 namespace mooncake {
+namespace {
+#ifdef USE_ASCEND_DIRECT
+bool checkAcl(aclError result, const char *message) {
+    if (result != ACL_ERROR_NONE) {
+        const char *errMsg = aclGetRecentErrMsg();
+        LOG(ERROR) << message << " (Error code: " << result << " - " << errMsg
+                   << ")";
+        return false;
+    }
+    return true;
+}
+#endif
+}  // namespace
 
 PyClient::~PyClient() {}
+
+bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
+                                          uint64_t dummy_addr, size_t buf_size,
+                                          const MappedShm *&last_hit_shm,
+                                          void *&out_real) const {
+    if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
+        dummy_addr + buf_size <=
+            last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
+        out_real = reinterpret_cast<void *>(dummy_addr +
+                                            last_hit_shm->shm_addr_offset);
+        return true;
+    }
+    for (const auto &shm : shm_ctx.mapped_shms) {
+        if (dummy_addr >= shm.dummy_base_addr &&
+            dummy_addr + buf_size <= shm.dummy_base_addr + shm.shm_size) {
+            out_real =
+                reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset);
+            last_hit_shm = &shm;
+            return true;
+        }
+    }
+    return false;
+}
+
+tl::expected<std::vector<void *>, ErrorCode>
+RealClient::map_dummy_addrs_to_real_ptrs(
+    const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
+    const std::vector<size_t> &sizes, const UUID &client_id) const {
+    if (dummy_addrs.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched dummy_addrs and sizes, client_id="
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<void *> buffers;
+    buffers.reserve(dummy_addrs.size());
+    const MappedShm *last_hit_shm = nullptr;
+    for (size_t i = 0; i < dummy_addrs.size(); ++i) {
+        void *real_ptr = nullptr;
+        if (!map_dummy_buffer_to_real(context, dummy_addrs[i], sizes[i],
+                                      last_hit_shm, real_ptr)) {
+            LOG(ERROR) << "Dummy buffer at " << dummy_addrs[i] << " (size "
+                       << sizes[i]
+                       << ") not found in any mapped shared memory, client_id="
+                       << client_id;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        buffers.push_back(real_ptr);
+    }
+    return buffers;
+}
+
+tl::expected<std::vector<std::vector<void *>>, ErrorCode>
+RealClient::map_dummy_nested_addrs_to_real_ptrs(
+    const ShmContext &context,
+    const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::string> &keys, const UUID &client_id) const {
+    if (keys.size() != dummy_all_buffers.size() ||
+        keys.size() != all_sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, dummy buffers, and sizes";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<std::vector<void *>> real_all_buffers;
+    real_all_buffers.reserve(keys.size());
+    const MappedShm *last_hit_shm = nullptr;
+    for (size_t ki = 0; ki < keys.size(); ++ki) {
+        const auto &row_addrs = dummy_all_buffers[ki];
+        const auto &row_sizes = all_sizes[ki];
+        if (row_addrs.size() != row_sizes.size()) {
+            LOG(ERROR) << "Mismatched buffers and sizes for key: " << keys[ki];
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::vector<void *> row_real;
+        row_real.reserve(row_addrs.size());
+        for (size_t j = 0; j < row_addrs.size(); ++j) {
+            void *real_ptr = nullptr;
+            if (!map_dummy_buffer_to_real(context, row_addrs[j], row_sizes[j],
+                                          last_hit_shm, real_ptr)) {
+                LOG(ERROR)
+                    << "Dummy buffer at " << row_addrs[j]
+                    << " not found in any mapped shared memory for client "
+                    << client_id;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            row_real.push_back(real_ptr);
+        }
+        real_all_buffers.push_back(std::move(row_real));
+    }
+    return real_all_buffers;
+}
 
 // ResourceTracker implementation using singleton pattern
 // Use a deliberately leaked heap object to avoid static destruction
@@ -192,6 +299,20 @@ std::shared_ptr<RealClient> RealClient::create() {
     return sp;
 }
 
+tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
+    size_t local_buffer_size) {
+#ifdef USE_ASCEND_DIRECT
+    // Initialize ContextManager for dummy-real mode
+    if (!ContextManager::getInstance().initialize()) {
+        LOG(ERROR) << "Failed to initialize ContextManager";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    LOG(INFO) << "ContextManager initialized with "
+              << ContextManager::getInstance().getDeviceCount() << " device(s)";
+#endif
+    return {};
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -205,6 +326,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const bool should_use_hugepage = use_hugepage_ &&
                                      this->protocol != "ascend" &&
                                      this->protocol != "ubshmem";
+#ifdef USE_ASCEND_DIRECT
+    if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
+        auto ascend_setup = setup_ascend_internal(local_buffer_size);
+        if (!ascend_setup) return ascend_setup;
+        if (!ContextManager::getInstance().setCurrentContext(0)) {
+            LOG(ERROR) << "Failed to set current context for device " << 0;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+#endif
 
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
@@ -609,14 +740,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
         // Iterate over all mapped_shms to unmap them
         for (auto &seg : context.mapped_shms) {
-            if (seg.shm_buffer) {
-                // Memory mapped from memfd needs munmap
-                if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
-                    LOG(ERROR) << "Failed to unmap shm: " << seg.shm_name
-                               << ", error: " << strerror(errno);
-                }
-                seg.shm_buffer = nullptr;
+            if (seg.shm_buffer == nullptr) {
+                continue;
             }
+            if (seg.is_ascend) {
+                teardown_ascend_shm_buffer(seg);
+            } else if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
+                LOG(ERROR) << "Failed to unmap shm: " << seg.shm_name
+                           << ", error: " << strerror(errno);
+            }
+            seg.shm_buffer = nullptr;
         }
         context.mapped_shms.clear();
 
@@ -1098,7 +1231,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
 
     close(fd);  // Close FD after mapping
 
-    MappedShm shm;
+    MappedShm shm{};
     shm.shm_name = shm_name;
     shm.shm_buffer = shm_buffer;
     shm.shm_size = shm_size;
@@ -1148,8 +1281,7 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
 
     for (auto &shm : context.mapped_shms) {
         if (shm.shm_buffer) {
-            auto rc =
-                client_->unregisterLocalMemory(shm.shm_buffer, shm.shm_size);
+            auto rc = client_->unregisterLocalMemory(shm.shm_buffer, true);
             if (!rc) {
                 LOG(ERROR) << "Failed to unregister memory";
                 munmap(shm.shm_buffer, shm.shm_size);
@@ -1161,6 +1293,228 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         }
     }
     context.mapped_shms.clear();
+    shm_contexts_.erase(it);
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
+    uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
+    const std::string &shareable_handle_bytes, int32_t device_id,
+    const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (shareable_handle_bytes.size() != sizeof(aclrtMemFabricHandle)) {
+        LOG(ERROR) << "Invalid fabric handle bytes size: "
+                   << shareable_handle_bytes.size();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto &context = shm_contexts_[client_id];
+    for (const auto &region : context.mapped_shms) {
+        if (region.dummy_base_addr == static_cast<uintptr_t>(dummy_base_addr)) {
+            LOG(INFO) << "VMM region already mapped for dummy address";
+            return {};
+        }
+    }
+
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set current context for physical device "
+                   << device_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    aclrtMemFabricHandle export_handle = {};
+    memcpy(&export_handle, shareable_handle_bytes.data(),
+           sizeof(export_handle));
+    aclrtDrvMemHandle imported_handle = nullptr;
+    if (!checkAcl(aclrtMemImportFromShareableHandleV2(
+                      &export_handle, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC,
+                      ACL_RT_VMM_EXPORT_FLAG_DEFAULT, &imported_handle),
+                  "Failed to import shareable handle")) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    void *mapped_va = nullptr;
+    if (!checkAcl(aclrtReserveMemAddress(&mapped_va, vmm_size, 0, nullptr, 1),
+                  "Failed to reserve VMM address")) {
+        (void)aclrtFreePhysical(imported_handle);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!checkAcl(aclrtMapMem(mapped_va, vmm_size, 0, imported_handle, 0),
+                  "Failed to map imported VMM handle")) {
+        (void)aclrtReleaseMemAddress(mapped_va);
+        (void)aclrtFreePhysical(imported_handle);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    MappedShm region;
+    region.shm_name = "vmm_" + std::to_string(client_id.first) + "_" +
+                      std::to_string(client_id.second);
+    region.shm_buffer = mapped_va;
+    region.shm_size = vmm_size;
+    region.dummy_base_addr = static_cast<uintptr_t>(dummy_base_addr);
+    region.shm_addr_offset = reinterpret_cast<uintptr_t>(mapped_va) -
+                             reinterpret_cast<uintptr_t>(dummy_base_addr);
+    region.is_ascend = true;
+    region.is_ipc = false;
+    region.vmm_handle = reinterpret_cast<uint64_t>(imported_handle);
+    region.device_id = device_id;
+
+    if (is_local_buffer) {
+        if (context.client_buffer_allocator) {
+            (void)aclrtUnmapMem(mapped_va);
+            (void)aclrtReleaseMemAddress(mapped_va);
+            (void)aclrtFreePhysical(imported_handle);
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        context.client_buffer_allocator =
+            ClientBufferAllocator::create(mapped_va, vmm_size, this->protocol);
+    }
+    context.mapped_shms.push_back(std::move(region));
+#endif
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
+    uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
+    const std::string &ipc_key_bytes, int32_t device_id,
+    const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    constexpr size_t kIPCKeyLen = 65;
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (ipc_key_bytes.size() != kIPCKeyLen) {
+        LOG(ERROR) << "Invalid IPC key size: " << ipc_key_bytes.size();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto &context = shm_contexts_[client_id];
+    for (const auto &region : context.mapped_shms) {
+        if (region.dummy_base_addr == static_cast<uintptr_t>(dummy_base_addr)) {
+            LOG(INFO) << "IPC region already mapped for dummy address";
+            return {};
+        }
+    }
+
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set current context for physical device "
+                   << device_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    void *mapped_va = nullptr;
+    auto ret =
+        aclrtIpcMemImportByKey(&mapped_va, ipc_key_bytes.data(),
+                               ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtIpcMemImportByKey failed, ret=" << ret
+                   << ", errmsg: " << aclGetRecentErrMsg();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (!globalConfig().ascend_use_fabric_mem) {
+        auto result = client_->RegisterLocalMemory(mapped_va, mem_size, "npu",
+                                                   false, true);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to register memory";
+            (void)aclrtIpcMemClose(ipc_key_bytes.data());
+            return tl::unexpected(result.error());
+        }
+        LOG(INFO) << "RegisterLocalMemory for ipc shm, va:" << mapped_va;
+    }
+
+    MappedShm region;
+    region.shm_name = "ipc_" + std::to_string(client_id.first) + "_" +
+                      std::to_string(client_id.second);
+    region.shm_buffer = mapped_va;
+    region.shm_size = mem_size;
+    region.dummy_base_addr = static_cast<uintptr_t>(dummy_base_addr);
+    region.shm_addr_offset = reinterpret_cast<uintptr_t>(mapped_va) -
+                             static_cast<uintptr_t>(dummy_base_addr);
+    region.is_ascend = true;
+    region.is_ipc = true;
+    region.ipc_key_data = ipc_key_bytes;
+    region.device_id = device_id;
+
+    if (is_local_buffer) {
+        if (context.client_buffer_allocator) {
+            (void)aclrtIpcMemClose(ipc_key_bytes.data());
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        context.client_buffer_allocator =
+            ClientBufferAllocator::create(mapped_va, mem_size, this->protocol);
+    }
+
+    context.mapped_shms.push_back(std::move(region));
+    LOG(INFO) << "IPC memory mapped: dummy_addr=0x" << std::hex
+              << dummy_base_addr << ", real_addr=" << mapped_va << std::dec
+              << ", size=" << mem_size << ", device_id=" << device_id;
+#endif
+    return {};
+}
+
+void RealClient::teardown_ascend_shm_buffer(MappedShm &shm) {
+#ifdef USE_ASCEND_DIRECT
+    (void)ContextManager::getInstance().setCurrentContextByPhysicalId(
+        shm.device_id);
+    if (shm.shm_size > 0 && client_) {
+        auto res = client_->unregisterLocalMemory(shm.shm_buffer, true);
+        if (!res) {
+            LOG(WARNING)
+                << "Failed to unregister local memory for shared memory: "
+                << shm.shm_name << ", error: " << toString(res.error());
+        }
+    }
+    if (shm.is_ipc) {
+        if (!shm.ipc_key_data.empty()) {
+            (void)aclrtIpcMemClose(shm.ipc_key_data.data());
+        }
+        LOG(INFO) << "Free ipc mem suc.";
+        shm.ipc_key_data.clear();
+    } else {
+        aclrtUnmapMem(shm.shm_buffer);
+        aclrtReleaseMemAddress(shm.shm_buffer);
+        if (shm.vmm_handle != 0) {
+            aclrtFreePhysical(
+                reinterpret_cast<aclrtDrvMemHandle>(shm.vmm_handle));
+        }
+        shm.vmm_handle = 0;
+        LOG(INFO) << "Free vmm mem suc.";
+    }
+#endif
+}
+
+tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
+    const UUID &client_id) {
+    LOG(INFO) << "[ascend_unmap_shm] client_id=" << client_id
+              << ", action=unmapping";
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "[ascend_unmap_shm] client_id=" << client_id
+                   << ", error=shm_not_mapped";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &context = it->second;
+    context.client_buffer_allocator.reset();
+
+    // Move regions out before cleanup so failure paths cannot erase the map
+    // entry while iterating (undefined behavior) or double-erase at the end.
+    std::vector<MappedShm> shms = std::move(context.mapped_shms);
+    context.mapped_shms.clear();
+
+    for (auto &shm : shms) {
+        if (!shm.shm_buffer) {
+            continue;
+        }
+        teardown_ascend_shm_buffer(shm);
+    }
     shm_contexts_.erase(it);
     return {};
 }
@@ -1195,24 +1549,23 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 
     // Unmap and clean up the shm
     if (shm_it->shm_buffer) {
-        // Unregister from transfer engine if it was registered
-        if (shm_it->shm_size > 0) {
-            // Matching the usage in unmap_shm_internal
-            auto res = client_->unregisterLocalMemory(shm_it->shm_buffer,
-                                                      shm_it->shm_size);
-            if (!res) {
-                LOG(WARNING)
-                    << "Failed to unregister local memory for shared memory: "
-                    << shm_it->shm_name << ", error: " << toString(res.error());
-            }
-        }
-
-        if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
-            LOG(ERROR) << "Failed to munmap shared memory: " << shm_it->shm_name
-                       << ", error: " << strerror(errno);
+        if (shm_it->is_ascend) {
+            teardown_ascend_shm_buffer(*shm_it);
         } else {
-            LOG(INFO) << "Unmapped and cleaned up shared memory: "
-                      << shm_it->shm_name << ", size: " << shm_it->shm_size;
+            auto rc = client_->unregisterLocalMemory(shm_it->shm_buffer, true);
+            if (!rc) {
+                LOG(ERROR) << "Failed to unregister memory: "
+                           << shm_it->shm_name;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (munmap(shm_it->shm_buffer, shm_it->shm_size) != 0) {
+                LOG(ERROR) << "Failed to munmap shared memory: "
+                           << shm_it->shm_name
+                           << ", error: " << strerror(errno);
+            } else {
+                LOG(INFO) << "Unmapped and cleaned up shared memory: "
+                          << shm_it->shm_name << ", size: " << shm_it->shm_size;
+            }
         }
     }
 
@@ -1711,7 +2064,17 @@ RealClient::batch_put_from_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<uint64_t> &dummy_buffers,
     const std::vector<size_t> &sizes, const ReplicateConfig &config,
-    const UUID &client_id) {
+    int32_t device_id, const UUID &client_id) {
+    // Set the device context for the current thread
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -1721,42 +2084,13 @@ RealClient::batch_put_from_dummy_helper(
     }
     auto &context = it->second;
 
-    std::vector<void *> buffers;
-    buffers.reserve(dummy_buffers.size());
-    const MappedShm *last_hit_shm = nullptr;
-
-    for (size_t i = 0; i < dummy_buffers.size(); ++i) {
-        uint64_t dummy_addr = dummy_buffers[i];
-        size_t size = sizes[i];
-        bool found = false;
-
-        if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
-            dummy_addr + size <=
-                last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
-            buffers.push_back(reinterpret_cast<void *>(
-                dummy_addr + last_hit_shm->shm_addr_offset));
-            found = true;
-        } else {
-            for (const auto &shm : context.mapped_shms) {
-                if (dummy_addr >= shm.dummy_base_addr &&
-                    dummy_addr + size <= shm.dummy_base_addr + shm.shm_size) {
-                    buffers.push_back(reinterpret_cast<void *>(
-                        dummy_addr + shm.shm_addr_offset));
-                    found = true;
-                    last_hit_shm = &shm;
-                    break;
-                }
-            }
-        }
-
-        if (!found) {
-            LOG(ERROR) << "Dummy buffer at " << dummy_addr
-                       << " not found in any mapped shared memory";
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
+    auto buffers_result =
+        map_dummy_addrs_to_real_ptrs(context, dummy_buffers, sizes, client_id);
+    if (!buffers_result) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(buffers_result.error()));
     }
-    return batch_put_from_internal(keys, buffers, sizes, config);
+    return batch_put_from_internal(keys, buffers_result.value(), sizes, config);
 }
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
@@ -1878,7 +2212,17 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<uint64_t> &dummy_buffers,
-    const std::vector<size_t> &sizes, const UUID &client_id) {
+    const std::vector<size_t> &sizes, int32_t device_id,
+    const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -1888,44 +2232,84 @@ RealClient::batch_get_into_dummy_helper(
     }
     auto &context = it->second;
 
-    std::vector<void *> buffers;
-    buffers.reserve(dummy_buffers.size());
-    const MappedShm *last_hit_shm = nullptr;
-
-    for (size_t i = 0; i < dummy_buffers.size(); ++i) {
-        uint64_t dummy_addr = dummy_buffers[i];
-        size_t size = sizes[i];
-        bool found = false;
-
-        if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
-            dummy_addr + size <=
-                last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
-            buffers.push_back(reinterpret_cast<void *>(
-                dummy_addr + last_hit_shm->shm_addr_offset));
-            found = true;
-        } else {
-            for (const auto &shm : context.mapped_shms) {
-                if (dummy_addr >= shm.dummy_base_addr &&
-                    dummy_addr + size <= shm.dummy_base_addr + shm.shm_size) {
-                    buffers.push_back(reinterpret_cast<void *>(
-                        dummy_addr + shm.shm_addr_offset));
-                    found = true;
-                    last_hit_shm = &shm;
-                    break;
-                }
-            }
-        }
-
-        if (!found) {
-            LOG(ERROR) << "Dummy buffer at " << dummy_addr << " (size " << size
-                       << ") "
-                       << "not found in any mapped shared memory for client "
-                       << client_id;
-            return std::vector<tl::expected<int64_t, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
+    auto buffers_result =
+        map_dummy_addrs_to_real_ptrs(context, dummy_buffers, sizes, client_id);
+    if (!buffers_result) {
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(buffers_result.error()));
     }
-    return batch_get_into_internal(keys, buffers, sizes);
+    return batch_get_into_internal(keys, buffers_result.value(), sizes);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_multi_buffers_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    auto real_buffers_result = map_dummy_nested_addrs_to_real_ptrs(
+        context, dummy_all_buffers, all_sizes, keys, client_id);
+    if (!real_buffers_result) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(real_buffers_result.error()));
+    }
+
+    return batch_put_from_multi_buffers_internal(
+        keys, real_buffers_result.value(), all_sizes, config);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_multi_buffers_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    bool prefer_alloc_in_same_node, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    auto real_buffers_result = map_dummy_nested_addrs_to_real_ptrs(
+        context, dummy_all_buffers, all_sizes, keys, client_id);
+    if (!real_buffers_result) {
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(real_buffers_result.error()));
+    }
+
+    return batch_get_into_multi_buffers_internal(
+        keys, real_buffers_result.value(), all_sizes,
+        prefer_alloc_in_same_node);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -2448,7 +2832,11 @@ void RealClient::dummy_client_monitor_func() {
         if (!expired_clients.empty()) {
             for (auto &client_id : expired_clients) {
                 // Unmap mapped_shms associated with this client
-                unmap_shm_internal(client_id);
+                if (globalConfig().ascend_agent_mode) {
+                    ascend_unmap_shm_internal(client_id);
+                } else {
+                    unmap_shm_internal(client_id);
+                }
             }
         }
 

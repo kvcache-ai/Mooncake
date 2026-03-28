@@ -26,10 +26,14 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "serialize/serializer_backend.h"
+#include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 
 namespace mooncake {
+namespace ha {
+class SnapshotCatalogStore;
+}
+
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
@@ -434,11 +438,13 @@ class MasterService {
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
 
-    tl::expected<void, SerializationError> UploadSnapshotFile(
+    tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
+    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
+    ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();
@@ -484,12 +490,13 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin)
+            bool enable_soft_pin, bool enable_hard_pin = false)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
+              hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
@@ -516,6 +523,7 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
+        const bool hard_pinned{false};          // immutable, set at creation
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -683,6 +691,8 @@ class MasterService {
             SpinLocker locker(&lock);
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
+
+        bool IsHardPinned() const { return hard_pinned; }
 
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
@@ -897,7 +907,8 @@ class MasterService {
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
-                    std::vector<Replica> replicas, bool enable_soft_pin) {
+                    std::vector<Replica> replicas, bool enable_soft_pin,
+                    bool enable_hard_pin = false) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -905,7 +916,8 @@ class MasterService {
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin));
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin));
             it_ = result.first;
         }
 
@@ -1028,6 +1040,8 @@ class MasterService {
 
     const bool enable_offload_;
 
+    const std::string ha_backend_connstring_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
@@ -1054,7 +1068,10 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::unique_ptr<SerializerBackend> snapshot_backend_;
+    std::string snapshot_catalog_store_type_{};
+    std::string snapshot_catalog_store_connstring_;
+    std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
+    std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
 
     // Discarded replicas management

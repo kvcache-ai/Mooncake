@@ -58,9 +58,17 @@ struct MasterConfig {
     uint64_t snapshot_child_timeout_seconds;
     uint32_t snapshot_retention_count;
 
-    // Snapshot storage backend type: "local" or "s3", required when snapshot
-    // or restore is enabled
-    std::string snapshot_backend_type;
+    // Snapshot object store type: "local" or "s3", required when
+    // snapshot or restore is enabled
+    std::string snapshot_object_store_type;
+
+    // Snapshot catalog store type: ""/"embedded" or "redis". Empty keeps the
+    // embedded catalog behavior. "payload" remains a deprecated alias.
+    std::string snapshot_catalog_store_type;
+
+    // Optional connection string for snapshot catalog store. When empty, the
+    // implementation may fall back to a backend-specific default.
+    std::string snapshot_catalog_store_connstring;
 
     // Task manager configuration
     uint32_t max_total_finished_tasks;
@@ -124,7 +132,9 @@ class MasterServiceSupervisorConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -181,7 +191,10 @@ class MasterServiceSupervisorConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -253,6 +266,7 @@ class WrappedMasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -271,7 +285,9 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -304,6 +320,7 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -342,7 +359,10 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -374,6 +394,7 @@ class WrappedMasterServiceConfig {
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -389,7 +410,10 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -420,6 +444,7 @@ class MasterServiceConfigBuilder {
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -437,7 +462,9 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type_;
+    std::string snapshot_object_store_type_;
+    std::string snapshot_catalog_store_type_;
+    std::string snapshot_catalog_store_connstring_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -496,6 +523,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_backend_connstring(
+        const std::string& connstring) {
+        ha_backend_connstring_ = connstring;
         return *this;
     }
 
@@ -572,11 +605,45 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_snapshot_backend_type(
+    MasterServiceConfigBuilder& set_snapshot_object_store_type(
         const std::string& type) {
-        snapshot_backend_type_ = type;
+        snapshot_object_store_type_ = type;
         return *this;
     }
+
+    // Deprecated compatibility shims for older tests and call sites.
+    MasterServiceConfigBuilder& set_snapshot_payload_store_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_payload_backend_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_type(
+        const std::string& type) {
+        snapshot_catalog_store_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_backend_type(
+        const std::string& type) {
+        return set_snapshot_catalog_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_connstring(
+        const std::string& connstring) {
+        snapshot_catalog_store_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_backend_connstring(
+        const std::string& connstring) {
+        return set_snapshot_catalog_store_connstring(connstring);
+    }
+
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
         uint32_t max_total_finished_tasks) {
         max_total_finished_tasks_ = max_total_finished_tasks;
@@ -652,6 +719,7 @@ class MasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -670,7 +738,9 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_backend_type;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -699,6 +769,7 @@ class MasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -716,7 +787,10 @@ class MasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_retention_count = config.snapshot_retention_count;
-        snapshot_backend_type = config.snapshot_backend_type;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -750,6 +824,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
@@ -765,7 +840,10 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_retention_count = snapshot_retention_count_;
-    config.snapshot_backend_type = snapshot_backend_type_;
+    config.snapshot_object_store_type = snapshot_object_store_type_;
+    config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
+    config.snapshot_catalog_store_connstring =
+        snapshot_catalog_store_connstring_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =

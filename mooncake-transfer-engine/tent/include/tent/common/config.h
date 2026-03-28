@@ -75,6 +75,33 @@ class Config {
         return get<std::string>(key, std::string(def));
     }
 
+    bool contains(const std::string& key_path) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (key_path.empty()) return false;
+
+        const json* node = &config_data_;
+        std::string::size_type start = 0;
+        bool nested_found = true;
+        while (start < key_path.size()) {
+            auto pos = key_path.find(kDelimiter, start);
+            auto segment = key_path.substr(start, pos - start);
+            start = (pos == std::string::npos) ? key_path.size() : pos + 1;
+            if (segment.empty()) continue;
+            auto it = node->find(segment);
+            if (it == node->end()) {
+                nested_found = false;
+                break;
+            }
+            node = &(*it);
+        }
+        if (nested_found && !node->is_null()) {
+            return true;
+        }
+
+        auto flat_it = config_data_.find(key_path);
+        return flat_it != config_data_.end() && !flat_it->is_null();
+    }
+
     template <typename T>
     std::vector<T> getArray(const std::string& key) const {
         return get<std::vector<T>>(key, {});

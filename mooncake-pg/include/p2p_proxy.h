@@ -17,7 +17,7 @@
 
 namespace mooncake {
 
-inline constexpr size_t kP2PBufferSize = 1u << 20;
+inline constexpr size_t kP2PBufferSize = 1u << 24;
 inline constexpr size_t kP2PNumSlots = 8;
 inline constexpr size_t kP2PSlotSize = kP2PBufferSize / kP2PNumSlots;
 

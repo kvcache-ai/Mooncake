@@ -106,7 +106,6 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 // Dummy implement for solving build issues, WIP
 Status NVMeoFTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     /* TBD */
     return Status::OK();

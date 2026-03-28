@@ -61,8 +61,125 @@ struct Batch {
     std::vector<SubmitHook> submit_hooks;
 };
 
+struct PreservedTentConfigOverrides {
+    std::optional<std::string> metadata_type;
+    std::optional<std::string> metadata_servers;
+    std::optional<std::string> local_segment_name;
+    std::optional<std::string> rpc_server_hostname;
+    std::optional<json> rpc_server_port;
+};
+
+template <typename T>
+std::optional<T> captureExplicitConfigValue(const Config& config,
+                                            const std::string& key,
+                                            const T& default_value) {
+    if (!config.contains(key)) {
+        return std::nullopt;
+    }
+    return config.get<T>(key, default_value);
+}
+
+std::optional<long long> tryParseConfigIntString(const std::string& value) {
+    try {
+        size_t parsed_chars = 0;
+        long long parsed_value = std::stoll(value, &parsed_chars);
+        if (parsed_chars == value.size()) {
+            return parsed_value;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+Status validateRpcServerPortValue(long long value, const std::string& source,
+                                  uint16_t& port) {
+    constexpr long long kMinPort = 0;
+    constexpr long long kMaxPort = std::numeric_limits<uint16_t>::max();
+    if (value < kMinPort || value > kMaxPort) {
+        return Status::InvalidArgument("Invalid rpc_server_port '" + source +
+                                       "', expected value in range [0, " +
+                                       std::to_string(kMaxPort) + "]" +
+                                       LOC_MARK);
+    }
+
+    port = static_cast<uint16_t>(value);
+    return Status::OK();
+}
+
+Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
+                                  uint16_t& port) {
+    constexpr const char* kKey = "rpc_server_port";
+    if (!config.contains(kKey)) {
+        port = default_value;
+        return Status::OK();
+    }
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validateRpcServerPortValue(numeric_value,
+                                          std::to_string(numeric_value), port);
+    }
+
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_port '" + string_value +
+                "', expected integer in range [0, 65535]" LOC_MARK);
+        }
+        return validateRpcServerPortValue(*parsed_value, string_value, port);
+    }
+
+    return Status::InvalidArgument(
+        "rpc_server_port must be an integer or integer string" LOC_MARK);
+}
+
+PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
+    const Config& config) {
+    PreservedTentConfigOverrides preserved;
+    preserved.metadata_type =
+        captureExplicitConfigValue(config, "metadata_type", std::string());
+    preserved.metadata_servers =
+        captureExplicitConfigValue(config, "metadata_servers", std::string());
+    preserved.local_segment_name =
+        captureExplicitConfigValue(config, "local_segment_name", std::string());
+    preserved.rpc_server_hostname = captureExplicitConfigValue(
+        config, "rpc_server_hostname", std::string());
+    preserved.rpc_server_port =
+        captureExplicitConfigValue(config, "rpc_server_port", json());
+    return preserved;
+}
+
+template <typename T>
+void restoreExplicitConfigValue(Config& config, const std::string& key,
+                                const std::optional<T>& value) {
+    if (value.has_value()) {
+        config.set(key, *value);
+    }
+}
+
+void restoreExplicitTransferEngineConfig(
+    Config& config, const PreservedTentConfigOverrides& preserved) {
+    restoreExplicitConfigValue(config, "metadata_type",
+                               preserved.metadata_type);
+    restoreExplicitConfigValue(config, "metadata_servers",
+                               preserved.metadata_servers);
+    restoreExplicitConfigValue(config, "local_segment_name",
+                               preserved.local_segment_name);
+    restoreExplicitConfigValue(config, "rpc_server_hostname",
+                               preserved.rpc_server_hostname);
+    restoreExplicitConfigValue(config, "rpc_server_port",
+                               preserved.rpc_server_port);
+}
+
 TransferEngineImpl::TransferEngineImpl()
-    : conf_(std::make_shared<Config>()), available_(false) {
+    : conf_(std::make_shared<Config>()),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
@@ -74,9 +191,16 @@ TransferEngineImpl::TransferEngineImpl()
 }
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
-    : conf_(conf), available_(false) {
-    // Load environment variables - they should override config file settings
+    : conf_(conf),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
+    auto preserved = captureExplicitTransferEngineConfig(*conf_);
+    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
+    // explicit metadata identity intact.
     ConfigHelper().loadFromEnv(*conf_);
+    restoreExplicitTransferEngineConfig(*conf_, preserved);
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -142,6 +266,12 @@ Status TransferEngineImpl::construct() {
         redis_password = env_password;
     }
 
+    std::string redis_username;
+    const char* env_username = std::getenv("MC_REDIS_USERNAME");
+    if (env_username && *env_username) {
+        redis_username = env_username;
+    }
+
     // Get Redis DB index from environment variable or config
     int redis_db_index_config = conf_->get("redis_db_index", 0);
     const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
@@ -158,7 +288,7 @@ Status TransferEngineImpl::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
-    port_ = conf_->get("rpc_server_port", 0);
+    CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
@@ -181,7 +311,8 @@ Status TransferEngineImpl::construct() {
     }
 
     metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, redis_password, db_index, this);
+        metadata_type, metadata_servers, redis_username, redis_password,
+        db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 

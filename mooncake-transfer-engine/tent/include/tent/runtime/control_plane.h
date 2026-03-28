@@ -108,6 +108,10 @@ class ControlService {
                    const std::string& password, uint8_t db_index,
                    TransferEngineImpl* impl);
 
+    ControlService(const std::string& type, const std::string& servers,
+                   const std::string& username, const std::string& password,
+                   uint8_t db_index, TransferEngineImpl* impl);
+
     ~ControlService();
 
     ControlService(const ControlService&) = delete;
