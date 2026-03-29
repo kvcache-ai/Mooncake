@@ -60,9 +60,27 @@ enum class HandShakeRequestType {
     Connection = 0,
     Metadata = 1,
     Notify = 2,
+    DeleteEndpoint = 3,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
+
+static inline const char *handshakeRequestTypeName(HandShakeRequestType type) {
+    switch (type) {
+        case HandShakeRequestType::Connection:
+            return "Connection";
+        case HandShakeRequestType::Metadata:
+            return "Metadata";
+        case HandShakeRequestType::Notify:
+            return "Notify";
+        case HandShakeRequestType::DeleteEndpoint:
+            return "DeleteEndpoint";
+        case HandShakeRequestType::OldProtocol:
+            return "OldProtocol";
+        default:
+            return "Unknown";
+    }
+}
 
 static inline std::string getHostname() {
     char hostname[256];
@@ -424,7 +442,7 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
-    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Notify)) {
+    if (buffer[0] <= static_cast<char>(HandShakeRequestType::DeleteEndpoint)) {
         type = static_cast<HandShakeRequestType>(buffer[0]);
         str.assign(buffer.data() + sizeof(char), length - sizeof(char));
     } else {

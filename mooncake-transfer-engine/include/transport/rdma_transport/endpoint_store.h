@@ -18,6 +18,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -27,6 +28,10 @@
 using namespace mooncake;
 
 namespace mooncake {
+
+// Callback type for endpoint deletion notification
+using OnDeleteEndpointCallback =
+    std::function<void(const std::string &peer_nic_path, uint64_t endpoint_id)>;
 // TODO: this can be implemented in std::concept from c++20
 /* TODO: A better abstraction may be used to reduce redundant codes,
 for example, make "cache eviction policy" a abstract class. Currently,
@@ -36,11 +41,17 @@ different eviction policy may need different data structure
 */
 class EndpointStore {
    public:
+    virtual ~EndpointStore() = default;
+
     virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) = 0;
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
+    // Delete endpoint only if its peer_endpoint_id matches (to avoid deleting
+    // a newer replacement endpoint for the same nic_path)
+    virtual int deleteEndpoint(const std::string &peer_nic_path,
+                               uint64_t peer_endpoint_id) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
     virtual size_t getSize() = 0;
@@ -50,6 +61,10 @@ class EndpointStore {
 
     // Get the total number of QPs across all endpoints
     virtual size_t getTotalQPNumber() = 0;
+
+    // Set callback for endpoint deletion notification
+    virtual void setOnDeleteEndpointCallback(
+        OnDeleteEndpointCallback callback) = 0;
 };
 
 // FIFO
@@ -61,6 +76,8 @@ class FIFOEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
+    int deleteEndpoint(const std::string &peer_nic_path,
+                       uint64_t peer_endpoint_id) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -69,6 +86,11 @@ class FIFOEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
+
+    void setOnDeleteEndpointCallback(
+        OnDeleteEndpointCallback callback) override {
+        on_delete_endpoint_callback_ = std::move(callback);
+    }
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -80,6 +102,7 @@ class FIFOEndpointStore : public EndpointStore {
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
 
     size_t max_size_;
+    OnDeleteEndpointCallback on_delete_endpoint_callback_;
 };
 
 // NSDI 24, similar to clock with quick demotion
@@ -92,6 +115,8 @@ class SIEVEEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
+    int deleteEndpoint(const std::string &peer_nic_path,
+                       uint64_t peer_endpoint_id) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -100,6 +125,11 @@ class SIEVEEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
+
+    void setOnDeleteEndpointCallback(
+        OnDeleteEndpointCallback callback) override {
+        on_delete_endpoint_callback_ = std::move(callback);
+    }
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -116,6 +146,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::atomic<int> waiting_list_len_;
 
     size_t max_size_;
+    OnDeleteEndpointCallback on_delete_endpoint_callback_;
 };
 }  // namespace mooncake
 
