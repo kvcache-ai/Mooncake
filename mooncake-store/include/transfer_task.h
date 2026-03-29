@@ -18,6 +18,7 @@
 #include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
+#include "trace_context.h"
 
 namespace mooncake {
 
@@ -173,8 +174,10 @@ class FilereadOperationState : public OperationState {
 class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
+                                 size_t batch_size,
+                                 mooncake::tracing::TraceContext trace_context = {})
+        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size),
+          trace_context_(std::move(trace_context)) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -199,6 +202,7 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    mooncake::tracing::TraceContext trace_context_;
 };
 
 /**

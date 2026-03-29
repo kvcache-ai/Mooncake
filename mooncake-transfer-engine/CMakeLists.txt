@@ -45,6 +45,7 @@ endif()
 
 include_directories(../mooncake-common/include)
 include_directories(include)
+include_directories(../mooncake-tracing/include)
 add_subdirectory(include)
 add_subdirectory(src)
 

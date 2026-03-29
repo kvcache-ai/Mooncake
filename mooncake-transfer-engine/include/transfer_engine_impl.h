@@ -25,6 +25,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "memory_location.h"
@@ -32,6 +33,8 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "trace_support.h"
+#include "tracing_facade.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -114,7 +117,14 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
+        auto& tracing = mooncake::tracing::TracingFacade::Instance(
+            "mooncake-transfer-engine", "transfer-engine");
+        auto span = tracing.StartSpan(
+            "submitTransfer", nullptr,
+            {{"te.batch_id", std::to_string(batch_id)},
+             {"transfer.count", std::to_string(entries.size())}});
         Status s = multi_transports_->submitTransfer(batch_id, entries);
+        if (!s.ok()) span.SetStatus("ERROR");
 #ifdef WITH_METRICS
         if (metrics_enabled_ && s.ok()) {
             auto& batch = Transport::toBatchDesc(batch_id);
@@ -126,14 +136,28 @@ class TransferEngineImpl {
             }
         }
 #endif
+        if (s.ok()) {
+            span_contexts_[batch_id] = span.context();
+        }
         return s;
     }
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg) {
+        auto& tracing = mooncake::tracing::TracingFacade::Instance(
+            "mooncake-transfer-engine", "transfer-engine");
+        auto parent = span_contexts_.find(batch_id);
+        mooncake::tracing::Span span = parent != span_contexts_.end()
+            ? tracing.StartSpan("submitTransferWithNotify", &parent->second,
+                                {{"te.batch_id", std::to_string(batch_id)}})
+            : tracing.StartSpan("submitTransferWithNotify", nullptr,
+                                {{"te.batch_id", std::to_string(batch_id)}});
         auto target_id = entries[0].target_id;
+        notify_msg.trace_carrier = mooncake::tracing::EncodeCarrierString(
+            mooncake::tracing::ToCarrier(span.context()));
         Status s = multi_transports_->submitTransfer(batch_id, entries);
+        if (!s.ok()) span.SetStatus("ERROR");
         if (!s.ok()) {
             return s;
         }
@@ -316,6 +340,17 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            auto it_ctx = span_contexts_.find(batch_id);
+            auto& tracing = mooncake::tracing::TracingFacade::Instance(
+                "mooncake-transfer-engine", "transfer-engine");
+            auto span = it_ctx != span_contexts_.end()
+                ? tracing.StartSpan("getBatchTransferStatus", &it_ctx->second,
+                                    {{"te.batch_id", std::to_string(batch_id)},
+                                     {"status", "COMPLETED"}})
+                : tracing.StartSpan("getBatchTransferStatus", nullptr,
+                                    {{"te.batch_id", std::to_string(batch_id)},
+                                     {"status", "COMPLETED"}});
+            span.AddEvent("batch terminal status");
             // send notify
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
             if (!notifies_to_send_.count(batch_id)) return result;
@@ -388,6 +423,8 @@ class TransferEngineImpl {
     std::unordered_map<BatchID,
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
+
+    std::unordered_map<BatchID, mooncake::tracing::TraceContext> span_contexts_;
 
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.

@@ -135,6 +135,7 @@ class TransferMetadata {
     struct NotifyDesc {
         std::string name;
         std::string notify_msg;
+        std::string trace_carrier;
     };
 
    public:

@@ -27,7 +27,8 @@ size_t ScopedTaskReadAccess::size() const {
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
-    const UUID& client_id, TaskType type, const std::string& payload) {
+    const UUID& client_id, TaskType type, const std::string& payload,
+    const std::string& trace_carrier) {
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
@@ -47,7 +48,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .last_updated_at = now,
                  .message = "",
                  .assigned_client = client_id,
-                 .max_retry_attempts = manager_->max_retry_attempts_};
+                 .max_retry_attempts = manager_->max_retry_attempts_,
+                 .trace_carrier = trace_carrier};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);

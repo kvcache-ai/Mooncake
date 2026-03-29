@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "tracing_facade.h"
 
 namespace mooncake {
 
@@ -223,6 +224,12 @@ bool TransferEngineOperationState::is_completed() {
 }
 
 void TransferEngineOperationState::check_task_status() {
+    auto& tracing = mooncake::tracing::TracingFacade::Instance(
+        "mooncake-store", "transfer-task");
+    auto span = tracing.StartSpan("mooncake.transfer.wait_completion",
+                                  trace_context_.valid() ? &trace_context_ : nullptr,
+                                  {{"te.batch_id", std::to_string(batch_id_)},
+                                   {"batch.size", std::to_string(batch_size_)}});
     // Check all transfers in the batch
     bool all_completed = true;
     bool has_failure = false;
@@ -234,6 +241,7 @@ void TransferEngineOperationState::check_task_status() {
             LOG(ERROR) << "Failed to get transfer status for batch "
                        << batch_id_ << " task " << i << " with error "
                        << s.message();
+            span.SetStatus("ERROR");
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -251,6 +259,7 @@ void TransferEngineOperationState::check_task_status() {
                            << static_cast<int>(status.s);
 #endif
                 has_failure = true;
+                span.AddEvent("transfer failed", {{"task.id", std::to_string(i)}});
                 break;
             default:
                 // Transfer is still pending (PENDING, RUNNING, etc.)
