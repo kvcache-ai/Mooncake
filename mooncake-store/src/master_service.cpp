@@ -13,6 +13,10 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "etcd_oplog_store.h"
+#endif
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -61,6 +65,12 @@ tl::expected<SnapshotCatalogBackendKind, std::string> ParseSnapshotCatalogKind(
                                std::string(store_type));
 }
 
+int64_t CurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -71,9 +81,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
@@ -2237,6 +2249,74 @@ void MasterService::HandleChildExit(pid_t pid, int status,
     }
 }
 
+tl::expected<ha::OpLogSequenceId, SerializationError>
+MasterService::ResolveSnapshotSequenceId() const {
+    if (!enable_ha_ || ha_backend_type_ != "etcd") {
+        return ha::OpLogSequenceId{0};
+    }
+
+#ifndef STORE_USE_ETCD
+    return tl::make_unexpected(SerializationError(
+        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+        "etcd snapshot sequence resolution is unavailable in this build"));
+#else
+    if (ha_backend_connstring_.empty()) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::INVALID_PARAMS,
+            "etcd snapshot sequence resolution requires a backend connstring"));
+    }
+
+    auto err =
+        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_.c_str());
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to connect to etcd for snapshot boundary: "
+                             "{}",
+                             toString(err))));
+    }
+
+    EtcdOpLogStore oplog_store(cluster_id_);
+    err = oplog_store.Init();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to initialize etcd oplog store: {}",
+                             toString(err))));
+    }
+
+    uint64_t sequence_id = 0;
+    err = oplog_store.GetLatestSequenceId(sequence_id);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ha::OpLogSequenceId{0};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to resolve snapshot sequence boundary: {}",
+                             toString(err))));
+    }
+
+    return static_cast<ha::OpLogSequenceId>(sequence_id);
+#endif
+}
+
+tl::expected<ha::SnapshotDescriptor, SerializationError>
+MasterService::BuildSnapshotDescriptor(const std::string& snapshot_id,
+                                       const std::string& manifest_path,
+                                       const std::string& object_prefix) const {
+    auto sequence_id = ResolveSnapshotSequenceId();
+    if (!sequence_id) {
+        return tl::make_unexpected(sequence_id.error());
+    }
+
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
+    descriptor.last_included_seq = sequence_id.value();
+    descriptor.producer_view_version = view_version_;
+    descriptor.manifest_key = manifest_path;
+    descriptor.object_prefix = object_prefix;
+    descriptor.created_at_ms = CurrentTimeMs();
+    return descriptor;
+}
+
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
@@ -2245,6 +2325,21 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             return tl::make_unexpected(SerializationError(
                 ErrorCode::PERSISTENT_FAIL,
                 "snapshot catalog store is not initialized"));
+        }
+
+        // Freeze snapshot metadata before any serialization or payload upload
+        // so the descriptor boundary matches the actual snapshot contents.
+        const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        auto descriptor =
+            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
+        if (!descriptor) {
+            SNAP_LOG_ERROR(
+                "[Snapshot] build descriptor failed, snapshot_id={}, code={}, "
+                "msg={}",
+                snapshot_id, toString(descriptor.error().code),
+                descriptor.error().message);
+            return tl::make_unexpected(descriptor.error());
         }
 
         SNAP_LOG_INFO(
@@ -2295,8 +2390,6 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             "[Snapshot] task manager serialization_successful, snapshot_id={}",
             snapshot_id);
 
-        // Create storage path prefix
-        std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
         const auto& serialized_metadata = metadata_result.value();
         const auto& serialized_segment = segment_result.value();
         const auto& serialized_task_manager = task_manager_result.value();
@@ -2366,7 +2459,6 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         }
 
         // Upload manifest
-        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
             fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
                         SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
@@ -2397,11 +2489,8 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        ha::SnapshotDescriptor descriptor;
-        descriptor.snapshot_id = snapshot_id;
-        descriptor.manifest_key = manifest_path;
-        descriptor.object_prefix = path_prefix;
-        auto publish_result = snapshot_catalog_store->Publish(descriptor);
+        auto publish_result =
+            snapshot_catalog_store->Publish(descriptor.value());
         if (publish_result != ErrorCode::OK) {
             SNAP_LOG_ERROR(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}, "
