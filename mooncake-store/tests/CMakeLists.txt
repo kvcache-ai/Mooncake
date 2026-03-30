@@ -125,6 +125,8 @@ add_ha_test(ha_metric_manager_test
             ha/standby/ha_metric_manager_test.cpp)
 add_ha_test(hot_standby_service_test
             ha/standby/hot_standby_service_test.cpp)
+add_ha_test(replication_controller_test
+            ha/standby/replication_controller_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
