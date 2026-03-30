@@ -2718,49 +2718,104 @@ void MasterService::CleanupOldSnapshot(int keep_count,
 }
 
 void MasterService::RestoreState() {
+    auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+    if (!snapshot_catalog_store) {
+        LOG(ERROR) << "[Restore] Snapshot catalog store is not initialized, "
+                      "starting fresh";
+        return;
+    }
+
+    LOG(INFO) << "[Restore] Backend info: "
+              << snapshot_object_store_->GetConnectionInfo();
+
+    std::vector<ha::SnapshotDescriptor> restore_candidates;
+    std::unordered_set<std::string> candidate_ids;
+    std::optional<std::string> latest_snapshot_id;
+
+    auto latest_result = snapshot_catalog_store->GetLatest();
+    if (!latest_result) {
+        LOG(WARNING) << "[Restore] Failed to load latest snapshot marker: "
+                     << toString(latest_result.error())
+                     << ", falling back to published snapshot listing";
+    } else if (latest_result->has_value()) {
+        const auto& latest_snapshot = latest_result->value();
+        latest_snapshot_id = latest_snapshot.snapshot_id;
+        restore_candidates.push_back(latest_snapshot);
+        candidate_ids.emplace(latest_snapshot.snapshot_id);
+    }
+
+    auto snapshots_result =
+        snapshot_catalog_store->List(kUnlimitedSnapshotList);
+    if (!snapshots_result) {
+        if (restore_candidates.empty()) {
+            LOG(ERROR) << "[Restore] Failed to list restorable snapshots: "
+                       << toString(snapshots_result.error())
+                       << ", starting fresh";
+            return;
+        }
+        LOG(WARNING) << "[Restore] Failed to list fallback snapshots: "
+                     << toString(snapshots_result.error())
+                     << ", attempting latest marker only";
+    } else {
+        for (const auto& snapshot : snapshots_result.value()) {
+            if (latest_snapshot_id.has_value() &&
+                snapshot.snapshot_id > latest_snapshot_id.value()) {
+                continue;
+            }
+            if (!candidate_ids.emplace(snapshot.snapshot_id).second) {
+                continue;
+            }
+            restore_candidates.push_back(snapshot);
+        }
+    }
+
+    if (restore_candidates.empty()) {
+        LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    for (const auto& snapshot : restore_candidates) {
+        ResetStateAfterFailedRestoreAttempt();
+        if (TryRestoreStateFromSnapshot(snapshot, now)) {
+            return;
+        }
+    }
+
+    ResetStateAfterFailedRestoreAttempt();
+    LOG(ERROR) << "[Restore] Failed to restore from all candidate snapshots "
+               << "(count=" << restore_candidates.size() << "), starting fresh";
+}
+
+bool MasterService::TryRestoreStateFromSnapshot(
+    const ha::SnapshotDescriptor& snapshot,
+    const std::chrono::system_clock::time_point& now) {
+    const std::string& state_id = snapshot.snapshot_id;
+    std::string path_prefix = snapshot.object_prefix;
+    if (path_prefix.empty()) {
+        path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
+    }
+
+    std::string manifest_path = snapshot.manifest_key;
+    if (manifest_path.empty()) {
+        manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+    }
+
+    auto fail_restore = [&](const std::string& message) {
+        LOG(WARNING) << "[Restore] Snapshot candidate " << state_id
+                     << " is unusable: " << message;
+        ResetStateAfterFailedRestoreAttempt();
+        return false;
+    };
+
     try {
-        auto* snapshot_catalog_store = GetSnapshotCatalogStore();
-        if (!snapshot_catalog_store) {
-            LOG(ERROR) << "[Restore] Snapshot catalog store is not "
-                          "initialized, starting fresh";
-            return;
-        }
-
-        auto now = std::chrono::system_clock::now();
-
-        LOG(INFO) << "[Restore] Backend info: "
-                  << snapshot_object_store_->GetConnectionInfo();
-        // 1. Resolve the latest snapshot from the snapshot catalog.
-        auto latest_result = snapshot_catalog_store->GetLatest();
-        if (!latest_result) {
-            LOG(ERROR) << "[Restore] Failed to load latest snapshot: "
-                       << toString(latest_result.error()) << ", starting fresh";
-            return;
-        }
-        if (!latest_result.value().has_value()) {
-            LOG(ERROR)
-                << "[Restore] No previous snapshot found, starting fresh";
-            return;
-        }
-
-        const auto& latest_snapshot = latest_result.value().value();
-        const std::string& state_id = latest_snapshot.snapshot_id;
-        std::string path_prefix = latest_snapshot.object_prefix;
-        if (path_prefix.empty()) {
-            path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
-        }
-
-        // 2. Download manifest.txt to parse protocol version info
-        std::string manifest_path = latest_snapshot.manifest_key;
-        if (manifest_path.empty()) {
-            manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-        }
         std::string manifest_content;
-        if (!snapshot_object_store_->DownloadString(manifest_path,
-                                                    manifest_content)) {
-            LOG(ERROR) << "[Restore] Failed to download manifest file: "
-                       << manifest_path << " , starting fresh";
-            return;
+        auto manifest_result = snapshot_object_store_->DownloadString(
+            manifest_path, manifest_content);
+        if (!manifest_result) {
+            return fail_restore("failed to download manifest '" +
+                                manifest_path +
+                                "': " + manifest_result.error());
         }
 
         if (use_snapshot_backup_dir_) {
@@ -2774,50 +2829,37 @@ void MasterService::RestoreState() {
             }
         }
 
-        // Format: protocol_type|version|20230801_123456_000
         std::vector<std::string> parts;
         boost::split(parts, manifest_content, boost::is_any_of("|"));
-
-        std::string protocol_type;  // Protocol type
-        std::string version;        // Version
-
-        if (parts.size() >= 3) {
-            protocol_type = parts[0];
-            version = parts[1];
-        } else {
-            // Invalid format
-            LOG(ERROR) << "[Restore] Invalid snapshot manifest format: "
-                       << manifest_content;
-            return;
+        if (parts.size() < 3) {
+            return fail_restore("invalid snapshot manifest format");
         }
 
-        LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
+        const std::string& protocol_type = parts[0];
+        const std::string& version = parts[1];
+
+        LOG(INFO) << "[Restore] Trying snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
 
-        // Strict compatibility check: fail fast on version/protocol mismatch
         if (protocol_type != SNAPSHOT_SERIALIZER_TYPE) {
-            LOG(ERROR) << "[Restore] Unsupported protocol type: "
-                       << protocol_type
-                       << ", expected: " << SNAPSHOT_SERIALIZER_TYPE
-                       << ", starting fresh";
-            return;
+            return fail_restore("unsupported protocol type '" + protocol_type +
+                                "', expected '" + SNAPSHOT_SERIALIZER_TYPE +
+                                "'");
         }
         if (version != SNAPSHOT_SERIALIZER_VERSION) {
-            LOG(ERROR) << "[Restore] Incompatible snapshot version: " << version
-                       << ", expected: " << SNAPSHOT_SERIALIZER_VERSION
-                       << ", starting fresh";
-            return;
+            return fail_restore("incompatible snapshot version '" + version +
+                                "', expected '" + SNAPSHOT_SERIALIZER_VERSION +
+                                "'");
         }
 
-        // 3. Download metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
         auto download_result = snapshot_object_store_->DownloadBuffer(
             metadata_path, metadata_content);
         if (!download_result) {
-            LOG(ERROR) << "[Restore] Failed to download metadata file: "
-                       << metadata_path << "error=" << download_result.error();
-            return;
+            return fail_restore("failed to download metadata '" +
+                                metadata_path +
+                                "': " + download_result.error());
         }
 
         if (use_snapshot_backup_dir_) {
@@ -2832,15 +2874,14 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
-        // 4. Download segments
         std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         std::vector<uint8_t> segments_content;
         download_result = snapshot_object_store_->DownloadBuffer(
             segments_path, segments_content);
         if (!download_result) {
-            LOG(ERROR) << "Failed to download segments file: " << segments_path
-                       << " error=" << download_result.error();
-            return;
+            return fail_restore("failed to download segments '" +
+                                segments_path +
+                                "': " + download_result.error());
         }
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
@@ -2854,17 +2895,15 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download segments file success";
 
-        // 5. Download task manager state
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
         std::vector<uint8_t> task_manager_content;
         download_result = snapshot_object_store_->DownloadBuffer(
             task_manager_path, task_manager_content);
         if (!download_result) {
-            LOG(ERROR) << "Failed to download task manager file: "
-                       << task_manager_path
-                       << " error=" << download_result.error();
-            return;
+            return fail_restore("failed to download task_manager '" +
+                                task_manager_path +
+                                "': " + download_result.error());
         }
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
@@ -2878,45 +2917,37 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download task manager file success";
 
-        // 6. Deserialize state
         SegmentSerializer segment_serializer(&segment_manager_);
         MetadataSerializer metadata_serializer(this);
         TaskManagerSerializer task_manager_serializer(&task_manager_);
 
         auto segments_result = segment_serializer.Deserialize(segments_content);
         if (!segments_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize segments: "
-                       << segments_result.error().code << " - "
-                       << segments_result.error().message;
-            segment_serializer.Reset();
-            return;
+            return fail_restore(
+                fmt::format("failed to deserialize segments: {} - {}",
+                            static_cast<int>(segments_result.error().code),
+                            segments_result.error().message));
         }
         LOG(INFO) << "[Restore] Deserialize segments success";
 
         auto metadata_result =
             metadata_serializer.Deserialize(metadata_content);
         if (!metadata_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize metadata: "
-                       << metadata_result.error().code;
-            metadata_serializer.Reset();
-            segment_serializer.Reset();
-            return;
+            return fail_restore(
+                fmt::format("failed to deserialize metadata: {} - {}",
+                            static_cast<int>(metadata_result.error().code),
+                            metadata_result.error().message));
         }
-
         LOG(INFO) << "[Restore] Deserialize metadata success";
 
         auto task_manager_result =
             task_manager_serializer.Deserialize(task_manager_content);
         if (!task_manager_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize task manager: "
-                       << task_manager_result.error().code << " - "
-                       << task_manager_result.error().message;
-            task_manager_serializer.Reset();
-            metadata_serializer.Reset();
-            segment_serializer.Reset();
-            return;
+            return fail_restore(
+                fmt::format("failed to deserialize task manager: {} - {}",
+                            static_cast<int>(task_manager_result.error().code),
+                            task_manager_result.error().message));
         }
-
         LOG(INFO) << "[Restore] Deserialize task manager success";
 
         std::vector<std::string> segment_names;
@@ -2927,18 +2958,17 @@ void MasterService::RestoreState() {
         }
 
         {
-            // After deserialization, iterate through metadata_shards_ to clean
-            // up non-ready metadata
             const bool skip_cleanup = std::getenv(
                 "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
             if (!skip_cleanup) {
+                auto cleanup_now = now;
                 for (auto& shard : metadata_shards_) {
                     for (auto it = shard.metadata.begin();
                          it != shard.metadata.end();) {
                         if (it->second.HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
-                            (it->second.IsLeaseExpired() &&
-                             !it->second.IsSoftPinned(now))) {
+                            (it->second.IsLeaseExpired(cleanup_now) &&
+                             !it->second.IsSoftPinned(cleanup_now))) {
                             VLOG(1)
                                 << "clear metadata key=" << it->first
                                 << " ,lease_timeout="
@@ -2965,8 +2995,6 @@ void MasterService::RestoreState() {
                 }
             }
 
-            // Restore memory usage
-            // Step 1: Reset memory usage
             MasterMetricManager::instance().reset_allocated_mem_size();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
@@ -3007,7 +3035,6 @@ void MasterService::RestoreState() {
         }
 
         {
-            // Reset total capacity
             MasterMetricManager::instance().reset_total_mem_capacity();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
@@ -3017,11 +3044,8 @@ void MasterService::RestoreState() {
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
             std::vector<std::pair<Segment, UUID>> unready_segments;
-
-            // Get all unready segments and their corresponding client_ids
             if (segment_access.GetUnreadySegments(unready_segments) ==
                 ErrorCode::OK) {
-                // Remove all unready segments
                 for (const auto& [segment, client_id] : unready_segments) {
                     UnmountSegment(segment.id, client_id);
                 }
@@ -3033,9 +3057,8 @@ void MasterService::RestoreState() {
             if (err == ErrorCode::OK) {
                 int64_t total_size = 0;
                 for (const auto& [segment, client_id] : all_segments) {
-                    Ping(client_id);  // Add to heartbeat monitoring
+                    Ping(client_id);
                     total_size += static_cast<int64_t>(segment.size);
-                    // Restore segment usage
                     MasterMetricManager::instance().inc_total_mem_capacity(
                         segment.name, segment.size);
                 }
@@ -3049,13 +3072,34 @@ void MasterService::RestoreState() {
 
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
                   << state_id;
-
+        return true;
     } catch (const std::exception& e) {
-        LOG(ERROR) << "[Restore] Exception during state restoration: "
-                   << e.what();
+        return fail_restore("exception during state restoration: " +
+                            std::string(e.what()));
     } catch (...) {
-        LOG(ERROR) << "[Restore] Unknown exception during state restoration";
+        return fail_restore("unknown exception during state restoration");
     }
+}
+
+void MasterService::ResetStateAfterFailedRestoreAttempt() {
+    SegmentSerializer segment_serializer(&segment_manager_);
+    MetadataSerializer metadata_serializer(this);
+    TaskManagerSerializer task_manager_serializer(&task_manager_);
+
+    task_manager_serializer.Reset();
+    metadata_serializer.Reset();
+    segment_serializer.Reset();
+
+    {
+        std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        ok_client_.clear();
+    }
+    PodUUID pod_uuid;
+    while (client_ping_queue_.pop(pod_uuid)) {
+    }
+
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {

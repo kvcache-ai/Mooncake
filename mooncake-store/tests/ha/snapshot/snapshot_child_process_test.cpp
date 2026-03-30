@@ -512,6 +512,80 @@ TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
     restore_service.reset();
 }
 
+TEST_F(SnapshotChildProcessTest,
+       RestoreFallsBackToPreviousHealthySnapshotWhenLatestIsCorrupted) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_fallback_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value())
+        << "MountSegment failed";
+
+    const std::string key1 = "restore_fallback_key_1";
+    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put1.has_value()) << "PutStart for key1 failed";
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value())
+        << "PutEnd for key1 failed";
+    EXPECT_TRUE(service_->ExistKey(key1).value_or(false))
+        << "ExistKey should refresh lease for key1 before snapshot1";
+
+    const std::string snapshot_id1 = "20240702_120000_000";
+    auto persist_result = CallPersistState(snapshot_id1);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState for snapshot1 failed: "
+        << persist_result.error().message;
+
+    const std::string key2 = "restore_fallback_key_2";
+    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put2.has_value()) << "PutStart for key2 failed";
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value())
+        << "PutEnd for key2 failed";
+    EXPECT_TRUE(service_->ExistKey(key2).value_or(false))
+        << "ExistKey should refresh lease for key2 before snapshot2";
+
+    const std::string snapshot_id2 = "20240702_120500_000";
+    persist_result = CallPersistState(snapshot_id2);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState for snapshot2 failed: "
+        << persist_result.error().message;
+
+    const fs::path corrupted_metadata = fs::path(tmp_dir()) /
+                                        "mooncake_master_snapshot" /
+                                        snapshot_id2 / "metadata";
+    std::ofstream corrupt_stream(corrupted_metadata, std::ios::binary);
+    ASSERT_TRUE(corrupt_stream.is_open())
+        << "Failed to corrupt latest snapshot metadata";
+    corrupt_stream << "corrupted-snapshot-payload";
+    corrupt_stream.close();
+
+    service_.reset();
+
+    auto restore_config = MasterServiceConfigBuilder()
+                              .set_enable_snapshot(false)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                              .set_snapshot_interval_seconds(100)
+                              .set_snapshot_child_timeout_seconds(60)
+                              .set_snapshot_retention_count(3)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+
+    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false))
+        << "Restore should fall back to the previous healthy snapshot";
+    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false))
+        << "Corrupted latest snapshot must not be partially restored";
+
+    restored_service.reset();
+}
+
 // ========== Environment Variable Tests ==========
 
 TEST_F(SnapshotChildProcessTest, EnableSnapshotWithoutEnvVar_Throws) {
