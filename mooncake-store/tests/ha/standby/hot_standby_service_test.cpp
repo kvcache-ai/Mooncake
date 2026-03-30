@@ -29,6 +29,20 @@ class FakeSnapshotProvider final : public SnapshotProvider {
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
 };
 
+LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
+                            std::string key, uint64_t size) {
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = std::move(snapshot_id);
+    snapshot.snapshot_sequence_id = seq_id;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = size;
+    metadata.last_sequence_id = seq_id;
+    snapshot.metadata.emplace_back(std::move(key), metadata);
+    return snapshot;
+}
+
 }  // namespace
 
 class HotStandbyServiceTest : public ::testing::Test {
@@ -310,15 +324,7 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     config_.enable_oplog_following = false;
     service_ = std::make_unique<HotStandbyService>(config_);
 
-    LoadedSnapshot snapshot;
-    snapshot.snapshot_id = "20260330_120000_000";
-    snapshot.snapshot_sequence_id = 42;
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = UUID{1, 2};
-    metadata.size = 4096;
-    metadata.last_sequence_id = 42;
-    snapshot.metadata.emplace_back("key-1", metadata);
+    auto snapshot = MakeSnapshot("20260330_120000_000", 42, "key-1", 4096);
 
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
@@ -339,6 +345,39 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     ASSERT_EQ(1u, exported.size());
     EXPECT_EQ("key-1", exported[0].first);
     EXPECT_EQ(4096u, exported[0].second.size);
+}
+
+TEST_F(HotStandbyServiceTest,
+       TestStart_SnapshotOnlyRestartRefreshesNewerCatalogSnapshot) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+    service_->Stop();
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_121500_000", 84, "key-new", 8192))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-new", exported[0].first);
+    EXPECT_EQ(8192u, exported[0].second.size);
+    EXPECT_EQ(84u, exported[0].second.last_sequence_id);
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
