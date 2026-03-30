@@ -478,6 +478,8 @@ class Client {
         return admission_sketch_->increment(key) >= admission_threshold_;
     }
 
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -672,8 +674,6 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
                                        const std::string& target);
-
-    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
