@@ -1,0 +1,34 @@
+#pragma once
+
+#include <memory>
+#include <optional>
+
+#include "ha/ha_types.h"
+#include "master_config.h"
+#include "types.h"
+
+namespace mooncake {
+namespace ha {
+
+class ReplicationController {
+   public:
+    virtual ~ReplicationController() = default;
+
+    virtual ErrorCode StartStandby(
+        const std::optional<MasterView>& observed_leader) = 0;
+
+    virtual void StopStandby() = 0;
+
+    virtual ErrorCode PrepareToServe() = 0;
+
+    virtual void UpdateObservedLeader(
+        const std::optional<MasterView>& observed_leader) = 0;
+
+    virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
+};
+
+std::unique_ptr<ReplicationController> CreateReplicationController(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config);
+
+}  // namespace ha
+}  // namespace mooncake

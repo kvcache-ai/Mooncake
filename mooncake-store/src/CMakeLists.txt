@@ -31,6 +31,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    ha/replication_controller.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
