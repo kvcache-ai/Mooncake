@@ -22,7 +22,7 @@ class ReplicationController {
 
     virtual void StopStandby() = 0;
 
-    virtual ErrorCode PrepareToServe() = 0;
+    virtual ErrorCode PromoteStandby() = 0;
 
     virtual void UpdateObservedLeader(
         const std::optional<MasterView>& observed_leader) = 0;
