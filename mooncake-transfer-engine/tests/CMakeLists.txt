@@ -24,6 +24,11 @@ add_executable(rdma_loopback_test ${WORKSPACE}/rdma_loopback_test.cpp)
 target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
+# This test verifies endpoint re-establishment in RDMATransport.
+# Intended for manual testing only.
+add_executable(rdma_endpoint_reestablish_test ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
+target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine gtest gtest_main )
+
 if (USE_CXL)
     add_executable(cxl_transport_test ${WORKSPACE}/cxl_transport_test.cpp)
     target_link_libraries(cxl_transport_test PUBLIC transfer_engine gtest gtest_main )
