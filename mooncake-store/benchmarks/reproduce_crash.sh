@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 #
-# reproduce_crash.sh — 复现 mooncake-store 同时杀掉 master + client 的 hang/crash bug
+# reproduce_crash.sh — Reproduce mooncake-store hang/crash when master + client
+#                      are killed simultaneously
 #
-# 用法:
+# Usage:
 #   chmod +x reproduce_crash.sh
 #   ./reproduce_crash.sh [--rounds N] [--strategy STRATEGY] [--timeout SECONDS]
 #
-# 策略 (--strategy):
-#   kill9_master_then_term_client  — 先 kill -9 master, 100ms 后 SIGTERM client (默认, 最易触发)
-#   term_both                      — 同时 SIGTERM master 和 client
-#   kill9_both                     — 同时 kill -9 master 和 client
-#   term_master_then_term_client   — SIGTERM master, 100ms 后 SIGTERM client
-#   stop_master_then_term_client   — SIGSTOP master (冻结), 100ms 后 SIGTERM client (最佳 hang 复现)
+# Strategies (--strategy):
+#   kill9_master_then_term_client  — kill -9 master, then SIGTERM client after 100ms
+#   term_both                      — SIGTERM both master and client simultaneously
+#   kill9_both                     — kill -9 both master and client simultaneously
+#   term_master_then_term_client   — SIGTERM master, then SIGTERM client after 100ms
+#   stop_master_then_term_client   — SIGSTOP master (freeze), then SIGTERM client (best for hang reproduction)
 #
-# 示例:
+# Examples:
 #   ./reproduce_crash.sh --rounds 5 --strategy kill9_master_then_term_client --timeout 10
 #
 
 set -uo pipefail
 
-# ======================== 配置 ========================
+# ======================== Configuration ========================
 MOONCAKE_BUILD="/home/ljh/develop/Mooncake/build"
 MASTER_BIN="${MOONCAKE_BUILD}/mooncake-store/src/mooncake_master"
 CLIENT_BIN="${MOONCAKE_BUILD}/mooncake-store/src/mooncake_client"
@@ -34,30 +35,30 @@ LOCAL_HOST="127.0.0.1"
 LOG_DIR="/home/ljh/bug_reproduce/logs"
 ROUND_TOTAL=3
 STRATEGY="stop_master_then_term_client"
-EXIT_TIMEOUT=10   # client 进程退出的超时秒数
+EXIT_TIMEOUT=10   # Timeout in seconds for client process to exit
 
-# ======================== 参数解析 ========================
+# ======================== Argument Parsing ========================
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --rounds)    ROUND_TOTAL="$2"; shift 2 ;;
         --strategy)  STRATEGY="$2";    shift 2 ;;
         --timeout)   EXIT_TIMEOUT="$2"; shift 2 ;;
         --help|-h)
-            head -18 "$0" | tail -16
+            head -19 "$0" | tail -17
             exit 0
             ;;
-        *) echo "未知参数: $1"; exit 1 ;;
+        *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
 mkdir -p "${LOG_DIR}"
 
-# ======================== 工具函数 ========================
+# ======================== Utility Functions ========================
 
 log() { >&2 echo "[$(date '+%H:%M:%S')] $*"; }
 
 cleanup_procs() {
-    # 先 SIGCONT 被冻结的进程，再强制清理
+    # Resume any frozen processes first, then force kill
     pkill -CONT -f "mooncake_master.*--rpc_port=${RPC_PORT}" 2>/dev/null || true
     pkill -9 -f "mooncake_master.*--rpc_port=${RPC_PORT}" 2>/dev/null || true
     pkill -9 -f "mooncake_client.*--master_server_address=${MASTER_ADDR}" 2>/dev/null || true
@@ -79,7 +80,7 @@ wait_for_port() {
 
 start_master() {
     local logfile="${LOG_DIR}/master_round${1}.log"
-    log "启动 master (rpc_port=${RPC_PORT}, http_meta_port=${HTTP_META_PORT})"
+    log "Starting master (rpc_port=${RPC_PORT}, http_meta_port=${HTTP_META_PORT})"
     "${MASTER_BIN}" \
         --rpc_port="${RPC_PORT}" \
         --enable_http_metadata_server=true \
@@ -91,15 +92,15 @@ start_master() {
     log "master PID=${MASTER_PID}"
 
     if ! wait_for_port "${RPC_PORT}" 10; then
-        log "ERROR: master 未能在 10s 内启动"
+        log "ERROR: master failed to start within 10s"
         return 1
     fi
-    log "master 已就绪"
+    log "master is ready"
 }
 
 start_client() {
     local logfile="${LOG_DIR}/client_round${1}.log"
-    log "启动 client (master_addr=${MASTER_ADDR})"
+    log "Starting client (master_addr=${MASTER_ADDR})"
     "${CLIENT_BIN}" \
         --master_server_address="${MASTER_ADDR}" \
         --metadata_server="${METADATA_SERVER}" \
@@ -110,18 +111,18 @@ start_client() {
         > "${logfile}" 2>&1 &
     CLIENT_PID=$!
     log "client PID=${CLIENT_PID}"
-    sleep 3  # 等待 client 完成 setup、注册 segment、启动 heartbeat
+    sleep 3  # Wait for client to complete setup, register segments, start heartbeat
     if ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
-        log "ERROR: client 进程已退出"
+        log "ERROR: client process has already exited"
         return 1
     fi
-    log "client 已就绪"
+    log "client is ready"
 }
 
-# 通过 Python 写入测试数据，增加 mounted segment 数量
+# Write test data via Python to increase mounted segment count
 write_test_data() {
     local round=$1
-    log "通过 Python 客户端写入测试数据..."
+    log "Writing test data via Python client..."
     PYTHONPATH="${PYTHON_PATH}" python3 << PYEOF > "${LOG_DIR}/python_round${round}.log" 2>&1 || true
 import store
 import os, sys, time
@@ -141,35 +142,33 @@ try:
         print(f"setup failed: {rc}")
         sys.exit(1)
 
-    # 写入多个 key，让 client 有更多 mounted segments 和活跃状态
+    # Write multiple keys to increase mounted segments and active state
     for i in range(10):
         key = f"test_crash_key_{i}"
         data = b"x" * (1024 * 1024)  # 1MB per key
         rc = s.put(key, data)
         print(f"put({key}): {rc}")
 
-    print("数据写入完成，等待 2 秒让 heartbeat 建立...")
+    print("Data written, waiting 2s for heartbeat to stabilize...")
     time.sleep(2)
 
-    # 不调用 close()，让 Python 进程自然退出
-    # close 会触发正常的清理流程
     s.close()
     print("Python client done")
 except Exception as e:
-    print(f"Python 客户端异常: {e}")
+    print(f"Python client error: {e}")
     sys.exit(1)
 PYEOF
-    log "Python 客户端数据写入完成"
+    log "Python client data write completed"
 }
 
-# 执行 kill 策略
+# Execute kill strategy
 execute_kill_strategy() {
     local strategy=$1
-    log "执行 kill 策略: ${strategy}"
+    log "Executing kill strategy: ${strategy}"
 
     case "${strategy}" in
         kill9_master_then_term_client)
-            # 最容易触发的场景：master 瞬间死亡，client 尝试优雅退出
+            # Easiest to trigger: master dies instantly, client attempts graceful exit
             log "  kill -9 master (PID=${MASTER_PID})"
             kill -9 "${MASTER_PID}" 2>/dev/null || true
             sleep 0.1
@@ -177,11 +176,11 @@ execute_kill_strategy() {
             kill -TERM "${CLIENT_PID}" 2>/dev/null || true
             ;;
         term_both)
-            log "  kill -TERM master+client 同时"
+            log "  kill -TERM master+client simultaneously"
             kill -TERM "${MASTER_PID}" "${CLIENT_PID}" 2>/dev/null || true
             ;;
         kill9_both)
-            log "  kill -9 master+client 同时"
+            log "  kill -9 master+client simultaneously"
             kill -9 "${MASTER_PID}" "${CLIENT_PID}" 2>/dev/null || true
             ;;
         term_master_then_term_client)
@@ -192,38 +191,39 @@ execute_kill_strategy() {
             kill -TERM "${CLIENT_PID}" 2>/dev/null || true
             ;;
         stop_master_then_term_client)
-            # SIGSTOP 冻结 master: 进程存活但不响应任何 RPC
-            # TCP 连接保持 open, syncAwait 永远等不到回复 → 完美模拟 hang
-            log "  kill -STOP master (PID=${MASTER_PID}) — 冻结，不杀死"
+            # SIGSTOP freezes master: process alive but unresponsive to RPC
+            # TCP connections stay open, syncAwait never gets a reply — perfect hang simulation
+            log "  kill -STOP master (PID=${MASTER_PID}) — frozen, not killed"
             kill -STOP "${MASTER_PID}" 2>/dev/null || true
             sleep 0.1
             log "  kill -TERM client (PID=${CLIENT_PID})"
             kill -TERM "${CLIENT_PID}" 2>/dev/null || true
             ;;
         *)
-            log "ERROR: 未知策略 ${strategy}"
+            log "ERROR: unknown strategy ${strategy}"
             return 1
             ;;
     esac
 }
 
-# 监控 client 退出状况
+# Monitor client exit behavior
 monitor_client_exit() {
     local timeout=$1 round=$2
     local elapsed=0
     local strace_pid=""
 
-    log "等待 client (PID=${CLIENT_PID}) 退出，超时=${timeout}s..."
+    log "Waiting for client (PID=${CLIENT_PID}) to exit, timeout=${timeout}s..."
 
-    # 尝试附加 strace（可能因 ptrace 权限失败，非致命）
+    # Attempt to attach strace (may fail due to ptrace permissions, non-fatal)
     if command -v strace &>/dev/null; then
-        strace -p "${CLIENT_PID}" -f -tt -e trace=futex,connect,sendto,recvfrom             -o "${LOG_DIR}/strace_round${round}.log" 2>/dev/null &
+        strace -p "${CLIENT_PID}" -f -tt -e trace=futex,connect,sendto,recvfrom \
+            -o "${LOG_DIR}/strace_round${round}.log" 2>/dev/null &
         strace_pid=$!
         if kill -0 "${strace_pid}" 2>/dev/null; then
-            log "已附加 strace (PID=${strace_pid}) 到 client"
+            log "Attached strace (PID=${strace_pid}) to client"
         else
             strace_pid=""
-            log "strace 附加失败(权限不足)，跳过系统调用追踪"
+            log "strace attach failed (insufficient permissions), skipping syscall tracing"
         fi
     fi
 
@@ -231,7 +231,7 @@ monitor_client_exit() {
         if ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
             wait "${CLIENT_PID}" 2>/dev/null
             local exit_code=$?
-            log "client 在 ${elapsed}s 内退出 (exit_code=${exit_code})"
+            log "client exited within ${elapsed}s (exit_code=${exit_code})"
             if [[ -n "${strace_pid}" ]]; then kill "${strace_pid}" 2>/dev/null || true; fi
             echo "OK:${elapsed}s:exit${exit_code}"
             return 0
@@ -240,19 +240,19 @@ monitor_client_exit() {
         ((elapsed++))
     done
 
-    # 超时 — bug 已触发
-    log "!!! CLIENT HANG 检测到 !!! 进程在 ${timeout}s 后仍未退出"
+    # Timeout — bug triggered
+    log "!!! CLIENT HANG DETECTED !!! Process still alive after ${timeout}s"
 
-    # 收集诊断信息
-    log "收集诊断信息..."
+    # Collect diagnostic information
+    log "Collecting diagnostics..."
     {
         echo "=== /proc/${CLIENT_PID}/status ==="
-        cat "/proc/${CLIENT_PID}/status" 2>/dev/null || echo "(无法读取)"
+        cat "/proc/${CLIENT_PID}/status" 2>/dev/null || echo "(unable to read)"
         echo ""
-        echo "=== /proc/${CLIENT_PID}/stack (内核栈) ==="
-        cat "/proc/${CLIENT_PID}/stack" 2>/dev/null || echo "(需要 root 权限)"
+        echo "=== /proc/${CLIENT_PID}/stack (kernel stack) ==="
+        cat "/proc/${CLIENT_PID}/stack" 2>/dev/null || echo "(requires root privileges)"
         echo ""
-        echo "=== /proc/${CLIENT_PID}/task/*/status (所有线程) ==="
+        echo "=== /proc/${CLIENT_PID}/task/*/status (all threads) ==="
         for tid_dir in /proc/${CLIENT_PID}/task/*/; do
             tid=$(basename "$tid_dir")
             echo "--- Thread ${tid} ---"
@@ -261,18 +261,18 @@ monitor_client_exit() {
         echo ""
         echo "=== pstack/gdb backtrace ==="
         if command -v gdb &>/dev/null; then
-            gdb -batch -ex "thread apply all bt" -p "${CLIENT_PID}" 2>/dev/null || echo "(gdb 附加失败)"
+            gdb -batch -ex "thread apply all bt" -p "${CLIENT_PID}" 2>/dev/null || echo "(gdb attach failed)"
         elif command -v pstack &>/dev/null; then
-            pstack "${CLIENT_PID}" 2>/dev/null || echo "(pstack 失败)"
+            pstack "${CLIENT_PID}" 2>/dev/null || echo "(pstack failed)"
         else
-            echo "(gdb/pstack 不可用)"
+            echo "(gdb/pstack not available)"
         fi
     } > "${LOG_DIR}/diag_round${round}.log" 2>&1
 
     if [[ -n "${strace_pid}" ]]; then kill "${strace_pid}" 2>/dev/null || true; fi
 
-    # 强杀 client
-    log "强制杀掉 client (kill -9)"
+    # Force kill client
+    log "Force killing client (kill -9)"
     kill -9 "${CLIENT_PID}" 2>/dev/null || true
     wait "${CLIENT_PID}" 2>/dev/null || true
 
@@ -280,16 +280,16 @@ monitor_client_exit() {
     return 1
 }
 
-# ======================== 主流程 ========================
+# ======================== Main Flow ========================
 
 log "======================================================"
-log "Mooncake Store 崩溃复现脚本"
-log "策略: ${STRATEGY}"
-log "轮次: ${ROUND_TOTAL}"
-log "超时: ${EXIT_TIMEOUT}s"
+log "Mooncake Store Crash Reproduction Script"
+log "Strategy: ${STRATEGY}"
+log "Rounds: ${ROUND_TOTAL}"
+log "Timeout: ${EXIT_TIMEOUT}s"
 log "======================================================"
 
-# 确保环境干净
+# Ensure clean environment
 cleanup_procs
 
 hang_count=0
@@ -298,86 +298,86 @@ ok_count=0
 
 for ((round=1; round<=ROUND_TOTAL; round++)); do
     log ""
-    log "==================== 第 ${round}/${ROUND_TOTAL} 轮 ===================="
+    log "==================== Round ${round}/${ROUND_TOTAL} ===================="
 
-    # 1. 启动 master
+    # 1. Start master
     if ! start_master "${round}"; then
-        log "master 启动失败，跳过本轮"
+        log "master failed to start, skipping this round"
         cleanup_procs
         continue
     fi
 
-    # 2. 启动 client
+    # 2. Start client
     if ! start_client "${round}"; then
-        log "client 启动失败，跳过本轮"
+        log "client failed to start, skipping this round"
         cleanup_procs
         continue
     fi
 
-    # 3. 写入测试数据（可选，增加 segment 注册量）
+    # 3. Write test data (increases segment registration count)
     write_test_data "${round}"
 
-    # 4. 等待 heartbeat 稳定
-    log "等待 2s 让 heartbeat 稳定运行..."
+    # 4. Wait for heartbeat to stabilize
+    log "Waiting 2s for heartbeat to stabilize..."
     sleep 2
 
-    # 5. 确认进程仍存活
+    # 5. Verify processes are still alive
     if ! kill -0 "${MASTER_PID}" 2>/dev/null; then
-        log "WARN: master 已提前退出"
+        log "WARN: master has already exited"
         cleanup_procs
         continue
     fi
     if ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
-        log "WARN: client 已提前退出"
+        log "WARN: client has already exited"
         cleanup_procs
         continue
     fi
 
-    # 6. 执行 kill 策略
+    # 6. Execute kill strategy
     execute_kill_strategy "${STRATEGY}"
 
-    # 7. 监控 client 退出
+    # 7. Monitor client exit
     result=$(monitor_client_exit "${EXIT_TIMEOUT}" "${round}" || true)
 
     if [[ "${result}" == HANG* ]]; then
         ((hang_count++))
-        log "第 ${round} 轮结果: HANG (bug 触发)"
+        log "Round ${round} result: HANG (bug triggered)"
     elif [[ "${result}" == OK* ]]; then
         exit_time=$(echo "${result}" | cut -d: -f2)
         exit_code=$(echo "${result}" | cut -d: -f3)
         if [[ "${exit_code}" != "exit0" ]]; then
             ((crash_count++))
-            log "第 ${round} 轮结果: CRASH (${exit_code}, 耗时 ${exit_time})"
+            log "Round ${round} result: CRASH (${exit_code}, took ${exit_time})"
         else
             ((ok_count++))
-            log "第 ${round} 轮结果: OK (正常退出, 耗时 ${exit_time})"
+            log "Round ${round} result: OK (clean exit, took ${exit_time})"
         fi
     else
         ((crash_count++))
-        log "第 ${round} 轮结果: UNKNOWN"
+        log "Round ${round} result: UNKNOWN"
     fi
 
-    # 清理残留进程，为下一轮准备
+    # Clean up residual processes for next round
     cleanup_procs
     sleep 1
 done
 
-# ======================== 汇总 ========================
+# ======================== Summary ========================
 log ""
 log "======================================================"
-log "测试完成 — 共 ${ROUND_TOTAL} 轮"
-log "  HANG (bug 触发):  ${hang_count}"
-log "  CRASH (异常退出): ${crash_count}"
-log "  OK (正常退出):    ${ok_count}"
+log "Test completed — ${ROUND_TOTAL} rounds total"
+log "  HANG (bug triggered):  ${hang_count}"
+log "  CRASH (abnormal exit): ${crash_count}"
+log "  OK (clean exit):       ${ok_count}"
 log "======================================================"
 
 if (( hang_count > 0 )); then
     log ""
-    log "Bug 已复现! 详见日志目录: ${LOG_DIR}"
-    log "  - strace_round*.log:  系统调用追踪 (卡在 futex/connect)"
-    log "  - diag_round*.log:    进程诊断 (线程状态, backtrace)"
-    log "  - client_round*.log:  client 标准输出日志"
-    log "  - master_round*.log:  master 标准输出日志"
+    log "Bug reproduced! See log directory: ${LOG_DIR}"
+    log "  - strace_round*.log:  syscall trace (stuck on futex/connect)"
+    log "  - diag_round*.log:    process diagnostics (thread states, backtrace)"
+    log "  - client_round*.log:  client stdout/stderr logs"
+    log "  - master_round*.log:  master stdout/stderr logs"
     exit 1
 fi
 

@@ -259,8 +259,7 @@ void ResourceTracker::startSignalThread() {
                 {
                     std::atomic<bool> cleanup_done{false};
                     std::thread cleanup_thread([&cleanup_done]() {
-                        ResourceTracker::getInstance()
-                            .cleanupAllResources();
+                        ResourceTracker::getInstance().cleanupAllResources();
                         cleanup_done.store(true, std::memory_order_release);
                     });
                     cleanup_thread.detach();
