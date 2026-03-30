@@ -26,6 +26,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 
@@ -446,6 +447,12 @@ class MasterService {
     // Persist master state
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
+    tl::expected<ha::SnapshotDescriptor, SerializationError>
+    BuildSnapshotDescriptor(const std::string& snapshot_id,
+                            const std::string& manifest_path,
+                            const std::string& object_prefix) const;
+    tl::expected<ha::OpLogSequenceId, SerializationError>
+    ResolveSnapshotSequenceId() const;
 
     tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
@@ -1048,6 +1055,8 @@ class MasterService {
     const bool enable_ha_;
 
     const bool enable_offload_;
+
+    const std::string ha_backend_type_;
 
     const std::string ha_backend_connstring_;
 
