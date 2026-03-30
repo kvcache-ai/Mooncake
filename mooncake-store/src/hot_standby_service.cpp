@@ -29,24 +29,27 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
 
     // Register callback for state change logging and metrics.
-    state_machine_.RegisterCallback(
-        [](StandbyState old_state, StandbyState new_state, StandbyEvent event) {
-            LOG(INFO) << "HotStandbyService state changed: "
-                      << StandbyStateToString(old_state) << " -> "
-                      << StandbyStateToString(new_state)
-                      << " (event: " << StandbyEventToString(event) << ")";
+    state_machine_.RegisterCallback([this](StandbyState old_state,
+                                           StandbyState new_state,
+                                           StandbyEvent event) {
+        LOG(INFO) << "HotStandbyService state changed: "
+                  << StandbyStateToString(old_state) << " -> "
+                  << StandbyStateToString(new_state)
+                  << " (event: " << StandbyEventToString(event) << ")";
 
-            // Update HA metrics
-            HAMetricManager::instance().set_standby_state(
-                static_cast<int64_t>(new_state));
-            HAMetricManager::instance().inc_state_transitions();
+        // Update HA metrics
+        HAMetricManager::instance().set_standby_state(
+            static_cast<int64_t>(new_state));
+        HAMetricManager::instance().inc_state_transitions();
 
-            // Track watch disconnections
-            if (event == StandbyEvent::WATCH_BROKEN ||
-                event == StandbyEvent::DISCONNECTED) {
-                HAMetricManager::instance().inc_oplog_watch_disconnections();
-            }
-        });
+        // Track watch disconnections
+        if (event == StandbyEvent::WATCH_BROKEN ||
+            event == StandbyEvent::DISCONNECTED) {
+            HAMetricManager::instance().inc_oplog_watch_disconnections();
+        }
+
+        NotifySyncStatus();
+    });
 }
 
 // StandbyMetadataStore implementation
@@ -273,6 +276,25 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
 #endif
 }
 
+void HotStandbyService::SetSyncStatusCallback(SyncStatusCallback callback) {
+    {
+        std::lock_guard<std::mutex> lock(sync_status_callback_mutex_);
+        sync_status_callback_ = std::move(callback);
+    }
+    NotifySyncStatus();
+}
+
+void HotStandbyService::NotifySyncStatus() {
+    SyncStatusCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(sync_status_callback_mutex_);
+        callback = sync_status_callback_;
+    }
+    if (callback) {
+        callback(GetSyncStatus());
+    }
+}
+
 void HotStandbyService::OnWatcherEvent(StandbyEvent event) {
     state_machine_.ProcessEvent(event);
 }
@@ -391,8 +413,7 @@ ErrorCode HotStandbyService::Promote() {
 
     LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
               << current_applied_seq_id << ", lag: " << status.lag_entries
-              << " entries"
-              << ", state: " << StandbyStateToString(GetState());
+              << " entries" << ", state: " << StandbyStateToString(GetState());
 
     // Final catch-up sync before promotion.
     // IMPORTANT:
@@ -581,6 +602,9 @@ void HotStandbyService::ReplicationLoop() {
     }
 #endif
 
+    uint64_t last_reported_applied_seq_id = applied_seq_id_.load();
+    uint64_t last_reported_primary_seq_id = primary_seq_id_.load();
+
     while (IsRunning()) {
         if (!IsConnected()) {
             // Not connected - wait a bit before checking again
@@ -609,6 +633,15 @@ void HotStandbyService::ReplicationLoop() {
             }
         }
 #endif
+
+        const uint64_t applied_seq_id = applied_seq_id_.load();
+        const uint64_t primary_seq_id = primary_seq_id_.load();
+        if (applied_seq_id != last_reported_applied_seq_id ||
+            primary_seq_id != last_reported_primary_seq_id) {
+            last_reported_applied_seq_id = applied_seq_id;
+            last_reported_primary_seq_id = primary_seq_id;
+            NotifySyncStatus();
+        }
 
         // Sleep and check again
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));

@@ -1,5 +1,6 @@
 #include "ha/replication_controller.h"
 
+#include <mutex>
 #include <memory>
 #include <optional>
 
@@ -27,6 +28,17 @@ class NoopReplicationController final : public ReplicationController {
     MasterRuntimeState GetStandbyRuntimeState() const override {
         return MasterRuntimeState::kStandby;
     }
+
+    void SetStandbyRuntimeStateCallback(
+        RuntimeStateCallback callback) override {
+        callback_ = std::move(callback);
+        if (callback_) {
+            callback_(MasterRuntimeState::kStandby);
+        }
+    }
+
+   private:
+    RuntimeStateCallback callback_;
 };
 
 #ifdef STORE_USE_ETCD
@@ -65,12 +77,23 @@ class EtcdReplicationController final : public ReplicationController {
               .max_replication_lag_entries = 1000,
               .enable_verification = false,
               .enable_snapshot_bootstrap = config.enable_snapshot_restore,
-          })) {}
+          })) {
+        standby_service_->SetSyncStatusCallback(
+            [this](const StandbySyncStatus&) {
+                NotifyRuntimeStateIfChanged();
+            });
+    }
 
     ErrorCode StartStandby(
         const std::optional<MasterView>& observed_leader) override {
-        observed_leader_ = observed_leader;
-        if (standby_running_) {
+        bool standby_running = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            observed_leader_ = observed_leader;
+            standby_running = standby_running_;
+        }
+        if (standby_running) {
+            NotifyRuntimeStateIfChanged();
             return ErrorCode::OK;
         }
 
@@ -81,17 +104,29 @@ class EtcdReplicationController final : public ReplicationController {
                 : config_.ha_backend_connstring,
             config_.cluster_id);
         if (err == ErrorCode::OK) {
-            standby_running_ = true;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                standby_running_ = true;
+            }
+            NotifyRuntimeStateIfChanged();
         }
         return err;
     }
 
     void StopStandby() override {
-        if (!standby_running_) {
-            return;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!standby_running_) {
+                return;
+            }
         }
+
         standby_service_->Stop();
-        standby_running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running_ = false;
+        }
+        NotifyRuntimeStateIfChanged();
     }
 
     ErrorCode PrepareToServe() override {
@@ -101,23 +136,68 @@ class EtcdReplicationController final : public ReplicationController {
 
     void UpdateObservedLeader(
         const std::optional<MasterView>& observed_leader) override {
-        observed_leader_ = observed_leader;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            observed_leader_ = observed_leader;
+        }
+        NotifyRuntimeStateIfChanged();
     }
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
-        if (!standby_running_) {
+        std::optional<MasterView> observed_leader;
+        bool standby_running = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            observed_leader = observed_leader_;
+            standby_running = standby_running_;
+        }
+        if (!standby_running) {
             return MasterRuntimeState::kStandby;
         }
-
         return MapStandbyRuntimeState(standby_service_->GetSyncStatus(),
-                                      observed_leader_);
+                                      observed_leader);
+    }
+
+    void SetStandbyRuntimeStateCallback(
+        RuntimeStateCallback callback) override {
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            runtime_state_callback_ = std::move(callback);
+            last_reported_runtime_state_.reset();
+        }
+        NotifyRuntimeStateIfChanged();
     }
 
    private:
+    void NotifyRuntimeStateIfChanged() {
+        NotifyRuntimeStateIfChanged(GetStandbyRuntimeState());
+    }
+
+    void NotifyRuntimeStateIfChanged(MasterRuntimeState runtime_state) {
+        RuntimeStateCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            if (!runtime_state_callback_.has_value()) {
+                return;
+            }
+            if (last_reported_runtime_state_.has_value() &&
+                last_reported_runtime_state_.value() == runtime_state) {
+                return;
+            }
+            last_reported_runtime_state_ = runtime_state;
+            callback = runtime_state_callback_.value();
+        }
+        callback(runtime_state);
+    }
+
     MasterServiceSupervisorConfig config_;
     std::unique_ptr<HotStandbyService> standby_service_;
+    mutable std::mutex state_mutex_;
     std::optional<MasterView> observed_leader_;
     bool standby_running_ = false;
+    std::mutex callback_mutex_;
+    std::optional<RuntimeStateCallback> runtime_state_callback_;
+    std::optional<MasterRuntimeState> last_reported_runtime_state_;
 };
 #endif
 
