@@ -279,11 +279,11 @@ int MasterServiceSupervisor::Start() {
         }
 
         accept_standby_runtime_updates.store(false, std::memory_order_release);
-        auto prepare_replication = replication_controller->PrepareToServe();
-        if (prepare_replication != ErrorCode::OK) {
+        auto promote_standby = replication_controller->PromoteStandby();
+        if (promote_standby != ErrorCode::OK) {
             enter_standby_mode(leadership_session->view);
-            if (HandleSupervisorError("prepare replication for serve",
-                                      prepare_replication, spec->type)) {
+            if (HandleSupervisorError("promote standby for serve",
+                                      promote_standby, spec->type)) {
                 return -1;
             }
             continue;

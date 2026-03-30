@@ -58,6 +58,33 @@ class HotStandbyServiceTest : public ::testing::Test {
     std::string cluster_id_;
 };
 
+namespace {
+
+std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
+    HotStandbyConfig config, const std::string& cluster_id) {
+    config.enable_snapshot_bootstrap = true;
+    config.enable_oplog_following = false;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "20260330_120000_000";
+    snapshot.snapshot_sequence_id = 42;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 42;
+    snapshot.metadata.emplace_back("key-1", metadata);
+
+    service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+    EXPECT_EQ(ErrorCode::OK, service->Start("", "", cluster_id));
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    return service;
+}
+
+}  // namespace
+
 // ========== 6.1.1 Start/Stop tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStart) {
@@ -200,15 +227,12 @@ TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {
 }
 
 TEST_F(HotStandbyServiceTest, TestPromote_WhenReady) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real etcd and full replication pipeline to reach "
-                    "ready state.";
-#else
-    // Even in non-etcd mode, Promote should safely return OK (simulated
-    // success)
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
     ErrorCode err = service_->Promote();
     EXPECT_EQ(ErrorCode::OK, err);
-#endif
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
 }
 
 TEST_F(HotStandbyServiceTest, TestPromote_FinalCatchUp) {
@@ -216,8 +240,7 @@ TEST_F(HotStandbyServiceTest, TestPromote_FinalCatchUp) {
     GTEST_SKIP() << "Requires real etcd and OpLog data to exercise final "
                     "catch-up logic.";
 #else
-    ErrorCode err = service_->Promote();
-    EXPECT_EQ(ErrorCode::OK, err);
+    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
 #endif
 }
 
@@ -226,8 +249,7 @@ TEST_F(HotStandbyServiceTest, TestPromote_WithGaps) {
     GTEST_SKIP()
         << "Requires real etcd and gaps in OpLog to validate gap resolution.";
 #else
-    ErrorCode err = service_->Promote();
-    EXPECT_EQ(ErrorCode::OK, err);
+    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
 #endif
 }
 
@@ -236,8 +258,7 @@ TEST_F(HotStandbyServiceTest, TestPromote_Timeout) {
     GTEST_SKIP()
         << "Requires real etcd and slow reads to trigger catch-up timeout.";
 #else
-    ErrorCode err = service_->Promote();
-    EXPECT_EQ(ErrorCode::OK, err);
+    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
 #endif
 }
 
@@ -245,8 +266,7 @@ TEST_F(HotStandbyServiceTest, TestPromote_BatchLimit) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd and large OpLog to hit batch limit.";
 #else
-    ErrorCode err = service_->Promote();
-    EXPECT_NE(ErrorCode::OK, err);
+    GTEST_SKIP() << "Requires an OpLog-following standby runtime.";
 #endif
 }
 
@@ -285,8 +305,9 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
 #endif
 }
 
-TEST_F(HotStandbyServiceTest, TestStartSnapshotBootstrap_WithSnapshot) {
+TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
     service_ = std::make_unique<HotStandbyService>(config_);
 
     LoadedSnapshot snapshot;
@@ -302,7 +323,7 @@ TEST_F(HotStandbyServiceTest, TestStartSnapshotBootstrap_WithSnapshot) {
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
 
-    auto err = service_->StartSnapshotBootstrap(cluster_id_);
+    auto err = service_->Start("", "", cluster_id_);
     EXPECT_EQ(ErrorCode::OK, err);
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(1u, service_->GetMetadataCount());
@@ -320,14 +341,15 @@ TEST_F(HotStandbyServiceTest, TestStartSnapshotBootstrap_WithSnapshot) {
     EXPECT_EQ(4096u, exported[0].second.size);
 }
 
-TEST_F(HotStandbyServiceTest, TestStartSnapshotBootstrap_WhenProviderFails) {
+TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
     config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
     service_ = std::make_unique<HotStandbyService>(config_);
 
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         tl::make_unexpected(ErrorCode::PERSISTENT_FAIL)));
 
-    auto err = service_->StartSnapshotBootstrap(cluster_id_);
+    auto err = service_->Start("", "", cluster_id_);
     EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }

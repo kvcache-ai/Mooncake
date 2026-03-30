@@ -21,7 +21,8 @@ struct StandbyRuntimeCapabilities {
 };
 
 std::unique_ptr<HotStandbyService> CreateStandbyService(
-    const MasterServiceSupervisorConfig& config) {
+    const MasterServiceSupervisorConfig& config,
+    const StandbyRuntimeCapabilities& capabilities) {
     return std::make_unique<HotStandbyService>(HotStandbyConfig{
         .standby_id = config.local_hostname,
         .primary_address = "",
@@ -29,6 +30,7 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .max_replication_lag_entries = 1000,
         .enable_verification = false,
         .enable_snapshot_bootstrap = config.enable_snapshot_restore,
+        .enable_oplog_following = capabilities.has_oplog_following,
     });
 }
 
@@ -74,7 +76,7 @@ class NoopReplicationController final : public ReplicationController {
 
     void StopStandby() override {}
 
-    ErrorCode PrepareToServe() override { return ErrorCode::OK; }
+    ErrorCode PromoteStandby() override { return ErrorCode::OK; }
 
     void UpdateObservedLeader(const std::optional<MasterView>&) override {}
 
@@ -102,7 +104,7 @@ class CapabilityDrivenReplicationController final
         : spec_(spec),
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
-          standby_service_(CreateStandbyService(config)) {
+          standby_service_(CreateStandbyService(config, capabilities_)) {
         if (capabilities_.has_snapshot_bootstrap) {
             auto snapshot_provider =
                 CreateCatalogBackedSnapshotProvider(config_);
@@ -146,15 +148,9 @@ class CapabilityDrivenReplicationController final
             return dependency_init_error_;
         }
 
-        ErrorCode err = ErrorCode::OK;
-        if (capabilities_.has_oplog_following) {
-            err = standby_service_->Start(
-                observed_leader.has_value() ? observed_leader->leader_address
-                                            : "",
-                oplog_connstring_, config_.cluster_id);
-        } else {
-            err = standby_service_->StartSnapshotBootstrap(config_.cluster_id);
-        }
+        ErrorCode err = standby_service_->Start(
+            observed_leader.has_value() ? observed_leader->leader_address : "",
+            oplog_connstring_, config_.cluster_id);
 
         if (err == ErrorCode::OK) {
             {
@@ -182,9 +178,27 @@ class CapabilityDrivenReplicationController final
         NotifyRuntimeStateIfChanged();
     }
 
-    ErrorCode PrepareToServe() override {
-        StopStandby();
-        return ErrorCode::OK;
+    ErrorCode PromoteStandby() override {
+        bool standby_running = false;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running = standby_running_;
+        }
+        if (!standby_running) {
+            return ErrorCode::OK;
+        }
+
+        ErrorCode err = standby_service_->Promote();
+        if (err != ErrorCode::OK) {
+            standby_service_->Stop();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running_ = false;
+        }
+        NotifyRuntimeStateIfChanged();
+        return err;
     }
 
     void UpdateObservedLeader(

@@ -37,10 +37,14 @@ struct HotStandbyConfig {
     uint32_t max_replication_lag_entries{1000};
     bool enable_verification{true};
 
-    // Snapshot bootstrap (optional):
-    // If provided, Standby will try to load a snapshot first, then replay OpLog
-    // from snapshot_sequence_id.
+    // Snapshot bootstrap phase (optional): Standby will try to load the latest
+    // snapshot baseline before switching to steady-state replication.
     bool enable_snapshot_bootstrap{false};
+
+    // OpLog following phase (optional): when disabled, Start() stops after the
+    // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
+    // state.
+    bool enable_oplog_following{true};
 };
 
 /**
@@ -77,25 +81,17 @@ class HotStandbyService {
     ~HotStandbyService();
 
     /**
-     * @brief Start connecting to Primary and begin replication
+     * @brief Start standby runtime: snapshot bootstrap plus optional OpLog
+     * following
      * @param primary_address Address of the Primary Master (not used with
-     * etcd-based sync)
-     * @param etcd_endpoints Comma-separated etcd endpoints
+     * OpLog backend-based sync)
+     * @param etcd_endpoints Comma-separated OpLog backend endpoints
      * @param cluster_id Cluster identifier for OpLog path
      * @return ErrorCode::OK on success
      */
     ErrorCode Start(const std::string& primary_address,
                     const std::string& etcd_endpoints,
                     const std::string& cluster_id);
-
-    /**
-     * @brief Start standby in snapshot-only mode without OpLog following
-     *
-     * This mode is used by non-etcd HA backends during the first stage of
-     * standby preheat: load the latest snapshot baseline and keep the admin
-     * plane observable, but do not start oplog catch-up.
-     */
-    ErrorCode StartSnapshotBootstrap(const std::string& cluster_id);
 
     /**
      * @brief Stop replication and disconnect from Primary
@@ -172,6 +168,13 @@ class HotStandbyService {
     void OnWatcherEvent(StandbyEvent event);
 
    private:
+    ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
+    void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
+    uint64_t GetLocalLastAppliedSequenceIdLocked() const;
+    void ResolvePromotionGapsLocked();
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     void NotifySyncStatus();
 
     /**
