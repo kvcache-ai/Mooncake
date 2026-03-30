@@ -104,6 +104,20 @@ class HotStandbySnapshotBootstrapTest
         published_snapshot_ids_.push_back(descriptor.snapshot_id);
     }
 
+    void PublishSnapshotWithMissingMetadata(
+        const ha::SnapshotDescriptor& descriptor) {
+        auto manifest = object_store_->UploadString(
+            descriptor.manifest_key, "messagepack|1.0.0|standby-test");
+        ASSERT_TRUE(manifest.has_value()) << manifest.error();
+
+        auto segments = object_store_->UploadBuffer(
+            descriptor.object_prefix + "segments", BuildSegmentsPayload());
+        ASSERT_TRUE(segments.has_value()) << segments.error();
+
+        ASSERT_EQ(catalog_store_->Publish(descriptor), ErrorCode::OK);
+        published_snapshot_ids_.push_back(descriptor.snapshot_id);
+    }
+
     std::string cluster_id_;
     std::string temp_dir_;
     ha::SnapshotDescriptor descriptor_;
@@ -195,6 +209,46 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ("key-2", exported.front().first);
     EXPECT_EQ(8192u, exported.front().second.size);
     EXPECT_EQ(84u, exported.front().second.last_sequence_id);
+}
+
+TEST_P(HotStandbySnapshotBootstrapTest,
+       SnapshotOnlyStandbyKeepsPreviousBaselineWhenLatestSnapshotIsUnreadable) {
+    PublishSnapshot(descriptor_);
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    HotStandbyService service(MakeSnapshotOnlyConfig());
+    service.SetSnapshotProvider(std::move(provider.value()));
+
+    ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            return service.GetLatestAppliedSequenceId() ==
+                   descriptor_.last_included_seq;
+        },
+        std::chrono::milliseconds(500)));
+
+    const auto broken_descriptor = MakeTestSnapshotDescriptor(
+        "20240330_120500_002", 84, descriptor_.producer_view_version + 1,
+        descriptor_.created_at_ms + 1000);
+    PublishSnapshotWithMissingMetadata(broken_descriptor);
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service.GetSyncStatus().primary_seq_id == 84; },
+        std::chrono::milliseconds(1500)));
+
+    EXPECT_EQ(StandbyState::WATCHING, service.GetState());
+    EXPECT_EQ(descriptor_.last_included_seq,
+              service.GetLatestAppliedSequenceId());
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service.ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ(kDefaultTestObjectKey, exported.front().first);
+    EXPECT_EQ(kDefaultTestObjectSize, exported.front().second.size);
+    EXPECT_EQ(descriptor_.last_included_seq,
+              exported.front().second.last_sequence_id);
 }
 
 INSTANTIATE_TEST_SUITE_P(

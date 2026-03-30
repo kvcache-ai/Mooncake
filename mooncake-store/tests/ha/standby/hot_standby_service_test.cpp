@@ -4,12 +4,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
-#include <mutex>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "master_service.h"
 
@@ -69,6 +73,66 @@ class MutableSnapshotProvider final : public SnapshotProvider {
    private:
     std::mutex mutex_;
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
+};
+
+class BlockingSnapshotProvider final : public SnapshotProvider {
+   public:
+    explicit BlockingSnapshotProvider(
+        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result)
+        : result_(std::move(result)) {}
+
+    void PublishAndBlockNextLoad(
+        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result_ = std::move(result);
+        block_next_load_ = true;
+        load_started_ = false;
+    }
+
+    bool WaitForBlockedLoad(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this]() { return load_started_; });
+    }
+
+    void UnblockLoad() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        block_next_load_ = false;
+        cv_.notify_all();
+    }
+
+    tl::expected<std::optional<SnapshotVersionInfo>, ErrorCode>
+    GetLatestSnapshotVersion(const std::string& /*cluster_id*/) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_) {
+            return tl::make_unexpected(result_.error());
+        }
+        if (!result_->has_value()) {
+            return std::optional<SnapshotVersionInfo>();
+        }
+
+        SnapshotVersionInfo version;
+        version.snapshot_id = result_->value().snapshot_id;
+        version.snapshot_sequence_id = result_->value().snapshot_sequence_id;
+        return std::optional<SnapshotVersionInfo>(std::move(version));
+    }
+
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& /*cluster_id*/) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (block_next_load_) {
+            load_started_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [this]() { return !block_next_load_; });
+        }
+        return result_;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
+    bool block_next_load_{false};
+    bool load_started_{false};
 };
 
 LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
@@ -494,6 +558,61 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
     auto err = service_->Start("", "", cluster_id_);
     EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(HotStandbyServiceTest,
+       TestPromote_DuringSnapshotRefreshKeepsPreviousMetadataConsistent) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    config_.snapshot_refresh_interval_ms = 20;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto provider = std::make_unique<BlockingSnapshotProvider>(
+        std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096)));
+    auto* provider_handle = provider.get();
+    service_->SetSnapshotProvider(std::move(provider));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service_->GetLatestAppliedSequenceId() == 42; },
+        std::chrono::milliseconds(500)));
+
+    provider_handle->PublishAndBlockNextLoad(std::optional<LoadedSnapshot>(
+        MakeSnapshot("20260330_121500_000", 84, "key-new", 8192)));
+    ASSERT_TRUE(
+        provider_handle->WaitForBlockedLoad(std::chrono::milliseconds(1000)));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service_->GetSyncStatus().primary_seq_id == 84; },
+        std::chrono::milliseconds(500)));
+
+    ErrorCode promote_err = ErrorCode::INTERNAL_ERROR;
+    std::atomic<bool> promote_done{false};
+    std::thread promote_thread([&]() {
+        promote_err = service_->Promote();
+        promote_done.store(true, std::memory_order_release);
+    });
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            return service_->GetState() == StandbyState::STOPPED &&
+                   !promote_done.load(std::memory_order_acquire);
+        },
+        std::chrono::milliseconds(1000)));
+
+    provider_handle->UnblockLoad();
+    promote_thread.join();
+
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-old", exported[0].first);
+    EXPECT_EQ(4096u, exported[0].second.size);
+    EXPECT_EQ(42u, exported[0].second.last_sequence_id);
 }
 
 // ========== 6.1.6 Metadata operation tests ==========

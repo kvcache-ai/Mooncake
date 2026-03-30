@@ -2,8 +2,11 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <string>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
@@ -11,6 +14,9 @@
 
 namespace mooncake::test {
 namespace {
+
+DEFINE_string(redis_endpoint, "",
+              "Redis endpoint for replication controller snapshot tests");
 
 class ScopedUnsetEnvVar {
    public:
@@ -47,6 +53,16 @@ MasterServiceSupervisorConfig MakeFailingSnapshotOnlyControllerConfig() {
     return config;
 }
 
+class ReplicationControllerSnapshotCatalogTest
+    : public ::testing::TestWithParam<CatalogBackendParam> {
+   protected:
+    void SetUp() override {
+        if (GetParam().requires_redis && FLAGS_redis_endpoint.empty()) {
+            GTEST_SKIP() << "Redis endpoint is not configured";
+        }
+    }
+};
+
 TEST(ReplicationControllerTest, PromoteFailsClosedWhenStandbyStartFails) {
     ScopedUnsetEnvVar unset_snapshot_path(kSnapshotLocalPathEnv);
 
@@ -66,10 +82,11 @@ TEST(ReplicationControllerTest, PromoteFailsClosedWhenStandbyStartFails) {
     EXPECT_EQ(promote_err, start_err);
 }
 
-TEST(ReplicationControllerTest,
-     PromoteExportsPreloadedStateForSnapshotOnlyStandby) {
+TEST_P(ReplicationControllerSnapshotCatalogTest,
+       PromoteExportsPreloadedStateForSnapshotOnlyStandby) {
     namespace fs = std::filesystem;
 
+    const auto& backend_param = GetParam();
     const auto cluster_id =
         "replication-controller-hot-state-" + UuidToString(generate_uuid());
     const auto temp_dir =
@@ -78,12 +95,8 @@ TEST(ReplicationControllerTest,
         std::make_unique<ScopedEnvVar>(kSnapshotLocalPathEnv, temp_dir);
     auto object_store =
         std::make_unique<LocalFileSnapshotObjectStore>(temp_dir);
-    CatalogBackendParam backend_param{
-        .name = "Embedded",
-        .catalog_store_type = "embedded",
-    };
     auto catalog_store = CreateCatalogStoreForTest(
-        backend_param, object_store.get(), cluster_id, "");
+        backend_param, object_store.get(), cluster_id, FLAGS_redis_endpoint);
     ASSERT_NE(catalog_store, nullptr);
 
     const auto descriptor = MakeTestSnapshotDescriptor(
@@ -97,12 +110,16 @@ TEST(ReplicationControllerTest,
     config.cluster_id = cluster_id;
     config.enable_snapshot_restore = true;
     config.snapshot_object_store_type = "local";
-    config.snapshot_catalog_store_type = "embedded";
+    config.snapshot_catalog_store_type = backend_param.catalog_store_type;
+    if (backend_param.requires_redis) {
+        config.snapshot_catalog_store_connstring = FLAGS_redis_endpoint;
+        config.ha_backend_connstring = FLAGS_redis_endpoint;
+    }
 
     auto controller = ha::CreateReplicationController(
         ha::HABackendSpec{
             .type = ha::HABackendType::REDIS,
-            .connstring = "",
+            .connstring = FLAGS_redis_endpoint,
             .cluster_namespace = cluster_id,
         },
         config);
@@ -131,5 +148,22 @@ TEST(ReplicationControllerTest,
     fs::remove_all(temp_dir);
 }
 
+INSTANTIATE_TEST_SUITE_P(
+    SnapshotCatalogBackends, ReplicationControllerSnapshotCatalogTest,
+    ::testing::ValuesIn(BuildCatalogBackendParams()),
+    [](const ::testing::TestParamInfo<CatalogBackendParam>& info) {
+        return info.param.name;
+    });
+
 }  // namespace
 }  // namespace mooncake::test
+
+int main(int argc, char** argv) {
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = 1;
+    gflags::ParseCommandLineFlags(&argc, &argv, true);
+    ::testing::InitGoogleTest(&argc, argv);
+    const int result = RUN_ALL_TESTS();
+    google::ShutdownGoogleLogging();
+    return result;
+}
