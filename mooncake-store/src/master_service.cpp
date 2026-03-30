@@ -127,6 +127,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           CreateAllocationStrategy(config.allocation_strategy_type)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
+      cleanup_expired_on_restore_(config.cleanup_expired_on_restore),
       snapshot_backup_dir_(config.snapshot_backup_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
@@ -2741,10 +2742,9 @@ void MasterService::RestoreState() {
         return;
     }
 
-    const auto now = std::chrono::system_clock::now();
     for (const auto& snapshot : restore_candidates) {
         ResetStateAfterFailedRestoreAttempt();
-        if (TryRestoreStateFromSnapshot(snapshot, now)) {
+        if (TryRestoreStateFromSnapshot(snapshot)) {
             return;
         }
     }
@@ -2755,8 +2755,7 @@ void MasterService::RestoreState() {
 }
 
 bool MasterService::TryRestoreStateFromSnapshot(
-    const ha::SnapshotDescriptor& snapshot,
-    const std::chrono::system_clock::time_point& now) {
+    const ha::SnapshotDescriptor& snapshot) {
     const std::string& state_id = snapshot.snapshot_id;
     std::string path_prefix = snapshot.object_prefix;
     if (path_prefix.empty()) {
@@ -2928,14 +2927,18 @@ bool MasterService::TryRestoreStateFromSnapshot(
             const bool skip_cleanup = std::getenv(
                 "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
             if (!skip_cleanup) {
-                auto cleanup_now = now;
+                auto cleanup_now = std::chrono::system_clock::now();
                 for (auto& shard : metadata_shards_) {
                     for (auto it = shard.metadata.begin();
                          it != shard.metadata.end();) {
-                        if (it->second.HasDiffRepStatus(
-                                ReplicaStatus::COMPLETE) ||
-                            (it->second.IsLeaseExpired(cleanup_now) &&
-                             !it->second.IsSoftPinned(cleanup_now))) {
+                        const bool cleanup_incomplete =
+                            it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)
+                                .has_value();
+                        const bool cleanup_expired_complete =
+                            cleanup_expired_on_restore_ &&
+                            it->second.IsLeaseExpired(cleanup_now) &&
+                            !it->second.IsSoftPinned(cleanup_now);
+                        if (cleanup_incomplete || cleanup_expired_complete) {
                             VLOG(1)
                                 << "clear metadata key=" << it->first
                                 << " ,lease_timeout="

@@ -722,7 +722,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
     restored_service.reset();
 }
 
-TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
+TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLeaseWhenConfigured) {
     // Step 1: Create service with long lease TTL
     auto config = MasterServiceConfigBuilder()
                       .set_enable_snapshot(false)
@@ -779,6 +779,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     auto restore_config = MasterServiceConfigBuilder()
                               .set_enable_snapshot(false)
                               .set_enable_snapshot_restore(true)
+                              .set_cleanup_expired_on_restore(true)
                               .set_snapshot_backup_dir(tmp_dir() + "/backup")
                               .set_snapshot_interval_seconds(100)
                               .set_snapshot_child_timeout_seconds(60)

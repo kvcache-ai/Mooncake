@@ -457,9 +457,7 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
-    bool TryRestoreStateFromSnapshot(
-        const ha::SnapshotDescriptor& snapshot,
-        const std::chrono::system_clock::time_point& now);
+    bool TryRestoreStateFromSnapshot(const ha::SnapshotDescriptor& snapshot);
     void ResetStateAfterFailedRestoreAttempt();
     void LoadPreloadedState(const ha::PromotedStandbyState& state);
 
@@ -1080,6 +1078,7 @@ class MasterService {
     bool enable_snapshot_restore_ = false;
 
     bool enable_snapshot_ = false;
+    bool cleanup_expired_on_restore_ = false;
     std::string snapshot_backup_dir_;
     bool use_snapshot_backup_dir_{false};
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;

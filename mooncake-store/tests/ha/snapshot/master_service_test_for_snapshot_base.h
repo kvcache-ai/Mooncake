@@ -42,6 +42,16 @@ namespace mooncake::test {
  */
 class MasterServiceSnapshotTestBase : public ::testing::Test {
    protected:
+    struct MasterMetricSnapshot {
+        int64_t allocated_mem_size = 0;
+        int64_t total_mem_capacity = 0;
+        int64_t allocated_file_size = 0;
+        int64_t total_file_capacity = 0;
+        int64_t key_count = 0;
+        int64_t soft_pin_key_count = 0;
+        int64_t active_clients = 0;
+    };
+
     // ==================== Temp Dir Accessor ====================
 
     const std::string& tmp_dir() const { return tmp_dir_; }
@@ -49,11 +59,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // ==================== SetUp ====================
 
     void SetUp() override {
-        // Reset MasterMetricManager singleton state to ensure test isolation
-        // This prevents metric state leakage between tests which can cause
-        // eviction behavior inconsistency and snapshot comparison failures
-        MasterMetricManager::instance().reset_allocated_mem_size();
-        MasterMetricManager::instance().reset_total_mem_capacity();
+        ResetMasterMetricsForTest();
 
         // Create a unique temporary directory for this test
         namespace fs = std::filesystem;
@@ -158,6 +164,18 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
+    static void EnsureSnapshotStoresInitialized(MasterService* service) {
+        if (!service->snapshot_object_store_) {
+            service->snapshot_object_store_ = SnapshotObjectStore::Create(
+                SnapshotObjectStoreType::LOCAL_FILE);
+        }
+        if (!service->snapshot_catalog_store_ &&
+            service->snapshot_object_store_) {
+            service->snapshot_catalog_store_ =
+                service->CreateSnapshotCatalogStore();
+        }
+    }
+
     // Wrapper method: Call MasterService's private method PersistState
     // This class is a friend of MasterService, so it can access private members
     static tl::expected<void, SerializationError> CallPersistState(
@@ -198,6 +216,50 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     }
 
     // ==================== State Capture Methods ====================
+
+    MasterMetricSnapshot CaptureMasterMetrics() const {
+        auto& metrics = MasterMetricManager::instance();
+        return {
+            .allocated_mem_size = metrics.get_allocated_mem_size(),
+            .total_mem_capacity = metrics.get_total_mem_capacity(),
+            .allocated_file_size = metrics.get_allocated_file_size(),
+            .total_file_capacity = metrics.get_total_file_capacity(),
+            .key_count = metrics.get_key_count(),
+            .soft_pin_key_count = metrics.get_soft_pin_key_count(),
+            .active_clients = metrics.get_active_clients(),
+        };
+    }
+
+    void ResetMasterMetricsForTest() const {
+        auto& metrics = MasterMetricManager::instance();
+        metrics.reset_allocated_mem_size();
+        metrics.reset_total_mem_capacity();
+
+        const int64_t allocated_file_size = metrics.get_allocated_file_size();
+        if (allocated_file_size != 0) {
+            metrics.dec_allocated_file_size(allocated_file_size);
+        }
+
+        const int64_t total_file_capacity = metrics.get_total_file_capacity();
+        if (total_file_capacity != 0) {
+            metrics.dec_total_file_capacity(total_file_capacity);
+        }
+
+        const int64_t key_count = metrics.get_key_count();
+        if (key_count != 0) {
+            metrics.dec_key_count(key_count);
+        }
+
+        const int64_t soft_pin_key_count = metrics.get_soft_pin_key_count();
+        if (soft_pin_key_count != 0) {
+            metrics.dec_soft_pin_key_count(soft_pin_key_count);
+        }
+
+        const int64_t active_clients = metrics.get_active_clients();
+        if (active_clients != 0) {
+            metrics.dec_active_clients(active_clients);
+        }
+    }
 
     // Capture current service state for validation
     ServiceStateSnapshot CaptureServiceState(MasterService* service) const {
