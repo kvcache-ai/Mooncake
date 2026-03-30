@@ -144,7 +144,12 @@ Status NVMeoFTransport::submitTransfer(
 
         auto &desc = segment_desc_map.at(target_id);
         // LOG(INFO) << "desc " << desc->name << " " << desc->protocol;
+#ifdef ENABLE_MULTI_PROTOCOL
+        assert(std::find(desc->protocol.begin(), desc->protocol.end(),
+                         "nvmeof") != desc->protocol.end());
+#else
         assert(desc->protocol == "nvmeof");
+#endif
         // TODO: solving iterator invalidation due to vector resize
         // Handle File Offset
         uint32_t buffer_id = 0;

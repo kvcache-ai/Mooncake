@@ -158,7 +158,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *protocol,
                                     const char *device_name,
                                     const char *metadata_type) {
-    std::string proto = protocol ? std::string(protocol) : "";
+    LOG(INFO) << "Init protocol: " << protocol;
+    proto_ = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
@@ -167,7 +168,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
     // auto-install RDMA
-    bool use_efa = (proto == "efa");
+    bool use_efa = (proto_ == "efa");
     // Disable auto_discover to prevent RDMA transport installation, we'll
     // install EFA manually
     engine_ = std::make_unique<TransferEngine>(false, device_filter);
@@ -221,6 +222,11 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 #endif
 
     free_list_.resize(kSlabSizeKBTabLen);
+#ifndef USE_ASCEND
+    if (proto_ != "cxl") {
+        doBuddyAllocate(kMaxClassId);
+    }
+#endif
     return 0;
 }
 
@@ -229,7 +235,15 @@ int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 char *TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
+    if (proto_ == "") return nullptr;
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map;
+    buffer_map[proto_].emplace_back(buffer, capacity, kWildcardLocation);
+    int ret = engine_->registerLocalMemory(buffer_map);
+#else
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
+#endif
     if (ret) {
         freeMemory(buffer);
         return nullptr;
@@ -266,6 +280,10 @@ int TransferEnginePy::doBuddyAllocate(int class_id) {
 }
 
 uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
+    if (proto_ == "cxl") {
+        LOG(ERROR) << "CXL does not support managed buffer";
+        return 0;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     int class_id = findClassId(length);
     if (class_id < 0) {
@@ -282,12 +300,24 @@ uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
 }
 
 int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
+    if (proto_ == "cxl") {
+        LOG(ERROR) << "CXL does not support managed buffer";
+        return 0;
+    }
     std::lock_guard<std::mutex> guard(mutex_);
     auto buffer = (char *)buffer_addr;
     int class_id = findClassId(length);
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+            buffer_map;
+        buffer_map[proto_].emplace_back(buffer);
+        engine_->unregisterLocalMemory(buffer_map);
+#else
         engine_->unregisterLocalMemory(buffer);
+#endif
         freeMemory(buffer);
         return 0;
     }
@@ -385,11 +415,20 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         entry.advise_retry_cnt = retry;
 
         Status s =
+#ifdef ENABLE_MULTI_PROTOCOL
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, {entry},
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg},
+                      proto_)
+                : engine_->submitTransfer(batch_id, {entry}, proto_);
+#else
             notify
                 ? engine_->submitTransferWithNotify(
                       batch_id, {entry},
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, {entry});
+#endif
         if (!s.ok()) {
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
@@ -482,11 +521,20 @@ int TransferEnginePy::batchTransferSync(
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(batch_size);
         Status s =
+#ifdef ENABLE_MULTI_PROTOCOL
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, entries,
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg},
+                      proto_)
+                : engine_->submitTransfer(batch_id, entries, proto_);
+#else
             notify
                 ? engine_->submitTransferWithNotify(
                       batch_id, entries,
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, entries);
+#endif
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
@@ -588,7 +636,11 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         auto start_ts = getCurrentTimeInNano();
         batch_desc->start_timestamp = start_ts;
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        Status s = engine_->submitTransfer(batch_id, entries, proto_);
+#else
         Status s = engine_->submitTransfer(batch_id, entries);
+#endif
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
             return 0;
@@ -686,7 +738,11 @@ batch_id_t TransferEnginePy::transferSubmitWrite(const char *target_hostname,
     entry.target_id = handle;
     entry.target_offset = peer_buffer_address;
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    Status s = engine_->submitTransfer(batch_id, {entry}, proto_);
+#else
     Status s = engine_->submitTransfer(batch_id, {entry});
+#endif
     if (!s.ok()) return -1;
 
     return batch_id;
@@ -734,13 +790,37 @@ int TransferEnginePy::batchUnregisterMemory(
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
+    if (proto_ == "cxl") {
+        auto base_addr = engine_->getBaseAddr();
+        if (!base_addr) return -1;
+        buffer_addr = buffer_addr + reinterpret_cast<uintptr_t>(base_addr);
+    }
+
     char *buffer = reinterpret_cast<char *>(buffer_addr);
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map;
+    buffer_map[proto_].emplace_back(buffer, capacity);
+    return engine_->registerLocalMemory(buffer_map);
+#else
     return engine_->registerLocalMemory(buffer, capacity);
+#endif
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
+    if (proto_ == "cxl") {
+        auto base_addr = engine_->getBaseAddr();
+        if (!base_addr) return -1;
+        buffer_addr = buffer_addr + reinterpret_cast<uintptr_t>(base_addr);
+    }
+
     char *buffer = reinterpret_cast<char *>(buffer_addr);
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>> buffer_map;
+    buffer_map[proto_].emplace_back(buffer);
+    return engine_->unregisterLocalMemory(buffer_map);
+#else
     return engine_->unregisterLocalMemory(buffer);
+#endif
 }
 
 #ifdef USE_CUDA
@@ -756,6 +836,9 @@ struct TransferOnCudaContext {
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::string proto;
+#endif
 };
 
 /**
@@ -770,7 +853,13 @@ struct TransferOnCudaContext {
 void CUDART_CB transfer_on_cuda_callback(void *data) {
     auto *ctx = reinterpret_cast<TransferOnCudaContext *>(data);
 
-    auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
+#ifdef ENABLE_MULTI_PROTOCOL
+    auto status =
+        ctx->engine->submitTransfer(ctx->batch_id, ctx->requests, ctx->proto);
+#else
+    auto status =
+        ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
+#endif
     if (!status.ok()) {
         LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
                    << " | BatchID: " << ctx->batch_id;
@@ -871,8 +960,13 @@ void TransferEnginePy::batchTransferOnCuda(
     }
 
     auto batch_id = engine_->allocateBatchID(batch_size);
+#ifdef ENABLE_MULTI_PROTOCOL
+    auto *ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
+                                          total_bytes, proto_};
+#else
     auto *ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
                                           total_bytes};
+#endif
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err =

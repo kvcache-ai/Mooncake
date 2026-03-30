@@ -82,6 +82,73 @@ int removeLocalSegment(transfer_engine_t engine, const char *segment_name) {
     return native->removeLocalSegment(segment_name);
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
+                        const char *location, int remote_accessible,
+                        const char *proto) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[proto].emplace_back(addr, length, location, remote_accessible,
+                                   true);
+    return native->registerLocalMemory(buffer_map);
+}
+
+int unregisterLocalMemory(transfer_engine_t engine, void *addr,
+                          const char *proto) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[proto].emplace_back(addr);
+    return native->unregisterLocalMemory(buffer_map);
+}
+
+int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
+                   struct transfer_request *entries, size_t count,
+                   char *protocol) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<Transport::TransferRequest> native_entries;
+    native_entries.resize(count);
+    for (size_t index = 0; index < count; index++) {
+        native_entries[index].opcode =
+            (Transport::TransferRequest::OpCode)entries[index].opcode;
+        native_entries[index].source = entries[index].source;
+        native_entries[index].target_id = entries[index].target_id;
+        native_entries[index].target_offset = entries[index].target_offset;
+        native_entries[index].length = entries[index].length;
+    }
+    std::string proto_str(protocol);
+    Status s = native->submitTransfer((Transport::BatchID)batch_id,
+                                      native_entries, proto_str);
+    return (int)s.code();
+}
+
+int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
+                             struct transfer_request *entries, size_t count,
+                             notify_msg_t notify_msg, char *protocol) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<Transport::TransferRequest> native_entries;
+    native_entries.resize(count);
+    for (size_t index = 0; index < count; index++) {
+        native_entries[index].opcode =
+            (Transport::TransferRequest::OpCode)entries[index].opcode;
+        native_entries[index].source = entries[index].source;
+        native_entries[index].target_id = entries[index].target_id;
+        native_entries[index].target_offset = entries[index].target_offset;
+        native_entries[index].length = entries[index].length;
+    }
+    TransferMetadata::NotifyDesc native_notify_msg;
+    native_notify_msg.name = notify_msg.name;
+    native_notify_msg.notify_msg = notify_msg.msg;
+    std::string proto_str(protocol);
+    Status s = native->submitTransferWithNotify((Transport::BatchID)batch_id,
+                                                native_entries,
+                                                native_notify_msg, proto_str);
+    return (int)s.code();
+}
+#else
 int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
                         const char *location, int remote_accessible) {
     TransferEngine *native = (TransferEngine *)engine;
@@ -92,34 +159,6 @@ int registerLocalMemory(transfer_engine_t engine, void *addr, size_t length,
 int unregisterLocalMemory(transfer_engine_t engine, void *addr) {
     TransferEngine *native = (TransferEngine *)engine;
     return native->unregisterLocalMemory(addr);
-}
-
-int registerLocalMemoryBatch(transfer_engine_t engine,
-                             buffer_entry_t *buffer_list, size_t buffer_len,
-                             const char *location) {
-    TransferEngine *native = (TransferEngine *)engine;
-    std::vector<BufferEntry> native_buffer_list;
-    for (size_t i = 0; i < buffer_len; ++i) {
-        BufferEntry entry;
-        entry.addr = buffer_list[i].addr;
-        entry.length = buffer_list[i].length;
-        native_buffer_list.push_back(entry);
-    }
-    return native->registerLocalMemoryBatch(native_buffer_list, location);
-}
-
-int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
-                               size_t addr_len) {
-    TransferEngine *native = (TransferEngine *)engine;
-    std::vector<void *> native_addr_list;
-    for (size_t i = 0; i < addr_len; ++i)
-        native_addr_list.push_back(addr_list[i]);
-    return native->unregisterLocalMemoryBatch(native_addr_list);
-}
-
-batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
-    TransferEngine *native = (TransferEngine *)engine;
-    return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
 int submitTransfer(transfer_engine_t engine, batch_id_t batch_id,
@@ -160,6 +199,35 @@ int submitTransferWithNotify(transfer_engine_t engine, batch_id_t batch_id,
     Status s = native->submitTransferWithNotify(
         (Transport::BatchID)batch_id, native_entries, native_notify_msg);
     return (int)s.code();
+}
+#endif
+
+int registerLocalMemoryBatch(transfer_engine_t engine,
+                             buffer_entry_t *buffer_list, size_t buffer_len,
+                             const char *location) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<BufferEntry> native_buffer_list;
+    for (size_t i = 0; i < buffer_len; ++i) {
+        BufferEntry entry;
+        entry.addr = buffer_list[i].addr;
+        entry.length = buffer_list[i].length;
+        native_buffer_list.push_back(entry);
+    }
+    return native->registerLocalMemoryBatch(native_buffer_list, location);
+}
+
+int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
+                               size_t addr_len) {
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<void *> native_addr_list;
+    for (size_t i = 0; i < addr_len; ++i)
+        native_addr_list.push_back(addr_list[i]);
+    return native->unregisterLocalMemoryBatch(native_addr_list);
+}
+
+batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size) {
+    TransferEngine *native = (TransferEngine *)engine;
+    return (batch_id_t)native->allocateBatchID(batch_size);
 }
 
 int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,

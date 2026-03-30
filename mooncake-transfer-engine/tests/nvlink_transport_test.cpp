@@ -22,6 +22,7 @@ DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server host address");
 DEFINE_string(local_server_name, "cuda_server:12345", "Local server name");
 DEFINE_string(segment_id, "cuda_server:12345", "Segment ID to access data");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
+DEFINE_string(protocol, "nvlink", "Transfer protocol");
 
 static void checkCudaError(cudaError_t result, const char* message) {
     if (result != cudaSuccess) {
@@ -57,9 +58,20 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     ASSERT_NE(server_transport, nullptr);
 
     void* server_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(server_buffer, kDataLength * 2,
+                                            "cuda:0");
+    int rc = server_engine->registerLocalMemory(buffer_map);
+    ASSERT_EQ(rc, 0);
+    buffer_map.clear();
+#else
     int rc = server_engine->registerLocalMemory(server_buffer, kDataLength * 2,
                                                 "cuda:0");
     ASSERT_EQ(rc, 0);
+#endif
 
     auto segment_id = server_engine->openSegment(FLAGS_segment_id);
 
@@ -73,9 +85,17 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     ASSERT_NE(client_transport, nullptr);
 
     void* client_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_map[FLAGS_protocol].emplace_back(client_buffer, kDataLength * 2,
+                                            "cuda:" + std::to_string(gpu_id));
+    rc = client_engine->registerLocalMemory(buffer_map);
+    ASSERT_EQ(rc, 0);
+    buffer_map.clear();
+#else
     rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2,
                                             "cuda:" + std::to_string(gpu_id));
     ASSERT_EQ(rc, 0);
+#endif
 
     // Write: client -> server
     {
@@ -92,7 +112,12 @@ TEST(NvlinkTransportTest, WriteAndRead) {
         entry.source = client_buffer;
         entry.target_id = segment_id;
         entry.target_offset = (uint64_t)server_buffer;
-        Status s = client_engine->submitTransfer(batch_id, {entry});
+        Status s =
+#ifdef ENABLE_MULTI_PROTOCOL
+            client_engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
+            client_engine->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_TRUE(s.ok());
 
         // Wait for completion
@@ -116,7 +141,12 @@ TEST(NvlinkTransportTest, WriteAndRead) {
         entry.source = (char*)client_buffer + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = (uint64_t)server_buffer;
-        Status s = client_engine->submitTransfer(batch_id, {entry});
+        Status s =
+#ifdef ENABLE_MULTI_PROTOCOL
+            client_engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
+            client_engine->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_TRUE(s.ok());
 
         // Wait for completion
@@ -142,10 +172,21 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     }
 
     // Cleanup
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_map[FLAGS_protocol].emplace_back(client_buffer);
+    client_engine->unregisterLocalMemory(buffer_map);
+    freeCudaBuffer(client_buffer);
+    buffer_map.clear();
+    buffer_map[FLAGS_protocol].emplace_back(server_buffer);
+    server_engine->unregisterLocalMemory(buffer_map);
+    freeCudaBuffer(server_buffer);
+    buffer_map.clear();
+#else
     client_engine->unregisterLocalMemory(client_buffer);
     freeCudaBuffer(client_buffer);
     server_engine->unregisterLocalMemory(server_buffer);
     freeCudaBuffer(server_buffer);
+#endif
 }
 
 int main(int argc, char** argv) {

@@ -200,7 +200,36 @@ int initiator() {
     memset(hostAddr, 0, size);
 
     LOG(INFO) << "hostAddr: " << hostAddr << ", len: " << FLAGS_block_size;
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        hostAddr, FLAGS_block_size, "npu:" + std::to_string(g_devicePhyId));
 
+    void *devAddr = NULL;
+    std::vector<void *> g_addr;
+    for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
+        uint64_t block_size = FLAGS_block_size * (1 << i);
+        ret = allocateDevMem(devAddr, FLAGS_batch_size * block_size);
+        if (ret) {
+            LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
+            return -1;
+        }
+        LOG(INFO) << "dev_addr_initiator: " << devAddr
+                  << " len:" << FLAGS_batch_size * block_size;
+        buffer_map[FLAGS_protocol].emplace_back(
+            devAddr, FLAGS_batch_size * block_size,
+            "npu:" + std::to_string(g_devicePhyId));
+        g_addr.push_back(devAddr);
+    }
+
+    ret = engine->registerLocalMemory(buffer_map);
+    if (ret) {
+        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
+        return ret;
+    }
+#else
     ret = engine->registerLocalMemory(hostAddr, FLAGS_block_size,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
@@ -229,7 +258,7 @@ int initiator() {
 
         g_addr.push_back(devAddr);
     }
-
+#endif
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
     TransferRequest::OpCode opcode;
@@ -261,7 +290,11 @@ int initiator() {
     entry.target_offset = remote_base;
     tmp_requests.emplace_back(entry);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    s = engine->submitTransfer(tmp_batch_id, tmp_requests, FLAGS_protocol);
+#else
     s = engine->submitTransfer(tmp_batch_id, tmp_requests);
+#endif
     LOG_ASSERT(s.ok());
 
     bool completed = false;
@@ -300,7 +333,11 @@ int initiator() {
             entry.target_offset = remote_base + block_size * j;
             requests.emplace_back(entry);
         }
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, requests);
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -360,6 +397,34 @@ int target() {
         return ret;
     }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        tmp_hostAddr, FLAGS_block_size, "npu:" + std::to_string(g_devicePhyId));
+
+    void *hostAddr = NULL;
+    std::vector<void *> g_addr;
+    for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
+        uint64_t block_size = FLAGS_block_size * (1 << i);
+        ret = aclrtMallocHost(&hostAddr, FLAGS_batch_size * block_size);
+        if (ret) {
+            LOG(ERROR) << "Failed to aclrtMallocHost, ret: " << ret;
+            return ret;
+        }
+        buffer_map[FLAGS_protocol].emplace_back(
+            hostAddr, FLAGS_batch_size * block_size,
+            "npu:" + std::to_string(g_devicePhyId));
+        g_addr.push_back(hostAddr);
+    }
+
+    ret = engine->registerLocalMemory(buffer_map);
+    if (ret) {
+        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
+        return ret;
+    }
+#else
     ret = engine->registerLocalMemory(tmp_hostAddr, FLAGS_block_size,
                                       "npu:" + std::to_string(g_devicePhyId));
     if (ret) {
@@ -387,7 +452,7 @@ int target() {
 
         g_addr.push_back(hostAddr);
     }
-
+#endif
     while (target_running) sleep(1);
 
     // release resource

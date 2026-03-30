@@ -31,7 +31,7 @@ namespace mooncake {
 
 DEFINE_string(metadata_server, "127.0.0.1:2379",
               "central metadata server for transfer engine");
-
+DEFINE_string(protocol, "nvlink", "Transfer protocol");
 class RDMALoopbackTest : public ::testing::Test {
    public:
     void *addr = nullptr;
@@ -46,13 +46,35 @@ class RDMALoopbackTest : public ::testing::Test {
         engine = std::make_unique<TransferEngine>(true);
         engine->init(FLAGS_metadata_server, "test_node");
         addr = numa_alloc_onnode(ram_buffer_size, 0);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+        int rc = engine->registerLocalMemory(buffer_map);
+
+#else
         int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+#endif
         ASSERT_EQ(rc, 0);
     }
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(addr);
+        engine->unregisterLocalMemory(buffer_map);
+
+#else
         engine->unregisterLocalMemory(addr);
+#endif
         numa_free(addr, ram_buffer_size);
     }
 };
@@ -71,7 +93,11 @@ TEST_F(RDMALoopbackTest, MultiWrite) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = LOCAL_SEGMENT_ID;
         entry.target_offset = (uint64_t)addr + kDataLength;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;

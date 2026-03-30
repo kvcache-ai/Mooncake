@@ -30,6 +30,7 @@
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
+#include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
@@ -44,6 +45,10 @@ using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
+
+#ifdef ENABLE_MULTI_PROTOCOL
+using RegisteredBuffer = TransferEngine::RegisteredBuffer;
+#endif
 
 class TransferEngineImpl {
    public:
@@ -100,25 +105,68 @@ class TransferEngineImpl {
 
     int removeLocalSegment(const std::string& segment_name);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    int registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    int unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries,
+                          std::string& proto) {
+        Status s = multi_transports_->submitTransfer(batch_id, entries, proto);
+#ifdef WITH_METRICS
+        if (metrics_enabled_ && s.ok()) {
+            auto& batch = Transport::toBatchDesc(batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
+            }
+        }
+#endif
+        return s;
+    }
+
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest>& entries,
+                                    TransferMetadata::NotifyDesc notify_msg,
+                                    std::string& proto) {
+        auto target_id = entries[0].target_id;
+        Status s = multi_transports_->submitTransfer(batch_id, entries, proto);
+        if (!s.ok()) {
+            return s;
+        }
+
+#ifdef WITH_METRICS
+        if (metrics_enabled_) {
+            auto& batch = Transport::toBatchDesc(batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
+            }
+        }
+#endif
+
+        // store notify
+        RWSpinlock::WriteGuard guard(send_notifies_lock_);
+        notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+
+        return s;
+    }
+#else
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
-
-    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
-                                 const std::string& location);
-
-    int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
-
-    BatchID allocateBatchID(size_t batch_size) {
-        return multi_transports_->allocateBatchID(batch_size);
-    }
-
-    Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
-    }
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
@@ -163,6 +211,20 @@ class TransferEngineImpl {
         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
 
         return s;
+    }
+#endif
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                                 const std::string& location);
+
+    int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
+
+    BatchID allocateBatchID(size_t batch_size) {
+        return multi_transports_->allocateBatchID(batch_size);
+    }
+
+    Status freeBatchID(BatchID batch_id) {
+        return multi_transports_->freeBatchID(batch_id);
     }
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);

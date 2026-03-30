@@ -75,6 +75,32 @@ int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     return impl_->removeLocalSegment(segment_name);
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+int TransferEngine::registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    return impl_->registerLocalMemory(buffer_map);
+}
+
+int TransferEngine::unregisterLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    return impl_->unregisterLocalMemory(buffer_map);
+}
+
+Status TransferEngine::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    std::string& proto) {
+    return impl_->submitTransfer(batch_id, entries, proto);
+}
+
+Status TransferEngine::submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg,
+                                           proto);
+}
+#else
 int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         const std::string& location,
                                         bool remote_accessible,
@@ -86,6 +112,18 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
 int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
     return impl_->unregisterLocalMemory(addr, update_metadata);
 }
+
+Status TransferEngine::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return impl_->submitTransfer(batch_id, entries);
+}
+
+Status TransferEngine::submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg) {
+    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
+}
+#endif
 
 int TransferEngine::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
@@ -103,17 +141,6 @@ BatchID TransferEngine::allocateBatchID(size_t batch_size) {
 
 Status TransferEngine::freeBatchID(BatchID batch_id) {
     return impl_->freeBatchID(batch_id);
-}
-
-Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest>& entries) {
-    return impl_->submitTransfer(batch_id, entries);
-}
-
-Status TransferEngine::submitTransferWithNotify(
-    BatchID batch_id, const std::vector<TransferRequest>& entries,
-    TransferMetadata::NotifyDesc notify_msg) {
-    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
 }
 
 int TransferEngine::getNotifies(

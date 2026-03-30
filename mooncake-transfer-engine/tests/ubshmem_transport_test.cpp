@@ -20,6 +20,7 @@ DEFINE_string(local_server_name, "127.0.0.1:12345", "Local server name");
 DEFINE_string(local_client_name, "127.0.0.1:12346", "Local client name");
 DEFINE_int32(server_npu_id, 0, "Server NPU ID to use");
 DEFINE_int32(client_npu_id, 2, "Client NPU ID to use");
+DEFINE_string(protocol, PROTOCOL, "Transfer protocol");
 
 enum class MemoryType { FABRIC_MEM_HOST, FABRIC_MEM_DEVICE, IPC_MEM_DEVICE };
 
@@ -167,15 +168,29 @@ static void serverThread(int npu_id, const std::string& metadataServer,
 
     const size_t kDataLength = 4194304;
     void* server_buffer = allocateAclBuffer(kDataLength * 2, npu_id, mem_type);
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
     if (mem_type == MemoryType::FABRIC_MEM_HOST) {
-        int rc = server_engine->registerLocalMemory(
-            server_buffer, kDataLength * 2, "cpu: " + std::to_string(npu_id));
-        ASSERT_EQ(rc, 0);
+        buffer_map[PROTOCOL].emplace_back(server_buffer, kDataLength * 2,
+                                          "cpu: " + std::to_string(npu_id));
     } else {
-        int rc = server_engine->registerLocalMemory(
-            server_buffer, kDataLength * 2, "npu: " + std::to_string(npu_id));
-        ASSERT_EQ(rc, 0);
+        buffer_map[PROTOCOL].emplace_back(server_buffer, kDataLength * 2,
+                                          "npu: " + std::to_string(npu_id));
     }
+    int rc = server_engine->registerLocalMemory(buffer_map);
+#else
+    std::string location;
+    if (mem_type == MemoryType::FABRIC_MEM_HOST) {
+        location = "cpu: " + std::to_string(npu_id);
+    } else {
+        location = "npu: " + std::to_string(npu_id);
+    }
+    int rc = server_engine->registerLocalMemory(server_buffer, kDataLength * 2,
+                                                location);
+#endif
+    ASSERT_EQ(rc, 0);
 
     // Notify main thread that server is ready
     serverReady.set_value();
@@ -184,7 +199,11 @@ static void serverThread(int npu_id, const std::string& metadataServer,
     testComplete.wait();
 
     // Cleanup
+#ifdef ENABLE_MULTI_PROTOCOL
+    server_engine->unregisterLocalMemory(buffer_map);
+#else
     server_engine->unregisterLocalMemory(server_buffer);
+#endif
     freeAclBuffer(server_buffer, mem_type);
 
     LOG(INFO) << "Server thread completed";
@@ -213,8 +232,17 @@ static void clientThread(int npu_id, const std::string& metadataServer,
     ASSERT_NE(client_transport, nullptr);
 
     void* client_buffer = allocateAclBuffer(kDataLength * 2, npu_id, mem_type);
-    int rc = client_engine->registerLocalMemory(
-        client_buffer, kDataLength * 2, "npu:" + std::to_string(npu_id));
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[PROTOCOL].emplace_back(client_buffer, kDataLength * 2,
+                                      "npu:" + std::to_string(npu_id));
+    rc = client_engine->registerLocalMemory(buffer_map);
+#else
+    rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2,
+                                            "npu:" + std::to_string(npu_id));
+#endif
     ASSERT_EQ(rc, 0);
 
     auto server_segment_id = client_engine->openSegment(segmentId);
@@ -237,7 +265,12 @@ static void clientThread(int npu_id, const std::string& metadataServer,
         entry.source = client_buffer;
         entry.target_id = server_segment_id;
         entry.target_offset = (uint64_t)segment_desc->buffers[0].addr;
-        Status s = client_engine->submitTransfer(batch_id, {entry});
+        Status s =
+#ifdef ENABLE_MULTI_PROTOCOL
+            client_engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
+            client_engine->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_TRUE(s.ok());
 
         // Wait for completion
@@ -265,7 +298,12 @@ static void clientThread(int npu_id, const std::string& metadataServer,
         entry.source = (char*)client_buffer + kDataLength;
         entry.target_id = server_segment_id;
         entry.target_offset = (uint64_t)segment_desc->buffers[0].addr;
-        Status s = client_engine->submitTransfer(batch_id, {entry});
+        Status s =
+#ifdef ENABLE_MULTI_PROTOCOL
+            client_engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
+            client_engine->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_TRUE(s.ok());
 
         // Wait for completion
@@ -293,7 +331,11 @@ static void clientThread(int npu_id, const std::string& metadataServer,
     }
 
     // Cleanup
+#ifdef ENABLE_MULTI_PROTOCOL
+    client_engine->unregisterLocalMemory(buffer_map);
+#else
     client_engine->unregisterLocalMemory(client_buffer);
+#endif
     freeAclBuffer(client_buffer, mem_type);
 
     // Notify server to cleanup

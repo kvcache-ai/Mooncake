@@ -198,7 +198,11 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             requests.emplace_back(entry);
         }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, requests);
+#endif
         if (!s.ok())
             LOG(INFO) << "Found Failed Requests";
         else {
@@ -295,6 +299,11 @@ int initiator() {
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+#endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
@@ -303,18 +312,34 @@ int initiator() {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
         std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
         int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : i;
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer_map[FLAGS_protocol].emplace_back(
+            addr[i], FLAGS_buffer_size,
+            name_prefix + std::to_string(name_suffix));
+#else
         int rc = engine->registerLocalMemory(
             addr[i], FLAGS_buffer_size,
             name_prefix + std::to_string(name_suffix));
         LOG_ASSERT(!rc);
+#endif
     }
 #else
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu:" + std::to_string(i));
+#else
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);
+#endif
     }
+#endif
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
 #endif
 
     std::thread workers[FLAGS_threads];
@@ -352,9 +377,15 @@ int initiator() {
               << calculateRate(
                      batch_count * FLAGS_batch_size * FLAGS_block_size,
                      duration);
-
+#ifdef ENABLE_MULTI_PROTOCOL
+    engine->unregisterLocalMemory(buffer_map);
+#else
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+    }
+#endif
+
+    for (int i = 0; i < buffer_num; ++i) {
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 
@@ -394,19 +425,41 @@ int target() {
     }
 
     std::vector<void *> addr(NR_SOCKETS, nullptr);
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+#endif
     for (int i = 0; i < NR_SOCKETS; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i);
         memset(addr[i], 'x', FLAGS_buffer_size);
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer_map[FLAGS_protocol].emplace_back(addr[i], FLAGS_buffer_size,
+                                                "cpu:" + std::to_string(i));
+#else
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              "cpu:" + std::to_string(i));
         LOG_ASSERT(!rc);
+#endif
     }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
+#endif
 
     LOG(INFO) << "numa node num: " << NR_SOCKETS;
 
     while (target_running) sleep(1);
+#ifdef ENABLE_MULTI_PROTOCOL
+    engine->unregisterLocalMemory(buffer_map);
+#else
     for (int i = 0; i < NR_SOCKETS; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+    }
+#endif
+
+    for (int i = 0; i < NR_SOCKETS; ++i) {
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
 

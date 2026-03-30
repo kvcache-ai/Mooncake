@@ -463,6 +463,102 @@ bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
     return false;
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+int TransferEngineImpl::registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    // Check for overlaps first
+    for (const auto& entry : buffer_map) {
+        for (const auto& buffer : entry.second) {
+            if (checkOverlap(buffer.addr, buffer.length)) {
+                LOG(ERROR) << "Transfer Engine does not support overlapped "
+                              "memory region";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+            if (buffer.length == 0) {
+                LOG(ERROR) << "Transfer Engine does not support zero length "
+                              "memory region";
+                return ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    // Register by protocol
+    std::vector<MemoryRegion> registered_buffers;
+    for (const auto& entry : buffer_map) {
+        const std::string& protocol = entry.first;
+        const auto& buffer_list = entry.second;
+
+        auto transport = multi_transports_->getTransport(protocol);
+        if (!transport) {
+            LOG(ERROR) << "Transport " << protocol << " not found";
+            return -1;
+        }
+
+        for (const auto& buffer : buffer_list) {
+            int ret = transport->registerLocalMemory(
+                buffer.addr, buffer.length, buffer.location,
+                buffer.remote_accessible, buffer.update_metadata);
+            if (ret < 0) {
+                LOG(ERROR) << "Failed to register memory with transport "
+                           << protocol << " addr=" << buffer.addr
+                           << " length=" << buffer.length;
+                return ret;
+            }
+            registered_buffers.push_back({buffer.addr, buffer.length,
+                                          buffer.location,
+                                          buffer.remote_accessible});
+        }
+        if (registered_buffers.size() != buffer_list.size()) {
+            for (auto& buffer : registered_buffers) {
+                transport->unregisterLocalMemory(buffer.addr, true);
+            }
+        } else {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            local_memory_regions_.insert(local_memory_regions_.end(),
+                                         registered_buffers.begin(),
+                                         registered_buffers.end());
+        }
+        registered_buffers.clear();
+    }
+    return 0;
+}
+
+int TransferEngineImpl::unregisterLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    for (const auto& buffer_entry : buffer_map) {
+        const std::string& protocol = buffer_entry.first;
+        const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
+
+        auto transport = multi_transports_->getTransport(protocol);
+        if (!transport) {
+            LOG(ERROR) << "Transport " << protocol << " not found";
+            return -1;
+        }
+
+        for (const auto& buffer : buffer_list) {
+            int ret = transport->unregisterLocalMemory(buffer.addr,
+                                                       buffer.update_metadata);
+            if (ret) {
+                return ret;
+            }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& buffer : buffer_list) {
+            for (auto it = local_memory_regions_.begin();
+                 it != local_memory_regions_.end(); ++it) {
+                if (it->addr == buffer.addr) {
+                    local_memory_regions_.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#else
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
                                             const std::string& location,
                                             bool remote_accessible,
@@ -506,6 +602,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     }
     return 0;
 }
+#endif
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {

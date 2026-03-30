@@ -52,6 +52,7 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
+        std::string protocol;
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
         std::string shm_name;        // for nvlink and hip
@@ -81,7 +82,11 @@ class TransferMetadata {
 
     struct SegmentDesc {
         std::string name;
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::vector<std::string> protocol;
+#else
         std::string protocol;
+#endif
         // this is for rdma/shm
         std::vector<DeviceDesc> devices;
         Topology topology;

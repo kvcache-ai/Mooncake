@@ -130,8 +130,20 @@ class RDMATransportTest : public ::testing::Test {
         xport = engine->installTransport("rdma", args);
         ASSERT_NE(xport, nullptr);
         addr = allocateMemoryPool(ram_buffer_size, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+        int rc = engine->registerLocalMemory(buffer_map);
+        ASSERT_EQ(rc, 0);
+
+#else
         int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
         ASSERT_EQ(rc, 0);
+#endif
         segment_id = engine->openSegment(FLAGS_segment_id.c_str());
         bindToSocket(0);
         segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
@@ -140,7 +152,18 @@ class RDMATransportTest : public ::testing::Test {
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(addr);
+        engine->unregisterLocalMemory(buffer_map);
+
+#else
         engine->unregisterLocalMemory(addr);
+#endif
         freeMemoryPool(addr, ram_buffer_size);
     }
 };
@@ -159,7 +182,11 @@ TEST_F(RDMATransportTest, MultiWrite) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -193,7 +220,11 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -221,7 +252,11 @@ TEST_F(RDMATransportTest, MultipleRead) {
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
         Status s;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_EQ(s, Status::OK());
         bool completed = false;
         TransferStatus status;
@@ -240,7 +275,17 @@ TEST_F(RDMATransportTest, MultipleRead) {
                      kDataLength);
         ASSERT_EQ(ret, 0);
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(addr);
+    engine->unregisterLocalMemory(buffer_map);
+
+#else
     engine->unregisterLocalMemory(addr);
+#endif
     freeMemoryPool(addr, ram_buffer_size);
 }
 
