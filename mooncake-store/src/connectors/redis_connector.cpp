@@ -89,12 +89,11 @@ tl::expected<void, std::string> RedisConnector::ListObjects(
         try {
             cursor = std::stoul(reply->element[0]->str);
         } catch (const std::exception&) {
-            std::string cursor_str = reply->element[0]->str
-                                         ? reply->element[0]->str
-                                         : "";
+            std::string cursor_str =
+                reply->element[0]->str ? reply->element[0]->str : "";
             freeReplyObject(reply);
-            return tl::make_unexpected(
-                "invalid cursor value in SCAN reply: " + cursor_str);
+            return tl::make_unexpected("invalid cursor value in SCAN reply: " +
+                                       cursor_str);
         }
 
         for (size_t i = 0; i < reply->element[1]->elements; ++i) {
