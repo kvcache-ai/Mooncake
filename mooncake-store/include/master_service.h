@@ -438,6 +438,8 @@ class MasterService {
     // Persist master state
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
+    tl::expected<void, SerializationError> PersistState(
+        const ha::SnapshotDescriptor& descriptor);
     tl::expected<ha::SnapshotDescriptor, SerializationError>
     BuildSnapshotDescriptor(const std::string& snapshot_id,
                             const std::string& manifest_path,

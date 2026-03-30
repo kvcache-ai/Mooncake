@@ -144,6 +144,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return service_->PersistState(snapshot_id);
     }
 
+    tl::expected<void, SerializationError> CallPersistState(
+        const ha::SnapshotDescriptor& descriptor) {
+        return service_->PersistState(descriptor);
+    }
+
     bool GetUseSnapshotBackupDir() {
         return service_->use_snapshot_backup_dir_;
     }
@@ -357,6 +362,38 @@ TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {
     EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
     EXPECT_GE(latest->value().created_at_ms, before_ms);
     EXPECT_LE(latest->value().created_at_ms, after_ms);
+}
+
+TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
+    const std::string snapshot_id = "20240601_120000_124";
+    CreateDefaultService();
+
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
+    descriptor.last_included_seq = 123;
+    descriptor.producer_view_version = 41;
+    descriptor.manifest_key =
+        "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
+    descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    descriptor.created_at_ms = 1717243200123;
+
+    auto persist_result = CallPersistState(descriptor);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().snapshot_id, descriptor.snapshot_id);
+    EXPECT_EQ(latest->value().manifest_key, descriptor.manifest_key);
+    EXPECT_EQ(latest->value().object_prefix, descriptor.object_prefix);
+    EXPECT_EQ(latest->value().last_included_seq, descriptor.last_included_seq);
+    EXPECT_EQ(latest->value().producer_view_version,
+              descriptor.producer_view_version);
+    EXPECT_EQ(latest->value().created_at_ms, descriptor.created_at_ms);
 }
 
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
