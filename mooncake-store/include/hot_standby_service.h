@@ -89,6 +89,15 @@ class HotStandbyService {
                     const std::string& cluster_id);
 
     /**
+     * @brief Start standby in snapshot-only mode without OpLog following
+     *
+     * This mode is used by non-etcd HA backends during the first stage of
+     * standby preheat: load the latest snapshot baseline and keep the admin
+     * plane observable, but do not start oplog catch-up.
+     */
+    ErrorCode StartSnapshotBootstrap(const std::string& cluster_id);
+
+    /**
      * @brief Stop replication and disconnect from Primary
      */
     void Stop();

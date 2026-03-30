@@ -1,17 +1,70 @@
 #include "ha/replication_controller.h"
 
-#include <mutex>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 
 #include <glog/logging.h>
 
+#include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "hot_standby_service.h"
 
 namespace mooncake {
 namespace ha {
 
 namespace {
+
+struct StandbyRuntimeCapabilities {
+    bool has_snapshot_bootstrap{false};
+    bool has_oplog_following{false};
+};
+
+std::unique_ptr<HotStandbyService> CreateStandbyService(
+    const MasterServiceSupervisorConfig& config) {
+    return std::make_unique<HotStandbyService>(HotStandbyConfig{
+        .standby_id = config.local_hostname,
+        .primary_address = "",
+        .verification_interval_sec = 30,
+        .max_replication_lag_entries = 1000,
+        .enable_verification = false,
+        .enable_snapshot_bootstrap = config.enable_snapshot_restore,
+    });
+}
+
+StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
+    StandbyRuntimeCapabilities capabilities;
+    capabilities.has_snapshot_bootstrap = config.enable_snapshot_restore;
+    capabilities.has_oplog_following = spec.type == HABackendType::ETCD;
+    return capabilities;
+}
+
+MasterRuntimeState MapStandbyRuntimeState(
+    const StandbySyncStatus& status,
+    const std::optional<MasterView>& observed_leader,
+    const StandbyRuntimeCapabilities& capabilities) {
+    switch (status.state) {
+        case StandbyState::STOPPED:
+            return MasterRuntimeState::kStandby;
+        case StandbyState::CONNECTING:
+        case StandbyState::SYNCING:
+        case StandbyState::RECOVERING:
+        case StandbyState::RECONNECTING:
+        case StandbyState::FAILED:
+            return MasterRuntimeState::kRecovering;
+        case StandbyState::WATCHING:
+            if (capabilities.has_oplog_following &&
+                observed_leader.has_value() && status.lag_entries > 0) {
+                return MasterRuntimeState::kCatchingUp;
+            }
+            return MasterRuntimeState::kStandby;
+        case StandbyState::PROMOTING:
+        case StandbyState::PROMOTED:
+            return MasterRuntimeState::kLeaderWarmup;
+    }
+    return MasterRuntimeState::kStandby;
+}
 
 class NoopReplicationController final : public ReplicationController {
    public:
@@ -41,43 +94,35 @@ class NoopReplicationController final : public ReplicationController {
     RuntimeStateCallback callback_;
 };
 
-#ifdef STORE_USE_ETCD
-MasterRuntimeState MapStandbyRuntimeState(
-    const StandbySyncStatus& status,
-    const std::optional<MasterView>& observed_leader) {
-    switch (status.state) {
-        case StandbyState::STOPPED:
-            return MasterRuntimeState::kStandby;
-        case StandbyState::CONNECTING:
-        case StandbyState::SYNCING:
-        case StandbyState::RECOVERING:
-        case StandbyState::RECONNECTING:
-        case StandbyState::FAILED:
-            return MasterRuntimeState::kRecovering;
-        case StandbyState::WATCHING:
-            if (observed_leader.has_value() && status.lag_entries > 0) {
-                return MasterRuntimeState::kCatchingUp;
-            }
-            return MasterRuntimeState::kStandby;
-        case StandbyState::PROMOTING:
-        case StandbyState::PROMOTED:
-            return MasterRuntimeState::kLeaderWarmup;
-    }
-    return MasterRuntimeState::kStandby;
-}
-
-class EtcdReplicationController final : public ReplicationController {
+class CapabilityDrivenReplicationController final
+    : public ReplicationController {
    public:
-    explicit EtcdReplicationController(
-        const MasterServiceSupervisorConfig& config)
-        : config_(config),
-          standby_service_(std::make_unique<HotStandbyService>(HotStandbyConfig{
-              .standby_id = config.local_hostname,
-              .verification_interval_sec = 30,
-              .max_replication_lag_entries = 1000,
-              .enable_verification = false,
-              .enable_snapshot_bootstrap = config.enable_snapshot_restore,
-          })) {
+    CapabilityDrivenReplicationController(
+        const HABackendSpec& spec, const MasterServiceSupervisorConfig& config)
+        : spec_(spec),
+          config_(config),
+          capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
+          standby_service_(CreateStandbyService(config)) {
+        if (capabilities_.has_snapshot_bootstrap) {
+            auto snapshot_provider =
+                CreateCatalogBackedSnapshotProvider(config_);
+            if (!snapshot_provider) {
+                dependency_init_error_ = snapshot_provider.error();
+                LOG(ERROR) << "Failed to initialize standby snapshot provider, "
+                           << "backend=" << HABackendTypeToString(spec_.type)
+                           << ", error=" << toString(dependency_init_error_);
+            } else {
+                standby_service_->SetSnapshotProvider(
+                    std::move(snapshot_provider.value()));
+            }
+        }
+
+        if (capabilities_.has_oplog_following) {
+            oplog_connstring_ = config_.ha_backend_connstring.empty()
+                                    ? config_.etcd_endpoints
+                                    : config_.ha_backend_connstring;
+        }
+
         standby_service_->SetSyncStatusCallback(
             [this](const StandbySyncStatus&) {
                 NotifyRuntimeStateIfChanged();
@@ -97,12 +142,20 @@ class EtcdReplicationController final : public ReplicationController {
             return ErrorCode::OK;
         }
 
-        ErrorCode err = standby_service_->Start(
-            observed_leader.has_value() ? observed_leader->leader_address : "",
-            config_.ha_backend_connstring.empty()
-                ? config_.etcd_endpoints
-                : config_.ha_backend_connstring,
-            config_.cluster_id);
+        if (dependency_init_error_ != ErrorCode::OK) {
+            return dependency_init_error_;
+        }
+
+        ErrorCode err = ErrorCode::OK;
+        if (capabilities_.has_oplog_following) {
+            err = standby_service_->Start(
+                observed_leader.has_value() ? observed_leader->leader_address
+                                            : "",
+                oplog_connstring_, config_.cluster_id);
+        } else {
+            err = standby_service_->StartSnapshotBootstrap(config_.cluster_id);
+        }
+
         if (err == ErrorCode::OK) {
             {
                 std::lock_guard<std::mutex> lock(state_mutex_);
@@ -155,7 +208,7 @@ class EtcdReplicationController final : public ReplicationController {
             return MasterRuntimeState::kStandby;
         }
         return MapStandbyRuntimeState(standby_service_->GetSyncStatus(),
-                                      observed_leader);
+                                      observed_leader, capabilities_);
     }
 
     void SetStandbyRuntimeStateCallback(
@@ -190,28 +243,32 @@ class EtcdReplicationController final : public ReplicationController {
         callback(runtime_state);
     }
 
+    HABackendSpec spec_;
     MasterServiceSupervisorConfig config_;
+    StandbyRuntimeCapabilities capabilities_;
     std::unique_ptr<HotStandbyService> standby_service_;
+    ErrorCode dependency_init_error_{ErrorCode::OK};
+    std::string oplog_connstring_;
+
     mutable std::mutex state_mutex_;
     std::optional<MasterView> observed_leader_;
     bool standby_running_ = false;
+
     std::mutex callback_mutex_;
     std::optional<RuntimeStateCallback> runtime_state_callback_;
     std::optional<MasterRuntimeState> last_reported_runtime_state_;
 };
-#endif
 
 }  // namespace
 
 std::unique_ptr<ReplicationController> CreateReplicationController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
-#ifdef STORE_USE_ETCD
-    if (spec.type == HABackendType::ETCD) {
-        return std::make_unique<EtcdReplicationController>(config);
+    const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
+    if (capabilities.has_snapshot_bootstrap ||
+        capabilities.has_oplog_following) {
+        return std::make_unique<CapabilityDrivenReplicationController>(spec,
+                                                                       config);
     }
-#else
-    (void)config;
-#endif
 
     LOG(INFO) << "HA replication controller falls back to noop, backend_type="
               << HABackendTypeToString(spec.type);

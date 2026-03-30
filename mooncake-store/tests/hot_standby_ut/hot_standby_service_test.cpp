@@ -12,6 +12,25 @@
 
 namespace mooncake::test {
 
+namespace {
+
+class FakeSnapshotProvider final : public SnapshotProvider {
+   public:
+    explicit FakeSnapshotProvider(
+        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result)
+        : result_(std::move(result)) {}
+
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& /*cluster_id*/) override {
+        return result_;
+    }
+
+   private:
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
+};
+
+}  // namespace
+
 class HotStandbyServiceTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -264,6 +283,53 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
     (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
     SUCCEED();
 #endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStartSnapshotBootstrap_WithSnapshot) {
+    config_.enable_snapshot_bootstrap = true;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "20260330_120000_000";
+    snapshot.snapshot_sequence_id = 42;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 42;
+    snapshot.metadata.emplace_back("key-1", metadata);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+
+    auto err = service_->StartSnapshotBootstrap(cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+
+    auto status = service_->GetSyncStatus();
+    EXPECT_EQ(42u, status.applied_seq_id);
+    EXPECT_EQ(42u, status.primary_seq_id);
+    EXPECT_TRUE(status.is_connected);
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    EXPECT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-1", exported[0].first);
+    EXPECT_EQ(4096u, exported[0].second.size);
+}
+
+TEST_F(HotStandbyServiceTest, TestStartSnapshotBootstrap_WhenProviderFails) {
+    config_.enable_snapshot_bootstrap = true;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        tl::make_unexpected(ErrorCode::PERSISTENT_FAIL)));
+
+    auto err = service_->StartSnapshotBootstrap(cluster_id_);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
 
 // ========== 6.1.6 Metadata operation tests ==========
