@@ -68,11 +68,11 @@ class FakeObjectStore final : public SnapshotObjectStore {
 };
 
 ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_id) {
-    ha::SnapshotDescriptor descriptor;
-    descriptor.snapshot_id = snapshot_id;
-    descriptor.manifest_key =
-        "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
-    descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
+    descriptor.last_included_seq = 42;
+    descriptor.producer_view_version = 7;
+    descriptor.created_at_ms = 1700000000000LL;
     return descriptor;
 }
 
@@ -131,12 +131,17 @@ TEST_F(RedisSnapshotCatalogStoreTest, PublishListAndGetLatestRoundTrip) {
     EXPECT_EQ(latest->value().snapshot_id, "20240302_120000_001");
     EXPECT_EQ(latest->value().manifest_key,
               "mooncake_master_snapshot/20240302_120000_001/manifest.txt");
+    EXPECT_EQ(latest->value().last_included_seq, 42u);
+    EXPECT_EQ(latest->value().producer_view_version, 7u);
+    EXPECT_EQ(latest->value().created_at_ms, 1700000000000LL);
 
     auto snapshots = store_->List(0);
     ASSERT_TRUE(snapshots.has_value());
     ASSERT_EQ(snapshots->size(), 2u);
     EXPECT_EQ(snapshots->at(0).snapshot_id, "20240302_120000_001");
     EXPECT_EQ(snapshots->at(1).snapshot_id, "20240301_120000_001");
+    EXPECT_EQ(snapshots->at(0).last_included_seq, 42u);
+    EXPECT_EQ(snapshots->at(1).last_included_seq, 42u);
 }
 
 TEST_F(RedisSnapshotCatalogStoreTest,
