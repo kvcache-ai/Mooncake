@@ -1,0 +1,4 @@
+---
+Checks: 'bugprone-use-after-move,bugprone-dangling-handle,performance-move-const-arg,performance-unnecessary-copy-initialization,-clang-diagnostic-unused-command-line-argument'
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
