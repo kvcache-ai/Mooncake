@@ -27,6 +27,7 @@ using namespace mooncake;
 
 namespace mooncake {
 
+DEFINE_string(protocol, "efa", "Transfer protocol");
 static void *allocateMemoryPool(size_t size, int socket_id) {
     return numa_alloc_onnode(size, socket_id);
 }
@@ -89,8 +90,19 @@ class EFATransportTest : public ::testing::Test {
         s.addr = allocateMemoryPool(buffer_size, 0);
         EXPECT_NE(s.addr, nullptr) << "allocateMemoryPool failed";
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(s.addr, buffer_size, "cpu:0");
+        rc = s.engine->registerLocalMemory(buffer_map);
+        EXPECT_EQ(rc, 0) << "registerLocalMemory failed";
+
+#else
         rc = s.engine->registerLocalMemory(s.addr, buffer_size, "cpu:0");
         EXPECT_EQ(rc, 0) << "registerLocalMemory failed";
+#endif
 
         // Use actual RPC address (P2PHANDSHAKE picks a random port)
         auto actual_addr = s.engine->getLocalIpAndPort();
@@ -100,7 +112,16 @@ class EFATransportTest : public ::testing::Test {
 
     void destroyEngine(EngineSetup &s) {
         if (s.engine && s.addr) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            std::unordered_map<
+                std::string,
+                std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+                buffer_map;
+            buffer_map[FLAGS_protocol].emplace_back(s.addr);
+            s.engine->unregisterLocalMemory(buffer_map);
+#else
             s.engine->unregisterLocalMemory(s.addr);
+#endif
         }
         if (s.addr) {
             freeMemoryPool(s.addr, s.buffer_size);
@@ -121,7 +142,11 @@ class EFATransportTest : public ::testing::Test {
         entry.target_id = segment_id;
         entry.target_offset = target_offset;
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        Status s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         Status s = engine->submitTransfer(batch_id, {entry});
+#endif
         if (!s.ok()) {
             LOG(ERROR) << "submitTransfer failed: " << s.ToString();
             engine->freeBatchID(batch_id);
@@ -248,8 +273,11 @@ TEST_F(EFATransportTest, MultiWrite) {
         entry.target_offset = remote_base + i * kDataLength;
         requests.push_back(entry);
     }
-
+#ifdef ENABLE_MULTI_PROTOCOL
+    Status s = setup.engine->submitTransfer(batch_id, requests, FLAGS_protocol);
+#else
     Status s = setup.engine->submitTransfer(batch_id, requests);
+#endif
     ASSERT_TRUE(s.ok()) << "submitTransfer failed: " << s.ToString();
 
     // Poll all tasks until completion
@@ -301,8 +329,12 @@ TEST_F(EFATransportTest, StressMultipleBatches) {
                 remote_base + (i + batch * kBatchSize) * kDataLength;
             requests.push_back(entry);
         }
-
+#ifdef ENABLE_MULTI_PROTOCOL
+        Status s =
+            setup.engine->submitTransfer(batch_id, requests, FLAGS_protocol);
+#else
         Status s = setup.engine->submitTransfer(batch_id, requests);
+#endif
         ASSERT_TRUE(s.ok())
             << "Batch " << batch << " submitTransfer failed: " << s.ToString();
 

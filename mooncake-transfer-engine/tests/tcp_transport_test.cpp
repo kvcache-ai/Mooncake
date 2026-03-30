@@ -50,7 +50,7 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use");
 using namespace mooncake;
 
 namespace mooncake {
-
+DEFINE_string(protocol, "tcp", "Transfer protocol");
 class TCPTransportTest : public ::testing::Test {
    public:
    protected:
@@ -114,7 +114,17 @@ TEST_F(TCPTransportTest, Writetest) {
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+    rc = engine->registerLocalMemory(buffer_map);
+
+#else
     rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+#endif
     LOG_ASSERT(!rc);
 
     for (size_t offset = 0; offset < kDataLength; ++offset)
@@ -130,7 +140,11 @@ TEST_F(TCPTransportTest, Writetest) {
     entry.source = (uint8_t *)(addr);
     entry.target_id = segment_id;
     entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+    s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
     s = engine->submitTransfer(batch_id, {entry});
+#endif
     LOG_ASSERT(s.ok());
     bool completed = false;
     TransferStatus status;
@@ -158,7 +172,17 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+    int rc = engine->registerLocalMemory(buffer_map);
+
+#else
     int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+#endif
     LOG_ASSERT(!rc);
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
@@ -175,7 +199,11 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -199,7 +227,11 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -230,7 +262,17 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     LOG_ASSERT(xport != nullptr);
 
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+    int rc = engine->registerLocalMemory(buffer_map);
+
+#else
     int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+#endif
     LOG_ASSERT(!rc);
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
@@ -248,7 +290,11 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -271,7 +317,11 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -298,7 +348,11 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -321,7 +375,11 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;

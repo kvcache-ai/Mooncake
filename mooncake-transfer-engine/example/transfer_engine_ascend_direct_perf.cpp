@@ -145,6 +145,37 @@ int initiator() {
 
     LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr
               << ", len: " << FLAGS_block_size;
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        tmp_devAddr, FLAGS_block_size,
+        "npu:" + std::to_string(g_deviceLogicId));
+
+    void *devAddr = NULL;
+    std::vector<void *> g_addr;
+    for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
+        uint64_t block_size = FLAGS_block_size * (1 << i);
+        ret = allocateDevMem(devAddr, FLAGS_batch_size * block_size * 2);
+        if (ret) {
+            LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
+            return -1;
+        }
+        LOG(INFO) << "dev_addr_initiator: " << devAddr
+                  << " len:" << FLAGS_batch_size * block_size * 2;
+        buffer_map[FLAGS_protocol].emplace_back(
+            devAddr, FLAGS_batch_size * block_size * 2,
+            "npu:" + std::to_string(g_deviceLogicId));
+        g_addr.push_back(devAddr);
+    }
+
+    ret = engine->registerLocalMemory(buffer_map);
+    if (ret) {
+        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
+        return ret;
+    }
+#else
     ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_block_size,
                                       "npu:" + std::to_string(g_deviceLogicId));
 
@@ -169,6 +200,7 @@ int initiator() {
 
         g_addr.push_back(devAddr);
     }
+#endif
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
 
@@ -202,7 +234,11 @@ int initiator() {
     entry.target_offset = remote_base;
     tmp_requests.emplace_back(entry);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    s = engine->submitTransfer(tmp_batch_id, tmp_requests, FLAGS_protocol);
+#else
     s = engine->submitTransfer(tmp_batch_id, tmp_requests);
+#endif
     LOG_ASSERT(s.ok());
     LOG(INFO) << "submit transfer suc.";
 
@@ -242,7 +278,11 @@ int initiator() {
             entry.target_offset = remote_base + block_size * 2 * j;
             requests.emplace_back(entry);
         }
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, requests, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, requests);
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -306,6 +346,38 @@ int target() {
 
     LOG(INFO) << "tmp_devAddr_target: " << tmp_devAddr
               << ", len: " << FLAGS_block_size;
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(
+        tmp_devAddr, FLAGS_block_size,
+        "npu:" + std::to_string(g_deviceLogicId));
+
+    void *devAddr = NULL;
+    std::vector<void *> g_addr;
+    for (uint32_t i = 0; i < FLAGS_block_iteration; i++) {
+        uint64_t block_size = FLAGS_block_size * (1 << i);
+        ret = allocateDevMem(devAddr, FLAGS_batch_size * block_size * 2);
+        if (ret) {
+            LOG(ERROR) << "Failed to allocateDevMem, ret: " << ret;
+            return ret;
+        }
+
+        LOG(INFO) << "devAddr_target: " << devAddr
+                  << ", len: " << FLAGS_batch_size * block_size * 2;
+        buffer_map[FLAGS_protocol].emplace_back(
+            devAddr, FLAGS_batch_size * block_size * 2,
+            "npu:" + std::to_string(g_deviceLogicId));
+        g_addr.push_back(devAddr);
+    }
+
+    ret = engine->registerLocalMemory(buffer_map);
+    if (ret) {
+        LOG(ERROR) << "Failed to registerLocalMemory, ret: " << ret;
+        return ret;
+    }
+#else
     ret = engine->registerLocalMemory(tmp_devAddr, FLAGS_block_size,
                                       "npu:" + std::to_string(g_deviceLogicId));
 
@@ -331,7 +403,7 @@ int target() {
 
         g_addr.push_back(devAddr);
     }
-
+#endif
     while (target_running) sleep(1);
 
     // release resource

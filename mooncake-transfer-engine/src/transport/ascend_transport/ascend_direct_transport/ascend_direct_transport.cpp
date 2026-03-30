@@ -146,7 +146,11 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     auto desc = std::make_shared<SegmentDesc>();
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc->protocol.push_back("ascend");
+#else
     desc->protocol = "ascend";
+#endif
 
     dummy_real_mode_ = globalConfig().ascend_agent_mode;
     char *roce_enable_str = std::getenv("HCCL_INTRA_ROCE_ENABLE");
@@ -325,6 +329,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
+    buffer_desc.protocol = "ascend";
 
     adxl::MemType mem_type;
     if (location.starts_with("cpu")) {

@@ -97,6 +97,48 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+Status MultiTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries,
+    std::string &proto) {
+    auto &batch_desc = *((BatchDesc *)(batch_id));
+    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+        return Status::TooManyRequests(
+            "Exceed the limitation of batch capacity");
+    }
+
+    size_t task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(task_id + entries.size());
+
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+        submit_tasks;
+    for (auto &request : entries) {
+        Transport *transport = nullptr;
+        auto status = selectTransport(request, transport, proto);
+        if (!status.ok()) return status;
+        assert(transport);
+        auto &task = batch_desc.task_list[task_id];
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest *>(&request);
+#else
+        task.request = &request;
+#endif
+        ++task_id;
+        submit_tasks[transport].push_back(&task);
+    }
+    Status overall_status = Status::OK();
+    for (auto &entry : submit_tasks) {
+        auto status = entry.first->submitTransferTask(entry.second);
+        if (!status.ok()) {
+            // LOG(ERROR) << "Failed to submit transfer task to "
+            //            << entry.first->getName();
+            overall_status = status;
+        }
+    }
+    return overall_status;
+}
+#else
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
@@ -136,6 +178,7 @@ Status MultiTransport::submitTransfer(
     }
     return overall_status;
 }
+#endif
 
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus &status) {
@@ -340,6 +383,46 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     return transport;
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+Status MultiTransport::selectTransport(const TransferRequest &entry,
+                                       Transport *&transport,
+                                       std::string &preferred_proto) {
+    auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
+    if (!target_segment_desc) {
+        return Status::InvalidArgument("Invalid target segment ID " +
+                                       std::to_string(entry.target_id));
+    }
+    auto protos = target_segment_desc->protocol;
+#ifdef USE_ASCEND_HETEROGENEOUS
+    // When USE_ASCEND_HETEROGENEOUS is enabled:
+    // - Target side directly reuses RDMA Transport
+    // - Initiator side uses heterogeneous_rdma_transport
+    // if (target_segment_desc->protocol == "rdma") {
+    //     proto = "ascend";
+    // }
+    if (preferred_proto == "rdma" &&
+        std::find(protos.begin(), protos.end(), "rdma") != protos.end()) {
+        preferred_proto = "ascend";
+    }
+#endif
+    if (!transport_map_.count(preferred_proto)) {
+        return Status::NotSupportedTransport("Transport " + preferred_proto +
+                                             " not installed");
+    }
+    if (std::find(protos.begin(), protos.end(), preferred_proto) ==
+        protos.end()) {
+        return Status::NotSupportedTransport(
+            "Transport " + preferred_proto +
+            " not supported by target segment");
+    }
+    // if (!transport_map_.count(proto)) {
+    //     return Status::NotSupportedTransport("Transport " + proto +
+    //                                          " not installed");
+    // }
+    transport = transport_map_[preferred_proto].get();
+    return Status::OK();
+}
+#else
 Status MultiTransport::selectTransport(const TransferRequest &entry,
                                        Transport *&transport) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
@@ -363,6 +446,7 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     transport = transport_map_[proto].get();
     return Status::OK();
 }
+#endif
 
 Transport *MultiTransport::getTransport(const std::string &proto) {
     if (!transport_map_.count(proto)) return nullptr;

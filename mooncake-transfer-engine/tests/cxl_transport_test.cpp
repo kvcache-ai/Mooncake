@@ -104,8 +104,20 @@ class CXLTransportTest : public ::testing::Test {
         cxl_xport = dynamic_cast<CxlTransport *>(xport);
         base_addr = (uint8_t *)cxl_xport->getCxlBaseAddr();
         addr = (uint8_t *)allocateMemoryPool(kDataLength, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(base_addr + offset_1, len);
+        int rc = engine->registerLocalMemory(buffer_map);
+        ASSERT_EQ(rc, 0);
+
+#else
         int rc = engine->registerLocalMemory(base_addr + offset_1, len);
         ASSERT_EQ(rc, 0);
+#endif
 
         segment_id = engine->openSegment(FLAGS_local_server_name.c_str());
         // bindToSocket(0);
@@ -136,8 +148,12 @@ TEST_F(CXLTransportTest, MultiWrite) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = offset_1;
-        // s = xport->submitTransfer(batch_id, {entry});
+// s = xport->submitTransfer(batch_id, {entry});
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
 
         bool completed = false;
@@ -171,8 +187,12 @@ TEST_F(CXLTransportTest, MultipleRead) {
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = offset_2;
-        // s = xport->submitTransfer(batch_id, {entry});
+// s = xport->submitTransfer(batch_id, {entry});
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
 
         bool completed = false;
@@ -207,8 +227,12 @@ TEST_F(CXLTransportTest, MultipleRead) {
         entry.target_id = segment_id;
         entry.target_offset = offset_2;
         Status s;
-        // s = xport->submitTransfer(batch_id, {entry});
+// s = xport->submitTransfer(batch_id, {entry});
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_EQ(s, Status::OK());
 
         bool completed = false;
@@ -230,7 +254,17 @@ TEST_F(CXLTransportTest, MultipleRead) {
 
         freeMemoryPool(src, kDataLength);
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(addr);
+    engine->unregisterLocalMemory(buffer_map);
+
+#else
     engine->unregisterLocalMemory(addr);
+#endif
 }
 
 }  // namespace mooncake

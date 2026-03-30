@@ -59,13 +59,31 @@ if (WITH_TE)
   include_directories(mooncake-transfer-engine/include)
 endif()
 
+option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
+
+# When multi-protocol is enabled, disable mooncake-store, mooncake-pg and mooncake-p2p-store
+# as they only support single-protocol interface
+if (ENABLE_MULTI_PROTOCOL)
+  if (WITH_STORE)
+    message(WARNING "ENABLE_MULTI_PROTOCOL is ON, disabling mooncake-store (single-protocol only)")
+    set(WITH_STORE OFF)
+  endif()
+  if (WITH_EP)
+    message(WARNING "ENABLE_MULTI_PROTOCOL is ON, disabling mooncake-pg (single-protocol only)")
+    set(WITH_EP OFF)
+  endif()
+  if (WITH_P2P_STORE)
+    message(WARNING "ENABLE_MULTI_PROTOCOL is ON, disabling mooncake-p2p-store (single-protocol only)")
+    set(WITH_P2P_STORE OFF)
+  endif()
+endif()
+
 if (WITH_STORE)
   message(STATUS "Mooncake Store will be built")
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
 endif()
 
-option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
 if (WITH_EP)
   if (EP_USE_IDE)
     message(WARNING "EP_USE_IDE enabled. DO NOT USE IN PRODUCTION!")

@@ -107,6 +107,11 @@ struct TEContext {
     bool segment_opened_{false};
     SegmentHandle segment_handle_{};
     uint64_t remote_base_{};
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map_;
+#endif
 
     TEContext(const std::string &local_server_name,
               const std::string &metadata_server, const std::string &segment_id,
@@ -126,8 +131,13 @@ struct TEContext {
         local_addr_ = static_cast<uint8_t *>(numa_alloc_onnode(kRAMBufSize, 0));
         memset(local_addr_, 0, kDataLength);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer_map_["rdma"].emplace_back(local_addr_, kRAMBufSize, "cpu:0");
+        int rc = engine_->registerLocalMemory(buffer_map_);
+#else
         int rc =
             engine_->registerLocalMemory(local_addr_, kRAMBufSize, "cpu:0");
+#endif
         LOG_ASSERT(!rc);
 
         if (!segment_id.empty()) {
@@ -141,7 +151,11 @@ struct TEContext {
     }
 
     ~TEContext() {
+#ifdef ENABLE_MULTI_PROTOCOL
+        engine_->unregisterLocalMemory(buffer_map_);
+#else
         engine_->unregisterLocalMemory(local_addr_);
+#endif
         numa_free(local_addr_, kRAMBufSize);
         if (segment_opened_) engine_->closeSegment(segment_handle_);
     }
@@ -210,7 +224,12 @@ TEST_F(RDMAEndpointReestablishTest, EndpointReestablish) {
         entry.target_id = init_ctx.segment_handle_;
         entry.target_offset = init_ctx.remote_base_;
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol = "rdma";
+        Status s = init_ctx.engine_->submitTransfer(batch_id, {entry}, protocol);
+#else
         Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_EQ(s, Status::OK());
 
         wait_for_transfer(init_ctx.engine_.get(), batch_id, "WRITE");
@@ -237,7 +256,12 @@ TEST_F(RDMAEndpointReestablishTest, EndpointReestablish) {
         entry.target_id = init_ctx.segment_handle_;
         entry.target_offset = init_ctx.remote_base_;
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol = "rdma";
+        Status s = init_ctx.engine_->submitTransfer(batch_id, {entry}, protocol);
+#else
         Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+#endif
         ASSERT_EQ(s, Status::OK());
 
         wait_for_transfer(init_ctx.engine_.get(), batch_id, "READ");

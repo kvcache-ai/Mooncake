@@ -63,7 +63,11 @@ class TransferMetadataTest : public ::testing::Test {
 TEST_F(TransferMetadataTest, LocalSegmentTest) {
     auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
     segment_des->name = "test_server";
+#ifdef ENABLE_MULTI_PROTOCOL
+    segment_des->protocol.push_back("rdma");
+#else
     segment_des->protocol = "rdma";
+#endif
     TransferMetadata::SegmentID segment_id = 1111111;
     std::string segment_name = "test_segment";
     int re = metadata_client->addLocalSegment(segment_id, segment_name,
@@ -83,7 +87,11 @@ TEST_F(TransferMetadataTest, LocalSegmentTest) {
 TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     auto segment_des = std::make_shared<TransferMetadata::SegmentDesc>();
     segment_des->name = "test_localMemory";
+#ifdef ENABLE_MULTI_PROTOCOL
+    segment_des->protocol.push_back("rdma");
+#else
     segment_des->protocol = "rdma";
+#endif
     int re = metadata_client->addLocalSegment(
         LOCAL_SEGMENT_ID, "test_local_segment", std::move(segment_des));
     ASSERT_EQ(re, 0);

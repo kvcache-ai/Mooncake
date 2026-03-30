@@ -87,7 +87,18 @@ class NVMeofTransportTest : public ::testing::Test {
         xport = engine->installTransport("nvmeof", args);
         ASSERT_NE(xport, nullptr);
         addr = allocateMemoryPool(ram_buffer_size, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+        int rc = engine->registerLocalMemory(buffer_map);
+
+#else
         int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
+#endif
         ASSERT_EQ(rc, 0);
         segment_id = engine->openSegment(FLAGS_segment_id.c_str());
         bindToSocket(0);
@@ -97,7 +108,18 @@ class NVMeofTransportTest : public ::testing::Test {
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
+#ifdef ENABLE_MULTI_PROTOCOL
+
+        std::unordered_map<
+            std::string,
+            std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[FLAGS_protocol].emplace_back(addr);
+        engine->unregisterLocalMemory(buffer_map);
+
+#else
         engine->unregisterLocalMemory(addr);
+#endif
         freeMemoryPool(addr, ram_buffer_size);
     }
 };
@@ -197,7 +219,16 @@ TEST_F(NVMeofTransportTest, MultipleRead) {
                      kDataLength);
         ASSERT_EQ(ret, 0);
     }
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+    buffer_map[FLAGS_protocol].emplace_back(addr);
+    engine->unregisterLocalMemory(buffer_map);
+
+#else
     engine->unregisterLocalMemory(addr);
+#endif
     freeMemoryPool(addr, ram_buffer_size);
 }
 

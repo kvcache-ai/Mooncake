@@ -50,6 +50,9 @@ class TransferEnginePy {
 
    public:
     using BatchDesc = Transport::BatchDesc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    using RegisteredBuffer = TransferEngine::RegisteredBuffer;
+#endif
 
    public:
     TransferEnginePy();
@@ -201,4 +204,6 @@ class TransferEnginePy {
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
+
+    std::string proto_;
 };

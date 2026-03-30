@@ -134,7 +134,11 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         entry.source = (uint8_t *)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -163,7 +167,11 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         entry.source = (uint8_t *)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
+#ifdef ENABLE_MULTI_PROTOCOL
+        s = engine->submitTransfer(batch_id, {entry}, FLAGS_protocol);
+#else
         s = engine->submitTransfer(batch_id, {entry});
+#endif
         LOG_ASSERT(s.ok());
         bool completed = false;
         TransferStatus status;
@@ -258,25 +266,49 @@ int initiator() {
 
     LOG_ASSERT(xport);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+#endif
+
     void *addr = nullptr;
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
     std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
     int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : 0;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_map[FLAGS_protocol].emplace_back(
+        addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
+#else
     int rc = engine->registerLocalMemory(
         addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
     LOG_ASSERT(!rc);
+#endif
 #else
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size,
+                                            kWildcardLocation);
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
+#else
     int rc =
         engine->registerLocalMemory(addr, ram_buffer_size, kWildcardLocation);
     LOG_ASSERT(!rc);
+#endif
 #endif
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
     std::thread workers(initiatorWorker, engine.get(), segment_id, 0, addr);
     workers.join();
+#ifdef ENABLE_MULTI_PROTOCOL
+    engine->unregisterLocalMemory(buffer_map);
+#else
     engine->unregisterLocalMemory(addr);
+#endif
     freeMemoryPool(addr, ram_buffer_size);
     return 0;
 }
@@ -304,14 +336,30 @@ int target() {
         LOG(ERROR) << "Unsupported protocol";
     }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::unordered_map<std::string,
+                       std::vector<mooncake::TransferEngine::RegisteredBuffer>>
+        buffer_map;
+#endif
+
     void *addr = nullptr;
     addr = allocateMemoryPool(ram_buffer_size, 0);
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_map[FLAGS_protocol].emplace_back(addr, ram_buffer_size, "cpu:0");
+    int rc = engine->registerLocalMemory(buffer_map);
+    LOG_ASSERT(!rc);
+#else
     int rc = engine->registerLocalMemory(addr, ram_buffer_size, "cpu:0");
     LOG_ASSERT(!rc);
+#endif
 
     while (true) sleep(1);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    engine->unregisterLocalMemory(buffer_map);
+#else
     engine->unregisterLocalMemory(addr);
+#endif
     freeMemoryPool(addr, ram_buffer_size);
     return 0;
 }
