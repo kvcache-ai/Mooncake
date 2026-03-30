@@ -266,6 +266,12 @@ Status TransferEngineImpl::construct() {
         redis_password = env_password;
     }
 
+    std::string redis_username;
+    const char* env_username = std::getenv("MC_REDIS_USERNAME");
+    if (env_username && *env_username) {
+        redis_username = env_username;
+    }
+
     // Get Redis DB index from environment variable or config
     int redis_db_index_config = conf_->get("redis_db_index", 0);
     const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
@@ -305,7 +311,8 @@ Status TransferEngineImpl::construct() {
     }
 
     metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, redis_password, db_index, this);
+        metadata_type, metadata_servers, redis_username, redis_password,
+        db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 

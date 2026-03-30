@@ -158,6 +158,7 @@ void MooncakeWorker::startWorker() {
                                     // connection poller to reconnect it.
                                     group->peerConnected[j] = false;
                                     group->activeRanks[j] = false;
+                                    group->activeRanksTensor[j] = 0;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -245,6 +246,7 @@ void MooncakeWorker::startWorker() {
                                 // connection poller to reconnect it.
                                 group->peerConnected[j] = false;
                                 group->activeRanks[j] = false;
+                                group->activeRanksTensor[j] = 0;
                             } else {
                                 task_done = false;
                                 break;

@@ -15,7 +15,7 @@
 #include "oplog_applier.h"
 #include "oplog_manager.h"
 #include "oplog_watcher.h"
-#include "snapshot_provider.h"
+#include "ha/snapshot/snapshot_provider.h"
 #include "standby_state_machine.h"
 #include "types.h"
 

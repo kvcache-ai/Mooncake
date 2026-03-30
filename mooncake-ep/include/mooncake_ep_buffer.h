@@ -173,13 +173,15 @@ struct MooncakeEpBuffer {
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,
                  const std::vector<int32_t>& remote_qpns,
-                 const std::vector<int32_t>& remote_lids);
+                 const std::vector<int32_t>& remote_lids,
+                 const std::vector<int>& active_ranks_mask);
 
     void sync_roce(const std::vector<int64_t>& remote_addrs,
                    const std::vector<int32_t>& remote_keys,
                    const std::vector<int32_t>& remote_qpns,
                    const std::vector<int64_t>& subnet_prefixes,
-                   const std::vector<int64_t>& interface_ids);
+                   const std::vector<int64_t>& interface_ids,
+                   const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
         return {(int64_t)mr->addr, (int32_t)mr->rkey};
@@ -208,7 +210,8 @@ struct MooncakeEpBuffer {
 
     std::vector<int32_t> get_ipc_handle();
     void sync_nvlink_ipc_handles(
-        const std::vector<std::vector<int32_t>>& remote_handles);
+        const std::vector<std::vector<int32_t>>& remote_handles,
+        const std::vector<int>& active_ranks_mask);
 };
 
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,

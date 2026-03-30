@@ -63,7 +63,37 @@ Errors in this part usually indicate that the error occurred within the `mooncak
    **Solution:**
    Ensure that the total memory registration does not exceed the device's upper limit. You may need to reduce the amount of memory being registered or split large memory regions into smaller chunks that fit within the device's `max_mr_size` limit.
 
-5. If you encounter errors indicating inability to allocate memory space when requesting large memory regions, this may be due to ulimit restrictions. When the total memory requirement (number of registered RDMA devices × requested space) exceeds the ulimit, the system will display errors about failing to allocate space.
+5. If you encounter `Failed to register memory 0x...: Resource temporarily unavailable [11]` and kernel logs show `CREATE_MKEY failed, status no resources(0xf)`, this indicates that the RDMA NIC has exhausted its internal Memory Key (MKEY) resources, even though `ulimit -l` and `vm.max_map_count` may appear sufficient.
+
+   This typically happens when:
+   - Applications that use RDMA (e.g., SGLang with HiCache + Mooncake) have crashed or been killed multiple times without cleanly releasing RDMA resources.
+   - The leaked MKEY entries accumulate in the NIC firmware and are not reclaimed by the kernel, eventually hitting the hardware limit.
+   - Large memory regions (e.g., NSA indexer buffers at ~4.68 GB each across multiple TP ranks) amplify the problem since each registration consumes more internal NIC resources.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Check current RDMA resource usage per device
+   rdma resource show
+
+   # Check kernel logs for CREATE_MKEY failures
+   dmesg | grep -i "CREATE_MKEY\|no resources\|mlx5_cmd_out_err"
+   # Example output:
+   # mlx5_core 0000:65:01.0: mlx5_cmd_out_err:829:(pid 3958462): CREATE_MKEY(0x200) op_mod(0x0) failed, status no resources(0xf), syndrome (0x2aac7c), err(-11)
+
+   # Ensure vm.max_map_count is large enough (default 65530 may be too small)
+   sysctl vm.max_map_count
+   ```
+
+   **Solutions:**
+   - **Reboot the node** to fully reset NIC firmware state and reclaim all leaked MKEY resources. This is the most reliable fix.
+   - Increase `vm.max_map_count` if it is at the default value: `sysctl -w vm.max_map_count=16777216`
+   - Ensure applications shut down cleanly (avoid `kill -9` when possible) so RDMA resources are properly deregistered.
+   - If rebooting is not feasible, try unloading and reloading the mlx5 kernel modules (may disrupt other services):
+     ```bash
+     modprobe -r mlx5_ib mlx5_core && modprobe mlx5_core mlx5_ib
+     ```
+
+6. If you encounter errors indicating inability to allocate memory space when requesting large memory regions, this may be due to ulimit restrictions. When the total memory requirement (number of registered RDMA devices × requested space) exceeds the ulimit, the system will display errors about failing to allocate space.
 
    **Diagnostic Commands:**
    - Use `ulimit -a` to check current limits, particularly the `max locked memory` value
@@ -80,7 +110,7 @@ Errors in this part usually indicate that the error occurred within the `mooncak
      *    hard    memlock    unlimited
      ```
 
-6. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
    - Update Mooncake to version v0.3.5 or later
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
 
