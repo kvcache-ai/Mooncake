@@ -457,6 +457,7 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
+    void LoadPreloadedState(const ha::PromotedStandbyState& state);
 
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
@@ -1069,6 +1070,8 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::vector<std::shared_ptr<BufferAllocatorBase>>
+        imported_replica_allocators_;
 
     bool enable_snapshot_restore_ = false;
 

@@ -6,6 +6,7 @@
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "ha/ha_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -281,6 +282,7 @@ class WrappedMasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    std::optional<ha::PromotedStandbyState> preloaded_state;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -750,6 +752,7 @@ class MasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    std::optional<ha::PromotedStandbyState> preloaded_state;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -799,8 +802,11 @@ class MasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot_restore = config.preloaded_state.has_value()
+                                      ? false
+                                      : config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        preloaded_state = config.preloaded_state;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;

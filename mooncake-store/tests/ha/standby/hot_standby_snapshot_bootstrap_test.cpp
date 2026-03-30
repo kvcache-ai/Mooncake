@@ -4,9 +4,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
@@ -22,6 +25,18 @@ DEFINE_string(redis_endpoint, "",
 namespace {
 
 namespace fs = std::filesystem;
+
+bool WaitUntil(const std::function<bool()>& predicate,
+               std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return predicate();
+}
 
 class HotStandbySnapshotBootstrapTest
     : public ::testing::TestWithParam<CatalogBackendParam> {
@@ -50,8 +65,10 @@ class HotStandbySnapshotBootstrapTest
     }
 
     void TearDown() override {
-        if (snapshot_published_ && catalog_store_ != nullptr) {
-            (void)catalog_store_->Delete(descriptor_.snapshot_id);
+        if (catalog_store_ != nullptr) {
+            for (const auto& snapshot_id : published_snapshot_ids_) {
+                (void)catalog_store_->Delete(snapshot_id);
+            }
         }
         catalog_store_.reset();
         object_store_.reset();
@@ -67,6 +84,7 @@ class HotStandbySnapshotBootstrapTest
         config.enable_verification = false;
         config.enable_snapshot_bootstrap = true;
         config.enable_oplog_following = false;
+        config.snapshot_refresh_interval_ms = 20;
         return config;
     }
 
@@ -76,17 +94,20 @@ class HotStandbySnapshotBootstrapTest
             GetParam(), cluster_id_, FLAGS_redis_endpoint));
     }
 
-    void PublishSnapshot() {
-        auto result = PublishSnapshotPayload(*object_store_, *catalog_store_,
-                                             descriptor_);
+    void PublishSnapshot(const ha::SnapshotDescriptor& descriptor,
+                         std::string_view object_key = kDefaultTestObjectKey,
+                         uint64_t object_size = kDefaultTestObjectSize) {
+        auto result = PublishSnapshotPayload(
+            *object_store_, *catalog_store_, descriptor, UUID{1, 2}, object_key,
+            kDefaultTestDiskFilePath, object_size);
         ASSERT_TRUE(result.has_value()) << result.error();
-        snapshot_published_ = true;
+        published_snapshot_ids_.push_back(descriptor.snapshot_id);
     }
 
     std::string cluster_id_;
     std::string temp_dir_;
-    bool snapshot_published_{false};
     ha::SnapshotDescriptor descriptor_;
+    std::vector<std::string> published_snapshot_ids_;
     std::unique_ptr<ScopedEnvVar> local_path_env_;
     std::unique_ptr<LocalFileSnapshotObjectStore> object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> catalog_store_;
@@ -94,7 +115,7 @@ class HotStandbySnapshotBootstrapTest
 
 TEST_P(HotStandbySnapshotBootstrapTest,
        SnapshotOnlyStartBootstrapsFromConfiguredBackend) {
-    PublishSnapshot();
+    PublishSnapshot(descriptor_);
 
     auto provider = CreateProvider();
     ASSERT_TRUE(provider.has_value()) << toString(provider.error());
@@ -139,6 +160,41 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(StandbyState::WATCHING, status.state);
     EXPECT_EQ(0u, status.applied_seq_id);
     EXPECT_EQ(0u, status.primary_seq_id);
+}
+
+TEST_P(HotStandbySnapshotBootstrapTest,
+       SnapshotOnlyStandbyRefreshesNewPublishedSnapshot) {
+    PublishSnapshot(descriptor_);
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    HotStandbyService service(MakeSnapshotOnlyConfig());
+    service.SetSnapshotProvider(std::move(provider.value()));
+
+    ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            return service.GetLatestAppliedSequenceId() ==
+                   descriptor_.last_included_seq;
+        },
+        std::chrono::milliseconds(500)));
+
+    const auto next_descriptor = MakeTestSnapshotDescriptor(
+        "20240330_120500_002", 84, descriptor_.producer_view_version + 1,
+        descriptor_.created_at_ms + 1000);
+    PublishSnapshot(next_descriptor, "key-2", 8192);
+
+    ASSERT_TRUE(
+        WaitUntil([&]() { return service.GetLatestAppliedSequenceId() == 84; },
+                  std::chrono::milliseconds(1500)));
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service.ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-2", exported.front().first);
+    EXPECT_EQ(8192u, exported.front().second.size);
+    EXPECT_EQ(84u, exported.front().second.last_sequence_id);
 }
 
 INSTANTIATE_TEST_SUITE_P(

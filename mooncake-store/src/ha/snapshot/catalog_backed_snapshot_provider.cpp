@@ -328,8 +328,8 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         }
     }
 
-    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& cluster_id) override {
+    tl::expected<std::optional<SnapshotVersionInfo>, ErrorCode>
+    GetLatestSnapshotVersion(const std::string& cluster_id) override {
         if (!cluster_id.empty() && cluster_id != cluster_id_) {
             LOG(ERROR) << "Snapshot provider cluster mismatch, requested="
                        << cluster_id << ", configured=" << cluster_id_;
@@ -344,7 +344,31 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
             return tl::make_unexpected(latest_result.error());
         }
         if (!latest_result->has_value()) {
+            return std::optional<SnapshotVersionInfo>();
+        }
+
+        SnapshotVersionInfo version;
+        version.snapshot_id = latest_result->value().snapshot_id;
+        version.snapshot_sequence_id = latest_result->value().last_included_seq;
+        return std::optional<SnapshotVersionInfo>(std::move(version));
+    }
+
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& cluster_id) override {
+        auto latest_version = GetLatestSnapshotVersion(cluster_id);
+        if (!latest_version) {
+            return tl::make_unexpected(latest_version.error());
+        }
+        if (!latest_version->has_value()) {
             return std::optional<LoadedSnapshot>();
+        }
+
+        const auto latest_result = catalog_store_->GetLatest();
+        if (!latest_result || !latest_result->has_value()) {
+            return latest_result
+                       ? tl::expected<std::optional<LoadedSnapshot>, ErrorCode>(
+                             std::optional<LoadedSnapshot>())
+                       : tl::make_unexpected(latest_result.error());
         }
 
         const auto& descriptor = latest_result->value();

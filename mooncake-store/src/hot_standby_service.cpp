@@ -155,6 +155,12 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     config_.primary_address = primary_address;
     etcd_endpoints_ = etcd_endpoints;
     cluster_id_ = cluster_id;
+    loaded_snapshot_id_.clear();
+    loaded_snapshot_seq_id_ = 0;
+    {
+        std::lock_guard<std::mutex> shutdown_lock(shutdown_mutex_);
+        shutdown_requested_ = false;
+    }
 
     if (config_.enable_oplog_following) {
 #ifdef STORE_USE_ETCD
@@ -256,6 +262,8 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     uint64_t& baseline_seq_id) {
     baseline_seq_id = 0;
     oplog_applier_->Recover(0);
+    loaded_snapshot_id_.clear();
+    loaded_snapshot_seq_id_ = 0;
 
     if (!config_.enable_snapshot_bootstrap || !snapshot_provider_) {
         return ErrorCode::OK;
@@ -291,11 +299,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
-    metadata_store_->Clear();
-    for (const auto& kv : snapshot.metadata) {
-        metadata_store_->PutMetadata(kv.first, kv.second);
-    }
-    oplog_applier_->Recover(snapshot.snapshot_sequence_id);
+    ApplyLoadedSnapshotLocked(snapshot);
     baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
 }
@@ -347,10 +351,38 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
 void HotStandbyService::ActivateSnapshotOnlyStandbyLocked(
     uint64_t baseline_seq_id) {
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+    replication_thread_ =
+        std::thread(&HotStandbyService::ReplicationLoop, this);
     LOG(INFO) << "HotStandbyService started in snapshot-only mode, cluster="
               << cluster_id_ << ", state=" << StandbyStateToString(GetState())
               << ", applied_seq_id=" << baseline_seq_id
               << ", metadata_keys=" << metadata_store_->GetKeyCount();
+}
+
+void HotStandbyService::ApplyLoadedSnapshotLocked(
+    const LoadedSnapshot& snapshot) {
+    metadata_store_->Clear();
+    for (const auto& kv : snapshot.metadata) {
+        metadata_store_->PutMetadata(kv.first, kv.second);
+    }
+    oplog_applier_->Recover(snapshot.snapshot_sequence_id);
+    applied_seq_id_.store(snapshot.snapshot_sequence_id,
+                          std::memory_order_release);
+    primary_seq_id_.store(snapshot.snapshot_sequence_id,
+                          std::memory_order_release);
+    loaded_snapshot_id_ = snapshot.snapshot_id;
+    loaded_snapshot_seq_id_ = snapshot.snapshot_sequence_id;
+}
+
+bool HotStandbyService::ShouldReloadSnapshotLocked(
+    const SnapshotVersionInfo& snapshot_version) const {
+    if (snapshot_version.snapshot_sequence_id > loaded_snapshot_seq_id_) {
+        return true;
+    }
+    if (snapshot_version.snapshot_sequence_id < loaded_snapshot_seq_id_) {
+        return false;
+    }
+    return snapshot_version.snapshot_id != loaded_snapshot_id_;
 }
 
 void HotStandbyService::SetSyncStatusCallback(SyncStatusCallback callback) {
@@ -377,28 +409,42 @@ void HotStandbyService::OnWatcherEvent(StandbyEvent event) {
 }
 
 void HotStandbyService::Stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_ptr<OpLogWatcher> watcher_to_stop;
+    std::thread replication_thread_to_join;
+    std::thread verification_thread_to_join;
 
-    StandbyState current_state = GetState();
-    if (current_state == StandbyState::STOPPED &&
-        !replication_thread_.joinable() && !verification_thread_.joinable()) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        StandbyState current_state = GetState();
+        if (current_state == StandbyState::STOPPED &&
+            !replication_thread_.joinable() &&
+            !verification_thread_.joinable()) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> shutdown_lock(shutdown_mutex_);
+            shutdown_requested_ = true;
+        }
+        shutdown_cv_.notify_all();
+
+        state_machine_.ProcessEvent(StandbyEvent::STOP);
+
+        watcher_to_stop = std::move(oplog_watcher_);
+        replication_thread_to_join = std::move(replication_thread_);
+        verification_thread_to_join = std::move(verification_thread_);
     }
 
-    state_machine_.ProcessEvent(StandbyEvent::STOP);
-
-    // Stop OpLogWatcher
-    if (oplog_watcher_) {
-        oplog_watcher_->Stop();
-        oplog_watcher_.reset();
+    if (watcher_to_stop) {
+        watcher_to_stop->Stop();
     }
 
-    // Wait for threads to finish
-    if (replication_thread_.joinable()) {
-        replication_thread_.join();
+    if (replication_thread_to_join.joinable()) {
+        replication_thread_to_join.join();
     }
-    if (verification_thread_.joinable()) {
-        verification_thread_.join();
+    if (verification_thread_to_join.joinable()) {
+        verification_thread_to_join.join();
     }
 
     LOG(INFO) << "HotStandbyService stopped, final_state="
@@ -653,14 +699,118 @@ void HotStandbyService::SetSnapshotProvider(
     std::unique_ptr<SnapshotProvider> provider) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (provider) {
-        snapshot_provider_ = std::move(provider);
+        snapshot_provider_ =
+            std::shared_ptr<SnapshotProvider>(std::move(provider));
     } else {
-        snapshot_provider_ = std::make_unique<NoopSnapshotProvider>();
+        snapshot_provider_ = std::make_shared<NoopSnapshotProvider>();
+    }
+}
+
+bool HotStandbyService::WaitForShutdownOrTimeout(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(shutdown_mutex_);
+    return shutdown_cv_.wait_for(lock, timeout,
+                                 [this]() { return shutdown_requested_; });
+}
+
+void HotStandbyService::RefreshSnapshotOnlyBaseline() {
+    std::shared_ptr<SnapshotProvider> snapshot_provider;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!config_.enable_snapshot_bootstrap || !snapshot_provider_) {
+            return;
+        }
+        snapshot_provider = snapshot_provider_;
+    }
+
+    if (!snapshot_provider) {
+        return;
+    }
+
+    auto latest_version =
+        snapshot_provider->GetLatestSnapshotVersion(cluster_id_);
+    if (!latest_version) {
+        LOG(WARNING) << "Failed to resolve latest snapshot version for "
+                     << "snapshot-only standby refresh, cluster=" << cluster_id_
+                     << ", error=" << toString(latest_version.error());
+        return;
+    }
+    if (!latest_version->has_value()) {
+        return;
+    }
+
+    const auto latest_seq_id = latest_version->value().snapshot_sequence_id;
+    const auto previous_primary_seq_id =
+        primary_seq_id_.exchange(latest_seq_id, std::memory_order_acq_rel);
+    if (previous_primary_seq_id != latest_seq_id) {
+        NotifySyncStatus();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ShouldReloadSnapshotLocked(latest_version->value())) {
+            return;
+        }
+    }
+
+    auto snapshot_result = snapshot_provider->LoadLatestSnapshot(cluster_id_);
+    if (!snapshot_result) {
+        LOG(WARNING) << "Failed to load latest snapshot during snapshot-only "
+                     << "refresh, cluster=" << cluster_id_
+                     << ", error=" << toString(snapshot_result.error());
+        return;
+    }
+    if (!snapshot_result->has_value()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    SnapshotVersionInfo loaded_snapshot_version;
+    loaded_snapshot_version.snapshot_id = snapshot_result->value().snapshot_id;
+    loaded_snapshot_version.snapshot_sequence_id =
+        snapshot_result->value().snapshot_sequence_id;
+
+    if (GetState() == StandbyState::STOPPED ||
+        GetState() == StandbyState::FAILED ||
+        GetState() == StandbyState::PROMOTING ||
+        GetState() == StandbyState::PROMOTED ||
+        !ShouldReloadSnapshotLocked(loaded_snapshot_version)) {
+        return;
+    }
+
+    auto recovery_start =
+        state_machine_.ProcessEvent(StandbyEvent::SNAPSHOT_REFRESH_REQUIRED);
+    if (!recovery_start.allowed) {
+        LOG(WARNING) << "Rejected snapshot refresh transition, state="
+                     << StandbyStateToString(GetState())
+                     << ", reason=" << recovery_start.reason;
+        return;
+    }
+
+    LOG(INFO) << "Refreshing snapshot-only standby baseline, cluster="
+              << cluster_id_
+              << ", snapshot_id=" << snapshot_result->value().snapshot_id
+              << ", snapshot_seq_id="
+              << snapshot_result->value().snapshot_sequence_id;
+
+    ApplyLoadedSnapshotLocked(snapshot_result->value());
+
+    auto recovery_finish =
+        state_machine_.ProcessEvent(StandbyEvent::RECOVERY_SUCCESS);
+    if (!recovery_finish.allowed) {
+        LOG(ERROR) << "Failed to finish snapshot refresh transition, state="
+                   << StandbyStateToString(GetState())
+                   << ", reason=" << recovery_finish.reason;
+        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
     }
 }
 
 void HotStandbyService::ReplicationLoop() {
-    LOG(INFO) << "Replication loop started (etcd-based OpLog sync)";
+    if (!config_.enable_oplog_following) {
+        LOG(INFO) << "Replication loop started (snapshot-only refresh mode)";
+    } else {
+        LOG(INFO) << "Replication loop started (etcd-based OpLog sync)";
+    }
 
     // With etcd-based OpLog sync, OpLogWatcher handles the actual watching
     // in its own thread. This loop now just monitors the status and updates
@@ -686,9 +836,20 @@ void HotStandbyService::ReplicationLoop() {
     uint64_t last_reported_primary_seq_id = primary_seq_id_.load();
 
     while (IsRunning()) {
+        if (!config_.enable_oplog_following) {
+            RefreshSnapshotOnlyBaseline();
+            if (WaitForShutdownOrTimeout(std::chrono::milliseconds(
+                    config_.snapshot_refresh_interval_ms))) {
+                break;
+            }
+            continue;
+        }
+
         if (!IsConnected()) {
             // Not connected - wait a bit before checking again
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (WaitForShutdownOrTimeout(std::chrono::seconds(1))) {
+                break;
+            }
             continue;
         }
 
@@ -724,7 +885,9 @@ void HotStandbyService::ReplicationLoop() {
         }
 
         // Sleep and check again
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        if (WaitForShutdownOrTimeout(std::chrono::milliseconds(1000))) {
+            break;
+        }
     }
 
     LOG(INFO) << "Replication loop stopped";
@@ -734,8 +897,10 @@ void HotStandbyService::VerificationLoop() {
     LOG(INFO) << "Verification loop started";
 
     while (IsRunning()) {
-        std::this_thread::sleep_for(
-            std::chrono::seconds(config_.verification_interval_sec));
+        if (WaitForShutdownOrTimeout(
+                std::chrono::seconds(config_.verification_interval_sec))) {
+            break;
+        }
 
         if (!IsConnected()) {
             continue;

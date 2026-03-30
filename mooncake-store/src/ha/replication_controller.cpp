@@ -78,6 +78,11 @@ class NoopReplicationController final : public ReplicationController {
 
     ErrorCode PromoteStandby() override { return ErrorCode::OK; }
 
+    tl::expected<std::optional<PromotedStandbyState>, ErrorCode>
+    TakePromotedStandbyState() override {
+        return std::optional<PromotedStandbyState>();
+    }
+
     void UpdateObservedLeader(const std::optional<MasterView>&) override {}
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
@@ -137,6 +142,7 @@ class CapabilityDrivenReplicationController final
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             observed_leader_ = observed_leader;
+            promoted_state_.reset();
             standby_running = standby_running_;
         }
         if (standby_running) {
@@ -161,6 +167,9 @@ class CapabilityDrivenReplicationController final
             std::lock_guard<std::mutex> lock(state_mutex_);
             standby_running_ = (err == ErrorCode::OK);
             standby_last_error_ = (err == ErrorCode::OK ? ErrorCode::OK : err);
+            if (err == ErrorCode::OK) {
+                promoted_state_.reset();
+            }
         }
         NotifyRuntimeStateIfChanged();
         return err;
@@ -178,6 +187,7 @@ class CapabilityDrivenReplicationController final
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             standby_running_ = false;
+            promoted_state_.reset();
         }
         NotifyRuntimeStateIfChanged();
     }
@@ -197,6 +207,21 @@ class CapabilityDrivenReplicationController final
         }
 
         ErrorCode err = standby_service_->Promote();
+        std::optional<PromotedStandbyState> promoted_state;
+        if (err == ErrorCode::OK) {
+            std::vector<std::pair<std::string, StandbyObjectMetadata>>
+                metadata_snapshot;
+            if (!standby_service_->ExportMetadataSnapshot(metadata_snapshot)) {
+                LOG(ERROR) << "Failed to export promoted standby metadata";
+                err = ErrorCode::INTERNAL_ERROR;
+            } else {
+                promoted_state = PromotedStandbyState{
+                    .metadata_snapshot = std::move(metadata_snapshot),
+                    .applied_seq_id =
+                        standby_service_->GetLatestAppliedSequenceId(),
+                };
+            }
+        }
         if (err != ErrorCode::OK) {
             standby_service_->Stop();
         }
@@ -204,12 +229,22 @@ class CapabilityDrivenReplicationController final
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             standby_running_ = false;
+            promoted_state_ =
+                err == ErrorCode::OK ? std::move(promoted_state) : std::nullopt;
             standby_last_error_ = (err == ErrorCode::OK)
                                       ? ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS
                                       : err;
         }
         NotifyRuntimeStateIfChanged();
         return err;
+    }
+
+    tl::expected<std::optional<PromotedStandbyState>, ErrorCode>
+    TakePromotedStandbyState() override {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        auto promoted_state = std::move(promoted_state_);
+        promoted_state_.reset();
+        return promoted_state;
     }
 
     void UpdateObservedLeader(
@@ -279,6 +314,7 @@ class CapabilityDrivenReplicationController final
     std::optional<MasterView> observed_leader_;
     bool standby_running_ = false;
     ErrorCode standby_last_error_ = ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    std::optional<PromotedStandbyState> promoted_state_;
 
     std::mutex callback_mutex_;
     std::optional<RuntimeStateCallback> runtime_state_callback_;

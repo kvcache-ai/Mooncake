@@ -341,9 +341,27 @@ int MasterServiceSupervisor::Start() {
             server.init_ibv();
         }
 
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            mooncake::WrappedMasterServiceConfig(
-                config_, leadership_session->view.view_version));
+        auto wrapped_config = mooncake::WrappedMasterServiceConfig(
+            config_, leadership_session->view.view_version);
+        auto promoted_state =
+            replication_controller->TakePromotedStandbyState();
+        if (!promoted_state) {
+            LOG(WARNING) << "Failed to fetch promoted standby preload state: "
+                         << toString(promoted_state.error())
+                         << ", falling back to cold master startup";
+        } else if (promoted_state->has_value()) {
+            LOG(INFO) << "Serving from promoted standby preload, keys="
+                      << promoted_state->value().metadata_snapshot.size()
+                      << ", applied_seq_id="
+                      << promoted_state->value().applied_seq_id;
+            wrapped_config.preloaded_state = std::move(promoted_state->value());
+        } else {
+            LOG(INFO) << "Promoted standby has no preload state, falling back "
+                      << "to cold master startup";
+        }
+
+        auto wrapped_master_service =
+            std::make_shared<WrappedMasterService>(wrapped_config);
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto serve_preflight =

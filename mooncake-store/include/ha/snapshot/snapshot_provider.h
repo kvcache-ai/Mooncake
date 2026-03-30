@@ -18,6 +18,11 @@ struct LoadedSnapshot {
     std::vector<std::pair<std::string, StandbyObjectMetadata>> metadata;
 };
 
+struct SnapshotVersionInfo {
+    std::string snapshot_id;
+    uint64_t snapshot_sequence_id{0};
+};
+
 /**
  * @brief SnapshotProvider is an abstraction for loading metadata snapshots.
  *
@@ -34,6 +39,24 @@ struct LoadedSnapshot {
 class SnapshotProvider {
    public:
     virtual ~SnapshotProvider() = default;
+
+    // Resolve the current latest snapshot without loading the full payload.
+    // Providers may override this for an efficient catalog-only check.
+    virtual tl::expected<std::optional<SnapshotVersionInfo>, ErrorCode>
+    GetLatestSnapshotVersion(const std::string& cluster_id) {
+        auto snapshot = LoadLatestSnapshot(cluster_id);
+        if (!snapshot) {
+            return tl::make_unexpected(snapshot.error());
+        }
+        if (!snapshot->has_value()) {
+            return std::optional<SnapshotVersionInfo>();
+        }
+
+        SnapshotVersionInfo version;
+        version.snapshot_id = snapshot->value().snapshot_id;
+        version.snapshot_sequence_id = snapshot->value().snapshot_sequence_id;
+        return std::optional<SnapshotVersionInfo>(std::move(version));
+    }
 
     // Load the latest available snapshot for `cluster_id`.
     // Return values:

@@ -4,6 +4,8 @@
 #include <memory>
 #include <optional>
 
+#include <ylt/util/tl/expected.hpp>
+
 #include "ha/ha_types.h"
 #include "master_config.h"
 #include "types.h"
@@ -23,6 +25,9 @@ class ReplicationController {
     virtual void StopStandby() = 0;
 
     virtual ErrorCode PromoteStandby() = 0;
+
+    virtual tl::expected<std::optional<PromotedStandbyState>, ErrorCode>
+    TakePromotedStandbyState() = 0;
 
     virtual void UpdateObservedLeader(
         const std::optional<MasterView>& observed_leader) = 0;

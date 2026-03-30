@@ -3,7 +3,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <functional>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <thread>
@@ -29,6 +32,45 @@ class FakeSnapshotProvider final : public SnapshotProvider {
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
 };
 
+class MutableSnapshotProvider final : public SnapshotProvider {
+   public:
+    explicit MutableSnapshotProvider(
+        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result)
+        : result_(std::move(result)) {}
+
+    void Publish(
+        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result_ = std::move(result);
+    }
+
+    tl::expected<std::optional<SnapshotVersionInfo>, ErrorCode>
+    GetLatestSnapshotVersion(const std::string& /*cluster_id*/) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_) {
+            return tl::make_unexpected(result_.error());
+        }
+        if (!result_->has_value()) {
+            return std::optional<SnapshotVersionInfo>();
+        }
+
+        SnapshotVersionInfo version;
+        version.snapshot_id = result_->value().snapshot_id;
+        version.snapshot_sequence_id = result_->value().snapshot_sequence_id;
+        return std::optional<SnapshotVersionInfo>(std::move(version));
+    }
+
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& /*cluster_id*/) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_;
+    }
+
+   private:
+    std::mutex mutex_;
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
+};
+
 LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
                             std::string key, uint64_t size) {
     LoadedSnapshot snapshot;
@@ -41,6 +83,18 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     metadata.last_sequence_id = seq_id;
     snapshot.metadata.emplace_back(std::move(key), metadata);
     return snapshot;
+}
+
+bool WaitUntil(const std::function<bool()>& predicate,
+               std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return predicate();
 }
 
 }  // namespace
@@ -378,6 +432,55 @@ TEST_F(HotStandbyServiceTest,
     EXPECT_EQ("key-new", exported[0].first);
     EXPECT_EQ(8192u, exported[0].second.size);
     EXPECT_EQ(84u, exported[0].second.last_sequence_id);
+}
+
+TEST_F(HotStandbyServiceTest,
+       TestSnapshotOnlyStandbyRefreshesNewSnapshotInPlace) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    config_.snapshot_refresh_interval_ms = 20;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto provider =
+        std::make_unique<MutableSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096)));
+    auto* provider_handle = provider.get();
+
+    std::mutex callback_mutex;
+    std::vector<StandbyState> state_history;
+    service_->SetSyncStatusCallback([&](const StandbySyncStatus& status) {
+        std::lock_guard<std::mutex> lock(callback_mutex);
+        state_history.push_back(status.state);
+    });
+    service_->SetSnapshotProvider(std::move(provider));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service_->GetLatestAppliedSequenceId() == 42; },
+        std::chrono::milliseconds(500)));
+
+    provider_handle->Publish(std::optional<LoadedSnapshot>(
+        MakeSnapshot("20260330_121500_000", 84, "key-new", 8192)));
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service_->GetLatestAppliedSequenceId() == 84; },
+        std::chrono::milliseconds(1000)));
+    EXPECT_EQ(84u, service_->GetSyncStatus().primary_seq_id);
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-new", exported[0].first);
+    EXPECT_EQ(8192u, exported[0].second.size);
+    EXPECT_EQ(84u, exported[0].second.last_sequence_id);
+
+    std::lock_guard<std::mutex> lock(callback_mutex);
+    EXPECT_NE(std::find(state_history.begin(), state_history.end(),
+                        StandbyState::RECOVERING),
+              state_history.end());
+
+    service_->SetSyncStatusCallback(nullptr);
+    service_->Stop();
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {

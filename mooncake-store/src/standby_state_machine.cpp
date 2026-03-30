@@ -75,6 +75,7 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
                     result.new_state = StandbyState::RECONNECTING;
                     break;
                 case StandbyEvent::MAX_ERRORS_REACHED:
+                case StandbyEvent::SNAPSHOT_REFRESH_REQUIRED:
                     result.allowed = true;
                     result.new_state = StandbyState::RECOVERING;
                     break;

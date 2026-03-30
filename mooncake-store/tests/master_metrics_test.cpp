@@ -264,6 +264,57 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
 }
 
+TEST_F(MasterMetricsTest, PreloadedStateServesImportedReplicaImmediately) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 1000;
+    service_config.enable_metric_reporting = false;
+
+    ha::PromotedStandbyState preloaded_state;
+    StandbyObjectMetadata standby_metadata;
+    standby_metadata.client_id = generate_uuid();
+    standby_metadata.size = 4096;
+    standby_metadata.last_sequence_id = 42;
+
+    Replica::Descriptor replica_descriptor;
+    replica_descriptor.id = 123;
+    replica_descriptor.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory_descriptor;
+    memory_descriptor.buffer_descriptor.size_ = standby_metadata.size;
+    memory_descriptor.buffer_descriptor.buffer_address_ = 0x12345000;
+    memory_descriptor.buffer_descriptor.protocol_ = "tcp";
+    memory_descriptor.buffer_descriptor.transport_endpoint_ = "10.0.0.1:1234";
+    replica_descriptor.descriptor_variant = memory_descriptor;
+    standby_metadata.replicas.push_back(replica_descriptor);
+
+    preloaded_state.metadata_snapshot.emplace_back("hot-key",
+                                                   std::move(standby_metadata));
+    preloaded_state.applied_seq_id = 42;
+    service_config.preloaded_state = std::move(preloaded_state);
+
+    WrappedMasterService service(service_config);
+
+    auto exist_result = service.ExistKey("hot-key");
+    ASSERT_TRUE(exist_result.has_value());
+    EXPECT_TRUE(exist_result.value());
+
+    auto replica_list_result = service.GetReplicaList("hot-key");
+    ASSERT_TRUE(replica_list_result.has_value());
+    ASSERT_EQ(1u, replica_list_result->replicas.size());
+    EXPECT_GT(replica_list_result->lease_ttl_ms, 0u);
+
+    const auto& restored_replica = replica_list_result->replicas.front();
+    ASSERT_TRUE(restored_replica.is_memory_replica());
+    EXPECT_EQ(123u, restored_replica.id);
+
+    const auto& restored_buffer =
+        restored_replica.get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(static_cast<uint64_t>(4096), restored_buffer.size_);
+    EXPECT_EQ(static_cast<uintptr_t>(0x12345000),
+              restored_buffer.buffer_address_);
+    EXPECT_EQ("tcp", restored_buffer.protocol_);
+    EXPECT_EQ("10.0.0.1:1234", restored_buffer.transport_endpoint_);
+}
+
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();

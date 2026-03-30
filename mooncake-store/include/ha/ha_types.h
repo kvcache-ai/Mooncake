@@ -6,8 +6,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "metadata_store.h"
 #include "types.h"
 
 namespace mooncake {
@@ -175,6 +177,12 @@ struct SnapshotDescriptor {
     std::string manifest_key;
     std::string object_prefix;
     int64_t created_at_ms = 0;
+};
+
+struct PromotedStandbyState {
+    std::vector<std::pair<std::string, StandbyObjectMetadata>>
+        metadata_snapshot;
+    OpLogSequenceId applied_seq_id = 0;
 };
 
 }  // namespace ha

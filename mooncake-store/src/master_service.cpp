@@ -71,6 +71,35 @@ int64_t CurrentTimeMs() {
         .count();
 }
 
+class ImportedReplicaBufferAllocator final : public BufferAllocatorBase {
+   public:
+    explicit ImportedReplicaBufferAllocator(std::string transport_endpoint)
+        : segment_name_(transport_endpoint),
+          transport_endpoint_(std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t) override {
+        return nullptr;
+    }
+
+    void deallocate(AllocatedBuffer*) override {}
+
+    size_t capacity() const override { return 0; }
+
+    size_t size() const override { return 0; }
+
+    std::string getSegmentName() const override { return segment_name_; }
+
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+    size_t getLargestFreeRegion() const override { return 0; }
+
+   private:
+    std::string segment_name_;
+    std::string transport_endpoint_;
+};
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -128,7 +157,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    if (enable_snapshot_restore_) {
+    if (config.preloaded_state.has_value()) {
+        LoadPreloadedState(config.preloaded_state.value());
+    } else if (enable_snapshot_restore_) {
         RestoreState();
     }
     if (enable_snapshot_ && snapshot_retention_count_ == 0) {
@@ -2992,6 +3023,104 @@ void MasterService::RestoreState() {
     } catch (...) {
         LOG(ERROR) << "[Restore] Unknown exception during state restoration";
     }
+}
+
+void MasterService::LoadPreloadedState(const ha::PromotedStandbyState& state) {
+    imported_replica_allocators_.clear();
+
+    std::unordered_map<std::string,
+                       std::shared_ptr<ImportedReplicaBufferAllocator>>
+        imported_allocator_cache;
+    const auto get_imported_allocator =
+        [&](const AllocatedBuffer::Descriptor& descriptor) {
+            std::string cache_key =
+                descriptor.protocol_ + "|" + descriptor.transport_endpoint_;
+            auto it = imported_allocator_cache.find(cache_key);
+            if (it != imported_allocator_cache.end()) {
+                return it->second;
+            }
+
+            auto allocator = std::make_shared<ImportedReplicaBufferAllocator>(
+                descriptor.transport_endpoint_);
+            imported_replica_allocators_.push_back(allocator);
+            imported_allocator_cache.emplace(cache_key, allocator);
+            return allocator;
+        };
+
+    size_t imported_key_count = 0;
+    for (const auto& [key, standby_metadata] : state.metadata_snapshot) {
+        if (standby_metadata.size == 0 || standby_metadata.replicas.empty()) {
+            continue;
+        }
+
+        std::vector<Replica> replicas;
+        replicas.reserve(standby_metadata.replicas.size());
+        for (const auto& replica_descriptor : standby_metadata.replicas) {
+            try {
+                if (replica_descriptor.is_memory_replica()) {
+                    const auto& buffer_descriptor =
+                        replica_descriptor.get_memory_descriptor()
+                            .buffer_descriptor;
+                    auto allocator = get_imported_allocator(buffer_descriptor);
+                    auto buffer = std::make_unique<AllocatedBuffer>(
+                        allocator,
+                        reinterpret_cast<void*>(
+                            buffer_descriptor.buffer_address_),
+                        static_cast<size_t>(buffer_descriptor.size_));
+                    buffer->RestoreDescriptorContext(buffer_descriptor);
+
+                    Replica replica(std::move(buffer),
+                                    replica_descriptor.status);
+                    replica.id_ = replica_descriptor.id;
+                    replicas.emplace_back(std::move(replica));
+                    continue;
+                }
+
+                if (replica_descriptor.is_disk_replica()) {
+                    const auto& disk_descriptor =
+                        replica_descriptor.get_disk_descriptor();
+                    Replica replica(disk_descriptor.file_path,
+                                    disk_descriptor.object_size,
+                                    replica_descriptor.status);
+                    replica.id_ = replica_descriptor.id;
+                    replicas.emplace_back(std::move(replica));
+                    continue;
+                }
+
+                if (replica_descriptor.is_local_disk_replica()) {
+                    const auto& local_disk_descriptor =
+                        replica_descriptor.get_local_disk_descriptor();
+                    Replica replica(local_disk_descriptor.client_id,
+                                    local_disk_descriptor.object_size,
+                                    local_disk_descriptor.transport_endpoint,
+                                    replica_descriptor.status);
+                    replica.id_ = replica_descriptor.id;
+                    replicas.emplace_back(std::move(replica));
+                }
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Failed to rebuild standby replica for key=" << key
+                    << ": " << e.what();
+            }
+        }
+
+        if (replicas.empty()) {
+            continue;
+        }
+
+        MetadataAccessorRW accessor(this, key);
+        if (accessor.Exists()) {
+            accessor.Erase();
+        }
+        accessor.Create(standby_metadata.client_id, standby_metadata.size,
+                        std::move(replicas), false, false);
+        accessor.Get().GrantLease(default_kv_lease_ttl_,
+                                  default_kv_soft_pin_ttl_);
+        ++imported_key_count;
+    }
+
+    LOG(INFO) << "Loaded preloaded standby state, keys=" << imported_key_count
+              << ", applied_seq_id=" << state.applied_seq_id;
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {

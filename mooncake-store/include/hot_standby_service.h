@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -45,6 +46,10 @@ struct HotStandbyConfig {
     // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
     // state.
     bool enable_oplog_following{true};
+
+    // Snapshot-only standby polls the catalog for newer published snapshots
+    // and refreshes its local metadata baseline when one appears.
+    uint32_t snapshot_refresh_interval_ms{1000};
 };
 
 /**
@@ -172,10 +177,15 @@ class HotStandbyService {
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
+    void ApplyLoadedSnapshotLocked(const LoadedSnapshot& snapshot);
+    bool ShouldReloadSnapshotLocked(
+        const SnapshotVersionInfo& snapshot_version) const;
+    void RefreshSnapshotOnlyBaseline();
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
     void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     void NotifySyncStatus();
+    bool WaitForShutdownOrTimeout(std::chrono::milliseconds timeout);
 
     /**
      * @brief Main replication loop (runs in background thread)
@@ -237,8 +247,8 @@ class HotStandbyService {
         std::unordered_map<std::string, StandbyObjectMetadata> store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
-    std::unique_ptr<SnapshotProvider> snapshot_provider_{
-        std::make_unique<NoopSnapshotProvider>()};
+    std::shared_ptr<SnapshotProvider> snapshot_provider_{
+        std::make_shared<NoopSnapshotProvider>()};
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
@@ -266,8 +276,13 @@ class HotStandbyService {
 
     // Synchronization
     mutable std::mutex mutex_;
+    mutable std::mutex shutdown_mutex_;
     mutable std::mutex sync_status_callback_mutex_;
+    std::condition_variable shutdown_cv_;
     SyncStatusCallback sync_status_callback_;
+    bool shutdown_requested_{false};
+    std::string loaded_snapshot_id_;
+    uint64_t loaded_snapshot_seq_id_{0};
 };
 
 }  // namespace mooncake
