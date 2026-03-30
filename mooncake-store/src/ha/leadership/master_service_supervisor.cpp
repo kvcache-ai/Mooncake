@@ -147,6 +147,25 @@ int MasterServiceSupervisor::Start() {
                   << MasterRuntimeStateToString(state)
                   << ", role=" << MasterRuntimeRoleToString(state);
     };
+    auto activate_serving_state =
+        [&admin_server, &set_runtime_state](
+            const std::shared_ptr<WrappedMasterService>& service) {
+            admin_server.SetServiceDelegate(service);
+            admin_server.SetServiceAvailable(true);
+            set_runtime_state(MasterRuntimeState::kServing);
+        };
+    auto deactivate_serving_state = [&admin_server]() {
+        admin_server.SetServiceAvailable(false);
+        admin_server.SetServiceDelegate(nullptr);
+    };
+    auto stop_leadership_monitor =
+        [](std::unique_ptr<LeadershipMonitorHandle>& monitor) {
+            if (!monitor) {
+                return;
+            }
+            monitor->Stop();
+            monitor.reset();
+        };
 
     set_runtime_state(MasterRuntimeState::kStarting);
     auto replication_controller = CreateReplicationController(*spec, config_);
@@ -326,15 +345,11 @@ int MasterServiceSupervisor::Start() {
             mooncake::WrappedMasterServiceConfig(
                 config_, leadership_session->view.view_version));
         mooncake::RegisterRpcService(server, *wrapped_master_service);
-        admin_server.SetServiceDelegate(wrapped_master_service);
-        admin_server.SetServiceAvailable(true);
-        set_runtime_state(MasterRuntimeState::kServing);
 
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
         if (!serve_preflight) {
-            admin_server.SetServiceAvailable(false);
-            admin_server.SetServiceDelegate(nullptr);
+            deactivate_serving_state();
             enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve preflight failure",
@@ -345,8 +360,7 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
         if (!serve_preflight.value()) {
-            admin_server.SetServiceAvailable(false);
-            admin_server.SetServiceDelegate(nullptr);
+            deactivate_serving_state();
             enter_standby_mode(std::nullopt);
             LogLeadershipReleaseWarning(
                 "serve preflight expiration",
@@ -356,17 +370,20 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
 
+        std::atomic<bool> serve_shutdown_requested{false};
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
-            *leadership_session, [&server, &admin_server](auto reason) {
+            *leadership_session,
+            [&server, &admin_server, &serve_shutdown_requested,
+             &set_runtime_state](auto reason) {
+                serve_shutdown_requested.store(true, std::memory_order_release);
                 admin_server.SetServiceAvailable(false);
-                admin_server.SetRuntimeState(MasterRuntimeState::kStandby);
+                set_runtime_state(MasterRuntimeState::kStandby);
                 LOG(INFO) << "Trying to stop server, reason="
                           << LeadershipLossReasonToString(reason);
                 server.stop();
             });
         if (!leadership_monitor) {
-            admin_server.SetServiceAvailable(false);
-            admin_server.SetServiceDelegate(nullptr);
+            deactivate_serving_state();
             enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve monitor startup failure", "start leadership monitor",
@@ -382,8 +399,8 @@ int MasterServiceSupervisor::Start() {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
-            admin_server.SetServiceAvailable(false);
-            admin_server.SetServiceDelegate(nullptr);
+            stop_leadership_monitor(leadership_monitor_handle);
+            deactivate_serving_state();
             enter_standby_mode(leadership_session->view);
             auto err =
                 leader_coordinator.ReleaseLeadership(*leadership_session);
@@ -393,12 +410,15 @@ int MasterServiceSupervisor::Start() {
             return -1;
         }
 
+        if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
+            activate_serving_state(wrapped_master_service);
+        }
+
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
-        admin_server.SetServiceAvailable(false);
-        admin_server.SetServiceDelegate(nullptr);
-        leadership_monitor_handle->Stop();
+        stop_leadership_monitor(leadership_monitor_handle);
+        deactivate_serving_state();
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();
