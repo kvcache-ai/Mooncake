@@ -467,7 +467,7 @@ bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
 int TransferEngineImpl::registerLocalMemory(
     std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
         buffer_map) {
-    // Check for overlaps first
+    // ========== Phase 1: Pre-check ==========
     for (const auto& entry : buffer_map) {
         for (const auto& buffer : entry.second) {
             if (checkOverlap(buffer.addr, buffer.length)) {
@@ -483,8 +483,24 @@ int TransferEngineImpl::registerLocalMemory(
         }
     }
 
-    // Register by protocol
-    std::vector<MemoryRegion> registered_buffers;
+    // ========== Phase 2: Prepare rollback records ==========
+    struct RegisteredRecord {
+        Transport* transport;  // Direct pointer to avoid lookup during rollback
+        void* addr;
+        uint64_t length;
+        std::string location;
+        bool remote_accessible;
+    };
+    std::vector<RegisteredRecord> success_records;
+    
+    // Reserve space to reduce reallocations
+    size_t total_buffers = 0;
+    for (const auto& entry : buffer_map) {
+        total_buffers += entry.second.size();
+    }
+    success_records.reserve(total_buffers);
+
+    // ========== Phase 3: Execute registration ==========
     for (const auto& entry : buffer_map) {
         const std::string& protocol = entry.first;
         const auto& buffer_list = entry.second;
@@ -492,36 +508,54 @@ int TransferEngineImpl::registerLocalMemory(
         auto transport = multi_transports_->getTransport(protocol);
         if (!transport) {
             LOG(ERROR) << "Transport " << protocol << " not found";
+            rollbackAllRegistrations(success_records);
             return -1;
         }
-
+        
         for (const auto& buffer : buffer_list) {
             int ret = transport->registerLocalMemory(
                 buffer.addr, buffer.length, buffer.location,
                 buffer.remote_accessible, buffer.update_metadata);
+            
             if (ret < 0) {
                 LOG(ERROR) << "Failed to register memory with transport "
                            << protocol << " addr=" << buffer.addr
                            << " length=" << buffer.length;
+                
+                // ========== Phase 4: Rollback on failure ==========
+                rollbackAllRegistrations(success_records);
                 return ret;
             }
-            registered_buffers.push_back({buffer.addr, buffer.length,
-                                          buffer.location,
-                                          buffer.remote_accessible});
+            
+            // Record successful registration for potential rollback
+            success_records.push_back({transport, buffer.addr, buffer.length,
+                                       buffer.location, buffer.remote_accessible});
         }
-        if (registered_buffers.size() != buffer_list.size()) {
-            for (auto& buffer : registered_buffers) {
-                transport->unregisterLocalMemory(buffer.addr, true);
-            }
-        } else {
-            std::unique_lock<std::shared_mutex> lock(mutex_);
-            local_memory_regions_.insert(local_memory_regions_.end(),
-                                         registered_buffers.begin(),
-                                         registered_buffers.end());
-        }
-        registered_buffers.clear();
     }
+    
+    // ========== Phase 5: Commit to system state ==========
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& record : success_records) {
+            local_memory_regions_.push_back({record.addr, record.length,
+                                             record.location,
+                                             record.remote_accessible});
+        }
+    }
+    
     return 0;
+}
+
+void TransferEngineImpl::rollbackAllRegistrations(
+    const std::vector<RegisteredRecord>& records) {
+    
+    LOG(INFO) << "Rolling back " << records.size() << " registered regions";
+    
+    for (const auto& record : records) {
+        if (record.transport) {
+            record.transport->unregisterLocalMemory(record.addr, true);
+        }
+    }
 }
 
 int TransferEngineImpl::unregisterLocalMemory(

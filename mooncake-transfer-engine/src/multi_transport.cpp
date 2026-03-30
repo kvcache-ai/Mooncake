@@ -405,11 +405,15 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
         preferred_proto = "ascend";
     }
 #endif
-    if (std::find(protos.begin(), protos.end(), preferred_proto) ==
-            protos.end() ||
-        !transport_map_.count(preferred_proto)) {
+    if (!transport_map_.count(preferred_proto)) {
         return Status::NotSupportedTransport("Transport " + preferred_proto +
                                              " not installed");
+    }
+    if (std::find(protos.begin(), protos.end(), preferred_proto) ==
+        protos.end()) {
+        return Status::NotSupportedTransport(
+            "Transport " + preferred_proto +
+            " not supported by target segment");
     }
     // if (!transport_map_.count(proto)) {
     //     return Status::NotSupportedTransport("Transport " + proto +

@@ -517,10 +517,12 @@ int initiator() {
         LOG_ASSERT(!rc);
     }
 #else
-    for (int i = 0; i < buffer_num; ++i) {
-        int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
-                                             getLocationName(i));
-        LOG_ASSERT(!rc);
+    if (FLAGS_protocol != "cxl") {
+        for (int i = 0; i < buffer_num; ++i) {
+            int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
+                                                 getLocationName(i));
+            LOG_ASSERT(!rc);
+        }
     }
 #endif
 
@@ -557,8 +559,10 @@ int initiator() {
         engine->unregisterLocalMemory(buffer_map);
     }
 #else
-    for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
+    if (FLAGS_protocol != "cxl") {
+        for (int i = 0; i < buffer_num; ++i) {
+            engine->unregisterLocalMemory(addr[i]);
+        }
     }
 #endif
 
@@ -639,8 +643,14 @@ int target() {
 #ifdef ENABLE_MULTI_PROTOCOL
     engine->unregisterLocalMemory(buffer_map);
 #else
-    for (int i = 0; i < buffer_num; ++i) {
-        engine->unregisterLocalMemory(addr[i]);
+    if (FLAGS_protocol == "cxl") {
+#ifdef USE_CXL
+        engine->unregisterLocalMemory(addr[0]);
+#endif
+    } else {
+        for (int i = 0; i < buffer_num; ++i) {
+            engine->unregisterLocalMemory(addr[i]);
+        }
     }
 #endif
     freeBuffers(addr);
