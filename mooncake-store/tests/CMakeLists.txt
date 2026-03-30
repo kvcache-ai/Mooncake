@@ -131,5 +131,13 @@ add_hot_standby_ut_test(ha_metric_manager_test
                         hot_standby_ut/ha_metric_manager_test.cpp)
 add_hot_standby_ut_test(hot_standby_service_test
                         hot_standby_ut/hot_standby_service_test.cpp)
+add_hot_standby_ut_test(catalog_backed_snapshot_provider_test
+                        ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
 add_hot_standby_ut_test(etcd_oplog_store_test
                         hot_standby_ut/etcd_oplog_store_test.cpp)
+if(STORE_USE_REDIS)
+  target_include_directories(catalog_backed_snapshot_provider_test PRIVATE
+                             ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+  target_link_libraries(catalog_backed_snapshot_provider_test
+                        PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+endif()
