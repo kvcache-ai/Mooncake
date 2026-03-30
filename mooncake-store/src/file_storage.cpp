@@ -464,11 +464,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                         descriptor.get_memory_descriptor();
                     std::vector<Slice> slices;
                     void* slice_ptr = reinterpret_cast<void*>(
-                        memory_descriptor.buffer_descriptor
-                            .buffer_address_);
-                    slices.emplace_back(
-                        Slice{slice_ptr,
-                              memory_descriptor.buffer_descriptor.size_});
+                        memory_descriptor.buffer_descriptor.buffer_address_);
+                    slices.emplace_back(Slice{
+                        slice_ptr, memory_descriptor.buffer_descriptor.size_});
                     batched_slices.insert({keys[i], std::move(slices)});
                     break;
                 }
