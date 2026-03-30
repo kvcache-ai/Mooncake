@@ -203,24 +203,27 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     uint64_t baseline_seq_id = has_local_state ? local_last_seq_id : 0;
     if (!has_local_state && config_.enable_snapshot_bootstrap &&
         snapshot_provider_) {
-        std::string snapshot_id;
-        uint64_t snapshot_seq_id = 0;
-        std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
-        if (snapshot_provider_->LoadLatestSnapshot(cluster_id_, snapshot_id,
-                                                   snapshot_seq_id, snapshot)) {
-            LOG(INFO) << "Loaded snapshot: snapshot_id=" << snapshot_id
-                      << ", snapshot_seq_id=" << snapshot_seq_id
-                      << ", keys=" << snapshot.size();
+        auto snapshot_result =
+            snapshot_provider_->LoadLatestSnapshot(cluster_id_);
+        if (!snapshot_result) {
+            LOG(WARNING) << "Failed to load snapshot baseline, falling back "
+                            "to OpLog-only bootstrap: "
+                         << toString(snapshot_result.error());
+        } else if (snapshot_result->has_value()) {
+            const auto& snapshot = snapshot_result->value();
+            LOG(INFO) << "Loaded snapshot: snapshot_id=" << snapshot.snapshot_id
+                      << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
+                      << ", keys=" << snapshot.metadata.size();
             // Apply snapshot into local standby store.
-            for (const auto& kv : snapshot) {
+            for (const auto& kv : snapshot.metadata) {
                 metadata_store_->PutMetadata(kv.first, kv.second);
             }
             // Align applier to snapshot boundary.
-            oplog_applier_->Recover(snapshot_seq_id);
-            baseline_seq_id = snapshot_seq_id;
+            oplog_applier_->Recover(snapshot.snapshot_sequence_id);
+            baseline_seq_id = snapshot.snapshot_sequence_id;
         } else {
-            LOG(INFO) << "No snapshot available (or provider not ready), "
-                         "falling back to OpLog-only bootstrap";
+            LOG(INFO) << "No snapshot available, falling back to OpLog-only "
+                         "bootstrap";
         }
     }
 
@@ -274,6 +277,90 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         << "STORE_USE_ETCD is not enabled, cannot start HotStandbyService";
     return ErrorCode::INTERNAL_ERROR;
 #endif
+}
+
+ErrorCode HotStandbyService::StartSnapshotBootstrap(
+    const std::string& cluster_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (IsRunning()) {
+        LOG(WARNING) << "HotStandbyService is already running";
+        return ErrorCode::OK;
+    }
+
+    auto result = state_machine_.ProcessEvent(StandbyEvent::START);
+    if (!result.allowed) {
+        LOG(ERROR) << "Cannot start HotStandbyService: " << result.reason;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    config_.primary_address.clear();
+    etcd_endpoints_.clear();
+    cluster_id_ = cluster_id;
+
+    state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
+
+    uint64_t local_last_seq_id = applied_seq_id_.load();
+    if (oplog_applier_) {
+        uint64_t expected = oplog_applier_->GetExpectedSequenceId();
+        if (expected > 0) {
+            local_last_seq_id = expected - 1;
+        }
+    }
+
+    const bool has_local_metadata =
+        metadata_store_ && metadata_store_->GetKeyCount() > 0;
+    oplog_applier_ =
+        std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id);
+
+    uint64_t baseline_seq_id = local_last_seq_id;
+    if (has_local_metadata) {
+        LOG(INFO) << "Standby warm start (snapshot-only): reuse local "
+                  << "metadata (keys=" << metadata_store_->GetKeyCount()
+                  << "), last_seq_id=" << local_last_seq_id;
+        oplog_applier_->Recover(local_last_seq_id);
+    } else if (config_.enable_snapshot_bootstrap && snapshot_provider_) {
+        auto snapshot_result =
+            snapshot_provider_->LoadLatestSnapshot(cluster_id_);
+        if (!snapshot_result) {
+            LOG(ERROR) << "Failed to load snapshot baseline for snapshot-only "
+                       << "standby bootstrap: "
+                       << toString(snapshot_result.error());
+            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+            return snapshot_result.error();
+        }
+
+        if (snapshot_result->has_value()) {
+            const auto& snapshot = snapshot_result->value();
+            LOG(INFO) << "Loaded snapshot-only baseline: snapshot_id="
+                      << snapshot.snapshot_id
+                      << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
+                      << ", keys=" << snapshot.metadata.size();
+            for (const auto& kv : snapshot.metadata) {
+                metadata_store_->PutMetadata(kv.first, kv.second);
+            }
+            oplog_applier_->Recover(snapshot.snapshot_sequence_id);
+            baseline_seq_id = snapshot.snapshot_sequence_id;
+        } else {
+            LOG(INFO) << "No snapshot available for snapshot-only bootstrap; "
+                         "standby starts from empty baseline";
+            oplog_applier_->Recover(0);
+            baseline_seq_id = 0;
+        }
+    } else {
+        oplog_applier_->Recover(0);
+        baseline_seq_id = 0;
+    }
+
+    applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
+
+    LOG(INFO) << "HotStandbyService started in snapshot-only mode, cluster="
+              << cluster_id_ << ", state=" << StandbyStateToString(GetState())
+              << ", applied_seq_id=" << baseline_seq_id
+              << ", metadata_keys=" << metadata_store_->GetKeyCount();
+    return ErrorCode::OK;
 }
 
 void HotStandbyService::SetSyncStatusCallback(SyncStatusCallback callback) {
