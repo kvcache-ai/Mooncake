@@ -11,6 +11,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "ha/leadership/leader_coordinator_factory.h"
+#include "ha/replication_controller.h"
 #include "rpc_service.h"
 
 namespace mooncake {
@@ -146,9 +147,25 @@ int MasterServiceSupervisor::Start() {
                   << ", role=" << MasterRuntimeRoleToString(state);
     };
 
-    admin_server.SetObservedLeader(std::nullopt);
     set_runtime_state(MasterRuntimeState::kStarting);
-    set_runtime_state(MasterRuntimeState::kStandby);
+    auto replication_controller = CreateReplicationController(*spec, config_);
+    auto enter_standby_mode =
+        [&](const std::optional<MasterView>& leader_view) {
+            admin_server.SetObservedLeader(leader_view);
+            replication_controller->UpdateObservedLeader(leader_view);
+
+            auto err = replication_controller->StartStandby(leader_view);
+            if (err != ErrorCode::OK) {
+                LOG(WARNING)
+                    << "Failed to start standby replication: " << toString(err);
+                set_runtime_state(MasterRuntimeState::kStandby);
+                return;
+            }
+
+            set_runtime_state(replication_controller->GetStandbyRuntimeState());
+        };
+
+    enter_standby_mode(std::nullopt);
 
     while (true) {
         auto coordinator = CreateLeaderCoordinator(*spec);
@@ -168,7 +185,7 @@ int MasterServiceSupervisor::Start() {
 
             auto current_view = leader_coordinator.ReadCurrentView();
             if (!current_view) {
-                set_runtime_state(MasterRuntimeState::kStandby);
+                enter_standby_mode(std::nullopt);
                 if (HandleSupervisorError("read current leader view",
                                           current_view.error(), spec->type)) {
                     return -1;
@@ -177,11 +194,12 @@ int MasterServiceSupervisor::Start() {
             }
 
             admin_server.SetObservedLeader(current_view.value());
+            replication_controller->UpdateObservedLeader(current_view.value());
             if (!current_view.value().has_value()) {
                 auto acquire = leader_coordinator.TryAcquireLeadership(
                     config_.local_hostname);
                 if (!acquire) {
-                    set_runtime_state(MasterRuntimeState::kStandby);
+                    enter_standby_mode(std::nullopt);
                     if (HandleSupervisorError("acquire leadership",
                                               acquire.error(), spec->type)) {
                         return -1;
@@ -191,6 +209,8 @@ int MasterServiceSupervisor::Start() {
 
                 if (acquire->observed_view.has_value()) {
                     admin_server.SetObservedLeader(acquire->observed_view);
+                    replication_controller->UpdateObservedLeader(
+                        acquire->observed_view);
                 }
 
                 if (acquire->status == AcquireLeadershipStatus::ACQUIRED &&
@@ -200,7 +220,7 @@ int MasterServiceSupervisor::Start() {
                     break;
                 }
 
-                set_runtime_state(MasterRuntimeState::kStandby);
+                enter_standby_mode(acquire->observed_view);
                 std::optional<ViewVersionId> observed_version = std::nullopt;
                 if (acquire->observed_view.has_value()) {
                     observed_version = acquire->observed_view->view_version;
@@ -217,11 +237,13 @@ int MasterServiceSupervisor::Start() {
                 if (wait->current_view.has_value() ||
                     (!wait->changed && !wait->timed_out)) {
                     admin_server.SetObservedLeader(wait->current_view);
+                    replication_controller->UpdateObservedLeader(
+                        wait->current_view);
                 }
                 continue;
             }
 
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(current_view.value());
             const auto& known_view = current_view.value().value();
             auto wait = leader_coordinator.WaitForViewChange(
                 known_view.view_version, kAcquireRetryInterval);
@@ -235,10 +257,22 @@ int MasterServiceSupervisor::Start() {
             if (wait->current_view.has_value() ||
                 (!wait->changed && !wait->timed_out)) {
                 admin_server.SetObservedLeader(wait->current_view);
+                replication_controller->UpdateObservedLeader(
+                    wait->current_view);
             }
         }
 
         if (!leadership_session.has_value()) {
+            continue;
+        }
+
+        auto prepare_replication = replication_controller->PrepareToServe();
+        if (prepare_replication != ErrorCode::OK) {
+            enter_standby_mode(leadership_session->view);
+            if (HandleSupervisorError("prepare replication for serve",
+                                      prepare_replication, spec->type)) {
+                return -1;
+            }
             continue;
         }
 
@@ -247,7 +281,7 @@ int MasterServiceSupervisor::Start() {
         auto warmup_result =
             WarmupLeadership(leader_coordinator, *leadership_session);
         if (!warmup_result) {
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "renewal startup failure", "start leadership renewal",
                     leader_coordinator, *leadership_session,
@@ -257,7 +291,7 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
         if (!warmup_result.value()) {
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(std::nullopt);
             LogLeadershipReleaseWarning(
                 "warmup expiration",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -288,7 +322,7 @@ int MasterServiceSupervisor::Start() {
         if (!serve_preflight) {
             admin_server.SetServiceAvailable(false);
             admin_server.SetServiceDelegate(nullptr);
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve preflight failure",
                     "validate leadership before serving", leader_coordinator,
@@ -300,7 +334,7 @@ int MasterServiceSupervisor::Start() {
         if (!serve_preflight.value()) {
             admin_server.SetServiceAvailable(false);
             admin_server.SetServiceDelegate(nullptr);
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(std::nullopt);
             LogLeadershipReleaseWarning(
                 "serve preflight expiration",
                 leader_coordinator.ReleaseLeadership(*leadership_session));
@@ -320,7 +354,7 @@ int MasterServiceSupervisor::Start() {
         if (!leadership_monitor) {
             admin_server.SetServiceAvailable(false);
             admin_server.SetServiceDelegate(nullptr);
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "serve monitor startup failure", "start leadership monitor",
                     leader_coordinator, *leadership_session,
@@ -337,7 +371,7 @@ int MasterServiceSupervisor::Start() {
                        << ec.result().value();
             admin_server.SetServiceAvailable(false);
             admin_server.SetServiceDelegate(nullptr);
-            set_runtime_state(MasterRuntimeState::kStandby);
+            enter_standby_mode(leadership_session->view);
             auto err =
                 leader_coordinator.ReleaseLeadership(*leadership_session);
             if (err != ErrorCode::OK) {
@@ -351,15 +385,14 @@ int MasterServiceSupervisor::Start() {
 
         admin_server.SetServiceAvailable(false);
         admin_server.SetServiceDelegate(nullptr);
-        set_runtime_state(MasterRuntimeState::kStandby);
         leadership_monitor_handle->Stop();
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);
         auto current_view = leader_coordinator.ReadCurrentView();
         if (current_view) {
-            admin_server.SetObservedLeader(current_view.value());
+            enter_standby_mode(current_view.value());
         } else {
-            admin_server.SetObservedLeader(std::nullopt);
+            enter_standby_mode(std::nullopt);
         }
     }
 
