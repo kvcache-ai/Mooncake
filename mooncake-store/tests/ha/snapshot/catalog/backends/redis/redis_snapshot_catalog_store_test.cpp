@@ -170,7 +170,7 @@ TEST_F(RedisSnapshotCatalogStoreTest,
     EXPECT_EQ(latest.error(), ErrorCode::PERSISTENT_FAIL);
 }
 
-TEST_F(RedisSnapshotCatalogStoreTest, ListReturnsErrorWhenDescriptorMissing) {
+TEST_F(RedisSnapshotCatalogStoreTest, ListSkipsSnapshotsWhenDescriptorMissing) {
     const std::string snapshot_id = "20240302_120000_001";
     ASSERT_EQ(store_->Publish(MakeDescriptor(snapshot_id)), ErrorCode::OK);
 
@@ -185,8 +185,31 @@ TEST_F(RedisSnapshotCatalogStoreTest, ListReturnsErrorWhenDescriptorMissing) {
     ASSERT_NE(reply->type, REDIS_REPLY_ERROR);
 
     auto snapshots = store_->List(0);
-    ASSERT_FALSE(snapshots.has_value());
-    EXPECT_EQ(snapshots.error(), ErrorCode::PERSISTENT_FAIL);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_TRUE(snapshots->empty());
+}
+
+TEST_F(RedisSnapshotCatalogStoreTest,
+       ListSkipsUnreadableSnapshotsAndKeepsHealthyEntries) {
+    ASSERT_EQ(store_->Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
+
+    auto redis = mooncake::testing::ConnectRedisForTest(FLAGS_redis_endpoint);
+    ASSERT_TRUE(redis.has_value());
+    const auto descriptor_key =
+        BuildDescriptorKey(cluster_namespace_, "20240302_120000_001");
+    mooncake::testing::RedisReplyPtr reply(static_cast<redisReply*>(
+        redisCommand(redis->get(), "DEL %b", descriptor_key.data(),
+                     descriptor_key.size())));
+    ASSERT_NE(reply, nullptr);
+    ASSERT_NE(reply->type, REDIS_REPLY_ERROR);
+
+    auto snapshots = store_->List(0);
+    ASSERT_TRUE(snapshots.has_value());
+    ASSERT_EQ(snapshots->size(), 1u);
+    EXPECT_EQ(snapshots->at(0).snapshot_id, "20240301_120000_001");
 }
 
 TEST_F(RedisSnapshotCatalogStoreTest,

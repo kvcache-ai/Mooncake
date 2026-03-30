@@ -4,6 +4,8 @@
 #include <set>
 #include <string_view>
 
+#include <glog/logging.h>
+
 namespace mooncake {
 namespace ha {
 namespace backends {
@@ -162,7 +164,10 @@ EmbeddedSnapshotCatalogStore::List(size_t limit) {
         }
         auto descriptor = LoadSnapshotDescriptor(object_store_, snapshot_id);
         if (!descriptor) {
-            return tl::make_unexpected(descriptor.error());
+            LOG(WARNING) << "Skipping unreadable embedded snapshot descriptor, "
+                         << "snapshot_id=" << snapshot_id
+                         << ", error=" << toString(descriptor.error());
+            continue;
         }
         snapshots.emplace_back(descriptor.value());
     }

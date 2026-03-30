@@ -183,13 +183,30 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest,
-       ListReturnsErrorWhenDescriptorMissing) {
+       ListSkipsSnapshotsWhenDescriptorMissing) {
     PutObject("mooncake_master_snapshot/20240303_120000_001/manifest.txt",
               "m3");
 
     auto snapshots = store_.List(0);
-    ASSERT_FALSE(snapshots.has_value());
-    EXPECT_EQ(snapshots.error(), ErrorCode::PERSISTENT_FAIL);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_TRUE(snapshots->empty());
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       ListSkipsUnreadableSnapshotsAndKeepsHealthyEntries) {
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240303_120000_001")),
+              ErrorCode::OK);
+
+    auto delete_result = backend_.DeleteObjectsWithPrefix(
+        "mooncake_master_snapshot/20240303_120000_001/descriptor.msgpack");
+    ASSERT_TRUE(delete_result.has_value()) << delete_result.error();
+
+    auto snapshots = store_.List(0);
+    ASSERT_TRUE(snapshots.has_value());
+    ASSERT_EQ(snapshots->size(), 1u);
+    EXPECT_EQ(snapshots->at(0).snapshot_id, "20240301_120000_001");
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest, DeleteRemovesSnapshotObjectsByPrefix) {

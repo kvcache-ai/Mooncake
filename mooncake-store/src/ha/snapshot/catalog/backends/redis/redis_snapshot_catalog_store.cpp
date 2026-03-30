@@ -283,7 +283,10 @@ RedisSnapshotCatalogStore::List(size_t limit) {
         auto descriptor = LoadSnapshotDescriptor(
             context->get(), cluster_namespace_, snapshot_id);
         if (!descriptor) {
-            return tl::make_unexpected(descriptor.error());
+            LOG(WARNING) << "Skipping unreadable Redis snapshot descriptor, "
+                         << "snapshot_id=" << snapshot_id
+                         << ", error=" << toString(descriptor.error());
+            continue;
         }
         snapshots.emplace_back(descriptor.value());
     }

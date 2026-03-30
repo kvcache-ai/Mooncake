@@ -457,6 +457,10 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
+    bool TryRestoreStateFromSnapshot(
+        const ha::SnapshotDescriptor& snapshot,
+        const std::chrono::system_clock::time_point& now);
+    void ResetStateAfterFailedRestoreAttempt();
     void LoadPreloadedState(const ha::PromotedStandbyState& state);
 
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
