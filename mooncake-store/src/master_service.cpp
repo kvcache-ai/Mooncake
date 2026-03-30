@@ -2120,11 +2120,31 @@ void MasterService::SnapshotThreadFunc() {
             continue;
         }
 
+        tl::expected<ha::SnapshotDescriptor, SerializationError> descriptor =
+            tl::make_unexpected(
+                SerializationError(ErrorCode::INTERNAL_ERROR,
+                                   "snapshot descriptor was not initialized"));
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
+            const std::string path_prefix =
+                SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+            const std::string manifest_path =
+                path_prefix + SNAPSHOT_MANIFEST_FILE;
+            descriptor = BuildSnapshotDescriptor(snapshot_id, manifest_path,
+                                                 path_prefix);
+            if (!descriptor) {
+                LOG(ERROR) << "[Snapshot] Failed to build descriptor before "
+                              "fork, snapshot_id="
+                           << snapshot_id
+                           << ", code=" << toString(descriptor.error().code)
+                           << ", msg=" << descriptor.error().message;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
             pid = fork();
         }
         if (pid == -1) {
@@ -2143,7 +2163,7 @@ void MasterService::SnapshotThreadFunc() {
             // Save current state using the configured persistence mechanism
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
-            auto result = PersistState(snapshot_id);
+            auto result = PersistState(descriptor.value());
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
@@ -2403,27 +2423,28 @@ MasterService::BuildSnapshotDescriptor(const std::string& snapshot_id,
 
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
+    const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+    const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+    auto descriptor =
+        BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
+    if (!descriptor) {
+        return tl::make_unexpected(descriptor.error());
+    }
+    return PersistState(descriptor.value());
+}
+
+tl::expected<void, SerializationError> MasterService::PersistState(
+    const ha::SnapshotDescriptor& descriptor) {
+    const std::string& snapshot_id = descriptor.snapshot_id;
+    const std::string& path_prefix = descriptor.object_prefix;
+    const std::string& manifest_path = descriptor.manifest_key;
+
     try {
         auto* snapshot_catalog_store = GetSnapshotCatalogStore();
         if (!snapshot_catalog_store) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::PERSISTENT_FAIL,
                 "snapshot catalog store is not initialized"));
-        }
-
-        // Freeze snapshot metadata before any serialization or payload upload
-        // so the descriptor boundary matches the actual snapshot contents.
-        const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
-        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-        auto descriptor =
-            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
-        if (!descriptor) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] build descriptor failed, snapshot_id={}, code={}, "
-                "msg={}",
-                snapshot_id, toString(descriptor.error().code),
-                descriptor.error().message);
-            return tl::make_unexpected(descriptor.error());
         }
 
         SNAP_LOG_INFO(
@@ -2573,8 +2594,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        auto publish_result =
-            snapshot_catalog_store->Publish(descriptor.value());
+        auto publish_result = snapshot_catalog_store->Publish(descriptor);
         if (publish_result != ErrorCode::OK) {
             SNAP_LOG_ERROR(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}, "
