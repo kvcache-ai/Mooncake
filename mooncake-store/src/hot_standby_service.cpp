@@ -104,6 +104,11 @@ size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
     return store_.size();
 }
 
+void HotStandbyService::StandbyMetadataStore::Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_.clear();
+}
+
 void HotStandbyService::StandbyMetadataStore::Snapshot(
     std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -211,6 +216,24 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     oplog_applier_ =
         std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id_);
+    if (!config_.enable_oplog_following) {
+        if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
+            LOG(INFO) << "Snapshot-only restart discards local metadata and "
+                         "reloads the latest catalog snapshot";
+            metadata_store_ = std::make_unique<StandbyMetadataStore>();
+            oplog_applier_ = std::make_unique<OpLogApplier>(
+                metadata_store_.get(), cluster_id_);
+        }
+
+        auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
+        if (snapshot_err != ErrorCode::OK) {
+            return snapshot_err;
+        }
+        applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
+        primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+        return ErrorCode::OK;
+    }
+
     if (has_recoverable_local_state) {
         LOG(INFO) << "Standby warm start: reuse local metadata (keys="
                   << metadata_store_->GetKeyCount()
@@ -268,6 +291,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
+    metadata_store_->Clear();
     for (const auto& kv : snapshot.metadata) {
         metadata_store_->PutMetadata(kv.first, kv.second);
     }

@@ -225,6 +225,7 @@ class HotStandbyService {
         bool Remove(const std::string& key) override;
         bool Exists(const std::string& key) const override;
         size_t GetKeyCount() const override;
+        void Clear();
 
         // Snapshot for promotion/restore.
         void Snapshot(
