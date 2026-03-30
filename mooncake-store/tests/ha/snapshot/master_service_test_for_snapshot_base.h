@@ -15,8 +15,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -174,12 +176,14 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         std::tm tm_now;
         localtime_r(&time_t_now, &tm_now);
 
-        char buffer[32];
-        std::snprintf(buffer, sizeof(buffer), "%04d%02d%02d_%02d%02d%02d_%03d",
-                      tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
-                      tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec,
-                      static_cast<int>(ms.count()));
-        return std::string(buffer);
+        std::ostringstream snapshot_id;
+        snapshot_id << std::setfill('0') << std::setw(4)
+                    << (tm_now.tm_year + 1900) << std::setw(2)
+                    << (tm_now.tm_mon + 1) << std::setw(2) << tm_now.tm_mday
+                    << "_" << std::setw(2) << tm_now.tm_hour << std::setw(2)
+                    << tm_now.tm_min << std::setw(2) << tm_now.tm_sec << "_"
+                    << std::setw(3) << ms.count();
+        return snapshot_id.str();
     }
 
     // Get msgpack snapshot directory path
