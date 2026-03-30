@@ -24,8 +24,7 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
         descriptor_payload);
     if (!get_result) {
         if (object_store->IsNotFoundError(get_result.error())) {
-            return snapshot_catalog_store_detail::MakeSnapshotDescriptor(
-                snapshot_id);
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
         }
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }

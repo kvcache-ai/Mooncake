@@ -143,6 +143,8 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest, GetLatestTrimsWhitespaceMarker) {
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_002")),
+              ErrorCode::OK);
     PutObject("mooncake_master_snapshot/latest.txt",
               "  \n20240301_120000_002\t\r\n");
 
@@ -153,12 +155,24 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest, GetLatestTrimsWhitespaceMarker) {
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest,
-       ListReturnsSnapshotsInDescendingOrder) {
-    PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
-              "m1");
-    PutObject("mooncake_master_snapshot/20240303_120000_001/metadata", "d3");
-    PutObject("mooncake_master_snapshot/20240302_120000_001/segments", "d2");
+       GetLatestReturnsErrorWhenDescriptorMissing) {
     PutObject("mooncake_master_snapshot/latest.txt", "20240303_120000_001");
+    PutObject("mooncake_master_snapshot/20240303_120000_001/manifest.txt",
+              "m3");
+
+    auto latest = store_.GetLatest();
+    ASSERT_FALSE(latest.has_value());
+    EXPECT_EQ(latest.error(), ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       ListReturnsSnapshotsInDescendingOrder) {
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240303_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
     PutObject("mooncake_master_snapshot/not-a-snapshot/file.txt", "ignore");
 
     auto snapshots = store_.List(2);
@@ -168,7 +182,21 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
     EXPECT_EQ(snapshots->at(1).snapshot_id, "20240302_120000_001");
 }
 
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       ListReturnsErrorWhenDescriptorMissing) {
+    PutObject("mooncake_master_snapshot/20240303_120000_001/manifest.txt",
+              "m3");
+
+    auto snapshots = store_.List(0);
+    ASSERT_FALSE(snapshots.has_value());
+    EXPECT_EQ(snapshots.error(), ErrorCode::PERSISTENT_FAIL);
+}
+
 TEST_F(EmbeddedSnapshotCatalogStoreTest, DeleteRemovesSnapshotObjectsByPrefix) {
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
     PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
               "m1");
     PutObject("mooncake_master_snapshot/20240301_120000_001/metadata", "d1");

@@ -65,8 +65,7 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
     if (reply->type == REDIS_REPLY_NIL) {
-        return snapshot_catalog_store_detail::MakeSnapshotDescriptor(
-            snapshot_id);
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
     if (!IsStringReply(reply.get()) || reply->str == nullptr) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
