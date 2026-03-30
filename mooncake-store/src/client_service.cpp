@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <future>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -77,41 +78,36 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    // Shut down RPC client first — this causes all pending and future RPC
+    // calls to fail immediately, unblocking any threads stuck in syncAwait.
+    master_client_.Shutdown();
+
+    // Helper: join a thread with a timeout, detach if it doesn't finish.
+    auto timed_join = [](std::thread& t, const char* name,
+                         int timeout_sec = 5) {
+        if (!t.joinable()) return;
+        auto f = std::async(std::launch::async, [&t] { t.join(); });
+        if (f.wait_for(std::chrono::seconds(timeout_sec)) ==
+            std::future_status::timeout) {
+            LOG(WARNING) << name << " thread join timed out after "
+                         << timeout_sec << "s, detaching";
+            t.detach();
+        }
+    };
+
     task_poll_running_ = false;
-    if (task_poll_thread_.joinable()) {
-        task_poll_thread_.join();
-    }
+    timed_join(task_poll_thread_, "task_poll");
 
     storage_heartbeat_running_ = false;
-    if (storage_heartbeat_thread_.joinable()) {
-        storage_heartbeat_thread_.join();
-    }
+    timed_join(storage_heartbeat_thread_, "storage_heartbeat");
 
     leader_monitor_running_ = false;
-    if (leader_monitor_thread_.joinable()) {
-        leader_monitor_thread_.join();
-    }
+    timed_join(leader_monitor_thread_, "leader_monitor");
 
-    // Make a copy of mounted_segments_ to avoid modifying while iterating
-    std::vector<Segment> segments_to_unmount;
-    {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        segments_to_unmount.reserve(mounted_segments_.size());
-        for (auto& entry : mounted_segments_) {
-            segments_to_unmount.emplace_back(entry.second);
-        }
-    }
-
-    for (auto& segment : segments_to_unmount) {
-        auto result =
-            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
-        if (!result) {
-            LOG(ERROR) << "Failed to unmount segment: "
-                       << toString(result.error());
-        }
-    }
-
-    // Clear any remaining segments
+    // Skip all remote calls during shutdown (both RPC to master and HTTP to
+    // metadata server). Master's ClientMonitorFunc auto-cleans expired
+    // client segments by TTL, and metadata entries expire naturally.
+    // On process exit, OS reclaims all local memory.
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_.clear();
@@ -2491,6 +2487,9 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
+        // Check shutdown before RPC
+        if (!storage_heartbeat_running_.load()) break;
+
         // Ping master
         auto ping_result = master_client_.Ping();
         if (ping_result) {
@@ -2552,6 +2551,7 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(INFO) << "Reconnected to master " << next_view.leader_address;
             ping_fail_count = 0;
         } else {
+            if (!storage_heartbeat_running_.load()) break;
             const std::string current_master_address = direct_master_address_;
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
@@ -2569,9 +2569,12 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
         }
     }
-    // Explicitly wait for the remount segment thread to finish
+    // Wait for the remount segment thread with a bounded timeout
     if (remount_segment_future.valid()) {
-        remount_segment_future.wait();
+        if (remount_segment_future.wait_for(std::chrono::seconds(3)) ==
+            std::future_status::timeout) {
+            LOG(WARNING) << "Remount segment future timed out, abandoning";
+        }
     }
 }
 

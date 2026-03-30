@@ -91,7 +91,7 @@ DEFINE_int32(
     "Port for RPC server to listen on (0 = use port, preferred over port)");
 DEFINE_string(rpc_address, "0.0.0.0",
               "Address for RPC server to bind to, required in HA mode");
-DEFINE_int32(rpc_conn_timeout_seconds, 0,
+DEFINE_int32(rpc_conn_timeout_seconds, 5,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
@@ -913,10 +913,19 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
+        // Use unique_ptr to control destruction order: server must stop
+        // (and all in-flight coroutines must complete) BEFORE the service
+        // object is destroyed. Otherwise coroutines may access a dangling
+        // reference to wrapped_master_service → use-after-free.
+        auto wrapped_master_service =
+            std::make_unique<mooncake::WrappedMasterService>(
+                mooncake::WrappedMasterServiceConfig(master_config, version));
 
-        mooncake::RegisterRpcService(server, wrapped_master_service);
-        return server.start();
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        auto ret = server.start();
+        // server.start() returns after server stops. All coroutines have
+        // completed at this point, so it is safe to destroy the service.
+        wrapped_master_service.reset();
+        return ret;
     }
 }

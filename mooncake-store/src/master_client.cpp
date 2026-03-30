@@ -224,6 +224,9 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    if (shutting_down_.load(std::memory_order_relaxed)) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -264,6 +267,10 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    if (shutting_down_.load(std::memory_order_relaxed)) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -311,7 +318,14 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 MasterClient::~MasterClient() = default;
 
+void MasterClient::Shutdown() {
+    shutting_down_.store(true, std::memory_order_release);
+}
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
+    if (shutting_down_.load(std::memory_order_relaxed)) {
+        return ErrorCode::RPC_FAIL;
+    }
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 

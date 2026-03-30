@@ -4,7 +4,7 @@
   "rpc_port": 50051,
   "rpc_thread_num": 4,
   "rpc_address": "0.0.0.0",
-  "rpc_conn_timeout_seconds": 0,
+  "rpc_conn_timeout_seconds": 5,
   "rpc_enable_tcp_no_delay": true,
   "default_kv_lease_ttl": 5000,
   "default_kv_soft_pin_ttl": 1800000,

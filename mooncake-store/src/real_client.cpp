@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <thread>
 #include <stop_token>
+#include <future>
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
@@ -248,10 +249,34 @@ void ResourceTracker::startSignalThread() {
                     continue;  // spurious
                 }
 
-                // Perform cleanup in normal thread context
+                // Perform cleanup with timeout — if cleanup hangs (e.g.
+                // because master is dead and RPC calls block), we still
+                // need to re-raise the signal to terminate the process.
+                // Use atomic flag + detached thread instead of std::async
+                // because std::future destructor blocks until completion.
                 LOG(INFO) << "Received signal " << sig
                           << ", cleaning up resources";
-                ResourceTracker::getInstance().cleanupAllResources();
+                {
+                    std::atomic<bool> cleanup_done{false};
+                    std::thread cleanup_thread([&cleanup_done]() {
+                        ResourceTracker::getInstance()
+                            .cleanupAllResources();
+                        cleanup_done.store(true, std::memory_order_release);
+                    });
+                    cleanup_thread.detach();
+
+                    auto deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(5);
+                    while (!cleanup_done.load(std::memory_order_acquire) &&
+                           std::chrono::steady_clock::now() < deadline) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
+                    }
+                    if (!cleanup_done.load(std::memory_order_acquire)) {
+                        LOG(WARNING) << "Resource cleanup timed out after "
+                                     << "5s, proceeding with signal re-raise";
+                    }
+                }
 
                 // Restore default action and re-raise to terminate normally
                 struct sigaction sa;

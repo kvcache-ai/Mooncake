@@ -46,6 +46,11 @@ class MasterClient {
     }
     ~MasterClient();
 
+    // Shutdown the client, causing all pending and future RPC calls to
+    // fail immediately. Used during cleanup to unblock threads stuck in
+    // syncAwait.
+    void Shutdown();
+
     MasterClient(const MasterClient&) = delete;
     MasterClient& operator=(const MasterClient&) = delete;
 
@@ -480,6 +485,9 @@ class MasterClient {
         client_pools_;
 
     // Mutex to insure the Connect function is atomic.
+    // When true, invoke_rpc returns RPC_FAIL immediately without making
+    // any RPC call. Set by Shutdown() to unblock threads during cleanup.
+    std::atomic<bool> shutting_down_{false};
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
