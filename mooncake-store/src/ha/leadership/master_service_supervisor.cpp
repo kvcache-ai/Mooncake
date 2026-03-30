@@ -1,5 +1,6 @@
 #include "ha/leadership/master_service_supervisor.h"
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -149,8 +150,19 @@ int MasterServiceSupervisor::Start() {
 
     set_runtime_state(MasterRuntimeState::kStarting);
     auto replication_controller = CreateReplicationController(*spec, config_);
+    std::atomic<bool> accept_standby_runtime_updates{false};
+    replication_controller->SetStandbyRuntimeStateCallback(
+        [&](MasterRuntimeState state) {
+            if (!accept_standby_runtime_updates.load(
+                    std::memory_order_acquire)) {
+                return;
+            }
+            set_runtime_state(state);
+        });
     auto enter_standby_mode =
         [&](const std::optional<MasterView>& leader_view) {
+            accept_standby_runtime_updates.store(true,
+                                                 std::memory_order_release);
             admin_server.SetObservedLeader(leader_view);
             replication_controller->UpdateObservedLeader(leader_view);
 
@@ -266,6 +278,7 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
 
+        accept_standby_runtime_updates.store(false, std::memory_order_release);
         auto prepare_replication = replication_controller->PrepareToServe();
         if (prepare_replication != ErrorCode::OK) {
             enter_standby_mode(leadership_session->view);

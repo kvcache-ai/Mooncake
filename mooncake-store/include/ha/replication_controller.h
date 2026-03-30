@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -12,6 +13,8 @@ namespace ha {
 
 class ReplicationController {
    public:
+    using RuntimeStateCallback = std::function<void(MasterRuntimeState)>;
+
     virtual ~ReplicationController() = default;
 
     virtual ErrorCode StartStandby(
@@ -25,6 +28,9 @@ class ReplicationController {
         const std::optional<MasterView>& observed_leader) = 0;
 
     virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
+
+    virtual void SetStandbyRuntimeStateCallback(
+        RuntimeStateCallback callback) = 0;
 };
 
 std::unique_ptr<ReplicationController> CreateReplicationController(

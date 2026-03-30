@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -70,6 +71,8 @@ struct StandbySyncStatus {
  */
 class HotStandbyService {
    public:
+    using SyncStatusCallback = std::function<void(const StandbySyncStatus&)>;
+
     explicit HotStandbyService(const HotStandbyConfig& config);
     ~HotStandbyService();
 
@@ -137,6 +140,10 @@ class HotStandbyService {
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 
+    // Notify callers when standby sync status changes. The callback is invoked
+    // from existing standby worker threads; no extra monitor thread is created.
+    void SetSyncStatusCallback(SyncStatusCallback callback);
+
     /**
      * @brief Get current state from state machine
      */
@@ -156,6 +163,8 @@ class HotStandbyService {
     void OnWatcherEvent(StandbyEvent event);
 
    private:
+    void NotifySyncStatus();
+
     /**
      * @brief Main replication loop (runs in background thread)
      */
@@ -244,6 +253,8 @@ class HotStandbyService {
 
     // Synchronization
     mutable std::mutex mutex_;
+    mutable std::mutex sync_status_callback_mutex_;
+    SyncStatusCallback sync_status_callback_;
 };
 
 }  // namespace mooncake
