@@ -643,18 +643,17 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
     end = std::chrono::high_resolution_clock::now();
     LOG(INFO) << "Time taken for BatchGet: "
               << std::chrono::duration_cast<std::chrono::microseconds>(end -
-                                                                        start)
+                                                                       start)
                      .count()
               << "us";
 
     for (int i = 0; i < batch_sz; i++) {
-        ASSERT_EQ(target_batched_slices[i][0].size,
-                  test_data_list[i].size());
+        ASSERT_EQ(target_batched_slices[i][0].size, test_data_list[i].size());
         ASSERT_EQ(memcmp(target_batched_slices[i][0].ptr,
                          test_data_list[i].data(), test_data_list[i].size()),
                   0);
-        client_buffer_allocator_->deallocate(
-            target_batched_slices[i][0].ptr, test_data_list[i].size());
+        client_buffer_allocator_->deallocate(target_batched_slices[i][0].ptr,
+                                             test_data_list[i].size());
     }
 }
 

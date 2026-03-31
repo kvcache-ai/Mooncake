@@ -383,6 +383,9 @@ class MooncakeStorePyWrapper {
         {
             py::gil_scoped_release release_gil;
             total_length = store_->get_into(key, buffer, size, config);
+            if (total_length <= 0) {
+                return pybind11::none();
+            }
         }
 
         return buffer_to_tensor(NULL, buffer, total_length);
@@ -440,8 +443,13 @@ class MooncakeStorePyWrapper {
 
         py::list results_list;
         for (size_t i = 0; i < total_lengths.size(); i++) {
-            const auto& buffer = buffers[i];
             const auto total_length = total_lengths[i];
+            if (total_length <= 0) {
+                // failed to read this key, return the error code
+                results_list.append(total_length);
+                continue;
+            }
+            const auto& buffer = buffers[i];
             results_list.append(buffer_to_tensor(
                 NULL, static_cast<char*>(buffer), total_length));
         }

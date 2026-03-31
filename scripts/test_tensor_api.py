@@ -360,6 +360,10 @@ class TestMooncakeFunctional(MooncakeTestBase):
         res = self.store.batch_get_tensor_into(keys, buffer_ptrs, buffer_sizes)
         self.assertEqual(len(res), len(tensors))
         for j in range(batch_size):
+            self.assertFalse(
+                isinstance(res[j], (int, float)) and res[j] < 0,
+                f"Tensor {j} batch_get_tensor_into failed with error code: {res[j]}"
+            )
             self.assertTrue(
                 verify_tensor_equality(tensors[j], res[j]),
                 f"Tensor {j} content mismatch, tensor: {tensors[j]}, res: {res[j]}"
@@ -485,6 +489,11 @@ class TestMooncakeFunctional(MooncakeTestBase):
                 tp_rank=rank, tp_size=tp_size
             )
             self.assertEqual(len(shards), num_tensors)
+            for j, shard in enumerate(shards):
+                self.assertFalse(
+                    isinstance(shard, (int, float)) and shard < 0,
+                    f"Tensor {j} rank {rank} batch_get_tensor_with_tp_into failed with error code: {shard}"
+                )
             all_shards.append(shards)
 
         # Step 3: Validate reconstruction
@@ -632,6 +641,10 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             get_times.append(time.perf_counter() - t0)
             self.assertEqual(len(res), len(self.tensors))
             for j in range(batch_size):
+                self.assertFalse(
+                    isinstance(res[j], (int, float)) and res[j] < 0,
+                    f"Tensor {j} batch_get_tensor_into failed with error code: {res[j]}"
+                )
                 self.assertTrue(
                     verify_tensor_equality(self.tensors[j], res[j]),
                     f"Tensor {j} content mismatch"
@@ -708,6 +721,11 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                     tp_size=tp_size
                 )
                 self.assertEqual(len(res), batch_size)
+                for j, r in enumerate(res):
+                    self.assertFalse(
+                        isinstance(r, (int, float)) and r < 0,
+                        f"Tensor {j} rank {rank} batch_get_tensor_with_tp_into failed with error code: {r}"
+                    )
                 all_res.append(res)
             get_times.append(time.perf_counter() - t0)
 

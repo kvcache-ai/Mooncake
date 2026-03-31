@@ -292,7 +292,8 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
 
         auto start_time = std::chrono::high_resolution_clock::now();
         std::vector<Slice> get_slices;
-        get_slices.emplace_back(Slice{write_buffer, static_cast<size_t>(FLAGS_value_size)});
+        get_slices.emplace_back(
+            Slice{write_buffer, static_cast<size_t>(FLAGS_value_size)});
         auto get_result = g_client->Get(key, get_slices);
         bool success = get_result.has_value();
         auto end_time = std::chrono::high_resolution_clock::now();
