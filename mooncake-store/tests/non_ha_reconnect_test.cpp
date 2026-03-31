@@ -263,15 +263,17 @@ class NonHAReconnectTest : public ::testing::TestWithParam<TestMode> {
         // P2P segments are registered asynchronously during InitStorage.
         bool ready = false;
         for (int i = 0; i < 100; ++i) {
-            segments_out = master_->GetClientSegments(client_out->GetClientID());
+            segments_out =
+                master_->GetClientSegments(client_out->GetClientID());
             if (segments_out.size() == num_segments) {
                 ready = true;
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        EXPECT_TRUE(ready) << "Timed out waiting for segments to register at Master. "
-                           << "Expected " << num_segments << ", got " << segments_out.size();
+        EXPECT_TRUE(ready)
+            << "Timed out waiting for segments to register at Master. "
+            << "Expected " << num_segments << ", got " << segments_out.size();
     }
 };
 

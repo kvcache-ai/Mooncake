@@ -435,7 +435,9 @@ class ClientService {
     class InflightRequestGuard {
        public:
         explicit InflightRequestGuard(ClientService* client)
-            : client_(client), valid_(false), lock_(&client_->running_rw_mtx_, shared_lock) {
+            : client_(client),
+              valid_(false),
+              lock_(&client_->running_rw_mtx_, shared_lock) {
             valid_ = client_->is_running_;
         }
         ~InflightRequestGuard() = default;

@@ -35,8 +35,8 @@ class DataManager {
      * with Client)
      */
     DataManager(std::unique_ptr<TieredBackend> tiered_backend,
-                 std::shared_ptr<TransferEngine> transfer_engine,
-                 size_t lock_shard_count = 1024);
+                std::shared_ptr<TransferEngine> transfer_engine,
+                size_t lock_shard_count = 1024);
 
     /**
      * @brief Graceful stop: delegates to TieredBackend::Stop().

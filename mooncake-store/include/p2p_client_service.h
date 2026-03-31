@@ -246,7 +246,8 @@ class P2PClientService final : public ClientService {
 
     /**
      * @brief Get data from a remote node via a list of proxy descriptors.
-     * Iterates through the list; stops, returns the slice of proxies from the successful one to the end.
+     * Iterates through the list; stops, returns the slice of proxies from the
+     * successful one to the end.
      */
     tl::expected<void, ErrorCode> GetRemoteViaRoute(
         const std::string& key, std::vector<Slice>& slices,
