@@ -14,6 +14,7 @@
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "utils/type_util.h"
 
 #include "master_config.h"
 
@@ -156,6 +157,9 @@ DEFINE_string(snapshot_backup_dir, "",
               "Optional local directory for snapshot and restore backup. "
               "If empty, local backup is disabled");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
+DEFINE_bool(cleanup_expired_on_restore, false,
+            "Drop lease-expired, non-soft-pinned complete objects during "
+            "snapshot restore");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
 DEFINE_uint64(snapshot_interval_seconds,
               mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
@@ -309,6 +313,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_snapshot_restore",
                            &master_config.enable_snapshot_restore,
                            FLAGS_enable_snapshot_restore);
+    default_config.GetBool("cleanup_expired_on_restore",
+                           &master_config.cleanup_expired_on_restore,
+                           FLAGS_cleanup_expired_on_restore);
     default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
                            FLAGS_enable_snapshot);
     default_config.GetUInt64("snapshot_interval_seconds",
@@ -627,6 +634,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
     }
+    if ((google::GetCommandLineFlagInfo("cleanup_expired_on_restore", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cleanup_expired_on_restore =
+            FLAGS_cleanup_expired_on_restore;
+    }
     if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -781,6 +794,16 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    if (const char* env_value = std::getenv("MC_CLEANUP_EXPIRED_ON_RESTORE")) {
+        bool parsed = false;
+        if (!mooncake::TypeUtil::ParseBool(env_value, parsed)) {
+            LOG(WARNING) << "Invalid MC_CLEANUP_EXPIRED_ON_RESTORE value: '"
+                         << env_value
+                         << "', expected one of 1/0/true/false/yes/no";
+        } else {
+            master_config.cleanup_expired_on_restore = parsed;
+        }
+    }
 
     const std::string ha_backend_connstring =
         ResolveHABackendConnstring(master_config);
@@ -867,6 +890,8 @@ int main(int argc, char* argv[]) {
         << master_config.processing_task_timeout_sec
         << ", enable_snapshot=" << master_config.enable_snapshot
         << ", enable_snapshot_restore=" << master_config.enable_snapshot_restore
+        << ", cleanup_expired_on_restore="
+        << master_config.cleanup_expired_on_restore
         << ", snapshot_interval_seconds="
         << master_config.snapshot_interval_seconds
         << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
@@ -913,10 +938,22 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
+        auto wrapped_master_service =
+            std::make_shared<mooncake::WrappedMasterService>(
+                mooncake::WrappedMasterServiceConfig(master_config, version));
+        mooncake::MasterAdminServer admin_server(
+            static_cast<uint16_t>(master_config.metrics_port),
+            master_config.enable_metric_reporting);
+        if (!admin_server.Start()) {
+            LOG(ERROR) << "Failed to start master admin server";
+            return 1;
+        }
+        admin_server.SetRuntimeState(
+            mooncake::ha::MasterRuntimeState::kServing);
+        admin_server.SetServiceDelegate(wrapped_master_service);
+        admin_server.SetServiceAvailable(true);
 
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
         return server.start();
     }
 }

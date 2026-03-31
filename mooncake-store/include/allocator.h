@@ -58,6 +58,15 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    // Preserve protocol/endpoint fields when rebuilding imported replicas from
+    // non-owning descriptors.
+    void RestoreDescriptorContext(const Descriptor& descriptor) {
+        protocol = descriptor.protocol_;
+        if (protocol == "cxl") {
+            segment_name_ = descriptor.transport_endpoint_;
+        }
+    }
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);

@@ -6,6 +6,7 @@
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "ha/ha_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -53,6 +54,7 @@ struct MasterConfig {
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
+    bool cleanup_expired_on_restore;
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
     uint64_t snapshot_child_timeout_seconds;
@@ -127,6 +129,7 @@ class MasterServiceSupervisorConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    bool cleanup_expired_on_restore = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -187,6 +190,7 @@ class MasterServiceSupervisorConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -266,6 +270,7 @@ class WrappedMasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -280,6 +285,8 @@ class WrappedMasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    bool cleanup_expired_on_restore = false;
+    std::optional<ha::PromotedStandbyState> preloaded_state;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -320,7 +327,11 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        if (ha_backend_connstring.empty()) {
+            ha_backend_connstring = config.etcd_endpoints;
+        }
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -355,6 +366,7 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -394,7 +406,11 @@ class WrappedMasterServiceConfig {
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        if (ha_backend_connstring.empty()) {
+            ha_backend_connstring = config.etcd_endpoints;
+        }
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -406,6 +422,7 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot = config.enable_snapshot;
         enable_snapshot_restore = config.enable_snapshot_restore;
+        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -444,6 +461,7 @@ class MasterServiceConfigBuilder {
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
@@ -457,6 +475,7 @@ class MasterServiceConfigBuilder {
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
     bool enable_snapshot_ = false;
+    bool cleanup_expired_on_restore_ = false;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
@@ -526,6 +545,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_ha_backend_type(
+        const std::string& backend_type) {
+        ha_backend_type_ = backend_type;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
@@ -579,6 +604,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
         enable_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_cleanup_expired_on_restore(bool enable) {
+        cleanup_expired_on_restore_ = enable;
         return *this;
     }
 
@@ -719,6 +749,7 @@ class MasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -733,6 +764,8 @@ class MasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
+    bool cleanup_expired_on_restore = false;
+    std::optional<ha::PromotedStandbyState> preloaded_state;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -769,6 +802,7 @@ class MasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -781,8 +815,12 @@ class MasterServiceConfig {
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
-        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot_restore = config.preloaded_state.has_value()
+                                      ? false
+                                      : config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
+        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
+        preloaded_state = config.preloaded_state;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -824,6 +862,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
@@ -836,6 +875,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.quota_bytes = quota_bytes_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
     config.enable_snapshot = enable_snapshot_;
+    config.cleanup_expired_on_restore = cleanup_expired_on_restore_;
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;

@@ -108,6 +108,7 @@ python-api-reference/ep-backend
 
 design/architecture
 design/mooncake-store
+design/mooncake-store-ha
 design/p2p-store
 design/transfer-engine/index
 design/tent/overview
@@ -132,6 +133,7 @@ troubleshooting/troubleshooting
 :maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
+deployment/mooncake-store-ha-deployment
 :::
 
 % Community

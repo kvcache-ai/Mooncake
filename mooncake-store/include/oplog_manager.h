@@ -14,6 +14,10 @@
 
 namespace mooncake {
 
+namespace test {
+class MasterServiceEtcdOpLogTest;
+}  // namespace test
+
 // Forward declaration
 class EtcdOpLogStore;
 
@@ -27,6 +31,9 @@ enum class OpType : uint8_t {
     // current etcd-based hot-standby design (Standby relies on Primary DELETE
     // operations).
     LEASE_RENEW = 4,
+    SEGMENT_MOUNT = 5,
+    SEGMENT_UNMOUNT = 6,
+    SEGMENT_UPDATE = 7,
 };
 
 // A single operation log entry.
@@ -44,6 +51,32 @@ struct OpLogEntry {
         0};  // Hash of the entire key (for verification and optimization)
 };
 
+struct SegmentMountOp {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+
+    YLT_REFL(SegmentMountOp, segment_name, transport_endpoint, capacity,
+             is_memory_segment, file_path);
+};
+
+struct SegmentUnmountOp {
+    std::string segment_name;
+    std::string transport_endpoint;
+
+    YLT_REFL(SegmentUnmountOp, segment_name, transport_endpoint);
+};
+
+struct SegmentUpdateOp {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+
+    YLT_REFL(SegmentUpdateOp, segment_name, transport_endpoint, capacity);
+};
+
 /**
  * @brief In-memory operation log manager.
  *
@@ -53,6 +86,8 @@ struct OpLogEntry {
  * written to etcd.
  */
 class OpLogManager {
+    friend class test::MasterServiceEtcdOpLogTest;
+
    public:
     OpLogManager();
 

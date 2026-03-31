@@ -1,0 +1,45 @@
+#pragma once
+
+#include <functional>
+#include <memory>
+#include <optional>
+
+#include <ylt/util/tl/expected.hpp>
+
+#include "ha/ha_types.h"
+#include "master_config.h"
+#include "types.h"
+
+namespace mooncake {
+namespace ha {
+
+class ReplicationController {
+   public:
+    using RuntimeStateCallback = std::function<void(MasterRuntimeState)>;
+
+    virtual ~ReplicationController() = default;
+
+    virtual ErrorCode StartStandby(
+        const std::optional<MasterView>& observed_leader) = 0;
+
+    virtual void StopStandby() = 0;
+
+    virtual ErrorCode PromoteStandby() = 0;
+
+    virtual tl::expected<std::optional<PromotedStandbyState>, ErrorCode>
+    TakePromotedStandbyState() = 0;
+
+    virtual void UpdateObservedLeader(
+        const std::optional<MasterView>& observed_leader) = 0;
+
+    virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
+
+    virtual void SetStandbyRuntimeStateCallback(
+        RuntimeStateCallback callback) = 0;
+};
+
+std::unique_ptr<ReplicationController> CreateReplicationController(
+    const HABackendSpec& spec, const MasterServiceSupervisorConfig& config);
+
+}  // namespace ha
+}  // namespace mooncake

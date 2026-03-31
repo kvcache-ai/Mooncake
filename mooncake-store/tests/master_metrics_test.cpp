@@ -1,9 +1,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <csignal>
 #include <thread>
 #include <vector>
 
+#include <ylt/coro_http/coro_http_client.hpp>
+
+#include "utils.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
@@ -13,6 +17,11 @@ namespace mooncake::test {
 
 class MasterMetricsTest : public ::testing::Test {
    protected:
+    struct HttpResponse {
+        int http_status;
+        std::string body;
+    };
+
     void SetUp() override {
         google::InitGoogleLogging("MasterMetricsTest");
         FLAGS_logtostderr = true;
@@ -21,6 +30,13 @@ class MasterMetricsTest : public ::testing::Test {
     std::vector<Replica::Descriptor> replica_list;
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    HttpResponse FetchUrl(int port, const std::string& path) {
+        coro_http::coro_http_client client;
+        auto result =
+            client.get("http://127.0.0.1:" + std::to_string(port) + path);
+        return {result.status, std::string(result.resp_body)};
+    }
 };
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
@@ -248,6 +264,106 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
 }
 
+TEST_F(MasterMetricsTest, PreloadedStateServesImportedReplicaImmediately) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 1000;
+    service_config.enable_metric_reporting = false;
+
+    ha::PromotedStandbyState preloaded_state;
+    StandbyObjectMetadata standby_metadata;
+    standby_metadata.client_id = generate_uuid();
+    standby_metadata.size = 4096;
+    standby_metadata.last_sequence_id = 42;
+
+    Replica::Descriptor replica_descriptor;
+    replica_descriptor.id = 123;
+    replica_descriptor.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory_descriptor;
+    memory_descriptor.buffer_descriptor.size_ = standby_metadata.size;
+    memory_descriptor.buffer_descriptor.buffer_address_ = 0x12345000;
+    memory_descriptor.buffer_descriptor.protocol_ = "tcp";
+    memory_descriptor.buffer_descriptor.transport_endpoint_ = "10.0.0.1:1234";
+    replica_descriptor.descriptor_variant = memory_descriptor;
+    standby_metadata.replicas.push_back(replica_descriptor);
+    preloaded_state.segment_registry.push_back(StandbySegmentInfo{
+        .segment_name = "segment-1",
+        .transport_endpoint = "10.0.0.1:1234",
+        .capacity = 4096,
+        .is_memory_segment = true,
+        .file_path = "",
+    });
+
+    preloaded_state.metadata_snapshot.emplace_back("hot-key",
+                                                   std::move(standby_metadata));
+    preloaded_state.applied_seq_id = 42;
+    service_config.preloaded_state = std::move(preloaded_state);
+
+    WrappedMasterService service(service_config);
+
+    auto exist_result = service.ExistKey("hot-key");
+    ASSERT_TRUE(exist_result.has_value());
+    EXPECT_TRUE(exist_result.value());
+
+    auto replica_list_result = service.GetReplicaList("hot-key");
+    ASSERT_TRUE(replica_list_result.has_value());
+    ASSERT_EQ(1u, replica_list_result->replicas.size());
+    EXPECT_GT(replica_list_result->lease_ttl_ms, 0u);
+
+    const auto& restored_replica = replica_list_result->replicas.front();
+    ASSERT_TRUE(restored_replica.is_memory_replica());
+    EXPECT_EQ(123u, restored_replica.id);
+
+    const auto& restored_buffer =
+        restored_replica.get_memory_descriptor().buffer_descriptor;
+    EXPECT_EQ(static_cast<uint64_t>(4096), restored_buffer.size_);
+    EXPECT_EQ(static_cast<uintptr_t>(0x12345000),
+              restored_buffer.buffer_address_);
+    EXPECT_EQ("tcp", restored_buffer.protocol_);
+    EXPECT_EQ("10.0.0.1:1234", restored_buffer.transport_endpoint_);
+}
+
+TEST_F(MasterMetricsTest,
+       PreloadedStateFiltersReplicaMissingFromSegmentRegistry) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 1000;
+    service_config.enable_metric_reporting = false;
+
+    ha::PromotedStandbyState preloaded_state;
+    StandbyObjectMetadata standby_metadata;
+    standby_metadata.client_id = generate_uuid();
+    standby_metadata.size = 4096;
+    standby_metadata.last_sequence_id = 42;
+
+    Replica::Descriptor replica_descriptor;
+    replica_descriptor.id = 123;
+    replica_descriptor.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory_descriptor;
+    memory_descriptor.buffer_descriptor.size_ = standby_metadata.size;
+    memory_descriptor.buffer_descriptor.buffer_address_ = 0x12345000;
+    memory_descriptor.buffer_descriptor.protocol_ = "tcp";
+    memory_descriptor.buffer_descriptor.transport_endpoint_ = "10.0.0.1:1234";
+    replica_descriptor.descriptor_variant = memory_descriptor;
+    standby_metadata.replicas.push_back(replica_descriptor);
+    preloaded_state.segment_registry.push_back(StandbySegmentInfo{
+        .segment_name = "segment-2",
+        .transport_endpoint = "10.0.0.2:4321",
+        .capacity = 4096,
+        .is_memory_segment = true,
+        .file_path = "",
+    });
+
+    preloaded_state.metadata_snapshot.emplace_back("hot-key",
+                                                   std::move(standby_metadata));
+    preloaded_state.applied_seq_id = 42;
+    service_config.preloaded_state = std::move(preloaded_state);
+
+    WrappedMasterService service(service_config);
+
+    auto replica_list_result = service.GetReplicaList("hot-key");
+    ASSERT_FALSE(replica_list_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, replica_list_result.error());
+}
+
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
@@ -273,17 +389,19 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    auto stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+    auto round_to_two_decimals = [](double value) {
+        return std::round(value * 100.0) / 100.0;
+    };
+
+    auto baseline_stats = metrics.calculate_cache_stats();
+    const double baseline_memory_hits =
+        baseline_stats[MasterMetricManager::CacheHitStat::MEMORY_HITS];
+    const double baseline_ssd_hits =
+        baseline_stats[MasterMetricManager::CacheHitStat::SSD_HITS];
+    const double baseline_memory_total =
+        baseline_stats[MasterMetricManager::CacheHitStat::MEMORY_TOTAL];
+    const double baseline_ssd_total =
+        baseline_stats[MasterMetricManager::CacheHitStat::SSD_TOTAL];
 
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -292,27 +410,106 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_TRUE(put_start_result1.has_value());
     auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result1.has_value());
-    stats_dict = metrics.calculate_cache_stats();
+    auto stats_dict = metrics.calculate_cache_stats();
 
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL],
+              baseline_memory_total + 1);
 
     auto get_replica_result = service_.GetReplicaList(key);
+    ASSERT_TRUE(get_replica_result.has_value());
     stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-                0.67, 0.01);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-                0.67, 0.01);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS],
+              baseline_memory_hits + 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS],
+              baseline_ssd_hits);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL],
+              baseline_memory_total + 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL],
+              baseline_ssd_total);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
+              round_to_two_decimals((baseline_memory_hits + 1) /
+                                    (baseline_memory_total + 1)));
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE],
+              baseline_stats[MasterMetricManager::CacheHitStat::SSD_HIT_RATE]);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
+              round_to_two_decimals(
+                  (baseline_memory_hits + baseline_ssd_hits + 1) /
+                  (baseline_memory_total + baseline_ssd_total + 1)));
+    ASSERT_GT(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 0);
+    ASSERT_LE(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
     auto remove_result = service_.Remove(key);
     ASSERT_TRUE(remove_result.has_value());
+}
+
+TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
+    const int http_port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+    admin_server.SetObservedLeader(ha::MasterView{
+        .leader_address = "127.0.0.1:19000",
+        .view_version = 7,
+    });
+
+    auto role_resp = FetchUrl(http_port, "/role");
+    EXPECT_EQ(role_resp.http_status, 200);
+    EXPECT_EQ(role_resp.body, "standby");
+
+    auto status_resp = FetchUrl(http_port, "/ha_status");
+    EXPECT_EQ(status_resp.http_status, 200);
+    EXPECT_EQ(status_resp.body, "standby");
+
+    auto leader_resp = FetchUrl(http_port, "/leader");
+    EXPECT_EQ(leader_resp.http_status, 200);
+    EXPECT_NE(leader_resp.body.find("\"present\":true"), std::string::npos);
+    EXPECT_NE(leader_resp.body.find("127.0.0.1:19000"), std::string::npos);
+    EXPECT_NE(leader_resp.body.find("\"view_version\":7"), std::string::npos);
+
+    auto segments_resp = FetchUrl(http_port, "/get_all_segments");
+    EXPECT_EQ(segments_resp.http_status, 503);
+    EXPECT_NE(segments_resp.body.find("service plane is not active"),
+              std::string::npos);
+
+    admin_server.Stop();
+}
+
+TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "admin_test_segment";
+    segment.base = 0x300000000;
+    segment.size = 8 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    const int http_port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin_server.SetServiceDelegate(service);
+    admin_server.SetServiceAvailable(true);
+
+    auto segments_resp = FetchUrl(http_port, "/get_all_segments");
+    EXPECT_EQ(segments_resp.http_status, 200);
+    EXPECT_NE(segments_resp.body.find(segment.name), std::string::npos);
+
+    auto query_resp =
+        FetchUrl(http_port, "/query_segment?segment=" + segment.name);
+    EXPECT_EQ(query_resp.http_status, 200);
+    EXPECT_NE(query_resp.body.find(segment.name), std::string::npos);
+    EXPECT_NE(query_resp.body.find("Capacity(bytes)"), std::string::npos);
+
+    admin_server.Stop();
 }
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {

@@ -115,6 +115,18 @@ TEST_F(StandbyStateMachineTest, TestWatchBrokenTransition) {
     EXPECT_FALSE(machine_->IsReadyForPromotion());
 }
 
+TEST_F(StandbyStateMachineTest, TestSnapshotRefreshTransition) {
+    ReachWatchingState();
+
+    auto result =
+        machine_->ProcessEvent(StandbyEvent::SNAPSHOT_REFRESH_REQUIRED);
+    EXPECT_TRUE(result.allowed);
+    EXPECT_EQ(StandbyState::WATCHING, result.old_state);
+    EXPECT_EQ(StandbyState::RECOVERING, result.new_state);
+    EXPECT_EQ(StandbyState::RECOVERING, machine_->GetState());
+    EXPECT_FALSE(machine_->IsReadyForPromotion());
+}
+
 TEST_F(StandbyStateMachineTest, TestDisconnectedFromWatching) {
     ReachWatchingState();
 

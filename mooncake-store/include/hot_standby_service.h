@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,10 +38,18 @@ struct HotStandbyConfig {
     uint32_t max_replication_lag_entries{1000};
     bool enable_verification{true};
 
-    // Snapshot bootstrap (optional):
-    // If provided, Standby will try to load a snapshot first, then replay OpLog
-    // from snapshot_sequence_id.
+    // Snapshot bootstrap phase (optional): Standby will try to load the latest
+    // snapshot baseline before switching to steady-state replication.
     bool enable_snapshot_bootstrap{false};
+
+    // OpLog following phase (optional): when disabled, Start() stops after the
+    // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
+    // state.
+    bool enable_oplog_following{true};
+
+    // Snapshot-only standby polls the catalog for newer published snapshots
+    // and refreshes its local metadata baseline when one appears.
+    uint32_t snapshot_refresh_interval_ms{1000};
 };
 
 /**
@@ -70,14 +80,17 @@ struct StandbySyncStatus {
  */
 class HotStandbyService {
    public:
+    using SyncStatusCallback = std::function<void(const StandbySyncStatus&)>;
+
     explicit HotStandbyService(const HotStandbyConfig& config);
     ~HotStandbyService();
 
     /**
-     * @brief Start connecting to Primary and begin replication
+     * @brief Start standby runtime: snapshot bootstrap plus optional OpLog
+     * following
      * @param primary_address Address of the Primary Master (not used with
-     * etcd-based sync)
-     * @param etcd_endpoints Comma-separated etcd endpoints
+     * OpLog backend-based sync)
+     * @param etcd_endpoints Comma-separated OpLog backend endpoints
      * @param cluster_id Cluster identifier for OpLog path
      * @return ErrorCode::OK on success
      */
@@ -134,8 +147,14 @@ class HotStandbyService {
     bool ExportMetadataSnapshot(
         std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
 
+    bool ExportSegmentRegistry(std::vector<StandbySegmentInfo>& out) const;
+
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
+
+    // Notify callers when standby sync status changes. The callback is invoked
+    // from existing standby worker threads; no extra monitor thread is created.
+    void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
      * @brief Get current state from state machine
@@ -156,6 +175,20 @@ class HotStandbyService {
     void OnWatcherEvent(StandbyEvent event);
 
    private:
+    ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
+    void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
+    void ApplyLoadedSnapshotLocked(const LoadedSnapshot& snapshot);
+    bool ShouldReloadSnapshotLocked(
+        const SnapshotVersionInfo& snapshot_version) const;
+    void RefreshSnapshotOnlyBaseline();
+    uint64_t GetLocalLastAppliedSequenceIdLocked() const;
+    void ResolvePromotionGapsLocked();
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+    void NotifySyncStatus();
+    bool WaitForShutdownOrTimeout(std::chrono::milliseconds timeout);
+
     /**
      * @brief Main replication loop (runs in background thread)
      */
@@ -204,6 +237,7 @@ class HotStandbyService {
         bool Remove(const std::string& key) override;
         bool Exists(const std::string& key) const override;
         size_t GetKeyCount() const override;
+        void Clear();
 
         // Snapshot for promotion/restore.
         void Snapshot(
@@ -215,8 +249,8 @@ class HotStandbyService {
         std::unordered_map<std::string, StandbyObjectMetadata> store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
-    std::unique_ptr<SnapshotProvider> snapshot_provider_{
-        std::make_unique<NoopSnapshotProvider>()};
+    std::shared_ptr<SnapshotProvider> snapshot_provider_{
+        std::make_shared<NoopSnapshotProvider>()};
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
@@ -244,6 +278,13 @@ class HotStandbyService {
 
     // Synchronization
     mutable std::mutex mutex_;
+    mutable std::mutex shutdown_mutex_;
+    mutable std::mutex sync_status_callback_mutex_;
+    std::condition_variable shutdown_cv_;
+    SyncStatusCallback sync_status_callback_;
+    bool shutdown_requested_{false};
+    std::string loaded_snapshot_id_;
+    uint64_t loaded_snapshot_seq_id_{0};
 };
 
 }  // namespace mooncake

@@ -32,6 +32,9 @@ class RedisSnapshotCatalogStore final : public SnapshotCatalogStore {
     static std::string BuildLatestKey(
         const ClusterNamespace& cluster_namespace);
     static std::string BuildIndexKey(const ClusterNamespace& cluster_namespace);
+    static std::string BuildDescriptorKey(
+        const ClusterNamespace& cluster_namespace,
+        const SnapshotId& snapshot_id);
 
     SnapshotObjectStore* object_store_;
     std::string connstring_;

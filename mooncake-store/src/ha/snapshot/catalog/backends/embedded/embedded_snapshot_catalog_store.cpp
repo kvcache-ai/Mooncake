@@ -4,6 +4,8 @@
 #include <set>
 #include <string_view>
 
+#include <glog/logging.h>
+
 namespace mooncake {
 namespace ha {
 namespace backends {
@@ -14,6 +16,31 @@ constexpr size_t kUnlimitedSnapshotList = 0;
 
 ErrorCode ValidateObjectStore(SnapshotObjectStore* object_store) {
     return object_store == nullptr ? ErrorCode::INVALID_PARAMS : ErrorCode::OK;
+}
+
+tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
+    SnapshotObjectStore* object_store, const SnapshotId& snapshot_id) {
+    std::string descriptor_payload;
+    auto get_result = object_store->DownloadString(
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id),
+        descriptor_payload);
+    if (!get_result) {
+        if (object_store->IsNotFoundError(get_result.error())) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    auto descriptor =
+        snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
+            descriptor_payload);
+    if (!descriptor) {
+        return tl::make_unexpected(descriptor.error());
+    }
+    if (descriptor->snapshot_id != snapshot_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return descriptor.value();
 }
 
 }  // namespace
@@ -31,6 +58,19 @@ ErrorCode EmbeddedSnapshotCatalogStore::Publish(
     if (!snapshot_catalog_store_detail::IsValidSnapshotId(
             snapshot.snapshot_id)) {
         return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto descriptor_payload =
+        snapshot_catalog_store_detail::SerializeSnapshotDescriptor(snapshot);
+    if (!descriptor_payload) {
+        return descriptor_payload.error();
+    }
+
+    auto descriptor_result = object_store_->UploadString(
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot.snapshot_id),
+        descriptor_payload.value());
+    if (!descriptor_result) {
+        return ErrorCode::PERSISTENT_FAIL;
     }
 
     auto publish_result = object_store_->UploadString(
@@ -68,9 +108,12 @@ EmbeddedSnapshotCatalogStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return std::optional<SnapshotDescriptor>(
-        snapshot_catalog_store_detail::MakeSnapshotDescriptor(
-            latest_snapshot_id));
+    auto descriptor = LoadSnapshotDescriptor(object_store_, latest_snapshot_id);
+    if (!descriptor) {
+        return tl::make_unexpected(descriptor.error());
+    }
+
+    return std::optional<SnapshotDescriptor>(descriptor.value());
 }
 
 tl::expected<std::vector<SnapshotDescriptor>, ErrorCode>
@@ -119,8 +162,14 @@ EmbeddedSnapshotCatalogStore::List(size_t limit) {
         if (limit != 0 && snapshots.size() >= limit) {
             break;
         }
-        snapshots.emplace_back(
-            snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id));
+        auto descriptor = LoadSnapshotDescriptor(object_store_, snapshot_id);
+        if (!descriptor) {
+            LOG(WARNING) << "Skipping unreadable embedded snapshot descriptor, "
+                         << "snapshot_id=" << snapshot_id
+                         << ", error=" << toString(descriptor.error());
+            continue;
+        }
+        snapshots.emplace_back(descriptor.value());
     }
 
     return snapshots;

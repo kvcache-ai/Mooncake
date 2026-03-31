@@ -21,11 +21,13 @@
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "oplog_manager.h"
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 
@@ -42,6 +44,7 @@ class EvictionStrategy;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+class MasterServiceEtcdOpLogTest;
 }  // namespace test
 
 /*
@@ -55,6 +58,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
+    friend class test::MasterServiceEtcdOpLogTest;
 
    public:
     MasterService();
@@ -441,11 +445,21 @@ class MasterService {
         const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
+    struct ObjectMetadata;
+
     void SnapshotThreadFunc();
 
     // Persist master state
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
+    tl::expected<void, SerializationError> PersistState(
+        const ha::SnapshotDescriptor& descriptor);
+    tl::expected<ha::SnapshotDescriptor, SerializationError>
+    BuildSnapshotDescriptor(const std::string& snapshot_id,
+                            const std::string& manifest_path,
+                            const std::string& object_prefix) const;
+    tl::expected<ha::OpLogSequenceId, SerializationError>
+    ResolveSnapshotSequenceId() const;
 
     tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
@@ -457,6 +471,18 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
+    bool TryRestoreStateFromSnapshot(const ha::SnapshotDescriptor& snapshot);
+    void ResetStateAfterFailedRestoreAttempt();
+    void LoadPreloadedState(const ha::PromotedStandbyState& state);
+    void InitializeEtcdOpLogManager();
+    bool ShouldReplicateToEtcdStandby() const;
+    void AppendOpLogAndNotify(OpType type, const std::string& key,
+                              const std::string& payload = std::string());
+    void AppendMetadataMutationOpLog(const std::string& key,
+                                     const ObjectMetadata* metadata);
+    void AppendSegmentUnmountOpLog(const std::string& segment_name,
+                                   const std::string& transport_endpoint);
+    std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
 
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
@@ -1049,10 +1075,14 @@ class MasterService {
 
     const bool enable_offload_;
 
+    const std::string ha_backend_type_;
+
     const std::string ha_backend_connstring_;
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    std::unordered_set<std::string> invalid_replica_endpoints_;
+    OpLogManager oplog_manager_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
@@ -1067,10 +1097,13 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::vector<std::shared_ptr<BufferAllocatorBase>>
+        imported_replica_allocators_;
 
     bool enable_snapshot_restore_ = false;
 
     bool enable_snapshot_ = false;
+    bool cleanup_expired_on_restore_ = false;
     std::string snapshot_backup_dir_;
     bool use_snapshot_backup_dir_{false};
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;

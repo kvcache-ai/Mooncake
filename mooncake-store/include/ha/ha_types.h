@@ -6,8 +6,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "metadata_store.h"
 #include "types.h"
 
 namespace mooncake {
@@ -88,6 +90,51 @@ struct ViewChangeResult {
     std::optional<MasterView> current_view;
 };
 
+enum class MasterRuntimeState {
+    kStarting,
+    kStandby,
+    kCandidate,
+    kRecovering,
+    kCatchingUp,
+    kLeaderWarmup,
+    kServing,
+};
+
+inline const char* MasterRuntimeStateToString(MasterRuntimeState state) {
+    switch (state) {
+        case MasterRuntimeState::kStarting:
+            return "starting";
+        case MasterRuntimeState::kStandby:
+            return "standby";
+        case MasterRuntimeState::kCandidate:
+            return "candidate";
+        case MasterRuntimeState::kRecovering:
+            return "recovering";
+        case MasterRuntimeState::kCatchingUp:
+            return "catching_up";
+        case MasterRuntimeState::kLeaderWarmup:
+            return "leader_warmup";
+        case MasterRuntimeState::kServing:
+            return "serving";
+    }
+    return "unknown";
+}
+
+inline const char* MasterRuntimeRoleToString(MasterRuntimeState state) {
+    switch (state) {
+        case MasterRuntimeState::kLeaderWarmup:
+        case MasterRuntimeState::kServing:
+            return "leader";
+        case MasterRuntimeState::kStarting:
+        case MasterRuntimeState::kStandby:
+        case MasterRuntimeState::kCandidate:
+        case MasterRuntimeState::kRecovering:
+        case MasterRuntimeState::kCatchingUp:
+            return "standby";
+    }
+    return "unknown";
+}
+
 enum class LeadershipLossReason {
     kRenewError,
     kLostLeadership,
@@ -130,6 +177,13 @@ struct SnapshotDescriptor {
     std::string manifest_key;
     std::string object_prefix;
     int64_t created_at_ms = 0;
+};
+
+struct PromotedStandbyState {
+    std::vector<std::pair<std::string, StandbyObjectMetadata>>
+        metadata_snapshot;
+    std::vector<StandbySegmentInfo> segment_registry;
+    OpLogSequenceId applied_seq_id = 0;
 };
 
 }  // namespace ha
