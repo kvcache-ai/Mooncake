@@ -107,8 +107,8 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
     try {
         return as_client(store)->setup_real(
             c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
-            global_segment_size, local_buffer_size,
-            c_str_or(protocol, "tcp"), c_str_or(device_name, ""),
+            global_segment_size, local_buffer_size, c_str_or(protocol, "tcp"),
+            c_str_or(device_name, ""),
             c_str_or(master_server_addr, "127.0.0.1:50051"));
     } catch (...) {
         return -1;
