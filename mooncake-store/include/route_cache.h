@@ -97,15 +97,13 @@ class RouteCache {
      * @brief overwrite
      */
     void Replace(const std::string& key,
-                 const std::vector<P2PProxyDescriptor>& replicas,
-                 bool force = true);
+                 const std::vector<P2PProxyDescriptor>& replicas);
 
     /**
      * @brief update if key exists, otherwise insert
      */
     void Upsert(const std::string& key,
-                const std::vector<P2PProxyDescriptor>& replicas,
-                bool force = true);
+                const std::vector<P2PProxyDescriptor>& replicas);
 
     void RemoveReplica(const std::string& key,
                        const std::vector<P2PProxyDescriptor>& remove_replicas);

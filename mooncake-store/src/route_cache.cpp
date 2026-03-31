@@ -19,10 +19,9 @@ size_t P2PRouteData::Serialize(
         auto& dst = record->data()[i];
         dst.client_id = src.client_id;
         dst.segment_id = src.segment_id;
-        std::memcpy(
-            dst.ip_address, src.ip_address.c_str(),
-            std::min(src.ip_address.length(), sizeof(dst.ip_address) - 1));
-        dst.ip_address[sizeof(dst.ip_address) - 1] = '\0';
+        size_t copy_len = std::min(src.ip_address.length(), sizeof(dst.ip_address) - 1);
+        std::memcpy(dst.ip_address, src.ip_address.c_str(), copy_len);
+        dst.ip_address[copy_len] = '\0';
         dst.rpc_port = src.rpc_port;
         dst.object_size = src.object_size;
     }
@@ -173,46 +172,38 @@ P2PRouteHandle RouteCache::Get(const std::string& key)
 }
 
 void RouteCache::Replace(const std::string& key,
-                         const std::vector<P2PProxyDescriptor>& replicas,
-                         bool force) NO_THREAD_SAFETY_ANALYSIS {
+                         const std::vector<P2PProxyDescriptor>& replicas)
+    NO_THREAD_SAFETY_ANALYSIS {
     size_t hash_val = std::hash<std::string>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
 
     MutexLocker lock(&shard.mtx_, false);
-    if (!force) {
-        int retries = 0;
-        while (!lock.TryLock()) {
-            if (++retries >= MAX_TRY_LOCK_RETRIES) {
-                return;
-            }
-            MOONCAKE_CPU_RELAX();
+    int retries = 0;
+    while (!lock.TryLock()) {
+        if (++retries >= MAX_TRY_LOCK_RETRIES) {
+            return;
         }
-    } else {
-        lock.lock();
+        MOONCAKE_CPU_RELAX();
     }
 
     InnerPut(shard, bucket_idx, hash_val, key, replicas, false);
 }
 
 void RouteCache::Upsert(const std::string& key,
-                        const std::vector<P2PProxyDescriptor>& replicas,
-                        bool force) NO_THREAD_SAFETY_ANALYSIS {
+                        const std::vector<P2PProxyDescriptor>& replicas)
+    NO_THREAD_SAFETY_ANALYSIS {
     size_t hash_val = std::hash<std::string>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
 
     MutexLocker lock(&shard.mtx_, false);
-    if (!force) {
-        int retries = 0;
-        while (!lock.TryLock()) {
-            if (++retries >= MAX_TRY_LOCK_RETRIES) {
-                return;
-            }
-            MOONCAKE_CPU_RELAX();
+    int retries = 0;
+    while (!lock.TryLock()) {
+        if (++retries >= MAX_TRY_LOCK_RETRIES) {
+            return;
         }
-    } else {
-        lock.lock();
+        MOONCAKE_CPU_RELAX();
     }
 
     InnerPut(shard, bucket_idx, hash_val, key, replicas, true);

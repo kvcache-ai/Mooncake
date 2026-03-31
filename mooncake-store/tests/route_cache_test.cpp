@@ -78,7 +78,7 @@ TEST_F(RouteCacheTest, TTLExpirationAndRenewal) {
     EXPECT_TRUE(cache.Get("key_expire").items().empty());
 
     // Merge with expired should ignore the old expired entry
-    cache.Upsert("key_merge", {proxy2}, true);
+    cache.Upsert("key_merge", {proxy2});
     auto result = cache.Get("key_merge");
     ASSERT_EQ(result.items().size(), 1u);
     EXPECT_EQ(result.items()[0].segment_id, (UUID{200, 0}));
@@ -118,15 +118,15 @@ TEST_F(RouteCacheTest, MergeScenarios) {
     auto proxy2 = MakeP2PProxy(2, 200);
 
     // 1. Upsert Append
-    cache_.Replace("key_merge", {proxy1}, true);
-    cache_.Upsert("key_merge", {proxy2}, true);
+    cache_.Replace("key_merge", {proxy1});
+    cache_.Upsert("key_merge", {proxy2});
 
     auto result = cache_.Get("key_merge");
     ASSERT_EQ(result.items().size(), 2u);
 
     // 2. Upsert Deduplicate
-    cache_.Replace("key_dedup", {proxy1, proxy2}, true);
-    cache_.Upsert("key_dedup", {proxy1}, true);  // Should be deduplicated
+    cache_.Replace("key_dedup", {proxy1, proxy2});
+    cache_.Upsert("key_dedup", {proxy1});  // Should be deduplicated
 
     result = cache_.Get("key_dedup");
     ASSERT_EQ(result.items().size(), 2u);
@@ -151,7 +151,7 @@ TEST_F(RouteCacheTest, SharedKeyConcurrencyStress) {
 
                 // Mix of Upsert, Get, and Invalidate
                 if (i % 2 == 0) {
-                    cache_.Upsert(key, {proxy}, true);
+                    cache_.Upsert(key, {proxy});
                 } else if (i % 3 == 0) {
                     cache_.RemoveReplica(key, {proxy});
                 } else {
@@ -285,7 +285,7 @@ TEST_F(RouteCacheTest, HighConcurrencyRCUStress) {
                     t, i, "192.168.1." + std::to_string(t), (uint16_t)i);
 
                 if (i % 5 == 0) {
-                    small_cache.Upsert(key, {proxy}, true);
+                    small_cache.Upsert(key, {proxy});
                 } else if (i % 7 == 0) {
                     small_cache.RemoveReplica(key, {proxy});
                 } else {
@@ -433,7 +433,7 @@ TEST_F(RouteCacheTest, WatermarkGCStrategy) {
     // 1. Fill until usage > 90%
     size_t to_fill = total * 0.92;
     for (size_t i = 0; i < to_fill; ++i) {
-        tiny.Replace("key_" + std::to_string(i), {MakeP2PProxy(i, i)}, true);
+        tiny.Replace("key_" + std::to_string(i), {MakeP2PProxy(i, i)});
     }
 
     auto m1 = tiny.GetMetrics();
@@ -461,8 +461,7 @@ TEST_F(RouteCacheTest, HighPressureStress) {
     constexpr int kThreads = 16;
     constexpr int kOps = 2000;
 
-    std::atomic<size_t> force_true_fail{0};
-    std::atomic<size_t> force_false_fail{0};
+    std::atomic<size_t> fail_count{0};
 
     std::vector<std::thread> workers;
     for (int t = 0; t < kThreads; ++t) {
@@ -472,23 +471,10 @@ TEST_F(RouteCacheTest, HighPressureStress) {
                     "key_" + std::to_string((t * kOps + i) % 1000);
                 auto proxy = MakeP2PProxy(t, i);
 
-                bool force = (i % 4 != 0);  // 75% force=true
+                stress_cache.Replace(key, {proxy});
 
-                // We don't have a return value for Replace/Upsert yet,
-                // but we can check existence to infer success for force=true
-                if (force) {
-                    stress_cache.Replace(key, {proxy}, true);
-                } else {
-                    stress_cache.Replace(key, {proxy}, false);
-                }
-
-                if (force) {
-                    auto res = stress_cache.Get(key);
-                    if (res.items().empty()) force_true_fail++;
-                } else {
-                    auto res = stress_cache.Get(key);
-                    if (res.items().empty()) force_false_fail++;
-                }
+                auto res = stress_cache.Get(key);
+                if (res.items().empty()) fail_count++;
 
                 if (i % 100 == 0) std::this_thread::yield();
             }
@@ -499,16 +485,14 @@ TEST_F(RouteCacheTest, HighPressureStress) {
 
     auto m = stress_cache.GetMetrics();
     printf(
-        "[ INFO ] Stress Done. ForceTrueFail: %zu, ForceFalseFail: %zu, "
+        "[ INFO ] Stress Done. FailCount: %zu, "
         "FinalUsage: %.2f%%\n",
-        force_true_fail.load(), force_false_fail.load(),
+        fail_count.load(),
         (1.0 - (double)m.free_node_count / m.total_node_count) * 100);
 
-    // Note: With foreground eviction removed, force=true doesn't guarantee
-    // success during high-pressure bursts. We focus on system stability and
-    // final usage.
-    (void)force_true_fail;
-    (void)force_false_fail;
+    // Note: try-lock may fail under high contention, so some writes are
+    // silently dropped. We focus on system stability and final usage.
+    (void)fail_count;
 }
 
 // ============================================================================
@@ -527,16 +511,15 @@ TEST_F(RouteCacheTest, TryLockYieldBehavior) {
     std::thread blocker([&]() {
         for (int i = 0; i < 2000 && !stop; ++i) {
             std::vector<P2PProxyDescriptor> huge_list(10, proxy);
-            cache_.Replace(key, huge_list, true);
+            cache_.Replace(key, huge_list);
         }
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    // Try to do force=false. Some of them should gracefully fail (return
-    // early).
+    // Some of them should gracefully fail (return early) under contention.
     for (int i = 0; i < 500; ++i) {
-        cache_.Upsert(key, {MakeP2PProxy(2, i)}, false);
+        cache_.Upsert(key, {MakeP2PProxy(2, i)});
     }
 
     stop = true;
@@ -556,7 +539,7 @@ TEST_F(RouteCacheTest, RemoveReplicaLockFreeFallback) {
     std::thread blocker([&]() {
         for (int i = 0; i < 2000 && !stop; ++i) {
             std::vector<P2PProxyDescriptor> huge_list(10, proxy1);
-            cache_.Replace(key, huge_list, true);
+            cache_.Replace(key, huge_list);
         }
     });
 

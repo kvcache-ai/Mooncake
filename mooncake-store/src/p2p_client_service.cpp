@@ -470,7 +470,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
                 if (route_cache_) {
                     P2PProxyDescriptor new_proxy = proxy;
                     new_proxy.segment_id = write_result.value();
-                    route_cache_->Upsert(key, {new_proxy}, false);
+                    route_cache_->Upsert(key, {new_proxy});
                 }
                 return {};  // write success
             }
@@ -911,7 +911,7 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
                 if (!is_cached_proxies && route_cache_) {
                     std::vector<P2PProxyDescriptor> remaining_proxies(
                         proxies.begin() + i, proxies.end());
-                    route_cache_->Replace(key, remaining_proxies, false);
+                    route_cache_->Replace(key, remaining_proxies);
                 }
                 recycle_failed();
                 return {};
