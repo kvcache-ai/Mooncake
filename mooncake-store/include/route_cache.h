@@ -57,6 +57,10 @@ struct P2PRouteData {
 
 /**
  * @brief High-performance read-only handle for RouteCache entries.
+ *
+ * Holds a shared_ptr to the underlying OffsetAllocationHandle, ensuring the
+ * data memory remains valid as long as this handle exists — even after the
+ * Node is recycled by the epoch-based reclamation system.
  */
 class P2PRouteHandle {
    public:
@@ -79,9 +83,19 @@ class P2PRouteHandle {
 /**
  * @brief Client-side route cache for P2P read operations.
  *
- * This implementation uses an Atomic Bucket Array with Pointer RCU to achieve
- * lock-free reads while maintaining consistency under concurrent writes.
- * It uses a Clock algorithm (Second Chance) for O(1) eviction via Ring Buffers.
+ * This implementation uses an Atomic Bucket Array with Epoch-Based Reclamation
+ * (EBR) to achieve lock-free reads while maintaining consistency under
+ * concurrent writes. It uses a Clock algorithm (Second Chance) for O(1)
+ * eviction.
+ *
+ * PROTECTION MODEL:
+ * 1. [Node Metadata]: Protected by EBR. Readers enter an epoch guard before
+ *    traversing bucket chains. Nodes are only recycled after all readers that
+ *    observed the node have left their epoch — providing a deterministic
+ *    safety guarantee
+ * 2. [Data Memory]: Protected by shared_ptr within P2PRouteHandle. Even after
+ *    the Node is recycled, the underlying P2PRouteData remains valid as long
+ *    as the caller holds the handle.
  */
 class RouteCache {
    public:
@@ -89,7 +103,7 @@ class RouteCache {
     ~RouteCache();
 
     /**
-     * @brief Lock-free lookup (RCU).
+     * @brief Lock-free lookup protected by EBR epoch guard.
      */
     P2PRouteHandle Get(const std::string& key);
 
@@ -118,13 +132,75 @@ class RouteCache {
     Metrics GetMetrics() const;
 
    private:
+    // ========================================================================
+    // Epoch-Based Reclamation (EBR) Infrastructure
+    // ========================================================================
+
+    static constexpr uint64_t EPOCH_INACTIVE = UINT64_MAX;
+    static constexpr size_t MAX_READER_SLOTS = 256;
+
+    struct alignas(64) ReaderSlot {
+        std::atomic<uint64_t> epoch{EPOCH_INACTIVE};
+    };
+
+    /**
+     * @brief RAII guard that pins the current epoch for the calling thread.
+     *
+     * While the guard is alive, SyncGC will not recycle any Node that was
+     * retired in or after the pinned epoch. This ensures safe lock-free
+     * traversal of bucket chains in Get() and RemoveReplica().
+     */
+    class EpochGuard {
+       public:
+        explicit EpochGuard(RouteCache* cache) : cache_(cache) {
+            slot_ = GetReaderSlot();
+            cache_->reader_slots_[slot_].epoch.store(
+                cache_->global_epoch_.load(std::memory_order_acquire),
+                std::memory_order_release);
+        }
+
+        ~EpochGuard() {
+            cache_->reader_slots_[slot_].epoch.store(EPOCH_INACTIVE,
+                                                     std::memory_order_release);
+        }
+
+        EpochGuard(const EpochGuard&) = delete;
+        EpochGuard& operator=(const EpochGuard&) = delete;
+
+       private:
+        static size_t GetReaderSlot() {
+            static thread_local size_t slot =
+                std::hash<std::thread::id>{}(std::this_thread::get_id()) %
+                MAX_READER_SLOTS;
+            return slot;
+        }
+
+        RouteCache* cache_;
+        size_t slot_;
+    };
+
+    /**
+     * @brief Compute the safe epoch for reclamation.
+     *
+     * Returns the maximum epoch E such that no active reader is in epoch <= E.
+     * Nodes retired at epoch <= E can be safely recycled.
+     */
+    uint64_t ComputeSafeEpoch() const;
+
+    std::atomic<uint64_t> global_epoch_{0};
+    std::unique_ptr<ReaderSlot[]> reader_slots_;
+
+    // ========================================================================
+    // Node & Shard Structures
+    // ========================================================================
+
     struct alignas(64) Node {
         const char* key_;
         uint32_t key_len_;
         std::atomic<bool> accessed_{false};
         std::atomic<bool> is_deleted_{false};
-        std::atomic<std::shared_ptr<offset_allocator::OffsetAllocationHandle>>
-            handle_;
+
+        std::shared_ptr<offset_allocator::OffsetAllocationHandle> handle_;
         std::atomic<int64_t> deadline_;
         std::atomic<Node*> next_;
 
@@ -140,15 +216,20 @@ class RouteCache {
             key_ = key;
             key_len_ = key_len;
             key_hash_ = (uint32_t)key_hash;
-            handle_.store(std::move(handle));
+            handle_ = std::move(handle);
             deadline_.store(deadline_count, std::memory_order_relaxed);
             next_.store(nullptr, std::memory_order_relaxed);
             accessed_.store(false, std::memory_order_relaxed);
             is_deleted_.store(false, std::memory_order_release);
         }
 
-        std::shared_ptr<offset_allocator::OffsetAllocationHandle> GetHandle() {
-            return handle_.load();
+        /**
+         * @brief Read handle_.
+         * Caller MUST be within an EpochGuard or holding the shard mutex.
+         */
+        std::shared_ptr<offset_allocator::OffsetAllocationHandle> GetHandle()
+            const {
+            return handle_;
         }
 
         void MarkDeleted() {
@@ -206,10 +287,10 @@ class RouteCache {
             }
         } nodes_ GUARDED_BY(mtx_);
 
-        // RCU Garbage Collection Queue
+        // EBR Garbage Collection Queue
         struct PendingDelete {
             Node* node_;
-            std::chrono::steady_clock::time_point timestamp_;
+            uint64_t retire_epoch_;
         };
         std::vector<PendingDelete> pending_deletes_ GUARDED_BY(mtx_);
 
@@ -245,7 +326,8 @@ class RouteCache {
     // Returns {prev, node} for a given key in the bucket.
     std::pair<Node*, Node*> findNodeInBucket(Shard& shard, size_t bucket_idx,
                                              const char* key_ptr,
-                                             uint32_t key_len) REQUIRES(shard.mtx_);
+                                             uint32_t key_len)
+        REQUIRES(shard.mtx_);
 
     void retireNode(Shard& shard, Node* prev, Node* node, size_t bucket_idx)
         REQUIRES(shard.mtx_);
@@ -275,23 +357,8 @@ class RouteCache {
     size_t buckets_per_shard_;
 
     static constexpr int MAX_TRY_LOCK_RETRIES = 5;
+
     // GC Control
-    /**
-     * @brief RCU Grace Period (200ms).
-     *
-     * This delay governs the lifecycle of the `Node` structure (metadata),
-     * which is reused from a fixed per-shard pool.
-     *
-     * TWO-STAGE PROTECTION MODEL:
-     * 1. [Function Execution]: Within Get(), the Reader is protected by this
-     *    Grace Period rather than mutex. It must complete before the Node is
-     *    recycled to avoid logical errors (e.g., requesting Key-A but returning
-     *    Key-B data).
-     * 2. [Return Handle]: After Get() returns, the Caller is protected by
-     *    the shared_ptr within P2PRouteHandle. Even if the Node is recycled,
-     *    the underlying physical memory (P2PRouteData) remains valid.
-     */
-    static constexpr auto GC_RETIRE_DELAY = std::chrono::milliseconds(200);
     static constexpr size_t MAX_GC_SKIP_COUNT = 5;
     static constexpr auto GC_IDLE_SLEEP = std::chrono::milliseconds(2000);
     static constexpr auto GC_LOW_PRESSURE_SLEEP =

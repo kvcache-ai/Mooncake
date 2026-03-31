@@ -19,7 +19,8 @@ size_t P2PRouteData::Serialize(
         auto& dst = record->data()[i];
         dst.client_id = src.client_id;
         dst.segment_id = src.segment_id;
-        size_t copy_len = std::min(src.ip_address.length(), sizeof(dst.ip_address) - 1);
+        size_t copy_len =
+            std::min(src.ip_address.length(), sizeof(dst.ip_address) - 1);
         std::memcpy(dst.ip_address, src.ip_address.c_str(), copy_len);
         dst.ip_address[copy_len] = '\0';
         dst.rpc_port = src.rpc_port;
@@ -80,6 +81,9 @@ RouteCache::RouteCache(size_t max_memory_bytes, uint64_t ttl_ms)
         shard.nodes_.Init(nodes_per_shard_);
     }
 
+    // Initialize EBR reader slots
+    reader_slots_ = std::make_unique<ReaderSlot[]>(MAX_READER_SLOTS);
+
     gc_thread_ = std::thread(&RouteCache::GCLoop, this);
 }
 
@@ -93,7 +97,7 @@ RouteCache::~RouteCache() {
     for (auto& shard_ptr : shards_) {
         auto& shard = *shard_ptr;
         for (auto& pd : shard.pending_deletes_) {
-            if (pd.node_) pd.node_->handle_.store(nullptr);
+            if (pd.node_) pd.node_->handle_.reset();
         }
         shard.pending_deletes_.clear();
         shard.buckets_.reset();
@@ -104,20 +108,28 @@ RouteCache::~RouteCache() {
     }
 }
 
-// RCU Lock-Free read.
-// TWO-STAGE PROTECTION MODEL:
-// 1. [Function Execution]: Within Get(), the Reader is protected by the RCU
-//    Grace Period (GC_RETIRE_DELAY). It must complete before the meta Node is
-//    recycled to avoid logical errors (e.g., requesting Key-A but returning
-//    Key-B data).
+uint64_t RouteCache::ComputeSafeEpoch() const {
+    uint64_t min_active = global_epoch_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < MAX_READER_SLOTS; ++i) {
+        uint64_t e = reader_slots_[i].epoch.load(std::memory_order_acquire);
+        if (e < min_active) {
+            min_active = e;
+        }
+    }
+    return (min_active > 0) ? min_active - 1 : 0;
+}
+
+// Lock-Free Read, EBR PROTECTION MODEL:
+// 1. [Function Execution]: Within Get(), the Reader is protected by the
+//    EpochGuard. Nodes will not be recycled until all readers that observed
+//    them have exited their epoch.
 // 2. [Return Handle]: After Get() returns, the Caller is protected by
 //    the shared_ptr within P2PRouteHandle. Even if the Node is recycled, the
 //    underlying P2PRouteData memory remains valid and unchanged.
-//
-// IMPORTANT: Do NOT perform blocking or long-running tasks inside this
-// function.
 P2PRouteHandle RouteCache::Get(const std::string& key)
     NO_THREAD_SAFETY_ANALYSIS {
+    EpochGuard guard(this);
+
     size_t hash_val = std::hash<std::string>{}(key);
     auto& shard = *shards_[hash_val % shard_count_];
     size_t bucket_idx = hash_val % buckets_per_shard_;
@@ -279,9 +291,9 @@ void RouteCache::RemoveReplica(const std::string& key,
     MutexLocker lock(&shard.mtx_, false);
 
     if (!lock.TryLock()) {
-        // Fallback to lock-free invalidation of whole route cache of the key:
-        // We only mark the node as deleted, the key will be unlinked by GC
-        // thread or a subsequent write operation holding the lock.
+        // the EpochGuard ensures that the node's key_ and key_len_ won't be
+        // cleared by SyncGC while we traverse the bucket chain.
+        EpochGuard guard(this);
 
         auto result = findNodeInBucket(shard, bucket_idx, key.data(),
                                        (uint32_t)key.length());
@@ -326,7 +338,7 @@ void RouteCache::BuildReplicaList(
     // Note: old_node might be marked as deleted soon after this method.
     // Ensure the data copy from old record is performed efficiently.
     out = increment_replicas;
-    auto handle = old_node->handle_.load();
+    auto handle = old_node->handle_;
     if (!old_node || !handle) return;
 
     const auto* old_rec = reinterpret_cast<const P2PRouteData*>(handle->ptr());
@@ -383,24 +395,18 @@ std::pair<RouteCache::Node*, RouteCache::Node*> RouteCache::findNodeInBucket(
     return {nullptr, nullptr};
 }
 
-// RCU SAFETY CONSTRAINT:
-// This function MUST be performed while holding the shard mutex because it will
-// physical unlink from the bucket chain.
-// This prevents multiple concurrent writers from corrupting the linked list
-// (ABA problem or skipping newly inserted nodes).
 void RouteCache::retireNode(Shard& shard, Node* prev, Node* node,
                             size_t bucket_idx) REQUIRES(shard.mtx_) {
     if (!node) return;
 
+    // 1. Unlink from bucket chain
     if (bucket_idx != (size_t)-1) {
         if (prev) {
-            // Consistency Check: ensure prev still points to node
             if (prev->next_.load(std::memory_order_acquire) == node) {
                 prev->next_.store(node->next_.load(std::memory_order_relaxed),
                                   std::memory_order_release);
             }
         } else {
-            // Consistency Check: ensure node is still at the bucket head
             if (shard.buckets_[bucket_idx].load(std::memory_order_acquire) ==
                 node) {
                 shard.buckets_[bucket_idx].store(
@@ -410,9 +416,10 @@ void RouteCache::retireNode(Shard& shard, Node* prev, Node* node,
         }
     }
 
-    // 2. Mark and Queue for GC
+    // 2. Mark deleted and enqueue for EBR reclamation
     node->MarkDeleted();
-    shard.pending_deletes_.push_back({node, std::chrono::steady_clock::now()});
+    uint64_t current_epoch = global_epoch_.load(std::memory_order_acquire);
+    shard.pending_deletes_.push_back({node, current_epoch});
 }
 
 bool RouteCache::acquireResource(
@@ -493,10 +500,40 @@ size_t RouteCache::Evict(RouteCache::Shard& shard, size_t goal_free_count)
     return evicted_total;
 }
 
+// ============================================================================
+// Epoch-Based Reclamation (EBR) — How the three roles interact
+//
+// [Reader] (Get / RemoveReplica lock-free path)
+//   On entry, snapshots global_epoch_ into reader_slots_[slot] via EpochGuard.
+//   On exit, resets slot to INACTIVE. While a slot holds epoch=E, the reader
+//   may be traversing bucket chains and holding pointers to nodes that were
+//   visible at epoch E.
+//
+// [Writer] (Replace / Upsert / RemoveReplica under shard mutex)
+//   Unlinks the old node from the bucket chain, then calls retireNode() which
+//   records {node, global_epoch_} into pending_deletes_. The retire_epoch
+//   means: "this node left the bucket chain at epoch N."
+//
+// [GC thread] (this function → SyncGC → ComputeSafeEpoch)
+//   Each iteration advances global_epoch_ by 1, then for each shard:
+//   1. SyncGC: calls ComputeSafeEpoch() which scans all reader slots to find
+//      min_active (the oldest epoch held by any active reader). Nodes with
+//      retire_epoch < min_active are safe to reclaim — all active readers
+//      entered at or after min_active, by which time these nodes were already
+//      off the bucket chain and unreachable.
+//   2. Watermark-based Clock eviction to keep memory usage healthy.
+//
+//   A freshly retired node needs at least 2 GC rounds to be reclaimed:
+//   retired at epoch=N → GC advances to N+1 → next round confirms all
+//   readers have left epoch N → reclaim.
+// ============================================================================
 void RouteCache::GCLoop() NO_THREAD_SAFETY_ANALYSIS {
     auto sleep_duration = GC_HIGH_PRESSURE_SLEEP;
     while (!stop_gc_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(sleep_duration);
+
+        global_epoch_.fetch_add(1, std::memory_order_release);
+
         double max_usage = 0.0;
         for (auto& shard_ptr : shards_) {
             auto& shard = *shard_ptr;
@@ -511,7 +548,7 @@ void RouteCache::GCLoop() NO_THREAD_SAFETY_ANALYSIS {
             }
             shard.gc_skip_count_ = 0;
 
-            // 1. Regular cleanup of pending deletes (safely after delay)
+            // 1. EBR-based cleanup of pending deletes
             SyncGC(shard);
 
             // 2. Double-watermark Check
@@ -548,13 +585,13 @@ void RouteCache::GCLoop() NO_THREAD_SAFETY_ANALYSIS {
 }
 
 void RouteCache::SyncGC(Shard& shard) REQUIRES(shard.mtx_) {
-    auto now = std::chrono::steady_clock::now();
+    uint64_t safe_epoch = ComputeSafeEpoch();
     std::vector<Node*> to_retire;
 
     auto it = std::remove_if(shard.pending_deletes_.begin(),
                              shard.pending_deletes_.end(),
                              [&](const Shard::PendingDelete& pd) {
-                                 if (now - pd.timestamp_ > GC_RETIRE_DELAY) {
+                                 if (pd.retire_epoch_ <= safe_epoch) {
                                      to_retire.push_back(pd.node_);
                                      return true;
                                  }
@@ -562,10 +599,9 @@ void RouteCache::SyncGC(Shard& shard) REQUIRES(shard.mtx_) {
                              });
     shard.pending_deletes_.erase(it, shard.pending_deletes_.end());
 
-    // Return nodes to pool
     for (auto* n : to_retire) {
-        n->handle_.store(nullptr);
-        n->key_ = nullptr;  // Prevent Evict from scanning freed key data (UAF)
+        n->handle_.reset();
+        n->key_ = nullptr;
         shard.nodes_.Push(n);
     }
 }

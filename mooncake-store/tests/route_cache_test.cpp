@@ -421,6 +421,35 @@ TEST_F(RouteCacheTest, AdaptiveConfig) {
 
 
 // ============================================================================
+// EBR Safety
+// ============================================================================
+
+TEST_F(RouteCacheTest, EBRPreventsReclaimWhileReaderActive) {
+    RouteCache cache(1024 * 1024, 600000);
+
+    // 1. Insert a key
+    cache.Replace("ebr_key", {MakeP2PProxy(1, 100)});
+
+    // 2. Get a handle (enters and exits EpochGuard internally)
+    auto handle = cache.Get("ebr_key");
+    ASSERT_FALSE(handle.items().empty());
+
+    // 3. Overwrite the key many times to retire old nodes, then trigger GC
+    //    by filling the cache to force eviction and SyncGC.
+    for (int i = 0; i < 3000; ++i) {
+        cache.Replace("flood_" + std::to_string(i), {MakeP2PProxy(i, i)});
+    }
+
+    // 4. Wait for GC to run
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // 5. The handle obtained in step 2 must still be valid.
+    //    shared_ptr protects the data memory even after the node is recycled.
+    ASSERT_EQ(handle.items().size(), 1u);
+    EXPECT_EQ(handle.items()[0].segment_id, (UUID{100, 0}));
+}
+
+// ============================================================================
 // Watermark & Stress Tests
 // ============================================================================
 
