@@ -15,6 +15,45 @@
 
 namespace mooncake {
 
+namespace {
+
+std::optional<StandbySegmentInfo> BuildSnapshotSegmentInfo(
+    const Replica::Descriptor& replica_descriptor) {
+    if (replica_descriptor.is_memory_replica()) {
+        const auto& buffer_descriptor =
+            replica_descriptor.get_memory_descriptor().buffer_descriptor;
+        if (buffer_descriptor.transport_endpoint_.empty()) {
+            return std::nullopt;
+        }
+        return StandbySegmentInfo{
+            .segment_name = buffer_descriptor.transport_endpoint_,
+            .transport_endpoint = buffer_descriptor.transport_endpoint_,
+            .capacity = 0,
+            .is_memory_segment = true,
+            .file_path = std::string(),
+        };
+    }
+
+    if (replica_descriptor.is_local_disk_replica()) {
+        const auto& local_disk_descriptor =
+            replica_descriptor.get_local_disk_descriptor();
+        if (local_disk_descriptor.transport_endpoint.empty()) {
+            return std::nullopt;
+        }
+        return StandbySegmentInfo{
+            .segment_name = local_disk_descriptor.transport_endpoint,
+            .transport_endpoint = local_disk_descriptor.transport_endpoint,
+            .capacity = 0,
+            .is_memory_segment = false,
+            .file_path = std::string(),
+        };
+    }
+
+    return std::nullopt;
+}
+
+}  // namespace
+
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
     // Explicitly initialize HA metric manager to ensure thread safety
@@ -362,9 +401,17 @@ void HotStandbyService::ActivateSnapshotOnlyStandbyLocked(
 void HotStandbyService::ApplyLoadedSnapshotLocked(
     const LoadedSnapshot& snapshot) {
     metadata_store_->Clear();
+    std::vector<StandbySegmentInfo> snapshot_segments;
     for (const auto& kv : snapshot.metadata) {
         metadata_store_->PutMetadata(kv.first, kv.second);
+        for (const auto& replica_descriptor : kv.second.replicas) {
+            auto segment_info = BuildSnapshotSegmentInfo(replica_descriptor);
+            if (segment_info.has_value()) {
+                snapshot_segments.push_back(std::move(segment_info.value()));
+            }
+        }
     }
+    oplog_applier_->ReplaceSegmentRegistry(snapshot_segments);
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     applied_seq_id_.store(snapshot.snapshot_sequence_id,
                           std::memory_order_release);
@@ -692,6 +739,17 @@ bool HotStandbyService::ExportMetadataSnapshot(
         return false;
     }
     metadata_store_->Snapshot(out);
+    return true;
+}
+
+bool HotStandbyService::ExportSegmentRegistry(
+    std::vector<StandbySegmentInfo>& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!oplog_applier_) {
+        out.clear();
+        return false;
+    }
+    oplog_applier_->SnapshotSegmentRegistry(out);
     return true;
 }
 

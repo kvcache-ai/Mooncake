@@ -147,6 +147,8 @@ class HotStandbyService {
     bool ExportMetadataSnapshot(
         std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
 
+    bool ExportSegmentRegistry(std::vector<StandbySegmentInfo>& out) const;
+
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 

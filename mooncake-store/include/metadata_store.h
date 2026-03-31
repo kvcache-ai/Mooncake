@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "replica.h"
@@ -56,6 +58,72 @@ struct MetadataPayload {
         meta.last_sequence_id = sequence_id;
         return meta;
     }
+};
+
+/**
+ * @brief Segment information retained on standby for promoted leader restore.
+ *
+ * This is intentionally lightweight: it captures the endpoint-level registry
+ * semantics needed by standby promotion, not a full allocator reconstruction.
+ */
+struct StandbySegmentInfo {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+};
+
+/**
+ * @brief Thread-safe segment registry maintained from standby replication.
+ */
+class StandbySegmentRegistry {
+   public:
+    void Upsert(const StandbySegmentInfo& info) {
+        std::lock_guard<std::shared_mutex> lock(mutex_);
+        segments_[info.transport_endpoint] = info;
+    }
+
+    void Remove(const std::string& transport_endpoint) {
+        std::lock_guard<std::shared_mutex> lock(mutex_);
+        segments_.erase(transport_endpoint);
+    }
+
+    void Replace(const std::vector<StandbySegmentInfo>& segments) {
+        std::lock_guard<std::shared_mutex> lock(mutex_);
+        segments_.clear();
+        for (const auto& segment : segments) {
+            segments_[segment.transport_endpoint] = segment;
+        }
+    }
+
+    void Snapshot(std::vector<StandbySegmentInfo>& out) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        out.clear();
+        out.reserve(segments_.size());
+        for (const auto& entry : segments_) {
+            out.push_back(entry.second);
+        }
+    }
+
+    std::optional<StandbySegmentInfo> Find(
+        const std::string& transport_endpoint) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = segments_.find(transport_endpoint);
+        if (it == segments_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    void Clear() {
+        std::lock_guard<std::shared_mutex> lock(mutex_);
+        segments_.clear();
+    }
+
+   private:
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<std::string, StandbySegmentInfo> segments_;
 };
 
 /**

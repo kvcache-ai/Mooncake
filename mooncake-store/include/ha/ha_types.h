@@ -182,6 +182,7 @@ struct SnapshotDescriptor {
 struct PromotedStandbyState {
     std::vector<std::pair<std::string, StandbyObjectMetadata>>
         metadata_snapshot;
+    std::vector<StandbySegmentInfo> segment_registry;
     OpLogSequenceId applied_seq_id = 0;
 };
 

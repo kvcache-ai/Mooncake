@@ -106,6 +106,30 @@ std::string MakeValidJsonPayload(uint64_t client_id_first = 1,
     return std::string(buf.data(), buf.size());
 }
 
+std::string MakeSegmentMountPayload(const std::string& segment_name,
+                                    const std::string& transport_endpoint,
+                                    uint64_t capacity,
+                                    bool is_memory_segment = true) {
+    SegmentMountOp payload;
+    payload.segment_name = segment_name;
+    payload.transport_endpoint = transport_endpoint;
+    payload.capacity = capacity;
+    payload.is_memory_segment = is_memory_segment;
+    auto buf = struct_pack::serialize(payload);
+    return std::string(buf.data(), buf.size());
+}
+
+std::string MakeSegmentUpdatePayload(const std::string& segment_name,
+                                     const std::string& transport_endpoint,
+                                     uint64_t capacity) {
+    SegmentUpdateOp payload;
+    payload.segment_name = segment_name;
+    payload.transport_endpoint = transport_endpoint;
+    payload.capacity = capacity;
+    auto buf = struct_pack::serialize(payload);
+    return std::string(buf.data(), buf.size());
+}
+
 class OpLogApplierTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -163,6 +187,76 @@ TEST_F(OpLogApplierTest, TestApplyRemove) {
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
     EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentMountAndSnapshotRegistry) {
+    const std::string endpoint = "10.0.0.1:12345";
+    OpLogEntry entry =
+        MakeEntry(1, OpType::SEGMENT_MOUNT, endpoint,
+                  MakeSegmentMountPayload("seg-a", endpoint, 4096));
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+
+    std::vector<StandbySegmentInfo> segments;
+    applier_->SnapshotSegmentRegistry(segments);
+    ASSERT_EQ(1u, segments.size());
+    EXPECT_EQ("seg-a", segments[0].segment_name);
+    EXPECT_EQ(endpoint, segments[0].transport_endpoint);
+    EXPECT_EQ(4096u, segments[0].capacity);
+    EXPECT_TRUE(segments[0].is_memory_segment);
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentUnmount) {
+    const std::string endpoint = "10.0.0.2:12345";
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::SEGMENT_MOUNT, endpoint,
+                  MakeSegmentMountPayload("seg-b", endpoint, 2048))));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::SEGMENT_UNMOUNT, endpoint, std::string())));
+
+    std::vector<StandbySegmentInfo> segments;
+    applier_->SnapshotSegmentRegistry(segments);
+    EXPECT_TRUE(segments.empty());
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentUpdate) {
+    const std::string endpoint = "10.0.0.3:12345";
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::SEGMENT_MOUNT, endpoint,
+                  MakeSegmentMountPayload("seg-c", endpoint, 1024))));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::SEGMENT_UPDATE, endpoint,
+                  MakeSegmentUpdatePayload("seg-c", endpoint, 8192))));
+
+    std::vector<StandbySegmentInfo> segments;
+    applier_->SnapshotSegmentRegistry(segments);
+    ASSERT_EQ(1u, segments.size());
+    EXPECT_EQ(8192u, segments[0].capacity);
+}
+
+TEST_F(OpLogApplierTest, TestReplaceSegmentRegistry) {
+    std::vector<StandbySegmentInfo> replacement = {
+        StandbySegmentInfo{
+            .segment_name = "seg-d",
+            .transport_endpoint = "10.0.0.4:12345",
+            .capacity = 512,
+            .is_memory_segment = true,
+            .file_path = std::string(),
+        },
+        StandbySegmentInfo{
+            .segment_name = "seg-e",
+            .transport_endpoint = "10.0.0.5:12345",
+            .capacity = 1024,
+            .is_memory_segment = false,
+            .file_path = "/tmp/seg-e",
+        },
+    };
+
+    applier_->ReplaceSegmentRegistry(replacement);
+
+    std::vector<StandbySegmentInfo> segments;
+    applier_->SnapshotSegmentRegistry(segments);
+    ASSERT_EQ(2u, segments.size());
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {

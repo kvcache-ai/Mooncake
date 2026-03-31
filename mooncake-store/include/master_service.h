@@ -21,6 +21,7 @@
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "oplog_manager.h"
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
@@ -43,6 +44,7 @@ class EvictionStrategy;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+class MasterServiceEtcdOpLogTest;
 }  // namespace test
 
 /*
@@ -56,6 +58,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
+    friend class test::MasterServiceEtcdOpLogTest;
 
    public:
     MasterService();
@@ -433,6 +436,8 @@ class MasterService {
         const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
+    struct ObjectMetadata;
+
     void SnapshotThreadFunc();
 
     // Persist master state
@@ -460,6 +465,15 @@ class MasterService {
     bool TryRestoreStateFromSnapshot(const ha::SnapshotDescriptor& snapshot);
     void ResetStateAfterFailedRestoreAttempt();
     void LoadPreloadedState(const ha::PromotedStandbyState& state);
+    void InitializeEtcdOpLogManager();
+    bool ShouldReplicateToEtcdStandby() const;
+    void AppendOpLogAndNotify(OpType type, const std::string& key,
+                              const std::string& payload = std::string());
+    void AppendMetadataMutationOpLog(const std::string& key,
+                                     const ObjectMetadata* metadata);
+    void AppendSegmentUnmountOpLog(const std::string& segment_name,
+                                   const std::string& transport_endpoint);
+    std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
 
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
@@ -1058,6 +1072,8 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    std::unordered_set<std::string> invalid_replica_endpoints_;
+    OpLogManager oplog_manager_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size

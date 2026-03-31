@@ -211,12 +211,19 @@ class CapabilityDrivenReplicationController final
         if (err == ErrorCode::OK) {
             std::vector<std::pair<std::string, StandbyObjectMetadata>>
                 metadata_snapshot;
+            std::vector<StandbySegmentInfo> segment_registry;
             if (!standby_service_->ExportMetadataSnapshot(metadata_snapshot)) {
                 LOG(ERROR) << "Failed to export promoted standby metadata";
+                err = ErrorCode::INTERNAL_ERROR;
+            } else if (!standby_service_->ExportSegmentRegistry(
+                           segment_registry)) {
+                LOG(ERROR) << "Failed to export promoted standby segment "
+                              "registry";
                 err = ErrorCode::INTERNAL_ERROR;
             } else {
                 promoted_state = PromotedStandbyState{
                     .metadata_snapshot = std::move(metadata_snapshot),
+                    .segment_registry = std::move(segment_registry),
                     .applied_seq_id =
                         standby_service_->GetLatestAppliedSequenceId(),
                 };

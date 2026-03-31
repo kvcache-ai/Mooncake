@@ -71,6 +71,46 @@ int64_t CurrentTimeMs() {
         .count();
 }
 
+std::optional<std::string> GetReplicaTransportEndpoint(
+    const Replica::Descriptor& replica_descriptor) {
+    if (replica_descriptor.is_memory_replica()) {
+        const auto& buffer_descriptor =
+            replica_descriptor.get_memory_descriptor().buffer_descriptor;
+        if (!buffer_descriptor.transport_endpoint_.empty()) {
+            return buffer_descriptor.transport_endpoint_;
+        }
+        return std::nullopt;
+    }
+
+    if (replica_descriptor.is_local_disk_replica()) {
+        const auto& local_disk_descriptor =
+            replica_descriptor.get_local_disk_descriptor();
+        if (!local_disk_descriptor.transport_endpoint.empty()) {
+            return local_disk_descriptor.transport_endpoint;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void FilterInvalidReplicaDescriptors(
+    std::vector<Replica::Descriptor>& replicas,
+    const std::unordered_set<std::string>& invalid_replica_endpoints) {
+    if (invalid_replica_endpoints.empty()) {
+        return;
+    }
+
+    replicas.erase(
+        std::remove_if(
+            replicas.begin(), replicas.end(),
+            [&](const Replica::Descriptor& replica_descriptor) {
+                auto endpoint = GetReplicaTransportEndpoint(replica_descriptor);
+                return endpoint.has_value() &&
+                       invalid_replica_endpoints.contains(endpoint.value());
+            }),
+        replicas.end());
+}
+
 class ImportedReplicaBufferAllocator final : public BufferAllocatorBase {
    public:
     explicit ImportedReplicaBufferAllocator(std::string transport_endpoint)
@@ -103,6 +143,113 @@ class ImportedReplicaBufferAllocator final : public BufferAllocatorBase {
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
+
+bool MasterService::ShouldReplicateToEtcdStandby() const {
+#ifdef STORE_USE_ETCD
+    return enable_ha_ && ha_backend_type_ == "etcd";
+#else
+    return false;
+#endif
+}
+
+std::string MasterService::SerializeMetadataForOpLog(
+    const ObjectMetadata& metadata) const {
+    MetadataPayload payload;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.size;
+
+    const auto& replicas = metadata.GetAllReplicas();
+    payload.replicas.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        payload.replicas.push_back(replica.get_descriptor());
+    }
+
+    auto serialized = struct_pack::serialize(payload);
+    return std::string(serialized.data(), serialized.size());
+}
+
+void MasterService::AppendMetadataMutationOpLog(
+    const std::string& key, const ObjectMetadata* metadata) {
+    if (!ShouldReplicateToEtcdStandby()) {
+        return;
+    }
+
+    if (metadata == nullptr || !metadata->IsValid()) {
+        AppendOpLogAndNotify(OpType::REMOVE, key);
+        return;
+    }
+
+    AppendOpLogAndNotify(OpType::PUT_END, key,
+                         SerializeMetadataForOpLog(*metadata));
+}
+
+void MasterService::AppendSegmentUnmountOpLog(
+    const std::string& segment_name, const std::string& transport_endpoint) {
+    if (!ShouldReplicateToEtcdStandby() || transport_endpoint.empty()) {
+        return;
+    }
+
+    SegmentUnmountOp payload;
+    payload.segment_name = segment_name;
+    payload.transport_endpoint = transport_endpoint;
+    auto serialized = struct_pack::serialize(payload);
+    AppendOpLogAndNotify(OpType::SEGMENT_UNMOUNT, transport_endpoint,
+                         std::string(serialized.data(), serialized.size()));
+}
+
+void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
+                                         const std::string& payload) {
+#ifdef STORE_USE_ETCD
+    if (enable_ha_ && ha_backend_type_ == "etcd") {
+        oplog_manager_.Append(type, key, payload);
+    }
+#else
+    (void)type;
+    (void)key;
+    (void)payload;
+#endif
+}
+
+void MasterService::InitializeEtcdOpLogManager() {
+#ifdef STORE_USE_ETCD
+    if (!enable_ha_ || ha_backend_type_ != "etcd") {
+        return;
+    }
+
+    if (cluster_id_.empty()) {
+        LOG(WARNING) << "HA mode enabled with etcd backend but cluster_id is "
+                        "empty, oplog replication is disabled";
+        return;
+    }
+
+    if (!ha_backend_connstring_.empty()) {
+        auto err = EtcdHelper::ConnectToEtcdStoreClient(
+            ha_backend_connstring_.c_str());
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "Failed to connect to etcd for oplog manager, "
+                         << "connstring=" << ha_backend_connstring_
+                         << ", err=" << toString(err);
+            return;
+        }
+    }
+
+    auto etcd_oplog_store = std::make_shared<EtcdOpLogStore>(
+        cluster_id_, /*enable_latest_seq_batch_update=*/true,
+        /*enable_batch_write=*/true);
+    if (etcd_oplog_store->Init() != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to initialize etcd oplog store for cluster_id="
+                     << cluster_id_;
+        return;
+    }
+
+    oplog_manager_.SetEtcdOpLogStore(etcd_oplog_store);
+
+    uint64_t max_seq = 0;
+    if (etcd_oplog_store->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
+        oplog_manager_.SetInitialSequenceId(max_seq);
+    }
+#endif
+}
 
 MasterService::MasterService(const MasterServiceConfig& config)
     : default_kv_lease_ttl_(config.default_kv_lease_ttl),
@@ -157,6 +304,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
             use_snapshot_backup_dir_ = true;
         }
     }
+
+    InitializeEtcdOpLogManager();
 
     if (config.preloaded_state.has_value()) {
         LoadPreloadedState(config.preloaded_state.value());
@@ -324,6 +473,18 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+
+    if (enable_ha_ && ha_backend_type_ == "etcd" &&
+        !segment.te_endpoint.empty()) {
+        SegmentMountOp payload;
+        payload.segment_name = segment.name;
+        payload.transport_endpoint = segment.te_endpoint;
+        payload.capacity = segment.size;
+        payload.is_memory_segment = true;
+        auto serialized = struct_pack::serialize(payload);
+        AppendOpLogAndNotify(OpType::SEGMENT_MOUNT, segment.te_endpoint,
+                             std::string(serialized.data(), serialized.size()));
+    }
     return {};
 }
 
@@ -378,7 +539,18 @@ void MasterService::ClearInvalidHandles() {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (CleanupStaleHandles(it->second)) {
+            const size_t replica_count_before = it->second.CountReplicas();
+            const bool key_became_invalid = CleanupStaleHandles(it->second);
+            const bool replicas_changed =
+                it->second.CountReplicas() != replica_count_before;
+
+            if (!replicas_changed) {
+                ++it;
+                continue;
+            }
+
+            if (key_became_invalid) {
+                AppendMetadataMutationOpLog(it->first, nullptr);
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
                 // replication_tasks, and offloading_tasks.
@@ -387,6 +559,7 @@ void MasterService::ClearInvalidHandles() {
                 shard->offloading_tasks.erase(it->first);
                 it = shard->metadata.erase(it);
             } else {
+                AppendMetadataMutationOpLog(it->first, &it->second);
                 ++it;
             }
         }
@@ -420,12 +593,20 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
+    std::string segment_name;
+    std::string transport_endpoint;
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        MountedSegment mounted_segment;
+        if (segment_manager_.getView().GetMountedSegment(
+                segment_id, mounted_segment) == ErrorCode::OK) {
+            segment_name = mounted_segment.segment.name;
+            transport_endpoint = mounted_segment.segment.te_endpoint;
+        }
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -448,6 +629,8 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+
+    AppendSegmentUnmountOpLog(segment_name, transport_endpoint);
     return {};
 }
 
@@ -630,6 +813,8 @@ auto MasterService::BatchReplicaClear(
                     }
                 });
 
+            AppendMetadataMutationOpLog(key, nullptr);
+
             // Erase the entire metadata (all replicas will be deallocated)
             accessor.Erase();
             cleared_keys.emplace_back(key);
@@ -676,7 +861,10 @@ auto MasterService::BatchReplicaClear(
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
+                AppendMetadataMutationOpLog(key, nullptr);
                 accessor.Erase();
+            } else {
+                AppendMetadataMutationOpLog(key, &metadata);
             }
 
             cleared_keys.emplace_back(key);
@@ -717,11 +905,13 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                     [&replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
                     });
+                FilterInvalidReplicaDescriptors(replica_list,
+                                                invalid_replica_endpoints_);
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
                         << "key=" << key
-                        << " matched by regex, but has no complete replicas.";
+                        << " matched by regex, but has no eligible replicas.";
                     continue;
                 }
 
@@ -753,6 +943,7 @@ auto MasterService::GetReplicaList(const std::string& key)
         &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
             replica_list.emplace_back(replica.get_descriptor());
         });
+    FilterInvalidReplicaDescriptors(replica_list, invalid_replica_endpoints_);
 
     if (replica_list.empty()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
@@ -937,6 +1128,11 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+
+    if (enable_ha_ && ha_backend_type_ == "etcd") {
+        AppendOpLogAndNotify(OpType::PUT_END, key,
+                             SerializeMetadataForOpLog(metadata));
+    }
     return {};
 }
 
@@ -962,6 +1158,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
+        AppendMetadataMutationOpLog(key, &metadata);
         return {};
     }
 
@@ -982,6 +1179,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                     .get_local_disk_descriptor()
                     .object_size;
         });
+    AppendMetadataMutationOpLog(key, &metadata);
     return {};
 }
 
@@ -1029,7 +1227,13 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
+        if (enable_ha_ && ha_backend_type_ == "etcd") {
+            AppendOpLogAndNotify(OpType::PUT_REVOKE, key);
+        }
         accessor.Erase();
+    } else if (enable_ha_ && ha_backend_type_ == "etcd") {
+        AppendOpLogAndNotify(OpType::PUT_END, key,
+                             SerializeMetadataForOpLog(metadata));
     }
     return {};
 }
@@ -1084,7 +1288,10 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     }
 
     if (!metadata.IsValid()) {
+        AppendMetadataMutationOpLog(key, nullptr);
         accessor.Erase();
+    } else {
+        AppendMetadataMutationOpLog(key, &metadata);
     }
     return {};
 }
@@ -1207,6 +1414,14 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
+    auto append_final_metadata = [&]() {
+        if (CleanupStaleHandles(metadata)) {
+            AppendMetadataMutationOpLog(key, nullptr);
+            accessor.Erase();
+            return;
+        }
+        AppendMetadataMutationOpLog(key, &metadata);
+    };
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr || !source->is_completed() ||
@@ -1220,10 +1435,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                              replica.id()) != task.replica_ids.end();
         });
         accessor.EraseReplicationTask();
-        if (!metadata.IsValid()) {
-            // Remove the object if it does not have any replicas.
-            accessor.Erase();
-        }
+        append_final_metadata();
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
@@ -1245,6 +1457,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
     }
 
     accessor.EraseReplicationTask();
+    append_final_metadata();
 
     return all_complete ? tl::expected<void, ErrorCode>()
                         : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
@@ -1278,6 +1491,14 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     auto& metadata = accessor.Get();
+    auto append_final_metadata = [&]() {
+        if (CleanupStaleHandles(metadata)) {
+            AppendMetadataMutationOpLog(key, nullptr);
+            accessor.Erase();
+            return;
+        }
+        AppendMetadataMutationOpLog(key, &metadata);
+    };
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr) {
@@ -1294,11 +1515,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     accessor.EraseReplicationTask();
-
-    if (!metadata.IsValid()) {
-        // Remove the object if it does not have any replicas.
-        accessor.Erase();
-    }
+    append_final_metadata();
 
     return {};
 }
@@ -1407,6 +1624,14 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
     }
 
     auto& metadata = accessor.Get();
+    auto append_final_metadata = [&]() {
+        if (CleanupStaleHandles(metadata)) {
+            AppendMetadataMutationOpLog(key, nullptr);
+            accessor.Erase();
+            return;
+        }
+        AppendMetadataMutationOpLog(key, &metadata);
+    };
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr || !source->is_completed() ||
@@ -1420,10 +1645,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                              replica.id()) != task.replica_ids.end();
         });
         accessor.EraseReplicationTask();
-        if (!metadata.IsValid()) {
-            // Remove the object if it does not have any replicas.
-            accessor.Erase();
-        }
+        append_final_metadata();
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
@@ -1441,6 +1663,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                 << "key=" << key << ", replica_id=" << replica_id
                 << ", move target becomes invalid during data transfer";
             accessor.EraseReplicationTask();
+            append_final_metadata();
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
 
@@ -1461,6 +1684,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
     }
 
     accessor.EraseReplicationTask();
+    append_final_metadata();
 
     return {};
 }
@@ -1493,6 +1717,14 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     auto& metadata = accessor.Get();
+    auto append_final_metadata = [&]() {
+        if (CleanupStaleHandles(metadata)) {
+            AppendMetadataMutationOpLog(key, nullptr);
+            accessor.Erase();
+            return;
+        }
+        AppendMetadataMutationOpLog(key, &metadata);
+    };
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr) {
@@ -1509,11 +1741,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     }
 
     accessor.EraseReplicationTask();
-
-    if (!metadata.IsValid()) {
-        // Remove the object if it does not have any replicas.
-        accessor.Erase();
-    }
+    append_final_metadata();
 
     return {};
 }
@@ -1550,6 +1778,9 @@ auto MasterService::Remove(const std::string& key, bool force)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    if (enable_ha_ && ha_backend_type_ == "etcd") {
+        AppendOpLogAndNotify(OpType::REMOVE, key);
+    }
     // Remove object metadata
     accessor.Erase();
     return {};
@@ -1603,6 +1834,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
                     continue;
                 }
 
+                AppendMetadataMutationOpLog(it->first, nullptr);
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 it = shard->metadata.erase(it);
@@ -1647,6 +1879,7 @@ long MasterService::RemoveAll(bool force) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                AppendMetadataMutationOpLog(it->first, nullptr);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -3075,6 +3308,20 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
 void MasterService::LoadPreloadedState(const ha::PromotedStandbyState& state) {
     imported_replica_allocators_.clear();
+    invalid_replica_endpoints_.clear();
+
+    if (enable_ha_ && ha_backend_type_ == "etcd" && state.applied_seq_id > 0 &&
+        oplog_manager_.GetLastSequenceId() == 0) {
+        oplog_manager_.SetInitialSequenceId(state.applied_seq_id);
+    }
+
+    std::unordered_set<std::string> known_endpoints;
+    known_endpoints.reserve(state.segment_registry.size());
+    for (const auto& segment_info : state.segment_registry) {
+        if (!segment_info.transport_endpoint.empty()) {
+            known_endpoints.insert(segment_info.transport_endpoint);
+        }
+    }
 
     std::unordered_map<std::string,
                        std::shared_ptr<ImportedReplicaBufferAllocator>>
@@ -3105,6 +3352,12 @@ void MasterService::LoadPreloadedState(const ha::PromotedStandbyState& state) {
         replicas.reserve(standby_metadata.replicas.size());
         for (const auto& replica_descriptor : standby_metadata.replicas) {
             try {
+                auto endpoint = GetReplicaTransportEndpoint(replica_descriptor);
+                if (!known_endpoints.empty() && endpoint.has_value() &&
+                    !known_endpoints.contains(endpoint.value())) {
+                    invalid_replica_endpoints_.insert(endpoint.value());
+                }
+
                 if (replica_descriptor.is_memory_replica()) {
                     const auto& buffer_descriptor =
                         replica_descriptor.get_memory_descriptor()
@@ -3207,6 +3460,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
+    auto append_eviction_oplog = [this](const std::string& key,
+                                        const ObjectMetadata& metadata) {
+        if (!metadata.IsValid()) {
+            AppendMetadataMutationOpLog(key, nullptr);
+            return;
+        }
+        AppendMetadataMutationOpLog(key, &metadata);
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
@@ -3283,6 +3545,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     total_freed_size +=
                         it->second.size *
                         evict_replicas(it->second);  // Erase memory replicas
+                    append_eviction_oplog(it->first, it->second);
                     if (it->second.IsValid() == false) {
                         it = shard->metadata.erase(it);
                     } else {
@@ -3344,6 +3607,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             it->second.size *
                             evict_replicas(
                                 it->second);  // Erase memory replicas
+                        append_eviction_oplog(it->first, it->second);
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
@@ -3393,6 +3657,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             it->second.size *
                             evict_replicas(
                                 it->second);  // Erase memory replicas
+                        append_eviction_oplog(it->first, it->second);
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
@@ -3470,6 +3735,7 @@ void MasterService::ClientMonitorFunc() {
             std::vector<size_t> dec_capacities;
             std::vector<UUID> client_ids;
             std::vector<std::string> segment_names;
+            std::vector<std::string> segment_transport_endpoints;
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             {
                 // Lock client_mutex and segment_mutex
@@ -3496,6 +3762,8 @@ void MasterService::ClientMonitorFunc() {
                             dec_capacities.push_back(metrics_dec_capacity);
                             client_ids.push_back(client_id);
                             segment_names.push_back(seg.name);
+                            segment_transport_endpoints.push_back(
+                                seg.te_endpoint);
                         } else {
                             LOG(ERROR) << "client_id=" << client_id
                                        << ", segment_name=" << seg.name
@@ -3516,6 +3784,8 @@ void MasterService::ClientMonitorFunc() {
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
                     segment_access.CommitUnmountSegment(
                         unmount_segments[i], client_ids[i], dec_capacities[i]);
+                    AppendSegmentUnmountOpLog(segment_names[i],
+                                              segment_transport_endpoints[i]);
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_segment";
