@@ -249,7 +249,8 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
     auto* backend = GetSnapshotObjectStore();
     ASSERT_NE(backend, nullptr);
 
-    // Create 5 fake snapshot directories with timestamp-like names
+    // Create 5 fake snapshots with valid catalog descriptors so cleanup sees
+    // the same metadata shape as production snapshots.
     std::vector<std::string> snapshot_ids = {
         "20240101_000000_000", "20240102_000000_000", "20240103_000000_000",
         "20240104_000000_000", "20240105_000000_000"};
@@ -260,6 +261,17 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
         std::string manifest_key =
             "mooncake_master_snapshot/" + id + "/manifest.txt";
         backend->UploadString(manifest_key, "messagepack|1.0.0|" + id);
+
+        auto descriptor =
+            ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(id);
+        auto descriptor_payload =
+            ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
+                descriptor);
+        ASSERT_TRUE(descriptor_payload.has_value())
+            << descriptor_payload.error();
+        auto descriptor_key =
+            ha::snapshot_catalog_store_detail::BuildDescriptorKey(id);
+        backend->UploadString(descriptor_key, descriptor_payload.value());
     }
 
     // Keep only 2, cleanup with current snapshot_id = last one
