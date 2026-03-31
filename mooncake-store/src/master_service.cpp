@@ -4444,10 +4444,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Snapshot compatibility:
-    //   7 + replicas: legacy format
-    //   8 + replicas: either data_type or trailing hard_pinned
-    //   9 + replicas: data_type plus trailing hard_pinned
+    // Format detection:
+    //   v1: 7 + replicas_count, no data_type or hard_pinned
+    //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
+    //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
     constexpr uint32_t kOldFieldCount = 7;
     constexpr uint32_t kOneExtraFieldCount = 8;
     constexpr uint32_t kCurrentFieldCount = 9;
@@ -4467,12 +4467,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
     ObjectDataType data_type = ObjectDataType::UNKNOWN;
     if (is_current_format) {
-        data_type =
-            static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     } else if (is_one_extra_format &&
                array[index].type == msgpack::type::POSITIVE_INTEGER) {
-        data_type =
-            static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     }
 
     // Deserialize replicas
