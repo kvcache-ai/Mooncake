@@ -200,6 +200,8 @@ mooncake_master \
 ```
 This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
+If the master runs in a container and its IP is dynamic, set `--rpc_interface=<ifname>` such as `--rpc_interface=eth0`. Mooncake Master will resolve the current IPv4 address from that interface at startup instead of relying on a fixed `--rpc_address`.
+
 Optional: Use the free-ratio-first allocation strategy for better load balancing across segments with different sizes or utilization:
 
 ```bash
