@@ -2,6 +2,9 @@
 
 This page summarizes useful flags, environment variables, and HTTP endpoints to help advanced users tune Mooncake Master and observe metrics.
 
+For end-to-end single-master and HA deployment examples, see
+[Mooncake Store HA Deployment](./mooncake-store-ha-deployment.md).
+
 ## Master Startup Flags (with defaults)
 
 - RPC Related
@@ -33,10 +36,12 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
 
 - High Availability (optional)
-  - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
-  - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
+  - `--enable_ha` (bool, default `false`): Enable HA mode.
+  - `--ha_backend_type` (str, default `etcd`): HA backend type. Current production backends are `etcd` and `redis`.
+  - `--ha_backend_connstring` (str, default empty): HA backend connection string.
+  - `--etcd_endpoints` (str, backward-compatible fallback): etcd endpoints, semicolon separated. Used only when `--ha_backend_connstring` is empty.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
-  - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
+  - `--cluster_id` (str, default `mooncake_cluster`): Cluster namespace used by the Store HA backend and snapshot catalog.
 
 - Task Manager (optional)
   - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
@@ -49,18 +54,22 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--global_file_segment_size` (int64, default `int64_max`): Maximum available space for DFS segments.
 
 - Snapshot / Restore (optional)
-  - `--enable_snapshot` (bool, default `false`): Enable periodic snapshot of master metadata data (effective when using the `offset` memory allocator).
+  - `--enable_snapshot` (bool, default `false`): Enable periodic snapshot of master metadata.
   - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
   - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
   - `--snapshot_retention_count` (uint32, default `2`): Number of recent snapshots to keep. Older snapshots beyond this limit will be automatically deleted.
-  - `--snapshot_backend_type` (str, required when snapshot enabled): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
-  - `--snapshot_backup_dir` (str, default empty): Optional local directory for snapshot backup. If empty (default), local backup is disabled. When set, it serves two purposes: (1) during snapshot persistence, data will be saved locally as a fallback if uploading to the backend fails; (2) during restore, downloaded metadata will also be saved to this directory as a local backup.
+  - `--snapshot_object_store_type` (str, required when snapshot is enabled): Snapshot object store type: `local` or `s3`.
+  - `--snapshot_catalog_store_type` (str, default `embedded`): Snapshot catalog store type: `embedded` or `redis`.
+  - `--snapshot_catalog_store_connstring` (str, optional): Connection string for the snapshot catalog store. If omitted for Redis catalogs, the master falls back to `--ha_backend_connstring`.
+  - `--snapshot_backup_dir` (str, default empty): Optional local directory for snapshot backup. If empty (default), local backup is disabled. When set, it serves two purposes: (1) during snapshot persistence, data will be saved locally as a fallback if uploading to the object store fails; (2) during restore, downloaded metadata will also be saved to this directory as a local backup.
   - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
-  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_backend_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
+  - `--cleanup_expired_on_restore` (bool, default `false`): Drop complete objects that are lease-expired and not soft-pinned during restore.
+  - **Environment variable** `MC_CLEANUP_EXPIRED_ON_RESTORE`: Process-level override for `--cleanup_expired_on_restore`.
+  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_object_store_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
 
   > **Warning: Managed Directory**
   >
-  > The snapshot storage path (`MOONCAKE_SNAPSHOT_LOCAL_PATH` for local backend, or S3 bucket for S3 backend) is a **managed directory** exclusively controlled by the Mooncake snapshot system. **DO NOT store other files or data in this directory.** Old snapshots exceeding `--snapshot_retention_count` will be automatically and permanently deleted during cleanup. Use a dedicated, isolated directory for snapshot storage to avoid accidental data loss.
+  > The snapshot storage path (`MOONCAKE_SNAPSHOT_LOCAL_PATH` for the local object store, or the configured S3 bucket for the S3 object store) is a **managed directory** exclusively controlled by the Mooncake snapshot system. **DO NOT store other files or data in this directory.** Old snapshots exceeding `--snapshot_retention_count` will be automatically and permanently deleted during cleanup. Use a dedicated, isolated directory for snapshot storage to avoid accidental data loss.
 
 Example (enable embedded HTTP metadata and metrics):
 

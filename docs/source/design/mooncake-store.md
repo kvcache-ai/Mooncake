@@ -26,7 +26,7 @@ As shown in the figure above, there are two key components in Mooncake Store: **
 
 **Master Service**: The `Master Service` orchestrates the logical storage space pool across the entire cluster, managing node join and leave events. It is responsible for object space allocation and metadata maintenance. Its memory allocation and eviction strategies are specifically designed and optimized to meet the demands of LLM inference workloads.
 
-The `Master Service` runs as an independent process and exposes RPC services to external components. Note that the `metadata service` required by the `Transfer Engine` (via etcd, Redis, or HTTP, etc.) is not included in the `Master Service` and needs to be deployed separately.
+The `Master Service` runs as an independent process and exposes RPC services to external components. Note that the `metadata service` required by the `Transfer Engine` (via etcd, Redis, or HTTP, etc.) is not included in the `Master Service` and needs to be deployed separately. The Store HA backend is also modeled separately from Transfer Engine metadata. They may share one backend service in deployment, but they are different control planes.
 
 **Client**: In Mooncake Store, the `Client` class is the only class defined to represent the client-side logic, but it serves **two distinct roles**:
 1. As a **client**, it is invoked by upper-layer applications to issue `Put`, `Get` and other requests.
@@ -40,12 +40,13 @@ The `Client` can be used in two modes:
 1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
 2. **Standalone mode**: Runs as an independent process. In this mode, the `Client` is separated into two parts: a **dummy** `Client` and a **real** `Client`: The **real** `Client` is a full-featured implementation that runs as a standalone process and directly communicates with other Mooncake Store components. It handles all RPC communications, memory management, and data transfer operations. The **real** `Client` is typically deployed on nodes that contribute memory to the distributed cache pool; The **dummy** `Client` is a lightweight wrapper that forwards all operations to a local **real** `Client` via RPC calls, which is designed for scenarios where the client needs to be embedded in the same process as the application (such as vLLM), but the actual Mooncake Store operations should be handled by a standalone process. The **dummy** `Client` and the **real** `Client` communicate via RPC calls and shared memory to make sure that Zero-copy transfers are still possible.
 
-Mooncake store supports two deployment methods to accommodate different availability requirements:
+Mooncake Store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
-2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
-If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
+2. **High availability mode**: In this mode, multiple master processes coordinate through a pluggable HA backend. Only one master serves client RPCs at a time, while the others remain in standby and observe leadership changes. The current production backends are `etcd` and `redis`.
 
-In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
+In both modes, the serving master monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
+
+For a detailed discussion of the runtime state machine, backend abstraction, snapshot bootstrap, and current capability boundaries, see [Mooncake Store High Availability](./mooncake-store-ha.md).
 
 ## Client C++ API
 
@@ -64,7 +65,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 - `metadata_connstring`: The address of the metadata service (e.g., etcd/Redis) required for Transfer Engine initialization
 - `protocol`: The protocol supported by the Transfer Engine, including RDMA and TCP
 - `protocol_args`: Protocol parameters required by the Transfer Engine
-- `master_server_entry`: The address information of the Master (`IP:Port` for default mode and `etcd://IP:Port;IP:Port;...;IP:Port` for high availability mode)
+- `master_server_entry`: The address information of the Master (`IP:Port` for default mode and `<backend>://<connstring>` for high availability mode, such as `etcd://...` or `redis://...`)
 
 ### Get
 
@@ -770,14 +771,18 @@ After enabling the persistence feature:
 If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
 
 ### Builtin Metadata Server
-Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
+Mooncake Store provides a built-in HTTP metadata server for the Transfer Engine
+metadata plane. This backend is particularly useful for development
+environments, single-master deployments, or scenarios where you do not want to
+operate a separate metadata service.
 #### Configuration Parameters
 The HTTP metadata server can be configured using the following parameters:
-- **`enable_http_metadata_server`** (boolean, default: `false`): Enables the built-in HTTP metadata server instead of using etcd. When set to `true`, the master service will start an embedded HTTP server that handles metadata operations.
+- **`enable_http_metadata_server`** (boolean, default: `false`): Enables the built-in HTTP metadata server. When set to `true`, the master service will start an embedded HTTP server that handles Transfer Engine metadata operations.
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 #### Environment Variables
-- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
+- MC_STORE_CLUSTER_ID: Identifies the Store HA namespace when clients resolve master views through a shared HA backend, default `mooncake`.
+- MC_METADATA_CLUSTER_ID: Identifies the Transfer Engine metadata namespace when Redis metadata is shared across multiple clusters.
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
@@ -791,8 +796,14 @@ To start the master service with the HTTP metadata server enabled:
     --http_metadata_server_port=8080 \
     --http_metadata_server_host=0.0.0.0
 ```
-When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
-Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
+When enabled, the HTTP metadata server will start automatically and provide
+Transfer Engine metadata services for the Mooncake Store cluster. This
+eliminates the need for a separate metadata deployment in development and
+testing environments.
+Note that the HTTP metadata server belongs to the Transfer Engine metadata
+plane, not the Store HA leadership plane. It is useful for single-node or
+development setups, but it does not replace the backend-driven HA runtime used
+by Store masters.
 
 ## Mooncake Store Python API
 
@@ -812,15 +823,23 @@ sudo make install # Install Python interface support package
 High availability mode:
 ```
 mkdir build && cd build
-cmake .. -DSTORE_USE_ETCD # compile etcd wrapper that depends on go
+cmake .. -DSTORE_USE_ETCD=ON -DSTORE_USE_REDIS=ON
 make
 sudo make install # Install Python interface support package
 ```
 
-**Note:** To use high availability mode, only `-DSTORE_USE_ETCD` is required. `-DUSE_ETCD` is a compilation option for the **Transfer Engine** and is **not related** to the high availability mode.
+**Note:** Store HA backends are enabled by `STORE_USE_ETCD` and/or `STORE_USE_REDIS`. Transfer Engine metadata backends are controlled separately by `USE_ETCD`, `USE_REDIS`, and `USE_HTTP`.
 
 ### Starting the Transfer Engine's Metadata Service
-Mooncake Store uses the Transfer Engine as its core transfer engine, so it is necessary to start the metadata service (etcd/redis/http). The startup and configuration of the `metadata` service can be referred to in the relevant sections of [Transfer Engine](./transfer-engine/index.md). **Special Note**: For the etcd service, by default, it only provides services for local processes. You need to modify the listening options (IP to 0.0.0.0 instead of the default 127.0.0.1). You can use commands like curl to verify correctness.
+Mooncake Store uses the Transfer Engine as its core transfer engine, so a
+Transfer Engine metadata backend must be available before clients are started.
+The supported metadata backends are `http`, `etcd`, and `redis`. The startup
+and configuration of the metadata service can be referred to in the relevant
+sections of [Transfer Engine](./transfer-engine/index.md).
+
+When the metadata backend is shared across hosts, make sure it is reachable from
+all client processes. For example, etcd defaults to `127.0.0.1`, so multi-node
+deployments must update its listen address before clients can connect.
 
 ### Starting the Master Service
 The Master Service runs as an independent process, provides gRPC interfaces externally, and is responsible for the metadata management of Mooncake Store (note that the Master Service does not reuse the metadata service of the Transfer Engine). The default listening port is `50051`. After compilation, you can directly run `mooncake_master` located in the `build/mooncake-store/src/` directory. After starting, the Master Service will output the following content in the log:
@@ -833,22 +852,23 @@ Master service listening on 0.0.0.0:50051
 
 **High availability mode**:
 
-HA mode relies on an etcd service for coordination. If Transfer Engine also uses etcd as its metadata service, the etcd cluster used by Mooncake Store can either be shared with or separate from the one used by Transfer Engine.
+HA mode is configured with:
 
-HA mode allows deployment of multiple master instances to eliminate the single point of failure. Each master instance must be started with the following parameters:
 ```
---enable-ha: enables high availability mode
---etcd-endpoints: specifies endpoints for etcd service, separated by ';'
---rpc-address: the RPC address of this instance. Note that the address specified here should be accessible to the client.
+--enable-ha=true
+--ha-backend-type=<etcd|redis>
+--ha-backend-connstring=<backend connection string>
+--cluster_id=<shared Store HA namespace>
+--rpc-address=<address reachable by clients>
 ```
 
-For example:
-```
-./build/mooncake-store/src/mooncake_master \
-    --enable-ha=true \
-    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
-    --rpc-address=10.0.0.1
-```
+`--etcd_endpoints` is still accepted as a backward-compatible fallback for the
+etcd backend, but the preferred entry point is `--ha-backend-connstring`.
+
+For detailed deployment examples, see
+[Mooncake Store Deployment & Operations Guide](../deployment/mooncake-store-deployment-guide.md)
+and
+[Mooncake Store HA Deployment](../deployment/mooncake-store-ha-deployment.md).
 
 ### Starting the Sample Program
 Mooncake Store provides various sample programs, including interface forms based on C++ and Python. Below is an example of how to run using `stress_cluster_benchmark`.
@@ -857,7 +877,7 @@ Mooncake Store provides various sample programs, including interface forms based
 `local_hostname`: the IP address of the local machine
 `metadata_server`: the address of the Transfer Engine metadata service
 `master_server_address`: the address of the Master Service
-**Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
+**Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `<backend>://<connstring>`, such as `etcd://IP:Port;IP:Port;...` or `redis://host:port`.
 For example:
 ```python
 import os
@@ -872,8 +892,8 @@ protocol = os.getenv("PROTOCOL", "tcp")
 device_name = os.getenv("DEVICE_NAME", "ibp6s0")
 # Hostname of this node in the cluster, port number is randomly selected from (12300-14300)
 local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
-# Metadata service address of the Transfer Engine, here etcd is used as the metadata service
-metadata_server = os.getenv("METADATA_ADDR", "127.0.0.1:2379")
+# Metadata service address of the Transfer Engine. Choose http://..., redis://..., or etcd endpoints based on deployment.
+metadata_server = os.getenv("METADATA_ADDR", "http://127.0.0.1:8080/metadata")
 # The size of the Segment mounted by each node to the cluster, allocated by the Master Service after mounting, in bytes
 global_segment_size = 3200 * 1024 * 1024
 # Local buffer size registered with the Transfer Engine, in bytes
@@ -975,10 +995,21 @@ Available log levels: trace, debug, info, warn (or warning), error, and critical
 ## Example Code
 
 #### Python Usage Example
-We provide a reference example `distributed_object_store_provider.py`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) in the background on the same server, and then execute this Python program in the foreground. It should output a successful test result.
+We provide a reference example `distributed_object_store_provider.py`, located
+in the `mooncake-store/tests` directory. To check if the related components are
+properly installed, start a supported metadata service together with the Master
+Service (`mooncake_master`) on the same server, and then execute this Python
+program in the foreground. The embedded HTTP metadata server is the simplest
+choice for local validation.
 
 #### C++ Usage Example
-The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
+The C++ API of Mooncake Store provides more low-level control capabilities. We
+provide a reference example `client_integration_test`, located in the
+`mooncake-store/tests` directory. To check if the related components are
+properly installed, start a supported metadata service together with the Master
+Service (`mooncake_master`) on the same server, and then execute this C++
+program (located in the `build/mooncake-store/tests` directory). It should
+output a successful test result.
 
 ## Version Management Policy
 
