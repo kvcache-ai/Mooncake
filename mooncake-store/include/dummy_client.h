@@ -107,6 +107,10 @@ class DummyClient : public PyClient {
                      std::vector<std::span<const char>> values,
                      const ReplicateConfig &config = ReplicateConfig{});
 
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
     [[nodiscard]] std::string get_hostname() const;
 
     // Check if a pointer falls within the hot cache shm region

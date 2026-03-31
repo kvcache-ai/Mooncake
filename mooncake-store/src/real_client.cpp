@@ -1706,6 +1706,98 @@ std::vector<int> RealClient::batch_put_from(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
+RealClient::put_from_dummy_helper(const std::string &key,
+                                  uint64_t dummy_buffer, size_t size,
+                                  const ReplicateConfig &config,
+                                  const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    for (const auto &shm : context.mapped_shms) {
+        if (dummy_buffer >= shm.dummy_base_addr &&
+            dummy_buffer + size <= shm.dummy_base_addr + shm.shm_size) {
+            void *real_buffer =
+                reinterpret_cast<void *>(dummy_buffer + shm.shm_addr_offset);
+            return put_from_internal(key, real_buffer, size, config);
+        }
+    }
+
+    LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
+               << ") not found in any mapped shared memory for client "
+               << client_id;
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+tl::expected<void, ErrorCode> RealClient::put_from_with_metadata_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer,
+    uint64_t dummy_metadata_buffer, size_t size, size_t metadata_size,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    void *real_buffer = nullptr;
+    void *real_metadata_buffer = nullptr;
+
+    for (const auto &shm : context.mapped_shms) {
+        if (!real_buffer && dummy_buffer >= shm.dummy_base_addr &&
+            dummy_buffer + size <= shm.dummy_base_addr + shm.shm_size) {
+            real_buffer =
+                reinterpret_cast<void *>(dummy_buffer + shm.shm_addr_offset);
+        }
+        if (!real_metadata_buffer &&
+            dummy_metadata_buffer >= shm.dummy_base_addr &&
+            dummy_metadata_buffer + metadata_size <=
+                shm.dummy_base_addr + shm.shm_size) {
+            real_metadata_buffer = reinterpret_cast<void *>(
+                dummy_metadata_buffer + shm.shm_addr_offset);
+        }
+        if (real_buffer && real_metadata_buffer) break;
+    }
+
+    if (!real_buffer || !real_metadata_buffer) {
+        LOG(ERROR) << "Dummy buffer(s) not found in any mapped shared memory "
+                      "for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Build slices from metadata + data, then call Put directly
+    std::vector<mooncake::Slice> slices;
+    uint64_t metadata_offset = 0;
+    while (metadata_offset < metadata_size) {
+        auto chunk_size =
+            std::min(metadata_size - metadata_offset, kMaxSliceSize);
+        void *chunk_ptr =
+            static_cast<char *>(real_metadata_buffer) + metadata_offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        metadata_offset += chunk_size;
+    }
+    uint64_t offset = 0;
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(real_buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    auto result = client_->Put(key, slices, config);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_put_from_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<uint64_t> &dummy_buffers,
@@ -1756,6 +1848,54 @@ RealClient::batch_put_from_dummy_helper(
         }
     }
     return batch_put_from_internal(keys, buffers, sizes, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_multi_buffers_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<uint64_t>> &all_dummy_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    std::vector<std::vector<void *>> all_buffers;
+    all_buffers.reserve(all_dummy_buffers.size());
+
+    for (size_t i = 0; i < all_dummy_buffers.size(); ++i) {
+        std::vector<void *> buffers;
+        buffers.reserve(all_dummy_buffers[i].size());
+        for (size_t j = 0; j < all_dummy_buffers[i].size(); ++j) {
+            uint64_t dummy_addr = all_dummy_buffers[i][j];
+            size_t size = all_sizes[i][j];
+            bool found = false;
+            for (const auto &shm : context.mapped_shms) {
+                if (dummy_addr >= shm.dummy_base_addr &&
+                    dummy_addr + size <= shm.dummy_base_addr + shm.shm_size) {
+                    buffers.push_back(reinterpret_cast<void *>(
+                        dummy_addr + shm.shm_addr_offset));
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                LOG(ERROR) << "Dummy buffer at " << dummy_addr << " (size "
+                           << size
+                           << ") not found in any mapped shared memory";
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
+        }
+        all_buffers.push_back(std::move(buffers));
+    }
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                  config);
 }
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
@@ -2003,6 +2143,32 @@ std::vector<int> RealClient::batch_upsert_from(
     return results;
 }
 
+tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t size,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    for (const auto &shm : context.mapped_shms) {
+        if (dummy_buffer >= shm.dummy_base_addr &&
+            dummy_buffer + size <= shm.dummy_base_addr + shm.shm_size) {
+            void *real_buffer = reinterpret_cast<void *>(
+                dummy_buffer + shm.shm_addr_offset);
+            return upsert_from_internal(key, real_buffer, size, config);
+        }
+    }
+
+    LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
+               << ") not found in any mapped shared memory for client "
+               << client_id;
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+}
+
 std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_upsert_from_dummy_helper(
     const std::vector<std::string> &keys,
@@ -2129,6 +2295,96 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_dummy_helper(
     auto &context = it->second;
     return upsert_parts_internal(key, values, config,
                                  context.client_buffer_allocator);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (keys.size() != values.size()) {
+        LOG(ERROR) << "Key and value size mismatch";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<BufferHandle> buffer_handles;
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto &key = keys[i];
+        auto &value = values[i];
+        auto alloc_result =
+            client_buffer_allocator->allocate(value.size_bytes());
+        if (!alloc_result) {
+            LOG(ERROR)
+                << "Failed to allocate buffer for upsert_batch operation, key: "
+                << key << ", value size: " << value.size();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto &buffer_handle = *alloc_result;
+        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto slices = split_into_slices(buffer_handle);
+        buffer_handles.emplace_back(std::move(*alloc_result));
+        batched_slices.emplace(key, std::move(slices));
+    }
+
+    // Convert unordered_map to vector format expected by BatchUpsert
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+    for (const auto &key : keys) {
+        auto it = batched_slices.find(key);
+        if (it != batched_slices.end()) {
+            ordered_batched_slices.emplace_back(it->second);
+        } else {
+            LOG(ERROR) << "Missing slices for key: " << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
+
+    // Check if any operations failed
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            return tl::unexpected(results[i].error());
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_batch_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    return upsert_batch_internal(keys, values, config,
+                                 context.client_buffer_allocator);
+}
+
+int RealClient::upsert_batch(const std::vector<std::string> &keys,
+                              const std::vector<std::span<const char>> &values,
+                              const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_batch_internal(keys, values, config, client_buffer_allocator_));
 }
 
 // --- End Upsert implementations ---

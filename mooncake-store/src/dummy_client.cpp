@@ -398,8 +398,9 @@ int DummyClient::upsert(const std::string& key, std::span<const char> value,
 
 int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
                              const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
+    return to_py_ret(invoke_rpc<&RealClient::upsert_from_dummy_helper, void>(
+        key, dummy_addr, size, config, client_id_));
 }
 
 std::vector<int> DummyClient::batch_upsert_from(
@@ -425,6 +426,13 @@ int DummyClient::upsert_parts(const std::string& key,
                               const ReplicateConfig& config) {
     return to_py_ret(invoke_rpc<&RealClient::upsert_parts_dummy_helper, void>(
         key, values, config, client_id_));
+}
+
+int DummyClient::upsert_batch(const std::vector<std::string>& keys,
+                               const std::vector<std::span<const char>>& values,
+                               const ReplicateConfig& config) {
+    return to_py_ret(invoke_rpc<&RealClient::upsert_batch_dummy_helper, void>(
+        keys, values, config, client_id_));
 }
 
 int DummyClient::remove(const std::string& key, bool force) {
@@ -614,8 +622,9 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
+    return to_py_ret(invoke_rpc<&RealClient::put_from_dummy_helper, void>(
+        key, dummy_addr, size, config, client_id_));
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
@@ -642,8 +651,12 @@ int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
                                         void* metadata_buffer, size_t size,
                                         size_t metadata_size,
                                         const ReplicateConfig& config) {
-    // TODO: implement this function
-    return -1;
+    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
+    uint64_t dummy_metadata_addr = reinterpret_cast<uint64_t>(metadata_buffer);
+    return to_py_ret(
+        invoke_rpc<&RealClient::put_from_with_metadata_dummy_helper, void>(
+            key, dummy_addr, dummy_metadata_addr, size, metadata_size, config,
+            client_id_));
 }
 
 std::vector<int> DummyClient::batch_put_from_multi_buffers(
@@ -651,9 +664,25 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReplicateConfig& config) {
-    // TODO: implement this function
-    std::vector<int> vec(keys.size(), -1);
-    return vec;
+    std::vector<std::vector<uint64_t>> all_dummy_buffers;
+    all_dummy_buffers.reserve(all_buffer_ptrs.size());
+    for (const auto& buffer_ptrs : all_buffer_ptrs) {
+        std::vector<uint64_t> dummy_buffers;
+        dummy_buffers.reserve(buffer_ptrs.size());
+        for (auto ptr : buffer_ptrs) {
+            dummy_buffers.push_back(reinterpret_cast<uint64_t>(ptr));
+        }
+        all_dummy_buffers.push_back(std::move(dummy_buffers));
+    }
+    auto internal_results = invoke_batch_rpc<
+        &RealClient::batch_put_from_multi_buffers_dummy_helper, void>(
+        keys.size(), keys, all_dummy_buffers, all_sizes, config, client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
 }
 
 std::vector<int> DummyClient::batch_get_into_multi_buffers(

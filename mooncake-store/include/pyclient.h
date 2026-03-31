@@ -220,6 +220,11 @@ class PyClient {
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    virtual int upsert_batch(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
     virtual int remove(const std::string &key, bool force = false) = 0;

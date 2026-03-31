@@ -234,6 +234,10 @@ class RealClient : public PyClient {
                      std::vector<std::span<const char>> values,
                      const ReplicateConfig &config = ReplicateConfig{});
 
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
     [[nodiscard]] std::string get_hostname() const;
 
     /**
@@ -362,11 +366,20 @@ class RealClient : public PyClient {
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config, const UUID &client_id);
 
+    tl::expected<void, ErrorCode> upsert_from_dummy_helper(
+        const std::string &key, uint64_t dummy_buffer, size_t size,
+        const ReplicateConfig &config, const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &dummy_buffers,
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
         const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_batch_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config, const UUID &client_id);
 
     tl::expected<void, ErrorCode> put_batch_dummy_helper(
         const std::vector<std::string> &keys,
@@ -382,11 +395,27 @@ class RealClient : public PyClient {
         const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes,
         const UUID &client_id);
 
+    tl::expected<void, ErrorCode> put_from_dummy_helper(
+        const std::string &key, uint64_t dummy_buffer, size_t size,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> put_from_with_metadata_dummy_helper(
+        const std::string &key, uint64_t dummy_buffer,
+        uint64_t dummy_metadata_buffer, size_t size, size_t metadata_size,
+        const ReplicateConfig &config, const UUID &client_id);
+
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<uint64_t> &dummy_buffers,
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
         const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &all_dummy_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, const UUID &client_id);
 
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
@@ -469,6 +498,13 @@ class RealClient : public PyClient {
 
     tl::expected<void, ErrorCode> upsert_parts_internal(
         const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_batch_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{},
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
