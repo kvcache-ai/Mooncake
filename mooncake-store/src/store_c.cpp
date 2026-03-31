@@ -34,6 +34,10 @@ struct StoreHandle {
     std::shared_ptr<mooncake::RealClient> client;
 };
 
+inline const char *c_str_or(const char *s, const char *fallback) {
+    return s ? s : fallback;
+}
+
 mooncake::ReplicateConfig to_replicate_config(
     const mooncake_replicate_config_t *c_config) {
     mooncake::ReplicateConfig config;
@@ -70,20 +74,27 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 mooncake_store_t mooncake_store_create() {
-    auto client = mooncake::RealClient::create();
-    if (!client) return nullptr;
-    auto *handle = new (std::nothrow) StoreHandle{std::move(client)};
-    if (!handle) return nullptr;
-    return static_cast<mooncake_store_t>(handle);
+    try {
+        auto client = mooncake::RealClient::create();
+        if (!client) return nullptr;
+        auto *handle = new (std::nothrow) StoreHandle{std::move(client)};
+        if (!handle) return nullptr;
+        return static_cast<mooncake_store_t>(handle);
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 void mooncake_store_destroy(mooncake_store_t store) {
-    if (!store) return;
-    auto *handle = as_handle(store);
-    if (handle->client) {
-        handle->client->tearDownAll();
+    try {
+        if (!store) return;
+        auto *handle = as_handle(store);
+        if (handle->client) {
+            handle->client->tearDownAll();
+        }
+        delete handle;
+    } catch (...) {
     }
-    delete handle;
 }
 
 int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
@@ -93,26 +104,37 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          const char *device_name,
                          const char *master_server_addr) {
     if (!store) return -1;
-    return as_client(store)->setup_real(
-        local_hostname ? local_hostname : "",
-        metadata_server ? metadata_server : "", global_segment_size,
-        local_buffer_size, protocol ? protocol : "tcp",
-        device_name ? device_name : "",
-        master_server_addr ? master_server_addr : "127.0.0.1:50051");
+    try {
+        return as_client(store)->setup_real(
+            c_str_or(local_hostname, ""), c_str_or(metadata_server, ""),
+            global_segment_size, local_buffer_size,
+            c_str_or(protocol, "tcp"), c_str_or(device_name, ""),
+            c_str_or(master_server_addr, "127.0.0.1:50051"));
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,
                             uint64_t mount_segment_size) {
     if (!store) return -1;
-    return as_client(store)->initAll(protocol ? protocol : "",
-                                     device_name ? device_name : "",
-                                     mount_segment_size);
+    try {
+        return as_client(store)->initAll(c_str_or(protocol, ""),
+                                         c_str_or(device_name, ""),
+                                         mount_segment_size);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_health_check(mooncake_store_t store) {
     if (!store) return -1;
-    return as_client(store)->health_check();
+    try {
+        return as_client(store)->health_check();
+    } catch (...) {
+        return -1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,17 +146,25 @@ int mooncake_store_put(mooncake_store_t store, const char *key,
                        const mooncake_replicate_config_t *config) {
     if (!store || !key) return -1;
     if (!value && size > 0) return -1;
-    auto rc = to_replicate_config(config);
-    std::span<const char> data(static_cast<const char *>(value), size);
-    return as_client(store)->put(key, data, rc);
+    try {
+        auto rc = to_replicate_config(config);
+        std::span<const char> data(static_cast<const char *>(value), size);
+        return as_client(store)->put(key, data, rc);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_put_from(mooncake_store_t store, const char *key,
                             void *buffer, size_t size,
                             const mooncake_replicate_config_t *config) {
     if (!store || !key) return -1;
-    auto rc = to_replicate_config(config);
-    return as_client(store)->put_from(key, buffer, size, rc);
+    try {
+        auto rc = to_replicate_config(config);
+        return as_client(store)->put_from(key, buffer, size, rc);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_batch_put_from(mooncake_store_t store, const char **keys,
@@ -143,24 +173,26 @@ int mooncake_store_batch_put_from(mooncake_store_t store, const char **keys,
                                   const mooncake_replicate_config_t *config,
                                   int *results_out) {
     if (!store || !keys || !buffers || !sizes || !results_out) return -1;
+    try {
+        std::vector<std::string> key_vec;
+        key_vec.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            key_vec.emplace_back(c_str_or(keys[i], ""));
+        }
+        std::vector<void *> buf_vec(buffers, buffers + count);
+        std::vector<size_t> size_vec(sizes, sizes + count);
 
-    std::vector<std::string> key_vec(count);
-    std::vector<void *> buf_vec(count);
-    std::vector<size_t> size_vec(count);
-    for (size_t i = 0; i < count; ++i) {
-        key_vec[i] = keys[i] ? keys[i] : "";
-        buf_vec[i] = buffers[i];
-        size_vec[i] = sizes[i];
+        auto rc = to_replicate_config(config);
+        auto results =
+            as_client(store)->batch_put_from(key_vec, buf_vec, size_vec, rc);
+
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
     }
-
-    auto rc = to_replicate_config(config);
-    auto results =
-        as_client(store)->batch_put_from(key_vec, buf_vec, size_vec, rc);
-
-    for (size_t i = 0; i < count; ++i) {
-        results_out[i] = (i < results.size()) ? results[i] : -1;
-    }
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,29 +202,36 @@ int mooncake_store_batch_put_from(mooncake_store_t store, const char **keys,
 int64_t mooncake_store_get_into(mooncake_store_t store, const char *key,
                                 void *buffer, size_t size) {
     if (!store || !key) return -1;
-    return as_client(store)->get_into(key, buffer, size);
+    try {
+        return as_client(store)->get_into(key, buffer, size);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_batch_get_into(mooncake_store_t store, const char **keys,
                                   void **buffers, const size_t *sizes,
                                   size_t count, int64_t *results_out) {
     if (!store || !keys || !buffers || !sizes || !results_out) return -1;
+    try {
+        std::vector<std::string> key_vec;
+        key_vec.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            key_vec.emplace_back(c_str_or(keys[i], ""));
+        }
+        std::vector<void *> buf_vec(buffers, buffers + count);
+        std::vector<size_t> size_vec(sizes, sizes + count);
 
-    std::vector<std::string> key_vec(count);
-    std::vector<void *> buf_vec(count);
-    std::vector<size_t> size_vec(count);
-    for (size_t i = 0; i < count; ++i) {
-        key_vec[i] = keys[i] ? keys[i] : "";
-        buf_vec[i] = buffers[i];
-        size_vec[i] = sizes[i];
+        auto results =
+            as_client(store)->batch_get_into(key_vec, buf_vec, size_vec);
+
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
     }
-
-    auto results = as_client(store)->batch_get_into(key_vec, buf_vec, size_vec);
-
-    for (size_t i = 0; i < count; ++i) {
-        results_out[i] = (i < results.size()) ? results[i] : -1;
-    }
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,38 +240,54 @@ int mooncake_store_batch_get_into(mooncake_store_t store, const char **keys,
 
 int mooncake_store_is_exist(mooncake_store_t store, const char *key) {
     if (!store || !key) return -1;
-    return as_client(store)->isExist(key);
+    try {
+        return as_client(store)->isExist(key);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
                                   size_t count, int *results_out) {
     if (!store || !keys || !results_out) return -1;
+    try {
+        std::vector<std::string> key_vec;
+        key_vec.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            key_vec.emplace_back(c_str_or(keys[i], ""));
+        }
 
-    std::vector<std::string> key_vec(count);
-    for (size_t i = 0; i < count; ++i) {
-        key_vec[i] = keys[i] ? keys[i] : "";
+        auto results = as_client(store)->batchIsExist(key_vec);
+
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
     }
-
-    auto results = as_client(store)->batchIsExist(key_vec);
-
-    for (size_t i = 0; i < count; ++i) {
-        results_out[i] = (i < results.size()) ? results[i] : -1;
-    }
-    return 0;
 }
 
 int64_t mooncake_store_get_size(mooncake_store_t store, const char *key) {
     if (!store || !key) return -1;
-    return as_client(store)->getSize(key);
+    try {
+        return as_client(store)->getSize(key);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_get_hostname(mooncake_store_t store, char *buf_out,
                                 size_t buf_len) {
     if (!store || !buf_out || buf_len == 0) return -1;
-    std::string hostname = as_client(store)->get_hostname();
-    if (hostname.size() >= buf_len) return -1;
-    std::memcpy(buf_out, hostname.c_str(), hostname.size() + 1);
-    return 0;
+    try {
+        std::string hostname = as_client(store)->get_hostname();
+        if (hostname.size() >= buf_len) return -1;
+        std::memcpy(buf_out, hostname.c_str(), hostname.size() + 1);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,19 +296,31 @@ int mooncake_store_get_hostname(mooncake_store_t store, char *buf_out,
 
 int mooncake_store_remove(mooncake_store_t store, const char *key, int force) {
     if (!store || !key) return -1;
-    return as_client(store)->remove(key, force != 0);
+    try {
+        return as_client(store)->remove(key, force != 0);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int64_t mooncake_store_remove_by_regex(mooncake_store_t store,
                                        const char *pattern, int force) {
     if (!store || !pattern) return -1;
-    return static_cast<int64_t>(
-        as_client(store)->removeByRegex(pattern, force != 0));
+    try {
+        return static_cast<int64_t>(
+            as_client(store)->removeByRegex(pattern, force != 0));
+    } catch (...) {
+        return -1;
+    }
 }
 
 int64_t mooncake_store_remove_all(mooncake_store_t store, int force) {
     if (!store) return -1;
-    return static_cast<int64_t>(as_client(store)->removeAll(force != 0));
+    try {
+        return static_cast<int64_t>(as_client(store)->removeAll(force != 0));
+    } catch (...) {
+        return -1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,12 +330,20 @@ int64_t mooncake_store_remove_all(mooncake_store_t store, int force) {
 int mooncake_store_register_buffer(mooncake_store_t store, void *buffer,
                                    size_t size) {
     if (!store || !buffer || size == 0) return -1;
-    return as_client(store)->register_buffer(buffer, size);
+    try {
+        return as_client(store)->register_buffer(buffer, size);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer) {
     if (!store) return -1;
-    return as_client(store)->unregister_buffer(buffer);
+    try {
+        return as_client(store)->unregister_buffer(buffer);
+    } catch (...) {
+        return -1;
+    }
 }
 
 }  // extern "C"
