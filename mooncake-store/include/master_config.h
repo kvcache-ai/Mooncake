@@ -17,6 +17,7 @@ struct MasterConfig {
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
+    std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
