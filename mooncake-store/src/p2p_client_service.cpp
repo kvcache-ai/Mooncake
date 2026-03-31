@@ -642,9 +642,10 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
 
 std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     const std::vector<std::string>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
     const ReadRouteConfig& config, bool /*aggregate_same_segment_task*/) {
-    if (keys.size() != batched_slices.size()) {
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -653,23 +654,32 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     std::vector<tl::expected<int64_t, ErrorCode>> results;
     results.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results.push_back(Get(keys[i], batched_slices[i], config));
+        results.push_back(Get(keys[i], all_buffers[i], all_sizes[i], config));
     }
     return results;
 }
 
 tl::expected<int64_t, ErrorCode> P2PClientService::Get(
-    const std::string& key, std::vector<Slice>& slices,
-    const ReadRouteConfig& config) {
+    const std::string& key, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
         return tl::unexpected(ErrorCode::SHUTTING_DOWN);
     }
 
+    // Attention:
+    // if Slice's size is larger than actual data size:
+    // 1. in local scene, the memcpy() could run normally
+    // 2. in remote scene, TE will return error code
+    // (currently, TE simplythinks the Slices's size is data size)
     // Step 1: Try local first via GetLocal
     if (data_manager_.has_value()) {
-        auto local_result = GetLocal(key, slices);
+        std::vector<Slice> local_slices;
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            local_slices.emplace_back(Slice{buffers[i], sizes[i]});
+        }
+        auto local_result = GetLocal(key, local_slices);
         if (local_result) {
             return static_cast<int64_t>(local_result.value());
         }
@@ -684,7 +694,8 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
     }
     auto& [replicas, total_size] = size_result.value();
 
-    size_t provided_size = ClientService::CalculateSliceSize(slices);
+    size_t provided_size = 0;
+    for (auto s : sizes) provided_size += s;
     if (provided_size < total_size) {
         LOG(ERROR) << "Buffer too small for key '" << key
                    << "': required=" << total_size
@@ -692,10 +703,8 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Trim slices to actual data size to avoid reading beyond remote buffer
-    TrimSlicesToSize(slices, total_size);
-
-    // Step 3: Remote get
+    // Step 3: Build correctly-sized slices and remote get
+    auto slices = BuildSlicesFromBuffers(buffers, sizes, total_size);
     auto remote_result = GetRemoteViaRoute(key, slices, replicas);
     if (!remote_result) {
         return tl::unexpected(remote_result.error());

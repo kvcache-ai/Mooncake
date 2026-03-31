@@ -986,9 +986,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<Slice> slices;
-    slices.emplace_back(Slice{buffer, size});
-    return client_service_->Get(key, slices, config);
+    return client_service_->Get(key, {buffer}, {size}, config);
 }
 
 int64_t RealClient::get_into(const std::string& key, void* buffer, size_t size,
@@ -1267,11 +1265,13 @@ RealClient::batch_get_into_internal(const std::vector<std::string>& keys,
         return {};
     }
 
-    std::vector<std::vector<Slice>> batched_slices(keys.size());
+    std::vector<std::vector<void*>> all_buffers(keys.size());
+    std::vector<std::vector<size_t>> all_sizes(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        batched_slices[i].emplace_back(Slice{buffers[i], sizes[i]});
+        all_buffers[i] = {buffers[i]};
+        all_sizes[i] = {sizes[i]};
     }
-    return client_service_->BatchGet(keys, batched_slices, config);
+    return client_service_->BatchGet(keys, all_buffers, all_sizes, config);
 }
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
@@ -1443,27 +1443,11 @@ RealClient::batch_get_into_multi_buffers_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    const size_t num_keys = keys.size();
-    if (num_keys == 0) {
+    if (keys.empty()) {
         return {};
     }
 
-    std::vector<std::vector<Slice>> batched_slices(num_keys);
-    for (size_t i = 0; i < num_keys; ++i) {
-        const auto& item_buffers = all_buffers[i];
-        const auto& item_sizes = all_sizes[i];
-        if (item_buffers.size() != item_sizes.size()) {
-            LOG(ERROR) << "Buffer/size mismatch for key[ " << i << "]";
-            return std::vector<tl::expected<int64_t, ErrorCode>>(
-                num_keys, tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        for (size_t j = 0; j < item_buffers.size(); ++j) {
-            batched_slices[i].emplace_back(
-                Slice{item_buffers[j], item_sizes[j]});
-        }
-    }
-
-    return client_service_->BatchGet(keys, batched_slices, config,
+    return client_service_->BatchGet(keys, all_buffers, all_sizes, config,
                                      prefer_alloc_in_same_node);
 }
 

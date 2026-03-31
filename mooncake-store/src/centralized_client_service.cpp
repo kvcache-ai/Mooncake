@@ -519,8 +519,8 @@ CentralizedClientService::BatchGet(
 }
 
 tl::expected<int64_t, ErrorCode> CentralizedClientService::Get(
-    const std::string& key, std::vector<Slice>& slices,
-    const ReadRouteConfig& config) {
+    const std::string& key, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
     // Step 1: Query metadata from master
     auto query_result = Query(key, config);
     if (!query_result) {
@@ -541,18 +541,17 @@ tl::expected<int64_t, ErrorCode> CentralizedClientService::Get(
         LOG(ERROR) << "Empty replica list for key: " << key;
         return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
-    size_t slices_size = ClientService::CalculateSliceSize(slices);
-    if (slices_size < total_size) {
+    size_t provided_size = 0;
+    for (auto s : sizes) provided_size += s;
+    if (provided_size < total_size) {
         LOG(ERROR) << "Buffer too small for key '" << key
                    << "': required=" << total_size
-                   << ", provided=" << slices_size;
+                   << ", provided=" << provided_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Trim slices to actual data size to avoid reading beyond remote buffer
-    TrimSlicesToSize(slices, total_size);
-
-    // Step 3: Transfer data
+    // Step 3: Build correctly-sized slices and transfer data
+    auto slices = BuildSlicesFromBuffers(buffers, sizes, total_size);
     auto get_result = InnerGet(key, *query_result.value(), slices);
     if (!get_result) {
         return tl::unexpected(get_result.error());
@@ -564,9 +563,11 @@ tl::expected<int64_t, ErrorCode> CentralizedClientService::Get(
 std::vector<tl::expected<int64_t, ErrorCode>>
 CentralizedClientService::BatchGet(
     const std::vector<std::string>& keys,
-    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
     const ReadRouteConfig& config, bool aggregate_same_segment_task) {
-    if (keys.size() != batched_slices.size()) {
+    if (keys.size() != all_buffers.size() ||
+        keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -610,25 +611,25 @@ CentralizedClientService::BatchGet(
 
         const auto& replica = query_ptr->replicas[0];
         uint64_t total_size = calculate_total_size(replica);
-        size_t current_slices_size =
-            ClientService::CalculateSliceSize(batched_slices[i]);
+        size_t provided_size = 0;
+        for (auto s : all_sizes[i]) provided_size += s;
 
-        if (current_slices_size < total_size) {
+        if (provided_size < total_size) {
             LOG(ERROR) << "Buffer too small for key '" << keys[i]
                        << "': required=" << total_size
-                       << ", available=" << current_slices_size;
+                       << ", available=" << provided_size;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
 
-        // Trim slices to actual data size to avoid reading beyond remote buffer
-        std::vector<Slice> trimmed_slices = batched_slices[i];
-        TrimSlicesToSize(trimmed_slices, total_size);
+        // Build correctly-sized slices from user buffers
+        auto slices =
+            BuildSlicesFromBuffers(all_buffers[i], all_sizes[i], total_size);
 
         // Optimistic: set success result now, override on failure
         results.emplace_back(static_cast<int64_t>(total_size));
         valid_ops.push_back(
-            {i, std::move(query_ptr), std::move(trimmed_slices), total_size});
+            {i, std::move(query_ptr), std::move(slices), total_size});
     }
 
     if (valid_ops.empty()) {

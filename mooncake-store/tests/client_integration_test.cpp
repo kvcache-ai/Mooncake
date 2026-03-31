@@ -317,16 +317,12 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
     // Verify data through Get operation
-    auto get_result = test_client_->Get(key, slices);
+    auto get_result = test_client_->Get(key, {buffer}, {test_data.size()});
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(slices.size(), 1);
-    ASSERT_EQ(slices[0].size, test_data.size());
-    ASSERT_EQ(slices[0].ptr, buffer);
-    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    ASSERT_EQ(get_result.value(), static_cast<int64_t>(test_data.size()));
+    ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Put again with the same key, should succeed
@@ -380,9 +376,7 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
 
     // Try to get the removed data - should fail
     buffer = client_buffer_allocator_->allocate(test_data.size());
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
-    auto get_result = test_client_->Get(key, slices);
+    auto get_result = test_client_->Get(key, {buffer}, {test_data.size()});
     ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 }
@@ -412,8 +406,6 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
 
     // Verify data through Get operation
     buffer = client_buffer_allocator_->allocate(test_data.size());
-    slices.clear();
-    slices.emplace_back(Slice{buffer, test_data.size()});
 
     auto query_result = test_client_->Query(key);
     ASSERT_TRUE(query_result.has_value())
@@ -425,12 +417,11 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
                   .buffer_descriptor.transport_endpoint_,
               segment_provider_client_->GetTransportEndpoint());
 
-    auto get_result = test_client_->Get(key, slices);
+    auto get_result = test_client_->Get(key, {buffer}, {test_data.size()});
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(slices.size(), 1);
-    ASSERT_EQ(slices[0].size, test_data.size());
-    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    ASSERT_EQ(get_result.value(), static_cast<int64_t>(test_data.size()));
+    ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Clean up
@@ -466,15 +457,12 @@ TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
         client_buffer_allocator_->deallocate(buffer, data_size);
         // Get and verify data
         buffer = client_buffer_allocator_->allocate(data_size);
-        std::vector<Slice> get_slices;
-        get_slices.emplace_back(Slice{buffer, data_size});
-        auto get_result = test_client_->Get(key, get_slices);
+        auto get_result = test_client_->Get(key, {buffer}, {data_size});
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
-        ASSERT_EQ(get_slices[0].size, data_size);
+        ASSERT_EQ(get_result.value(), static_cast<int64_t>(data_size));
 
-        std::string retrieved_data(static_cast<const char*>(get_slices[0].ptr),
-                                   get_slices[0].size);
+        std::string retrieved_data(static_cast<const char*>(buffer), data_size);
         EXPECT_EQ(retrieved_data, large_data);
         client_buffer_allocator_->deallocate(buffer, data_size);
     }
@@ -544,16 +532,17 @@ TEST_F(ClientIntegrationTest, LargeAllocateTest) {
         memset(buffers[i], 0, data_size);
     }
 
-    // Get operation
-    auto get_result = test_client_->Get(key, slices);
+    // Get operation with multiple buffers
+    std::vector<void*> get_buffers(buffers.begin(), buffers.end());
+    std::vector<size_t> get_sizes(kNumBuffers, data_size);
+    auto get_result = test_client_->Get(key, get_buffers, get_sizes);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
 
     // Verify data and deallocate buffers
     for (size_t i = 0; i < kNumBuffers; ++i) {
-        ASSERT_EQ(slices[i].size, data_size);
-        std::string retrieved_data(static_cast<const char*>(slices[i].ptr),
-                                   slices[i].size);
+        std::string retrieved_data(static_cast<const char*>(buffers[i]),
+                                   data_size);
         std::string expected_data(data_size, 'A' + i);
         EXPECT_EQ(
             memcmp(retrieved_data.data(), expected_data.data(), data_size), 0);
@@ -607,11 +596,10 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
 
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < batch_sz; i++) {
-        std::vector<Slice> slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
-        auto get_result = test_client_->Get(keys[i], slices);
+        auto get_result = test_client_->Get(
+            keys[i], {target_buffer}, {test_data_list[i].size()});
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,
@@ -625,18 +613,20 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     start = std::chrono::high_resolution_clock::now();
-    std::vector<std::vector<Slice>> target_batched_slices;
-    target_batched_slices.reserve(batch_sz);
+    std::vector<std::vector<void*>> batch_get_buffers;
+    std::vector<std::vector<size_t>> batch_get_sizes;
+    batch_get_buffers.reserve(batch_sz);
+    batch_get_sizes.reserve(batch_sz);
+    std::vector<void*> allocated_buffers;
     for (int i = 0; i < batch_sz; i++) {
-        std::vector<Slice> target_slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        target_slices.emplace_back(
-            Slice{target_buffer, test_data_list[i].size()});
-        target_batched_slices.push_back(std::move(target_slices));
+        batch_get_buffers.push_back({target_buffer});
+        batch_get_sizes.push_back({test_data_list[i].size()});
+        allocated_buffers.push_back(target_buffer);
     }
     auto batch_get_results =
-        test_client_->BatchGet(keys, target_batched_slices);
+        test_client_->BatchGet(keys, batch_get_buffers, batch_get_sizes);
     for (const auto& result : batch_get_results) {
         ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
     }
@@ -648,11 +638,12 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
               << "us";
 
     for (int i = 0; i < batch_sz; i++) {
-        ASSERT_EQ(target_batched_slices[i][0].size, test_data_list[i].size());
-        ASSERT_EQ(memcmp(target_batched_slices[i][0].ptr,
-                         test_data_list[i].data(), test_data_list[i].size()),
+        ASSERT_EQ(batch_get_results[i].value(),
+                  static_cast<int64_t>(test_data_list[i].size()));
+        ASSERT_EQ(memcmp(allocated_buffers[i], test_data_list[i].data(),
+                         test_data_list[i].size()),
                   0);
-        client_buffer_allocator_->deallocate(target_batched_slices[i][0].ptr,
+        client_buffer_allocator_->deallocate(allocated_buffers[i],
                                              test_data_list[i].size());
     }
 }

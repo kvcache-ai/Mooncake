@@ -133,4 +133,18 @@ int allocateSlices(std::vector<Slice>& slices,
     return 0;
 }
 
+std::vector<Slice> BuildSlicesFromBuffers(
+    const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes,
+    uint64_t total_size) {
+    std::vector<Slice> slices;
+    uint64_t remaining = total_size;
+    for (size_t i = 0; i < buffers.size() && remaining > 0; ++i) {
+        size_t chunk = std::min(static_cast<uint64_t>(sizes[i]), remaining);
+        slices.emplace_back(Slice{buffers[i], chunk});
+        remaining -= chunk;
+    }
+    return slices;
+}
+
 }  // namespace mooncake

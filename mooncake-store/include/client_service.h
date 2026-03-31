@@ -145,30 +145,34 @@ class ClientService {
              const ReadRouteConfig& config = {}) = 0;
 
     /**
-     * @brief Gets data without memory allocation
+     * @brief Gets data into user-provided buffers without memory allocation
      * @param key Object key
-     * @param slices Vector of read buffer slices
+     * @param buffers Vector of destination buffer pointers
+     * @param sizes Vector of buffer sizes (must match buffers.size())
      * @param config Read route config
      * @return Number of bytes read on success. ErrorCode on failure.
      */
     virtual tl::expected<int64_t, ErrorCode> Get(
-        const std::string& key, std::vector<Slice>& slices,
+        const std::string& key, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes,
         const ReadRouteConfig& config = {}) = 0;
 
     /**
-     * @brief Batch get data with replication
+     * @brief Batch get data into user-provided buffers
      * @param keys Object keys
-     * @param batched_slices Vector of vectors of read buffer slices
+     * @param all_buffers Vector of buffer pointer vectors (one per key)
+     * @param all_sizes Vector of buffer size vectors (one per key)
      * @param config Read route config
      * @param aggregate_same_segment_task
-     * Whether to aggregate read tasks on the same segment .
+     * Whether to aggregate read tasks on the same segment.
      * If false, each key will be generated as a independent task.
      * Otherwise, the tasks will be aggregated on the same segment.
      * @return Vector of bytes read on success. ErrorCode on failure.
      */
     virtual std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
         const std::vector<std::string>& keys,
-        std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<std::vector<void*>>& all_buffers,
+        const std::vector<std::vector<size_t>>& all_sizes,
         const ReadRouteConfig& config = {},
         bool aggregate_same_segment_task = false) = 0;
 
@@ -336,14 +340,6 @@ class ClientService {
      */
     [[nodiscard]] static size_t CalculateSliceSize(
         std::span<const Slice> slices);
-
-    /**
-     * @brief Trim slices so their total size does not exceed total_size.
-     * @param slices Vector of slices to trim in-place.
-     * @param total_size Maximum total size in bytes.
-     */
-    static void TrimSlicesToSize(std::vector<Slice>& slices,
-                                 uint64_t total_size);
 
    protected:
     /**

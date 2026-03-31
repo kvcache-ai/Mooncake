@@ -116,9 +116,7 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
         throw std::runtime_error("Failed to allocate memory for Get");
     }
 
-    std::vector<Slice> get_slices_call;
-    get_slices_call.emplace_back(Slice{buffer, (size_t)total_size});
-    auto get_result = client_->Get(key, get_slices_call);
+    auto get_result = client_->Get(key, {buffer}, {(size_t)total_size});
     if (!get_result.has_value()) {
         allocator_->deallocate(buffer, total_size);
         return get_result.error();

@@ -105,12 +105,14 @@ class P2PClientService final : public ClientService {
              const ReadRouteConfig& config = {}) override;
 
     tl::expected<int64_t, ErrorCode> Get(
-        const std::string& key, std::vector<Slice>& slices,
+        const std::string& key, const std::vector<void*>& buffers,
+        const std::vector<size_t>& sizes,
         const ReadRouteConfig& config = {}) override;
 
     std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
         const std::vector<std::string>& keys,
-        std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<std::vector<void*>>& all_buffers,
+        const std::vector<std::vector<size_t>>& all_sizes,
         const ReadRouteConfig& config = {},
         bool aggregate_same_segment_task = false) override;
 
