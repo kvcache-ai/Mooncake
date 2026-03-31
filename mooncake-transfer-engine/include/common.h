@@ -113,6 +113,10 @@ static inline int64_t getCurrentTimeInNano() {
     return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
 }
 
+static inline int64_t getCurrentTimeInMilli() {
+    return getCurrentTimeInNano() / 1000 / 1000;
+}
+
 static inline std::string getCurrentDateTime() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
