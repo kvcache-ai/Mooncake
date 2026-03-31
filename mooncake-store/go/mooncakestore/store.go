@@ -436,11 +436,7 @@ func (s *Store) Hostname() (string, error) {
 	if ret != 0 {
 		return "", ErrHostname
 	}
-	n := 0
-	for n < len(buf) && buf[n] != 0 {
-		n++
-	}
-	return string(buf[:n]), nil
+	return C.GoString((*C.char)(unsafe.Pointer(&buf[0]))), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +531,7 @@ func (s *Store) UnregisterBuffer(ptr uintptr) error {
 	}
 	ret := C.mooncake_store_unregister_buffer(s.handle, unsafe.Pointer(ptr))
 	if ret != 0 {
-		return ErrRegisterBuffer
+		return ErrUnregisterBuffer
 	}
 	return nil
 }

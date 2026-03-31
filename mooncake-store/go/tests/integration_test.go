@@ -75,7 +75,7 @@ func TestPutGetRoundTrip(t *testing.T) {
 		t.Fatalf("expected size=%d, got %d", len(value), size)
 	}
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, size)
 	n, err := s.Get(key, buf)
 	if err != nil {
 		t.Fatalf("Get() failed: %v", err)
