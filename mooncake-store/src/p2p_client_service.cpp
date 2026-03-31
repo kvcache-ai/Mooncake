@@ -692,6 +692,9 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Trim slices to actual data size to avoid reading beyond remote buffer
+    TrimSlicesToSize(slices, total_size);
+
     // Step 3: Remote get
     auto remote_result = GetRemoteViaRoute(key, slices, replicas);
     if (!remote_result) {

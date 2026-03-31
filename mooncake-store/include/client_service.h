@@ -337,6 +337,14 @@ class ClientService {
     [[nodiscard]] static size_t CalculateSliceSize(
         std::span<const Slice> slices);
 
+    /**
+     * @brief Trim slices so their total size does not exceed total_size.
+     * @param slices Vector of slices to trim in-place.
+     * @param total_size Maximum total size in bytes.
+     */
+    static void TrimSlicesToSize(std::vector<Slice>& slices,
+                                 uint64_t total_size);
+
    protected:
     /**
      * @brief Private constructor to enforce creation through Create() method

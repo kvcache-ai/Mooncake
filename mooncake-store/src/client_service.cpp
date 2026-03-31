@@ -32,6 +32,23 @@ size_t ClientService::CalculateSliceSize(std::span<const Slice> slices) {
     return slice_size;
 }
 
+void ClientService::TrimSlicesToSize(std::vector<Slice>& slices,
+                                     uint64_t total_size) {
+    uint64_t remaining = total_size;
+    size_t last_valid = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        if (remaining == 0) {
+            break;
+        }
+        if (slices[i].size > remaining) {
+            slices[i].size = remaining;
+        }
+        remaining -= slices[i].size;
+        last_valid = i + 1;
+    }
+    slices.resize(last_valid);
+}
+
 ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
                              const std::string& metadata_connstring,
                              const std::map<std::string, std::string>& labels)

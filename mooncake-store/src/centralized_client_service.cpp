@@ -549,6 +549,9 @@ tl::expected<int64_t, ErrorCode> CentralizedClientService::Get(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Trim slices to actual data size to avoid reading beyond remote buffer
+    TrimSlicesToSize(slices, total_size);
+
     // Step 3: Transfer data
     auto get_result = InnerGet(key, *query_result.value(), slices);
     if (!get_result) {
@@ -618,10 +621,14 @@ CentralizedClientService::BatchGet(
             continue;
         }
 
+        // Trim slices to actual data size to avoid reading beyond remote buffer
+        std::vector<Slice> trimmed_slices = batched_slices[i];
+        TrimSlicesToSize(trimmed_slices, total_size);
+
         // Optimistic: set success result now, override on failure
         results.emplace_back(static_cast<int64_t>(total_size));
         valid_ops.push_back(
-            {i, std::move(query_ptr), batched_slices[i], total_size});
+            {i, std::move(query_ptr), std::move(trimmed_slices), total_size});
     }
 
     if (valid_ops.empty()) {
