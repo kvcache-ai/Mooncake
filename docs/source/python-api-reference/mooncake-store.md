@@ -721,6 +721,39 @@ print(f"Removed {count} objects")
 
 ---
 
+#### batch_remove()
+Remove multiple objects by their keys in a single batch operation.
+
+```python
+def batch_remove(self, keys: List[str], force: bool = False) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to remove
+- `force` (bool): If True, skip lease and replication task checks (default: False)
+
+**Returns:**
+- `List[int]`: List of status codes for each key (0 = success, negative = error code)
+
+**Example:**
+```python
+# Remove multiple keys in one batch
+keys = ["key1", "key2", "key3", "key4", "key5"]
+results = store.batch_remove(keys)
+
+# Check results
+for key, result in zip(keys, results):
+    if result == 0:
+        print(f"✓ {key} removed successfully")
+    else:
+        print(f"✗ {key} failed with error code: {result}")
+
+# Force remove (bypass lease checks)
+results = store.batch_remove(keys, force=True)
+```
+
+---
+
 #### is_exist()
 Check if an object exists in the storage system.
 

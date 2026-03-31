@@ -108,6 +108,9 @@ class DummyClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
+
     int isExist(const std::string &key);
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);

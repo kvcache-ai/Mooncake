@@ -108,6 +108,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
+    static constexpr const char* value = "BatchRemove";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MountSegment> {
     static constexpr const char* value = "MountSegment";
 };
@@ -555,6 +560,17 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
 
     auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>(force);
     timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
+    const std::vector<std::string>& keys, bool force) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchRemove");
+    timer.LogRequest("keys_count=", keys.size(), ", force=", force);
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchRemove, void>(
+        keys.size(), keys, force);
+    timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 

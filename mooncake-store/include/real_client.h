@@ -244,6 +244,9 @@ class RealClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
+
     int tearDownAll();
 
     int health_check() override;
@@ -485,6 +488,9 @@ class RealClient : public PyClient {
                                                          bool force = false);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
+
+    std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
+        const std::vector<std::string> &keys, bool force = false);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 

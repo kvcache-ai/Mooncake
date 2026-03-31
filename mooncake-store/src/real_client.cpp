@@ -1122,6 +1122,32 @@ long RealClient::removeAll(bool force) {
     return to_py_ret(removeAll_internal(force));
 }
 
+std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
+    const std::vector<std::string> &keys, bool force) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchRemove(keys, force);
+}
+
+std::vector<int> RealClient::batchRemove(const std::vector<std::string> &keys,
+                                         bool force) {
+    auto results = batchRemove_internal(keys, force);
+    std::vector<int> ret;
+    ret.reserve(results.size());
+
+    for (const auto &item : results) {
+        if (item.has_value()) {
+            ret.push_back(0);
+        } else {
+            ret.push_back(toInt(item.error()));
+        }
+    }
+    return ret;
+}
+
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string &key) {
     if (!client_) {

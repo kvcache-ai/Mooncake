@@ -228,6 +228,15 @@ class Client {
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<ObjectKey>& keys, bool force = false);
+
+    /**
      * @brief Notify master that a disk replica was evicted locally
      * @param key The evicted object key
      * @param replica_type DISK or LOCAL_DISK

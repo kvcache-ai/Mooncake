@@ -1381,6 +1381,16 @@ PYBIND11_MODULE(store, m) {
             py::arg("force") = false,
             "Remove all objects from the store. If force=True, skip lease "
             "and replication task checks.")
+        .def(
+            "batch_remove",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys, bool force) {
+                py::gil_scoped_release release;
+                return self.store_->batchRemove(keys, force);
+            },
+            py::arg("keys"), py::arg("force") = false,
+            "Batch remove objects by keys. Returns a list of status codes "
+            "(0=success, negative=error code) for each key.")
         .def("is_exist",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

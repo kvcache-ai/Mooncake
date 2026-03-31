@@ -85,6 +85,9 @@ class WrappedMasterService {
 
     long RemoveAll(bool force = false);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<std::string>& keys, bool force = false);
+
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
 

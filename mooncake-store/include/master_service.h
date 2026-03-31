@@ -336,6 +336,15 @@ class MasterService {
     long RemoveAll(bool force = false);
 
     /**
+     * @brief Batch remove objects and their replicas
+     * @param keys The list of keys to remove.
+     * @param force If true, skip lease and replication task checks.
+     * @return Vector of expected results for each key.
+     */
+    auto BatchRemove(const std::vector<std::string>& keys, bool force = false)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+
+    /**
      * @brief Get the count of keys
      * @return The count of keys
      */
