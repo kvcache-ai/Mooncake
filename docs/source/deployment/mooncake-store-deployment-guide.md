@@ -8,6 +8,7 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--rpc_port` (int, default 50051): RPC listen port.
   - `--rpc_thread_num` (int, default min(4, CPU cores)): RPC worker threads. If not set, uses `--max_threads` (default 4) capped by CPU cores.
   - `--rpc_address` (str, default `0.0.0.0`): RPC bind address.
+  - `--rpc_interface` (str, default empty): Network interface used to resolve the final RPC address. When set, Mooncake Master resolves the interface's current IPv4 address at startup and uses it as the final `rpc_address`. This overrides `--rpc_address`.
   - `--rpc_conn_timeout_seconds` (int, default `0`): RPC idle connection timeout; `0` disables.
   - `--rpc_enable_tcp_no_delay` (bool, default `true`): Enable TCP_NODELAY.
 
@@ -74,6 +75,18 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
+Example (resolve the master RPC address from a stable interface name in a container):
+
+```bash
+mooncake_master \
+  --rpc_interface=eth0 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
+```
+
+This resolves the current IPv4 address of `eth0` at startup and uses it as the final `rpc_address`.
+
 Example (use free-ratio-first allocation strategy for better load balancing):
 
 ```bash
@@ -90,6 +103,13 @@ In addition to command-line flags, the Master also supports configuration via JS
 ```bash
 mooncake_master \
   --config_path=mooncake-store/conf/master.yaml
+```
+
+For config files, the equivalent setting is:
+
+```yaml
+rpc_interface: "eth0"
+rpc_port: 50051
 ```
 
 ## Metrics Endpoints
