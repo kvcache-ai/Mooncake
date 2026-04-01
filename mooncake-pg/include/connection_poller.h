@@ -88,7 +88,7 @@ class ConnectionContext {
     std::mutex backend_wakeup_mutex_;
     std::condition_variable backend_wakeup_cv_;
 
-    bool resource_abandoned_;
+    bool resource_abandoned_{false};
 
    public:
     ConnectionContext(int backendIndex, int rank, int size, bool isDummy,

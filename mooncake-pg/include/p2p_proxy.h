@@ -256,7 +256,7 @@ class P2PProxy {
     int cuda_device_index_ = -1;
     std::string location_;
     P2PResources resources_;
-    bool resource_abandoned_;
+    bool resource_abandoned_{false};
 
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;

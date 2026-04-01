@@ -458,13 +458,13 @@ bool ConnectionContext::tryStop() {
             continue;
         }
 
-        if (peerState.state != PeerConnectionState::WAITING_PEER_WARMUP) {
+        if (peerState.state != PeerConnectionState::WAITING_WARMUP_TRANSFER) {
             peerState.state = PeerConnectionState::EXPIRING;
             continue;
         }
 
-        // For WAITING_PEER_WARMUP, wait for the existing transfer to complete
-        // so that we can safely release the registered memory.
+        // For WAITING_WARMUP_TRANSFER, wait for the existing transfer to
+        // complete so that we can safely release the registered memory.
         TransferStatus status;
         engine_->getTransferStatus(peerState.warmupBatchId.value(), 0, status);
 
