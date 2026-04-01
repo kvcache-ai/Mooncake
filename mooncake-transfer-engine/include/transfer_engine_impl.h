@@ -54,6 +54,100 @@ using BufferEntry = Transport::BufferEntry;
 using RegisteredBuffer = TransferEngine::RegisteredBuffer;
 #endif
 
+inline const char* ToTransferStatusName(TransferStatusEnum status) {
+    switch (status) {
+        case TransferStatusEnum::WAITING:
+            return "WAITING";
+        case TransferStatusEnum::PENDING:
+            return "PENDING";
+        case TransferStatusEnum::INVALID:
+            return "INVALID";
+        case TransferStatusEnum::CANCELED:
+            return "CANCELED";
+        case TransferStatusEnum::COMPLETED:
+            return "COMPLETED";
+        case TransferStatusEnum::TIMEOUT:
+            return "TIMEOUT";
+        case TransferStatusEnum::FAILED:
+            return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+class ActiveBatchTraceRegistry {
+   public:
+    struct EnsureResult {
+        mooncake::tracing::TraceContext context;
+        bool created{false};
+    };
+
+    EnsureResult EnsureRoot(mooncake::tracing::TracingFacade& tracing,
+                            BatchID batch_id) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = spans_.find(batch_id);
+        if (it != spans_.end()) {
+            return {it->second.context, false};
+        }
+
+        auto root = tracing.StartSpan("te.batch", nullptr,
+                                      {{"te.batch_id",
+                                        std::to_string(batch_id)}});
+        if (!root.valid()) {
+            return {};
+        }
+        root.AddEvent("batch trace root established");
+
+        auto [inserted, ok] = spans_.try_emplace(batch_id);
+        inserted->second.context = root.context();
+        inserted->second.span = std::move(root);
+        return {inserted->second.context, ok};
+    }
+
+    std::optional<mooncake::tracing::TraceContext> LookupContext(
+        BatchID batch_id) const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = spans_.find(batch_id);
+        if (it == spans_.end()) {
+            return std::nullopt;
+        }
+        return it->second.context;
+    }
+
+    bool Finish(BatchID batch_id, const std::string& event_name,
+                const mooncake::tracing::TraceAttrs& attrs = {},
+                bool error = false) {
+        std::optional<ActiveBatchSpan> active;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            auto it = spans_.find(batch_id);
+            if (it == spans_.end()) {
+                return false;
+            }
+            active.emplace(std::move(it->second));
+            spans_.erase(it);
+        }
+
+        for (const auto& attr : attrs) {
+            active->span.SetAttribute(attr.first, attr.second);
+        }
+        active->span.AddEvent(event_name, attrs);
+        if (error) {
+            active->span.SetStatus("ERROR");
+        }
+        active->span.End();
+        return true;
+    }
+
+   private:
+    struct ActiveBatchSpan {
+        mooncake::tracing::Span span;
+        mooncake::tracing::TraceContext context;
+    };
+
+    mutable std::mutex mutex_;
+    std::unordered_map<BatchID, ActiveBatchSpan> spans_;
+};
+
 class TransferEngineImpl {
    public:
     TransferEngineImpl(bool auto_discover = false)
@@ -247,11 +341,31 @@ class TransferEngineImpl {
     }
 
     Status freeBatchID(BatchID batch_id) {
-        {
-            std::lock_guard<std::mutex> guard(span_contexts_lock_);
-            span_contexts_.erase(batch_id);
+        TransferStatus batch_status;
+        const Status status_before_free =
+            multi_transports_->getBatchTransferStatus(batch_id, batch_status);
+        const Status free_status = multi_transports_->freeBatchID(batch_id);
+        if (!free_status.ok()) {
+            return free_status;
         }
-        return multi_transports_->freeBatchID(batch_id);
+        if (status_before_free.ok() &&
+            (batch_status.s == TransferStatusEnum::COMPLETED ||
+             batch_status.s == TransferStatusEnum::FAILED ||
+             batch_status.s == TransferStatusEnum::TIMEOUT ||
+             batch_status.s == TransferStatusEnum::CANCELED)) {
+            const bool error = batch_status.s != TransferStatusEnum::COMPLETED;
+            active_batch_traces_.Finish(
+                batch_id, "batch terminal status",
+                {{"status", ToTransferStatusName(batch_status.s)},
+                 {"transferred.bytes",
+                  std::to_string(batch_status.transferred_bytes)}},
+                error);
+        } else {
+            active_batch_traces_.Finish(
+                batch_id, "batch released before terminal",
+                {{"status", "UNKNOWN"}}, true);
+        }
+        return free_status;
     }
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
@@ -339,39 +453,42 @@ class TransferEngineImpl {
             }
         }
 #endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            std::optional<mooncake::tracing::TraceContext> batch_context;
-            {
-                std::lock_guard<std::mutex> guard(span_contexts_lock_);
-                auto it_ctx = span_contexts_.find(batch_id);
-                if (it_ctx != span_contexts_.end()) {
-                    batch_context = it_ctx->second;
-                }
-            }
+        if (result.ok() &&
+            (status.s == TransferStatusEnum::COMPLETED ||
+             status.s == TransferStatusEnum::FAILED ||
+             status.s == TransferStatusEnum::TIMEOUT ||
+             status.s == TransferStatusEnum::CANCELED)) {
+            auto batch_context = active_batch_traces_.LookupContext(batch_id);
             auto& tracing = mooncake::tracing::TracingFacade::Instance(
                 "mooncake-transfer-engine", "transfer-engine");
-            auto span = batch_context.has_value()
-                            ? tracing.StartSpan(
-                                  "getBatchTransferStatus",
-                                  &batch_context.value(),
-                                  {{"te.batch_id", std::to_string(batch_id)},
-                                   {"status", "COMPLETED"}})
-                            : tracing.StartSpan(
-                                  "getBatchTransferStatus", nullptr,
-                                  {{"te.batch_id", std::to_string(batch_id)},
-                                   {"status", "COMPLETED"}});
-            span.AddEvent("batch terminal status");
-            // send notify
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            if (!notifies_to_send_.count(batch_id)) return result;
-            auto value = notifies_to_send_[batch_id];
-            auto rc = sendNotifyByID(value.first, value.second);
-            if (rc) {
-                LOG(ERROR) << "Failed to send notify message, error code: "
-                           << rc;
-                span.SetStatus("ERROR");
+            mooncake::tracing::Span span;
+            if (batch_context.has_value()) {
+                span = tracing.StartSpan(
+                    "getBatchTransferStatus", &batch_context.value(),
+                    {{"te.batch_id", std::to_string(batch_id)},
+                     {"status", ToTransferStatusName(status.s)}});
+                span.AddEvent("batch terminal status");
             }
-            notifies_to_send_.erase(batch_id);
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                RWSpinlock::WriteGuard guard(send_notifies_lock_);
+                auto it = notifies_to_send_.find(batch_id);
+                if (it != notifies_to_send_.end()) {
+                    auto rc = sendNotifyByID(it->second.first, it->second.second);
+                    if (rc) {
+                        LOG(ERROR) << "Failed to send notify message, error code: "
+                                   << rc;
+                        span.SetStatus("ERROR");
+                    }
+                    notifies_to_send_.erase(it);
+                }
+            }
+            const bool error = status.s != TransferStatusEnum::COMPLETED;
+            active_batch_traces_.Finish(
+                batch_id, "batch terminal status",
+                {{"status", ToTransferStatusName(status.s)},
+                 {"transferred.bytes",
+                  std::to_string(status.transferred_bytes)}},
+                error);
         }
         return result;
     }
@@ -416,41 +533,16 @@ class TransferEngineImpl {
     }
 
    private:
-    std::optional<mooncake::tracing::TraceContext> LookupBatchTraceContext(
-        BatchID batch_id) const {
-        std::lock_guard<std::mutex> guard(span_contexts_lock_);
-        auto it = span_contexts_.find(batch_id);
-        if (it == span_contexts_.end()) {
-            return std::nullopt;
-        }
-        return it->second;
-    }
-
-    std::optional<mooncake::tracing::TraceContext> RegisterBatchTraceContext(
-        BatchID batch_id, const mooncake::tracing::TraceContext& context) {
-        std::lock_guard<std::mutex> guard(span_contexts_lock_);
-        auto [it, inserted] = span_contexts_.emplace(batch_id, context);
-        if (inserted) {
-            multi_transports_->SetBatchTraceContext(batch_id, context);
-        }
-        return it->second;
-    }
-
     mooncake::tracing::Span StartBatchOperationSpan(
         const std::string& span_name, BatchID batch_id,
         const mooncake::tracing::TraceAttrs& attrs) {
         auto& tracing = mooncake::tracing::TracingFacade::Instance(
             "mooncake-transfer-engine", "transfer-engine");
-        auto batch_context = LookupBatchTraceContext(batch_id);
-        if (!batch_context.has_value()) {
-            auto batch_root = tracing.StartSpan(
-                "te.batch", nullptr,
-                {{"te.batch_id", std::to_string(batch_id)}});
-            batch_root.AddEvent("batch trace root established");
-            batch_context =
-                RegisterBatchTraceContext(batch_id, batch_root.context());
+        auto ensured = active_batch_traces_.EnsureRoot(tracing, batch_id);
+        if (ensured.created) {
+            multi_transports_->SetBatchTraceContext(batch_id, ensured.context);
         }
-        return tracing.StartSpan(span_name, &batch_context.value(), attrs);
+        return tracing.StartSpan(span_name, &ensured.context, attrs);
     }
 
     struct MemoryRegion {
@@ -472,8 +564,7 @@ class TransferEngineImpl {
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
 
-    mutable std::mutex span_contexts_lock_;
-    std::unordered_map<BatchID, mooncake::tracing::TraceContext> span_contexts_;
+    ActiveBatchTraceRegistry active_batch_traces_;
 
     // Discover topology and install transports automatically when it's true.
     // Set it to false only for testing.

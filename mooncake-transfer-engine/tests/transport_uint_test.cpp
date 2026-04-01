@@ -25,6 +25,7 @@
 #include "multi_transport.h"
 #include "trace_context.h"
 #include "transfer_engine.h"
+#include "transfer_engine_impl.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -263,6 +264,36 @@ TEST_F(TransportTest, BatchTraceRegistryKeepsFirstBatchContext) {
     ASSERT_TRUE(batch_context.has_value());
     EXPECT_EQ(batch_context->span_id, "root-span");
     EXPECT_EQ(batch_context->trace_id, "trace-root");
+}
+
+TEST_F(TransportTest, ActiveBatchTraceRegistryKeepsRootAliveUntilFinish) {
+    tracing::TracingFacade tracing({.enabled = true,
+                                    .exporter_mode = "inmemory",
+                                    .service_name = "test-te",
+                                    .node_id = "node-a",
+                                    .process_role = "unit-test"});
+    ActiveBatchTraceRegistry registry;
+    Transport::BatchID batch_id = 123;
+
+    auto first = registry.EnsureRoot(tracing, batch_id);
+    ASSERT_TRUE(first.context.valid());
+    EXPECT_TRUE(first.created);
+
+    auto second = registry.EnsureRoot(tracing, batch_id);
+    ASSERT_TRUE(second.context.valid());
+    EXPECT_FALSE(second.created);
+    EXPECT_EQ(second.context.trace_id, first.context.trace_id);
+    EXPECT_EQ(second.context.span_id, first.context.span_id);
+
+    EXPECT_TRUE(registry.Finish(batch_id, "batch terminal status",
+                                {{"status", "COMPLETED"}}, false));
+    EXPECT_FALSE(registry.Finish(batch_id, "batch terminal status",
+                                 {{"status", "COMPLETED"}}, false));
+
+    auto third = registry.EnsureRoot(tracing, batch_id);
+    ASSERT_TRUE(third.context.valid());
+    EXPECT_TRUE(third.created);
+    EXPECT_NE(third.context.span_id, first.context.span_id);
 }
 }  // namespace mooncake
 
