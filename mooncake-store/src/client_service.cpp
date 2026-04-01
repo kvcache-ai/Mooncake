@@ -1169,13 +1169,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    // Simple implementation: loop over keys calling Upsert individually
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results.emplace_back(Upsert(keys[i], batched_slices[i], config));
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
     }
-    return results;
+    if (client_cfg.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported for upsert";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    StartBatchUpsert(ops, client_cfg);
+
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchUpsert(ops);
+    return CollectResults(ops);
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -1295,6 +1313,52 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             // Operation continues to next stage - result remains INTERNAL_ERROR
             // until fully successful
             VLOG(1) << "Successfully started put for key " << ops[i].key
+                    << " with " << ops[i].replicas.size() << " replicas";
+        }
+    }
+}
+
+void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
+                              const ReplicateConfig& config) {
+    std::vector<std::string> keys;
+    std::vector<std::vector<uint64_t>> slice_lengths;
+
+    keys.reserve(ops.size());
+    slice_lengths.reserve(ops.size());
+
+    for (const auto& op : ops) {
+        keys.emplace_back(op.key);
+
+        std::vector<uint64_t> slice_sizes;
+        slice_sizes.reserve(op.slices.size());
+        for (const auto& slice : op.slices) {
+            slice_sizes.emplace_back(slice.size);
+        }
+        slice_lengths.emplace_back(std::move(slice_sizes));
+    }
+
+    auto start_responses =
+        master_client_.BatchUpsertStart(keys, slice_lengths, config);
+
+    // Ensure response size matches request size
+    if (start_responses.size() != ops.size()) {
+        LOG(ERROR) << "BatchUpsertStart response size mismatch: expected "
+                   << ops.size() << ", got " << start_responses.size();
+        for (auto& op : ops) {
+            op.SetError(ErrorCode::RPC_FAIL,
+                        "BatchUpsertStart response size mismatch");
+        }
+        return;
+    }
+
+    // Process individual responses with robust error handling
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (!start_responses[i]) {
+            ops[i].SetError(start_responses[i].error(),
+                            "Master failed to start upsert operation");
+        } else {
+            ops[i].replicas = start_responses[i].value();
+            VLOG(1) << "Successfully started upsert for key " << ops[i].key
                     << " with " << ops[i].replicas.size() << " replicas";
         }
     }
@@ -1512,6 +1576,103 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                         original_context + "; revoke also failed";
                 } else {
                     LOG(INFO) << "Successfully revoked failed put for key "
+                              << failed_keys[i];
+                }
+            }
+        }
+    }
+
+    // Ensure all operations have definitive results
+    for (auto& op : ops) {
+        if (!op.IsResolved()) {
+            op.SetError(ErrorCode::INTERNAL_ERROR,
+                        "Operation not resolved after finalization");
+            LOG(ERROR) << "Operation for key " << op.key
+                       << " was not properly resolved";
+        }
+    }
+}
+
+void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
+    std::vector<std::string> successful_keys;
+    std::vector<size_t> successful_indices;
+    std::vector<std::string> failed_keys;
+    std::vector<size_t> failed_indices;
+
+    successful_keys.reserve(ops.size());
+    successful_indices.reserve(ops.size());
+    failed_keys.reserve(ops.size());
+    failed_indices.reserve(ops.size());
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        auto& op = ops[i];
+
+        if (!op.IsResolved() && !op.replicas.empty() &&
+            !op.pending_transfers.empty()) {
+            successful_keys.emplace_back(op.key);
+            successful_indices.emplace_back(i);
+        } else if (op.state != PutOperationState::PENDING &&
+                   !op.replicas.empty()) {
+            failed_keys.emplace_back(op.key);
+            failed_indices.emplace_back(i);
+        }
+    }
+
+    // Process successful operations
+    if (!successful_keys.empty()) {
+        auto end_responses =
+            master_client_.BatchUpsertEnd(successful_keys);
+        if (end_responses.size() != successful_keys.size()) {
+            LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
+                       << successful_keys.size() << ", got "
+                       << end_responses.size();
+            for (size_t idx : successful_indices) {
+                ops[idx].SetError(ErrorCode::RPC_FAIL,
+                                  "BatchUpsertEnd response size mismatch");
+            }
+        } else {
+            for (size_t i = 0; i < end_responses.size(); ++i) {
+                const size_t op_idx = successful_indices[i];
+                if (!end_responses[i]) {
+                    LOG(ERROR) << "Failed to finalize upsert for key "
+                               << successful_keys[i] << ": "
+                               << toString(end_responses[i].error());
+                    ops[op_idx].SetError(end_responses[i].error(),
+                                         "BatchUpsertEnd failed");
+                } else {
+                    ops[op_idx].SetSuccess();
+                    VLOG(1) << "Successfully completed upsert for key "
+                            << successful_keys[i];
+                }
+            }
+        }
+    }
+
+    // Process failed operations that need cleanup
+    if (!failed_keys.empty()) {
+        auto revoke_responses =
+            master_client_.BatchUpsertRevoke(failed_keys);
+        if (revoke_responses.size() != failed_keys.size()) {
+            LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
+                       << failed_keys.size() << ", got "
+                       << revoke_responses.size();
+            for (size_t idx : failed_indices) {
+                ops[idx].SetError(ErrorCode::RPC_FAIL,
+                                  "BatchUpsertRevoke response size mismatch");
+            }
+        } else {
+            for (size_t i = 0; i < revoke_responses.size(); ++i) {
+                const size_t op_idx = failed_indices[i];
+                if (!revoke_responses[i]) {
+                    LOG(ERROR)
+                        << "Failed to revoke upsert for key " << failed_keys[i]
+                        << ": " << toString(revoke_responses[i].error());
+                    std::string original_context =
+                        ops[op_idx].failure_context.value_or("unknown error");
+                    ops[op_idx].failure_context =
+                        original_context + "; revoke also failed";
+                } else {
+                    LOG(INFO) << "Successfully revoked failed upsert for key "
                               << failed_keys[i];
                 }
             }
