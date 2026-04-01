@@ -11,6 +11,10 @@
 #include <glog/logging.h>
 
 #include "utils.h"
+#include "config.h"
+#if defined(USE_ASCEND_DIRECT)
+#include "ascend_allocator.h"
+#endif
 
 #ifndef MOONCAKE_SHM_NAME
 #define MOONCAKE_SHM_NAME "mooncake_shm"
@@ -49,6 +53,12 @@ bool ShmHelper::cleanup() {
             shm->fd = -1;
         }
         if (shm->base_addr) {
+#if defined(USE_ASCEND_DIRECT)
+            if (globalConfig().ascend_agent_mode) {
+                free_memory("ascend", shm->base_addr);
+                continue;
+            }
+#endif
             if (munmap(shm->base_addr, shm->size) == -1) {
                 LOG(ERROR) << "Failed to unmap shared memory: "
                            << strerror(errno);
@@ -63,6 +73,24 @@ bool ShmHelper::cleanup() {
 
 void* ShmHelper::allocate(size_t size) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
+#ifdef USE_ASCEND_DIRECT
+    if (globalConfig().ascend_agent_mode) {
+        void* base_addr = nullptr;
+        size_t alloc_size = size;
+        base_addr = ascend_allocate_vmm_memory_direct(alloc_size);
+        if (base_addr == nullptr) {
+            throw std::runtime_error("Failed to allocate VMM shared memory");
+        }
+        auto shm = std::make_shared<ShmSegment>();
+        shm->fd = -1;
+        shm->base_addr = base_addr;
+        shm->size = alloc_size;
+        shm->name = MOONCAKE_SHM_NAME;
+        shm->registered = false;
+        shms_.push_back(shm);
+        return base_addr;
+    }
+#endif
 
     unsigned int flags = MFD_CLOEXEC;
     if (use_hugepage_) {
@@ -112,11 +140,17 @@ int ShmHelper::free(void* addr) {
             if ((*it)->fd != -1) {
                 close((*it)->fd);
             }
-            if ((*it)->base_addr &&
-                munmap((*it)->base_addr, (*it)->size) == -1) {
-                LOG(ERROR) << "Failed to unmap shared memory during free: "
-                           << strerror(errno);
-                return -1;
+            if ((*it)->base_addr) {
+#if defined(USE_ASCEND_DIRECT)
+                if (globalConfig().ascend_agent_mode) {
+                    free_memory("ascend", (*it)->base_addr);
+                } else
+#endif
+                    if (munmap((*it)->base_addr, (*it)->size) == -1) {
+                    LOG(ERROR) << "Failed to unmap shared memory during free: "
+                               << strerror(errno);
+                    return -1;
+                }
             }
             LOG(INFO) << "Freed shared memory at " << addr
                       << ", size: " << (*it)->size;

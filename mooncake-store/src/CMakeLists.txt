@@ -26,11 +26,16 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
-    serialize/serializer_backend.cpp
-    ha/ha_backend_factory.cpp
-    ha/etcd_leader_coordinator.cpp
-    ha/master_service_supervisor.cpp
-    ha/redis_leader_coordinator.cpp
+    ha/leadership/leader_coordinator_factory.cpp
+    ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
+    ha/common/redis/redis_connection.cpp
+    ha/leadership/backends/redis/redis_leader_coordinator.cpp
+    ha/leadership/master_service_supervisor.cpp
+    ha/snapshot/object/snapshot_object_store.cpp
+    ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
+    ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
+    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
+    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
@@ -154,21 +159,6 @@ endif()
 if(URING_LIB AND URING_INCLUDE)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
-endif()
-
-if(USE_ASCEND_DIRECT)
-  set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
-  if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
-    file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
-    if("${ACL_RUNTIME_CONTENT}" MATCHES "ACL_MEM_P2P_HUGE1G")
-      message(STATUS "ACL_MEM_P2P_HUGE1G exist.")
-      add_compile_definitions(ASCEND_SUPPORT_FABRIC_MEM)
-    else()
-      message(STATUS "ACL_MEM_P2P_HUGE1G is not exist.")
-    endif()
-  else()
-    message(WARNING "Acl runtime header file is not exist")
-  endif()
 endif()
 
 if(BUILD_SHARED_LIBS)

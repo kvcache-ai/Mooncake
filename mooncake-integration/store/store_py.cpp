@@ -701,7 +701,8 @@ class MooncakeStorePyWrapper {
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
         std::vector<size_t> processed_indices;
-        std::vector<int> final_results(base_keys.size(), 0);
+        std::vector<int> final_results(base_keys.size(),
+                                       to_py_ret(ErrorCode::INVALID_PARAMS));
 
         try {
             // Chunking phase (GIL Held)
@@ -739,12 +740,17 @@ class MooncakeStorePyWrapper {
             // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
                 size_t original_idx = processed_indices[i];
+                bool all_ok = true;
                 for (int j = 0; j < tp_size; ++j) {
                     int res = chunk_results[i * tp_size + j];
                     if (res != 0) {
                         final_results[original_idx] = res;  // First error wins
+                        all_ok = false;
                         break;
                     }
+                }
+                if (all_ok) {
+                    final_results[original_idx] = 0;
                 }
             }
 
@@ -858,17 +864,35 @@ class MooncakeStorePyWrapper {
                 << "put_tensor_with_tp_from is not supported for dummy client";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
+        if (buffer_ptr == 0) {
+            LOG(ERROR) << "Buffer pointer cannot be null";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (size <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Buffer size too small for tensor metadata";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
         if (tp_size <= 1) {
             return put_tensor_from(key, buffer_ptr, size);
         }
-        std::string tp_key = get_tp_key_name(key, tp_rank);
-        return put_tensor_from(tp_key, buffer_ptr, size);
+
+        pybind11::object tensor =
+            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
+                             static_cast<int64_t>(size));
+        if (tensor.is_none()) {
+            LOG(ERROR) << "Failed to decode full tensor buffer for "
+                          "put_tensor_with_tp_from";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
+                                       tp_size, split_dim);
     }
 
     std::vector<int> batch_put_tensor_with_tp_from(
         const std::vector<std::string> &base_keys,
         const std::vector<uintptr_t> &buffer_ptrs,
-        const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
+        const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1,
+        int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return std::vector<int>(base_keys.size(),
@@ -883,12 +907,64 @@ class MooncakeStorePyWrapper {
         if (tp_size <= 1) {
             return batch_put_tensor_from(base_keys, buffer_ptrs, sizes);
         }
-        std::vector<std::string> shard_keys;
-        shard_keys.reserve(base_keys.size());
-        for (const auto &key : base_keys) {
-            shard_keys.push_back(get_tp_key_name(key, tp_rank));
+        if (base_keys.size() != buffer_ptrs.size() ||
+            base_keys.size() != sizes.size() || base_keys.empty()) {
+            if (!base_keys.empty()) {
+                LOG(ERROR) << "Size mismatch: base_keys, buffer_ptrs, and "
+                              "sizes must have the same length";
+            }
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
-        return batch_put_tensor_from(shard_keys, buffer_ptrs, sizes);
+
+        py::list tensors_list;
+        std::vector<size_t> processed_indices;
+        std::vector<int> final_results(base_keys.size(), 0);
+
+        for (size_t i = 0; i < base_keys.size(); ++i) {
+            if (buffer_ptrs[i] == 0) {
+                LOG(ERROR) << "Buffer pointer at index " << i
+                           << " cannot be null";
+                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            if (sizes[i] <= sizeof(TensorMetadata)) {
+                LOG(ERROR) << "Buffer size at index " << i
+                           << " too small for tensor metadata";
+                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+
+            py::object tensor =
+                buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptrs[i]),
+                                 static_cast<int64_t>(sizes[i]));
+            if (tensor.is_none()) {
+                LOG(ERROR) << "Failed to decode full tensor buffer at index "
+                           << i;
+                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            tensors_list.append(tensor);
+            processed_indices.push_back(i);
+        }
+
+        if (processed_indices.empty()) {
+            return final_results;
+        }
+
+        std::vector<std::string> valid_keys;
+        valid_keys.reserve(processed_indices.size());
+        for (size_t idx : processed_indices) {
+            valid_keys.push_back(base_keys[idx]);
+        }
+
+        std::vector<int> op_results = batch_put_tensor_with_tp_impl(
+            valid_keys, tensors_list, ReplicateConfig{}, tp_rank, tp_size,
+            split_dim);
+        for (size_t i = 0; i < processed_indices.size(); ++i) {
+            final_results[processed_indices[i]] = op_results[i];
+        }
+        return final_results;
     }
 
     int validate_replicate_config(
@@ -1381,6 +1457,16 @@ PYBIND11_MODULE(store, m) {
             py::arg("force") = false,
             "Remove all objects from the store. If force=True, skip lease "
             "and replication task checks.")
+        .def(
+            "batch_remove",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys, bool force) {
+                py::gil_scoped_release release;
+                return self.store_->batchRemove(keys, force);
+            },
+            py::arg("keys"), py::arg("force") = false,
+            "Batch remove objects by keys. Returns a list of status codes "
+            "(0=success, negative=error code) for each key.")
         .def("is_exist",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
@@ -1536,14 +1622,17 @@ PYBIND11_MODULE(store, m) {
              &MooncakeStorePyWrapper::put_tensor_with_tp_from, py::arg("key"),
              py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
              py::arg("tp_size") = 1, py::arg("split_dim") = 0,
-             "Put a tensor shard directly from a pre-allocated buffer for "
-             "Tensor Parallelism. Buffer is stored under key_tp_<tp_rank>.")
+             "Put a full tensor directly from a pre-allocated buffer for "
+             "Tensor Parallelism. The buffer is split internally and stored "
+             "under key_tp_<rank> for all ranks.")
         .def("batch_put_tensor_with_tp_from",
              &MooncakeStorePyWrapper::batch_put_tensor_with_tp_from,
              py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
              py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
-             "Put a batch of tensor shards directly from pre-allocated "
-             "buffers for a given Tensor Parallel rank.")
+             py::arg("split_dim") = 0,
+             "Put a batch of full tensors directly from pre-allocated "
+             "buffers for Tensor Parallelism. Each buffer is internally split "
+             "and stored under key_tp_<rank> for all ranks.")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
@@ -1744,12 +1833,6 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::vector<size_t>> &all_sizes,
                const ReplicateConfig &config = ReplicateConfig{}) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR)
-                        << "batch_put_from_multi_buffers is not supported for "
-                           "dummy client now";
-                    return std::vector<int>{};
-                }
                 return self.store_->batch_put_from_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
             },
@@ -1766,12 +1849,6 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::vector<size_t>> &all_sizes,
                bool prefer_alloc_in_same_node = false) {
                 py::gil_scoped_release release;
-                if (self.use_dummy_client_) {
-                    LOG(ERROR)
-                        << "batch_get_into_multi_buffers is not supported for "
-                           "dummy client now";
-                    return std::vector<int>{};
-                }
                 return self.store_->batch_get_into_multi_buffers(
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
                     prefer_alloc_in_same_node);

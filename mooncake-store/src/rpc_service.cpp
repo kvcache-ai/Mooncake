@@ -683,6 +683,29 @@ long WrappedMasterService::RemoveAll(bool force) {
     return result;
 }
 
+std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
+    const std::vector<std::string>& keys, bool force) {
+    ScopedVLogTimer timer(1, "BatchRemove");
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys, ", force=", force);
+    MasterMetricManager::instance().inc_remove_requests(total_keys);
+
+    auto results = master_service_.BatchRemove(keys, force);
+
+    size_t failure_count = 0;
+    for (const auto& result : results) {
+        if (!result.has_value()) {
+            failure_count++;
+        }
+    }
+    if (failure_count > 0) {
+        MasterMetricManager::instance().inc_remove_failures(failure_count);
+    }
+
+    timer.LogResponse("total=", total_keys, ", failures=", failure_count);
+    return results;
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
     const Segment& segment, const UUID& client_id) {
     return execute_rpc(
@@ -1030,6 +1053,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchRemove>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);

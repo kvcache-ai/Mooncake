@@ -224,6 +224,15 @@ class MasterClient {
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<std::string>& keys, bool force = false);
+
+    /**
      * @brief Registers a segment to master for allocation
      * @param segment Segment to register
      * @return tl::expected<void, ErrorCode> indicating success/failure

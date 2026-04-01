@@ -22,7 +22,7 @@
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
-#include "ha/ha_backend_factory.h"
+#include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.hpp"
 #include "utils.h"
@@ -1755,6 +1755,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     //     storage_backend_->RemoveAll();
     // }
     return master_client_.RemoveAll(force);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
+    const std::vector<ObjectKey>& keys, bool force) {
+    return master_client_.BatchRemove(keys, force);
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(

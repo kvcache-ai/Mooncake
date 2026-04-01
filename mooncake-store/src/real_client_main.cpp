@@ -3,6 +3,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
+#include "config.h"
 #include "real_client.h"
 
 using namespace mooncake;
@@ -30,6 +31,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::remove_internal>(&real_client);
     server.register_handler<&RealClient::removeByRegex_internal>(&real_client);
     server.register_handler<&RealClient::removeAll_internal>(&real_client);
+    server.register_handler<&RealClient::batchRemove_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
@@ -37,7 +39,15 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(
         &real_client);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
+    server.register_handler<
+        &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
+    server.register_handler<&RealClient::ascend_shm_internal>(&real_client);
+    server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);
+    server.register_handler<&RealClient::ascend_unmap_shm_internal>(
+        &real_client);
     server.register_handler<&RealClient::unmap_shm_internal>(&real_client);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(
         &real_client);
@@ -69,6 +79,10 @@ int main(int argc, char *argv[]) {
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
+#ifdef USE_ASCEND_DIRECT
+    // just set to true, does not affect GPU process.
+    globalConfig().ascend_agent_mode = true;
+#endif
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(

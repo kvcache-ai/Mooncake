@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include "memory_location.h"
 #include "mooncake_worker.cuh"
 #include "environ.h"
 
@@ -38,8 +39,8 @@ static bool supportFabricMem() {
     return true;
 }
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
+                                     bool isDummy,
                                      uint64_t* local2global_rank_map,
-                                     std::string location,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
                                      std::shared_ptr<P2PProxy> p2p_proxy,
@@ -47,6 +48,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
     : backendIndex_(backendIndex),
       rank_(rank),
       groupSize_(size),
+      isDummy_(isDummy),
       establishedGroupSize_(0),
       local2global_rank_map_(local2global_rank_map),
       store_(std::move(store)),
@@ -63,15 +65,15 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
         return;
     }
 
-    warmup_send_region_ = new int32_t[kMaxNumRanks];
+    warmup_send_region_ = new int32_t[kMaxNumRanks]{};
     warmup_send_region_[0] = 1;
     int rc = engine_->registerLocalMemory(
-        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), location);
+        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_->registerLocalMemory(warmup_recv_region_,
-                                      kMaxNumRanks * sizeof(int32_t), location);
+    rc = engine_->registerLocalMemory(
+        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 }
 
@@ -129,6 +131,9 @@ void ConnectionContext::waitUntilAllConnected() {
 }
 
 void ConnectionContext::waitUntilNewRanksConnected() {
+    if (isDummy_) {
+        return;
+    }
     const int targetGroupSize = groupSize_.load(std::memory_order_acquire);
     const int established =
         establishedGroupSize_.load(std::memory_order_acquire);
@@ -151,6 +156,32 @@ void ConnectionContext::waitUntilNewRanksConnected() {
     });
 
     establishedGroupSize_.store(targetGroupSize, std::memory_order_release);
+}
+
+void ConnectionContext::bootstrapLocalPeer(const std::string& localServerName,
+                                           const SegmentInfo& localRankInfo) {
+    auto& peerState = peerStates_[rank_];
+    if (peerState.state == PeerConnectionState::CONNECTED) {
+        return;
+    }
+
+    auto segment_id = engine_->openSegment(localServerName);
+    meta_->segmentIDs[rank_] = segment_id;
+    peerState.segmentId = segment_id;
+    memcpy(&meta_->segmentInfos[rank_], &localRankInfo, sizeof(SegmentInfo));
+
+    meta_->peerConnected[rank_] = true;
+    ConnectionPoller::GetInstance()
+        .global_peerConnected_[local2global_rank_map_[rank_]] = true;
+    peerState.state = PeerConnectionState::CONNECTED;
+
+    {
+        std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+        totalConnectedPeers_.store(1, std::memory_order_release);
+        if (isAllPeerConnected()) {
+            backend_wakeup_cv_.notify_all();
+        }
+    }
 }
 
 void ConnectionContext::shutdown() {
@@ -350,6 +381,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // reports a failure. We must set both to false here.
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
+            meta_->activeRanks[pollingRank] = false;
+            meta_->activeRanksTensor[pollingRank] = 0;
 
             // Reset store
             store_->deleteKey(
@@ -357,6 +390,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
             store_->deleteKey(
                 getExtensionTaskCountStoreKey(backendIndex_, pollingRank));
+            store_->deleteKey(
+                getExtensionActiveRanksStoreKey(backendIndex_, pollingRank));
 
             // Reset warmup region
             *reinterpret_cast<volatile int32_t*>(
@@ -404,12 +439,20 @@ bool ConnectionContext::tryStop() {
     return stopped;
 }
 
-ConnectionPoller::ConnectionPoller() {
+ConnectionPoller::ConnectionPoller() = default;
+
+void ConnectionPoller::ensureThreadStarted() {
+    bool expected = false;
+    if (!pollerThreadStarted_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
     pollerThread_ = std::thread([this] { pollerLoop(); });
 }
 
 void ConnectionPoller::registerContext(
     const std::shared_ptr<ConnectionContext>& ctx) {
+    ensureThreadStarted();
     {
         std::lock_guard<std::mutex> lock(contexts_mutex_);
         contexts_.push_back(ctx);

@@ -42,6 +42,10 @@ def worker(rank, world_size, results, collective):
         dist.all_gather(gathered, tensor)
         results[rank] = [t.item() for t in gathered]
 
+    elif collective == "barrier":
+        dist.barrier()
+        results[rank] = "ok"
+
     elif collective == "gather":
         tensor = torch.tensor([rank], dtype=torch.int32, device="cuda")
         if rank == 0:
@@ -120,6 +124,9 @@ class TestMooncakeBackend(unittest.TestCase):
     def test_allgather(self):
         # Expected gather = [0, 1, 2, 3]
         self._spawn_and_check("all_gather", lambda size: list(range(size)))
+
+    def test_barrier(self):
+        self._spawn_and_check("barrier", lambda size: "ok")
 
     def test_gather(self):
         # Expected gather (Root) = [0, 1, 2, ..., size-1]

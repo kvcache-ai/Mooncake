@@ -16,6 +16,34 @@
 #include "rpc_types.h"
 #include "types.h"
 #include "default_config.h"
+#include "config.h"
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl_rt.h"
+#include "ascend_allocator.h"
+#endif
+
+namespace {
+
+std::vector<uint64_t> void_ptrs_to_u64(const std::vector<void*>& ptrs) {
+    std::vector<uint64_t> out;
+    out.reserve(ptrs.size());
+    for (void* p : ptrs) {
+        out.push_back(reinterpret_cast<uint64_t>(p));
+    }
+    return out;
+}
+
+std::vector<std::vector<uint64_t>> void_ptr_rows_to_u64_nested(
+    const std::vector<std::vector<void*>>& rows) {
+    std::vector<std::vector<uint64_t>> nested;
+    nested.reserve(rows.size());
+    for (const auto& row : rows) {
+        nested.push_back(void_ptrs_to_u64(row));
+    }
+    return nested;
+}
+
+}  // namespace
 
 namespace mooncake {
 
@@ -138,6 +166,79 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
     return ErrorCode::OK;
 }
 
+int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
+                                     bool is_local) {
+#ifdef USE_ASCEND_DIRECT
+    // Detect memory type: device memory uses IPC sharing
+    aclrtPtrAttributes attributes;
+    auto ret = aclrtPointerGetAttributes(shm->base_addr, &attributes);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get pointer attributes, ret=" << ret;
+        return -1;
+    }
+    // all device mem shared by ipc
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        constexpr size_t kIPCKeyLen = 65;
+        char ipc_key[kIPCKeyLen] = {0};
+        ret = aclrtIpcMemGetExportKey(
+            shm->base_addr, shm->size, ipc_key, kIPCKeyLen,
+            ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtIpcMemGetExportKey failed, ret=" << ret
+                       << ", errmsg: " << aclGetRecentErrMsg();
+            return -1;
+        }
+
+        std::string ipc_key_bytes(ipc_key, kIPCKeyLen);
+        auto map_ret = invoke_rpc<&RealClient::ascend_ipc_shm_internal, void>(
+            reinterpret_cast<uint64_t>(shm->base_addr), shm->size, is_local,
+            ipc_key_bytes, device_id_, client_id_);
+        if (!map_ret.has_value()) {
+            LOG(ERROR) << "Failed to map IPC buffer on real side";
+            return -1;
+        }
+        LOG(INFO) << "Registered device memory via IPC, addr=" << shm->base_addr
+                  << ", size=" << shm->size << ", device_id=" << device_id_;
+        return 0;
+    }
+    if (!globalConfig().ascend_use_fabric_mem) {
+        LOG(ERROR) << "Host mem is only supported in fabric mem mode.";
+        return -1;
+    }
+
+    // Fabric host mem shared by vmm
+    aclrtDrvMemHandle physical_handle =
+        ascend_get_physical_handle_from_va(shm->base_addr);
+    if (physical_handle == nullptr) {
+        LOG(ERROR) << "Failed to get physical handle for va (memory must be "
+                      "allocated via ascend_allocate_vmm_memory_direct)";
+        return -1;
+    }
+
+    aclrtMemFabricHandle export_handle = {};
+    ret = aclrtMemExportToShareableHandleV2(
+        physical_handle, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
+        ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &export_handle);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to export shareable handle, ret=" << ret;
+        return -1;
+    }
+
+    std::string handle_bytes(reinterpret_cast<char*>(&export_handle),
+                             sizeof(export_handle));
+    auto map_ret = invoke_rpc<&RealClient::ascend_shm_internal, void>(
+        reinterpret_cast<uint64_t>(shm->base_addr), shm->size, is_local,
+        handle_bytes, device_id_, client_id_);
+    if (!map_ret.has_value()) {
+        LOG(ERROR) << "Failed to map VMM buffer on real side";
+        return -1;
+    }
+    LOG(INFO) << "Registered memory suc, addr=" << shm->base_addr
+              << ", size=" << shm->size << ", device_id=" << device_id_;
+#endif
+    return 0;
+}
+
 int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
                                       bool is_local) {
     if (shm->fd < 0) {
@@ -218,6 +319,12 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
+    const char* use_fabric_mem_env =
+        std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
+        globalConfig().ascend_use_fabric_mem = true;
+    }
+
     void* base_addr = nullptr;
     ErrorCode err = connect(server_address);
     if (err != ErrorCode::OK) {
@@ -225,32 +332,60 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         return -1;
     }
 
-    shm_helper_ = ShmHelper::getInstance();
-    try {
-        base_addr = shm_helper_->allocate(local_buffer_size);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
+#ifdef USE_ASCEND_DIRECT
+    // just set to true when USE_ASCEND_DIRECT
+    globalConfig().ascend_agent_mode = true;
+    int32_t logic_dev = 0;
+    auto acl_ret = aclrtGetDevice(&logic_dev);
+    if (acl_ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get current device, ret=" << acl_ret;
         return -1;
     }
+    acl_ret = aclrtGetPhyDevIdByLogicDevId(logic_dev, &device_id_);
+    if (acl_ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get physical device id, ret=" << acl_ret
+                   << ", errmsg: " << aclGetRecentErrMsg();
+        return -1;
+    }
+    LOG(INFO) << "Setup dummy: logic_dev=" << logic_dev
+              << " physical_dev=" << device_id_;
+#endif
 
     ipc_socket_path_ = ipc_socket_path;
+    shm_helper_ = ShmHelper::getInstance();
+    if (local_buffer_size > 0) {
+        try {
+            base_addr = shm_helper_->allocate(local_buffer_size);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
+            return -1;
+        }
+        // Attempt registration for the primary segment
+        auto local_buffer_shm = shm_helper_->get_shm(base_addr);
+        if (!local_buffer_shm) {
+            LOG(ERROR) << "Failed to get shm segment for base address";
+            shm_helper_->free(base_addr);
+            return -1;
+        }
 
-    // Attempt registration for the primary segment
-    auto local_buffer_shm = shm_helper_->get_shm(base_addr);
-    if (!local_buffer_shm) {
-        LOG(ERROR) << "Failed to get shm segment for base address";
-        shm_helper_->free(base_addr);
-        return -1;
+        if (globalConfig().ascend_agent_mode) {
+            if (register_ascend_shm(local_buffer_shm.get(), true) != 0) {
+                LOG(ERROR) << "Failed to register SHM via IPC";
+                // Register failed, cleanup
+                shm_helper_->free(local_buffer_shm->base_addr);
+                return -1;
+            }
+        } else {
+            if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
+                LOG(ERROR) << "Failed to register SHM via IPC";
+                // Register failed, cleanup
+                shm_helper_->free(local_buffer_shm->base_addr);
+                return -1;
+            }
+        }
+        local_buffer_shm->registered = true;
+        local_buffer_shm->is_local = true;
     }
-
-    if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
-        LOG(ERROR) << "Failed to register SHM via IPC";
-        // Register failed, cleanup
-        shm_helper_->free(local_buffer_shm->base_addr);
-        return -1;
-    }
-    local_buffer_shm->registered = true;
-    local_buffer_shm->is_local = true;
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
@@ -260,7 +395,6 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         LOG(INFO)
             << "Hot cache shm not available (real client may not have it)";
     }
-
     return 0;
 }
 
@@ -290,6 +424,14 @@ int DummyClient::tearDownAll() {
 }
 
 int64_t DummyClient::unregister_shm() {
+    LOG(INFO) << "[unregister_shm] client_id=" << client_id_;
+#if defined(USE_ASCEND_DIRECT)
+    if (globalConfig().ascend_agent_mode) {
+        return to_py_ret(
+            invoke_rpc<&RealClient::ascend_unmap_shm_internal, void>(
+                client_id_));
+    }
+#endif
     return to_py_ret(
         invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
 }
@@ -299,6 +441,16 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     if (buffer == nullptr) {
         LOG(ERROR) << "Invalid buffer pointer";
         return -1;
+    }
+    if (globalConfig().ascend_agent_mode) {
+        auto shm = std::make_shared<ShmHelper::ShmSegment>();
+        shm->base_addr = buffer;
+        shm->size = size;
+        if (register_ascend_shm(shm.get(), false) != 0) {
+            LOG(ERROR) << "Failed to implicitly register new ascend shm.";
+            return -1;
+        }
+        return 0;
     }
     // Find which shm this buffer belongs to
     auto shm = shm_helper_->get_shm(buffer);
@@ -403,6 +555,19 @@ long DummyClient::removeByRegex(const std::string& str, bool force) {
 long DummyClient::removeAll(bool force) {
     return to_py_ret(
         invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
+}
+
+std::vector<int> DummyClient::batchRemove(const std::vector<std::string>& keys,
+                                          bool force) {
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchRemove_internal, void>(keys.size(),
+                                                                  keys, force);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
 }
 
 int DummyClient::isExist(const std::string& key) {
@@ -558,13 +723,10 @@ std::string DummyClient::get_hostname() const {
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
-    std::vector<uint64_t> buffers;
-    for (auto ptr : buffer_ptrs) {
-        buffers.push_back(reinterpret_cast<uint64_t>(ptr));
-    }
+    std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
-            keys.size(), keys, buffers, sizes, config, client_id_);
+            keys.size(), keys, buffers, sizes, config, device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -584,13 +746,10 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
-    std::vector<uint64_t> buffers;
-    for (auto ptr : buffer_ptrs) {
-        buffers.push_back(reinterpret_cast<uint64_t>(ptr));
-    }
+    std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
-            keys.size(), keys, buffers, sizes, client_id_);
+            keys.size(), keys, buffers, sizes, device_id_, client_id_);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 
@@ -614,9 +773,18 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReplicateConfig& config) {
-    // TODO: implement this function
-    std::vector<int> vec(keys.size(), -1);
-    return vec;
+    std::vector<std::vector<uint64_t>> dummy_nested =
+        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
+                         void>(keys.size(), keys, dummy_nested, all_sizes,
+                               config, device_id_, client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
 }
 
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
@@ -624,9 +792,19 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     bool prefer_alloc_in_same_node) {
-    // TODO: implement this function
-    std::vector<int> vec(keys.size(), -1);
-    return vec;
+    std::vector<std::vector<uint64_t>> dummy_nested =
+        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_get_into_multi_buffers_dummy_helper,
+                         int64_t>(keys.size(), keys, dummy_nested, all_sizes,
+                                  prefer_alloc_in_same_node, device_id_,
+                                  client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
 }
 
 std::map<std::string, std::vector<Replica::Descriptor>>
@@ -714,13 +892,23 @@ void DummyClient::ping_thread_main() {
                 const auto& shms = shm_helper_->get_shms();
                 for (const auto& shm_ptr : shms) {
                     if (shm_ptr->registered) {
-                        if (register_shm_via_ipc(shm_ptr.get(),
-                                                 shm_ptr->is_local) != 0) {
-                            LOG(WARNING)
-                                << "Failed to re-register shared memory "
-                                   "during reconnection";
-                            all_registered = false;
-                            break;
+                        if (globalConfig().ascend_agent_mode) {
+                            if (register_ascend_shm(shm_ptr.get(),
+                                                    shm_ptr->is_local) != 0) {
+                                LOG(WARNING) << "Failed to re-register VMM "
+                                                "during reconnection";
+                                all_registered = false;
+                                break;
+                            }
+                        } else {
+                            if (register_shm_via_ipc(shm_ptr.get(),
+                                                     shm_ptr->is_local) != 0) {
+                                LOG(WARNING)
+                                    << "Failed to re-register shared memory "
+                                       "during reconnection";
+                                all_registered = false;
+                                break;
+                            }
                         }
                     }
                 }

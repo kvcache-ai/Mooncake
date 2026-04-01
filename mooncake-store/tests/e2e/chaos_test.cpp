@@ -8,7 +8,7 @@
 
 #include "client_wrapper.h"
 #include "e2e_utils.h"
-#include "ha/ha_backend_factory.h"
+#include "ha/leadership/leader_coordinator_factory.h"
 #include "process_handler.h"
 #include "types.h"
 #include "utils.h"

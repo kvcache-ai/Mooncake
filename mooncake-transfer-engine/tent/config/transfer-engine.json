@@ -33,8 +33,8 @@
             "enable" : true,
             "shared_quota_shm_path" : "mooncake_quota_shm",
             "max_timeout_ns": 10000000000,
+            "num_lanes": 1,
             "device": {
-                "num_cq_list": 1,
                 "num_comp_channels": 1,
                 "port": 1,
                 "gid_index": 0,
@@ -42,7 +42,6 @@
             },
             "endpoint": {
                 "endpoint_store_cap": 256,
-                "qp_mul_factor": 1,
                 "max_sge": 4,
                 "max_qp_wr": 256,
                 "max_inline_bytes": 64,
@@ -64,7 +63,6 @@
                 "max_rd_atomic": 16
             },
             "workers" : {
-                "num_workers": 1,
                 "max_retry_count": 8,
                 "block_size": 65536,
                 "grace_period_ns": 50000,

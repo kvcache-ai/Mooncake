@@ -44,16 +44,87 @@
 
 namespace mooncake {
 namespace tent {
-static void convertConfToRdmaParams(std::shared_ptr<Config> conf,
-                                    std::shared_ptr<RdmaParams> params) {
-    SET_DEVICE(num_cq_list, params->device.num_cq_list);
+static Status configureLaneCount(std::shared_ptr<Config> conf,
+                                 std::shared_ptr<RdmaParams> params) {
+    constexpr int kUnset = -1;
+    const int num_lanes = conf->get("transports/rdma/num_lanes", kUnset);
+    const int num_cq_list =
+        conf->get("transports/rdma/device/num_cq_list", kUnset);
+    const int qp_mul_factor =
+        conf->get("transports/rdma/endpoint/qp_mul_factor", kUnset);
+    const int num_workers =
+        conf->get("transports/rdma/workers/num_workers", kUnset);
+
+    auto validate_positive = [](int value, const char* name) -> Status {
+        if (value == kUnset || value > 0) return Status::OK();
+        std::stringstream ss;
+        ss << "Invalid RDMA " << name << ": " << value
+           << ", expected a positive integer";
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
+    };
+
+    auto status = validate_positive(num_lanes, "num_lanes");
+    if (!status.ok()) return status;
+    status = validate_positive(num_cq_list, "device.num_cq_list");
+    if (!status.ok()) return status;
+    status = validate_positive(qp_mul_factor, "endpoint.qp_mul_factor");
+    if (!status.ok()) return status;
+    status = validate_positive(num_workers, "workers.num_workers");
+    if (!status.ok()) return status;
+
+    int lane_count = params->num_lanes;
+    if (num_lanes != kUnset) {
+        lane_count = num_lanes;
+    } else if (num_cq_list != kUnset) {
+        lane_count = num_cq_list;
+    } else if (qp_mul_factor != kUnset) {
+        lane_count = qp_mul_factor;
+    } else if (num_workers != kUnset) {
+        lane_count = num_workers;
+    }
+
+    auto validate_match = [lane_count](int value, const char* name) -> Status {
+        if (value == kUnset || value == lane_count) return Status::OK();
+        std::stringstream ss;
+        ss << "Inconsistent RDMA lane configuration: " << name << "=" << value
+           << " but expected lane count " << lane_count
+           << " so worker/QP/CQ counts stay aligned";
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
+    };
+
+    status = validate_match(num_cq_list, "device.num_cq_list");
+    if (!status.ok()) return status;
+    status = validate_match(qp_mul_factor, "endpoint.qp_mul_factor");
+    if (!status.ok()) return status;
+    status = validate_match(num_workers, "workers.num_workers");
+    if (!status.ok()) return status;
+
+    if (num_cq_list != kUnset || qp_mul_factor != kUnset ||
+        num_workers != kUnset) {
+        LOG(WARNING) << "Legacy RDMA parallelism knobs "
+                     << "(device.num_cq_list, endpoint.qp_mul_factor, "
+                     << "workers.num_workers) are deprecated; prefer "
+                     << "transports/rdma/num_lanes";
+    }
+
+    params->num_lanes = lane_count;
+    params->device.num_cq_list = lane_count;
+    params->endpoint.qp_mul_factor = lane_count;
+    params->workers.num_workers = lane_count;
+    return Status::OK();
+}
+
+static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
+                                      std::shared_ptr<RdmaParams> params) {
+    auto status = configureLaneCount(conf, params);
+    if (!status.ok()) return status;
+
     SET_DEVICE(num_comp_channels, params->device.num_comp_channels);
     SET_DEVICE(port, params->device.port);
     SET_DEVICE(gid_index, params->device.gid_index);
     SET_DEVICE(max_cqe, params->device.max_cqe);
 
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
-    SET_ENDPOINT(qp_mul_factor, params->endpoint.qp_mul_factor);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
@@ -83,13 +154,13 @@ static void convertConfToRdmaParams(std::shared_ptr<Config> conf,
     else
         params->endpoint.path_mtu = IBV_MTU_512;
 
-    SET_WORKERS(num_workers, params->workers.num_workers);
     SET_WORKERS(max_retry_count, params->workers.max_retry_count);
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
 
     params->verbose = conf->get("verbose", false);
+    return Status::OK();
 }
 
 static bool isGpuDirectRdmaSupported() {
@@ -134,7 +205,8 @@ Status RdmaTransport::install(std::string& local_segment_name,
 
     conf_ = conf;
     params_ = std::make_shared<RdmaParams>();
-    convertConfToRdmaParams(conf_, params_);
+    auto param_status = convertConfToRdmaParams(conf_, params_);
+    if (!param_status.ok()) return param_status;
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;

@@ -108,6 +108,19 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     }
 }
 
+namespace {
+
+template <typename scalar_t>
+void preload_reduce_kernel(const char* name) {
+    cudaFuncAttributes attr{};
+    auto err = cudaFuncGetAttributes(
+        &attr, reinterpret_cast<const void*>(reduceKernel<scalar_t>));
+    TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
+                cudaGetErrorString(err));
+}
+
+}  // namespace
+
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream) {
@@ -242,6 +255,18 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
                                         dst.scalar_type()));
     }
+}
+
+void preloadReduceKernels() {
+    preload_reduce_kernel<uint8_t>("reduceKernel<uint8_t>");
+    preload_reduce_kernel<int8_t>("reduceKernel<int8_t>");
+    preload_reduce_kernel<int16_t>("reduceKernel<int16_t>");
+    preload_reduce_kernel<int>("reduceKernel<int>");
+    preload_reduce_kernel<int64_t>("reduceKernel<int64_t>");
+    preload_reduce_kernel<float>("reduceKernel<float>");
+    preload_reduce_kernel<double>("reduceKernel<double>");
+    preload_reduce_kernel<bool>("reduceKernel<bool>");
+    preload_reduce_kernel<at::BFloat16>("reduceKernel<BFloat16>");
 }
 
 MooncakeWorker::MooncakeWorker(int cuda_device_index)

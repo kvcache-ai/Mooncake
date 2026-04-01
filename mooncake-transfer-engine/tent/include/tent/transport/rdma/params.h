@@ -22,7 +22,7 @@ namespace mooncake {
 namespace tent {
 
 struct DeviceParams {
-    int num_cq_list = 6;  // == num_workers is preferred
+    int num_cq_list = 6;  // Derived from RdmaParams::num_lanes.
     int num_comp_channels = 1;
     uint8_t port = 1;
     int gid_index = -1;  // -1 means auto-select, >= 0 means explicit index
@@ -31,7 +31,7 @@ struct DeviceParams {
 
 struct EndPointParams {
     int endpoint_store_cap = 65536;
-    int qp_mul_factor = 6;  // == num_workers is preferred
+    int qp_mul_factor = 6;  // Derived from RdmaParams::num_lanes.
     int max_sge = 4;
     int max_qp_wr = 256;
     int max_inline_bytes = 64;
@@ -59,7 +59,7 @@ struct EndPointParams {
 };
 
 struct WorkerParams {
-    int num_workers = 6;
+    int num_workers = 6;  // Derived from RdmaParams::num_lanes.
     int max_retry_count = 8;
     int block_size = 65536;
     uint64_t grace_period_ns = 5000000;  // 5ms
@@ -68,6 +68,7 @@ struct WorkerParams {
 };
 
 struct RdmaParams {
+    int num_lanes = 6;  // Unified worker/QP/CQ parallelism.
     DeviceParams device;
     EndPointParams endpoint;
     WorkerParams workers;

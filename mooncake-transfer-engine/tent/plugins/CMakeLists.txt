@@ -8,4 +8,6 @@ target_include_directories(tent_plugin
 )
 target_compile_features(tent_plugin INTERFACE cxx_std_20)
 
-add_subdirectory(cuda)
+if (USE_CUDA)
+    add_subdirectory(cuda)
+endif()

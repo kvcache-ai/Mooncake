@@ -108,6 +108,9 @@ class DummyClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
+
     int isExist(const std::string &key);
 
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
@@ -133,6 +136,9 @@ class DummyClient : public PyClient {
 
    private:
     ErrorCode connect(const std::string &server_address);
+
+    int register_ascend_shm(const ShmHelper::ShmSegment *shm,
+                            bool is_local = false);
 
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
@@ -217,6 +223,9 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+
+    // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
+    int32_t device_id_ = 0;
 };
 
 }  // namespace mooncake
