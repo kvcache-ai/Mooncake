@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -118,6 +119,63 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
               kDefaultTestDiskFilePath);
     EXPECT_EQ(replica.get_disk_descriptor().object_size,
               kDefaultTestObjectSize);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotColdRestoreDropsLeaseExpiredObject) {
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto publish_result = mooncake::test::PublishSnapshotPayload(
+        *object_store_, *catalog_store_, descriptor_, UUID{1, 2},
+        kDefaultTestObjectKey, kDefaultTestDiskFilePath, kDefaultTestObjectSize,
+        /*lease_timeout_ms=*/now_ms - 1000,
+        /*has_soft_pin_timeout=*/true,
+        /*soft_pin_timeout_ms=*/now_ms + 60000);
+    ASSERT_TRUE(publish_result.has_value()) << publish_result.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    EXPECT_EQ(snapshot->value().snapshot_id, descriptor_.snapshot_id);
+    EXPECT_EQ(snapshot->value().snapshot_sequence_id,
+              descriptor_.last_included_seq);
+    EXPECT_TRUE(snapshot->value().metadata.empty());
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotOplogCatchupKeepsLeaseExpiredObject) {
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto publish_result = mooncake::test::PublishSnapshotPayload(
+        *object_store_, *catalog_store_, descriptor_, UUID{1, 2},
+        kDefaultTestObjectKey, kDefaultTestDiskFilePath, kDefaultTestObjectSize,
+        /*lease_timeout_ms=*/now_ms - 1000,
+        /*has_soft_pin_timeout=*/true,
+        /*soft_pin_timeout_ms=*/now_ms + 60000);
+    ASSERT_TRUE(publish_result.has_value()) << publish_result.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    auto snapshot = provider.value()->LoadLatestSnapshot(
+        cluster_id_, SnapshotRestoreMode::kStandbyCatchupWithOplog);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    ASSERT_EQ(1u, snapshot->value().metadata.size());
+    EXPECT_EQ(kDefaultTestObjectKey, snapshot->value().metadata.front().first);
+    EXPECT_EQ(kDefaultTestObjectSize,
+              snapshot->value().metadata.front().second.size);
+    EXPECT_EQ(descriptor_.last_included_seq,
+              snapshot->value().metadata.front().second.last_sequence_id);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsClusterMismatch) {

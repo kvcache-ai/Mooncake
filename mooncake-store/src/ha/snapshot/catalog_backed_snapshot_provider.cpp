@@ -100,7 +100,7 @@ ErrorCode ValidateManifest(std::string_view snapshot_id,
 tl::expected<std::optional<StandbyObjectMetadata>, ErrorCode>
 DeserializeStandbyObjectMetadata(
     const msgpack::object& object, const SegmentView& segment_view,
-    uint64_t snapshot_sequence_id,
+    uint64_t snapshot_sequence_id, SnapshotRestoreMode restore_mode,
     const std::chrono::system_clock::time_point& now) {
     if (object.type != msgpack::type::ARRAY) {
         LOG(ERROR) << "Snapshot metadata entry is not an array";
@@ -144,7 +144,8 @@ DeserializeStandbyObjectMetadata(
         (void)has_soft_pin_timeout;
         (void)soft_pin_timestamp_ms;
 
-        if (size == 0 || !IsSnapshotRestoreLeaseAlive(lease_timeout, now)) {
+        if (size == 0 || !ShouldAdmitSnapshotEntryForRestore(
+                             restore_mode, lease_timeout, now)) {
             return std::optional<StandbyObjectMetadata>();
         }
 
@@ -189,7 +190,8 @@ tl::expected<std::vector<std::pair<std::string, StandbyObjectMetadata>>,
              ErrorCode>
 DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                                    const SegmentView& segment_view,
-                                   uint64_t snapshot_sequence_id) {
+                                   uint64_t snapshot_sequence_id,
+                                   SnapshotRestoreMode restore_mode) {
     msgpack::object_handle root_handle;
     try {
         root_handle = msgpack::unpack(
@@ -257,7 +259,7 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                 const std::string key = item.via.array.ptr[0].as<std::string>();
                 auto metadata_result = DeserializeStandbyObjectMetadata(
                     item.via.array.ptr[1], segment_view, snapshot_sequence_id,
-                    now);
+                    restore_mode, now);
                 if (!metadata_result) {
                     return tl::make_unexpected(metadata_result.error());
                 }
@@ -350,6 +352,13 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
 
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
         const std::string& cluster_id) override {
+        return LoadLatestSnapshot(cluster_id,
+                                  SnapshotRestoreMode::kColdRestore);
+    }
+
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& cluster_id,
+        SnapshotRestoreMode restore_mode) override {
         auto latest_version = GetLatestSnapshotVersion(cluster_id);
         if (!latest_version) {
             return tl::make_unexpected(latest_version.error());
@@ -432,7 +441,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
 
         auto deserialize_metadata = DeserializeStandbySnapshotMetadata(
             metadata_content, segment_manager.getView(),
-            descriptor.last_included_seq);
+            descriptor.last_included_seq, restore_mode);
         if (!deserialize_metadata) {
             LOG(ERROR) << "Failed to deserialize snapshot metadata payload, "
                        << "snapshot_id=" << descriptor.snapshot_id
@@ -444,6 +453,11 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.snapshot_id = descriptor.snapshot_id;
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
+        VLOG(1) << "Loaded snapshot through catalog-backed provider, mode="
+                << SnapshotRestoreModeToString(restore_mode)
+                << ", snapshot_id=" << snapshot.snapshot_id
+                << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
+                << ", metadata_keys=" << snapshot.metadata.size();
         return std::optional<LoadedSnapshot>(std::move(snapshot));
     }
 

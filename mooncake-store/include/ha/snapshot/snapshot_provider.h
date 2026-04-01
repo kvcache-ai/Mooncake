@@ -13,16 +13,41 @@
 
 namespace mooncake {
 
-inline bool IsSnapshotRestoreLeaseAlive(
+enum class SnapshotRestoreMode {
+    kColdRestore,
+    kStandbyCatchupWithOplog,
+};
+
+inline const char* SnapshotRestoreModeToString(SnapshotRestoreMode mode) {
+    switch (mode) {
+        case SnapshotRestoreMode::kColdRestore:
+            return "cold-restore";
+        case SnapshotRestoreMode::kStandbyCatchupWithOplog:
+            return "standby-catchup-with-oplog";
+    }
+    return "unknown";
+}
+
+inline bool ShouldAdmitSnapshotEntryForRestore(
+    SnapshotRestoreMode mode,
     const std::chrono::system_clock::time_point& lease_timeout,
     const std::chrono::system_clock::time_point& now) {
-    return lease_timeout > now;
+    switch (mode) {
+        case SnapshotRestoreMode::kColdRestore:
+            return lease_timeout > now;
+        case SnapshotRestoreMode::kStandbyCatchupWithOplog:
+            return true;
+    }
+    return false;
 }
 
 template <typename Metadata>
-inline bool IsSnapshotRestoreLeaseAlive(
-    const Metadata& metadata,
+inline bool ShouldAdmitSnapshotEntryForRestore(
+    SnapshotRestoreMode mode, const Metadata& metadata,
     const std::chrono::system_clock::time_point& now) {
+    if (mode == SnapshotRestoreMode::kStandbyCatchupWithOplog) {
+        return true;
+    }
     auto now_copy = now;
     return !metadata.IsLeaseExpired(now_copy);
 }
@@ -80,6 +105,13 @@ class SnapshotProvider {
     // - LoadedSnapshot: full metadata baseline
     virtual tl::expected<std::optional<LoadedSnapshot>, ErrorCode>
     LoadLatestSnapshot(const std::string& cluster_id) = 0;
+
+    virtual tl::expected<std::optional<LoadedSnapshot>, ErrorCode>
+    LoadLatestSnapshot(const std::string& cluster_id,
+                       SnapshotRestoreMode restore_mode) {
+        (void)restore_mode;
+        return LoadLatestSnapshot(cluster_id);
+    }
 };
 
 // Default no-op provider: behaves as if "no snapshot available".

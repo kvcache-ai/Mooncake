@@ -52,6 +52,12 @@ std::optional<StandbySegmentInfo> BuildSnapshotSegmentInfo(
     return std::nullopt;
 }
 
+SnapshotRestoreMode ResolveSnapshotRestoreMode(bool enable_oplog_following) {
+    return enable_oplog_following
+               ? SnapshotRestoreMode::kStandbyCatchupWithOplog
+               : SnapshotRestoreMode::kColdRestore;
+}
+
 }  // namespace
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
@@ -270,7 +276,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
                 metadata_store_.get(), cluster_id_);
         }
 
-        auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
+        auto snapshot_err = LoadSnapshotBaselineLocked(
+            baseline_seq_id, SnapshotRestoreMode::kColdRestore);
         if (snapshot_err != ErrorCode::OK) {
             return snapshot_err;
         }
@@ -286,7 +293,9 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
         oplog_applier_->Recover(local_last_seq_id);
         baseline_seq_id = local_last_seq_id;
     } else {
-        auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
+        auto snapshot_err = LoadSnapshotBaselineLocked(
+            baseline_seq_id,
+            ResolveSnapshotRestoreMode(config_.enable_oplog_following));
         if (snapshot_err != ErrorCode::OK) {
             return snapshot_err;
         }
@@ -298,7 +307,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 }
 
 ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
-    uint64_t& baseline_seq_id) {
+    uint64_t& baseline_seq_id, SnapshotRestoreMode restore_mode) {
     baseline_seq_id = 0;
     oplog_applier_->Recover(0);
     loaded_snapshot_id_.clear();
@@ -308,16 +317,19 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
         return ErrorCode::OK;
     }
 
-    auto snapshot_result = snapshot_provider_->LoadLatestSnapshot(cluster_id_);
+    auto snapshot_result =
+        snapshot_provider_->LoadLatestSnapshot(cluster_id_, restore_mode);
     if (!snapshot_result) {
         if (config_.enable_oplog_following) {
             LOG(WARNING) << "Failed to load snapshot baseline, falling back "
-                            "to OpLog-only bootstrap: "
+                            "to OpLog-only bootstrap, restore_mode="
+                         << SnapshotRestoreModeToString(restore_mode) << ": "
                          << toString(snapshot_result.error());
             return ErrorCode::OK;
         }
         LOG(ERROR) << "Failed to load snapshot baseline for snapshot-only "
-                   << "standby bootstrap: "
+                   << "standby bootstrap, restore_mode="
+                   << SnapshotRestoreModeToString(restore_mode) << ": "
                    << toString(snapshot_result.error());
         return snapshot_result.error();
     }
@@ -337,6 +349,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     LOG(INFO) << "Loaded snapshot baseline: snapshot_id="
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
+              << ", restore_mode=" << SnapshotRestoreModeToString(restore_mode)
               << ", keys=" << snapshot.metadata.size();
     ApplyLoadedSnapshotLocked(snapshot);
     baseline_seq_id = snapshot.snapshot_sequence_id;
@@ -811,7 +824,8 @@ void HotStandbyService::RefreshSnapshotOnlyBaseline() {
         }
     }
 
-    auto snapshot_result = snapshot_provider->LoadLatestSnapshot(cluster_id_);
+    auto snapshot_result = snapshot_provider->LoadLatestSnapshot(
+        cluster_id_, SnapshotRestoreMode::kColdRestore);
     if (!snapshot_result) {
         LOG(WARNING) << "Failed to load latest snapshot during snapshot-only "
                      << "refresh, cluster=" << cluster_id_

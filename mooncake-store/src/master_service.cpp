@@ -3168,8 +3168,9 @@ bool MasterService::TryRestoreStateFromSnapshot(
                             it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)
                                 .has_value();
                         const bool cleanup_expired_complete =
-                            !IsSnapshotRestoreLeaseAlive(it->second,
-                                                         cleanup_now);
+                            !ShouldAdmitSnapshotEntryForRestore(
+                                SnapshotRestoreMode::kColdRestore, it->second,
+                                cleanup_now);
                         if (cleanup_incomplete || cleanup_expired_complete) {
                             VLOG(1)
                                 << "clear metadata key=" << it->first

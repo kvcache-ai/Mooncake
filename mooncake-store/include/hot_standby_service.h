@@ -176,7 +176,8 @@ class HotStandbyService {
 
    private:
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
-    ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id,
+                                         SnapshotRestoreMode restore_mode);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     void ApplyLoadedSnapshotLocked(const LoadedSnapshot& snapshot);

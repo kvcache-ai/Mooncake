@@ -11,7 +11,8 @@ namespace mooncake {
 
 // Build a standby-facing snapshot provider backed by the configured snapshot
 // catalog + object store pair. The provider is intentionally snapshot-only: it
-// loads the latest baseline but does not provide oplog catch-up state.
+// loads the latest baseline; callers choose cold-restore vs
+// standby-catchup-with-oplog admission semantics through SnapshotRestoreMode.
 tl::expected<std::unique_ptr<SnapshotProvider>, ErrorCode>
 CreateCatalogBackedSnapshotProvider(
     const MasterServiceSupervisorConfig& config);
