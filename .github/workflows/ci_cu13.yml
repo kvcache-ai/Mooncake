@@ -3,9 +3,23 @@ name: 'Build Wheel (CUDA 13)'
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'CMakeLists.txt'
+      - 'dependencies.sh'
+      - 'scripts/**'
+      - '.github/workflows/ci_cu13.yml'
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'CMakeLists.txt'
+      - 'dependencies.sh'
+      - 'scripts/**'
+      - '.github/workflows/ci_cu13.yml'
 
 jobs:
   build-wheel-cu13:

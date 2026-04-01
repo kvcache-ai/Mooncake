@@ -10,6 +10,7 @@ on:
 
 jobs:
   build:
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
@@ -193,6 +194,7 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   build-musa:
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
@@ -356,6 +358,7 @@ jobs:
       shell: bash
 
   build-flags:
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
@@ -510,6 +513,7 @@ jobs:
 
   build-docker:
     name: Build Docker Image
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||

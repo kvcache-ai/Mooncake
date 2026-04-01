@@ -1,15 +1,40 @@
 name: 'CI Test on ASCEND Platform'
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-    types: [opened, synchronize, reopened, labeled]
+  workflow_run:
+    workflows: ["Build & Test (Linux)"]
+    types:
+      - completed
 
 jobs:
+  check-paths:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.filter.outputs.changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Check changed files
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          base: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0].base.ref || 'main' }}
+          ref: ${{ github.event.workflow_run.head_sha }}
+          filters: |
+            changed:
+              - 'mooncake-*/**'
+              - 'extern/**'
+              - 'CMakeLists.txt'
+              - 'scripts/**'
+              - '.github/workflows/**'
+
   build-and-test:
-    if: github.repository == 'kvcache-ai/Mooncake'
+    needs: check-paths
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.repository == 'kvcache-ai/Mooncake' && needs.check-paths.outputs.should-run == 'true' }}
     runs-on: self-hosted
 
     container:
