@@ -85,7 +85,8 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     auto provider = CreateProvider();
     ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
-    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    auto snapshot = provider.value()->LoadLatestSnapshot(
+        cluster_id_, SnapshotRestoreMode::kColdRestore);
     ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
     EXPECT_FALSE(snapshot->has_value());
 }
@@ -96,7 +97,8 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
     auto provider = CreateProvider();
     ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
-    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    auto snapshot = provider.value()->LoadLatestSnapshot(
+        cluster_id_, SnapshotRestoreMode::kColdRestore);
     ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
     ASSERT_TRUE(snapshot->has_value());
     EXPECT_EQ(snapshot->value().snapshot_id, descriptor_.snapshot_id);
@@ -139,7 +141,8 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     auto provider = CreateProvider();
     ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
-    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    auto snapshot = provider.value()->LoadLatestSnapshot(
+        cluster_id_, SnapshotRestoreMode::kColdRestore);
     ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
     ASSERT_TRUE(snapshot->has_value());
     EXPECT_EQ(snapshot->value().snapshot_id, descriptor_.snapshot_id);
@@ -184,8 +187,8 @@ TEST_P(CatalogBackedSnapshotProviderTest, RejectsClusterMismatch) {
     auto provider = CreateProvider();
     ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
-    auto snapshot =
-        provider.value()->LoadLatestSnapshot(cluster_id_ + "-other");
+    auto snapshot = provider.value()->LoadLatestSnapshot(
+        cluster_id_ + "-other", SnapshotRestoreMode::kColdRestore);
     ASSERT_FALSE(snapshot.has_value());
     EXPECT_EQ(snapshot.error(), ErrorCode::INVALID_PARAMS);
 }

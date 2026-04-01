@@ -28,7 +28,8 @@ class FakeSnapshotProvider final : public SnapshotProvider {
         : result_(std::move(result)) {}
 
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& /*cluster_id*/) override {
+        const std::string& /*cluster_id*/,
+        SnapshotRestoreMode /*restore_mode*/) override {
         return result_;
     }
 
@@ -65,7 +66,8 @@ class MutableSnapshotProvider final : public SnapshotProvider {
     }
 
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& /*cluster_id*/) override {
+        const std::string& /*cluster_id*/,
+        SnapshotRestoreMode /*restore_mode*/) override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_;
     }
@@ -117,7 +119,8 @@ class BlockingSnapshotProvider final : public SnapshotProvider {
     }
 
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& /*cluster_id*/) override {
+        const std::string& /*cluster_id*/,
+        SnapshotRestoreMode /*restore_mode*/) override {
         std::unique_lock<std::mutex> lock(mutex_);
         if (block_next_load_) {
             load_started_ = true;

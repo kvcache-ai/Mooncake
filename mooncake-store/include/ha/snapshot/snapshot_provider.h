@@ -84,7 +84,8 @@ class SnapshotProvider {
     // Providers may override this for an efficient catalog-only check.
     virtual tl::expected<std::optional<SnapshotVersionInfo>, ErrorCode>
     GetLatestSnapshotVersion(const std::string& cluster_id) {
-        auto snapshot = LoadLatestSnapshot(cluster_id);
+        auto snapshot =
+            LoadLatestSnapshot(cluster_id, SnapshotRestoreMode::kColdRestore);
         if (!snapshot) {
             return tl::make_unexpected(snapshot.error());
         }
@@ -104,21 +105,16 @@ class SnapshotProvider {
     // - std::nullopt: no snapshot published yet
     // - LoadedSnapshot: full metadata baseline
     virtual tl::expected<std::optional<LoadedSnapshot>, ErrorCode>
-    LoadLatestSnapshot(const std::string& cluster_id) = 0;
-
-    virtual tl::expected<std::optional<LoadedSnapshot>, ErrorCode>
     LoadLatestSnapshot(const std::string& cluster_id,
-                       SnapshotRestoreMode restore_mode) {
-        (void)restore_mode;
-        return LoadLatestSnapshot(cluster_id);
-    }
+                       SnapshotRestoreMode restore_mode) = 0;
 };
 
 // Default no-op provider: behaves as if "no snapshot available".
 class NoopSnapshotProvider final : public SnapshotProvider {
    public:
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& /*cluster_id*/) override {
+        const std::string& /*cluster_id*/,
+        SnapshotRestoreMode /*restore_mode*/) override {
         return std::optional<LoadedSnapshot>();
     }
 };

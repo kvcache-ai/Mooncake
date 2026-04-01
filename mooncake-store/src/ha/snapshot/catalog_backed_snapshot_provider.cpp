@@ -351,12 +351,6 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
     }
 
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
-        const std::string& cluster_id) override {
-        return LoadLatestSnapshot(cluster_id,
-                                  SnapshotRestoreMode::kColdRestore);
-    }
-
-    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
         const std::string& cluster_id,
         SnapshotRestoreMode restore_mode) override {
         auto latest_version = GetLatestSnapshotVersion(cluster_id);
