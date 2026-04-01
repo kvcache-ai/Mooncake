@@ -40,6 +40,9 @@ add_definitions(-DCONFIG_ERDMA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Memory-aware build parallelism (compile vs. link job pools)
+include(${CMAKE_CURRENT_LIST_DIR}/limit_jobs.cmake)
+
 option(ENABLE_SCCACHE "Whether to open sccache" OFF)
 if (ENABLE_SCCACHE)
   find_program(SCCACHE sccache REQUIRED)
@@ -58,6 +61,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
+option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
@@ -140,6 +144,23 @@ if (USE_CUDA)
   link_directories(
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
+  )
+endif()
+
+if (USE_MACA)
+  # MACA toolchain is CUDA-compatible in first-stage porting.
+  # Reuse CUDA code paths to get a runnable baseline quickly.
+  add_compile_definitions(USE_MACA)
+  message(STATUS "MACA support is enabled")
+  if(DEFINED ENV{MACA_HOME})
+    set(MACA_HOME $ENV{MACA_HOME})
+  else()
+    set(MACA_HOME /opt/maca)
+  endif()
+  include_directories(${MACA_HOME}/include)
+  link_directories(
+    ${MACA_HOME}/lib
+    ${MACA_HOME}/lib64
   )
 endif()
 

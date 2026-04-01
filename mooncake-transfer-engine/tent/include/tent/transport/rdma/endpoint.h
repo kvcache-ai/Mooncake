@@ -16,6 +16,8 @@
 #define TENT_ENDPOINT_H
 
 #include <queue>
+#include <unordered_set>
+#include <vector>
 
 #include "context.h"
 
@@ -157,6 +159,9 @@ class RdmaEndPoint {
     void cancelQuota(int qp_index, int num_entries);
 
    private:
+    // Caller must hold lock_ in write mode.
+    int deconstructUnlocked();
+
     void resetInflightSlices();
 
     void postNotifyRecv(size_t idx);
@@ -169,6 +174,8 @@ class RdmaEndPoint {
     std::string endpoint_name_;
 
     std::vector<ibv_qp*> qp_list_;
+    // Each data QP queue is owned by exactly one worker lane; reset/deconstruct
+    // are synchronized by the endpoint lifecycle lock.
     std::vector<BoundedSliceQueue> slice_queue_;
     WrDepthBlock* wr_depth_list_;
     volatile int inflight_slices_;
@@ -177,6 +184,7 @@ class RdmaEndPoint {
 
     std::string peer_server_name_;
     std::string peer_nic_name_;
+    std::vector<uint32_t> peer_qp_num_list_;
     std::atomic<int>* endpoints_count_;
 
     // Notification QP (one per endpoint for control plane operations)

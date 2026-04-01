@@ -8,8 +8,16 @@ configure_file(include/version.h.in include/version.h @ONLY)
 if (STORE_USE_ETCD)
     set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/)
     set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/libetcd_wrapper.so)
-else()
-    message(STATUS "STORE_USE_ETCD=OFF, high availability of Store is disabled")
+endif()
+
+if (STORE_USE_REDIS)
+    find_path(MOONCAKE_STORE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
+    find_library(MOONCAKE_STORE_HIREDIS_LIBRARY hiredis REQUIRED)
+    message(STATUS "Redis HA backend: Enabled")
+endif()
+
+if (NOT STORE_USE_ETCD AND NOT STORE_USE_REDIS)
+    message(STATUS "Store HA backends are disabled")
 endif()
 
 # Add include directories

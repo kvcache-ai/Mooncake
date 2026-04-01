@@ -40,6 +40,7 @@ static bool supportFabricMem() {
     return true;
 }
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
+                                     bool isDummy,
                                      uint64_t* local2global_rank_map,
                                      std::string location,
                                      c10::intrusive_ptr<::c10d::Store> store,
@@ -48,7 +49,9 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      TransferEngine* engine)
     : backendIndex_(backendIndex),
       rank_(rank),
-      size_(size),
+      groupSize_(size),
+      isDummy_(isDummy),
+      establishedGroupSize_(0),
       local2global_rank_map_(local2global_rank_map),
       store_(std::move(store)),
       meta_(std::move(meta)),
@@ -77,7 +80,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
 }
 
 ConnectionContext::~ConnectionContext() {
-    for (int i = 0; i < size_; ++i) {
+    for (int i = 0; i < groupSize_; ++i) {
         if (peerStates_[i].segmentId.has_value()) {
             engine_->closeSegment(peerStates_[i].segmentId.value());
         }
@@ -93,12 +96,94 @@ ConnectionContext::~ConnectionContext() {
     }
 }
 
+int ConnectionContext::getTotalConnectedPeers() const {
+    return totalConnectedPeers_.load(std::memory_order_acquire);
+}
+
+void ConnectionContext::extendGroupSizeTo(int newGroupSize) {
+    const int oldGroupSize = groupSize_.load(std::memory_order_acquire);
+    if (newGroupSize == oldGroupSize) return;
+
+    TORCH_CHECK(
+        newGroupSize >= 0 && static_cast<size_t>(newGroupSize) < kMaxNumRanks,
+        "Size out of range");
+    TORCH_CHECK(newGroupSize >= oldGroupSize, "newGroupSize < oldGroupSize");
+
+    // Reset local peer state for newly added ranks
+    for (int i = oldGroupSize; i < newGroupSize; ++i) {
+        meta_->peerConnected[i] = false;
+    }
+
+    groupSize_.store(newGroupSize, std::memory_order_release);
+}
+
+bool ConnectionContext::isAllPeerConnected() const {
+    return totalConnectedPeers_ == groupSize_;
+}
+
 void ConnectionContext::waitUntilAllConnected() {
+    if (isAllPeerConnected()) return;
+
     std::unique_lock<std::mutex> lock(backend_wakeup_mutex_);
     backend_wakeup_cv_.wait(lock, [this]() {
         return isAllPeerConnected() ||
                isShutdown_.load(std::memory_order_acquire);
     });
+    establishedGroupSize_.store(groupSize_, std::memory_order_release);
+}
+
+void ConnectionContext::waitUntilNewRanksConnected() {
+    if (isDummy_) {
+        return;
+    }
+    const int targetGroupSize = groupSize_.load(std::memory_order_acquire);
+    const int established =
+        establishedGroupSize_.load(std::memory_order_acquire);
+    if (established >= targetGroupSize) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(backend_wakeup_mutex_);
+    backend_wakeup_cv_.wait(lock, [this, targetGroupSize, established]() {
+        if (isShutdown_.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        for (int i = established; i < targetGroupSize; ++i) {
+            if (!meta_->peerConnected[i]) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    establishedGroupSize_.store(targetGroupSize, std::memory_order_release);
+}
+
+void ConnectionContext::bootstrapLocalPeer(const std::string& localServerName,
+                                           const SegmentInfo& localRankInfo) {
+    auto& peerState = peerStates_[rank_];
+    if (peerState.state == PeerConnectionState::CONNECTED) {
+        return;
+    }
+
+    auto segment_id = engine_->openSegment(localServerName);
+    meta_->segmentIDs[rank_] = segment_id;
+    peerState.segmentId = segment_id;
+    memcpy(&meta_->segmentInfos[rank_], &localRankInfo, sizeof(SegmentInfo));
+
+    meta_->peerConnected[rank_] = true;
+    ConnectionPoller::GetInstance()
+        .global_peerConnected_[local2global_rank_map_[rank_]] = true;
+    peerState.state = PeerConnectionState::CONNECTED;
+
+    {
+        std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+        totalConnectedPeers_.store(1, std::memory_order_release);
+        if (isAllPeerConnected()) {
+            backend_wakeup_cv_.notify_all();
+        }
+    }
 }
 
 void ConnectionContext::shutdown() {
@@ -118,7 +203,7 @@ bool ConnectionContext::poll() {
     bool did_work = false;
 
     // Poll all peers sequentially.
-    for (int pollingRank = 0; pollingRank < size_; ++pollingRank) {
+    for (int pollingRank = 0; pollingRank < groupSize_; ++pollingRank) {
         did_work |= pollPeer(pollingRank);
     }
 
@@ -189,7 +274,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);
-                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                    backend_wakeup_cv_.notify_all();
                 }
             } else if (pollingRank <= rank_) {
                 // Send a warmup request to establish connections
@@ -232,7 +317,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);
-                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                    backend_wakeup_cv_.notify_all();
                 }
                 state_changed = true;
             } else if (status.s == TransferStatusEnum::FAILED) {
@@ -259,7 +344,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);
-                    if (isAllPeerConnected()) backend_wakeup_cv_.notify_all();
+                    backend_wakeup_cv_.notify_all();
                 }
                 state_changed = true;
             }
@@ -298,6 +383,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             // reports a failure. We must set both to false here.
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
+            meta_->activeRanks[pollingRank] = false;
+            meta_->activeRanksTensor[pollingRank] = 0;
 
             // Reset store
             store_->deleteKey(
@@ -305,6 +392,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
             store_->deleteKey(
                 getExtensionTaskCountStoreKey(backendIndex_, pollingRank));
+            store_->deleteKey(
+                getExtensionActiveRanksStoreKey(backendIndex_, pollingRank));
 
             // Reset warmup region
             *reinterpret_cast<volatile int32_t*>(
@@ -352,12 +441,20 @@ bool ConnectionContext::tryStop() {
     return stopped;
 }
 
-ConnectionPoller::ConnectionPoller() {
+ConnectionPoller::ConnectionPoller() = default;
+
+void ConnectionPoller::ensureThreadStarted() {
+    bool expected = false;
+    if (!pollerThreadStarted_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
     pollerThread_ = std::thread([this] { pollerLoop(); });
 }
 
 void ConnectionPoller::registerContext(
     const std::shared_ptr<ConnectionContext>& ctx) {
+    ensureThreadStarted();
     {
         std::lock_guard<std::mutex> lock(contexts_mutex_);
         contexts_.push_back(ctx);

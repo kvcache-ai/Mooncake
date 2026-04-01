@@ -33,16 +33,11 @@ def _elastic_worker(rank, num_processes, signals):
             signals["extend"] = 1
 
         backend = dist.group.WORLD._get_backend(torch.device("cpu"))
-        while True:
-            num_synced_ranks = pg.get_num_synced_ranks(backend)
-            if num_synced_ranks == num_processes:
-                break
-            # Simulate ongoing operations
-            tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cpu")
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-            assert tensor.item() == sum(range(1, world_size + 1))
-
         # Extend world
+        # Note: `extend_group_size_to` is non-blocking. Blocking will only
+        # occur at the first communication if some peers have not yet connected.
+        # This allows overlapping other operations between the group expansion
+        # and the first communication call.
         pg.extend_group_size_to(backend, num_processes)
     else:
         while "extend" not in signals:
@@ -62,8 +57,8 @@ def _elastic_worker(rank, num_processes, signals):
     )
 
 
-def _recovery_worker(rank, num_processes, signals):
-    """Worker for testing rank recovery."""
+def _deferred_recovery_worker(rank, num_processes, signals):
+    """Worker for testing deferred rank recovery join."""
     if rank < num_processes:
         dist.init_process_group(
             backend="mooncake-cpu",
@@ -73,9 +68,10 @@ def _recovery_worker(rank, num_processes, signals):
         if rank == broken_rank:
             return  # Simulate broken rank
 
+        expected_without_broken = sum(range(0, num_processes)) - broken_rank
         tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        assert tensor.item() == sum(range(0, num_processes)) - broken_rank
+        assert tensor.item() == expected_without_broken
 
         time.sleep(5)
         signals["recover"] = 1
@@ -84,9 +80,17 @@ def _recovery_worker(rank, num_processes, signals):
             (peer_state,) = pg.get_peer_state(backend, [broken_rank])
             if peer_state:
                 break
+
+        # Healthy ranks keep making progress before the recovered rank joins.
+        tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        assert tensor.item() == expected_without_broken
+
+        while "join_ready" not in signals:
+            time.sleep(0.1)
+
         pg.recover_ranks(backend, [broken_rank])
 
-        # Ensure correct operation after recovery
         tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         assert tensor.item() == sum(range(0, num_processes)), (
@@ -95,7 +99,8 @@ def _recovery_worker(rank, num_processes, signals):
         )
     else:
         while "recover" not in signals:
-            time.sleep(1)
+            time.sleep(0.1)
+
         dist.init_process_group(
             backend="mooncake-cpu",
             rank=broken_rank,
@@ -106,7 +111,16 @@ def _recovery_worker(rank, num_processes, signals):
             ),
         )
 
-        # Ensure correct operation after recovery
+        backend = dist.group.WORLD._get_backend(torch.device("cpu"))
+
+        # Deferred join starts in a local-only mode so collectives stay self-contained.
+        tensor = torch.tensor([broken_rank], dtype=torch.int32, device="cpu")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        assert tensor.item() == broken_rank
+
+        signals["join_ready"] = 1
+        pg.join_group(backend)
+
         tensor = torch.tensor([broken_rank], dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         assert tensor.item() == sum(range(0, num_processes)), (
@@ -128,6 +142,16 @@ class TestMooncakeBackend(unittest.TestCase):
         signals = mp_manager.dict()
         mp.spawn(
             _recovery_worker,
+            args=(num_processes, signals),
+            nprocs=num_processes + 1,
+        )
+
+    def test_rank_recovery_deferred_join(self):
+        num_processes = 4
+        mp_manager = mp.Manager()
+        signals = mp_manager.dict()
+        mp.spawn(
+            _deferred_recovery_worker,
             args=(num_processes, signals),
             nprocs=num_processes + 1,
         )

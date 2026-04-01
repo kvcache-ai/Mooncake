@@ -181,6 +181,17 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_MIN_REG_SIZE";
     }
 
+    const char *max_mr_size_env = std::getenv("MC_MAX_MR_SIZE");
+    if (max_mr_size_env) {
+        uint64_t val = atoll(max_mr_size_env);
+        if (val > 0) {
+            config.max_mr_size = val;
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_MR_SIZE";
+        }
+    }
+
     const char *retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);

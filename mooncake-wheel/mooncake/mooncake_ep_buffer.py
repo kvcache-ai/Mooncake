@@ -150,8 +150,11 @@ class Buffer:
                 dist.all_gather(interface_ids, interface_id, self.group)
                 interface_ids = torch.cat(interface_ids).tolist()
 
+                from mooncake.ep import get_active_ranks
+                active_ranks_mask = get_active_ranks(self.backend).tolist()
                 self.runtime.sync_roce(
-                    raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids
+                    raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids,
+                    active_ranks_mask
                 )
             else:
                 local_lids = self.runtime.get_local_lids()
@@ -169,7 +172,10 @@ class Buffer:
                 dist.all_to_all(remote_lids, local_lids, self.group)
                 remote_lids = torch.cat(remote_lids).tolist()
 
-                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
+                from mooncake.ep import get_active_ranks
+                active_ranks_mask = get_active_ranks(self.backend).tolist()
+                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids,
+                                     active_ranks_mask)
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
@@ -183,7 +189,10 @@ class Buffer:
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
             remote_handles = [h.tolist() for h in handles]
-            self.runtime.sync_nvlink_ipc_handles(remote_handles)
+            from mooncake.ep import get_active_ranks
+            active_ranks_mask = get_active_ranks(self.backend).tolist()
+            self.runtime.sync_nvlink_ipc_handles(remote_handles,
+                                                 active_ranks_mask)
         except Exception as e:
             import warnings
 

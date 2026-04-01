@@ -51,6 +51,7 @@ jobs:
                 echo "Detected that extern/pybind11 already exists, continuing execution...."
             fi
         fi
+        bash scripts/ascend/dependencies_ascend_installation.sh
         echo "Configuring CMake..."
         rm -rf build
         mkdir -p build
@@ -67,8 +68,8 @@ jobs:
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         echo "Building..."
         cd build
-        make -j8
-        make install -j8
+        cmake --build . -j$(nproc)
+        cmake --install .
         echo "Mooncake installed successfully."
 
     - name: Run Hixl Mooncake Store Test
@@ -129,37 +130,86 @@ jobs:
               "batch_put_get_multi_buffers_sample.py"
           )
 
+          # List of test scenarios (HCCL_INTRA_ROCE_ENABLE settings)
+          TEST_SCENARIOS=(
+              "HCCL_INTRA_ROCE_ENABLE=1"
+              "HCCL_INTRA_ROCE_ENABLE_UNSET"
+          )
+
           # Track test results
           FAILED_TESTS=()
           PASSED_TESTS=()
 
-          # Run each test case
-          export ASCEND_BUFFER_POOL=4:8
-          for test_case in "${TEST_CASES[@]}"; do
+          # Run each test scenario
+          for scenario in "${TEST_SCENARIOS[@]}"; do
               echo ""
               echo "========================================="
-              echo "Running test: $test_case"
+              echo "Running scenario: $scenario"
               echo "========================================="
 
-              if [ ! -f "$test_case" ]; then
-                  echo "Warning: Test file $test_case not found, skipping..."
-                  continue
-              fi
-              # Run the test with run.sh
-              python3 $test_case \
-                  --device_id=0 \
-                  --rank=0 \
-                  2>&1 | tee "/tmp/hixl_test_${test_case%.py}.log"
-
-              TEST_RESULT=${PIPESTATUS[0]}
-
-              if [ $TEST_RESULT -eq 0 ]; then
-                  echo "✓ $test_case PASSED"
-                  PASSED_TESTS+=("$test_case")
+              # Configure environment variables for the current scenario
+              if [ "$scenario" = "HCCL_INTRA_ROCE_ENABLE=1" ]; then
+                  export HCCL_INTRA_ROCE_ENABLE=1
+                  unset ASCEND_BUFFER_POOL
+                  echo "HCCL_INTRA_ROCE_ENABLE is set to 1, ASCEND_BUFFER_POOL is unset"
               else
-                  echo "✗ $test_case FAILED with exit code: $TEST_RESULT"
-                  FAILED_TESTS+=("$test_case")
+                  unset HCCL_INTRA_ROCE_ENABLE
+                  export ASCEND_BUFFER_POOL=4:8
+                  echo "HCCL_INTRA_ROCE_ENABLE is not set, ASCEND_BUFFER_POOL is set to 4:8"
               fi
+
+              # Run each test case in the current scenario
+              for test_case in "${TEST_CASES[@]}"; do
+                  echo ""
+                  echo "-----------------------------------------"
+                  echo "Test: $test_case"
+                  echo "-----------------------------------------"
+
+                  if [ ! -f "$test_case" ]; then
+                      echo "Warning: Test file $test_case not found, skipping..."
+                      continue
+                  fi
+
+                  # Run the test with 2 devices in distributed mode
+                  # Run rank 0 on device 0
+                  python3 $test_case \
+                      --device_id=0 \
+                      --rank=0 \
+                      --world_size=2 \
+                      --distributed \
+                      2>&1 | tee "/tmp/hixl_test_${scenario//=/}_${test_case%.py}_rank0.log" &
+                  PID0=$!
+
+                  # Run rank 1 on device 1
+                  python3 $test_case \
+                      --device_id=2 \
+                      --rank=1 \
+                      --world_size=2 \
+                      --distributed \
+                      2>&1 | tee "/tmp/hixl_test_${scenario//=/}_${test_case%.py}_rank1.log" &
+                  PID1=$!
+
+                  # Wait for both processes to complete
+                  wait $PID0
+                  TEST_RESULT0=$?
+                  wait $PID1
+                  TEST_RESULT1=$?
+
+                  # Check test results
+                  if [ $TEST_RESULT0 -eq 0 ] && [ $TEST_RESULT1 -eq 0 ]; then
+                      echo "✓ $test_case PASSED (scenario: $scenario)"
+                      PASSED_TESTS+=("$scenario:$test_case")
+                  else
+                      echo "✗ $test_case FAILED (scenario: $scenario)"
+                      if [ $TEST_RESULT0 -ne 0 ]; then
+                          echo "  Rank 0 failed with code: $TEST_RESULT0"
+                      fi
+                      if [ $TEST_RESULT1 -ne 0 ]; then
+                          echo "  Rank 1 failed with code: $TEST_RESULT1"
+                      fi
+                      FAILED_TESTS+=("$scenario:$test_case")
+                  fi
+              done
           done
 
           echo ""

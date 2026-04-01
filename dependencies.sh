@@ -103,6 +103,7 @@ echo -e "${YELLOW}This may take a few minutes...${NC}"
 
 SYSTEM_PACKAGES="build-essential \
                   cmake \
+                  ninja-build \
                   git \
                   wget \
                   unzip \
@@ -127,6 +128,7 @@ SYSTEM_PACKAGES="build-essential \
                   libmsgpack-dev \
                   libzstd-dev \
                   libasio-dev \
+                  libxxhash-dev \
                   pkg-config \
                   patchelf \
                   libc6-dev \

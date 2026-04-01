@@ -2,6 +2,8 @@
 
 The source code path for Ascend Transport is `Mooncake/mooncake-transfer-engine/src/transport/ascend_transport`, which also includes automated build scripts and the README file.
 
+**ASCEND TRANSPORT is scheduled for deprecation, please use [ASCEND DIRECT TRANSPORT](./ascend_direct_transport.md) on ASCEND platform. **
+
 ## Overview
 
 Ascend Transport is a high-performance zero-copy NPU data transfer library with one-sided semantics, directly compatible with Mooncake Transfer Engine. To compile and use the Ascend Transport library, please set the `USE_ASCEND` flag to `"ON"` in the `mooncake-common/common.cmake` file.
@@ -142,7 +144,7 @@ Therefore, in testing:
    Watch the log produced by `mooncake-transfer-engine/src/transfer_engine.cpp`; you should see a line similar to  
    ```
    Transfer Engine RPC using <protocol> listening on <IP>:<actual-port>
-   ```  
+   ```
    Note the **actual port** the target node is listening on.
 
 2. **Edit the initiator’s launch command**:  

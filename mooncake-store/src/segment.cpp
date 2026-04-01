@@ -358,7 +358,8 @@ ErrorCode ScopedSegmentAccess::GetUnreadySegments(
 }
 
 ErrorCode SegmentView::GetSegment(
-    std::shared_ptr<BufferAllocatorBase> allocator, Segment& segment) const {
+    const std::shared_ptr<BufferAllocatorBase>& allocator,
+    Segment& segment) const {
     // Check input parameters
     if (!allocator) {
         return ErrorCode::INVALID_PARAMS;

@@ -36,8 +36,10 @@ sudo apt-get install -y \
     libibverbs-dev \
     libboost-all-dev \
     libcurl4-openssl-dev \
-    libyaml-cpp-dev \
     libgtest-dev \
+    libmsgpack-dev \
+    libxxhash-dev \
+    libyaml-cpp-dev \
     pybind11-dev \
     python3-dev
 
@@ -81,6 +83,7 @@ make -j$(nproc)
 ```bash
 # Copy built modules to wheel directory
 cp mooncake-integration/engine.cpython-*.so ../mooncake-wheel/mooncake/
+cp mooncake-integration/store.cpython-*.so ../mooncake-wheel/mooncake/
 cp mooncake-asio/libasio.so ../mooncake-wheel/mooncake/
 
 # Install with pip

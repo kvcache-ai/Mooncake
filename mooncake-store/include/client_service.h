@@ -13,7 +13,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "ha_helper.h"
+#include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
@@ -22,6 +22,7 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "count_min_sketch.h"
 #include "local_hot_cache.h"
 
 namespace mooncake {
@@ -69,8 +70,8 @@ class Client {
      *        Optional with default auto-discovery. Only required when
      *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
-     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
-     *        HA mode)
+     *        address for non-HA mode, or <backend>://connstring for HA mode,
+     *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -255,6 +256,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    ReplicaType replica_type);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -471,6 +475,31 @@ class Client {
 
     bool is_ping_healthy() const { return last_ping_success_.load(); }
 
+    /**
+     * @brief Get current frequency admission count for a key.
+     * @return estimated count, or 0 if admission sketch is disabled.
+     */
+    uint8_t GetAdmissionCount(const std::string& key) const {
+        if (admission_sketch_ == nullptr) {
+            return 0;
+        }
+        return admission_sketch_->count(key);
+    }
+
+    /**
+     * @brief Decide whether a key should be admitted to local hot cache.
+     * Updates admission sketch only when cache was not used.
+     */
+    bool ShouldAdmitToHotCache(const std::string& key, bool cache_used) {
+        if (!(hot_cache_ && !cache_used)) {
+            return false;
+        }
+        if (admission_sketch_ == nullptr) {
+            return true;
+        }
+        return admission_sketch_->increment(key) >= admission_threshold_;
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -610,11 +639,22 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
-    MasterViewHelper master_view_helper_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
+    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
+    std::mutex leader_switch_mutex_;
+    std::optional<ha::MasterView> current_master_view_;
+    std::string direct_master_address_;
+    std::thread leader_monitor_thread_;
+    std::atomic<bool> leader_monitor_running_{false};
+    std::thread storage_heartbeat_thread_;
+    std::atomic<bool> storage_heartbeat_running_{false};
+    std::thread task_poll_thread_;
+    std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
-    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LeaderMonitorThreadMain();
+    void StorageHeartbeatThreadMain();
+    void TaskPollThreadMain();
+    void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
 
@@ -673,6 +713,10 @@ class Client {
     // Local hot cache and async handler
     std::shared_ptr<LocalHotCache> hot_cache_;
     std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
+
+    // Frequency admission: only cache keys whose CMS count >= threshold
+    std::unique_ptr<CountMinSketch> admission_sketch_;
+    uint8_t admission_threshold_ = 2;
 };
 
 }  // namespace mooncake

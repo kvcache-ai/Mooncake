@@ -86,6 +86,7 @@ struct MooncakeEpBuffer {
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
     int gid_index_ = -1;  // Dynamically discovered GID index
+    int USE_QP_COUNT = MAX_QP_COUNT;
 
     mlx5dv_devx_umem* ctrl_buf_umem;
     ibv_pd* pd;
@@ -172,13 +173,15 @@ struct MooncakeEpBuffer {
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,
                  const std::vector<int32_t>& remote_qpns,
-                 const std::vector<int32_t>& remote_lids);
+                 const std::vector<int32_t>& remote_lids,
+                 const std::vector<int>& active_ranks_mask);
 
     void sync_roce(const std::vector<int64_t>& remote_addrs,
                    const std::vector<int32_t>& remote_keys,
                    const std::vector<int32_t>& remote_qpns,
                    const std::vector<int64_t>& subnet_prefixes,
-                   const std::vector<int64_t>& interface_ids);
+                   const std::vector<int64_t>& interface_ids,
+                   const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
         return {(int64_t)mr->addr, (int32_t)mr->rkey};
@@ -191,7 +194,7 @@ struct MooncakeEpBuffer {
 
     std::vector<int32_t> get_local_qpns() {
         std::vector<int32_t> local_qpns;
-        for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        for (int i = 0; i < USE_QP_COUNT; ++i) {
             local_qpns.push_back((int32_t)qps[i]->qpn);
         }
         return local_qpns;
@@ -199,7 +202,7 @@ struct MooncakeEpBuffer {
 
     std::vector<int32_t> get_local_lids() {
         std::vector<int32_t> local_lids;
-        for (int i = 0; i < MAX_QP_COUNT; ++i) {
+        for (int i = 0; i < USE_QP_COUNT; ++i) {
             local_lids.push_back((int32_t)qps[i]->port_attr.lid);
         }
         return local_lids;
@@ -207,7 +210,8 @@ struct MooncakeEpBuffer {
 
     std::vector<int32_t> get_ipc_handle();
     void sync_nvlink_ipc_handles(
-        const std::vector<std::vector<int32_t>>& remote_handles);
+        const std::vector<std::vector<int32_t>>& remote_handles,
+        const std::vector<int>& active_ranks_mask);
 };
 
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,

@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -13,12 +14,92 @@
 #include <ylt/easylog/record.hpp>
 
 #include "client_service.h"
+#include "master_metric_manager.h"
 #include "utils.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 
 namespace mooncake {
 namespace testing {
+
+TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+
+    std::string local_hostname = "127.0.0.1:18011";
+    std::string master_addr = master.master_address();
+    const auto ping_before =
+        MasterMetricManager::instance().get_ping_requests();
+
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
+                                     std::nullopt, master_addr);
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+
+    // Zero-segment clients should not start storage heartbeat immediately.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto ping_without_mount =
+        MasterMetricManager::instance().get_ping_requests();
+    EXPECT_EQ(ping_without_mount, ping_before);
+
+    size_t ram_buffer_size = 16 * 1024 * 1024;
+    void* seg_ptr = allocate_buffer_allocator_memory(ram_buffer_size);
+    ASSERT_NE(seg_ptr, nullptr);
+
+    auto mount_res = client->MountSegment(seg_ptr, ram_buffer_size);
+    ASSERT_TRUE(mount_res.has_value()) << toString(mount_res.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto ping_after_mount =
+        MasterMetricManager::instance().get_ping_requests();
+    EXPECT_GT(ping_after_mount, ping_without_mount);
+
+    auto unmount_res = client->UnmountSegment(seg_ptr, ram_buffer_size);
+    ASSERT_TRUE(unmount_res.has_value()) << toString(unmount_res.error());
+    free(seg_ptr);
+}
+
+TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatAfterLocalDiskMount) {
+    const auto tmp_dir =
+        std::filesystem::temp_directory_path() /
+        ("mc_zero_seg_local_disk_" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    ASSERT_TRUE(std::filesystem::create_directories(tmp_dir));
+
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_root_fs_dir(tmp_dir.string())
+                                 .set_enable_offload(true)
+                                 .build()));
+
+    std::string local_hostname = "127.0.0.1:18012";
+    std::string master_addr = master.master_address();
+    const auto ping_before =
+        MasterMetricManager::instance().get_ping_requests();
+
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
+                                     std::nullopt, master_addr);
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto ping_without_mount =
+        MasterMetricManager::instance().get_ping_requests();
+    EXPECT_EQ(ping_without_mount, ping_before);
+
+    auto mount_res = client->MountLocalDiskSegment(false);
+    ASSERT_TRUE(mount_res.has_value()) << toString(mount_res.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    const auto ping_after_mount =
+        MasterMetricManager::instance().get_ping_requests();
+    EXPECT_GT(ping_after_mount, ping_without_mount);
+
+    client.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(tmp_dir, ec);
+}
 
 // Non-HA: client auto-reconnects to master and remounts segments
 TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {

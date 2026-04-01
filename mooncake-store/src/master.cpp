@@ -9,7 +9,8 @@
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
-#include "ha_helper.h"
+#include "duration_utils.h"
+#include "ha/leadership/master_service_supervisor.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -20,6 +21,42 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
+static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
+              "Update kDefaultKvLeaseTtlFlagValue when "
+              "DEFAULT_DEFAULT_KV_LEASE_TTL changes");
+static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
+              "Update kDefaultKvSoftPinTtlFlagValue when "
+              "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
+
+constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
+constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
+
+namespace {
+
+bool ValidateDurationFlag(const char* flagname, const std::string& value) {
+    uint64_t parsed_value = 0;
+    std::string error;
+    if (!mooncake::ParseDurationMs(value, &parsed_value, &error)) {
+        LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+                   << ". " << error;
+        return false;
+    }
+    return true;
+}
+
+uint64_t ParseDurationFlagOrDie(const char* flag_name,
+                                const std::string& value) {
+    uint64_t parsed_value = 0;
+    std::string error;
+    if (!mooncake::ParseDurationMs(value, &parsed_value, &error)) {
+        LOG(FATAL) << "Invalid value for --" << flag_name << ": " << value
+                   << ". " << error;
+    }
+    return parsed_value;
+}
+
+}  // namespace
+
 DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
@@ -28,13 +65,17 @@ DEFINE_int32(
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
-DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
-              "Default lease time for kv objects");
-DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
-              "Default soft pin ttl for kv objects");
+DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
+              "Default lease time for kv objects. Supports raw milliseconds "
+              "or duration strings with ms, s, m, or h suffixes");
+DEFINE_string(default_kv_soft_pin_ttl, kDefaultKvSoftPinTtlFlagValue,
+              "Default soft pin TTL for kv objects. Supports raw milliseconds "
+              "or duration strings with ms, s, m, or h suffixes");
 DEFINE_bool(allow_evict_soft_pinned_objects,
             mooncake::DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
             "Whether to allow eviction of soft pinned objects during eviction");
+DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
+DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
               "Ratio of objects to evict when storage space is full");
 DEFINE_double(eviction_high_watermark_ratio,
@@ -64,6 +105,11 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
 DEFINE_bool(enable_ha, false,
             "Enable high availability, which depends on etcd");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_string(ha_backend_type, "etcd",
+              "HA backend type, e.g. etcd | redis | k8s");
+DEFINE_string(ha_backend_connstring, "",
+              "HA backend connection string. If unset, fallback to "
+              "etcd_endpoints for backward compatibility");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
@@ -121,9 +167,22 @@ DEFINE_uint32(snapshot_retention_count,
               mooncake::DEFAULT_SNAPSHOT_RETENTION_COUNT,
               "Number of recent snapshots to keep (older snapshots will be "
               "automatically deleted)");
-DEFINE_string(snapshot_backend_type, "",
-              "Snapshot storage backend type: 'local' for local filesystem, "
+DEFINE_string(snapshot_object_store_type, "",
+              "Snapshot object store type: 'local' for local filesystem, "
               "'s3' for S3 storage");
+DEFINE_string(snapshot_payload_store_type, "",
+              "Deprecated alias of --snapshot_object_store_type");
+DEFINE_string(snapshot_payload_backend_type, "",
+              "Deprecated alias of --snapshot_object_store_type");
+DEFINE_string(snapshot_catalog_store_type, "",
+              "Snapshot catalog store type: ''/'embedded' or 'redis' "
+              "('payload' is kept as a deprecated alias)");
+DEFINE_string(snapshot_catalog_backend_type, "",
+              "Deprecated alias of --snapshot_catalog_store_type");
+DEFINE_string(snapshot_catalog_store_connstring, "",
+              "Optional connection string for snapshot catalog store");
+DEFINE_string(snapshot_catalog_backend_connstring, "",
+              "Deprecated alias of --snapshot_catalog_store_connstring");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -142,6 +201,19 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+namespace {
+
+std::string ResolveHABackendConnstring(
+    const mooncake::MasterConfig& master_config) {
+    if (!master_config.ha_backend_connstring.empty()) {
+        return master_config.ha_backend_connstring;
+    }
+    return master_config.etcd_endpoints;
+}
+
+}  // namespace
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -168,12 +240,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
-    default_config.GetUInt64("default_kv_lease_ttl",
-                             &master_config.default_kv_lease_ttl,
-                             FLAGS_default_kv_lease_ttl);
-    default_config.GetUInt64("default_kv_soft_pin_ttl",
-                             &master_config.default_kv_soft_pin_ttl,
-                             FLAGS_default_kv_soft_pin_ttl);
+    default_config.GetDurationMs("default_kv_lease_ttl",
+                                 &master_config.default_kv_lease_ttl,
+                                 mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL);
+    default_config.GetDurationMs("default_kv_soft_pin_ttl",
+                                 &master_config.default_kv_soft_pin_ttl,
+                                 mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS);
     default_config.GetBool("allow_evict_soft_pinned_objects",
                            &master_config.allow_evict_soft_pinned_objects,
                            FLAGS_allow_evict_soft_pinned_objects);
@@ -190,6 +262,11 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_ha);
     default_config.GetBool("enable_offload", &master_config.enable_offload,
                            FLAGS_enable_offload);
+    default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
+                             FLAGS_ha_backend_type);
+    default_config.GetString("ha_backend_connstring",
+                             &master_config.ha_backend_connstring,
+                             FLAGS_ha_backend_connstring);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -243,9 +320,36 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("snapshot_retention_count",
                              &master_config.snapshot_retention_count,
                              FLAGS_snapshot_retention_count);
-    default_config.GetString("snapshot_backend_type",
-                             &master_config.snapshot_backend_type,
-                             FLAGS_snapshot_backend_type);
+    default_config.GetString("snapshot_object_store_type",
+                             &master_config.snapshot_object_store_type,
+                             FLAGS_snapshot_object_store_type);
+    if (master_config.snapshot_object_store_type.empty()) {
+        default_config.GetString("snapshot_payload_store_type",
+                                 &master_config.snapshot_object_store_type,
+                                 master_config.snapshot_object_store_type);
+    }
+    if (master_config.snapshot_object_store_type.empty()) {
+        default_config.GetString("snapshot_payload_backend_type",
+                                 &master_config.snapshot_object_store_type,
+                                 master_config.snapshot_object_store_type);
+    }
+    default_config.GetString("snapshot_catalog_store_type",
+                             &master_config.snapshot_catalog_store_type,
+                             FLAGS_snapshot_catalog_store_type);
+    if (master_config.snapshot_catalog_store_type.empty()) {
+        default_config.GetString("snapshot_catalog_backend_type",
+                                 &master_config.snapshot_catalog_store_type,
+                                 master_config.snapshot_catalog_store_type);
+    }
+    default_config.GetString("snapshot_catalog_store_connstring",
+                             &master_config.snapshot_catalog_store_connstring,
+                             FLAGS_snapshot_catalog_store_connstring);
+    if (master_config.snapshot_catalog_store_connstring.empty()) {
+        default_config.GetString(
+            "snapshot_catalog_backend_connstring",
+            &master_config.snapshot_catalog_store_connstring,
+            master_config.snapshot_catalog_store_connstring);
+    }
     default_config.GetUInt32("max_total_finished_tasks",
                              &master_config.max_total_finished_tasks,
                              FLAGS_max_total_finished_tasks);
@@ -356,12 +460,14 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.default_kv_lease_ttl = FLAGS_default_kv_lease_ttl;
+        master_config.default_kv_lease_ttl = ParseDurationFlagOrDie(
+            "default_kv_lease_ttl", FLAGS_default_kv_lease_ttl);
     }
     if ((google::GetCommandLineFlagInfo("default_kv_soft_pin_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
-        master_config.default_kv_soft_pin_ttl = FLAGS_default_kv_soft_pin_ttl;
+        master_config.default_kv_soft_pin_ttl = ParseDurationFlagOrDie(
+            "default_kv_soft_pin_ttl", FLAGS_default_kv_soft_pin_ttl);
     }
     if ((google::GetCommandLineFlagInfo("allow_evict_soft_pinned_objects",
                                         &info) &&
@@ -392,12 +498,22 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_offload = FLAGS_enable_offload;
     }
+    if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_backend_type = FLAGS_ha_backend_type;
+    }
+    if ((google::GetCommandLineFlagInfo("ha_backend_connstring", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.ha_backend_connstring = FLAGS_ha_backend_connstring;
+    }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.etcd_endpoints = FLAGS_etcd_endpoints;
     }
-    if ((google::GetCommandLineFlagInfo("client_live_ttl_sec", &info) &&
+    if ((google::GetCommandLineFlagInfo("client_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
@@ -534,10 +650,86 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
     }
-    if ((google::GetCommandLineFlagInfo("snapshot_backend_type", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.snapshot_backend_type = FLAGS_snapshot_backend_type;
+    bool use_snapshot_object_store_flag = false;
+    bool use_snapshot_payload_store_flag = false;
+    bool use_snapshot_payload_backend_flag = false;
+    if (google::GetCommandLineFlagInfo("snapshot_object_store_type", &info) &&
+        !info.is_default) {
+        use_snapshot_object_store_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_payload_store_type", &info) &&
+        !info.is_default) {
+        use_snapshot_payload_store_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_payload_backend_type",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_payload_backend_flag = true;
+    }
+    if (use_snapshot_object_store_flag) {
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_object_store_type;
+    } else if (use_snapshot_payload_store_flag) {
+        LOG(WARNING) << "--snapshot_payload_store_type is deprecated; use "
+                     << "--snapshot_object_store_type instead";
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_payload_store_type;
+    } else if (use_snapshot_payload_backend_flag) {
+        LOG(WARNING) << "--snapshot_payload_backend_type is deprecated; use "
+                     << "--snapshot_object_store_type instead";
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_payload_backend_type;
+    } else if (!conf_set) {
+        master_config.snapshot_object_store_type =
+            FLAGS_snapshot_object_store_type;
+    }
+    bool use_snapshot_catalog_store_flag = false;
+    bool use_snapshot_catalog_backend_flag = false;
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_store_type", &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_store_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_backend_type",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_backend_flag = true;
+    }
+    if (use_snapshot_catalog_store_flag) {
+        master_config.snapshot_catalog_store_type =
+            FLAGS_snapshot_catalog_store_type;
+    } else if (use_snapshot_catalog_backend_flag) {
+        LOG(WARNING) << "--snapshot_catalog_backend_type is deprecated; use "
+                     << "--snapshot_catalog_store_type instead";
+        master_config.snapshot_catalog_store_type =
+            FLAGS_snapshot_catalog_backend_type;
+    } else if (!conf_set) {
+        master_config.snapshot_catalog_store_type =
+            FLAGS_snapshot_catalog_store_type;
+    }
+    bool use_snapshot_catalog_store_connstring_flag = false;
+    bool use_snapshot_catalog_backend_connstring_flag = false;
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_store_connstring",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_store_connstring_flag = true;
+    }
+    if (google::GetCommandLineFlagInfo("snapshot_catalog_backend_connstring",
+                                       &info) &&
+        !info.is_default) {
+        use_snapshot_catalog_backend_connstring_flag = true;
+    }
+    if (use_snapshot_catalog_store_connstring_flag) {
+        master_config.snapshot_catalog_store_connstring =
+            FLAGS_snapshot_catalog_store_connstring;
+    } else if (use_snapshot_catalog_backend_connstring_flag) {
+        LOG(WARNING)
+            << "--snapshot_catalog_backend_connstring is deprecated; use "
+            << "--snapshot_catalog_store_connstring instead";
+        master_config.snapshot_catalog_store_connstring =
+            FLAGS_snapshot_catalog_backend_connstring;
+    } else if (!conf_set) {
+        master_config.snapshot_catalog_store_connstring =
+            FLAGS_snapshot_catalog_store_connstring;
     }
 }
 
@@ -590,13 +782,26 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
 
-    if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
-        LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
+    const std::string ha_backend_connstring =
+        ResolveHABackendConnstring(master_config);
+    if (master_config.enable_ha && ha_backend_connstring.empty()) {
+        LOG(FATAL) << "HA backend connection string must be set when "
+                   << "enable_ha is true";
         return 1;
     }
-    if (!master_config.enable_ha && !master_config.etcd_endpoints.empty()) {
+    if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
+                                     !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
-            << "Etcd endpoints are set but will not be used in non-HA mode";
+            << "HA backend connection string is set but will not be used in "
+            << "non-HA mode";
+    }
+    if (!master_config.ha_backend_connstring.empty() &&
+        !master_config.etcd_endpoints.empty() &&
+        master_config.ha_backend_connstring != master_config.etcd_endpoints) {
+        LOG(WARNING) << "Both ha_backend_connstring and etcd_endpoints are "
+                     << "set. Using ha_backend_connstring="
+                     << master_config.ha_backend_connstring
+                     << " for HA coordinator setup";
     }
     if (master_config.memory_allocator != "cachelib" &&
         master_config.memory_allocator != "offset") {
@@ -625,6 +830,8 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
+        << ", ha_backend_type=" << master_config.ha_backend_type
+        << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
@@ -663,7 +870,10 @@ int main(int argc, char* argv[]) {
         << ", snapshot_interval_seconds="
         << master_config.snapshot_interval_seconds
         << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
-        << ", snapshot_backend_type=" << master_config.snapshot_backend_type
+        << ", snapshot_object_store_type="
+        << master_config.snapshot_object_store_type
+        << ", snapshot_catalog_store_type="
+        << master_config.snapshot_catalog_store_type
         << ", snapshot_retention_count="
         << master_config.snapshot_retention_count
         << ", max_retry_attempts=" << master_config.max_retry_attempts
@@ -688,7 +898,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
-        mooncake::MasterServiceSupervisor supervisor(
+        mooncake::ha::MasterServiceSupervisor supervisor(
             mooncake::MasterServiceSupervisorConfig{master_config});
         return supervisor.Start();
     } else {

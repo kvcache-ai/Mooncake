@@ -20,7 +20,6 @@ namespace mooncake {
 inline constexpr size_t kP2PBufferSize = 1u << 24;
 inline constexpr size_t kP2PNumSlots = 8;
 inline constexpr size_t kP2PSlotSize = kP2PBufferSize / kP2PNumSlots;
-inline constexpr size_t kP2PTotalBufferSize = kP2PBufferSize * kMaxNumRanks;
 
 struct alignas(64) AtomicHeadTail {
     uint32_t load(
@@ -66,6 +65,7 @@ class P2PProxy {
         int rank = 0;
         int size = 0;
         int cuda_device_index = -1;
+        std::string location;
     };
 
     struct SendOp {
@@ -231,6 +231,7 @@ class P2PProxy {
     int rank_ = 0;
     int size_ = 0;
     int cuda_device_index_ = -1;
+    std::string location_;
     P2PResources resources_;
 
     std::queue<SendOpContext> send_queue_;

@@ -21,7 +21,7 @@ ib_devices = get_rdma_devices_args()
 
 
 
-class TestDPAttn(CustomTestCase):
+class TestMooncakeBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
@@ -35,13 +35,12 @@ class TestDPAttn(CustomTestCase):
                     "--trust-remote-code",
                     "--tp",
                     "2",
-                    "--dp",
-                    "2",
-                    "--enable-dp-attention",
                     "--elastic-ep-backend",
                     "mooncake",
                     "--mooncake-ib-device",
                     ib_devices,
+                    "--mem-fraction-static",
+                    "0.8",
                 ],
             )
 

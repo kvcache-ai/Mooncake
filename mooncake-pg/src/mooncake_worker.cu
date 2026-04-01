@@ -244,7 +244,8 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
-MooncakeWorker::MooncakeWorker() {
+MooncakeWorker::MooncakeWorker(int cuda_device_index)
+    : cuda_device_index_(cuda_device_index) {
     int deviceCount = 0;
     cudaError err = cudaGetDeviceCount(&deviceCount);
     if (!err && deviceCount > 0) {
@@ -259,18 +260,18 @@ MooncakeWorker::MooncakeWorker() {
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
     }
-
-    // Start worker
-    startWorker();
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
+    const std::shared_ptr<ConnectionContext>& connection_ctx,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
+    connection_ctx->waitUntilNewRanksConnected();
+
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
@@ -339,11 +340,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
+    const std::shared_ptr<ConnectionContext>& connection_ctx,
     const at::cuda::CUDAStream& stream,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
+    connection_ctx->waitUntilNewRanksConnected();
+
     // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     //  Alternately use even-odd items to maintain tasks
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;

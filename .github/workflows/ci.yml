@@ -54,10 +54,10 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc"]'
 
-    - name: Install coverage tools
+    - name: Install coverage tools and build utilities
       run: |
         sudo apt-get update
-        sudo apt-get install -y lcov gcovr
+        sudo apt-get install -y lcov gcovr ninja-build
 
     - name: Set up coverage compilation flags
       run: |
@@ -87,14 +87,14 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
       shell: bash
 
     - name: Build project
       run: |
         cd build
-        make -j4
-        sudo make install
+        cmake --build .
+        sudo cmake --install .
       shell: bash
 
     - name: Build nvlink_allocator.so
@@ -117,7 +117,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
       shell: bash
 
     - name: Generate coverage report
@@ -209,18 +209,19 @@ jobs:
     - name: Configure project
       run: |
         apt update -y
+        apt install -y ninja-build
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
       shell: bash
 
     - name: Build project
       run: |
         cd build
         source ~/.bashrc
-        make -j
-        make install
+        cmake --build .
+        cmake --install .
       shell: bash
 
   test-wheel-ubuntu:
@@ -411,6 +412,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt update -y
+        sudo apt install -y ninja-build
         sudo bash -x dependencies.sh -y
         df -h
       shell: bash
@@ -422,9 +424,9 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
-        make -j4
-        sudo make install
+        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake --build .
+        sudo cmake --install .
         df -h
       shell: bash
 
@@ -432,7 +434,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -441,15 +443,15 @@ jobs:
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
-        make -j4
-        sudo make install
+        cmake --build .
+        sudo cmake --install .
         df -h
       shell: bash
 
     - name: Configure project with unit tests and examples
       run: |
         cd build
-        cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
 
@@ -458,15 +460,15 @@ jobs:
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
-        make -j4
-        sudo make install
+        cmake --build .
+        sudo cmake --install .
       shell: bash
 
     - name: Configure project
       run: |
         cd build
         rm -r */tests
-        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
       shell: bash
 
     - name: Build project
@@ -474,8 +476,8 @@ jobs:
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
-        make -j4
-        sudo make install
+        cmake --build .
+        sudo cmake --install .
       shell: bash
 
     - name: Build nvlink_allocator.so

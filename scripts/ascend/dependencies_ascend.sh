@@ -15,6 +15,9 @@
 
 # If git clone fails, you can place dependencies and Mooncake source code in a directory for compilation and installation.
 
+# ASCEND TRANSPORT is scheduled for deprecation, please use ASCEND DIRECT TRANSPORT on ASCEND platform. 
+# Use dependencies_ascend_installation.sh to install dependencies instead.
+
 #!/bin/bash
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -59,6 +62,7 @@ if command -v apt-get &> /dev/null; then
             libpython3-dev \
             libboost-all-dev \
             libssl-dev \
+            libzstd-dev \
             libgrpc-dev \
             libgrpc++-dev \
             libprotobuf-dev \
@@ -86,6 +90,7 @@ elif command -v yum &> /dev/null; then
             hiredis-devel \
             libcurl-devel \
             jsoncpp-devel \
+            zstd-devel \
             mpich \
             mpich-devel
     # Install yaml-cpp

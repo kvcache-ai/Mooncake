@@ -150,9 +150,16 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     void recoverRanks(const std::vector<int>& ranks);
 
+    void joinGroup();
+
    private:
+    void waitForExtensionState();
+    void publishLocalPeerMetadata();
+    void setLocalOnlyActiveRanks();
+    void syncActiveRanksTensor();
+
     static TransferEngine* engine_;
-    static MooncakeWorker* worker_;
+    std::shared_ptr<MooncakeWorker> worker_;
     static bool engineInitialized_;
     static int backendIndex_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
@@ -166,6 +173,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
     uint64_t local2global_rank_map_[kMaxNumRanks];
+    std::string localServerName_;
 
     // P2P async infrastructure
     // p2p_proxy_ is created in MooncakeBackend, but can live longer than
@@ -181,6 +189,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     // Similar to p2p_proxy_, connection_ctx_ is created in MooncakeBackend, but
     // can live longer than MooncakeBackend.
     std::shared_ptr<ConnectionContext> connection_ctx_;
+    bool connectionPollerRegistered_{false};
 };
 
 }  // namespace mooncake

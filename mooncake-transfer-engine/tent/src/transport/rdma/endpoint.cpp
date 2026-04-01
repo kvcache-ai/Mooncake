@@ -167,9 +167,15 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
 }
 
 int RdmaEndPoint::deconstruct() {
+    RWSpinlock::WriteGuard guard(lock_);
+    return deconstructUnlocked();
+}
+
+int RdmaEndPoint::deconstructUnlocked() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
+    peer_qp_num_list_.clear();
 
     // Destroy notification QP
     if (notify_qp_) {
@@ -208,6 +214,8 @@ int RdmaEndPoint::deconstruct() {
     slice_queue_.clear();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
+    peer_server_name_.clear();
+    peer_nic_name_.clear();
     status_ = EP_UNINIT;
     return 0;
 }
@@ -316,6 +324,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             return Status::InternalError(
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
+        peer_qp_num_list_ = qp_num;
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -340,6 +349,32 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                             BootstrapDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (status_ == EP_READY) {
+        // Idempotency check: if the incoming bootstrap is from the same peer
+        // and carries the same peer QP list as the established connection,
+        // this is a duplicate request (e.g. from a concurrent connect() on
+        // the initiator that released its lock during Phase 2). Re-using the
+        // existing connection is safe and avoids resetting QPs that may
+        // already have in-flight RDMA operations.
+        auto incoming_peer_server =
+            getServerNameFromNicPath(peer_desc.local_nic_path);
+        auto incoming_peer_nic =
+            getNicNameFromNicPath(peer_desc.local_nic_path);
+        if (incoming_peer_server == peer_server_name_ &&
+            incoming_peer_nic == peer_nic_name_ &&
+            peer_desc.qp_num == peer_qp_num_list_) {
+            LOG(INFO) << "Endpoint already established with " << peer_nic_name_
+                      << " of " << peer_server_name_
+                      << " (duplicate bootstrap, reusing connection)";
+            auto& transport = context_->transport_;
+            local_desc.local_nic_path =
+                MakeNicPath(transport.local_segment_name_, context_->name());
+            local_desc.peer_nic_path = peer_desc.local_nic_path;
+            local_desc.qp_num = qpNum();
+            local_desc.local_lid = context_->lid();
+            local_desc.local_gid = context_->gid();
+            local_desc.notify_qp_num = notifyQpNum();
+            return Status::OK();
+        }
         LOG(WARNING) << "Endpoint is established with " << peer_nic_name_
                      << " of " << peer_server_name_ << ", resetting first";
         resetUnlocked();
@@ -378,6 +413,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         return Status::InternalError(
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
+    peer_qp_num_list_ = peer_desc.qp_num;
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -404,6 +440,7 @@ int RdmaEndPoint::reset() {
 int RdmaEndPoint::resetUnlocked() {
     if (status_ != EP_READY) return 0;
     status_ = EP_RESET;
+    peer_qp_num_list_.clear();
     resetInflightSlices();
 
     if (notify_qp_) {
@@ -427,7 +464,7 @@ int RdmaEndPoint::resetUnlocked() {
             context_->verbs_.ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) {
             PLOG(ERROR) << "ibv_modify_qp(RESET)";
-            deconstruct();
+            deconstructUnlocked();
             return -1;
         }
         cancelQuota(i, wr_depth_list_[i].value);
@@ -445,7 +482,7 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
 
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::stringstream ss;
-        ss << "Inconsistent qp_mul_factor: local " << qp_list_.size()
+        ss << "Inconsistent RDMA lane count: local " << qp_list_.size()
            << " peer " << peer_qp_num_list.size() << " for endpoint "
            << peer_nic_name_ << " of " << peer_server_name_;
         LOG(ERROR) << ss.str();
@@ -480,11 +517,12 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index) {
-    // RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
     const static int kSgeEntries = 1;
-    if (status_ != EP_READY) return 0;
+    RWSpinlock::ReadGuard guard(lock_);
+    if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
     qp_index %= qp_list_.size();
+    if (status_ != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
     int wr_count =
         std::min(cq->maxCqe() - cq->getQuota(),
@@ -574,7 +612,9 @@ void RdmaEndPoint::resetInflightSlices() {
 }
 
 size_t RdmaEndPoint::acknowledge(RdmaSlice* slice, TransferStatusEnum status) {
+    RWSpinlock::ReadGuard guard(lock_);
     auto qp_index = slice->qp_index;
+    if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
     auto& queue = slice_queue_[qp_index];
     if (!queue.contains(slice)) return 0;
     int num_entries = 0;

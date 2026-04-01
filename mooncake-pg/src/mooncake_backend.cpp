@@ -27,9 +27,30 @@ constexpr int kBarrierDummyTensorSize = 1;
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 // leaky singleton to avoid destructor fiasco problem
 TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
-MooncakeWorker* MooncakeBackend::worker_ = new MooncakeWorker();
+// worker_ is now owned per backend instance via MooncakeWorkerManager.
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
+
+namespace {
+
+std::vector<uint8_t> serializeActiveRanks(const bool* activeRanks, int size) {
+    std::vector<uint8_t> bytes(size);
+    for (int i = 0; i < size; ++i) {
+        bytes[i] = activeRanks[i] ? 1 : 0;
+    }
+    return bytes;
+}
+
+void deserializeActiveRanks(const std::vector<uint8_t>& bytes,
+                            bool* activeRanks, int size) {
+    TORCH_CHECK(static_cast<int>(bytes.size()) == size,
+                "Unexpected active-ranks snapshot size.");
+    for (int i = 0; i < size; ++i) {
+        activeRanks[i] = (bytes[i] != 0);
+    }
+}
+
+}  // namespace
 
 // Async Work implementation for P2P operations processed by worker threads.
 class MooncakeP2PWork : public ::c10d::Work {
@@ -98,9 +119,7 @@ MooncakeBackend::MooncakeBackend(
         engine_->init(P2PHANDSHAKE, hostIp_);
         engineInitialized_ = true;
     }
-    auto localRpcMeta = engine_->getMetadata()->localRpcMeta();
-    std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
-                                  std::to_string(localRpcMeta.rpc_port);
+    localServerName_ = engine_->getLocalIpAndPort();
     // construct local to global rank map
     if (globalRanks.size() == static_cast<size_t>(size)) {
         for (int i = 0; i < size; ++i) {
@@ -179,19 +198,27 @@ MooncakeBackend::MooncakeBackend(
     else
         p2p_device_worker_ = dev_worker_mgr.GetCUDAWorker(cuda_device_index);
 
+    auto& worker_mgr = MooncakeWorkerManager::GetInstance();
+    if (isCpu_)
+        worker_ = worker_mgr.GetCPUWorker();
+    else
+        worker_ = worker_mgr.GetCUDAWorker(cuda_device_index);
+    worker_->Start();
+
     p2p_proxy_ = std::make_shared<P2PProxy>(
         engine_, P2PProxy::Options{
                      .is_cpu = isCpu_,
                      .rank = rank_,
                      .size = size_,
                      .cuda_device_index = cuda_device_index,
+                     .location = location,
                  });
     p2p_device_worker_->registerProxy(p2p_proxy_);
 
     meta_ = std::make_shared<TransferGroupMeta>();
     connection_ctx_ = std::make_shared<ConnectionContext>(
-        backendIndex_, rank, size, local2global_rank_map_, location, store,
-        meta_, p2p_proxy_, engine_);
+        backendIndex_, rank, size, options_ && options_->isExtension_,
+        local2global_rank_map_, location, store, meta_, p2p_proxy_, engine_);
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
@@ -213,16 +240,6 @@ MooncakeBackend::MooncakeBackend(
     // Sync metadata
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
     memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
-    auto bufferKey = ConnectionContext::getBufferStoreKey(backendIndex_, rank_);
-    store->set(bufferKey, rank_info_bytes);
-
-    auto serverNameKey =
-        ConnectionContext::getServerNameStoreKey(backendIndex_, rank_);
-    store->set(serverNameKey, localServerName);
-
-    // Start polling connection
-    ConnectionPoller::GetInstance().registerContext(connection_ctx_);
-
     meta_->rank = rank;
     meta_->size = size;
     meta_->taskCount = 0;
@@ -259,21 +276,14 @@ MooncakeBackend::MooncakeBackend(
     meta_->bufferBaseIndex = backendIndex_ * 10;
     p2p_proxy_->BindMeta(meta_);
 
-    // Wait for peers
-    connection_ctx_->waitUntilAllConnected();
-
+    connection_ctx_->bootstrapLocalPeer(localServerName_, rank_info);
     if (options_ && options_->isExtension_) {
-        auto key = ConnectionContext::getExtensionTaskCountStoreKey(
-            backendIndex_, rank_);
-        while (true) {
-            if (store->check({key})) {
-                auto data = store->get(key);
-                std::string val(data.begin(), data.end());
-                meta_->taskCount = std::stoi(val);
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+        setLocalOnlyActiveRanks();
+    } else {
+        publishLocalPeerMetadata();
+        ConnectionPoller::GetInstance().registerContext(connection_ctx_);
+        connectionPollerRegistered_ = true;
+        connection_ctx_->waitUntilAllConnected();
     }
 
     // Increment backend index
@@ -286,6 +296,8 @@ const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     std::vector<at::Tensor>& tensors, int dstRank, int tag) {
+    connection_ctx_->waitUntilNewRanksConnected();
+
     (void)tag;
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     auto tensor = tensors.back();
@@ -316,6 +328,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     std::vector<at::Tensor>& tensors, int srcRank, int tag) {
+    connection_ctx_->waitUntilNewRanksConnected();
+
     (void)tag;
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     auto tensor = tensors.back();
@@ -354,7 +368,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     bool isRoot = (root == rank_);
     if (isCpu_) {
         return worker_->putTaskCpu(
-            c10d::OpType::BROADCAST, tensorSize, root, meta_,
+            c10d::OpType::BROADCAST, tensorSize, root, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
@@ -367,7 +381,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
         at::cuda::CUDAStream stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::BROADCAST, tensorSize, root, meta_, stream,
+            c10d::OpType::BROADCAST, tensorSize, root, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos,
@@ -390,7 +405,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     if (isCpu_) {
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
-            c10d::OpType::ALLREDUCE, tensorSize, 0, meta_,
+            c10d::OpType::ALLREDUCE, tensorSize, 0, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
             },
@@ -402,7 +417,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::ALLREDUCE, tensorSize, 0, meta_, stream,
+            c10d::OpType::ALLREDUCE, tensorSize, 0, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
                                 cudaMemcpyDeviceToDevice, stream);
@@ -427,7 +443,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
         return worker_->putTaskCpu(
-            c10d::OpType::ALLGATHER, tensorSize, 0, meta_,
+            c10d::OpType::ALLGATHER, tensorSize, 0, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
             },
@@ -441,7 +457,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::ALLGATHER, tensorSize, 0, meta_, stream,
+            c10d::OpType::ALLGATHER, tensorSize, 0, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputTensor.data_ptr() + pos,
                                 realSize, cudaMemcpyDeviceToDevice, stream);
@@ -464,6 +481,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
+            connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputBuffer.data_ptr() + pos, realSize);
             },
@@ -478,7 +496,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_, stream,
+            c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
+            connection_ctx_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputBuffer.data_ptr() + pos,
                                 realSize, cudaMemcpyDeviceToDevice, stream);
@@ -502,6 +521,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
+            connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(numRanks)) {
                     memcpy((char*)dst + j * realSize,
@@ -518,7 +538,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_, stream,
+            c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
+            connection_ctx_, stream,
             [=, this](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(meta_->size)) {
                     cudaMemcpyAsync(
@@ -544,7 +565,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
         inputTensors[0].numel() * inputTensors[0].element_size();
     if (isCpu_) {
         return worker_->putTaskCpu(
-            c10d::OpType::ALLTOALL, tensorSize, 0, meta_,
+            c10d::OpType::ALLTOALL, tensorSize, 0, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
                     memcpy((char*)dst + j * realSize,
@@ -561,7 +582,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensors[0].device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::ALLTOALL, tensorSize, 0, meta_, stream,
+            c10d::OpType::ALLTOALL, tensorSize, 0, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
                     cudaMemcpyAsync((char*)dst + j * realSize,
@@ -580,12 +602,21 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
 }
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
-    TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
-    return worker_->putTaskCpu(
-        // a non-zero tensorSize is required to ensure the worker task for the
-        // barrier is created
-        c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
-        [=](void*, size_t, size_t) {}, [=](void*, size_t, size_t) {});
+    if (isCpu_) {
+        return worker_->putTaskCpu(
+            // a non-zero tensorSize is required to ensure the worker task for
+            // the barrier is created
+            c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
+            connection_ctx_, [=](void*, size_t, size_t) {},
+            [=](void*, size_t, size_t) {});
+    } else {
+        auto device_index = at::cuda::current_device();
+        auto stream = c10::cuda::getDefaultCUDAStream(device_index);
+        return worker_->putTaskCuda(
+            c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
+            connection_ctx_, stream, [=](void*, size_t, size_t) {},
+            [=](void*, size_t, size_t) {});
+    }
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
@@ -598,7 +629,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     if (isCpu_) {
         auto numRanks = meta_->size;
         return worker_->putTaskCpu(
-            c10d::OpType::REDUCE, tensorSize, root, meta_,
+            c10d::OpType::REDUCE, tensorSize, root, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
             },
@@ -612,7 +643,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::REDUCE, tensorSize, root, meta_, stream,
+            c10d::OpType::REDUCE, tensorSize, root, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
                                 cudaMemcpyDeviceToDevice, stream);
@@ -642,7 +674,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
         return worker_->putTaskCpu(
-            c10d::OpType::GATHER, tensorSize, root, meta_,
+            c10d::OpType::GATHER, tensorSize, root, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
             },
@@ -659,7 +691,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::GATHER, tensorSize, root, meta_, stream,
+            c10d::OpType::GATHER, tensorSize, root, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputTensor.data_ptr() + pos,
                                 realSize, cudaMemcpyDeviceToDevice, stream);
@@ -692,7 +725,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     size_t tensorSize = outputTensor.numel() * outputTensor.element_size();
     if (isCpu_) {
         return worker_->putTaskCpu(
-            c10d::OpType::SCATTER, tensorSize, root, meta_,
+            c10d::OpType::SCATTER, tensorSize, root, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto inputTensors_ = inputTensors.back();
@@ -710,7 +743,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
         auto stream =
             at::cuda::getCurrentCUDAStream(outputTensor.device().index());
         return worker_->putTaskCuda(
-            c10d::OpType::SCATTER, tensorSize, root, meta_, stream,
+            c10d::OpType::SCATTER, tensorSize, root, meta_, connection_ctx_,
+            stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto inputTensors_ = inputTensors.back();
@@ -739,7 +773,10 @@ void MooncakeBackend::shutdown() {
     p2p_proxy_.reset();
 
     connection_ctx_->shutdown();
-    ConnectionPoller::GetInstance().removeContext(connection_ctx_);
+    if (connectionPollerRegistered_) {
+        ConnectionPoller::GetInstance().removeContext(connection_ctx_);
+        connectionPollerRegistered_ = false;
+    }
 
     for (size_t i = 0; i < 2; i++) {
         engine_->unregisterLocalMemory(cpu_sync_send_region_[i]);
@@ -755,6 +792,76 @@ void MooncakeBackend::shutdown() {
             cudaFree(send_buffer_[i]);
             cudaFree(recv_buffer_[i]);
         }
+    }
+}
+
+void MooncakeBackend::syncActiveRanksTensor() {
+    std::vector<int32_t> active_ranks(meta_->size);
+    for (int i = 0; i < meta_->size; ++i) {
+        active_ranks[i] = meta_->activeRanks[i] ? 1 : 0;
+    }
+
+    auto cpu_tensor = torch::tensor(active_ranks, torch::dtype(torch::kInt32));
+    if (!meta_->activeRanksTensor.defined() ||
+        meta_->activeRanksTensor.size(0) != meta_->size) {
+        meta_->activeRanksTensor =
+            cpu_tensor.to(isCpu_ ? torch::kCPU : torch::kCUDA);
+        return;
+    }
+
+    if (meta_->activeRanksTensor.device().is_cpu()) {
+        meta_->activeRanksTensor.copy_(cpu_tensor);
+    } else {
+        meta_->activeRanksTensor.copy_(
+            cpu_tensor.to(meta_->activeRanksTensor.device()));
+    }
+}
+
+void MooncakeBackend::publishLocalPeerMetadata() {
+    TORCH_CHECK(meta_->store,
+                "Publishing local peer metadata requires a valid Store.");
+
+    std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
+    memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
+
+    auto bufferKey =
+        ConnectionContext::getBufferStoreKey(meta_->backendIndex, rank_);
+    meta_->store->set(bufferKey, rank_info_bytes);
+
+    auto serverNameKey =
+        ConnectionContext::getServerNameStoreKey(meta_->backendIndex, rank_);
+    meta_->store->set(serverNameKey, localServerName_);
+}
+
+void MooncakeBackend::setLocalOnlyActiveRanks() {
+    for (int i = 0; i < meta_->size; ++i) {
+        meta_->activeRanks[i] = (i == meta_->rank);
+    }
+    syncActiveRanksTensor();
+}
+
+void MooncakeBackend::waitForExtensionState() {
+    TORCH_CHECK(meta_->store, "Recovery join requires a valid Store.");
+
+    auto task_count_key = ConnectionContext::getExtensionTaskCountStoreKey(
+        meta_->backendIndex, rank_);
+    auto active_ranks_key = ConnectionContext::getExtensionActiveRanksStoreKey(
+        meta_->backendIndex, rank_);
+
+    while (true) {
+        if (meta_->store->check({task_count_key, active_ranks_key})) {
+            auto task_count_data = meta_->store->get(task_count_key);
+            std::string task_count(task_count_data.begin(),
+                                   task_count_data.end());
+            meta_->taskCount = std::stoi(task_count);
+
+            auto active_ranks = meta_->store->get(active_ranks_key);
+            deserializeActiveRanks(active_ranks, meta_->activeRanks,
+                                   meta_->size);
+            syncActiveRanksTensor();
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
@@ -776,14 +883,34 @@ int MooncakeBackend::getNumSyncedRanks() {
     return tensors[0].cpu().item<int>();
 }
 
-void MooncakeBackend::extendGroupSizeTo(int size) {
-    LOG(INFO) << rank_ << " extend to " << size;
-    meta_->size = size;
+void MooncakeBackend::extendGroupSizeTo(int newSize) {
+    const int oldSize = meta_->size;
+    if (newSize == oldSize) return;
+
+    TORCH_CHECK(newSize >= 0 && static_cast<size_t>(newSize) < kMaxNumRanks,
+                "Size out of range");
+    TORCH_CHECK(newSize >= oldSize, "newSize < oldSize");
+
+    LOG(INFO) << "Backend " << backendIndex_ << " rank " << rank_
+              << ": Group size extend to " << newSize;
+
+    meta_->size = newSize;
     meta_->taskCount = 0;
-    // TODO: compatibility with fault-tolerance
-    meta_->activeRanksTensor =
-        at::ones({size}, torch::dtype(torch::kInt32)
-                             .device(isCpu_ ? torch::kCPU : torch::kCUDA));
+
+    // Initialize new rank's metadata
+    for (int i = oldSize; i < newSize; ++i) {
+        local2global_rank_map_[i] = i;
+        meta_->activeRanks[i] = true;
+    }
+
+    auto& tensor = meta_->activeRanksTensor;
+    tensor.resize_({newSize});
+    tensor.slice(0, oldSize, newSize).fill_(1);
+
+    connection_ctx_->extendGroupSizeTo(newSize);
+    // After extendGroupSizeTo, we don't `waitUntilNewRanksConnected` here
+    // but do it in the first task. This enables client code to overlap
+    // execution between `extendGroupSizeTo` and the first communication call.
 }
 
 std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
@@ -832,15 +959,38 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
 }
 
 void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
+    TORCH_CHECK(meta_->store, "Rank recovery requires a valid Store.");
+
     for (const int rank : ranks) {
         TORCH_CHECK(rank >= 0 && static_cast<size_t>(rank) < kMaxNumRanks,
                     "Rank out of range");
         TORCH_CHECK(meta_->peerConnected[rank]);
         meta_->activeRanks[rank] = true;
-        meta_->store->set("extension_task_count_" +
-                              std::to_string(meta_->backendIndex) + "_" +
-                              std::to_string(rank),
-                          std::to_string(meta_->taskCount));
     }
+
+    syncActiveRanksTensor();
+    auto active_ranks_snapshot =
+        serializeActiveRanks(meta_->activeRanks, meta_->size);
+    for (const int rank : ranks) {
+        meta_->store->set(ConnectionContext::getExtensionTaskCountStoreKey(
+                              meta_->backendIndex, rank),
+                          std::to_string(meta_->taskCount));
+        meta_->store->set(ConnectionContext::getExtensionActiveRanksStoreKey(
+                              meta_->backendIndex, rank),
+                          active_ranks_snapshot);
+    }
+}
+
+void MooncakeBackend::joinGroup() {
+    TORCH_CHECK(options_ && options_->isExtension_,
+                "joinGroup is only valid for extension backends.");
+    connection_ctx_->setDummy(false);
+    publishLocalPeerMetadata();
+    if (!connectionPollerRegistered_) {
+        ConnectionPoller::GetInstance().registerContext(connection_ctx_);
+        connectionPollerRegistered_ = true;
+    }
+    connection_ctx_->waitUntilAllConnected();
+    waitForExtensionState();
 }
 }  // namespace mooncake

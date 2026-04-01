@@ -25,9 +25,13 @@ ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
                                        const std::string& device_name,
                                        const std::string& master_server_entry,
                                        size_t local_buffer_size) {
-    auto client_opt =
-        Client::Create(hostname,  // Local hostname
-                       metadata_connstring, protocol, master_server_entry);
+    std::optional<std::string> device_names = std::nullopt;
+    if (!device_name.empty()) {
+        device_names = device_name;
+    }
+
+    auto client_opt = Client::Create(hostname, metadata_connstring, protocol,
+                                     device_names, master_server_entry);
 
     if (!client_opt.has_value()) {
         return std::nullopt;
@@ -149,6 +153,50 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
 ErrorCode ClientTestWrapper::Delete(const std::string& key) {
     auto remove_result = client_->Remove(key);
     return remove_result.has_value() ? ErrorCode::OK : remove_result.error();
+}
+
+bool ClientTestWrapper::HasDiskReplica(const std::string& key) {
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) return false;
+    for (const auto& replica : query_result.value().replicas) {
+        if (replica.is_disk_replica()) return true;
+    }
+    return false;
+}
+
+bool ClientTestWrapper::HasLocalDiskReplica(const std::string& key) {
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) return false;
+    for (const auto& replica : query_result.value().replicas) {
+        if (replica.is_local_disk_replica()) return true;
+    }
+    return false;
+}
+
+bool ClientTestWrapper::HasMemoryReplica(const std::string& key) {
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) return false;
+    for (const auto& replica : query_result.value().replicas) {
+        if (replica.is_memory_replica()) return true;
+    }
+    return false;
+}
+
+ErrorCode ClientTestWrapper::GetWithExpectedSize(const std::string& key,
+                                                 size_t expected_size,
+                                                 std::string& value) {
+    SliceGuard slice_guard(expected_size, allocator_);
+    auto get_result = client_->Get(key, slice_guard.slices_);
+    ErrorCode error_code =
+        get_result.has_value() ? ErrorCode::OK : get_result.error();
+    if (error_code != ErrorCode::OK) {
+        return error_code;
+    }
+    value.clear();
+    for (const auto& slice : slice_guard.slices_) {
+        value.append(static_cast<const char*>(slice.ptr), slice.size);
+    }
+    return ErrorCode::OK;
 }
 
 ClientTestWrapper::SliceGuard::SliceGuard(

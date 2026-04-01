@@ -75,6 +75,9 @@ class InProcMaster {
             wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
             wms_cfg.allow_evict_soft_pinned_objects = true;
             wms_cfg.enable_metric_reporting = false;
+            wms_cfg.enable_offload = config.enable_offload.has_value()
+                                         ? config.enable_offload.value()
+                                         : false;
             wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
             wms_cfg.eviction_high_watermark_ratio =
                 config.eviction_high_watermark_ratio.has_value()

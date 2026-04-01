@@ -14,9 +14,13 @@
 
 #include "tent/runtime/transfer_engine_impl.h"
 
-#include <fstream>
-#include <random>
+#include <algorithm>
 #include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <optional>
+#include <random>
 #include <stdexcept>
 
 #include "tent/common/config.h"
@@ -57,8 +61,125 @@ struct Batch {
     std::vector<SubmitHook> submit_hooks;
 };
 
+struct PreservedTentConfigOverrides {
+    std::optional<std::string> metadata_type;
+    std::optional<std::string> metadata_servers;
+    std::optional<std::string> local_segment_name;
+    std::optional<std::string> rpc_server_hostname;
+    std::optional<json> rpc_server_port;
+};
+
+template <typename T>
+std::optional<T> captureExplicitConfigValue(const Config& config,
+                                            const std::string& key,
+                                            const T& default_value) {
+    if (!config.contains(key)) {
+        return std::nullopt;
+    }
+    return config.get<T>(key, default_value);
+}
+
+std::optional<long long> tryParseConfigIntString(const std::string& value) {
+    try {
+        size_t parsed_chars = 0;
+        long long parsed_value = std::stoll(value, &parsed_chars);
+        if (parsed_chars == value.size()) {
+            return parsed_value;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+Status validateRpcServerPortValue(long long value, const std::string& source,
+                                  uint16_t& port) {
+    constexpr long long kMinPort = 0;
+    constexpr long long kMaxPort = std::numeric_limits<uint16_t>::max();
+    if (value < kMinPort || value > kMaxPort) {
+        return Status::InvalidArgument("Invalid rpc_server_port '" + source +
+                                       "', expected value in range [0, " +
+                                       std::to_string(kMaxPort) + "]" +
+                                       LOC_MARK);
+    }
+
+    port = static_cast<uint16_t>(value);
+    return Status::OK();
+}
+
+Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
+                                  uint16_t& port) {
+    constexpr const char* kKey = "rpc_server_port";
+    if (!config.contains(kKey)) {
+        port = default_value;
+        return Status::OK();
+    }
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validateRpcServerPortValue(numeric_value,
+                                          std::to_string(numeric_value), port);
+    }
+
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_port '" + string_value +
+                "', expected integer in range [0, 65535]" LOC_MARK);
+        }
+        return validateRpcServerPortValue(*parsed_value, string_value, port);
+    }
+
+    return Status::InvalidArgument(
+        "rpc_server_port must be an integer or integer string" LOC_MARK);
+}
+
+PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
+    const Config& config) {
+    PreservedTentConfigOverrides preserved;
+    preserved.metadata_type =
+        captureExplicitConfigValue(config, "metadata_type", std::string());
+    preserved.metadata_servers =
+        captureExplicitConfigValue(config, "metadata_servers", std::string());
+    preserved.local_segment_name =
+        captureExplicitConfigValue(config, "local_segment_name", std::string());
+    preserved.rpc_server_hostname = captureExplicitConfigValue(
+        config, "rpc_server_hostname", std::string());
+    preserved.rpc_server_port =
+        captureExplicitConfigValue(config, "rpc_server_port", json());
+    return preserved;
+}
+
+template <typename T>
+void restoreExplicitConfigValue(Config& config, const std::string& key,
+                                const std::optional<T>& value) {
+    if (value.has_value()) {
+        config.set(key, *value);
+    }
+}
+
+void restoreExplicitTransferEngineConfig(
+    Config& config, const PreservedTentConfigOverrides& preserved) {
+    restoreExplicitConfigValue(config, "metadata_type",
+                               preserved.metadata_type);
+    restoreExplicitConfigValue(config, "metadata_servers",
+                               preserved.metadata_servers);
+    restoreExplicitConfigValue(config, "local_segment_name",
+                               preserved.local_segment_name);
+    restoreExplicitConfigValue(config, "rpc_server_hostname",
+                               preserved.rpc_server_hostname);
+    restoreExplicitConfigValue(config, "rpc_server_port",
+                               preserved.rpc_server_port);
+}
+
 TransferEngineImpl::TransferEngineImpl()
-    : conf_(std::make_shared<Config>()), available_(false) {
+    : conf_(std::make_shared<Config>()),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
@@ -70,9 +191,16 @@ TransferEngineImpl::TransferEngineImpl()
 }
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
-    : conf_(conf), available_(false) {
-    // Load environment variables - they should override config file settings
+    : conf_(conf),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
+    auto preserved = captureExplicitTransferEngineConfig(*conf_);
+    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
+    // explicit metadata identity intact.
     ConfigHelper().loadFromEnv(*conf_);
+    restoreExplicitTransferEngineConfig(*conf_, preserved);
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -138,6 +266,12 @@ Status TransferEngineImpl::construct() {
         redis_password = env_password;
     }
 
+    std::string redis_username;
+    const char* env_username = std::getenv("MC_REDIS_USERNAME");
+    if (env_username && *env_username) {
+        redis_username = env_username;
+    }
+
     // Get Redis DB index from environment variable or config
     int redis_db_index_config = conf_->get("redis_db_index", 0);
     const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
@@ -154,7 +288,7 @@ Status TransferEngineImpl::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
-    port_ = conf_->get("rpc_server_port", 0);
+    CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
@@ -177,7 +311,8 @@ Status TransferEngineImpl::construct() {
     }
 
     metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, redis_password, db_index, this);
+        metadata_type, metadata_servers, redis_username, redis_password,
+        db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -681,33 +816,66 @@ std::string printRequest(const Request& request) {
     return ss.str();
 }
 
+struct BufferKey {
+    uint64_t addr{0};
+    uint64_t length{0};
+
+    bool operator==(const BufferKey&) const = default;
+};
+
+struct RequestBoundaryInfo {
+    std::optional<BufferKey> source_key;
+    std::optional<BufferKey> target_key;
+};
+
 struct MergeResult {
     std::vector<Request> request_list;
     std::map<size_t, size_t> task_lookup;
 };
 
-MergeResult mergeRequests(const std::vector<Request>& requests, bool do_merge) {
+namespace {
+
+bool tryAddUint64(uint64_t lhs, uint64_t rhs, uint64_t& out) {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) return false;
+    out = lhs + rhs;
+    return true;
+}
+
+MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
     MergeResult result;
-    if (requests.empty()) return result;
-    if (!do_merge) {
-        size_t idx = 0;
-        for (auto& req : requests) {
-            result.request_list.push_back(req);
-            result.task_lookup[idx] = idx;
-            idx++;
-        }
-        return result;
+    result.request_list.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        result.request_list.push_back(requests[i]);
+        result.task_lookup[i] = i;
+    }
+    return result;
+}
+
+uint64_t requestSourceAddr(const Request& request) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request.source));
+}
+
+}  // namespace
+
+MergeResult mergeRequests(const std::vector<Request>& requests,
+                          const std::vector<RequestBoundaryInfo>& boundaries,
+                          bool do_merge) {
+    if (requests.empty()) return {};
+    if (!do_merge || boundaries.size() != requests.size()) {
+        return makePassThroughMergeResult(requests);
     }
 
     struct Item {
         Request req;
+        RequestBoundaryInfo boundary;
         size_t orig_idx;
     };
 
     std::vector<Item> items;
     items.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); i++)
-        items.push_back({requests[i], i});
+    for (size_t i = 0; i < requests.size(); ++i) {
+        items.push_back({requests[i], boundaries[i], i});
+    }
 
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
         if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
@@ -715,34 +883,101 @@ MergeResult mergeRequests(const std::vector<Request>& requests, bool do_merge) {
             return a.req.target_id < b.req.target_id;
         if (a.req.target_offset != b.req.target_offset)
             return a.req.target_offset < b.req.target_offset;
-        return a.req.source < b.req.source;
+        return requestSourceAddr(a.req) < requestSourceAddr(b.req);
     });
 
-    for (const auto& item : items) {
-        if (result.request_list.empty()) {
-            result.request_list.push_back(item.req);
-            result.task_lookup[item.orig_idx] = result.request_list.size() - 1;
-        } else {
-            Request& last = result.request_list.back();
-            char* last_src_end = static_cast<char*>(last.source) + last.length;
-            char* curr_src = static_cast<char*>(item.req.source);
-            uint64_t last_tgt_end = last.target_offset + last.length;
-            if (last.opcode == item.req.opcode &&
-                last.target_id == item.req.target_id &&
-                last_src_end == curr_src &&
-                last_tgt_end == item.req.target_offset) {
-                last.length += item.req.length;
-                result.task_lookup[item.orig_idx] =
-                    result.request_list.size() - 1;
-            } else {
-                result.request_list.push_back(item.req);
-                result.task_lookup[item.orig_idx] =
-                    result.request_list.size() - 1;
-            }
+    auto can_merge = [](const Item& last, const Item& curr) {
+        if (last.req.opcode != curr.req.opcode ||
+            last.req.target_id != curr.req.target_id) {
+            return false;
         }
+        if (!last.boundary.source_key || !curr.boundary.source_key ||
+            !last.boundary.target_key || !curr.boundary.target_key) {
+            return false;
+        }
+        if (last.boundary.source_key != curr.boundary.source_key ||
+            last.boundary.target_key != curr.boundary.target_key) {
+            return false;
+        }
+        if (curr.req.length >
+            std::numeric_limits<size_t>::max() - last.req.length) {
+            return false;
+        }
+
+        uint64_t last_source_end = 0;
+        uint64_t last_target_end = 0;
+        if (!tryAddUint64(requestSourceAddr(last.req), last.req.length,
+                          last_source_end) ||
+            !tryAddUint64(last.req.target_offset, last.req.length,
+                          last_target_end)) {
+            return false;
+        }
+        return last_source_end == requestSourceAddr(curr.req) &&
+               last_target_end == curr.req.target_offset;
+    };
+
+    std::vector<Item> merged_items;
+    merged_items.reserve(items.size());
+
+    MergeResult result;
+    for (const auto& item : items) {
+        if (merged_items.empty() || !can_merge(merged_items.back(), item)) {
+            merged_items.push_back(item);
+        } else {
+            merged_items.back().req.length += item.req.length;
+        }
+        result.task_lookup[item.orig_idx] = merged_items.size() - 1;
     }
 
+    result.request_list.reserve(merged_items.size());
+    for (const auto& item : merged_items) {
+        result.request_list.push_back(item.req);
+    }
     return result;
+}
+
+std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
+    if (!buffer) return std::nullopt;
+    return BufferKey{buffer->addr, buffer->length};
+}
+
+RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
+                                           SegmentDesc* local_desc,
+                                           const Request& request) {
+    RequestBoundaryInfo boundary;
+
+    if (local_desc) {
+        auto source_addr =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(request.source));
+        boundary.source_key =
+            toBufferKey(local_desc->findBuffer(source_addr, request.length));
+    }
+
+    SegmentDesc* target_desc = nullptr;
+    if (request.target_id == LOCAL_SEGMENT_ID) {
+        target_desc = local_desc;
+    } else {
+        auto status = metadata->segmentManager().getRemoteCached(
+            target_desc, request.target_id);
+        if (!status.ok()) return boundary;
+    }
+    if (target_desc) {
+        boundary.target_key = toBufferKey(
+            target_desc->findBuffer(request.target_offset, request.length));
+    }
+    return boundary;
+}
+
+std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
+    ControlService* metadata, const std::vector<Request>& requests) {
+    std::vector<RequestBoundaryInfo> boundaries;
+    boundaries.reserve(requests.size());
+    auto* local_desc = metadata->segmentManager().getLocal().get();
+    for (const auto& request : requests) {
+        boundaries.push_back(
+            resolveRequestBoundary(metadata, local_desc, request));
+    }
+    return boundaries;
 }
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,
@@ -828,7 +1063,12 @@ Status TransferEngineImpl::submitTransfer(
     // Record start time for metrics tracking
     auto submit_time = std::chrono::steady_clock::now();
 
-    auto merged = mergeRequests(request_list, merge_requests_);
+    auto merge_boundaries =
+        merge_requests_
+            ? resolveRequestBoundaries(metadata_.get(), request_list)
+            : std::vector<RequestBoundaryInfo>{};
+    auto merged =
+        mergeRequests(request_list, merge_boundaries, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
         size_t task_id = start_task_id + kv.first;

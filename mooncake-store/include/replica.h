@@ -84,6 +84,7 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
+    bool with_hard_pin{false};  // Hard pin: object cannot be evicted
     std::vector<std::string>
         preferred_segments{};         // Preferred segments for allocation
     std::string preferred_segment{};  // Deprecated: Single preferred segment
@@ -94,6 +95,7 @@ struct ReplicateConfig {
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", with_soft_pin: " << config.with_soft_pin
+           << ", with_hard_pin: " << config.with_hard_pin
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];

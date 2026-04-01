@@ -170,8 +170,16 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-pip install --upgrade pip
-pip install build setuptools wheel auditwheel
+if command -v pip &>/dev/null; then
+    pip install --upgrade pip
+    pip install build setuptools wheel auditwheel
+elif command -v uv &>/dev/null; then
+    uv pip install --upgrade pip
+    uv pip install build setuptools wheel auditwheel
+else
+    echo "Error: Neither pip nor uv found"
+    exit 1
+fi
 
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"

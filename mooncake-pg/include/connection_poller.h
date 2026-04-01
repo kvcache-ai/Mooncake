@@ -54,8 +54,16 @@ class ConnectionContext {
     int backendIndex_;
     int rank_;
 
-    // TODO: make it atomic and add `expandSize` to handle runtime scaling-up?
-    int size_;
+    std::atomic<int> groupSize_;
+
+    bool isDummy_;
+
+    // A mark tracking the group size for which all ranks
+    // in [0, establishedGroupSize_) have been successfully
+    // connected at least once (they may disconnect afterwards).
+    // Mainly used in `waitUntilNewRanksConnected()`.
+    std::atomic<int> establishedGroupSize_;
+
     uint64_t* local2global_rank_map_;
     c10::intrusive_ptr<::c10d::Store> store_;
 
@@ -81,7 +89,7 @@ class ConnectionContext {
     std::condition_variable backend_wakeup_cv_;
 
    public:
-    ConnectionContext(int backendIndex, int rank, int size,
+    ConnectionContext(int backendIndex, int rank, int size, bool isDummy,
                       uint64_t* local2global_rank_map, std::string location,
                       c10::intrusive_ptr<::c10d::Store> store,
                       std::shared_ptr<TransferGroupMeta> meta,
@@ -92,13 +100,60 @@ class ConnectionContext {
     int32_t* warmup_send_region() const { return warmup_send_region_; }
     int32_t* warmup_recv_region() const { return warmup_recv_region_; }
 
-    int getTotalConnectedPeers() const {
-        return totalConnectedPeers_.load(std::memory_order_acquire);
-    }
-    bool isAllPeerConnected() const { return totalConnectedPeers_ == size_; }
+    /**
+     * @brief Get the total number of actively connected peers.
+     * @return The count of peers currently in the CONNECTED state.
+     */
+    int getTotalConnectedPeers() const;
 
+    /**
+     * @brief Expands the group to a new size.
+     *
+     * @note This is a non-blocking operation. Callers must invoke
+     *       `waitUntilNewRanksConnected()` prior to initiating any
+     *       subsequent communications (e.g., send, recv, putTaskCpu,
+     *       putTaskCuda) to ensure the new peers are ready.
+     *
+     * @param newGroupSize The target size for the extended group.
+     */
+    void extendGroupSizeTo(int newGroupSize);
+
+    /**
+     * @brief Checks whether all peers within the group have
+     *        established connections.
+     *
+     * @return True if all peers are fully connected.
+     */
+    bool isAllPeerConnected() const;
+
+    /**
+     * @brief Blocks until all peers in the group are connected.
+     *
+     * This method is primarily used during backend initialization.
+     * Upon completion, it set `establishedGroupSize_` to the
+     * current `groupSize_`.
+     */
     void waitUntilAllConnected();
+
+    void bootstrapLocalPeer(const std::string& localServerName,
+                            const SegmentInfo& localRankInfo);
+
+    /**
+     * @brief Blocks until all newly added ranks in the
+     *        extended group are connected.
+     *
+     * Specifically, it waits for pending ranks in the range
+     * `[establishedGroupSize_, groupSize_)` to reach the connected state.
+     * This should be called before starting new communications if
+     * `extendGroupSizeTo()` has been invoked.
+     * Upon completion, it set `establishedGroupSize_` to the
+     * current `groupSize_`.
+     */
+    void waitUntilNewRanksConnected();
+
     void shutdown();
+
+    void setDummy(bool isDummy) { isDummy_ = isDummy; }
 
     static std::string getServerNameStoreKey(int backendIndex, int rank) {
         return "server_name_" + std::to_string(backendIndex) + "_" +
@@ -111,6 +166,11 @@ class ConnectionContext {
     static std::string getExtensionTaskCountStoreKey(int backendIndex,
                                                      int rank) {
         return "extension_task_count_" + std::to_string(backendIndex) + "_" +
+               std::to_string(rank);
+    }
+    static std::string getExtensionActiveRanksStoreKey(int backendIndex,
+                                                       int rank) {
+        return "extension_active_ranks_" + std::to_string(backendIndex) + "_" +
                std::to_string(rank);
     }
 
@@ -146,6 +206,7 @@ class ConnectionPoller {
 
    private:
     ConnectionPoller();
+    void ensureThreadStarted();
     void pollerLoop();
     bool processContext(const std::shared_ptr<ConnectionContext>& ctx);
     bool processPeer(const std::shared_ptr<ConnectionContext>& ctx,
@@ -154,6 +215,7 @@ class ConnectionPoller {
     std::mutex wakeup_mutex_;
     std::condition_variable wakeup_cv_;
     std::thread pollerThread_;
+    std::atomic<bool> pollerThreadStarted_{false};
 
     std::mutex contexts_mutex_;
     std::atomic<uint64_t> contexts_version_{0};
