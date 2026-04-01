@@ -1132,6 +1132,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // --- Case B: same size — in-place update ---
         // Reuse existing buffer addresses.  No allocation or deallocation.
         // The client will RDMA-write new data to the same addresses.
+        //
+        // hard_pinned is const and preserved automatically — upsert does not
+        // change the eviction protection level of an existing object.
         metadata.client_id = client_id;
         metadata.put_start_time = now;
 

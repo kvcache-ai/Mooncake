@@ -771,9 +771,8 @@ std::vector<int> DummyClient::batch_put_from(
 
 int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
                           const ReplicateConfig& config) {
-    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
-    return to_py_ret(invoke_rpc<&RealClient::put_from_dummy_helper, void>(
-        key, dummy_addr, size, config, client_id_));
+    // TODO: implement this function
+    return -1;
 }
 
 std::vector<int64_t> DummyClient::batch_get_into(
@@ -797,12 +796,8 @@ int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
                                         void* metadata_buffer, size_t size,
                                         size_t metadata_size,
                                         const ReplicateConfig& config) {
-    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
-    uint64_t dummy_metadata_addr = reinterpret_cast<uint64_t>(metadata_buffer);
-    return to_py_ret(
-        invoke_rpc<&RealClient::put_from_with_metadata_dummy_helper, void>(
-            key, dummy_addr, dummy_metadata_addr, size, metadata_size, config,
-            client_id_));
+    // TODO: implement this function
+    return -1;
 }
 
 std::vector<int> DummyClient::batch_put_from_multi_buffers(

@@ -1826,7 +1826,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 
         // Additional validation and logging for debugging
         if (!op.result.has_value()) {
-            // if error == object already exist, consider as ok
+            // If error == object already exist, consider as ok (Put semantics).
+            // UpsertStart never returns this error, so this branch is
+            // unreachable for BatchUpsert — kept for BatchPut compatibility.
             if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 results.back() = {};
                 continue;

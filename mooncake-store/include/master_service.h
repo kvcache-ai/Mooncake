@@ -558,7 +558,9 @@ class MasterService {
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
+        // Updated by UpsertStart (Case B) to reflect the new writer.
         UUID client_id;
+        // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
 
