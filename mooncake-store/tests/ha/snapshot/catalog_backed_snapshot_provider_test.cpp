@@ -99,14 +99,15 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
     ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
     ASSERT_TRUE(snapshot->has_value());
     EXPECT_EQ(snapshot->value().snapshot_id, descriptor_.snapshot_id);
+    EXPECT_EQ(snapshot->value().snapshot_sequence_id,
+              descriptor_.last_included_seq);
     ASSERT_EQ(snapshot->value().metadata.size(), 1u);
 
     const auto& [key, metadata] = snapshot->value().metadata.front();
     EXPECT_EQ(key, kDefaultTestObjectKey);
     EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
     EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
-    EXPECT_EQ(metadata.last_sequence_id,
-              snapshot->value().snapshot_sequence_id);
+    EXPECT_EQ(metadata.last_sequence_id, descriptor_.last_included_seq);
     ASSERT_EQ(metadata.replicas.size(), 1u);
 
     const auto& replica = metadata.replicas.front();

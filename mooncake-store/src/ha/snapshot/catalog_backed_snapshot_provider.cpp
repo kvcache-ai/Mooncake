@@ -412,7 +412,8 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         }
 
         auto deserialize_metadata = DeserializeStandbySnapshotMetadata(
-            metadata_content, segment_manager.getView(), 0);
+            metadata_content, segment_manager.getView(),
+            descriptor.last_included_seq);
         if (!deserialize_metadata) {
             LOG(ERROR) << "Failed to deserialize snapshot metadata payload, "
                        << "snapshot_id=" << descriptor.snapshot_id
@@ -422,7 +423,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
 
         LoadedSnapshot snapshot;
         snapshot.snapshot_id = descriptor.snapshot_id;
-        snapshot.snapshot_sequence_id = 0;
+        snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
         return std::optional<LoadedSnapshot>(std::move(snapshot));
     }

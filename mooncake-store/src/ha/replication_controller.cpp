@@ -145,6 +145,8 @@ class CapabilityDrivenReplicationController final
         }
 
         if (dependency_init_error_ != ErrorCode::OK) {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            last_standby_error_ = dependency_init_error_;
             return dependency_init_error_;
         }
 
@@ -152,11 +154,12 @@ class CapabilityDrivenReplicationController final
             observed_leader.has_value() ? observed_leader->leader_address : "",
             oplog_connstring_, config_.cluster_id);
 
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running_ = err == ErrorCode::OK;
+            last_standby_error_ = err;
+        }
         if (err == ErrorCode::OK) {
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                standby_running_ = true;
-            }
             NotifyRuntimeStateIfChanged();
         }
         return err;
@@ -174,18 +177,23 @@ class CapabilityDrivenReplicationController final
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             standby_running_ = false;
+            last_standby_error_ = ErrorCode::OK;
         }
         NotifyRuntimeStateIfChanged();
     }
 
     ErrorCode PromoteStandby() override {
-        bool standby_running = false;
+        ErrorCode promote_error = ErrorCode::OK;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            standby_running = standby_running_;
+            if (!standby_running_) {
+                promote_error = last_standby_error_ != ErrorCode::OK
+                                    ? last_standby_error_
+                                    : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
         }
-        if (!standby_running) {
-            return ErrorCode::OK;
+        if (promote_error != ErrorCode::OK) {
+            return promote_error;
         }
 
         ErrorCode err = standby_service_->Promote();
@@ -196,6 +204,7 @@ class CapabilityDrivenReplicationController final
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             standby_running_ = false;
+            last_standby_error_ = err;
         }
         NotifyRuntimeStateIfChanged();
         return err;
@@ -267,6 +276,7 @@ class CapabilityDrivenReplicationController final
     mutable std::mutex state_mutex_;
     std::optional<MasterView> observed_leader_;
     bool standby_running_ = false;
+    ErrorCode last_standby_error_{ErrorCode::OK};
 
     std::mutex callback_mutex_;
     std::optional<RuntimeStateCallback> runtime_state_callback_;

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "ha/replication_controller.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
@@ -105,23 +106,21 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service.GetState());
     EXPECT_EQ(1u, service.GetMetadataCount());
-
-    // Current catalog-backed bootstrap restores metadata payload only. The
-    // snapshot sequence watermark is not materialized yet, so standby starts
-    // from sequence_id=0 even though metadata is preloaded.
-    EXPECT_EQ(0u, service.GetLatestAppliedSequenceId());
+    EXPECT_EQ(descriptor_.last_included_seq,
+              service.GetLatestAppliedSequenceId());
 
     auto status = service.GetSyncStatus();
     EXPECT_EQ(StandbyState::WATCHING, status.state);
-    EXPECT_EQ(0u, status.applied_seq_id);
-    EXPECT_EQ(0u, status.primary_seq_id);
+    EXPECT_EQ(descriptor_.last_included_seq, status.applied_seq_id);
+    EXPECT_EQ(descriptor_.last_included_seq, status.primary_seq_id);
 
     std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
     ASSERT_TRUE(service.ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
     EXPECT_EQ(kDefaultTestObjectKey, exported.front().first);
     EXPECT_EQ(kDefaultTestObjectSize, exported.front().second.size);
-    EXPECT_EQ(0u, exported.front().second.last_sequence_id);
+    EXPECT_EQ(descriptor_.last_included_seq,
+              exported.front().second.last_sequence_id);
 }
 
 TEST_P(HotStandbySnapshotBootstrapTest,
@@ -141,6 +140,28 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(StandbyState::WATCHING, status.state);
     EXPECT_EQ(0u, status.applied_seq_id);
     EXPECT_EQ(0u, status.primary_seq_id);
+}
+
+TEST(ReplicationControllerTest, PromoteStandbyReturnsStartFailure) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::ETCD,
+        .connstring = "http://localhost:2379",
+        .cluster_namespace = "replication-controller-test",
+    };
+    MasterServiceSupervisorConfig config;
+    config.cluster_id = "replication-controller-test";
+    config.local_hostname = "127.0.0.1:50051";
+    config.ha_backend_connstring = spec.connstring;
+    config.etcd_endpoints = spec.connstring;
+    config.enable_snapshot_restore = true;
+    config.snapshot_object_store_type = "local";
+    config.snapshot_catalog_store_type = "invalid";
+
+    auto controller = ha::CreateReplicationController(spec, config);
+    ASSERT_NE(controller, nullptr);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              controller->StartStandby(std::nullopt));
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, controller->PromoteStandby());
 }
 
 INSTANTIATE_TEST_SUITE_P(
