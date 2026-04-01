@@ -598,8 +598,8 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
     for (int i = 0; i < batch_sz; i++) {
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        auto get_result = test_client_->Get(
-            keys[i], {target_buffer}, {test_data_list[i].size()});
+        auto get_result = test_client_->Get(keys[i], {target_buffer},
+                                            {test_data_list[i].size()});
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,

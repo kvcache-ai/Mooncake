@@ -292,8 +292,7 @@ void worker_thread(int thread_id, std::atomic<bool>& stop_flag,
 
         auto start_time = std::chrono::high_resolution_clock::now();
         auto get_result = g_client->Get(
-            key, {write_buffer},
-            {static_cast<size_t>(FLAGS_value_size)});
+            key, {write_buffer}, {static_cast<size_t>(FLAGS_value_size)});
         bool success = get_result.has_value();
         auto end_time = std::chrono::high_resolution_clock::now();
 

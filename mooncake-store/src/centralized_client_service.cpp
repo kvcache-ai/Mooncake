@@ -566,8 +566,7 @@ CentralizedClientService::BatchGet(
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReadRouteConfig& config, bool aggregate_same_segment_task) {
-    if (keys.size() != all_buffers.size() ||
-        keys.size() != all_sizes.size()) {
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
