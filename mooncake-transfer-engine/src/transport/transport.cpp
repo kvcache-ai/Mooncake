@@ -18,7 +18,115 @@
 #include "transfer_engine.h"
 
 namespace mooncake {
+namespace {
+const char* ToSliceStatusName(Transport::Slice::SliceStatus status) {
+    switch (status) {
+        case Transport::Slice::PENDING:
+            return "PENDING";
+        case Transport::Slice::POSTED:
+            return "POSTED";
+        case Transport::Slice::SUCCESS:
+            return "SUCCESS";
+        case Transport::Slice::TIMEOUT:
+            return "TIMEOUT";
+        case Transport::Slice::FAILED:
+            return "FAILED";
+    }
+    return "UNKNOWN";
+}
+}  // namespace
+
 thread_local static Transport::ThreadLocalSliceCache tl_slice_cache;
+
+void Transport::Slice::ResetTraceState() {
+    trace_batch_id_ = 0;
+    trace_task_id_ = 0;
+    trace_slice_id_ = 0;
+    trace_transport_name_.clear();
+    trace_span_ = tracing::Span();
+    trace_started_ = false;
+    trace_terminal_recorded_ = false;
+}
+
+void Transport::Slice::StartTrace(const tracing::TraceContext& parent_context,
+                                  BatchID batch_id, size_t task_id,
+                                  size_t slice_id,
+                                  const std::string& transport_name) {
+    if (trace_started_) {
+        return;
+    }
+
+    trace_batch_id_ = batch_id;
+    trace_task_id_ = task_id;
+    trace_slice_id_ = slice_id;
+    trace_transport_name_ = transport_name;
+
+    auto& tracing = tracing::TracingFacade::Instance("mooncake-transfer-engine",
+                                                     "multi-transport");
+    trace_span_ = tracing.StartSpan(
+        "te.slice", &parent_context,
+        {{"te.batch_id", std::to_string(batch_id)},
+         {"task.id", std::to_string(task_id)},
+         {"slice.id", std::to_string(slice_id)},
+         {"transport.name", transport_name},
+         {"slice.length", std::to_string(length)},
+         {"slice.status", ToSliceStatusName(status)}});
+    if (!trace_span_.valid()) {
+        return;
+    }
+
+    trace_started_ = true;
+    trace_span_.AddEvent("slice execution started",
+                         {{"slice.status", ToSliceStatusName(status)}});
+
+    if (status == Slice::SUCCESS) {
+        FinishTrace("SUCCESS", false);
+    } else if (status == Slice::FAILED) {
+        FinishTrace("FAILED", true);
+    } else if (status == Slice::TIMEOUT) {
+        FinishTrace("TIMEOUT", true);
+    }
+}
+
+void Transport::Slice::markSuccess() {
+    status = Slice::SUCCESS;
+    __atomic_fetch_add(&task->transferred_bytes, length, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+
+    FinishTrace("SUCCESS", false);
+    check_batch_completion(false);
+}
+
+void Transport::Slice::markFailed() {
+    status = Slice::FAILED;
+    __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+
+    FinishTrace("FAILED", true);
+    check_batch_completion(true);
+}
+
+void Transport::Slice::markTimeoutForTrace() { FinishTrace("TIMEOUT", true); }
+
+void Transport::Slice::FinishTrace(const char* status_name, bool error) {
+    if (!trace_started_ || trace_terminal_recorded_) {
+        return;
+    }
+
+    trace_span_.SetAttribute("status", status_name);
+    trace_span_.AddEvent(
+        "slice terminal status",
+        {{"te.batch_id", std::to_string(trace_batch_id_)},
+         {"task.id", std::to_string(trace_task_id_)},
+         {"slice.id", std::to_string(trace_slice_id_)},
+         {"transport.name", trace_transport_name_},
+         {"slice.length", std::to_string(length)},
+         {"status", status_name}});
+    if (error) {
+        trace_span_.SetStatus("ERROR");
+    }
+    trace_span_.End();
+    trace_terminal_recorded_ = true;
+}
 
 Transport::ThreadLocalSliceCache &Transport::getSliceCache() {
     return tl_slice_cache;

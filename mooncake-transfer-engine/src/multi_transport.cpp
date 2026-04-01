@@ -223,6 +223,8 @@ Status MultiTransport::submitTransfer(
         for (size_t slice_idx = 0; slice_idx < task.slice_list.size();
              ++slice_idx) {
             auto* slice = task.slice_list[slice_idx];
+            slice->StartTrace(task_context, batch_id, idx, slice_idx,
+                              task_transport_names[idx]);
             if (!trace_registry_.MarkSliceQueued(batch_id, idx, slice_idx)) {
                 continue;
             }
@@ -343,6 +345,9 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             if (!trace_registry_.MarkSliceTerminal(batch_id, task_id, slice_idx,
                                                    slice->status)) {
                 continue;
+            }
+            if (slice->status == Transport::Slice::TIMEOUT) {
+                slice->markTimeoutForTrace();
             }
             pending_events.emplace_back(
                 slice->status == Transport::Slice::SUCCESS

@@ -295,6 +295,55 @@ TEST_F(TransportTest, ActiveBatchTraceRegistryKeepsRootAliveUntilFinish) {
     EXPECT_TRUE(third.created);
     EXPECT_NE(third.context.span_id, first.context.span_id);
 }
+
+TEST_F(TransportTest, SliceTraceLifecycleTracksSuccessAndTimeout) {
+    setenv("MC_TRACING_ENABLED", "1", 1);
+    setenv("MC_TRACING_EXPORTER", "jsonl", 1);
+
+    tracing::TraceContext parent_context{
+        .trace_id = "trace-slice",
+        .span_id = "task-span",
+        .parent_span_id = "batch-span",
+        .correlation_id = "corr-slice"};
+
+    Transport::BatchDesc success_batch;
+    success_batch.batch_size = 1;
+    Transport::TransferTask success_task;
+    success_task.batch_id =
+        reinterpret_cast<Transport::BatchID>(&success_batch);
+    success_task.slice_count = 1;
+    Transport::Slice success_slice;
+    success_slice.task = &success_task;
+    success_slice.length = 512;
+    success_slice.status = Transport::Slice::PENDING;
+
+    success_slice.StartTrace(parent_context, success_task.batch_id, 3, 0, "tcp");
+    EXPECT_TRUE(success_slice.has_active_trace_for_test());
+    EXPECT_FALSE(success_slice.trace_terminal_recorded_for_test());
+
+    success_slice.markSuccess();
+    EXPECT_TRUE(success_slice.trace_terminal_recorded_for_test());
+    EXPECT_EQ(success_task.success_slice_count, 1u);
+    EXPECT_EQ(success_task.transferred_bytes, 512u);
+
+    Transport::BatchDesc timeout_batch;
+    timeout_batch.batch_size = 1;
+    Transport::TransferTask timeout_task;
+    timeout_task.batch_id =
+        reinterpret_cast<Transport::BatchID>(&timeout_batch);
+    Transport::Slice timeout_slice;
+    timeout_slice.task = &timeout_task;
+    timeout_slice.length = 256;
+    timeout_slice.status = Transport::Slice::TIMEOUT;
+
+    timeout_slice.StartTrace(parent_context, timeout_task.batch_id, 4, 1,
+                             "rdma");
+    EXPECT_TRUE(timeout_slice.has_active_trace_for_test());
+    EXPECT_TRUE(timeout_slice.trace_terminal_recorded_for_test());
+
+    timeout_slice.markTimeoutForTrace();
+    EXPECT_TRUE(timeout_slice.trace_terminal_recorded_for_test());
+}
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

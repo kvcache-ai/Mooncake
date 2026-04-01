@@ -32,6 +32,7 @@
 #include <condition_variable>
 
 #include "common/base/status.h"
+#include "tracing_facade.h"
 #include "transfer_metadata.h"
 
 namespace mooncake {
@@ -163,25 +164,28 @@ class Transport {
         };
 
        public:
-        void markSuccess() {
-            status = Slice::SUCCESS;
-            __atomic_fetch_add(&task->transferred_bytes, length,
-                               __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+        void ResetTraceState();
 
-            check_batch_completion(false);
-        }
+        void StartTrace(const tracing::TraceContext& parent_context,
+                        BatchID batch_id, size_t task_id, size_t slice_id,
+                        const std::string& transport_name);
 
-        void markFailed() {
-            status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+        void markSuccess();
 
-            check_batch_completion(true);
+        void markFailed();
+
+        void markTimeoutForTrace();
+
+        bool has_active_trace_for_test() const { return trace_started_; }
+        bool trace_terminal_recorded_for_test() const {
+            return trace_terminal_recorded_;
         }
 
         volatile int64_t ts;
 
        private:
+        void FinishTrace(const char* status_name, bool error);
+
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
@@ -235,6 +239,14 @@ class Transport {
             }
 #endif
         }
+
+        BatchID trace_batch_id_{0};
+        size_t trace_task_id_{0};
+        size_t trace_slice_id_{0};
+        std::string trace_transport_name_;
+        tracing::Span trace_span_;
+        bool trace_started_{false};
+        bool trace_terminal_recorded_{false};
     };
 
     struct ThreadLocalSliceCache {
@@ -260,6 +272,8 @@ class Transport {
                 tail_++;
                 slice->from_cache = true;
             }
+
+            slice->ResetTraceState();
 
             return slice;
         }
