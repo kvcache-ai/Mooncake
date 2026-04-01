@@ -133,7 +133,8 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
-    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs) {
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    bool has_soft_pin_timeout = false, uint64_t soft_pin_timeout_ms = 0) {
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
     shard_packer.pack_map(1);
@@ -147,8 +148,8 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
-    shard_packer.pack(false);
-    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(has_soft_pin_timeout);
+    shard_packer.pack(soft_pin_timeout_ms);
     shard_packer.pack(uint32_t{1});
     PackDiskReplica(shard_packer, disk_file_path, object_size);
 
@@ -222,7 +223,9 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
     const UUID& client_id = UUID{1, 2},
     std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
-    uint64_t object_size = kDefaultTestObjectSize) {
+    uint64_t object_size = kDefaultTestObjectSize,
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    bool has_soft_pin_timeout = false, uint64_t soft_pin_timeout_ms = 0) {
     auto manifest = object_store.UploadString(descriptor.manifest_key,
                                               "messagepack|1.0.0|standby-test");
     if (!manifest) {
@@ -237,8 +240,9 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
 
     auto metadata = object_store.UploadBuffer(
         descriptor.object_prefix + "metadata",
-        BuildMetadataPayload(client_id, object_key, disk_file_path,
-                             object_size));
+        BuildMetadataPayload(client_id, object_key, disk_file_path, object_size,
+                             kDefaultTestPutStartTimeMs, lease_timeout_ms,
+                             has_soft_pin_timeout, soft_pin_timeout_ms));
     if (!metadata) {
         return tl::make_unexpected(metadata.error());
     }

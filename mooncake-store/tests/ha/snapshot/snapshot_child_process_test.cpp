@@ -722,7 +722,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
     restored_service.reset();
 }
 
-TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLeaseWhenConfigured) {
+TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     // Step 1: Create service with long lease TTL
     auto config = MasterServiceConfigBuilder()
                       .set_enable_snapshot(false)
@@ -733,6 +733,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLeaseWhenConfigured) {
                       .set_snapshot_retention_count(3)
                       .set_snapshot_object_store_type("local")
                       .set_default_kv_lease_ttl(600000)  // 10 min lease
+                      .set_default_kv_soft_pin_ttl(600000)
                       .build();
     service_ = std::make_unique<MasterService>(config);
 
@@ -747,11 +748,13 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLeaseWhenConfigured) {
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value()) << "MountSegment failed";
 
-    // Add two complete objects via PutStart + PutEnd
-    // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
+    // Add two complete objects via PutStart + PutEnd.
+    // Note: PutEnd calls GrantLease(0, ...), so lease is immediately expired.
+    // The expired key keeps a live soft pin to verify restore ignores it.
     std::string expired_key = "expired_lease_object";
     auto put_exp =
-        service_->PutStart(client_id, expired_key, {1024}, {.replica_num = 1});
+        service_->PutStart(client_id, expired_key, {1024},
+                           {.replica_num = 1, .with_soft_pin = true});
     ASSERT_TRUE(put_exp.has_value()) << "PutStart expired failed";
     ASSERT_TRUE(service_->PutEnd(client_id, expired_key, ReplicaType::MEMORY)
                     .has_value())
@@ -779,7 +782,6 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLeaseWhenConfigured) {
     auto restore_config = MasterServiceConfigBuilder()
                               .set_enable_snapshot(false)
                               .set_enable_snapshot_restore(true)
-                              .set_cleanup_expired_on_restore(true)
                               .set_snapshot_backup_dir(tmp_dir() + "/backup")
                               .set_snapshot_interval_seconds(100)
                               .set_snapshot_child_timeout_seconds(60)

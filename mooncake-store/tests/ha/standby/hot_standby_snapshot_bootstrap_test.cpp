@@ -96,10 +96,14 @@ class HotStandbySnapshotBootstrapTest
 
     void PublishSnapshot(const ha::SnapshotDescriptor& descriptor,
                          std::string_view object_key = kDefaultTestObjectKey,
-                         uint64_t object_size = kDefaultTestObjectSize) {
+                         uint64_t object_size = kDefaultTestObjectSize,
+                         uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+                         bool has_soft_pin_timeout = false,
+                         uint64_t soft_pin_timeout_ms = 0) {
         auto result = PublishSnapshotPayload(
             *object_store_, *catalog_store_, descriptor, UUID{1, 2}, object_key,
-            kDefaultTestDiskFilePath, object_size);
+            kDefaultTestDiskFilePath, object_size, lease_timeout_ms,
+            has_soft_pin_timeout, soft_pin_timeout_ms);
         ASSERT_TRUE(result.has_value()) << result.error();
         published_snapshot_ids_.push_back(descriptor.snapshot_id);
     }
@@ -174,6 +178,32 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(StandbyState::WATCHING, status.state);
     EXPECT_EQ(0u, status.applied_seq_id);
     EXPECT_EQ(0u, status.primary_seq_id);
+}
+
+TEST_P(HotStandbySnapshotBootstrapTest,
+       SnapshotOnlyStartDropsLeaseExpiredObjectEvenWhenSoftPinned) {
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    PublishSnapshot(descriptor_, kDefaultTestObjectKey, kDefaultTestObjectSize,
+                    now_ms - 1000, true, now_ms + 60000);
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    HotStandbyService service(MakeSnapshotOnlyConfig());
+    service.SetSnapshotProvider(std::move(provider.value()));
+
+    ASSERT_EQ(ErrorCode::OK, service.Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service.GetState());
+    EXPECT_EQ(0u, service.GetMetadataCount());
+    EXPECT_EQ(descriptor_.last_included_seq,
+              service.GetLatestAppliedSequenceId());
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service.ExportMetadataSnapshot(exported));
+    EXPECT_TRUE(exported.empty());
 }
 
 TEST_P(HotStandbySnapshotBootstrapTest,

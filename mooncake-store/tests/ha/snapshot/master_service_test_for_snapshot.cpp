@@ -291,60 +291,6 @@ TEST_F(MasterServiceSnapshotTest, RestoreRebuildsMasterStateMetrics) {
     EXPECT_EQ(summary.find("Mem Storage: 0 B / 0 B"), std::string::npos);
 }
 
-TEST_F(MasterServiceSnapshotTest,
-       RestoreKeepsCompleteExpiredObjectsAndDropsIncompleteObjects) {
-    ResetMasterMetricsForTest();
-
-    service_.reset(
-        new MasterService(MasterServiceConfig::builder()
-                              .set_memory_allocator(BufferAllocatorType::OFFSET)
-                              .build()));
-
-    Segment segment = MakeSegment("restore_cleanup_segment",
-                                  kDefaultSegmentBase, 16 * 1024 * 1024);
-    UUID client_id = generate_uuid();
-    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    const std::string complete_key = "restore_complete_expired_key";
-    auto put_start = service_->PutStart(client_id, complete_key, 4096, config);
-    ASSERT_TRUE(put_start.has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, complete_key, ReplicaType::MEMORY)
-                    .has_value());
-
-    const std::string incomplete_key = "restore_incomplete_key";
-    put_start = service_->PutStart(client_id, incomplete_key, 2048, config);
-    ASSERT_TRUE(put_start.has_value());
-
-    EnsureSnapshotStoresInitialized(service_.get());
-    const std::string snapshot_id = GenerateSnapshotId();
-    auto persist_result = CallPersistState(service_.get(), snapshot_id);
-    ASSERT_TRUE(persist_result.has_value())
-        << "Failed to persist state: " << persist_result.error().message;
-
-    service_.reset();
-    ResetMasterMetricsForTest();
-
-    auto restore_config = MasterServiceConfig::builder()
-                              .set_memory_allocator(BufferAllocatorType::OFFSET)
-                              .set_enable_snapshot_restore(true)
-                              .set_snapshot_object_store_type("local")
-                              .build();
-    service_.reset(new MasterService(restore_config));
-
-    auto complete_result = service_->GetReplicaList(complete_key);
-    ASSERT_TRUE(complete_result.has_value());
-    ASSERT_EQ(1u, complete_result->replicas.size());
-
-    auto incomplete_result = service_->GetReplicaList(incomplete_key);
-    ASSERT_FALSE(incomplete_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, incomplete_result.error());
-
-    EXPECT_EQ(1u, service_->GetKeyCount());
-}
-
 TEST_F(MasterServiceSnapshotTest, PutStartEndFlow) {
     service_.reset(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);

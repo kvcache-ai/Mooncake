@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -11,6 +12,20 @@
 #include "metadata_store.h"
 
 namespace mooncake {
+
+inline bool IsSnapshotRestoreLeaseAlive(
+    const std::chrono::system_clock::time_point& lease_timeout,
+    const std::chrono::system_clock::time_point& now) {
+    return lease_timeout > now;
+}
+
+template <typename Metadata>
+inline bool IsSnapshotRestoreLeaseAlive(
+    const Metadata& metadata,
+    const std::chrono::system_clock::time_point& now) {
+    auto now_copy = now;
+    return !metadata.IsLeaseExpired(now_copy);
+}
 
 struct LoadedSnapshot {
     std::string snapshot_id;

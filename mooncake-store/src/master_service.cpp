@@ -20,6 +20,7 @@
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_provider.h"
 #include "types.h"
 #include "serialize/serializer.hpp"
 #include "ha/snapshot/snapshot_logger.h"
@@ -274,7 +275,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
           CreateAllocationStrategy(config.allocation_strategy_type)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
-      cleanup_expired_on_restore_(config.cleanup_expired_on_restore),
       snapshot_backup_dir_(config.snapshot_backup_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
@@ -3168,9 +3168,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
                             it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE)
                                 .has_value();
                         const bool cleanup_expired_complete =
-                            cleanup_expired_on_restore_ &&
-                            it->second.IsLeaseExpired(cleanup_now) &&
-                            !it->second.IsSoftPinned(cleanup_now);
+                            !IsSnapshotRestoreLeaseAlive(it->second,
+                                                         cleanup_now);
                         if (cleanup_incomplete || cleanup_expired_complete) {
                             VLOG(1)
                                 << "clear metadata key=" << it->first

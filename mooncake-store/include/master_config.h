@@ -54,7 +54,6 @@ struct MasterConfig {
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
-    bool cleanup_expired_on_restore;
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
     uint64_t snapshot_child_timeout_seconds;
@@ -129,7 +128,6 @@ class MasterServiceSupervisorConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
-    bool cleanup_expired_on_restore = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
@@ -190,7 +188,6 @@ class MasterServiceSupervisorConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
-        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -285,7 +282,6 @@ class WrappedMasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
-    bool cleanup_expired_on_restore = false;
     std::optional<ha::PromotedStandbyState> preloaded_state;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -366,7 +362,6 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
-        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -422,7 +417,6 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot = config.enable_snapshot;
         enable_snapshot_restore = config.enable_snapshot_restore;
-        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
@@ -475,7 +469,6 @@ class MasterServiceConfigBuilder {
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
     bool enable_snapshot_ = false;
-    bool cleanup_expired_on_restore_ = false;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
@@ -604,11 +597,6 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
         enable_snapshot_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_cleanup_expired_on_restore(bool enable) {
-        cleanup_expired_on_restore_ = enable;
         return *this;
     }
 
@@ -764,7 +752,6 @@ class MasterServiceConfig {
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
-    bool cleanup_expired_on_restore = false;
     std::optional<ha::PromotedStandbyState> preloaded_state;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -819,7 +806,6 @@ class MasterServiceConfig {
                                       ? false
                                       : config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
-        cleanup_expired_on_restore = config.cleanup_expired_on_restore;
         preloaded_state = config.preloaded_state;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
@@ -875,7 +861,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.quota_bytes = quota_bytes_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
     config.enable_snapshot = enable_snapshot_;
-    config.cleanup_expired_on_restore = cleanup_expired_on_restore_;
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;

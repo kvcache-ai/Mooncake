@@ -141,15 +141,10 @@ DeserializeStandbyObjectMetadata(
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
             std::chrono::milliseconds(lease_timestamp_ms));
-        std::optional<std::chrono::system_clock::time_point> soft_pin_timeout;
-        if (has_soft_pin_timeout) {
-            soft_pin_timeout.emplace(
-                std::chrono::milliseconds(soft_pin_timestamp_ms));
-        }
+        (void)has_soft_pin_timeout;
+        (void)soft_pin_timestamp_ms;
 
-        if (size == 0 ||
-            (lease_timeout <= now && (!soft_pin_timeout.has_value() ||
-                                      soft_pin_timeout.value() <= now))) {
+        if (size == 0 || !IsSnapshotRestoreLeaseAlive(lease_timeout, now)) {
             return std::optional<StandbyObjectMetadata>();
         }
 
