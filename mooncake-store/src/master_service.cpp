@@ -942,10 +942,25 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     return results;
 }
 
+// UpsertStart — insert-or-update entry point.
+//
+// Three-way dispatch depending on key state:
+//   Case A: key does not exist  → allocate new buffers (same as PutStart)
+//   Case B: key exists, same size → in-place update (reuse existing buffers)
+//   Case C: key exists, different size → discard old + allocate new
+//
+// Before reaching Case B/C the function runs safety checks and may preempt
+// an in-progress Put/Upsert on the same key.  Preempted PROCESSING replicas
+// are moved to discarded_replicas_ for delayed release (the previous writer
+// may still be performing RDMA writes to those buffers).
+//
+// Note: during Case B the key is temporarily unreadable (all replicas are
+// PROCESSING).  Readers will get REPLICA_IS_NOT_READY until UpsertEnd.
 auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    // --- Parameter validation (same as PutStart) ---
     if (config.replica_num == 0 || key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", slice_length=" << slice_length
@@ -964,36 +979,48 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=upsert_start_begin";
 
+    // --- Lock acquisition ---
+    // snapshot_mutex_ (shared): allows concurrent reads/writes, blocks only
+    //   during full metadata snapshots.
+    // shard lock (exclusive via MetadataShardAccessorRW): serializes all
+    //   operations on keys that hash to the same shard.
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
     const auto now = std::chrono::system_clock::now();
     auto it = shard->metadata.find(key);
 
-    // If key found but all handles are stale, erase and treat as non-existent
+    // --- Step 0: stale handle cleanup ---
+    // If all memory replicas point to unmounted segments (node crashed and
+    // restarted), the metadata is useless — erase it and treat as new key.
     if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
         shard->processing_keys.erase(key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
     }
 
-    // If key exists and is valid, handle Case B/C or preemption
+    // --- Step 1: safety checks and preemption (only if key exists) ---
     if (it != shard->metadata.end()) {
         auto& metadata = it->second;
 
-        // Safety check: reject if Copy/Move in progress
+        // Reject if a Copy/Move task is actively reading this key's replicas.
+        // Writing during replication would corrupt the copy.
         if (shard->replication_tasks.count(key) > 0) {
             LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
-        // Safety check: reject if offloading in progress
+        // Reject if an offload-to-disk task is in progress (same reason).
         if (shard->offloading_tasks.count(key) > 0) {
             LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
-        // Preemption: if another Put/Upsert is in progress, preempt it
+        // Preempt an in-progress Put/Upsert on the same key.  The previous
+        // writer's PROCESSING replicas are moved to discarded_replicas_ with a
+        // TTL so they are not freed while the old writer may still be doing
+        // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
+        // UpsertStart preempts immediately.
         if (shard->processing_keys.count(key) > 0) {
             auto processing_replicas =
                 metadata.PopReplicas(&Replica::fn_is_processing);
@@ -1005,8 +1032,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
             shard->processing_keys.erase(key);
 
-            // If no COMPLETE replicas remain after preemption, erase metadata
-            // and fall through to Case A
+            // If no COMPLETE replicas survive the preemption, this key
+            // effectively does not exist — fall through to Case A.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
                 shard->metadata.erase(it);
                 it = shard->metadata.end();
@@ -1014,30 +1041,33 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         }
     }
 
-    // If metadata was erased (stale, preempted with no COMPLETE replicas,
-    // or never existed), fall through to Case A
+    // --- Case A: key does not exist (or was erased above) ---
+    // Allocate fresh buffers, identical to PutStart.
     if (it == shard->metadata.end()) {
-        // Case A: key does not exist — same as PutStart
         VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
         return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                          config, now);
     }
 
-    // Key exists with COMPLETE replicas — Case B or Case C
+    // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
     auto& metadata = it->second;
 
-    // Safety check: reject if any replica has non-zero refcnt
+    // Reject if any reader holds a reference (refcnt > 0).  Overwriting a
+    // buffer that an RDMA read is streaming from would cause data corruption.
+    // The client should retry after readers finish.
     if (metadata.HasReplica(&Replica::fn_is_busy)) {
         LOG(INFO) << "key=" << key << ", error=object_replica_busy";
         return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
     }
 
     if (metadata.size == slice_length) {
-        // Case B: same size — in-place update
+        // --- Case B: same size — in-place update ---
+        // Reuse existing buffer addresses.  No allocation or deallocation.
+        // The client will RDMA-write new data to the same addresses.
         metadata.client_id = client_id;
         metadata.put_start_time = now;
 
-        // Reconcile soft_pin state with the incoming config
+        // Reconcile soft_pin state with the incoming config.
         {
             SpinLocker locker(&metadata.lock);
             if (config.with_soft_pin && !metadata.soft_pin_timeout) {
@@ -1049,12 +1079,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
         }
 
+        // Mark COMPLETE → PROCESSING so readers won't see stale data
+        // mid-transfer.  The key becomes unreadable until UpsertEnd.
         metadata.VisitReplicas(&Replica::fn_is_completed, [](Replica& replica) {
             replica.mark_processing();
         });
 
         shard->processing_keys.insert(key);
 
+        // Return the existing descriptors — same buffer addresses as before.
         std::vector<Replica::Descriptor> replica_list;
         const auto& all_replicas = metadata.GetAllReplicas();
         replica_list.reserve(all_replicas.size());
@@ -1066,7 +1099,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return replica_list;
     }
 
-    // Case C: different size — delete and reallocate
+    // --- Case C: different size — discard old replicas and reallocate ---
+    // Old buffers cannot be reused.  Move them to discarded_replicas_ for
+    // delayed release (readers may still hold descriptors without refcnt),
+    // then allocate fresh buffers at the new size.
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {
         std::lock_guard lock(discarded_replicas_mutex_);
