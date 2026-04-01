@@ -11,6 +11,7 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "ha_metric_manager.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/replication_controller.h"
 #include "rpc_service.h"
@@ -23,6 +24,28 @@ namespace {
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
 constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
+
+HARuntimeMode ResolveRuntimeMode(HABackendType type) {
+    return type == HABackendType::ETCD ? HARuntimeMode::kSnapshotWithOplog
+                                       : HARuntimeMode::kSnapshotOnly;
+}
+
+HARuntimePhaseStats BuildPromotedStandbyPhaseStats(
+    const std::optional<PromotedStandbyState>& promoted_state) {
+    HARuntimePhaseStats stats;
+    if (!promoted_state.has_value()) {
+        return stats;
+    }
+
+    stats.key_count =
+        static_cast<int64_t>(promoted_state->metadata_snapshot.size());
+    for (const auto& [key, metadata] : promoted_state->metadata_snapshot) {
+        (void)key;
+        stats.logical_bytes += static_cast<int64_t>(metadata.size);
+    }
+    stats.applied_seq_id = static_cast<int64_t>(promoted_state->applied_seq_id);
+    return stats;
+}
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
@@ -133,6 +156,7 @@ int MasterServiceSupervisor::Start() {
                    << ", backend_type=" << config_.ha_backend_type;
         return -1;
     }
+    const auto runtime_mode = ResolveRuntimeMode(spec->type);
 
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
@@ -310,9 +334,12 @@ int MasterServiceSupervisor::Start() {
 
         LOG(INFO) << "Entering warmup phase...";
         set_runtime_state(MasterRuntimeState::kLeaderWarmup);
+        ScopedHARuntimePhaseRecorder warmup_recorder(
+            runtime_mode, HARuntimePhase::kLeaderWarmup);
         auto warmup_result =
             WarmupLeadership(leader_coordinator, *leadership_session);
         if (!warmup_result) {
+            warmup_recorder.FinishFailure();
             enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
                     "renewal startup failure", "start leadership renewal",
@@ -323,6 +350,7 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
         if (!warmup_result.value()) {
+            warmup_recorder.FinishFailure();
             enter_standby_mode(std::nullopt);
             LogLeadershipReleaseWarning(
                 "warmup expiration",
@@ -331,6 +359,7 @@ int MasterServiceSupervisor::Start() {
             admin_server.SetObservedLeader(std::nullopt);
             continue;
         }
+        warmup_recorder.FinishSuccess();
 
         LOG(INFO) << "Starting serve phase...";
         coro_rpc::coro_rpc_server server(
@@ -360,6 +389,11 @@ int MasterServiceSupervisor::Start() {
                       << "to cold master startup";
         }
 
+        const auto master_start_stats =
+            BuildPromotedStandbyPhaseStats(wrapped_config.preloaded_state);
+        ScopedHARuntimePhaseRecorder master_start_recorder(
+            runtime_mode, HARuntimePhase::kMasterStart);
+
         auto wrapped_master_service =
             std::make_shared<WrappedMasterService>(wrapped_config);
         mooncake::RegisterRpcService(server, *wrapped_master_service);
@@ -367,6 +401,7 @@ int MasterServiceSupervisor::Start() {
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
         if (!serve_preflight) {
+            master_start_recorder.FinishFailure(master_start_stats);
             deactivate_serving_state();
             enter_standby_mode(leadership_session->view);
             if (HandleLeadershipPhaseError(
@@ -378,6 +413,7 @@ int MasterServiceSupervisor::Start() {
             continue;
         }
         if (!serve_preflight.value()) {
+            master_start_recorder.FinishFailure(master_start_stats);
             deactivate_serving_state();
             enter_standby_mode(std::nullopt);
             LogLeadershipReleaseWarning(
@@ -417,6 +453,7 @@ int MasterServiceSupervisor::Start() {
         if (ec.hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
                        << ec.result().value();
+            master_start_recorder.FinishFailure(master_start_stats);
             stop_leadership_monitor(leadership_monitor_handle);
             deactivate_serving_state();
             enter_standby_mode(leadership_session->view);
@@ -430,10 +467,14 @@ int MasterServiceSupervisor::Start() {
 
         if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
             activate_serving_state(wrapped_master_service);
+            master_start_recorder.FinishSuccess(master_start_stats);
         }
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
+        if (!master_start_recorder.finished()) {
+            master_start_recorder.FinishFailure(master_start_stats);
+        }
 
         stop_leadership_monitor(leadership_monitor_handle);
         deactivate_serving_state();

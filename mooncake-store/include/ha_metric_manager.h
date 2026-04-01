@@ -1,15 +1,52 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
 
+#include "hybrid_metric.h"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
 
 namespace mooncake {
+
+enum class HARuntimeMode : uint8_t {
+    kSnapshotOnly = 0,
+    kSnapshotWithOplog = 1,
+};
+
+const char* HARuntimeModeToString(HARuntimeMode mode);
+
+enum class HARuntimePhase : uint8_t {
+    kStandbyStart = 0,
+    kSnapshotBootstrap = 1,
+    kSnapshotRefresh = 2,
+    kOplogFollowingStart = 3,
+    kFinalCatchup = 4,
+    kStandbyPromote = 5,
+    kLeaderWarmup = 6,
+    kMasterStart = 7,
+};
+
+const char* HARuntimePhaseToString(HARuntimePhase phase);
+
+enum class HARuntimePhaseResult : uint8_t {
+    kSuccess = 0,
+    kFailure = 1,
+    kEmpty = 2,
+};
+
+const char* HARuntimePhaseResultToString(HARuntimePhaseResult result);
+
+struct HARuntimePhaseStats {
+    int64_t key_count{0};
+    int64_t logical_bytes{0};
+    int64_t oplog_entries{0};
+    int64_t applied_seq_id{0};
+};
 
 /**
  * @brief Singleton manager for High Availability (HA) related metrics.
@@ -168,6 +205,33 @@ class HAMetricManager {
     void inc_state_transitions(int64_t val = 1);
     int64_t get_state_transitions_total();
 
+    // ========== Runtime Phase Metrics ==========
+
+    void ObserveRuntimePhase(HARuntimeMode mode, HARuntimePhase phase,
+                             HARuntimePhaseResult result,
+                             std::chrono::microseconds duration,
+                             const HARuntimePhaseStats& stats = {});
+
+    int64_t get_runtime_phase_runs_total(HARuntimeMode mode,
+                                         HARuntimePhase phase,
+                                         HARuntimePhaseResult result);
+    int64_t get_runtime_phase_last_duration_us(HARuntimeMode mode,
+                                               HARuntimePhase phase);
+    int64_t get_runtime_phase_last_key_count(HARuntimeMode mode,
+                                             HARuntimePhase phase);
+    int64_t get_runtime_phase_last_logical_bytes(HARuntimeMode mode,
+                                                 HARuntimePhase phase);
+    int64_t get_runtime_phase_last_oplog_entries(HARuntimeMode mode,
+                                                 HARuntimePhase phase);
+    int64_t get_runtime_phase_last_applied_seq_id(HARuntimeMode mode,
+                                                  HARuntimePhase phase);
+    int64_t get_runtime_phase_last_key_rate_per_sec(HARuntimeMode mode,
+                                                    HARuntimePhase phase);
+    int64_t get_runtime_phase_last_byte_rate_per_sec(HARuntimeMode mode,
+                                                     HARuntimePhase phase);
+    int64_t get_runtime_phase_last_oplog_entry_rate_per_sec(
+        HARuntimeMode mode, HARuntimePhase phase);
+
     // ========== Serialization ==========
 
     /**
@@ -217,6 +281,68 @@ class HAMetricManager {
     // State Machine
     ylt::metric::gauge_t standby_state_;
     ylt::metric::counter_t state_transitions_total_;
+
+    using RuntimePhaseGauge = ylt::metric::basic_dynamic_gauge<int64_t, 2>;
+
+    ylt::metric::hybrid_counter_3t runtime_phase_runs_total_;
+    ylt::metric::hybrid_histogram_3t runtime_phase_duration_us_;
+    RuntimePhaseGauge runtime_phase_last_duration_us_;
+    RuntimePhaseGauge runtime_phase_last_key_count_;
+    RuntimePhaseGauge runtime_phase_last_logical_bytes_;
+    RuntimePhaseGauge runtime_phase_last_oplog_entries_;
+    RuntimePhaseGauge runtime_phase_last_applied_seq_id_;
+    RuntimePhaseGauge runtime_phase_last_key_rate_per_sec_;
+    RuntimePhaseGauge runtime_phase_last_byte_rate_per_sec_;
+    RuntimePhaseGauge runtime_phase_last_oplog_entry_rate_per_sec_;
+
+    mutable std::mutex runtime_phase_summary_mutex_;
+    std::string last_runtime_phase_summary_{"none"};
+};
+
+class ScopedHARuntimePhaseRecorder {
+   public:
+    ScopedHARuntimePhaseRecorder(HARuntimeMode mode, HARuntimePhase phase)
+        : mode_(mode),
+          phase_(phase),
+          start_time_(std::chrono::steady_clock::now()) {}
+
+    ScopedHARuntimePhaseRecorder(const ScopedHARuntimePhaseRecorder&) = delete;
+    ScopedHARuntimePhaseRecorder& operator=(
+        const ScopedHARuntimePhaseRecorder&) = delete;
+
+    void Finish(HARuntimePhaseResult result,
+                const HARuntimePhaseStats& stats = {}) {
+        if (finished_) {
+            return;
+        }
+
+        finished_ = true;
+        HAMetricManager::instance().ObserveRuntimePhase(
+            mode_, phase_, result,
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start_time_),
+            stats);
+    }
+
+    void FinishSuccess(const HARuntimePhaseStats& stats = {}) {
+        Finish(HARuntimePhaseResult::kSuccess, stats);
+    }
+
+    void FinishFailure(const HARuntimePhaseStats& stats = {}) {
+        Finish(HARuntimePhaseResult::kFailure, stats);
+    }
+
+    void FinishEmpty(const HARuntimePhaseStats& stats = {}) {
+        Finish(HARuntimePhaseResult::kEmpty, stats);
+    }
+
+    bool finished() const { return finished_; }
+
+   private:
+    HARuntimeMode mode_;
+    HARuntimePhase phase_;
+    std::chrono::steady_clock::time_point start_time_;
+    bool finished_{false};
 };
 
 }  // namespace mooncake

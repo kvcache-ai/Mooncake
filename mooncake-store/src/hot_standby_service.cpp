@@ -58,6 +58,37 @@ SnapshotRestoreMode ResolveSnapshotRestoreMode(bool enable_oplog_following) {
                : SnapshotRestoreMode::kColdRestore;
 }
 
+HARuntimeMode ResolveRuntimeMode(bool enable_oplog_following) {
+    return enable_oplog_following ? HARuntimeMode::kSnapshotWithOplog
+                                  : HARuntimeMode::kSnapshotOnly;
+}
+
+HARuntimeMode ResolveRuntimeMode(SnapshotRestoreMode restore_mode) {
+    return restore_mode == SnapshotRestoreMode::kStandbyCatchupWithOplog
+               ? HARuntimeMode::kSnapshotWithOplog
+               : HARuntimeMode::kSnapshotOnly;
+}
+
+int64_t SumLogicalBytes(
+    const std::vector<std::pair<std::string, StandbyObjectMetadata>>&
+        metadata) {
+    int64_t total = 0;
+    for (const auto& [key, value] : metadata) {
+        (void)key;
+        total += static_cast<int64_t>(value.size);
+    }
+    return total;
+}
+
+HARuntimePhaseStats BuildLoadedSnapshotPhaseStats(
+    const LoadedSnapshot& snapshot) {
+    HARuntimePhaseStats stats;
+    stats.key_count = static_cast<int64_t>(snapshot.metadata.size());
+    stats.logical_bytes = SumLogicalBytes(snapshot.metadata);
+    stats.applied_seq_id = static_cast<int64_t>(snapshot.snapshot_sequence_id);
+    return stats;
+}
+
 }  // namespace
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
@@ -183,18 +214,31 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
                                    const std::string& etcd_endpoints,
                                    const std::string& cluster_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-
     // Use state machine to check if already running
     if (IsRunning()) {
         LOG(WARNING) << "HotStandbyService is already running";
         return ErrorCode::OK;
     }
 
+    const auto runtime_mode =
+        ResolveRuntimeMode(config_.enable_oplog_following);
+    ScopedHARuntimePhaseRecorder start_recorder(runtime_mode,
+                                                HARuntimePhase::kStandbyStart);
+    auto finish_start = [&](ErrorCode err) {
+        if (err == ErrorCode::OK) {
+            start_recorder.FinishSuccess(CollectLocalRuntimePhaseStatsLocked());
+        } else {
+            start_recorder.FinishFailure();
+        }
+        return err;
+    };
+
     // Trigger START event
     auto result = state_machine_.ProcessEvent(StandbyEvent::START);
     if (!result.allowed) {
         LOG(ERROR) << "Cannot start HotStandbyService: " << result.reason;
-        return ErrorCode::INTERNAL_ERROR;  // State machine rejected START
+        return finish_start(
+            ErrorCode::INTERNAL_ERROR);  // State machine rejected START
     }
 
     config_.primary_address = primary_address;
@@ -214,14 +258,14 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to etcd: " << etcd_endpoints;
             state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
-            return err;
+            return finish_start(err);
         }
 #else
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         LOG(ERROR)
             << "STORE_USE_ETCD is not enabled, cannot start HotStandbyService "
             << "with OpLog following enabled";
-        return ErrorCode::INTERNAL_ERROR;
+        return finish_start(ErrorCode::INTERNAL_ERROR);
 #endif
     }
 
@@ -231,15 +275,15 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     auto baseline_err = PrepareBootstrapBaselineLocked(baseline_seq_id);
     if (baseline_err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-        return baseline_err;
+        return finish_start(baseline_err);
     }
 
     if (!config_.enable_oplog_following) {
         ActivateSnapshotOnlyStandbyLocked(baseline_seq_id);
-        return ErrorCode::OK;
+        return finish_start(ErrorCode::OK);
     }
 
-    return StartOplogFollowingLocked(baseline_seq_id);
+    return finish_start(StartOplogFollowingLocked(baseline_seq_id));
 }
 
 uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
@@ -248,6 +292,24 @@ uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
         return expected > 0 ? expected - 1 : 0;
     }
     return applied_seq_id_.load(std::memory_order_acquire);
+}
+
+HARuntimePhaseStats HotStandbyService::CollectLocalRuntimePhaseStatsLocked()
+    const {
+    HARuntimePhaseStats stats;
+    if (!metadata_store_) {
+        stats.applied_seq_id =
+            static_cast<int64_t>(GetLocalLastAppliedSequenceIdLocked());
+        return stats;
+    }
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> metadata;
+    metadata_store_->Snapshot(metadata);
+    stats.key_count = static_cast<int64_t>(metadata.size());
+    stats.logical_bytes = SumLogicalBytes(metadata);
+    stats.applied_seq_id =
+        static_cast<int64_t>(GetLocalLastAppliedSequenceIdLocked());
+    return stats;
 }
 
 ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
@@ -308,6 +370,10 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
 ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     uint64_t& baseline_seq_id, SnapshotRestoreMode restore_mode) {
+    const auto runtime_mode = ResolveRuntimeMode(restore_mode);
+    ScopedHARuntimePhaseRecorder snapshot_bootstrap_recorder(
+        runtime_mode, HARuntimePhase::kSnapshotBootstrap);
+
     baseline_seq_id = 0;
     oplog_applier_->Recover(0);
     loaded_snapshot_id_.clear();
@@ -320,6 +386,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     auto snapshot_result =
         snapshot_provider_->LoadLatestSnapshot(cluster_id_, restore_mode);
     if (!snapshot_result) {
+        snapshot_bootstrap_recorder.FinishFailure();
         if (config_.enable_oplog_following) {
             LOG(WARNING) << "Failed to load snapshot baseline, falling back "
                             "to OpLog-only bootstrap, restore_mode="
@@ -342,6 +409,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
             LOG(INFO) << "No snapshot available for snapshot-only bootstrap; "
                          "standby starts from empty baseline";
         }
+        snapshot_bootstrap_recorder.FinishEmpty();
         return ErrorCode::OK;
     }
 
@@ -353,11 +421,19 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << ", keys=" << snapshot.metadata.size();
     ApplyLoadedSnapshotLocked(snapshot);
     baseline_seq_id = snapshot.snapshot_sequence_id;
+    snapshot_bootstrap_recorder.FinishSuccess(
+        BuildLoadedSnapshotPhaseStats(snapshot));
     return ErrorCode::OK;
 }
 
 ErrorCode HotStandbyService::StartOplogFollowingLocked(
     uint64_t baseline_seq_id) {
+    ScopedHARuntimePhaseRecorder oplog_following_start_recorder(
+        HARuntimeMode::kSnapshotWithOplog,
+        HARuntimePhase::kOplogFollowingStart);
+    HARuntimePhaseStats phase_stats;
+    phase_stats.applied_seq_id = static_cast<int64_t>(baseline_seq_id);
+
     oplog_watcher_ = std::make_unique<OpLogWatcher>(
         etcd_endpoints_, cluster_id_, oplog_applier_.get());
     oplog_watcher_->SetStateCallback(
@@ -384,6 +460,7 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         LOG(ERROR) << "Failed to start OpLogWatcher after " << kMaxStartRetries
                    << " attempts, aborting Start()";
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        oplog_following_start_recorder.FinishFailure(phase_stats);
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -397,6 +474,7 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
 
     LOG(INFO) << "HotStandbyService started, watching OpLog for cluster: "
               << cluster_id_ << ", state=" << StandbyStateToString(GetState());
+    oplog_following_start_recorder.FinishSuccess(phase_stats);
     return ErrorCode::OK;
 }
 
@@ -604,11 +682,22 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     }
 
 #ifdef STORE_USE_ETCD
+    ScopedHARuntimePhaseRecorder final_catchup_recorder(
+        HARuntimeMode::kSnapshotWithOplog, HARuntimePhase::kFinalCatchup);
+    auto build_final_catchup_stats = [&](size_t applied) {
+        HARuntimePhaseStats stats;
+        stats.oplog_entries = static_cast<int64_t>(applied);
+        stats.applied_seq_id =
+            static_cast<int64_t>(GetLocalLastAppliedSequenceIdLocked());
+        return stats;
+    };
+
     LOG(INFO) << "Final catch-up sync from etcd before promotion...";
     EtcdOpLogStore oplog_store(cluster_id_,
                                /*enable_latest_seq_batch_update=*/false);
     if (oplog_store.Init() != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize oplog_store for final catch-up";
+        final_catchup_recorder.FinishFailure(build_final_catchup_stats(0));
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
 
@@ -662,6 +751,8 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
 
     LOG(INFO) << "Final catch-up sync done. total_applied=" << total_applied
               << ", batches=" << batch_count;
+    final_catchup_recorder.FinishSuccess(
+        build_final_catchup_stats(total_applied));
     return ErrorCode::OK;
 #else
     LOG(ERROR) << "STORE_USE_ETCD is not enabled, cannot run final OpLog "
@@ -672,10 +763,15 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
 
 ErrorCode HotStandbyService::Promote() {
     std::unique_lock<std::mutex> lock(mutex_);
+    const auto runtime_mode =
+        ResolveRuntimeMode(config_.enable_oplog_following);
+    ScopedHARuntimePhaseRecorder promote_recorder(
+        runtime_mode, HARuntimePhase::kStandbyPromote);
 
     if (!IsReadyForPromotion()) {
         LOG(ERROR) << "Standby is not ready for promotion, state="
                    << StandbyStateToString(GetState());
+        promote_recorder.FinishFailure();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -683,6 +779,7 @@ ErrorCode HotStandbyService::Promote() {
     auto result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
     if (!result.allowed) {
         LOG(ERROR) << "Cannot promote: " << result.reason;
+        promote_recorder.FinishFailure();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -702,6 +799,7 @@ ErrorCode HotStandbyService::Promote() {
     auto catch_up_err = FinalCatchUpForPromotionLocked(current_applied_seq_id);
     if (catch_up_err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        promote_recorder.FinishFailure();
         return catch_up_err;
     }
 
@@ -713,9 +811,11 @@ ErrorCode HotStandbyService::Promote() {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
     if (!promotion_success.allowed) {
         LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
+        promote_recorder.FinishFailure();
         return ErrorCode::INTERNAL_ERROR;
     }
 
+    const auto promote_stats = CollectLocalRuntimePhaseStatsLocked();
     lock.unlock();
     Stop();
 
@@ -725,6 +825,7 @@ ErrorCode HotStandbyService::Promote() {
     } else {
         LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
     }
+    promote_recorder.FinishSuccess(promote_stats);
     return ErrorCode::OK;
 }
 
@@ -824,15 +925,20 @@ void HotStandbyService::RefreshSnapshotOnlyBaseline() {
         }
     }
 
+    ScopedHARuntimePhaseRecorder snapshot_refresh_recorder(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotRefresh);
+
     auto snapshot_result = snapshot_provider->LoadLatestSnapshot(
         cluster_id_, SnapshotRestoreMode::kColdRestore);
     if (!snapshot_result) {
         LOG(WARNING) << "Failed to load latest snapshot during snapshot-only "
                      << "refresh, cluster=" << cluster_id_
                      << ", error=" << toString(snapshot_result.error());
+        snapshot_refresh_recorder.FinishFailure();
         return;
     }
     if (!snapshot_result->has_value()) {
+        snapshot_refresh_recorder.FinishEmpty();
         return;
     }
 
@@ -856,6 +962,7 @@ void HotStandbyService::RefreshSnapshotOnlyBaseline() {
         LOG(WARNING) << "Rejected snapshot refresh transition, state="
                      << StandbyStateToString(GetState())
                      << ", reason=" << recovery_start.reason;
+        snapshot_refresh_recorder.FinishFailure();
         return;
     }
 
@@ -874,7 +981,12 @@ void HotStandbyService::RefreshSnapshotOnlyBaseline() {
                    << StandbyStateToString(GetState())
                    << ", reason=" << recovery_finish.reason;
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        snapshot_refresh_recorder.FinishFailure();
+        return;
     }
+
+    snapshot_refresh_recorder.FinishSuccess(
+        BuildLoadedSnapshotPhaseStats(snapshot_result->value()));
 }
 
 void HotStandbyService::ReplicationLoop() {

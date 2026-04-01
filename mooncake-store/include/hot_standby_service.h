@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "metadata_store.h"
+#include "ha_metric_manager.h"
 #include "oplog_applier.h"
 #include "oplog_manager.h"
 #include "oplog_watcher.h"
@@ -185,6 +186,7 @@ class HotStandbyService {
         const SnapshotVersionInfo& snapshot_version) const;
     void RefreshSnapshotOnlyBaseline();
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
+    HARuntimePhaseStats CollectLocalRuntimePhaseStatsLocked() const;
     void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     void NotifySyncStatus();

@@ -468,6 +468,61 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     EXPECT_EQ(4096u, exported[0].second.size);
 }
 
+TEST_F(HotStandbyServiceTest, TestSnapshotOnlyStartAndPromoteUpdateMetrics) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto& metrics = HAMetricManager::instance();
+    const auto bootstrap_before = metrics.get_runtime_phase_runs_total(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotBootstrap,
+        HARuntimePhaseResult::kSuccess);
+    const auto start_before = metrics.get_runtime_phase_runs_total(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStart,
+        HARuntimePhaseResult::kSuccess);
+    const auto promote_before = metrics.get_runtime_phase_runs_total(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyPromote,
+        HARuntimePhaseResult::kSuccess);
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-1", 4096))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(bootstrap_before + 1, metrics.get_runtime_phase_runs_total(
+                                        HARuntimeMode::kSnapshotOnly,
+                                        HARuntimePhase::kSnapshotBootstrap,
+                                        HARuntimePhaseResult::kSuccess));
+    EXPECT_EQ(start_before + 1,
+              metrics.get_runtime_phase_runs_total(
+                  HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStart,
+                  HARuntimePhaseResult::kSuccess));
+    EXPECT_EQ(1, metrics.get_runtime_phase_last_key_count(
+                     HARuntimeMode::kSnapshotOnly,
+                     HARuntimePhase::kSnapshotBootstrap));
+    EXPECT_EQ(4096, metrics.get_runtime_phase_last_logical_bytes(
+                        HARuntimeMode::kSnapshotOnly,
+                        HARuntimePhase::kSnapshotBootstrap));
+    EXPECT_EQ(42, metrics.get_runtime_phase_last_applied_seq_id(
+                      HARuntimeMode::kSnapshotOnly,
+                      HARuntimePhase::kSnapshotBootstrap));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Promote());
+    EXPECT_EQ(promote_before + 1,
+              metrics.get_runtime_phase_runs_total(
+                  HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyPromote,
+                  HARuntimePhaseResult::kSuccess));
+    EXPECT_EQ(
+        1, metrics.get_runtime_phase_last_key_count(
+               HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyPromote));
+    EXPECT_EQ(4096, metrics.get_runtime_phase_last_logical_bytes(
+                        HARuntimeMode::kSnapshotOnly,
+                        HARuntimePhase::kStandbyPromote));
+    EXPECT_EQ(
+        42, metrics.get_runtime_phase_last_applied_seq_id(
+                HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyPromote));
+}
+
 TEST_F(HotStandbyServiceTest,
        TestStart_SnapshotOnlyRestartRefreshesNewerCatalogSnapshot) {
     config_.enable_snapshot_bootstrap = true;
@@ -548,6 +603,50 @@ TEST_F(HotStandbyServiceTest,
 
     service_->SetSyncStatusCallback(nullptr);
     service_->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, TestSnapshotOnlyRefreshUpdatesMetrics) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    config_.snapshot_refresh_interval_ms = 20;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto provider =
+        std::make_unique<MutableSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096)));
+    auto* provider_handle = provider.get();
+    service_->SetSnapshotProvider(std::move(provider));
+
+    auto& metrics = HAMetricManager::instance();
+    const auto refresh_before = metrics.get_runtime_phase_runs_total(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotRefresh,
+        HARuntimePhaseResult::kSuccess);
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service_->GetLatestAppliedSequenceId() == 42; },
+        std::chrono::milliseconds(500)));
+
+    provider_handle->Publish(std::optional<LoadedSnapshot>(
+        MakeSnapshot("20260330_121500_000", 84, "key-new", 8192)));
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return service_->GetLatestAppliedSequenceId() == 84; },
+        std::chrono::milliseconds(1000)));
+
+    EXPECT_EQ(refresh_before + 1, metrics.get_runtime_phase_runs_total(
+                                      HARuntimeMode::kSnapshotOnly,
+                                      HARuntimePhase::kSnapshotRefresh,
+                                      HARuntimePhaseResult::kSuccess));
+    EXPECT_EQ(
+        1, metrics.get_runtime_phase_last_key_count(
+               HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotRefresh));
+    EXPECT_EQ(8192, metrics.get_runtime_phase_last_logical_bytes(
+                        HARuntimeMode::kSnapshotOnly,
+                        HARuntimePhase::kSnapshotRefresh));
+    EXPECT_EQ(84, metrics.get_runtime_phase_last_applied_seq_id(
+                      HARuntimeMode::kSnapshotOnly,
+                      HARuntimePhase::kSnapshotRefresh));
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {

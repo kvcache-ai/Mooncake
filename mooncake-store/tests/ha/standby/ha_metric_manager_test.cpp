@@ -135,6 +135,60 @@ TEST_F(HAMetricManagerTest, TestGetSummaryString) {
     EXPECT_NE(std::string::npos, summary.find("applied_seq"));
 }
 
+TEST_F(HAMetricManagerTest, TestObserveRuntimePhase) {
+    const auto before = M().get_runtime_phase_runs_total(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotBootstrap,
+        HARuntimePhaseResult::kSuccess);
+
+    HARuntimePhaseStats stats;
+    stats.key_count = 3;
+    stats.logical_bytes = 12288;
+    stats.oplog_entries = 0;
+    stats.applied_seq_id = 42;
+
+    M().ObserveRuntimePhase(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotBootstrap,
+        HARuntimePhaseResult::kSuccess, std::chrono::microseconds(2000), stats);
+
+    EXPECT_EQ(before + 1, M().get_runtime_phase_runs_total(
+                              HARuntimeMode::kSnapshotOnly,
+                              HARuntimePhase::kSnapshotBootstrap,
+                              HARuntimePhaseResult::kSuccess));
+    EXPECT_EQ(2000, M().get_runtime_phase_last_duration_us(
+                        HARuntimeMode::kSnapshotOnly,
+                        HARuntimePhase::kSnapshotBootstrap));
+    EXPECT_EQ(3, M().get_runtime_phase_last_key_count(
+                     HARuntimeMode::kSnapshotOnly,
+                     HARuntimePhase::kSnapshotBootstrap));
+    EXPECT_EQ(12288, M().get_runtime_phase_last_logical_bytes(
+                         HARuntimeMode::kSnapshotOnly,
+                         HARuntimePhase::kSnapshotBootstrap));
+    EXPECT_EQ(42, M().get_runtime_phase_last_applied_seq_id(
+                      HARuntimeMode::kSnapshotOnly,
+                      HARuntimePhase::kSnapshotBootstrap));
+    EXPECT_GT(
+        M().get_runtime_phase_last_key_rate_per_sec(
+            HARuntimeMode::kSnapshotOnly, HARuntimePhase::kSnapshotBootstrap),
+        0);
+}
+
+TEST_F(HAMetricManagerTest, TestSerializeMetricsIncludesRuntimePhaseMetrics) {
+    HARuntimePhaseStats stats;
+    stats.oplog_entries = 7;
+    M().ObserveRuntimePhase(
+        HARuntimeMode::kSnapshotWithOplog, HARuntimePhase::kFinalCatchup,
+        HARuntimePhaseResult::kSuccess, std::chrono::microseconds(5000), stats);
+
+    std::string text = M().serialize_metrics();
+    EXPECT_NE(std::string::npos, text.find("ha_runtime_phase_runs_total"));
+    EXPECT_NE(std::string::npos, text.find("ha_runtime_phase_duration_us"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_runtime_phase_last_oplog_entries"));
+
+    std::string summary = M().get_summary_string();
+    EXPECT_NE(std::string::npos, summary.find("last_runtime_phase"));
+}
+
 // ========== 7.1.3 Singleton tests ==========
 
 TEST_F(HAMetricManagerTest, TestSingletonInstance) {
