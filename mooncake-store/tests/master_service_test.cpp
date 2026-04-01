@@ -4603,6 +4603,98 @@ TEST_F(MasterServiceTest, BatchUpsertStart) {
     EXPECT_TRUE(end_results[1].has_value());
 }
 
+TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
+    // Upsert should preempt an in-progress Upsert (Case B in-place).
+    // After preemption, all replicas were PROCESSING (no COMPLETE survives),
+    // so metadata is erased and the new upsert falls through to Case A.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const UUID client_c = generate_uuid();
+
+    std::string key = "upsert_preempt_upsert";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Step 1: Create the object via Put
+    auto put_result = service_->PutStart(client_a, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_a, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // Step 2: Client B starts in-place upsert (Case B) — marks COMPLETE → PROCESSING
+    auto upsert_b = service_->UpsertStart(client_b, key, slice_length, config);
+    ASSERT_TRUE(upsert_b.has_value());
+
+    // Key should be unreadable now (all replicas are PROCESSING)
+    auto get_mid = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_mid.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_mid.error());
+
+    // Step 3: Client C upserts the same key — preempts Client B
+    auto upsert_c = service_->UpsertStart(client_c, key, slice_length, config);
+    ASSERT_TRUE(upsert_c.has_value());
+    EXPECT_EQ(1, upsert_c.value().size());
+
+    // Step 4: Client B's UpsertEnd should fail (preempted)
+    auto end_b = service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
+    EXPECT_FALSE(end_b.has_value());
+
+    // Step 5: Client C's UpsertEnd should succeed
+    auto end_c = service_->UpsertEnd(client_c, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_c.has_value());
+
+    // Final verification
+    auto final_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(final_result.has_value());
+    EXPECT_EQ(1, final_result.value().replicas.size());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
+    // Case C (different size) followed by UpsertRevoke.
+    // Old replicas go to discarded_replicas_, new replicas are erased by revoke.
+    // The key should disappear entirely.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_diff_revoke";
+    uint64_t original_size = 1024;
+    uint64_t new_size = 2048;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create object with original size
+    auto put_result = service_->PutStart(client_id, key, original_size, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // Verify the key exists
+    auto exist_before = service_->ExistKey(key);
+    ASSERT_TRUE(exist_before.has_value());
+    EXPECT_TRUE(exist_before.value());
+
+    // UpsertStart with different size (Case C) — old replicas discarded,
+    // new replicas allocated
+    auto upsert_result =
+        service_->UpsertStart(client_id, key, new_size, config);
+    ASSERT_TRUE(upsert_result.has_value());
+
+    // Revoke — erase the newly allocated PROCESSING replicas
+    auto revoke_result =
+        service_->UpsertRevoke(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(revoke_result.has_value());
+
+    // Key should be gone (old replicas in discarded, new replicas erased)
+    auto exist_after = service_->ExistKey(key);
+    ASSERT_TRUE(exist_after.has_value());
+    EXPECT_FALSE(exist_after.value());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
