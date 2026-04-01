@@ -103,6 +103,30 @@ class ActiveBatchTraceRegistry {
         return {inserted->second.context, ok};
     }
 
+    EnsureResult EnsureDataPlane(mooncake::tracing::TracingFacade& tracing,
+                                 BatchID batch_id) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = spans_.find(batch_id);
+        if (it == spans_.end()) {
+            return {};
+        }
+        if (it->second.data_plane_started) {
+            return {it->second.data_plane_context, false};
+        }
+
+        auto span = tracing.StartSpan("te.batch.execute", &it->second.context,
+                                      {{"te.batch_id",
+                                        std::to_string(batch_id)}});
+        if (!span.valid()) {
+            return {};
+        }
+
+        it->second.data_plane_context = span.context();
+        it->second.data_plane_span = std::move(span);
+        it->second.data_plane_started = true;
+        return {it->second.data_plane_context, true};
+    }
+
     std::optional<mooncake::tracing::TraceContext> LookupContext(
         BatchID batch_id) const {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -130,6 +154,16 @@ class ActiveBatchTraceRegistry {
         for (const auto& attr : attrs) {
             active->span.SetAttribute(attr.first, attr.second);
         }
+        if (active->data_plane_started) {
+            for (const auto& attr : attrs) {
+                active->data_plane_span.SetAttribute(attr.first, attr.second);
+            }
+            active->data_plane_span.AddEvent("batch data plane finished", attrs);
+            if (error) {
+                active->data_plane_span.SetStatus("ERROR");
+            }
+            active->data_plane_span.End();
+        }
         active->span.AddEvent(event_name, attrs);
         if (error) {
             active->span.SetStatus("ERROR");
@@ -142,6 +176,9 @@ class ActiveBatchTraceRegistry {
     struct ActiveBatchSpan {
         mooncake::tracing::Span span;
         mooncake::tracing::TraceContext context;
+        mooncake::tracing::Span data_plane_span;
+        mooncake::tracing::TraceContext data_plane_context;
+        bool data_plane_started{false};
     };
 
     mutable std::mutex mutex_;
@@ -539,7 +576,15 @@ class TransferEngineImpl {
         auto& tracing = mooncake::tracing::TracingFacade::Instance(
             "mooncake-transfer-engine", "transfer-engine");
         auto ensured = active_batch_traces_.EnsureRoot(tracing, batch_id);
-        if (ensured.created) {
+        if (span_name == "submitTransfer" ||
+            span_name == "submitTransferWithNotify") {
+            auto data_plane = active_batch_traces_.EnsureDataPlane(tracing, batch_id);
+            auto transport_context =
+                data_plane.context.valid() ? data_plane.context : ensured.context;
+            if (ensured.created && transport_context.valid()) {
+                multi_transports_->SetBatchTraceContext(batch_id, transport_context);
+            }
+        } else if (ensured.created && ensured.context.valid()) {
             multi_transports_->SetBatchTraceContext(batch_id, ensured.context);
         }
         return tracing.StartSpan(span_name, &ensured.context, attrs);

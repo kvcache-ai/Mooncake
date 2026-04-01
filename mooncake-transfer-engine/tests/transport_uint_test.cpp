@@ -285,6 +285,16 @@ TEST_F(TransportTest, ActiveBatchTraceRegistryKeepsRootAliveUntilFinish) {
     EXPECT_EQ(second.context.trace_id, first.context.trace_id);
     EXPECT_EQ(second.context.span_id, first.context.span_id);
 
+    auto data_plane = registry.EnsureDataPlane(tracing, batch_id);
+    ASSERT_TRUE(data_plane.context.valid());
+    EXPECT_TRUE(data_plane.created);
+    EXPECT_EQ(data_plane.context.trace_id, first.context.trace_id);
+
+    auto data_plane_again = registry.EnsureDataPlane(tracing, batch_id);
+    ASSERT_TRUE(data_plane_again.context.valid());
+    EXPECT_FALSE(data_plane_again.created);
+    EXPECT_EQ(data_plane_again.context.span_id, data_plane.context.span_id);
+
     EXPECT_TRUE(registry.Finish(batch_id, "batch terminal status",
                                 {{"status", "COMPLETED"}}, false));
     EXPECT_FALSE(registry.Finish(batch_id, "batch terminal status",
