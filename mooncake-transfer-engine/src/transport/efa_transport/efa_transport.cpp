@@ -440,20 +440,24 @@ Status EfaTransport::submitTransferTask(
         slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
-    const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
-    const size_t kFragmentSize = globalConfig().fragment_limit;
-    const size_t kSubmitWatermark =
-        globalConfig().max_wr * globalConfig().num_qp_per_ep;
-    uint64_t nr_slices;
+    // Striping threshold: transfers larger than this stripe across all
+    // active local NICs (one chunk per NIC) instead of creating thousands
+    // of small slices.  This dramatically reduces per-slice overhead
+    // (spinlock acquisition, atomic ops, MR lookup, heap allocation).
+    // Value matches NIXL's NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD.
+    static constexpr size_t kStripingThreshold = 128 * 1024;  // 128KB
+
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
-        nr_slices = 0;
         assert(task.request);
         auto &request = *task.request;
 
-        auto request_buffer_id = -1, request_device_id = -1;
+        if (request.length == 0) continue;
+
+        // Find which buffer and preferred device covers this request
+        int request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
                          request.length, request_buffer_id,
                          request_device_id)) {
@@ -461,22 +465,88 @@ Status EfaTransport::submitTransferTask(
             request_device_id = -1;
         }
 
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
-            Slice *slice = getSliceCache().allocate();
-            assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
+        if (request.length > kStripingThreshold && request_buffer_id >= 0) {
+            // LARGE TRANSFER: stripe across all active local NICs.
+            // Creates one slice per NIC instead of (length / 64KB) slices,
+            // e.g. 240MB transfer: 4-32 slices vs 3840 slices.
+            std::vector<std::pair<int, std::shared_ptr<EfaContext>>>
+                active_devs;
+            for (int d = 0;
+                 d < static_cast<int>(context_list_.size()); ++d) {
+                auto &ctx = context_list_[d];
+                if (!ctx || !ctx->active()) continue;
+                if (static_cast<size_t>(request_buffer_id) <
+                        local_segment_desc->buffers.size() &&
+                    local_segment_desc->buffers[request_buffer_id]
+                            .lkey.size() >
+                        static_cast<size_t>(d)) {
+                    active_devs.push_back({d, ctx});
+                }
             }
 
-            bool merge_final_slice =
-                request.length - offset <= kBlockSize + kFragmentSize;
+            if (active_devs.empty()) {
+                LOG(ERROR)
+                    << "No active EFA device for striping transfer of "
+                    << request.length << " bytes";
+                for (auto &entry : slices_to_post)
+                    for (auto s : entry.second)
+                        getSliceCache().deallocate(s);
+                return Status::AddressNotRegistered(
+                    "No active EFA device found for striping");
+            }
 
-            slice->source_addr = (char *)request.source + offset;
-            slice->length =
-                merge_final_slice ? request.length - offset : kBlockSize;
+            size_t num_nics = active_devs.size();
+            size_t chunk_size = request.length / num_nics;
+
+            for (size_t i = 0; i < num_nics; ++i) {
+                Slice *slice = getSliceCache().allocate();
+                assert(slice);
+
+                size_t offset = i * chunk_size;
+                size_t len = (i == num_nics - 1)
+                                 ? request.length - offset
+                                 : chunk_size;
+
+                slice->source_addr = (char *)request.source + offset;
+                slice->length = len;
+                slice->opcode = request.opcode;
+                slice->rdma.dest_addr = request.target_offset + offset;
+                slice->rdma.retry_cnt = request.advise_retry_cnt;
+                slice->rdma.max_retry_cnt = kMaxRetryCount;
+                slice->task = &task;
+                slice->target_id = request.target_id;
+                slice->status = Slice::PENDING;
+                slice->ts = 0;
+                task.slice_list.push_back(slice);
+
+                int dev_id = active_devs[i].first;
+                auto &context = active_devs[i].second;
+                slice->rdma.source_lkey =
+                    local_segment_desc->buffers[request_buffer_id]
+                        .lkey[dev_id];
+                slices_to_post[context].push_back(slice);
+                task.total_bytes += slice->length;
+                __sync_fetch_and_add(&task.slice_count, 1);
+            }
+        } else if (request_buffer_id >= 0 && request_device_id >= 0) {
+            // SMALL TRANSFER (or single-NIC): one slice, no sub-slicing.
+            // Round-robin NIC selection is handled by selectDevice above.
+            auto &context = context_list_[request_device_id];
+            if (!context || !context->active()) {
+                LOG(ERROR)
+                    << "EFA Device " << request_device_id << " is not active";
+                return Status::InvalidArgument(
+                    "EFA Device " + std::to_string(request_device_id) +
+                    " is not active");
+            }
+
+            Slice *slice = getSliceCache().allocate();
+            assert(slice);
+
+            slice->source_addr = (char *)request.source;
+            slice->length = request.length;
             slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset + offset;
+            slice->rdma.dest_addr = request.target_offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
             slice->rdma.max_retry_cnt = kMaxRetryCount;
             slice->task = &task;
@@ -485,69 +555,68 @@ Status EfaTransport::submitTransferTask(
             slice->ts = 0;
             task.slice_list.push_back(slice);
 
-            int buffer_id = -1, device_id = -1,
-                retry_cnt = request.advise_retry_cnt;
+            slice->rdma.source_lkey =
+                local_segment_desc->buffers[request_buffer_id]
+                    .lkey[request_device_id];
+            slices_to_post[context].push_back(slice);
+            task.total_bytes += slice->length;
+            __sync_fetch_and_add(&task.slice_count, 1);
+        } else {
+            // FALLBACK: device not found via initial selectDevice.
+            // Try per-slice retry with increasing retry_cnt to find any
+            // available device (handles edge cases like multi-buffer spans).
+            int buffer_id = -1, device_id = -1;
+            int retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
-            if (request_buffer_id >= 0 && request_device_id >= 0) {
-                found_device = true;
-                buffer_id = request_buffer_id;
-                device_id = request_device_id;
-            }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
+                                 (uint64_t)request.source, request.length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
-                assert(device_id >= 0 &&
-                       static_cast<size_t>(device_id) < context_list_.size());
-                auto &context = context_list_[device_id];
-                assert(context.get());
-                if (!context->active()) continue;
-                assert(buffer_id >= 0 &&
-                       static_cast<size_t>(buffer_id) <
-                           local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
-                       context_list_.size());
-                found_device = true;
-                break;
+                if (device_id >= 0 &&
+                    static_cast<size_t>(device_id) < context_list_.size() &&
+                    context_list_[device_id] &&
+                    context_list_[device_id]->active()) {
+                    found_device = true;
+                    break;
+                }
             }
             if (!found_device) {
-                auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
                 LOG(ERROR) << "Memory region not registered by any active EFA "
                               "device(s): "
-                           << source_addr;
+                           << request.source;
+                for (auto &entry : slices_to_post)
+                    for (auto s : entry.second)
+                        getSliceCache().deallocate(s);
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active EFA "
                     "device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
-            } else {
-                auto &context = context_list_[device_id];
-                if (!context->active()) {
-                    LOG(ERROR)
-                        << "EFA Device " << device_id << " is not active";
-                    return Status::InvalidArgument("EFA Device " +
-                                                   std::to_string(device_id) +
-                                                   " is not active");
-                }
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
+                    std::to_string(
+                        reinterpret_cast<uintptr_t>(request.source)));
             }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
+            // Found a device via retry — create single slice
+            Slice *slice = getSliceCache().allocate();
+            assert(slice);
 
-            if (merge_final_slice) {
-                break;
-            }
+            slice->source_addr = (char *)request.source;
+            slice->length = request.length;
+            slice->opcode = request.opcode;
+            slice->rdma.dest_addr = request.target_offset;
+            slice->rdma.retry_cnt = request.advise_retry_cnt;
+            slice->rdma.max_retry_cnt = kMaxRetryCount;
+            slice->task = &task;
+            slice->target_id = request.target_id;
+            slice->status = Slice::PENDING;
+            slice->ts = 0;
+            task.slice_list.push_back(slice);
+
+            auto &context = context_list_[device_id];
+            slice->rdma.source_lkey =
+                local_segment_desc->buffers[buffer_id].lkey[device_id];
+            slices_to_post[context].push_back(slice);
+            task.total_bytes += slice->length;
+            __sync_fetch_and_add(&task.slice_count, 1);
         }
     }
 
