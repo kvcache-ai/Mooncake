@@ -663,7 +663,7 @@ auto MasterService::GetReplicaList(const std::string& key)
 
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
-    const std::string& key, uint64_t slice_length, uint64_t total_length,
+    const std::string& key, uint64_t value_length,
     const ReplicateConfig& config,
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -681,7 +681,7 @@ auto MasterService::AllocateAndInsertMetadata(
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, slice_length, config.replica_num,
+            allocator_manager, value_length, config.replica_num,
             preferred_segments);
 
         if (!allocation_result.has_value()) {
@@ -700,7 +700,7 @@ auto MasterService::AllocateAndInsertMetadata(
     if (use_disk_replica_) {
         std::string file_path =
             ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
-        replicas.emplace_back(file_path, total_length,
+        replicas.emplace_back(file_path, value_length,
                               ReplicaStatus::PROCESSING);
     }
 
@@ -712,7 +712,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
+        std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               config.with_soft_pin));
     shard->processing_keys.insert(key);
 
@@ -730,8 +730,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate slice lengths
-    uint64_t total_length = 0;
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
         LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
@@ -739,11 +737,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                    << ", error=invalid_slice_size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    total_length += slice_length;
 
-    VLOG(1) << "key=" << key << ", value_length=" << total_length
-            << ", slice_length=" << slice_length << ", config=" << config
-            << ", action=put_start_begin";
+    VLOG(1) << "key=" << key << ", value_length=" << slice_length
+            << ", config=" << config << ", action=put_start_begin";
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
@@ -774,7 +770,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
 
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     total_length, config, now);
+                                     config, now);
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
@@ -957,8 +953,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate slice lengths
-    uint64_t total_length = 0;
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
         LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
@@ -966,11 +960,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                    << ", error=invalid_slice_size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    total_length += slice_length;
 
-    VLOG(1) << "key=" << key << ", value_length=" << total_length
-            << ", slice_length=" << slice_length << ", config=" << config
-            << ", action=upsert_start_begin";
+    VLOG(1) << "key=" << key << ", value_length=" << slice_length
+            << ", config=" << config << ", action=upsert_start_begin";
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, getShardIndex(key));
@@ -1028,7 +1020,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // Case A: key does not exist — same as PutStart
         VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
         return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                         total_length, config, now);
+                                         config, now);
     }
 
     // Key exists with COMPLETE replicas — Case B or Case C
@@ -1040,7 +1032,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
     }
 
-    if (metadata.size == total_length) {
+    if (metadata.size == slice_length) {
         // Case B: same size — in-place update
         metadata.client_id = client_id;
         metadata.put_start_time = now;
@@ -1085,7 +1077,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     total_length, config, now);
+                                     config, now);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
