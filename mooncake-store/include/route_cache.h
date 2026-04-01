@@ -326,8 +326,7 @@ class RouteCache {
     // Returns {prev, node} for a given key in the bucket.
     std::pair<Node*, Node*> findNodeInBucket(Shard& shard, size_t bucket_idx,
                                              const char* key_ptr,
-                                             uint32_t key_len)
-        REQUIRES(shard.mtx_);
+                                             uint32_t key_len);
 
     void retireNode(Shard& shard, Node* prev, Node* node, size_t bucket_idx)
         REQUIRES(shard.mtx_);

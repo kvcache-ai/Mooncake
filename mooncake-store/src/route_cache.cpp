@@ -425,7 +425,7 @@ void RouteCache::retireNode(Shard& shard, Node* prev, Node* node,
 bool RouteCache::acquireResource(
     Shard& shard, size_t total_size, Node** out_node,
     std::optional<offset_allocator::OffsetAllocationHandle>& out_handle)
-    NO_THREAD_SAFETY_ANALYSIS {
+    REQUIRES(shard.mtx_) {
     auto try_once = [&]() -> bool {
         Node* node = shard.nodes_.Pop();
         if (!node) return false;
