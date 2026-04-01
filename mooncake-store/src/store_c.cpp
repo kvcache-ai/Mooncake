@@ -86,15 +86,15 @@ mooncake_store_t mooncake_store_create() {
 }
 
 void mooncake_store_destroy(mooncake_store_t store) {
+    if (!store) return;
+    auto *handle = as_handle(store);
     try {
-        if (!store) return;
-        auto *handle = as_handle(store);
         if (handle->client) {
             handle->client->tearDownAll();
         }
-        delete handle;
     } catch (...) {
     }
+    delete handle;
 }
 
 int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
@@ -120,7 +120,7 @@ int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             uint64_t mount_segment_size) {
     if (!store) return -1;
     try {
-        return as_client(store)->initAll(c_str_or(protocol, ""),
+        return as_client(store)->initAll(c_str_or(protocol, "tcp"),
                                          c_str_or(device_name, ""),
                                          mount_segment_size);
     } catch (...) {
@@ -159,6 +159,7 @@ int mooncake_store_put_from(mooncake_store_t store, const char *key,
                             void *buffer, size_t size,
                             const mooncake_replicate_config_t *config) {
     if (!store || !key) return -1;
+    if (!buffer && size > 0) return -1;
     try {
         auto rc = to_replicate_config(config);
         return as_client(store)->put_from(key, buffer, size, rc);
@@ -173,11 +174,14 @@ int mooncake_store_batch_put_from(mooncake_store_t store, const char **keys,
                                   const mooncake_replicate_config_t *config,
                                   int *results_out) {
     if (!store || !keys || !buffers || !sizes || !results_out) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!keys[i] || (!buffers[i] && sizes[i] > 0)) return -1;
+    }
     try {
         std::vector<std::string> key_vec;
         key_vec.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            key_vec.emplace_back(c_str_or(keys[i], ""));
+            key_vec.emplace_back(keys[i]);
         }
         std::vector<void *> buf_vec(buffers, buffers + count);
         std::vector<size_t> size_vec(sizes, sizes + count);
@@ -202,6 +206,7 @@ int mooncake_store_batch_put_from(mooncake_store_t store, const char **keys,
 int64_t mooncake_store_get_into(mooncake_store_t store, const char *key,
                                 void *buffer, size_t size) {
     if (!store || !key) return -1;
+    if (!buffer && size > 0) return -1;
     try {
         return as_client(store)->get_into(key, buffer, size);
     } catch (...) {
@@ -213,11 +218,14 @@ int mooncake_store_batch_get_into(mooncake_store_t store, const char **keys,
                                   void **buffers, const size_t *sizes,
                                   size_t count, int64_t *results_out) {
     if (!store || !keys || !buffers || !sizes || !results_out) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!keys[i] || (!buffers[i] && sizes[i] > 0)) return -1;
+    }
     try {
         std::vector<std::string> key_vec;
         key_vec.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            key_vec.emplace_back(c_str_or(keys[i], ""));
+            key_vec.emplace_back(keys[i]);
         }
         std::vector<void *> buf_vec(buffers, buffers + count);
         std::vector<size_t> size_vec(sizes, sizes + count);
@@ -250,11 +258,14 @@ int mooncake_store_is_exist(mooncake_store_t store, const char *key) {
 int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
                                   size_t count, int *results_out) {
     if (!store || !keys || !results_out) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!keys[i]) return -1;
+    }
     try {
         std::vector<std::string> key_vec;
         key_vec.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            key_vec.emplace_back(c_str_or(keys[i], ""));
+            key_vec.emplace_back(keys[i]);
         }
 
         auto results = as_client(store)->batchIsExist(key_vec);
