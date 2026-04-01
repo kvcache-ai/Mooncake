@@ -68,7 +68,7 @@ MasterRuntimeState MapStandbyRuntimeState(
     return MasterRuntimeState::kStandby;
 }
 
-class NoopReplicationController final : public ReplicationController {
+class NoopStandbyController final : public StandbyController {
    public:
     ErrorCode StartStandby(const std::optional<MasterView>&) override {
         return ErrorCode::OK;
@@ -96,10 +96,9 @@ class NoopReplicationController final : public ReplicationController {
     RuntimeStateCallback callback_;
 };
 
-class CapabilityDrivenReplicationController final
-    : public ReplicationController {
+class CapabilityDrivenStandbyController final : public StandbyController {
    public:
-    CapabilityDrivenReplicationController(
+    CapabilityDrivenStandbyController(
         const HABackendSpec& spec, const MasterServiceSupervisorConfig& config)
         : spec_(spec),
           config_(config),
@@ -285,18 +284,18 @@ class CapabilityDrivenReplicationController final
 
 }  // namespace
 
-std::unique_ptr<ReplicationController> CreateReplicationController(
+std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     const auto capabilities = BuildStandbyRuntimeCapabilities(spec, config);
     if (capabilities.has_snapshot_bootstrap ||
         capabilities.has_oplog_following) {
-        return std::make_unique<CapabilityDrivenReplicationController>(spec,
-                                                                       config);
+        return std::make_unique<CapabilityDrivenStandbyController>(spec,
+                                                                   config);
     }
 
-    LOG(INFO) << "HA replication controller falls back to noop, backend_type="
+    LOG(INFO) << "HA standby controller falls back to noop, backend_type="
               << HABackendTypeToString(spec.type);
-    return std::make_unique<NoopReplicationController>();
+    return std::make_unique<NoopStandbyController>();
 }
 
 }  // namespace ha

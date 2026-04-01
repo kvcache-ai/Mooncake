@@ -142,7 +142,7 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(0u, status.primary_seq_id);
 }
 
-TEST(ReplicationControllerTest, PromoteStandbyReturnsStartFailure) {
+TEST(StandbyControllerTest, PromoteStandbyReturnsStartFailure) {
     ha::HABackendSpec spec{
         .type = ha::HABackendType::ETCD,
         .connstring = "http://localhost:2379",
@@ -157,7 +157,7 @@ TEST(ReplicationControllerTest, PromoteStandbyReturnsStartFailure) {
     config.snapshot_object_store_type = "local";
     config.snapshot_catalog_store_type = "invalid";
 
-    auto controller = ha::CreateReplicationController(spec, config);
+    auto controller = ha::CreateStandbyController(spec, config);
     ASSERT_NE(controller, nullptr);
     EXPECT_EQ(ErrorCode::INVALID_PARAMS,
               controller->StartStandby(std::nullopt));

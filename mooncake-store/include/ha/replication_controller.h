@@ -11,11 +11,11 @@
 namespace mooncake {
 namespace ha {
 
-class ReplicationController {
+class StandbyController {
    public:
     using RuntimeStateCallback = std::function<void(MasterRuntimeState)>;
 
-    virtual ~ReplicationController() = default;
+    virtual ~StandbyController() = default;
 
     virtual ErrorCode StartStandby(
         const std::optional<MasterView>& observed_leader) = 0;
@@ -33,7 +33,7 @@ class ReplicationController {
         RuntimeStateCallback callback) = 0;
 };
 
-std::unique_ptr<ReplicationController> CreateReplicationController(
+std::unique_ptr<StandbyController> CreateStandbyController(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config);
 
 }  // namespace ha
