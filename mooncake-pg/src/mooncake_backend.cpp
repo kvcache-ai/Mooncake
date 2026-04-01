@@ -617,7 +617,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
             [=](void*, size_t, size_t) {});
     } else {
         auto device_index = at::cuda::current_device();
-        auto stream = c10::cuda::getDefaultCUDAStream(device_index);
+        auto stream = at::cuda::getCurrentCUDAStream(device_index);
         return worker_->putTaskCuda(
             c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
             connection_ctx_, stream, [=](void*, size_t, size_t) {},
