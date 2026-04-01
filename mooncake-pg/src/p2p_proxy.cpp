@@ -10,6 +10,7 @@
 #include <limits>
 #include <thread>
 #include "memory_location.h"
+#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -54,7 +55,15 @@ P2PProxy::P2PProxy(TransferEngine* engine, const Options& options)
     AllocateResources();
 }
 
-P2PProxy::~P2PProxy() { ReleaseResources(); }
+P2PProxy::~P2PProxy() {
+    if (resource_abandoned_) {
+        LOG(WARNING) << "Resource leak in P2PProxy: cleanup skipped due to "
+                        "hung operations.";
+        return;
+    }
+
+    ReleaseResources();
+}
 
 void P2PProxy::BindMeta(const std::shared_ptr<TransferGroupMeta>& meta) {
     meta_ = meta;
@@ -214,6 +223,9 @@ void P2PProxy::PerformRecvReset(int peer_rank) {
 }
 
 void P2PProxy::ReleaseResources() {
+    TORCH_CHECK(!resource_abandoned_,
+                "Should not release abandoned resources.");
+
     SetCudaDeviceIfNeeded(is_cpu_, cuda_device_index_,
                           "P2PProxy ReleaseResources cudaSetDevice failed");
 
@@ -286,6 +298,8 @@ void P2PProxy::ReleaseResources() {
         resources_.recv_buffer_ = nullptr;
     }
 }
+
+void P2PProxy::AbandonResources() { resource_abandoned_ = true; }
 
 void P2PProxy::EnqueueSend(SendOp op) {
     op.tensor_ =
@@ -897,6 +911,13 @@ bool P2PProxy::HasActiveRecvWork() const {
         if (reset_recv_req_[i].load(std::memory_order_acquire)) return true;
     }
     return active_recv_tasks_.load(std::memory_order_acquire) > 0;
+}
+
+bool P2PProxy::DrainTasks() const {
+    BackoffWaiter waiter;
+    return waiter.wait_for(
+        std::chrono::milliseconds(kDrainTasksTimeoutMs),
+        [this] { return !HasActiveSendWork() && !HasActiveRecvWork(); });
 }
 
 void P2PDeviceWorker::Start() {

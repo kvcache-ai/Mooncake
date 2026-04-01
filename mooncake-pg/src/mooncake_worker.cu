@@ -287,6 +287,13 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
 }
 
+MooncakeWorker::~MooncakeWorker() {
+    running_ = false;
+    if (worker_thread_.joinable()) {
+        worker_thread_.join();
+    }
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
