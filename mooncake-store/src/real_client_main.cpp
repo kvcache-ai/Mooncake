@@ -31,6 +31,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::remove_internal>(&real_client);
     server.register_handler<&RealClient::removeByRegex_internal>(&real_client);
     server.register_handler<&RealClient::removeAll_internal>(&real_client);
+    server.register_handler<&RealClient::batchRemove_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);

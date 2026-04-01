@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include "memory_location.h"
 #include "mooncake_worker.cuh"
 
 namespace mooncake {
@@ -42,7 +43,6 @@ static bool supportFabricMem() {
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      bool isDummy,
                                      uint64_t* local2global_rank_map,
-                                     std::string location,
                                      c10::intrusive_ptr<::c10d::Store> store,
                                      std::shared_ptr<TransferGroupMeta> meta,
                                      std::shared_ptr<P2PProxy> p2p_proxy,
@@ -67,15 +67,15 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
         return;
     }
 
-    warmup_send_region_ = new int32_t[kMaxNumRanks];
+    warmup_send_region_ = new int32_t[kMaxNumRanks]{};
     warmup_send_region_[0] = 1;
     int rc = engine_->registerLocalMemory(
-        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), location);
+        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 
     warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
-    rc = engine_->registerLocalMemory(warmup_recv_region_,
-                                      kMaxNumRanks * sizeof(int32_t), location);
+    rc = engine_->registerLocalMemory(
+        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, "Failed to register local memory for context.");
 }
 

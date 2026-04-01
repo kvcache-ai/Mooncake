@@ -132,6 +132,18 @@ TEST(UtilsTest, SplitStringBasic) {
     EXPECT_EQ(tokens[3], "d");
 }
 
+TEST(UtilsTest, GetInterfaceIPv4AddressLoopback) {
+    auto address = GetInterfaceIPv4Address("lo");
+    ASSERT_TRUE(address.has_value()) << address.error();
+    EXPECT_EQ(address.value(), "127.0.0.1");
+}
+
+TEST(UtilsTest, GetInterfaceIPv4AddressMissingInterface) {
+    auto address = GetInterfaceIPv4Address("mooncake_missing_if");
+    ASSERT_FALSE(address.has_value());
+    EXPECT_NE(address.error().find("not found"), std::string::npos);
+}
+
 TEST(UtilsTest, AutoPortBinderRAII) {
     // Test RAII behavior - port should be released when binder is destroyed
     int port;

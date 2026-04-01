@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <thread>
 #include <mooncake_worker.cuh>
+#include <glog/logging.h>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -11,6 +12,8 @@ enum WorkerTaskStatus {
     SIGNALED_1 = 2,
     DONE = 3,
 };
+
+static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
 
 void MooncakeWorker::Start() {
     bool expected = false;
@@ -50,6 +53,9 @@ void MooncakeWorker::startWorker() {
                         task_status[i].store(TRANSFERRED_1,
                                              std::memory_order_release);
                         continue;
+                    }
+                    for (size_t j = 0; j < kMaxNumRanks; ++j) {
+                        rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
@@ -131,6 +137,9 @@ void MooncakeWorker::startWorker() {
                             if (!group->activeRanks[j]) {
                                 continue;
                             }
+                            if (rankToTaskId[i][j] == kInvalidTaskId) {
+                                continue;
+                            }
                             group->engine->getTransferStatus(
                                 task.batchID, rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
@@ -175,6 +184,9 @@ void MooncakeWorker::startWorker() {
                     auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
                                           .send_sync[task.bufferOffset];
 
+                    for (size_t j = 0; j < kMaxNumRanks; ++j) {
+                        rankToTaskId[i][j] = kInvalidTaskId;
+                    }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
@@ -211,6 +223,9 @@ void MooncakeWorker::startWorker() {
                     TransferStatus status;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
+                            continue;
+                        }
+                        if (rankToTaskId[i][j] == kInvalidTaskId) {
                             continue;
                         }
                         group->engine->getTransferStatus(

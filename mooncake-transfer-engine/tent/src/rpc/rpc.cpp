@@ -69,6 +69,16 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
             server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port);
             server_->register_handler<&CoroRpcAgent::process>(this);
             server_->async_start();
+            const auto err = server_->get_errc();
+            if (err) {
+                LOG(WARNING)
+                    << "Failed to start RPC server(async_start) on port "
+                    << port << ": " << err.message();
+                delete server_;
+                server_ = nullptr;
+                port = 0;
+                continue;
+            }
             running_ = true;
             return Status::OK();
         } catch (const std::exception& e) {
