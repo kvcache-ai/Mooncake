@@ -183,6 +183,9 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     HAMetricManager::instance().inc_oplog_applied_entries();
     HAMetricManager::instance().set_oplog_applied_sequence_id(
         static_cast<int64_t>(entry.sequence_id));
+    HAMetricManager::instance().set_oplog_last_sequence_id(
+        std::max(HAMetricManager::instance().get_oplog_last_sequence_id(),
+                 static_cast<int64_t>(entry.sequence_id)));
 
     // Try to process pending entries
     ProcessPendingEntries();

@@ -29,6 +29,35 @@ namespace mooncake::test {
 
 namespace fs = std::filesystem;
 
+namespace {
+
+class EmptyEndpointAllocator final : public BufferAllocatorBase {
+   public:
+    explicit EmptyEndpointAllocator(std::string segment_name)
+        : segment_name_(std::move(segment_name)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t) override {
+        return nullptr;
+    }
+
+    void deallocate(AllocatedBuffer*) override {}
+
+    size_t capacity() const override { return 0; }
+
+    size_t size() const override { return 0; }
+
+    std::string getSegmentName() const override { return segment_name_; }
+
+    std::string getTransportEndpoint() const override { return {}; }
+
+    size_t getLargestFreeRegion() const override { return 0; }
+
+   private:
+    std::string segment_name_;
+};
+
+}  // namespace
+
 class SnapshotChildProcessTest : public ::testing::Test {
    protected:
     const std::string& tmp_dir() const { return tmp_dir_; }
@@ -79,6 +108,22 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_object_store_type("local")
                           .set_view_version(view_version)
                           .build();
+        service_ = std::make_unique<MasterService>(config);
+    }
+
+    void CreatePreloadedService(const ha::PromotedStandbyState& state,
+                                ViewVersionId view_version = 0) {
+        auto config = MasterServiceConfigBuilder()
+                          .set_enable_snapshot(false)
+                          .set_enable_snapshot_restore(true)
+                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                          .set_snapshot_interval_seconds(100)
+                          .set_snapshot_child_timeout_seconds(60)
+                          .set_snapshot_retention_count(3)
+                          .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
+                          .build();
+        config.preloaded_state = state;
         service_ = std::make_unique<MasterService>(config);
     }
 
@@ -159,6 +204,28 @@ class SnapshotChildProcessTest : public ::testing::Test {
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
         return shard.metadata.find(key) != shard.metadata.end();
+    }
+
+    void InsertImportedReplicaBackedMetadata(const std::string& key,
+                                             const UUID& client_id,
+                                             uint64_t size,
+                                             std::string transport_endpoint) {
+        auto allocator =
+            std::make_shared<EmptyEndpointAllocator>("imported-segment-name");
+        auto buffer = std::make_unique<AllocatedBuffer>(
+            allocator, reinterpret_cast<void*>(0x12345000), size);
+        buffer->RestoreDescriptorContext(AllocatedBuffer::Descriptor{
+            .size_ = size,
+            .buffer_address_ = 0x12345000,
+            .protocol_ = "tcp",
+            .transport_endpoint_ = std::move(transport_endpoint),
+        });
+
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(buffer), ReplicaStatus::COMPLETE);
+
+        MasterService::MetadataAccessorRW accessor(service_.get(), key);
+        accessor.Create(client_id, size, std::move(replicas), false, false);
     }
 
    private:
@@ -362,6 +429,69 @@ TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {
     EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
     EXPECT_GE(latest->value().created_at_ms, before_ms);
     EXPECT_LE(latest->value().created_at_ms, after_ms);
+}
+
+TEST_F(SnapshotChildProcessTest,
+       PersistState_SucceedsForPromotedImportedReplicas) {
+    ha::PromotedStandbyState state;
+    state.applied_seq_id = 123;
+    state.segment_registry.push_back(StandbySegmentInfo{
+        .segment_name = "10.0.0.1:1234",
+        .transport_endpoint = "10.0.0.1:1234",
+        .capacity = 0,
+        .is_memory_segment = true,
+        .file_path = std::string(),
+    });
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 123;
+
+    Replica::Descriptor replica_descriptor;
+    replica_descriptor.id = 7;
+    replica_descriptor.status = ReplicaStatus::COMPLETE;
+    MemoryDescriptor memory_descriptor;
+    memory_descriptor.buffer_descriptor = AllocatedBuffer::Descriptor{
+        .size_ = 4096,
+        .buffer_address_ = 0x12345000,
+        .protocol_ = "tcp",
+        .transport_endpoint_ = "10.0.0.1:1234",
+    };
+    replica_descriptor.descriptor_variant = std::move(memory_descriptor);
+    metadata.replicas.push_back(std::move(replica_descriptor));
+    state.metadata_snapshot.emplace_back("imported_key", std::move(metadata));
+
+    CreatePreloadedService(state);
+
+    auto persist_result = CallPersistState("20260401_120000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+    EXPECT_EQ("20260401_120000_000", latest->value().snapshot_id);
+}
+
+TEST_F(SnapshotChildProcessTest,
+       PersistState_UsesRestoredEndpointWhenAllocatorEndpointIsMissing) {
+    CreateDefaultService();
+    InsertImportedReplicaBackedMetadata("imported_key", UUID{1, 2}, 4096,
+                                        "10.0.0.1:1234");
+
+    auto persist_result = CallPersistState("20260401_120000_001");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+    EXPECT_EQ("20260401_120000_001", latest->value().snapshot_id);
 }
 
 TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {

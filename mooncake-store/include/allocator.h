@@ -62,6 +62,7 @@ class AllocatedBuffer {
     // non-owning descriptors.
     void RestoreDescriptorContext(const Descriptor& descriptor) {
         protocol = descriptor.protocol_;
+        transport_endpoint_ = descriptor.transport_endpoint_;
         if (protocol == "cxl") {
             segment_name_ = descriptor.transport_endpoint_;
         }
@@ -87,6 +88,7 @@ class AllocatedBuffer {
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
     std::string segment_name_;
+    std::string transport_endpoint_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     std::string protocol{"tcp"};
@@ -122,6 +124,37 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+};
+
+class ImportedReplicaBufferAllocator final : public BufferAllocatorBase {
+   public:
+    explicit ImportedReplicaBufferAllocator(std::string transport_endpoint,
+                                            std::string segment_name = "")
+        : segment_name_(segment_name.empty() ? transport_endpoint
+                                             : std::move(segment_name)),
+          transport_endpoint_(std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t) override {
+        return nullptr;
+    }
+
+    void deallocate(AllocatedBuffer*) override {}
+
+    size_t capacity() const override { return 0; }
+
+    size_t size() const override { return 0; }
+
+    std::string getSegmentName() const override { return segment_name_; }
+
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+    size_t getLargestFreeRegion() const override { return 0; }
+
+   private:
+    std::string segment_name_;
+    std::string transport_endpoint_;
 };
 
 /**

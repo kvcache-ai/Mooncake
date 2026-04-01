@@ -293,6 +293,31 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
 #endif
 }
 
+TEST_F(HotStandbyServiceTest, SnapshotOnlyStartPublishesWatermarkMetrics) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "20260401_120000_000";
+    snapshot.snapshot_sequence_id = 42;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 42;
+    snapshot.metadata.emplace_back("key-1", metadata);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(42, HAMetricManager::instance().get_oplog_last_sequence_id());
+    EXPECT_EQ(42, HAMetricManager::instance().get_oplog_applied_sequence_id());
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_standby_lag());
+}
+
 TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP()

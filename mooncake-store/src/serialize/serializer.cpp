@@ -489,7 +489,7 @@ auto Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
 tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
     const AllocatedBuffer &buffer, const SegmentView &segment_view,
     MsgpackPacker &packer) {
-    packer.pack_array(5);
+    packer.pack_array(7);
 
     // Serialize basic properties
     // packer.pack(buffer.segment_name_);
@@ -497,34 +497,49 @@ tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
     packer.pack(reinterpret_cast<uint64_t>(buffer.buffer_ptr_));
     // packer.pack(static_cast<int32_t>(buffer.status));
 
-    if (buffer.allocator_.expired()) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::SERIALIZE_FAIL,
-            fmt::format("buffer.allocator_.expired,buffer_ptr:{}",
-                        buffer.buffer_ptr_)));
+    const auto descriptor = buffer.get_descriptor();
+    const auto allocator = buffer.allocator_.lock();
+    if (!allocator) {
+        if (descriptor.transport_endpoint_.empty() ||
+            buffer.offset_handle_.has_value()) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::SERIALIZE_FAIL,
+                fmt::format("serialize AllocatedBuffer "
+                            "buffer.allocator_.lock() fail,buffer_ptr:{}",
+                            buffer.buffer_ptr_)));
+        }
+
+        packer.pack(std::string());
+        packer.pack(false);
+        packer.pack_nil();
+        packer.pack(descriptor.protocol_);
+        packer.pack(descriptor.transport_endpoint_);
+        return {};
     }
 
-    // Get segment info
-    const auto &allocator = buffer.allocator_.lock();
-    if (!allocator) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::SERIALIZE_FAIL,
-            fmt::format("serialize AllocatedBuffer "
-                        "buffer.allocator_.lock() fail,buffer_ptr:{}",
-                        buffer.buffer_ptr_)));
+    std::string fallback_endpoint = descriptor.transport_endpoint_;
+    if (fallback_endpoint.empty()) {
+        fallback_endpoint = allocator->getTransportEndpoint();
+    }
+    if (fallback_endpoint.empty()) {
+        fallback_endpoint = allocator->getSegmentName();
     }
 
     Segment segment;
     ErrorCode ret = segment_view.GetSegment(allocator, segment);
-    if (ret != ErrorCode::OK) {
+    if (ret == ErrorCode::OK) {
+        packer.pack(UuidToString(segment.id));
+    } else if (!fallback_endpoint.empty()) {
+        packer.pack(std::string());
+    } else {
         return tl::unexpected(SerializationError(
             ErrorCode::SERIALIZE_FAIL,
             fmt::format("serialize AllocatedBuffer "
-                        "segment_view.GetSegment() fail ret={}",
-                        static_cast<int32_t>(ret))));
+                        "segment_view.GetSegment() fail ret={}, protocol={}, "
+                        "segment_name='{}'",
+                        static_cast<int32_t>(ret), descriptor.protocol_,
+                        buffer.getSegmentName())));
     }
-
-    packer.pack(UuidToString(segment.id));
 
     // Serialize offset_handle_ (if exists)
     if (buffer.offset_handle_.has_value()) {
@@ -542,6 +557,9 @@ tl::expected<void, SerializationError> Serializer<AllocatedBuffer>::serialize(
         packer.pack_nil();
     }
 
+    packer.pack(descriptor.protocol_);
+    packer.pack(fallback_endpoint);
+
     return {};
 }
 
@@ -556,13 +574,14 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                                "msgpack data, expected array"));
     }
 
-    // Verify array size is correct (should have 5 elements: size, buffer_ptr,
-    // segment_id, has_offset_handle, offset_handle)
-    if (obj.via.array.size != 5) {
+    // Old format has 5 fields. Imported-replica aware format appends
+    // protocol/transport_endpoint to make non-mounted descriptors
+    // round-trippable.
+    if (obj.via.array.size != 5 && obj.via.array.size != 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize_msgpack AllocatedBuffer invalid array "
-                        "size: expected 5, got {}",
+                        "size: expected 5 or 7, got {}",
                         obj.via.array.size)));
     }
 
@@ -577,7 +596,7 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Get segment_id and find corresponding allocator
     std::string segment_id = array_items[2].as<std::string>();
     UUID segment_uuid;
-    bool success = StringToUuid(segment_id, segment_uuid);
+    bool success = segment_id.empty() || StringToUuid(segment_id, segment_uuid);
     if (!success) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -586,36 +605,48 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                         segment_id)));
     }
 
-    MountedSegment mountedSegment;
-    ErrorCode ret =
-        segment_view.GetMountedSegment(segment_uuid, mountedSegment);
-    if (ret != ErrorCode::OK) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format(
-                "deserialize_msgpack AllocatedBuffer "
-                "segment_view.GetMountedSegment() fail ret={},segment_id={}",
-                static_cast<int32_t>(ret), segment_id)));
+    std::string protocol = "tcp";
+    std::string transport_endpoint;
+    if (obj.via.array.size == 7) {
+        protocol = array_items[5].as<std::string>();
+        transport_endpoint = array_items[6].as<std::string>();
     }
 
-    if (mountedSegment.status != SegmentStatus::OK) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize_msgpack AllocatedBuffer "
-                        "mountedSegment.status!=OK status={} segment_id={}",
-                        static_cast<int32_t>(mountedSegment.status),
-                        segment_id)));
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    if (!segment_id.empty()) {
+        MountedSegment mountedSegment;
+        ErrorCode ret =
+            segment_view.GetMountedSegment(segment_uuid, mountedSegment);
+        if (ret != ErrorCode::OK) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("deserialize_msgpack AllocatedBuffer "
+                            "segment_view.GetMountedSegment() fail "
+                            "ret={},segment_id={}",
+                            static_cast<int32_t>(ret), segment_id)));
+        }
+
+        if (mountedSegment.status != SegmentStatus::OK) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("deserialize_msgpack AllocatedBuffer "
+                            "mountedSegment.status!=OK status={} segment_id={}",
+                            static_cast<int32_t>(mountedSegment.status),
+                            segment_id)));
+        }
+
+        allocator = mountedSegment.buf_allocator;
+    } else if (!transport_endpoint.empty()) {
+        allocator = std::make_shared<ImportedReplicaBufferAllocator>(
+            transport_endpoint);
     }
 
-    std::shared_ptr<BufferAllocatorBase> allocator =
-        mountedSegment.buf_allocator;
-    // Check if allocator is valid
     if (!allocator) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize_msgpack AllocatedBuffer invalid allocator "
-                        "for segment {}",
-                        segment_id)));
+                        "for segment '{}' endpoint '{}'",
+                        segment_id, transport_endpoint)));
     }
 
     // Deserialize offset_handle_ (if exists)
@@ -643,7 +674,9 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // Create AllocatedBuffer object
     auto buffer = std::make_unique<AllocatedBuffer>(allocator, buffer_ptr, size,
                                                     std::move(offsetHandle));
-    // buffer->status = status;
+    buffer->RestoreDescriptorContext(AllocatedBuffer::Descriptor{
+        static_cast<uint64_t>(size), reinterpret_cast<uintptr_t>(buffer_ptr),
+        std::move(protocol), std::move(transport_endpoint)});
 
     return buffer;
 }

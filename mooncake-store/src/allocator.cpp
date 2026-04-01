@@ -34,11 +34,21 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     std::string endpoint;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
+    } else if (!transport_endpoint_.empty()) {
+        endpoint = transport_endpoint_;
+    } else if (!segment_name_.empty()) {
+        endpoint = segment_name_;
     } else {
         LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
     }
 
+    if (endpoint.empty()) {
+        endpoint = transport_endpoint_;
+    }
+
     if (this->protocol == "cxl") {
+        endpoint = this->segment_name_;
+    } else if (endpoint.empty()) {
         endpoint = this->segment_name_;
     }
 

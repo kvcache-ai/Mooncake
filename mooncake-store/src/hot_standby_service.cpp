@@ -89,6 +89,44 @@ HARuntimePhaseStats BuildLoadedSnapshotPhaseStats(
     return stats;
 }
 
+#ifdef STORE_USE_ETCD
+std::optional<uint64_t> ReadPrimarySequenceWatermark(
+    EtcdOpLogStore& oplog_store, uint64_t applied_seq_id) {
+    uint64_t latest_seq = 0;
+    const auto latest_err = oplog_store.GetLatestSequenceId(latest_seq);
+    if (latest_err == ErrorCode::OK && latest_seq >= applied_seq_id) {
+        return latest_seq;
+    }
+
+    uint64_t max_seq = 0;
+    const auto max_err = oplog_store.GetMaxSequenceId(max_seq);
+    if (max_err == ErrorCode::OK && max_seq >= applied_seq_id) {
+        LOG(INFO) << "Standby primary watermark fallback to max sequence: "
+                  << "latest_seq=" << latest_seq
+                  << ", applied_seq=" << applied_seq_id
+                  << ", max_seq=" << max_seq;
+        return max_seq;
+    }
+
+    if (latest_seq > 0) {
+        LOG(INFO) << "Standby primary watermark uses stale /latest: "
+                  << "latest_seq=" << latest_seq
+                  << ", applied_seq=" << applied_seq_id
+                  << ", latest_err=" << static_cast<int>(latest_err)
+                  << ", max_err=" << static_cast<int>(max_err)
+                  << ", max_seq=" << max_seq;
+        return latest_seq;
+    }
+    LOG(INFO) << "Standby primary watermark unavailable: "
+              << "applied_seq=" << applied_seq_id
+              << ", latest_err=" << static_cast<int>(latest_err)
+              << ", latest_seq=" << latest_seq
+              << ", max_err=" << static_cast<int>(max_err)
+              << ", max_seq=" << max_seq;
+    return std::nullopt;
+}
+#endif
+
 }  // namespace
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
@@ -464,6 +502,15 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         return ErrorCode::INTERNAL_ERROR;
     }
 
+    const uint64_t latest_applied_seq_id =
+        GetLocalLastAppliedSequenceIdLocked();
+    applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+    primary_seq_id_.store(
+        std::max(primary_seq_id_.load(std::memory_order_acquire),
+                 latest_applied_seq_id),
+        std::memory_order_release);
+    phase_stats.applied_seq_id = static_cast<int64_t>(latest_applied_seq_id);
+
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
     replication_thread_ =
         std::thread(&HotStandbyService::ReplicationLoop, this);
@@ -532,13 +579,21 @@ void HotStandbyService::SetSyncStatusCallback(SyncStatusCallback callback) {
 }
 
 void HotStandbyService::NotifySyncStatus() {
+    const StandbySyncStatus status = GetSyncStatus();
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_oplog_applied_sequence_id(
+        static_cast<int64_t>(status.applied_seq_id));
+    metrics.set_oplog_last_sequence_id(
+        static_cast<int64_t>(status.primary_seq_id));
+    metrics.set_oplog_standby_lag(static_cast<int64_t>(status.lag_entries));
+
     SyncStatusCallback callback;
     {
         std::lock_guard<std::mutex> lock(sync_status_callback_mutex_);
         callback = sync_status_callback_;
     }
     if (callback) {
-        callback(GetSyncStatus());
+        callback(status);
     }
 }
 
@@ -606,6 +661,9 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     // Primary sequence ID (best-effort): updated by ReplicationLoop via etcd
     // `/latest`.
     status.primary_seq_id = primary_seq_id_.load();
+    if (status.primary_seq_id < status.applied_seq_id) {
+        status.primary_seq_id = status.applied_seq_id;
+    }
 
     // Use state machine for connection status
     status.is_connected = IsConnected();
@@ -1051,10 +1109,18 @@ void HotStandbyService::ReplicationLoop() {
         // monitoring only.
 #ifdef STORE_USE_ETCD
         if (oplog_store) {
-            uint64_t latest_seq = 0;
-            ErrorCode err = oplog_store->GetLatestSequenceId(latest_seq);
-            if (err == ErrorCode::OK) {
-                primary_seq_id_.store(latest_seq);
+            const uint64_t current_applied = applied_seq_id_.load();
+            auto primary_seq =
+                ReadPrimarySequenceWatermark(*oplog_store, current_applied);
+            if (primary_seq.has_value()) {
+                uint64_t current_primary =
+                    primary_seq_id_.load(std::memory_order_acquire);
+                while (primary_seq.value() > current_primary &&
+                       !primary_seq_id_.compare_exchange_weak(
+                           current_primary, primary_seq.value(),
+                           std::memory_order_acq_rel,
+                           std::memory_order_acquire)) {
+                }
             }
         }
 #endif

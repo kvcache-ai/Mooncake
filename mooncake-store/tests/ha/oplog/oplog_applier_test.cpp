@@ -13,6 +13,7 @@
 #include <xxhash.h>
 
 #include "etcd_oplog_store.h"
+#include "ha_metric_manager.h"
 #include "metadata_store.h"
 #include "oplog_manager.h"
 #include "types.h"
@@ -159,6 +160,20 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd) {
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
     EXPECT_EQ(1u, mock_metadata_store_->GetKeyCount());
+}
+
+TEST_F(OpLogApplierTest, TestApplyPutEndUpdatesSequenceMetrics) {
+    HAMetricManager::Init();
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_oplog_last_sequence_id(0);
+    metrics.set_oplog_applied_sequence_id(0);
+
+    std::string payload = MakeValidJsonPayload();
+    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(1, metrics.get_oplog_applied_sequence_id());
+    EXPECT_EQ(1, metrics.get_oplog_last_sequence_id());
 }
 
 TEST_F(OpLogApplierTest, TestApplyPutRevoke) {

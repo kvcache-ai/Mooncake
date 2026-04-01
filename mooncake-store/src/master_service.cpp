@@ -112,35 +112,6 @@ void FilterInvalidReplicaDescriptors(
         replicas.end());
 }
 
-class ImportedReplicaBufferAllocator final : public BufferAllocatorBase {
-   public:
-    explicit ImportedReplicaBufferAllocator(std::string transport_endpoint)
-        : segment_name_(transport_endpoint),
-          transport_endpoint_(std::move(transport_endpoint)) {}
-
-    std::unique_ptr<AllocatedBuffer> allocate(size_t) override {
-        return nullptr;
-    }
-
-    void deallocate(AllocatedBuffer*) override {}
-
-    size_t capacity() const override { return 0; }
-
-    size_t size() const override { return 0; }
-
-    std::string getSegmentName() const override { return segment_name_; }
-
-    std::string getTransportEndpoint() const override {
-        return transport_endpoint_;
-    }
-
-    size_t getLargestFreeRegion() const override { return 0; }
-
-   private:
-    std::string segment_name_;
-    std::string transport_endpoint_;
-};
-
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
