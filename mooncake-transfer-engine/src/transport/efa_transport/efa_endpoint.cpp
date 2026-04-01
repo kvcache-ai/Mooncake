@@ -380,17 +380,27 @@ int EfaEndPoint::submitPostSend(
             op_ctx->slice = slice;
             op_ctx->wr_depth = &wr_depth_;
 
-            // Serialize fi_write per-endpoint: concurrent fi_write on the
-            // same RDM endpoint corrupts provider state.  Cross-endpoint
+            // Serialize fi_write/fi_read per-endpoint: concurrent RMA ops on
+            // the same RDM endpoint corrupt provider state.  Cross-endpoint
             // safety is handled by the FI_THREAD_SAFE hint.
             while (post_lock_.test_and_set(std::memory_order_acquire)) {
             }
-            ssize_t ret = fi_write(ep_,
-                                   (void *)slice->source_addr,  // local buffer
-                                   slice->length, local_desc, peer_fi_addr_,
-                                   slice->rdma.dest_addr,  // remote address
-                                   slice->rdma.dest_rkey,  // remote key
-                                   &op_ctx->fi_ctx);  // context for completion
+            ssize_t ret;
+            if (slice->opcode == Transport::TransferRequest::READ) {
+                ret = fi_read(ep_,
+                              (void *)slice->source_addr,  // local buffer
+                              slice->length, local_desc, peer_fi_addr_,
+                              slice->rdma.dest_addr,  // remote address
+                              slice->rdma.dest_rkey,  // remote key
+                              &op_ctx->fi_ctx);  // context for completion
+            } else {
+                ret = fi_write(ep_,
+                               (void *)slice->source_addr,  // local buffer
+                               slice->length, local_desc, peer_fi_addr_,
+                               slice->rdma.dest_addr,  // remote address
+                               slice->rdma.dest_rkey,  // remote key
+                               &op_ctx->fi_ctx);  // context for completion
+            }
             post_lock_.clear(std::memory_order_release);
 
             if (ret == 0) {
@@ -408,7 +418,7 @@ int EfaEndPoint::submitPostSend(
                 // Don't advance iterator - retry the same slice
             } else {
                 // Hard error - release reservations
-                LOG(ERROR) << "fi_write failed: " << fi_strerror(-ret)
+                LOG(ERROR) << "fi_read/fi_write failed: " << fi_strerror(-ret)
                            << " (source=" << slice->source_addr
                            << ", len=" << slice->length
                            << ", dest=" << (void *)slice->rdma.dest_addr

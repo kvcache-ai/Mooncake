@@ -34,11 +34,18 @@
 namespace mooncake {
 
 // EfaEndpointStore implementation
+
+EfaEndpointStore::EfaEndpointStore(size_t max_endpoints,
+                                   double inactive_timeout_sec)
+    : max_endpoints_(max_endpoints),
+      inactive_timeout_sec_(inactive_timeout_sec) {}
+
 std::shared_ptr<EfaEndPoint> EfaEndpointStore::get(
     const std::string &peer_nic_path) {
     RWSpinlock::ReadGuard guard(lock_);
     auto it = endpoints_.find(peer_nic_path);
     if (it != endpoints_.end()) {
+        it->second->set_active(true);
         return it->second;
     }
     return nullptr;
@@ -49,9 +56,20 @@ std::shared_ptr<EfaEndPoint> EfaEndpointStore::getOrInsert(
     RWSpinlock::WriteGuard guard(lock_);
     auto it = endpoints_.find(peer_nic_path);
     if (it != endpoints_.end()) {
+        it->second->set_active(true);
         return it->second;  // Another thread already created it
     }
+    // Evict stale endpoints if at capacity
+    if (endpoints_.size() >= max_endpoints_) {
+        size_t evicted = evictStaleLocked();
+        if (evicted == 0 && endpoints_.size() >= max_endpoints_) {
+            LOG(WARNING) << "EfaEndpointStore at capacity ("
+                         << max_endpoints_
+                         << ") with no stale endpoints to evict";
+        }
+    }
     endpoints_[peer_nic_path] = new_ep;
+    new_ep->set_active(true);
     return new_ep;
 }
 
@@ -81,6 +99,46 @@ size_t EfaEndpointStore::size() const {
     return endpoints_.size();
 }
 
+size_t EfaEndpointStore::evictStale() {
+    RWSpinlock::WriteGuard guard(lock_);
+    return evictStaleLocked();
+}
+
+size_t EfaEndpointStore::evictStaleLocked() {
+    size_t evicted = 0;
+    for (auto it = endpoints_.begin(); it != endpoints_.end();) {
+        auto &ep = it->second;
+        if (ep && !ep->active() &&
+            ep->inactiveTime() > inactive_timeout_sec_ &&
+            !ep->hasOutstandingSlice()) {
+            LOG(INFO) << "Evicting stale EFA endpoint: " << it->first
+                      << " (inactive " << ep->inactiveTime() << "s)";
+            ep->disconnect();
+            it = endpoints_.erase(it);
+            ++evicted;
+        } else {
+            ++it;
+        }
+    }
+    return evicted;
+}
+
+size_t EfaEndpointStore::removeDisconnected() {
+    RWSpinlock::WriteGuard guard(lock_);
+    size_t removed = 0;
+    for (auto it = endpoints_.begin(); it != endpoints_.end();) {
+        auto &ep = it->second;
+        if (ep && !ep->connected() && !ep->hasOutstandingSlice()) {
+            LOG(INFO) << "Removing disconnected EFA endpoint: " << it->first;
+            it = endpoints_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
 // EfaContext implementation
 EfaContext::EfaContext(EfaTransport &engine, const std::string &device_name)
     : engine_(engine),
@@ -99,7 +157,7 @@ EfaContext::~EfaContext() {
 int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                           uint8_t port, int gid_index, size_t max_cqe,
                           int max_endpoints) {
-    endpoint_store_ = std::make_shared<EfaEndpointStore>();
+    endpoint_store_ = std::make_shared<EfaEndpointStore>(max_endpoints);
 
     // Setup hints for EFA provider
     hints_ = fi_allocinfo();

@@ -55,12 +55,23 @@ struct EfaMemoryRegionMeta {
     uint64_t key;
 };
 
-// Simple endpoint store for EFA
+// Endpoint store for EFA with LRU eviction support.
+// When the store approaches the AV capacity (max_endpoints), stale endpoints
+// that have been inactive beyond `inactive_timeout_sec` are evicted to free
+// AV slots.  This prevents AV exhaustion in long-running services that
+// communicate with many transient peers.
 class EfaEndpointStore {
    public:
+    static constexpr double kDefaultInactiveTimeoutSec = 300.0;  // 5 minutes
+
+    explicit EfaEndpointStore(size_t max_endpoints = 256,
+                              double inactive_timeout_sec =
+                                  kDefaultInactiveTimeoutSec);
+
     std::shared_ptr<EfaEndPoint> get(const std::string &peer_nic_path);
     // Atomically get-or-insert: returns existing endpoint or inserts new_ep.
     // Prevents duplicate endpoint creation from concurrent callers.
+    // Triggers eviction when the store is at or above max_endpoints.
     std::shared_ptr<EfaEndPoint> getOrInsert(
         const std::string &peer_nic_path, std::shared_ptr<EfaEndPoint> new_ep);
     void add(const std::string &peer_nic_path,
@@ -69,9 +80,22 @@ class EfaEndpointStore {
     int disconnectAll();
     size_t size() const;
 
+    // Evict endpoints that have been inactive longer than the configured
+    // timeout.  Returns the number of evicted endpoints.
+    size_t evictStale();
+
+    // Remove endpoints whose connections are broken (not connected and not
+    // initializing).  Returns the number of removed endpoints.
+    size_t removeDisconnected();
+
    private:
+    // Must be called with write lock held.
+    size_t evictStaleLocked();
+
     mutable RWSpinlock lock_;
     std::unordered_map<std::string, std::shared_ptr<EfaEndPoint>> endpoints_;
+    size_t max_endpoints_;
+    double inactive_timeout_sec_;
 };
 
 // EfaContext represents the set of resources controlled by each local EFA
