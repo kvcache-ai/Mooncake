@@ -59,6 +59,7 @@ class TracingFacade {
    private:
     TraceConfig config_;
     std::shared_ptr<TraceExporter> exporter_;
+    std::unique_ptr<TraceSampler> sampler_;
   };
 
 }  // namespace mooncake::tracing

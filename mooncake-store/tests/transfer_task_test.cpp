@@ -6,10 +6,14 @@
 
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include "trace_exporter.h"
+#include "tracing_facade.h"
 #include "types.h"
 
 namespace mooncake {
@@ -158,6 +162,195 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     oss.str("");
     oss << TransferStrategy::TRANSFER_ENGINE;
     EXPECT_EQ(oss.str(), "TRANSFER_ENGINE");
+}
+
+TEST_F(TransferTaskTest, StartSpanFromCarrierUsesCarrierSpanAsParent) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "inmemory";
+    config.service_name = "test-service";
+    config.process_role = "test-role";
+
+    mooncake::tracing::TracingFacade facade(config);
+    mooncake::tracing::TraceCarrier carrier{
+        .trace_id = "0123456789abcdef0123456789abcdef",
+        .span_id = "89abcdef01234567",
+        .correlation_id = "corr-1234"};
+
+    auto span = facade.StartSpanFromCarrier("child-span", carrier);
+    auto context = span.context();
+
+    EXPECT_EQ(context.trace_id, carrier.trace_id);
+    EXPECT_EQ(context.parent_span_id, carrier.span_id);
+    EXPECT_EQ(context.correlation_id, carrier.correlation_id);
+    EXPECT_NE(context.span_id, carrier.span_id);
+}
+
+TEST_F(TransferTaskTest, AsyncRemoteExporterDropsWhenQueueIsFull) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "remote";
+    config.service_name = "test-service";
+    config.process_role = "test-role";
+    config.exporter_queue_max_items = 1;
+    config.exporter_queue_max_bytes = 1024;
+    config.exporter_retry_base_ms = 1;
+    config.exporter_retry_max_ms = 2;
+    config.exporter_retry_max_attempts = 1;
+
+    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    mooncake::tracing::AsyncRemoteTraceExporter exporter(
+        config, fallback,
+        [](const mooncake::tracing::TraceRecord&, std::string*) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return false;
+        });
+
+    mooncake::tracing::TraceRecord record;
+    record.trace_id = "trace";
+    record.span_id = "span";
+    record.span_name = "span-name";
+
+    exporter.Export(record);
+    exporter.Export(record);
+    exporter.Export(record);
+    exporter.FlushForTest(std::chrono::milliseconds(200));
+
+    auto stats = exporter.SnapshotStats();
+    EXPECT_GE(stats.dropped_records, 1u);
+    EXPECT_GE(stats.retry_count, 1u);
+    EXPECT_GE(stats.fallback_count, 1u);
+}
+
+TEST_F(TransferTaskTest, TraceSamplerBaseModeKeepsErrorAndSlowSpan) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.sampling_mode = "base";
+    config.sampling_base_ratio = 0.0;
+    config.sampling_slow_threshold_ms = 10;
+
+    mooncake::tracing::TraceSampler sampler(config);
+
+    mooncake::tracing::TraceRecord error_record;
+    error_record.status = "ERROR";
+    EXPECT_TRUE(sampler.ShouldSample(error_record));
+
+    mooncake::tracing::TraceRecord slow_record;
+    slow_record.start_time_unix_nano = 0;
+    slow_record.end_time_unix_nano = 20 * 1000 * 1000;
+    EXPECT_TRUE(sampler.ShouldSample(slow_record));
+
+    mooncake::tracing::TraceRecord normal_record;
+    normal_record.trace_id = "trace-normal";
+    normal_record.start_time_unix_nano = 0;
+    normal_record.end_time_unix_nano = 1 * 1000 * 1000;
+    EXPECT_FALSE(sampler.ShouldSample(normal_record));
+}
+
+TEST_F(TransferTaskTest, TraceSamplerDiagKeepsEventfulSpan) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.sampling_mode = "diag";
+    config.sampling_base_ratio = 0.0;
+
+    mooncake::tracing::TraceSampler sampler(config);
+
+    mooncake::tracing::TraceRecord eventful_record;
+    eventful_record.trace_id = "trace-diag";
+    eventful_record.events.push_back(
+        mooncake::tracing::TraceEvent{"important-event", 1, {}});
+    EXPECT_TRUE(sampler.ShouldSample(eventful_record));
+
+    mooncake::tracing::TraceRecord normal_record;
+    normal_record.trace_id = "trace-normal";
+    EXPECT_FALSE(sampler.ShouldSample(normal_record));
+}
+
+TEST_F(TransferTaskTest, AsyncRemoteExporterSpoolsWhenConfiguredAndRemoteFails) {
+    namespace fs = std::filesystem;
+
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "remote";
+    config.service_name = "spool-service";
+    config.process_role = "test-role";
+    config.exporter_retry_base_ms = 1;
+    config.exporter_retry_max_ms = 2;
+    config.exporter_retry_max_attempts = 0;
+
+    auto spool_dir = fs::temp_directory_path() / "mooncake-tracing-spool-test";
+    fs::remove_all(spool_dir);
+    config.exporter_spool_dir = spool_dir.string();
+    config.jsonl_path = (spool_dir / "fallback.jsonl").string();
+
+    mooncake::tracing::AsyncRemoteTraceExporter exporter(
+        config, std::make_shared<mooncake::tracing::InMemoryTraceExporter>(),
+        [](const mooncake::tracing::TraceRecord&, std::string*) {
+            return false;
+        });
+
+    mooncake::tracing::TraceRecord record;
+    record.trace_id = "trace-spool";
+    record.span_id = "span-spool";
+    record.span_name = "span-name";
+
+    exporter.Export(record);
+    EXPECT_TRUE(exporter.FlushForTest(std::chrono::milliseconds(200)));
+
+    auto stats = exporter.SnapshotStats();
+    EXPECT_GE(stats.collector_unreachable_count, 1u);
+    EXPECT_GE(stats.spooled_records, 1u);
+    EXPECT_EQ(stats.fallback_count, 0u);
+
+    bool found_spool_file = false;
+    if (fs::exists(spool_dir)) {
+        for (const auto& entry : fs::directory_iterator(spool_dir)) {
+            if (entry.is_regular_file()) {
+                found_spool_file = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(found_spool_file);
+    fs::remove_all(spool_dir);
+}
+
+TEST_F(TransferTaskTest, AsyncRemoteExporterCountsQueueFullAndCollectorFailure) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "remote";
+    config.service_name = "counter-service";
+    config.process_role = "test-role";
+    config.exporter_queue_max_items = 1;
+    config.exporter_queue_max_bytes = 1024;
+    config.exporter_retry_base_ms = 1;
+    config.exporter_retry_max_ms = 2;
+    config.exporter_retry_max_attempts = 1;
+
+    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    mooncake::tracing::AsyncRemoteTraceExporter exporter(
+        config, fallback,
+        [](const mooncake::tracing::TraceRecord&, std::string*) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return false;
+        });
+
+    mooncake::tracing::TraceRecord record;
+    record.trace_id = "trace-counter";
+    record.span_id = "span-counter";
+    record.span_name = "span-name";
+
+    exporter.Export(record);
+    exporter.Export(record);
+    exporter.Export(record);
+    EXPECT_TRUE(exporter.FlushForTest(std::chrono::milliseconds(200)));
+
+    auto stats = exporter.SnapshotStats();
+    EXPECT_GE(stats.dropped_records, 1u);
+    EXPECT_GE(stats.queue_full_count, 1u);
+    EXPECT_GE(stats.collector_unreachable_count, 1u);
+    EXPECT_GE(stats.retry_count, 1u);
+    EXPECT_GE(stats.fallback_count, 1u);
 }
 
 }  // namespace mooncake

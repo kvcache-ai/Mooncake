@@ -24,6 +24,7 @@
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
+#include "trace_context.h"
 
 namespace mooncake {
 
@@ -530,11 +531,17 @@ class Client {
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+                           TransferRequest::OpCode op_code,
+                           const tracing::TraceContext* trace_context =
+                               nullptr);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
+                            std::vector<Slice>& slices,
+                            const tracing::TraceContext* trace_context =
+                                nullptr);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+                           std::vector<Slice>& slices,
+                           const tracing::TraceContext* trace_context =
+                               nullptr);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -685,7 +692,8 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        const tracing::TraceContext* trace_context = nullptr);
 
     /**
      * @brief Copy an object's replica to target segments
@@ -696,7 +704,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> Copy(const std::string& key,
                                        const std::string& source,
-                                       const std::vector<std::string>& targets);
+                                       const std::vector<std::string>& targets,
+                                       const tracing::TraceContext* trace_context =
+                                           nullptr);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -707,7 +717,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
-                                       const std::string& target);
+                                       const std::string& target,
+                                       const tracing::TraceContext* trace_context =
+                                           nullptr);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

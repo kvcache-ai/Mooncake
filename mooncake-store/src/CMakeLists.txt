@@ -157,6 +157,7 @@ target_link_libraries(mooncake_store
         gflags::gflags
         ${EXTRA_LIBS}
         asio_shared
+        mooncake-tracing
     PRIVATE
         transfer_engine
 )

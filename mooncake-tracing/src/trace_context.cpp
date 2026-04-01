@@ -22,6 +22,27 @@ TraceCarrier ToCarrier(const TraceContext& ctx) {
     return TraceCarrier{ctx.trace_id, ctx.span_id, ctx.correlation_id};
 }
 
+std::string EncodeTraceCarrier(const TraceCarrier& carrier) {
+    return carrier.trace_id + "|" + carrier.span_id + "|" +
+           carrier.correlation_id;
+}
+
+TraceCarrier DecodeTraceCarrier(const std::string& encoded) {
+    TraceCarrier carrier;
+    const auto first_sep = encoded.find('|');
+    const auto second_sep =
+        encoded.find('|', first_sep == std::string::npos ? first_sep
+                                                         : first_sep + 1);
+    if (first_sep == std::string::npos || second_sep == std::string::npos) {
+        return carrier;
+    }
+    carrier.trace_id = encoded.substr(0, first_sep);
+    carrier.span_id =
+        encoded.substr(first_sep + 1, second_sep - first_sep - 1);
+    carrier.correlation_id = encoded.substr(second_sep + 1);
+    return carrier;
+}
+
 TraceContext ChildContextFromCarrier(const TraceCarrier& carrier) {
     if (carrier.empty()) {
         auto root = RootContext();

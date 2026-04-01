@@ -69,19 +69,20 @@ void JsonlTraceExporter::Export(const TraceRecord& record) {
 
 std::shared_ptr<TraceExporter> MakeDefaultExporter(
     const std::string& service_name) {
-    const char* mode = std::getenv("MC_TRACING_EXPORTER");
-    if (mode && std::string(mode) == "inmemory") {
+    TraceConfig config = LoadTraceConfig(service_name);
+    if (!config.enabled || config.exporter_mode == "off") {
+        return nullptr;
+    }
+    if (config.exporter_mode == "inmemory") {
         return std::make_shared<InMemoryTraceExporter>();
     }
-    const char* path = std::getenv("MC_TRACING_JSONL_PATH");
-    std::string jsonl_path;
-    if (path && *path) {
-        jsonl_path = path;
-    } else {
-        jsonl_path = "/tmp/mooncake-traces/" + service_name + "-" +
-                     std::to_string(::getpid()) + ".jsonl";
+    if (config.exporter_mode == "remote" ||
+        config.exporter_mode == "otlp_http" ||
+        config.exporter_mode == "otlp") {
+        return std::make_shared<AsyncRemoteTraceExporter>(
+            config, std::make_shared<JsonlTraceExporter>(config.jsonl_path));
     }
-    return std::make_shared<JsonlTraceExporter>(jsonl_path);
+    return std::make_shared<JsonlTraceExporter>(config.jsonl_path);
 }
 
 }  // namespace mooncake::tracing

@@ -185,6 +185,7 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     auto span = tracing.StartSpanFromCarrier("notify.received", carrier,
                                              {{"notify.name", peer_notify.name}});
     span.AddEvent("carrier decode", {{"trace_carrier.present", peer_notify.trace_carrier.empty() ? "false" : "true"}});
+    span.AddEvent("notify received", {{"notify.name", peer_notify.name}});
     {
       RWSpinlock::WriteGuard guard(notify_lock_);
       notifys.push_back(peer_notify);

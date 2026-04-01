@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
+#include "rpc_types.h"
 #include "task_manager.h"
 #include <thread>
 
@@ -39,6 +40,28 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     ASSERT_EQ(tasks.size(), 1);
     EXPECT_EQ(tasks[0].id, task_id);
     EXPECT_EQ(tasks[0].status, TaskStatus::PROCESSING);
+}
+
+TEST_F(ClientTaskManagerTest, SubmitTaskWithTracePreservesCarrierOnAssignment) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
+    UUID client_id = generate_uuid();
+    const std::string trace_carrier = "trace-1|span-1|corr-1";
+
+    auto task_id_exp =
+        manager.get_write_access()
+            .submit_task_typed_with_trace<TaskType::REPLICA_COPY>(
+                client_id,
+                ReplicaCopyPayload{
+                    .key = "trace_key", .source = "seg1", .targets = {"seg2"}},
+                trace_carrier);
+    ASSERT_TRUE(task_id_exp.has_value());
+
+    auto tasks = manager.get_write_access().pop_tasks(client_id, 1);
+    ASSERT_EQ(tasks.size(), 1u);
+
+    TaskAssignment assignment(tasks[0]);
+    EXPECT_EQ(assignment.trace_carrier, trace_carrier);
+    EXPECT_EQ(assignment.max_retry_attempts, 3u);
 }
 
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
@@ -374,6 +397,37 @@ TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
               1);
     EXPECT_FALSE(task4->payload.empty());
     EXPECT_EQ(task4->assigned_client, client_id2);
+}
+
+TEST_F(ClientTaskManagerTest, SerializerPreservesTraceCarrierAndRetryCount) {
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 7});
+    UUID client_id = generate_uuid();
+    const std::string trace_carrier = "trace-9|span-9|corr-9";
+
+    auto task_id = manager.get_write_access()
+                       .submit_task_typed_with_trace<TaskType::REPLICA_COPY>(
+                           client_id,
+                           ReplicaCopyPayload{
+                               .key = "key1",
+                               .source = "seg1",
+                               .targets = {"seg2"}},
+                           trace_carrier);
+    ASSERT_TRUE(task_id.has_value());
+
+    TaskManagerSerializer serializer(&manager);
+    auto serialized = serializer.Serialize();
+    ASSERT_TRUE(serialized.has_value());
+
+    ClientTaskManager restored({10000, 10000, 10000, 0, 0, 1});
+    TaskManagerSerializer restored_serializer(&restored);
+    auto result = restored_serializer.Deserialize(serialized.value());
+    ASSERT_TRUE(result.has_value());
+
+    auto restored_task =
+        restored.get_read_access().find_task_by_id(task_id.value());
+    ASSERT_TRUE(restored_task.has_value());
+    EXPECT_EQ(restored_task->trace_carrier, trace_carrier);
+    EXPECT_EQ(restored_task->max_retry_attempts, 7u);
 }
 
 TEST_F(ClientTaskManagerTest, SerializerEmptyManager) {

@@ -25,6 +25,8 @@ struct TraceCarrier {
 };
 
 TraceCarrier ToCarrier(const TraceContext& ctx);
+std::string EncodeTraceCarrier(const TraceCarrier& carrier);
+TraceCarrier DecodeTraceCarrier(const std::string& encoded);
 TraceContext ChildContextFromCarrier(const TraceCarrier& carrier);
 TraceContext RootContext(const std::string& correlation_id = "");
 

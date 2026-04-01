@@ -446,7 +446,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code,
+    const tracing::TraceContext* trace_context) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -461,17 +462,20 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
         switch (strategy) {
             case TransferStrategy::LOCAL_MEMCPY:
-                future = submitMemcpyOperation(handle, slices, op_code);
+                future = submitMemcpyOperation(handle, slices, op_code,
+                                               trace_context);
                 break;
             case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
+                future = submitTransferEngineOperation(handle, slices, op_code,
+                                                       trace_context);
                 break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                 return std::nullopt;
         }
     } else {
-        future = submitFileReadOperation(replica, slices, op_code);
+        future = submitFileReadOperation(replica, slices, op_code,
+                                         trace_context);
     }
 
     // Update metrics on successful submission
@@ -485,7 +489,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code,
+    const tracing::TraceContext* trace_context) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
@@ -514,7 +519,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+    future = submitTransfer(requests, trace_context);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -548,12 +553,14 @@ TransferSubmitter::submit_batch_get_offload_object(
         request.length = slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, nullptr);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code,
+    const tracing::TraceContext* trace_context) {
+    (void)trace_context;
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
@@ -597,20 +604,29 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests,
+    const tracing::TraceContext* trace_context) {
+    auto& tracing = tracing::TracingFacade::Instance("mooncake-store",
+                                                     "transfer-task");
+    auto span = tracing.StartSpan(
+        "mooncake.transfer.prepare", trace_context,
+        {{"batch.size", std::to_string(requests.size())}});
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
+        span.SetStatus("ERROR");
         return std::nullopt;
     }
+    span.SetAttribute("te.batch_id", std::to_string(batch_id));
 
     // Submit transfer
     Status s = engine_.submitTransfer(batch_id, requests);
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
+        span.SetStatus("ERROR");
         // Note: batch_id will be freed by TransferEngineOperationState
         // destructor if we create the state object, otherwise we need to free
         // it here
@@ -626,14 +642,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size);
+        engine_, batch_id, batch_size, span.context());
 
     return TransferFuture(state);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code,
+    const tracing::TraceContext* trace_context) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -667,12 +684,14 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, trace_context);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code,
+    const tracing::TraceContext* trace_context) {
+    (void)trace_context;
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;

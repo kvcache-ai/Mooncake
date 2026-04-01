@@ -387,12 +387,15 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code);
+                                         TransferRequest::OpCode op_code,
+                                         const tracing::TraceContext* trace_context =
+                                             nullptr);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code,
+        const tracing::TraceContext* trace_context = nullptr);
 
     std::optional<TransferFuture> submit_batch_get_offload_object(
         const std::string& transfer_engine_addr,
@@ -430,7 +433,8 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const TransferRequest::OpCode op_code,
+        const tracing::TraceContext* trace_context);
 
     /**
      * @brief Submit transfer engine operation asynchronously
@@ -438,11 +442,13 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const TransferRequest::OpCode op_code,
+        const tracing::TraceContext* trace_context);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code,
+        const tracing::TraceContext* trace_context);
 
     /**
      * @brief Calculate total bytes for transfer operation and update metrics
@@ -451,7 +457,8 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests,
+        const tracing::TraceContext* trace_context);
 };
 
 }  // namespace mooncake

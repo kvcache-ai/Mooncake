@@ -1,6 +1,7 @@
 #include "task_manager.h"
 #include <glog/logging.h>
 #include <msgpack.hpp>
+#include "tracing_facade.h"
 #include "utils/zstd_util.h"
 
 namespace mooncake {
@@ -29,10 +30,21 @@ size_t ScopedTaskReadAccess::size() const {
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload,
     const std::string& trace_carrier) {
+    auto carrier = tracing::DecodeTraceCarrier(trace_carrier);
+    auto& tracing_facade = tracing::TracingFacade::Instance(
+        "mooncake-store", "task-manager");
+    auto span = carrier.empty()
+                    ? tracing_facade.StartSpan(
+                          "task_manager.submit_task", nullptr,
+                          {{"assigned_client", UuidToString(client_id)}})
+                    : tracing_facade.StartSpanFromCarrier(
+                          "task_manager.submit_task", carrier,
+                          {{"assigned_client", UuidToString(client_id)}});
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"
                    << manager_->max_total_pending_tasks_ << ")";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
     }
     UUID id = generate_uuid();
@@ -53,6 +65,7 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
+    span.SetAttribute("task.id", UuidToString(task.id));
 
     return task.id;
 }
@@ -90,7 +103,19 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
         }
 
         Task& task = it->second;
+        auto carrier = tracing::DecodeTraceCarrier(task.trace_carrier);
+        auto& tracing_facade = tracing::TracingFacade::Instance(
+            "mooncake-store", "task-manager");
+        auto span = carrier.empty()
+                        ? tracing_facade.StartSpan(
+                              "task_manager.pop_tasks", nullptr,
+                              {{"task.id", UuidToString(task.id)}})
+                        : tracing_facade.StartSpanFromCarrier(
+                              "task_manager.pop_tasks", carrier,
+                              {{"task.id", UuidToString(task.id)}});
         task.mark_processing();
+        span.AddEvent("task marked processing",
+                      {{"assigned_client", UuidToString(client_id)}});
 
         const auto [_, inserted] = processing_set.insert(task_id);
         if (!inserted) {
@@ -111,6 +136,8 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,
                                                const std::string& message) {
+    auto& tracing_facade = tracing::TracingFacade::Instance(
+        "mooncake-store", "task-manager");
     if (!is_finished_status(status)) {
         LOG(ERROR) << "complete_task: invalid completion status=" << status
                    << ", task_id=" << task_id;
@@ -124,10 +151,19 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
     }
 
     Task& task = it->second;
+    auto carrier = tracing::DecodeTraceCarrier(task.trace_carrier);
+    auto span = carrier.empty()
+                    ? tracing_facade.StartSpan(
+                          "task_manager.complete_task", nullptr,
+                          {{"task.id", UuidToString(task_id)}})
+                    : tracing_facade.StartSpanFromCarrier(
+                          "task_manager.complete_task", carrier,
+                          {{"task.id", UuidToString(task_id)}});
 
     if (task.assigned_client != client_id) {
         LOG(ERROR) << "Client " << client_id << " is not assigned to task "
                    << task_id;
+        span.SetStatus("ERROR");
         return ErrorCode::ILLEGAL_CLIENT;
     }
 
@@ -138,6 +174,11 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
     }
 
     task.mark_complete(status, message);
+    span.SetAttribute("task.status", status == TaskStatus::SUCCESS ? "SUCCESS"
+                                                                   : "FAILED");
+    if (status == TaskStatus::FAILED) {
+        span.SetStatus("ERROR");
+    }
 
     auto ps_it = manager_->processing_tasks_.find(client_id);
     if (ps_it != manager_->processing_tasks_.end()) {
@@ -154,15 +195,28 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
+    auto& tracing_facade = tracing::TracingFacade::Instance(
+        "mooncake-store", "task-manager");
+    const auto before = manager_->finished_task_history_.size();
     while (manager_->finished_task_history_.size() >
            manager_->max_total_finished_tasks_) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
         manager_->finished_task_history_.pop_front();
         manager_->all_tasks_.erase(oldest_task_id);
     }
+    const auto after = manager_->finished_task_history_.size();
+    auto span = tracing_facade.StartSpan(
+        "task_manager.prune_finished_tasks", nullptr,
+        {{"finished.count.before", std::to_string(before)},
+         {"finished.count.after", std::to_string(after)},
+         {"tasks.pruned", std::to_string(before - after)}});
 }
 
 void ScopedTaskWriteAccess::prune_expired_tasks() {
+    auto& tracing_facade = tracing::TracingFacade::Instance(
+        "mooncake-store", "task-manager");
+    const auto pending_before = manager_->total_pending_tasks_;
+    const auto processing_before = manager_->total_processing_tasks_;
     const auto now = std::chrono::system_clock::now();
     // Pending timeout: based on created_at
     if (manager_->pending_task_timeout_sec_ > 0) {
@@ -252,6 +306,14 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
             }
         }
     }
+
+    auto span = tracing_facade.StartSpan(
+        "task_manager.prune_expired_tasks", nullptr,
+        {{"pending.before", std::to_string(pending_before)},
+         {"pending.after", std::to_string(manager_->total_pending_tasks_)},
+         {"processing.before", std::to_string(processing_before)},
+         {"processing.after",
+          std::to_string(manager_->total_processing_tasks_)}});
 }
 
 void ScopedTaskWriteAccess::restore_task(Task&& task) {
@@ -334,6 +396,8 @@ TaskManagerSerializer::Serialize() {
                 .count()));
         packer.pack(task.message);
         packer.pack(UuidToString(task.assigned_client));
+        packer.pack(task.max_retry_attempts);
+        packer.pack(task.trace_carrier);
     }
 
     // Compress entire data
@@ -417,6 +481,8 @@ tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
             task.last_updated_at = std::chrono::system_clock::time_point(
                 std::chrono::milliseconds(arr[5].as<int64_t>()));
             task.message = arr[6].as<std::string>();
+            task.max_retry_attempts = arr[8].as<uint32_t>();
+            task.trace_carrier = arr[9].as<std::string>();
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid task field types for task index " << i
                          << ": " << e.what() << ", skipping deserialization";

@@ -22,6 +22,8 @@
 #include <iomanip>
 #include <memory>
 
+#include "multi_transport.h"
+#include "trace_context.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -170,6 +172,97 @@ TEST_F(TransportTest, ReadEmptyFile) {
     EXPECT_EQ(bytesRead, static_cast<ssize_t>(0));
 
     close(fd);
+}
+
+TEST_F(TransportTest, BatchTraceRegistryDeduplicatesSliceAndTaskTerminal) {
+    MultiTransportTraceRegistry registry;
+    Transport::BatchID batch_id = 42;
+
+    tracing::TraceContext batch_context{
+        .trace_id = "trace-1",
+        .span_id = "batch-span",
+        .parent_span_id = "",
+        .correlation_id = "corr-1"};
+    tracing::TraceContext task_context{
+        .trace_id = "trace-1",
+        .span_id = "task-span",
+        .parent_span_id = "batch-span",
+        .correlation_id = "corr-1"};
+
+    registry.RegisterBatch(batch_id, batch_context);
+    registry.RegisterTask(batch_id, 0, task_context, "tcp", 2, 1024);
+
+    auto task = registry.LookupTask(batch_id, 0);
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(task->transport_name, "tcp");
+    EXPECT_EQ(task->slice_terminal_states.size(), 2u);
+
+    EXPECT_TRUE(registry.MarkSliceQueued(batch_id, 0, 0));
+    EXPECT_FALSE(registry.MarkSliceQueued(batch_id, 0, 0));
+
+    EXPECT_TRUE(registry.MarkSliceTerminal(
+        batch_id, 0, 0, Transport::Slice::SUCCESS));
+    EXPECT_FALSE(registry.MarkSliceTerminal(
+        batch_id, 0, 0, Transport::Slice::SUCCESS));
+
+    EXPECT_TRUE(registry.MarkTaskTerminal(batch_id, 0));
+    EXPECT_FALSE(registry.MarkTaskTerminal(batch_id, 0));
+
+    EXPECT_TRUE(registry.MarkBatchTerminal(batch_id));
+    EXPECT_FALSE(registry.MarkBatchTerminal(batch_id));
+}
+
+TEST_F(TransportTest, BatchTraceRegistryTracksTimeoutAsDistinctTerminal) {
+    MultiTransportTraceRegistry registry;
+    Transport::BatchID batch_id = 7;
+
+    tracing::TraceContext batch_context{
+        .trace_id = "trace-2",
+        .span_id = "batch-2",
+        .parent_span_id = "",
+        .correlation_id = "corr-2"};
+    tracing::TraceContext task_context{
+        .trace_id = "trace-2",
+        .span_id = "task-2",
+        .parent_span_id = "batch-2",
+        .correlation_id = "corr-2"};
+
+    registry.RegisterBatch(batch_id, batch_context);
+    registry.RegisterTask(batch_id, 1, task_context, "rdma", 1, 4096);
+
+    EXPECT_TRUE(registry.MarkSliceTerminal(
+        batch_id, 1, 0, Transport::Slice::TIMEOUT));
+    EXPECT_FALSE(registry.MarkSliceTerminal(
+        batch_id, 1, 0, Transport::Slice::FAILED));
+
+    auto task = registry.LookupTask(batch_id, 1);
+    ASSERT_TRUE(task.has_value());
+    EXPECT_EQ(task->slice_terminal_states[0],
+              MultiTransportTraceRegistry::SliceTerminalState::kTimedOut);
+}
+
+TEST_F(TransportTest, BatchTraceRegistryKeepsFirstBatchContext) {
+    MultiTransportTraceRegistry registry;
+    Transport::BatchID batch_id = 99;
+
+    tracing::TraceContext root_context{
+        .trace_id = "trace-root",
+        .span_id = "root-span",
+        .parent_span_id = "",
+        .correlation_id = "corr-root"};
+    tracing::TraceContext later_context{
+        .trace_id = "trace-root",
+        .span_id = "later-span",
+        .parent_span_id = "root-span",
+        .correlation_id = "corr-root"};
+
+    registry.RegisterBatch(batch_id, root_context);
+    registry.RegisterBatch(batch_id, later_context);
+
+    auto batch_context = registry.LookupBatchContext(batch_id);
+    ASSERT_TRUE(batch_context.has_value());
+    EXPECT_EQ(batch_context->span_id, "root-span");
+    EXPECT_EQ(batch_context->trace_id, "trace-root");
 }
 }  // namespace mooncake
 
