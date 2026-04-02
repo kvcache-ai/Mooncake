@@ -564,7 +564,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
     if (rc) {
-        LOG(ERROR) << "ibv_post_send: " << strerror(-rc) << " [" << rc << "]";
+        LOG(ERROR) << "ibv_post_send: " << strerror(abs(rc)) << " [" << rc
+                   << "]";
         while (bad_wr) {
             slice_list[bad_wr - wr_list.data()]->failed = true;
             cancelQuota(qp_index, 1);
@@ -593,7 +594,8 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     int rc = ibv_post_recv(qp_list_[qp_index], &wr, &bad_wr);
     if (rc) {
         cancelQuota(qp_index, 1);
-        LOG(ERROR) << "ibv_post_recv: " << strerror(-rc) << " [" << rc << "]";
+        LOG(ERROR) << "ibv_post_recv: " << strerror(abs(rc)) << " [" << rc
+                   << "]";
         return -1;
     }
     return 1;
@@ -772,7 +774,7 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     ibv_recv_wr* bad_wr = nullptr;
     int ret = ibv_post_recv(notify_qp_, &wr, &bad_wr);
     if (ret) {
-        LOG(ERROR) << "Failed to post notification recv: " << strerror(-ret)
+        LOG(ERROR) << "Failed to post notification recv: " << strerror(abs(ret))
                    << " [" << ret << "]";
     }
 }
@@ -924,7 +926,7 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
     if (ret) {
-        LOG(ERROR) << "Failed to post notification send: " << strerror(-ret)
+        LOG(ERROR) << "Failed to post notification send: " << strerror(abs(ret))
                    << " [" << ret << "], "
                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
                    << ", endpoint: " << peer_nic_name_ << " of "
