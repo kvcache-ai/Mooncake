@@ -184,6 +184,8 @@ class TransferTraceSession {
 
     bool owns_operation_span() const { return operation_span_.valid(); }
 
+    void StartQueueWait(mooncake::tracing::TracingFacade& tracing,
+                        BatchID batch_id, size_t batch_size);
     mooncake::tracing::Span* EnsureWaitSpan(
         mooncake::tracing::TracingFacade& tracing, BatchID batch_id,
         size_t batch_size);
@@ -194,11 +196,16 @@ class TransferTraceSession {
     void RecordBatch(BatchID batch_id);
     void MarkSubmitError();
     void FinishWait(ErrorCode error_code);
-    void Finish(ErrorCode error_code);
+    void Finish(mooncake::tracing::TracingFacade& tracing,
+                ErrorCode error_code);
 
    private:
+    void FinishQueueWait(ErrorCode error_code);
+
     mooncake::tracing::TraceContext parent_context_;
     mooncake::tracing::Span operation_span_;
+    mooncake::tracing::Span queue_wait_span_;
+    mooncake::tracing::TraceContext queue_wait_context_;
     mooncake::tracing::Span wait_span_;
     mooncake::tracing::TraceContext wait_context_;
     BatchID batch_id_{INVALID_BATCH_ID};

@@ -181,6 +181,24 @@ void TransferTraceSession::RecordBatch(BatchID batch_id) {
     operation_span_.SetAttribute("te.batch_id", std::to_string(batch_id_));
 }
 
+void TransferTraceSession::StartQueueWait(
+    mooncake::tracing::TracingFacade& tracing, BatchID batch_id,
+    size_t batch_size) {
+    if (queue_wait_context_.valid() || wait_context_.valid()) {
+        return;
+    }
+
+    auto span = tracing.StartSpan(
+        "mooncake.transfer.queue_wait", parent_context(),
+        {{"te.batch_id", std::to_string(batch_id)},
+         {"batch.size", std::to_string(batch_size)}});
+    if (!span.valid()) {
+        return;
+    }
+    queue_wait_context_ = span.context();
+    queue_wait_span_ = std::move(span);
+}
+
 void TransferTraceSession::MarkSubmitError() {
     if (!operation_span_.valid()) {
         return;
@@ -193,12 +211,30 @@ void TransferTraceSession::MarkSubmitError() {
     operation_span_.SetStatus("ERROR");
 }
 
+void TransferTraceSession::FinishQueueWait(ErrorCode error_code) {
+    if (!queue_wait_context_.valid()) {
+        return;
+    }
+
+    queue_wait_span_.AddEvent(
+        "queue wait finished",
+        {{"result.code", std::to_string(static_cast<int>(error_code))}});
+    if (error_code != ErrorCode::OK) {
+        queue_wait_span_.SetStatus("ERROR");
+    }
+    queue_wait_span_.End();
+    queue_wait_span_ = mooncake::tracing::Span();
+    queue_wait_context_ = {};
+}
+
 mooncake::tracing::Span* TransferTraceSession::EnsureWaitSpan(
     mooncake::tracing::TracingFacade& tracing, BatchID batch_id,
     size_t batch_size) {
     if (wait_context_.valid()) {
         return &wait_span_;
     }
+
+    FinishQueueWait(ErrorCode::OK);
 
     auto span = tracing.StartSpan(
         "mooncake.transfer.wait_completion", parent_context(),
@@ -228,7 +264,25 @@ void TransferTraceSession::FinishWait(ErrorCode error_code) {
     wait_context_ = {};
 }
 
-void TransferTraceSession::Finish(ErrorCode error_code) {
+void TransferTraceSession::Finish(mooncake::tracing::TracingFacade& tracing,
+                                  ErrorCode error_code) {
+    FinishQueueWait(error_code);
+    auto complete_span = tracing.StartSpan(
+        "mooncake.transfer.complete", parent_context(),
+        {{"batch.size", std::to_string(batch_size_)},
+         {"result.code", std::to_string(static_cast<int>(error_code))}});
+    if (complete_span.valid()) {
+        if (batch_id_ != INVALID_BATCH_ID) {
+            complete_span.SetAttribute("te.batch_id", std::to_string(batch_id_));
+        }
+        complete_span.AddEvent(
+            "transfer operation completed",
+            {{"result.code", std::to_string(static_cast<int>(error_code))}});
+        if (error_code != ErrorCode::OK) {
+            complete_span.SetStatus("ERROR");
+        }
+    }
+
     if (!operation_span_.valid()) {
         return;
     }
@@ -434,7 +488,9 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
             << static_cast<int>(error_code);
     result_.emplace(error_code);
     trace_session_.FinishWait(error_code);
-    trace_session_.Finish(error_code);
+    auto& tracing = mooncake::tracing::TracingFacade::Instance(
+        "mooncake-store", "transfer-task");
+    trace_session_.Finish(tracing, error_code);
 }
 
 void TransferEngineOperationState::wait_for_completion() {
@@ -789,6 +845,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         LOG(ERROR) << "Invalid batch ID for transfer engine operation";
         return std::nullopt;
     }
+
+    trace_session.StartQueueWait(tracing, batch_id, batch_size);
 
     // Create state with transfer engine context - no polling thread
     // needed

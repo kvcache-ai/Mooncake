@@ -426,6 +426,35 @@ class TransferEngineImpl {
                              TransferStatus& status) {
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
+        const bool is_terminal =
+            result.ok() &&
+            (status.s == TransferStatusEnum::COMPLETED ||
+             status.s == TransferStatusEnum::FAILED ||
+             status.s == TransferStatusEnum::TIMEOUT ||
+             status.s == TransferStatusEnum::CANCELED);
+        if (!result.ok() || is_terminal) {
+            auto span = StartBatchOperationSpan(
+                "getTransferStatus", batch_id, nullptr,
+                {{"te.batch_id", std::to_string(batch_id)},
+                 {"task.id", std::to_string(task_id)},
+                 {"status",
+                  result.ok() ? ToTransferStatusName(status.s) : "ERROR"}});
+            if (!result.ok()) {
+                span.SetStatus("ERROR");
+                span.AddEvent("status query failed",
+                              {{"task.id", std::to_string(task_id)},
+                               {"error.message", std::string(result.message())}});
+            } else {
+                span.AddEvent("task terminal status",
+                              {{"task.id", std::to_string(task_id)},
+                               {"status", ToTransferStatusName(status.s)},
+                               {"transferred.bytes",
+                                std::to_string(status.transferred_bytes)}});
+                if (status.s != TransferStatusEnum::COMPLETED) {
+                    span.SetStatus("ERROR");
+                }
+            }
+        }
 #ifdef WITH_METRICS
         if (!metrics_enabled_ || !result.ok()) {
             goto metrics_done;

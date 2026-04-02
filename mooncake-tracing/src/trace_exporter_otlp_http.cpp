@@ -21,6 +21,9 @@
 
 namespace mooncake::tracing {
 namespace {
+constexpr size_t kMaxRemoteBatchItems = 256;
+constexpr size_t kMaxRemoteBatchBytes = 512 * 1024;
+
 std::string BuildSpoolFileName(const TraceConfig& config) {
     std::string file_name = config.service_name;
     if (!config.node_id.empty()) {
@@ -98,51 +101,8 @@ Json::Value RecordToJson(const TraceRecord& record) {
     root["events"] = events;
     return root;
 }
-}  // namespace
 
-OtlpHttpTraceExporter::OtlpHttpTraceExporter(std::string endpoint,
-                                             std::string path,
-                                             std::string headers,
-                                             int timeout_ms)
-    : endpoint_(std::move(endpoint)),
-      path_(std::move(path)),
-      headers_(std::move(headers)),
-      timeout_ms_(timeout_ms) {}
-
-void OtlpHttpTraceExporter::Export(const TraceRecord& record) {
-    std::string ignored_error;
-    (void)TryExport(record, &ignored_error);
-}
-
-bool OtlpHttpTraceExporter::TryExport(const TraceRecord& record,
-                                      std::string* error_message) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        LOG(ERROR) << "OTLP exporter: curl_easy_init failed";
-        if (error_message) {
-            *error_message = "curl_easy_init failed";
-        }
-        return false;
-    }
-
-    Json::Value root;
-    Json::Value resource_spans(Json::arrayValue);
-    Json::Value resource_span;
-    Json::Value resource_attrs(Json::arrayValue);
-    resource_attrs.append(AttrToJson({"service.name", record.service_name}));
-    if (!record.node_id.empty()) {
-        resource_attrs.append(AttrToJson({"service.instance.id", record.node_id}));
-    }
-    if (!record.process_role.empty()) {
-        resource_attrs.append(AttrToJson({"mooncake.process_role", record.process_role}));
-    }
-    resource_span["resource"]["attributes"] = resource_attrs;
-
-    Json::Value scope_spans(Json::arrayValue);
-    Json::Value scope_span;
-    scope_span["scope"]["name"] = "mooncake-tracing";
-    Json::Value spans(Json::arrayValue);
+Json::Value RecordToOtlpSpan(const TraceRecord& record) {
     Json::Value span;
     span["traceId"] = NormalizeTraceId(record.trace_id);
     span["spanId"] = NormalizeSpanId(record.span_id);
@@ -158,7 +118,9 @@ bool OtlpHttpTraceExporter::TryExport(const TraceRecord& record,
     if (!record.correlation_id.empty()) {
         attrs.append(AttrToJson({"correlation.id", record.correlation_id}));
     }
-    for (const auto& kv : record.attrs) attrs.append(AttrToJson(kv));
+    for (const auto& kv : record.attrs) {
+        attrs.append(AttrToJson(kv));
+    }
     span["attributes"] = attrs;
 
     Json::Value events(Json::arrayValue);
@@ -167,7 +129,9 @@ bool OtlpHttpTraceExporter::TryExport(const TraceRecord& record,
         event["name"] = ev.name;
         event["timeUnixNano"] = std::to_string(ev.unix_nano);
         Json::Value event_attrs(Json::arrayValue);
-        for (const auto& kv : ev.attrs) event_attrs.append(AttrToJson(kv));
+        for (const auto& kv : ev.attrs) {
+            event_attrs.append(AttrToJson(kv));
+        }
         event["attributes"] = event_attrs;
         events.append(event);
     }
@@ -178,70 +142,188 @@ bool OtlpHttpTraceExporter::TryExport(const TraceRecord& record,
     } else {
         span["status"]["code"] = 1;
     }
+    return span;
+}
 
-    spans.append(span);
-    scope_span["spans"] = spans;
-    scope_spans.append(scope_span);
-    resource_span["scopeSpans"] = scope_spans;
-    resource_spans.append(resource_span);
+std::string BuildOtlpUrl(const std::string& endpoint, const std::string& path) {
+    std::string url = endpoint;
+    if (!path.empty()) {
+        if (!url.empty() && url.back() == '/' && path.front() == '/') {
+            url.pop_back();
+        }
+        url += path;
+    }
+    return url;
+}
+
+std::string BuildOtlpPayload(const std::vector<TraceRecord>& records) {
+    Json::Value root;
+    Json::Value resource_spans(Json::arrayValue);
+    if (!records.empty()) {
+        const auto& first = records.front();
+        Json::Value resource_span;
+        Json::Value resource_attrs(Json::arrayValue);
+        resource_attrs.append(AttrToJson({"service.name", first.service_name}));
+        if (!first.node_id.empty()) {
+            resource_attrs.append(
+                AttrToJson({"service.instance.id", first.node_id}));
+        }
+        if (!first.process_role.empty()) {
+            resource_attrs.append(
+                AttrToJson({"mooncake.process_role", first.process_role}));
+        }
+        resource_span["resource"]["attributes"] = resource_attrs;
+
+        Json::Value scope_spans(Json::arrayValue);
+        Json::Value scope_span;
+        scope_span["scope"]["name"] = "mooncake-tracing";
+        Json::Value spans(Json::arrayValue);
+        for (const auto& record : records) {
+            spans.append(RecordToOtlpSpan(record));
+        }
+        scope_span["spans"] = spans;
+        scope_spans.append(scope_span);
+        resource_span["scopeSpans"] = scope_spans;
+        resource_spans.append(resource_span);
+    }
     root["resourceSpans"] = resource_spans;
 
     Json::StreamWriterBuilder builder;
     builder["indentation"] = "";
-    const std::string payload = Json::writeString(builder, root);
+    return Json::writeString(builder, root);
+}
 
-    std::string url = endpoint_;
-    if (!path_.empty()) {
-        if (!url.empty() && url.back() == '/' && path_.front() == '/') {
-            url.pop_back();
+bool IsHighPriorityRecord(const TraceRecord& record, const TraceConfig& config) {
+    if (record.parent_span_id.empty()) {
+        return true;
+    }
+    if (record.status == "ERROR") {
+        return true;
+    }
+    if (config.sampling_slow_threshold_ms > 0 &&
+        record.end_time_unix_nano > record.start_time_unix_nano) {
+        const auto duration_ms =
+            (record.end_time_unix_nano - record.start_time_unix_nano) / 1000000;
+        if (duration_ms >= config.sampling_slow_threshold_ms) {
+            return true;
         }
-        url += path_;
+    }
+    return false;
+}
+}  // namespace
+
+OtlpHttpTraceExporter::OtlpHttpTraceExporter(std::string endpoint,
+                                             std::string path,
+                                             std::string headers,
+                                             int timeout_ms)
+    : endpoint_(std::move(endpoint)),
+      path_(std::move(path)),
+      headers_(std::move(headers)),
+      timeout_ms_(timeout_ms) {}
+
+OtlpHttpTraceExporter::~OtlpHttpTraceExporter() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (header_list_ != nullptr) {
+        curl_slist_free_all(header_list_);
+        header_list_ = nullptr;
+    }
+    if (curl_ != nullptr) {
+        curl_easy_cleanup(curl_);
+        curl_ = nullptr;
+    }
+}
+
+void OtlpHttpTraceExporter::Export(const TraceRecord& record) {
+    std::string ignored_error;
+    (void)TryExport(record, &ignored_error);
+}
+
+void OtlpHttpTraceExporter::ExportBatch(const std::vector<TraceRecord>& records) {
+    std::string ignored_error;
+    (void)TryExportBatch(records, &ignored_error);
+}
+
+bool OtlpHttpTraceExporter::TryExport(const TraceRecord& record,
+                                      std::string* error_message) {
+    return TryExportBatch(std::vector<TraceRecord>{record}, error_message);
+}
+
+bool OtlpHttpTraceExporter::EnsureCurlLocked() {
+    if (curl_ != nullptr) {
+        return true;
     }
 
-    struct curl_slist* header_list = nullptr;
-    header_list = curl_slist_append(header_list, "Content-Type: application/json");
+    curl_ = curl_easy_init();
+    if (curl_ == nullptr) {
+        LOG(ERROR) << "OTLP exporter: curl_easy_init failed";
+        return false;
+    }
+
+    header_list_ = curl_slist_append(header_list_, "Content-Type: application/json");
     if (!headers_.empty()) {
         std::stringstream ss(headers_);
         std::string item;
         while (std::getline(ss, item, ',')) {
-            if (!item.empty()) header_list = curl_slist_append(header_list, item.c_str());
+            if (!item.empty()) {
+                header_list_ = curl_slist_append(header_list_, item.c_str());
+            }
         }
     }
 
+    const auto url = BuildOtlpUrl(endpoint_, path_);
+    curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl_, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout_ms_);
+    curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms_);
+    curl_easy_setopt(curl_, CURLOPT_DNS_CACHE_TIMEOUT, 300L);
+    curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, header_list_);
+    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
+    return true;
+}
+
+bool OtlpHttpTraceExporter::TryExportBatch(const std::vector<TraceRecord>& records,
+                                           std::string* error_message) {
+    if (records.empty()) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!EnsureCurlLocked()) {
+        if (error_message) {
+            *error_message = "curl_easy_init failed";
+        }
+        return false;
+    }
+
+    const std::string payload = BuildOtlpPayload(records);
     std::string response;
     char errbuf[CURL_ERROR_SIZE] = {0};
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, payload.size());
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms_);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, timeout_ms_);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, header_list);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, payload.c_str());
+    curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, payload.size());
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl_, CURLOPT_ERRORBUFFER, errbuf);
 
-    CURLcode rc = curl_easy_perform(curl);
+    CURLcode rc = curl_easy_perform(curl_);
     long code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
     bool ok = rc == CURLE_OK && code >= 200 && code < 300;
     if (rc != CURLE_OK || code < 200 || code >= 300) {
+        const auto url = BuildOtlpUrl(endpoint_, path_);
         std::ostringstream oss;
         oss << "OTLP exporter POST failed url=" << url
             << " curl=" << curl_easy_strerror(rc) << " http=" << code
             << " errbuf=" << errbuf << " body=" << response;
-        LOG(ERROR) << "OTLP exporter POST failed url=" << url
-                   << " curl=" << curl_easy_strerror(rc)
-                   << " http=" << code << " errbuf=" << errbuf
-                   << " body=" << response;
+        LOG_EVERY_N(ERROR, 100)
+            << "OTLP exporter POST failed url=" << url
+            << " curl=" << curl_easy_strerror(rc)
+            << " http=" << code << " errbuf=" << errbuf
+            << " body=" << response << " batch_size=" << records.size();
         if (error_message) {
             *error_message = oss.str();
         }
     }
-
-    curl_slist_free_all(header_list);
-    curl_easy_cleanup(curl);
     return ok;
 }
 
@@ -265,8 +347,9 @@ AsyncRemoteTraceExporter::AsyncRemoteTraceExporter(
                 endpoint, config_.otlp_http_path, config_.otlp_headers,
                 config_.otlp_timeout_ms);
             remote_send_fns_.push_back(
-                [remote](const TraceRecord& record, std::string* error_message) {
-                    return remote->TryExport(record, error_message);
+                [remote](const std::vector<TraceRecord>& records,
+                         std::string* error_message) {
+                    return remote->TryExportBatch(records, error_message);
                 });
         }
     }
@@ -287,11 +370,46 @@ AsyncRemoteTraceExporter::~AsyncRemoteTraceExporter() {
 void AsyncRemoteTraceExporter::Export(const TraceRecord& record) {
     const auto record_bytes = EstimateRecordBytes(record);
     std::lock_guard<std::mutex> lock(mutex_);
-    if (queue_.size() >= config_.exporter_queue_max_items ||
-        queued_bytes_ + record_bytes > config_.exporter_queue_max_bytes) {
-        stats_.dropped_records++;
+    const bool queue_full =
+        queue_.size() >= config_.exporter_queue_max_items ||
+        queued_bytes_ + record_bytes > config_.exporter_queue_max_bytes;
+    if (queue_full) {
         stats_.queue_full_count++;
-        LOG_EVERY_N(WARNING, 100)
+
+        if (IsHighPriorityRecord(record, config_)) {
+            bool evicted = false;
+            while ((queue_.size() >= config_.exporter_queue_max_items ||
+                    queued_bytes_ + record_bytes >
+                        config_.exporter_queue_max_bytes) &&
+                   !queue_.empty()) {
+                auto it = std::find_if(queue_.begin(), queue_.end(),
+                                       [this](const TraceRecord& queued) {
+                                           return !IsHighPriorityRecord(
+                                               queued, config_);
+                                       });
+                if (it == queue_.end()) {
+                    break;
+                }
+                queued_bytes_ -=
+                    std::min(queued_bytes_, EstimateRecordBytes(*it));
+                queue_.erase(it);
+                stats_.dropped_records++;
+                evicted = true;
+            }
+            if (evicted && queue_.size() < config_.exporter_queue_max_items &&
+                queued_bytes_ + record_bytes <=
+                    config_.exporter_queue_max_bytes) {
+                queue_.push_back(record);
+                queued_bytes_ += record_bytes;
+                stats_.queued_records = queue_.size();
+                stats_.queued_bytes = queued_bytes_;
+                cv_.notify_one();
+                return;
+            }
+        }
+
+        stats_.dropped_records++;
+        LOG_EVERY_N(WARNING, 1000)
             << "Tracing queue full, dropping record span=" << record.span_name;
         return;
     }
@@ -336,12 +454,12 @@ size_t AsyncRemoteTraceExporter::EstimateRecordBytes(
     return total;
 }
 
-bool AsyncRemoteTraceExporter::TrySendRemote(const TraceRecord& record,
+bool AsyncRemoteTraceExporter::TrySendRemote(const std::vector<TraceRecord>& records,
                                              std::string* error_message) {
     std::ostringstream oss;
     for (size_t i = 0; i < remote_send_fns_.size(); ++i) {
         std::string endpoint_error;
-        if (remote_send_fns_[i](record, &endpoint_error)) {
+        if (remote_send_fns_[i](records, &endpoint_error)) {
             return true;
         }
         if (!endpoint_error.empty()) {
@@ -399,7 +517,7 @@ bool AsyncRemoteTraceExporter::TrySpool(const TraceRecord& record,
 
 void AsyncRemoteTraceExporter::WorkerMain() {
     while (true) {
-        TraceRecord record;
+        std::vector<TraceRecord> records;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
@@ -407,9 +525,18 @@ void AsyncRemoteTraceExporter::WorkerMain() {
                 break;
             }
             worker_busy_ = true;
-            record = std::move(queue_.front());
-            queued_bytes_ -= std::min(queued_bytes_, EstimateRecordBytes(record));
-            queue_.pop_front();
+            size_t batch_bytes = 0;
+            while (!queue_.empty() && records.size() < kMaxRemoteBatchItems) {
+                const auto next_bytes = EstimateRecordBytes(queue_.front());
+                if (!records.empty() &&
+                    batch_bytes + next_bytes > kMaxRemoteBatchBytes) {
+                    break;
+                }
+                batch_bytes += next_bytes;
+                queued_bytes_ -= std::min(queued_bytes_, next_bytes);
+                records.push_back(std::move(queue_.front()));
+                queue_.pop_front();
+            }
             stats_.queued_records = queue_.size();
             stats_.queued_bytes = queued_bytes_;
         }
@@ -419,7 +546,7 @@ void AsyncRemoteTraceExporter::WorkerMain() {
         int backoff_ms = std::max(1, config_.exporter_retry_base_ms);
         for (int attempt = 0; attempt <= config_.exporter_retry_max_attempts;
              ++attempt) {
-            if (TrySendRemote(record, &error_message)) {
+            if (TrySendRemote(records, &error_message)) {
                 exported = true;
                 break;
             }
@@ -436,36 +563,50 @@ void AsyncRemoteTraceExporter::WorkerMain() {
         }
 
         if (!exported) {
-            bool spooled = false;
+            size_t spooled_records = 0;
+            size_t fallback_records = 0;
+            size_t spool_failures = 0;
             std::string spool_error;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                stats_.collector_unreachable_count++;
+                stats_.collector_unreachable_count += records.size();
             }
             LOG_EVERY_N(ERROR, 100)
                 << "Tracing remote exporter unavailable, span="
-                << record.span_name << " error=" << error_message;
+                << (records.empty() ? "" : records.front().span_name)
+                << " error=" << error_message
+                << " batch_size=" << records.size();
 
-            if (!config_.exporter_spool_dir.empty()) {
-                spooled = TrySpool(record, &spool_error);
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (spooled) {
-                    stats_.spooled_records++;
-                } else {
-                    stats_.spool_failures++;
+            for (const auto& record : records) {
+                bool spooled = false;
+                std::string current_spool_error;
+                if (!config_.exporter_spool_dir.empty() &&
+                    IsHighPriorityRecord(record, config_)) {
+                    spooled = TrySpool(record, &current_spool_error);
+                    if (spooled) {
+                        ++spooled_records;
+                    } else if (!current_spool_error.empty()) {
+                        ++spool_failures;
+                        spool_error = current_spool_error;
+                    }
+                }
+
+                if (!spooled && fallback_exporter_) {
+                    fallback_exporter_->Export(record);
+                    ++fallback_records;
                 }
             }
 
-            if (!spooled && fallback_exporter_) {
-                fallback_exporter_->Export(record);
+            {
                 std::lock_guard<std::mutex> lock(mutex_);
-                stats_.fallback_count++;
+                stats_.spooled_records += spooled_records;
+                stats_.fallback_count += fallback_records;
+                stats_.spool_failures += spool_failures;
             }
 
-            if (!spooled && !spool_error.empty()) {
+            if (!spool_error.empty()) {
                 LOG_EVERY_N(ERROR, 100)
-                    << "Tracing spool failed, span=" << record.span_name
-                    << " error=" << spool_error;
+                    << "Tracing spool failed, error=" << spool_error;
             }
         }
 

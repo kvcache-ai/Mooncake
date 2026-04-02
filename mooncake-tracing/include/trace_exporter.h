@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <curl/curl.h>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -66,22 +67,30 @@ class OtlpHttpTraceExporter : public TraceExporter {
    public:
     OtlpHttpTraceExporter(std::string endpoint, std::string path,
                           std::string headers, int timeout_ms);
+    ~OtlpHttpTraceExporter() override;
     void Export(const TraceRecord& record) override;
+    void ExportBatch(const std::vector<TraceRecord>& records);
     bool TryExport(const TraceRecord& record,
                    std::string* error_message = nullptr);
+    bool TryExportBatch(const std::vector<TraceRecord>& records,
+                        std::string* error_message = nullptr);
 
    private:
+    bool EnsureCurlLocked();
+
     std::string endpoint_;
     std::string path_;
     std::string headers_;
     int timeout_ms_{3000};
     std::mutex mutex_;
+    CURL* curl_{nullptr};
+    curl_slist* header_list_{nullptr};
 };
 
 class AsyncRemoteTraceExporter : public TraceExporter {
    public:
-    using RemoteSendFn =
-        std::function<bool(const TraceRecord&, std::string* error_message)>;
+    using RemoteSendFn = std::function<bool(
+        const std::vector<TraceRecord>&, std::string* error_message)>;
 
     AsyncRemoteTraceExporter(TraceConfig config,
                              std::shared_ptr<TraceExporter> fallback_exporter,
@@ -94,7 +103,8 @@ class AsyncRemoteTraceExporter : public TraceExporter {
 
    private:
     size_t EstimateRecordBytes(const TraceRecord& record) const;
-    bool TrySendRemote(const TraceRecord& record, std::string* error_message);
+    bool TrySendRemote(const std::vector<TraceRecord>& records,
+                       std::string* error_message);
     bool TrySpool(const TraceRecord& record, std::string* error_message);
     void WorkerMain();
 
