@@ -15,8 +15,46 @@
 use std::env;
 use std::path::PathBuf;
 
+fn resolve_existing_path(candidates: &[PathBuf], kind: &str) -> PathBuf {
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+
+    panic!("Unable to locate {}. Checked: {:?}", kind, candidates);
+}
+
 fn main() {
-    println!("cargo:rustc-link-search=native=../build/src");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_TE_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_TE_HEADER");
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let transfer_engine_lib_dir = if let Ok(path) = env::var("MOONCAKE_TE_LIB_DIR") {
+        PathBuf::from(path)
+    } else {
+        resolve_existing_path(
+            &[
+                manifest_dir.join("../build/src"),
+                manifest_dir.join("../../build/mooncake-transfer-engine/src"),
+            ],
+            "Transfer Engine library directory",
+        )
+    };
+
+    let transfer_engine_header = if let Ok(path) = env::var("MOONCAKE_TE_HEADER") {
+        PathBuf::from(path)
+    } else {
+        resolve_existing_path(
+            &[manifest_dir.join("../include/transfer_engine_c.h")],
+            "Transfer Engine C header",
+        )
+    };
+
+    println!(
+        "cargo:rustc-link-search=native={}",
+        transfer_engine_lib_dir.display()
+    );
     println!("cargo:rustc-link-lib=static=transfer_engine");
 
     println!("cargo:rustc-link-lib=stdc++");
@@ -28,8 +66,10 @@ fn main() {
     println!("cargo:rustc-link-lib=numa");
     println!("cargo:rustc-link-lib=etcd-cpp-api");
 
+    println!("cargo:rerun-if-changed={}", transfer_engine_header.display());
+
     let bindings = bindgen::builder()
-        .header("../include/transfer_engine_c.h")
+        .header(transfer_engine_header.to_string_lossy())
         .generate()
         .expect("Unable to generate bindings");
 

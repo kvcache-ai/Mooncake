@@ -83,8 +83,46 @@ jobs:
           name: mooncake-wheel-non-cuda-py${{ steps.generate_tag_release.outputs.python_version_tag }}
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
+  build-rust-package:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+        shell: bash
+
+      - name: Build Rust release package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v} OUTPUT_DIR=dist-rust ./scripts/package_rust_release.sh
+        shell: bash
+
+      - name: Upload Rust release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-rust-release
+          path: |
+            dist-rust/*.tar.gz
+            dist-rust/*.sha256
+
   publish-release:
-    needs: build
+    needs:
+      - build
+      - build-rust-package
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -99,20 +137,32 @@ jobs:
           path: mooncake-wheel/dist-all
           pattern: mooncake-wheel-non-cuda-py*
 
+      - name: Download Rust release artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-rust-artifacts
+          pattern: mooncake-rust-release
+
       - name: Prepare wheels for release
         run: |
-          # Move all wheels to a single directory
           mkdir -p mooncake-wheel/dist-release
+          mkdir -p dist-rust-release
           find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          find dist-rust-artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} dist-rust-release/ \;
+
+          echo "Collected wheel assets:"
           ls -la mooncake-wheel/dist-release/
-          # List all collected wheels
-          echo "Collected wheels for release:"
-          ls -la mooncake-wheel/dist-release/
+
+          echo "Collected Rust assets:"
+          ls -la dist-rust-release/
 
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          files: mooncake-wheel/dist-release/*.whl
+          files: |
+            mooncake-wheel/dist-release/*.whl
+            dist-rust-release/*.tar.gz
+            dist-rust-release/*.sha256
 
       - name: Publish package to PyPI
         if: github.repository == 'kvcache-ai/Mooncake'

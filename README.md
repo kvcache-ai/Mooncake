@@ -254,6 +254,26 @@ The build and installation steps are as follows:
    sudo make install # optional, make it ready to be used by vLLM/SGLang
    ```
 
+### Use Rust release asset
+For users who only need the Rust Transfer Engine benchmark binary, each tagged GitHub release also publishes a standalone Rust package as a Release asset.
+
+The archive name follows this pattern:
+
+```bash
+mooncake-transfer-engine-rust-<version>-linux-<arch>.tar.gz
+```
+
+After downloading and extracting the archive, you can inspect the CLI options with:
+
+```bash
+./transfer_engine_rust --help
+```
+
+> [!NOTE]
+> - The Rust package currently ships the `transfer_engine_rust` benchmark binary, which wraps the Transfer Engine C API.
+> - The target host still needs Mooncake runtime dependencies such as RDMA / metadata backend prerequisites when applicable.
+> - GitHub Release also includes a matching `.sha256` file for integrity verification.
+
 
 <h2 id="milestones"> 🛣️ Incoming Milestones</h2>
 
