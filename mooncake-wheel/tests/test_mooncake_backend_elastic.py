@@ -80,7 +80,6 @@ def _deferred_recovery_worker(rank, num_processes, signals):
         while pg.get_num_synced_ranks(backend) < num_processes:
             time.sleep(0.1)
         if rank == broken_rank:
-            time.sleep(5)
             return  # Simulate broken rank
 
         expected_without_broken = sum(range(0, num_processes)) - broken_rank
