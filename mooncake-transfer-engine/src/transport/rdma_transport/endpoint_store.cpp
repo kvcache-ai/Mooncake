@@ -35,6 +35,17 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpoint(
     return nullptr;
 }
 
+std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        if (kv.second.get() == endpoint_ptr) return kv.second;
+    }
+    for (auto &endpoint : waiting_list_)
+        if (endpoint.get() == endpoint_ptr) return endpoint;
+    return nullptr;
+}
+
 std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
     const std::string &peer_nic_path, RdmaContext *context) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
@@ -136,6 +147,17 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpoint(
     }
     // LOG(INFO) << "Endpoint " << peer_nic_path << " not found in
     // SIEVEEndpointStore";
+    return nullptr;
+}
+
+std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+    for (auto &kv : endpoint_map_) {
+        if (kv.second.first.get() == endpoint_ptr) return kv.second.first;
+    }
+    for (auto &endpoint : waiting_list_)
+        if (endpoint.get() == endpoint_ptr) return endpoint;
     return nullptr;
 }
 
