@@ -186,6 +186,69 @@ TEST_F(TransferTaskTest, StartSpanFromCarrierUsesCarrierSpanAsParent) {
     EXPECT_NE(context.span_id, carrier.span_id);
 }
 
+TEST_F(TransferTaskTest, TransferTraceSessionCreatesStandaloneRootWhenMissingParent) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "inmemory";
+    config.service_name = "test-service";
+    config.process_role = "test-role";
+
+    mooncake::tracing::TracingFacade facade(config);
+    auto session = TransferTraceSession::Start(facade, nullptr, 4, 4096);
+
+    ASSERT_TRUE(session.parent_context() != nullptr);
+    EXPECT_TRUE(session.parent_context()->valid());
+    EXPECT_TRUE(session.owns_operation_span());
+}
+
+TEST_F(TransferTaskTest, TransferTraceSessionReusesProvidedParentContext) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "inmemory";
+    config.service_name = "test-service";
+    config.process_role = "test-role";
+
+    mooncake::tracing::TracingFacade facade(config);
+    mooncake::tracing::TraceContext parent_context{
+        .trace_id = "trace-parent",
+        .span_id = "span-parent",
+        .parent_span_id = "",
+        .correlation_id = "corr-parent"};
+
+    auto session =
+        TransferTraceSession::Start(facade, &parent_context, 2, 1024);
+
+    ASSERT_TRUE(session.parent_context() != nullptr);
+    EXPECT_EQ(session.parent_context()->trace_id, parent_context.trace_id);
+    EXPECT_EQ(session.parent_context()->span_id, parent_context.span_id);
+    EXPECT_FALSE(session.owns_operation_span());
+}
+
+TEST_F(TransferTaskTest, TransferTraceSessionReusesSingleWaitCompletionSpan) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "inmemory";
+    config.service_name = "test-service";
+    config.process_role = "test-role";
+
+    mooncake::tracing::TracingFacade facade(config);
+    auto session = TransferTraceSession::Start(facade, nullptr, 3, 2048);
+
+    auto* first_wait_span = session.EnsureWaitSpan(facade, 77, 3);
+    ASSERT_NE(first_wait_span, nullptr);
+    ASSERT_TRUE(session.wait_context() != nullptr);
+    auto first_context = *session.wait_context();
+
+    auto* second_wait_span = session.EnsureWaitSpan(facade, 77, 3);
+    ASSERT_NE(second_wait_span, nullptr);
+    ASSERT_TRUE(session.wait_context() != nullptr);
+    EXPECT_EQ(session.wait_context()->span_id, first_context.span_id);
+    EXPECT_EQ(session.wait_context()->trace_id, first_context.trace_id);
+
+    session.FinishWait(ErrorCode::OK);
+    EXPECT_EQ(session.wait_context(), nullptr);
+}
+
 TEST_F(TransferTaskTest, AsyncRemoteExporterDropsWhenQueueIsFull) {
     mooncake::tracing::TraceConfig config;
     config.enabled = true;

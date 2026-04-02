@@ -306,6 +306,29 @@ TEST_F(TransportTest, ActiveBatchTraceRegistryKeepsRootAliveUntilFinish) {
     EXPECT_NE(third.context.span_id, first.context.span_id);
 }
 
+TEST_F(TransportTest, ActiveBatchTraceRegistryUsesProvidedParentContext) {
+    tracing::TracingFacade tracing({.enabled = true,
+                                    .exporter_mode = "inmemory",
+                                    .service_name = "test-te",
+                                    .node_id = "node-a",
+                                    .process_role = "unit-test"});
+    ActiveBatchTraceRegistry registry;
+    Transport::BatchID batch_id = 321;
+
+    tracing::TraceContext parent_context{
+        .trace_id = "trace-parent",
+        .span_id = "parent-span",
+        .parent_span_id = "",
+        .correlation_id = "corr-parent"};
+
+    auto root = registry.EnsureRoot(tracing, batch_id, &parent_context);
+    ASSERT_TRUE(root.context.valid());
+    EXPECT_TRUE(root.created);
+    EXPECT_EQ(root.context.trace_id, parent_context.trace_id);
+    EXPECT_EQ(root.context.parent_span_id, parent_context.span_id);
+    EXPECT_EQ(root.context.correlation_id, parent_context.correlation_id);
+}
+
 TEST_F(TransportTest, SliceTraceLifecycleTracksSuccessAndTimeout) {
     setenv("MC_TRACING_ENABLED", "1", 1);
     setenv("MC_TRACING_EXPORTER", "jsonl", 1);

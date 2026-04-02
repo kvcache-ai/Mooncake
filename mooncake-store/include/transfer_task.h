@@ -19,6 +19,7 @@
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "trace_context.h"
+#include "tracing_facade.h"
 
 namespace mooncake {
 
@@ -168,6 +169,42 @@ class FilereadOperationState : public OperationState {
     }
 };
 
+class TransferTraceSession {
+   public:
+    TransferTraceSession() = default;
+
+    static TransferTraceSession Start(
+        mooncake::tracing::TracingFacade& tracing,
+        const mooncake::tracing::TraceContext* trace_context,
+        size_t batch_size, size_t total_bytes);
+
+    const mooncake::tracing::TraceContext* parent_context() const {
+        return parent_context_.valid() ? &parent_context_ : nullptr;
+    }
+
+    bool owns_operation_span() const { return operation_span_.valid(); }
+
+    mooncake::tracing::Span* EnsureWaitSpan(
+        mooncake::tracing::TracingFacade& tracing, BatchID batch_id,
+        size_t batch_size);
+    const mooncake::tracing::TraceContext* wait_context() const {
+        return wait_context_.valid() ? &wait_context_ : nullptr;
+    }
+
+    void RecordBatch(BatchID batch_id);
+    void MarkSubmitError();
+    void FinishWait(ErrorCode error_code);
+    void Finish(ErrorCode error_code);
+
+   private:
+    mooncake::tracing::TraceContext parent_context_;
+    mooncake::tracing::Span operation_span_;
+    mooncake::tracing::Span wait_span_;
+    mooncake::tracing::TraceContext wait_context_;
+    BatchID batch_id_{INVALID_BATCH_ID};
+    size_t batch_size_{0};
+};
+
 /**
  * @brief Operation state for transfer engine operations
  */
@@ -175,9 +212,9 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size,
-                                 mooncake::tracing::TraceContext trace_context = {})
+                                 TransferTraceSession trace_session = {})
         : engine_(engine), batch_id_(batch_id), batch_size_(batch_size),
-          trace_context_(std::move(trace_context)) {}
+          trace_session_(std::move(trace_session)) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -202,7 +239,7 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
-    mooncake::tracing::TraceContext trace_context_;
+    TransferTraceSession trace_session_;
 };
 
 /**

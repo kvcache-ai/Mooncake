@@ -88,14 +88,17 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
 }
 
 Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest>& entries) {
-    return impl_->submitTransfer(batch_id, entries);
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    const tracing::TraceContext* trace_context) {
+    return impl_->submitTransfer(batch_id, entries, trace_context);
 }
 
 Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
-    TransferMetadata::NotifyDesc notify_msg) {
-    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
+    TransferMetadata::NotifyDesc notify_msg,
+    const tracing::TraceContext* trace_context) {
+    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg,
+                                           trace_context);
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -437,7 +440,9 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
 }
 
 Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    const tracing::TraceContext* trace_context) {
+    (void)trace_context;
     if (use_tent_) {
         std::vector<mooncake::tent::Request> requests;
         for (auto& item : entries) {
@@ -455,13 +460,15 @@ Status TransferEngine::submitTransfer(
         else
             return Status::OK();
     } else {
-        return impl_->submitTransfer(batch_id, entries);
+        return impl_->submitTransfer(batch_id, entries, trace_context);
     }
 }
 
 Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
-    TransferMetadata::NotifyDesc notify_msg) {
+    TransferMetadata::NotifyDesc notify_msg,
+    const tracing::TraceContext* trace_context) {
+    (void)trace_context;
     if (use_tent_) {
         std::vector<mooncake::tent::Request> requests;
         for (auto& item : entries) {
@@ -482,7 +489,8 @@ Status TransferEngine::submitTransferWithNotify(
         else
             return Status::OK();
     } else {
-        return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
+        return impl_->submitTransferWithNotify(batch_id, entries, notify_msg,
+                                               trace_context);
     }
 }
 

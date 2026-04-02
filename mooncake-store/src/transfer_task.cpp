@@ -123,6 +123,130 @@ void FilereadWorkerPool::workerThread() {
 // Since memcpy is bound by memory bandwidth, we only need one worker thread.
 constexpr int kDefaultMemcpyWorkers = 1;
 
+size_t CalculateRequestBytes(const std::vector<TransferRequest>& requests) {
+    size_t total_bytes = 0;
+    for (const auto& request : requests) {
+        total_bytes += request.length;
+    }
+    return total_bytes;
+}
+
+const char* ToStoreTransferStatusName(TransferStatusEnum status) {
+    switch (status) {
+        case TransferStatusEnum::WAITING:
+            return "WAITING";
+        case TransferStatusEnum::PENDING:
+            return "PENDING";
+        case TransferStatusEnum::INVALID:
+            return "INVALID";
+        case TransferStatusEnum::CANCELED:
+            return "CANCELED";
+        case TransferStatusEnum::COMPLETED:
+            return "COMPLETED";
+        case TransferStatusEnum::TIMEOUT:
+            return "TIMEOUT";
+        case TransferStatusEnum::FAILED:
+            return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
+TransferTraceSession TransferTraceSession::Start(
+    mooncake::tracing::TracingFacade& tracing,
+    const mooncake::tracing::TraceContext* trace_context, size_t batch_size,
+    size_t total_bytes) {
+    TransferTraceSession session;
+    session.batch_size_ = batch_size;
+
+    if (trace_context != nullptr && trace_context->valid()) {
+        session.parent_context_ = *trace_context;
+        return session;
+    }
+
+    session.operation_span_ = tracing.StartSpan(
+        "mooncake.transfer.operation", nullptr,
+        {{"batch.size", std::to_string(batch_size)},
+         {"bytes.total", std::to_string(total_bytes)}});
+    if (session.operation_span_.valid()) {
+        session.parent_context_ = session.operation_span_.context();
+    }
+    return session;
+}
+
+void TransferTraceSession::RecordBatch(BatchID batch_id) {
+    batch_id_ = batch_id;
+    if (!operation_span_.valid()) {
+        return;
+    }
+    operation_span_.SetAttribute("te.batch_id", std::to_string(batch_id_));
+}
+
+void TransferTraceSession::MarkSubmitError() {
+    if (!operation_span_.valid()) {
+        return;
+    }
+    if (batch_id_ != INVALID_BATCH_ID) {
+        operation_span_.AddEvent(
+            "transfer submit failed",
+            {{"te.batch_id", std::to_string(batch_id_)}});
+    }
+    operation_span_.SetStatus("ERROR");
+}
+
+mooncake::tracing::Span* TransferTraceSession::EnsureWaitSpan(
+    mooncake::tracing::TracingFacade& tracing, BatchID batch_id,
+    size_t batch_size) {
+    if (wait_context_.valid()) {
+        return &wait_span_;
+    }
+
+    auto span = tracing.StartSpan(
+        "mooncake.transfer.wait_completion", parent_context(),
+        {{"te.batch_id", std::to_string(batch_id)},
+         {"batch.size", std::to_string(batch_size)}});
+    if (!span.valid()) {
+        return nullptr;
+    }
+    wait_context_ = span.context();
+    wait_span_ = std::move(span);
+    return &wait_span_;
+}
+
+void TransferTraceSession::FinishWait(ErrorCode error_code) {
+    if (!wait_context_.valid()) {
+        return;
+    }
+
+    wait_span_.AddEvent(
+        "wait completion finished",
+        {{"result.code", std::to_string(static_cast<int>(error_code))}});
+    if (error_code != ErrorCode::OK) {
+        wait_span_.SetStatus("ERROR");
+    }
+    wait_span_.End();
+    wait_span_ = mooncake::tracing::Span();
+    wait_context_ = {};
+}
+
+void TransferTraceSession::Finish(ErrorCode error_code) {
+    if (!operation_span_.valid()) {
+        return;
+    }
+    if (batch_id_ != INVALID_BATCH_ID) {
+        operation_span_.SetAttribute("te.batch_id", std::to_string(batch_id_));
+    }
+    operation_span_.SetAttribute("batch.size", std::to_string(batch_size_));
+    operation_span_.SetAttribute(
+        "result.code", std::to_string(static_cast<int>(error_code)));
+    operation_span_.AddEvent(
+        "transfer operation completed",
+        {{"result.code", std::to_string(static_cast<int>(error_code))}});
+    if (error_code != ErrorCode::OK) {
+        operation_span_.SetStatus("ERROR");
+    }
+    operation_span_.End();
+}
+
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
     VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
             << " workers";
@@ -226,10 +350,8 @@ bool TransferEngineOperationState::is_completed() {
 void TransferEngineOperationState::check_task_status() {
     auto& tracing = mooncake::tracing::TracingFacade::Instance(
         "mooncake-store", "transfer-task");
-    auto span = tracing.StartSpan("mooncake.transfer.wait_completion",
-                                  trace_context_.valid() ? &trace_context_ : nullptr,
-                                  {{"te.batch_id", std::to_string(batch_id_)},
-                                   {"batch.size", std::to_string(batch_size_)}});
+    auto* wait_span =
+        trace_session_.EnsureWaitSpan(tracing, batch_id_, batch_size_);
     // Check all transfers in the batch
     bool all_completed = true;
     bool has_failure = false;
@@ -241,7 +363,13 @@ void TransferEngineOperationState::check_task_status() {
             LOG(ERROR) << "Failed to get transfer status for batch "
                        << batch_id_ << " task " << i << " with error "
                        << s.message();
-            span.SetStatus("ERROR");
+            if (wait_span != nullptr) {
+                wait_span->AddEvent(
+                    "status query failed",
+                    {{"task.id", std::to_string(i)},
+                     {"error.message", std::string(s.message())}});
+                wait_span->SetStatus("ERROR");
+            }
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -259,7 +387,13 @@ void TransferEngineOperationState::check_task_status() {
                            << static_cast<int>(status.s);
 #endif
                 has_failure = true;
-                span.AddEvent("transfer failed", {{"task.id", std::to_string(i)}});
+                if (wait_span != nullptr) {
+                    wait_span->AddEvent(
+                        "transfer failed",
+                        {{"task.id", std::to_string(i)},
+                         {"status",
+                          std::string(ToStoreTransferStatusName(status.s))}});
+                }
                 break;
             default:
                 // Transfer is still pending (PENDING, RUNNING, etc.)
@@ -276,6 +410,9 @@ void TransferEngineOperationState::check_task_status() {
     }
 
     if (all_completed) {
+        if (wait_span != nullptr) {
+            wait_span->AddEvent("all transfers completed");
+        }
         set_result_internal(ErrorCode::OK);
         return;
     }
@@ -296,6 +433,8 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
+    trace_session_.FinishWait(error_code);
+    trace_session_.Finish(error_code);
 }
 
 void TransferEngineOperationState::wait_for_completion() {
@@ -307,6 +446,9 @@ void TransferEngineOperationState::wait_for_completion() {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+    auto& tracing = mooncake::tracing::TracingFacade::Instance(
+        "mooncake-store", "transfer-task");
+    trace_session_.EnsureWaitSpan(tracing, batch_id_, batch_size_);
 
     // Wait directly on BatchDesc's condition variable.
     auto& batch_desc = Transport::toBatchDesc(batch_id_);
@@ -608,25 +750,34 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     const tracing::TraceContext* trace_context) {
     auto& tracing = tracing::TracingFacade::Instance("mooncake-store",
                                                      "transfer-task");
-    auto span = tracing.StartSpan(
-        "mooncake.transfer.prepare", trace_context,
-        {{"batch.size", std::to_string(requests.size())}});
-    // Allocate batch ID
     const size_t batch_size = requests.size();
+    const size_t total_bytes = CalculateRequestBytes(requests);
+    auto trace_session = TransferTraceSession::Start(
+        tracing, trace_context, batch_size, total_bytes);
+
+    auto span = tracing.StartSpan(
+        "mooncake.transfer.prepare", trace_session.parent_context(),
+        {{"batch.size", std::to_string(batch_size)},
+         {"bytes.total", std::to_string(total_bytes)}});
+    // Allocate batch ID
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
         span.SetStatus("ERROR");
+        trace_session.MarkSubmitError();
         return std::nullopt;
     }
     span.SetAttribute("te.batch_id", std::to_string(batch_id));
+    trace_session.RecordBatch(batch_id);
 
     // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
+    Status s = engine_.submitTransfer(batch_id, requests,
+                                      trace_session.parent_context());
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
         span.SetStatus("ERROR");
+        trace_session.MarkSubmitError();
         // Note: batch_id will be freed by TransferEngineOperationState
         // destructor if we create the state object, otherwise we need to free
         // it here
@@ -642,7 +793,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // Create state with transfer engine context - no polling thread
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
-        engine_, batch_id, batch_size, span.context());
+        engine_, batch_id, batch_size, std::move(trace_session));
 
     return TransferFuture(state);
 }
