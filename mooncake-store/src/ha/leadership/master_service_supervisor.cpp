@@ -12,7 +12,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "ha/leadership/leader_coordinator_factory.h"
-#include "ha/replication_controller.h"
+#include "ha/standby_controller.h"
 #include "rpc_service.h"
 
 namespace mooncake {
