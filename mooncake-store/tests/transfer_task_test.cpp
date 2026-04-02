@@ -290,7 +290,7 @@ TEST_F(TransferTaskTest, TransferTraceSessionReusesSingleWaitCompletionSpan) {
     EXPECT_EQ(session.wait_context(), nullptr);
 }
 
-TEST_F(TransferTaskTest, TransferTraceSessionEmitsQueueWaitAndCompleteSpans) {
+TEST_F(TransferTaskTest, TransferTraceSessionEmitsSubmitGapAndCompleteSpans) {
     namespace fs = std::filesystem;
 
     auto trace_path =
@@ -308,7 +308,7 @@ TEST_F(TransferTaskTest, TransferTraceSessionEmitsQueueWaitAndCompleteSpans) {
         mooncake::tracing::TracingFacade facade(config);
         auto session = TransferTraceSession::Start(facade, nullptr, 2, 1024);
         session.RecordBatch(55);
-        session.StartQueueWait(facade, 55, 2);
+        session.StartSubmitGap(facade, 55, 2);
         ASSERT_NE(session.EnsureWaitSpan(facade, 55, 2), nullptr);
         session.FinishWait(ErrorCode::OK);
         session.Finish(facade, ErrorCode::OK);
@@ -316,7 +316,7 @@ TEST_F(TransferTaskTest, TransferTraceSessionEmitsQueueWaitAndCompleteSpans) {
 
     auto span_names = ReadSpanNamesFromJsonl(trace_path);
     EXPECT_EQ(CountSpanName(span_names, "mooncake.transfer.operation"), 1u);
-    EXPECT_EQ(CountSpanName(span_names, "mooncake.transfer.queue_wait"), 1u);
+    EXPECT_EQ(CountSpanName(span_names, "mooncake.transfer.submit_gap"), 1u);
     EXPECT_EQ(CountSpanName(span_names, "mooncake.transfer.wait_completion"),
               1u);
     EXPECT_EQ(CountSpanName(span_names, "mooncake.transfer.complete"), 1u);

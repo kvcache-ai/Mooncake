@@ -181,22 +181,22 @@ void TransferTraceSession::RecordBatch(BatchID batch_id) {
     operation_span_.SetAttribute("te.batch_id", std::to_string(batch_id_));
 }
 
-void TransferTraceSession::StartQueueWait(
+void TransferTraceSession::StartSubmitGap(
     mooncake::tracing::TracingFacade& tracing, BatchID batch_id,
     size_t batch_size) {
-    if (queue_wait_context_.valid() || wait_context_.valid()) {
+    if (submit_gap_context_.valid() || wait_context_.valid()) {
         return;
     }
 
     auto span = tracing.StartSpan(
-        "mooncake.transfer.queue_wait", parent_context(),
+        "mooncake.transfer.submit_gap", parent_context(),
         {{"te.batch_id", std::to_string(batch_id)},
          {"batch.size", std::to_string(batch_size)}});
     if (!span.valid()) {
         return;
     }
-    queue_wait_context_ = span.context();
-    queue_wait_span_ = std::move(span);
+    submit_gap_context_ = span.context();
+    submit_gap_span_ = std::move(span);
 }
 
 void TransferTraceSession::MarkSubmitError() {
@@ -211,20 +211,20 @@ void TransferTraceSession::MarkSubmitError() {
     operation_span_.SetStatus("ERROR");
 }
 
-void TransferTraceSession::FinishQueueWait(ErrorCode error_code) {
-    if (!queue_wait_context_.valid()) {
+void TransferTraceSession::FinishSubmitGap(ErrorCode error_code) {
+    if (!submit_gap_context_.valid()) {
         return;
     }
 
-    queue_wait_span_.AddEvent(
-        "queue wait finished",
+    submit_gap_span_.AddEvent(
+        "submit gap finished",
         {{"result.code", std::to_string(static_cast<int>(error_code))}});
     if (error_code != ErrorCode::OK) {
-        queue_wait_span_.SetStatus("ERROR");
+        submit_gap_span_.SetStatus("ERROR");
     }
-    queue_wait_span_.End();
-    queue_wait_span_ = mooncake::tracing::Span();
-    queue_wait_context_ = {};
+    submit_gap_span_.End();
+    submit_gap_span_ = mooncake::tracing::Span();
+    submit_gap_context_ = {};
 }
 
 mooncake::tracing::Span* TransferTraceSession::EnsureWaitSpan(
@@ -234,7 +234,7 @@ mooncake::tracing::Span* TransferTraceSession::EnsureWaitSpan(
         return &wait_span_;
     }
 
-    FinishQueueWait(ErrorCode::OK);
+    FinishSubmitGap(ErrorCode::OK);
 
     auto span = tracing.StartSpan(
         "mooncake.transfer.wait_completion", parent_context(),
@@ -266,7 +266,7 @@ void TransferTraceSession::FinishWait(ErrorCode error_code) {
 
 void TransferTraceSession::Finish(mooncake::tracing::TracingFacade& tracing,
                                   ErrorCode error_code) {
-    FinishQueueWait(error_code);
+    FinishSubmitGap(error_code);
     auto complete_span = tracing.StartSpan(
         "mooncake.transfer.complete", parent_context(),
         {{"batch.size", std::to_string(batch_size_)},
@@ -846,7 +846,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    trace_session.StartQueueWait(tracing, batch_id, batch_size);
+    trace_session.StartSubmitGap(tracing, batch_id, batch_size);
 
     // Create state with transfer engine context - no polling thread
     // needed
