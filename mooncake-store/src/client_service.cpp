@@ -1744,8 +1744,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process successful operations
     if (!successful_keys.empty()) {
-        auto end_responses =
-            master_client_.BatchUpsertEnd(successful_keys);
+        auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
         if (end_responses.size() != successful_keys.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
                        << successful_keys.size() << ", got "
@@ -1774,8 +1773,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process failed operations that need cleanup
     if (!failed_keys.empty()) {
-        auto revoke_responses =
-            master_client_.BatchUpsertRevoke(failed_keys);
+        auto revoke_responses = master_client_.BatchUpsertRevoke(failed_keys);
         if (revoke_responses.size() != failed_keys.size()) {
             LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
                        << failed_keys.size() << ", got "

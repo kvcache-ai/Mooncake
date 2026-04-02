@@ -1178,10 +1178,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // Preserve hard_pin and soft_pin from the old metadata so that eviction
     // protection survives a size-changing upsert (RFC §2.2.2).
     ReplicateConfig merged_config = config;
-    merged_config.with_hard_pin = merged_config.with_hard_pin ||
-                                  metadata.IsHardPinned();
-    merged_config.with_soft_pin = merged_config.with_soft_pin ||
-                                  metadata.IsSoftPinned();
+    merged_config.with_hard_pin =
+        merged_config.with_hard_pin || metadata.IsHardPinned();
+    merged_config.with_soft_pin =
+        merged_config.with_soft_pin || metadata.IsSoftPinned();
 
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {

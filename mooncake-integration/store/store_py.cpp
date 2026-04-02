@@ -1137,9 +1137,8 @@ class MooncakeStorePyWrapper {
         return results;
     }
 
-    std::vector<int> batch_upsert_tensor(
-        const std::vector<std::string> &keys,
-        const pybind11::list &tensors_list) {
+    std::vector<int> batch_upsert_tensor(const std::vector<std::string> &keys,
+                                         const pybind11::list &tensors_list) {
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -1876,9 +1875,9 @@ PYBIND11_MODULE(store, m) {
              py::arg("tensors_list"),
              "Upsert a batch of PyTorch tensors into the store (insert or "
              "update)")
-        .def("upsert_pub_tensor",
-             &MooncakeStorePyWrapper::upsert_pub_tensor, py::arg("key"),
-             py::arg("tensor"), py::arg("config") = ReplicateConfig{},
+        .def("upsert_pub_tensor", &MooncakeStorePyWrapper::upsert_pub_tensor,
+             py::arg("key"), py::arg("tensor"),
+             py::arg("config") = ReplicateConfig{},
              "Upsert a PyTorch tensor with configurable replication settings")
         .def("batch_upsert_pub_tensor",
              &MooncakeStorePyWrapper::batch_upsert_pub_tensor, py::arg("keys"),

@@ -581,8 +581,8 @@ int DummyClient::upsert_parts(const std::string& key,
 }
 
 int DummyClient::upsert_batch(const std::vector<std::string>& keys,
-                               const std::vector<std::span<const char>>& values,
-                               const ReplicateConfig& config) {
+                              const std::vector<std::span<const char>>& values,
+                              const ReplicateConfig& config) {
     return to_py_ret(invoke_rpc<&RealClient::upsert_batch_dummy_helper, void>(
         keys, values, config, client_id_));
 }

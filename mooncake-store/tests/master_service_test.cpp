@@ -4624,7 +4624,8 @@ TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
     auto put_end = service_->PutEnd(client_a, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
-    // Step 2: Client B starts in-place upsert (Case B) — marks COMPLETE → PROCESSING
+    // Step 2: Client B starts in-place upsert (Case B) — marks COMPLETE →
+    // PROCESSING
     auto upsert_b = service_->UpsertStart(client_b, key, slice_length, config);
     ASSERT_TRUE(upsert_b.has_value());
 
@@ -4655,8 +4656,8 @@ TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
 
 TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
     // Case C (different size) followed by UpsertRevoke.
-    // Old replicas go to discarded_replicas_, new replicas are erased by revoke.
-    // The key should disappear entirely.
+    // Old replicas go to discarded_replicas_, new replicas are erased by
+    // revoke. The key should disappear entirely.
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();

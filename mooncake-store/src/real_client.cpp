@@ -2378,8 +2378,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
     for (const auto &shm : context.mapped_shms) {
         if (dummy_buffer >= shm.dummy_base_addr &&
             dummy_buffer + size <= shm.dummy_base_addr + shm.shm_size) {
-            void *real_buffer = reinterpret_cast<void *>(
-                dummy_buffer + shm.shm_addr_offset);
+            void *real_buffer =
+                reinterpret_cast<void *>(dummy_buffer + shm.shm_addr_offset);
             return upsert_from_internal(key, real_buffer, size, config);
         }
     }
@@ -2602,8 +2602,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_dummy_helper(
 }
 
 int RealClient::upsert_batch(const std::vector<std::string> &keys,
-                              const std::vector<std::span<const char>> &values,
-                              const ReplicateConfig &config) {
+                             const std::vector<std::span<const char>> &values,
+                             const ReplicateConfig &config) {
     return to_py_ret(
         upsert_batch_internal(keys, values, config, client_buffer_allocator_));
 }
