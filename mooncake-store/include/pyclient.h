@@ -212,6 +212,9 @@ class PyClient {
 
     virtual long removeAll(bool force = false) = 0;
 
+    virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                         bool force = false) = 0;
+
     virtual int isExist(const std::string &key) = 0;
 
     virtual std::vector<int> batchIsExist(

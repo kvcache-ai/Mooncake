@@ -459,22 +459,16 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
         if (batched_query_results[i]) {
             for (const auto& descriptor :
                  batched_query_results[i].value().replicas) {
-                if (descriptor.is_memory_replica()) {
+                if (client_->IsReplicaOnLocalMemory(descriptor)) {
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
-                    if (memory_descriptor.buffer_descriptor
-                            .transport_endpoint_ ==
-                        client_->GetTransportEndpoint()) {
-                        std::vector<Slice> slices;
-                        void* slice_ptr = reinterpret_cast<void*>(
-                            memory_descriptor.buffer_descriptor
-                                .buffer_address_);
-                        slices.emplace_back(
-                            Slice{slice_ptr,
-                                  memory_descriptor.buffer_descriptor.size_});
-                        batched_slices.insert({keys[i], std::move(slices)});
-                        break;
-                    }
+                    std::vector<Slice> slices;
+                    void* slice_ptr = reinterpret_cast<void*>(
+                        memory_descriptor.buffer_descriptor.buffer_address_);
+                    slices.emplace_back(Slice{
+                        slice_ptr, memory_descriptor.buffer_descriptor.size_});
+                    batched_slices.insert({keys[i], std::move(slices)});
+                    break;
                 }
             }
             if (batched_slices.find(keys[i]) == batched_slices.end()) {

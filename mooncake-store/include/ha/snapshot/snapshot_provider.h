@@ -1,13 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <ylt/util/tl/expected.hpp>
+
 #include "metadata_store.h"
 
 namespace mooncake {
+
+struct LoadedSnapshot {
+    std::string snapshot_id;
+    uint64_t snapshot_sequence_id{0};
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> metadata;
+};
 
 /**
  * @brief SnapshotProvider is an abstraction for loading metadata snapshots.
@@ -27,29 +36,20 @@ class SnapshotProvider {
     virtual ~SnapshotProvider() = default;
 
     // Load the latest available snapshot for `cluster_id`.
-    // Returns true on success and fills:
-    // - snapshot_id: opaque identifier (e.g. timestamp/version)
-    // - snapshot_sequence_id: global OpLog sequence_id at snapshot boundary
-    // - snapshot: full metadata baseline as key -> StandbyObjectMetadata
-    virtual bool LoadLatestSnapshot(
-        const std::string& cluster_id, std::string& snapshot_id,
-        uint64_t& snapshot_sequence_id,
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>&
-            snapshot) = 0;
+    // Return values:
+    // - unexpected(error): backend or parsing failure
+    // - std::nullopt: no snapshot published yet
+    // - LoadedSnapshot: full metadata baseline
+    virtual tl::expected<std::optional<LoadedSnapshot>, ErrorCode>
+    LoadLatestSnapshot(const std::string& cluster_id) = 0;
 };
 
 // Default no-op provider: behaves as if "no snapshot available".
 class NoopSnapshotProvider final : public SnapshotProvider {
    public:
-    bool LoadLatestSnapshot(
-        const std::string& /*cluster_id*/, std::string& snapshot_id,
-        uint64_t& snapshot_sequence_id,
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>& snapshot)
-        override {
-        snapshot_id.clear();
-        snapshot_sequence_id = 0;
-        snapshot.clear();
-        return false;
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& /*cluster_id*/) override {
+        return std::optional<LoadedSnapshot>();
     }
 };
 

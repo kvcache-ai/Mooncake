@@ -20,7 +20,7 @@ namespace mooncake {
 class S3SnapshotObjectStore final : public SnapshotObjectStore {
    public:
     S3SnapshotObjectStore();
-    ~S3SnapshotObjectStore() override = default;
+    ~S3SnapshotObjectStore() override;
 
     tl::expected<void, std::string> UploadBuffer(
         const std::string& key, const std::vector<uint8_t>& buffer) override;

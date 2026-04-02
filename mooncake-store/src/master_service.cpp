@@ -1617,6 +1617,90 @@ long MasterService::RemoveAll(bool force) {
     return removed_count;
 }
 
+auto MasterService::BatchRemove(const std::vector<std::string>& keys,
+                                bool force)
+    -> std::vector<tl::expected<void, ErrorCode>> {
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+
+    // Group keys by shard to reduce lock contention
+    std::unordered_map<size_t,
+                       std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard;
+    keys_by_shard.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        size_t shard_idx = getShardIndex(keys[i]);
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
+    }
+
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+
+    // Process each shard once, acquiring lock per shard
+    for (auto& [shard_idx, key_group] : keys_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        auto now = std::chrono::system_clock::now();
+
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            auto it = shard->metadata.find(key);
+
+            if (it == shard->metadata.end()) {
+                VLOG(1) << "key=" << key << ", error=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            // Clean up stale replica handles (consistent with single Remove)
+            if (CleanupStaleHandles(it->second)) {
+                shard->processing_keys.erase(key);
+                shard->replication_tasks.erase(key);
+                shard->offloading_tasks.erase(key);
+                shard->metadata.erase(it);
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+            if (!it->second.IsValid()) {
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            auto& metadata = it->second;
+
+            if (!force && !metadata.IsLeaseExpired(now)) {
+                VLOG(1) << "key=" << key << ", error=object_has_lease";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                continue;
+            }
+
+            if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+                LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+                continue;
+            }
+
+            if (shard->replication_tasks.contains(key)) {
+                LOG(ERROR) << "key=" << key
+                           << ", error=object_has_replication_task";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                continue;
+            }
+
+            // Remove object metadata
+            shard->metadata.erase(it);
+            results[original_idx] = {};  // Success
+        }
+    }
+
+    return results;
+}
+
 bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     // Remove those with invalid allocators
     metadata.EraseReplicas([](const Replica& replica) {

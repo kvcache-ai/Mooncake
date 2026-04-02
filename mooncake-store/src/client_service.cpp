@@ -1755,6 +1755,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
+    const std::vector<ObjectKey>& keys, bool force) {
+    return master_client_.BatchRemove(keys, force);
+}
+
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     const std::string& key, ReplicaType replica_type) {
     return master_client_.EvictDiskReplica(key, replica_type);

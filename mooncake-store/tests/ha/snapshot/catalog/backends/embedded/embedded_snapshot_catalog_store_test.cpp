@@ -97,6 +97,9 @@ class EmbeddedSnapshotCatalogStoreTest : public ::testing::Test {
             "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
         descriptor.object_prefix =
             "mooncake_master_snapshot/" + snapshot_id + "/";
+        descriptor.last_included_seq = 42;
+        descriptor.producer_view_version = 7;
+        descriptor.created_at_ms = 1700000000000;
         return descriptor;
     }
 
@@ -121,6 +124,9 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest, PublishAndGetLatestRoundTrip) {
               "mooncake_master_snapshot/20240301_120000_001/manifest.txt");
     EXPECT_EQ(latest->value().object_prefix,
               "mooncake_master_snapshot/20240301_120000_001/");
+    EXPECT_EQ(latest->value().last_included_seq, 42u);
+    EXPECT_EQ(latest->value().producer_view_version, 7u);
+    EXPECT_EQ(latest->value().created_at_ms, 1700000000000);
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest,
@@ -142,11 +148,15 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
 TEST_F(EmbeddedSnapshotCatalogStoreTest, GetLatestTrimsWhitespaceMarker) {
     PutObject("mooncake_master_snapshot/latest.txt",
               "  \n20240301_120000_002\t\r\n");
+    PutObject("mooncake_master_snapshot/20240301_120000_002/descriptor.txt",
+              ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
+                  MakeDescriptor("20240301_120000_002")));
 
     auto latest = store_.GetLatest();
     ASSERT_TRUE(latest.has_value());
     ASSERT_TRUE(latest->has_value());
     EXPECT_EQ(latest->value().snapshot_id, "20240301_120000_002");
+    EXPECT_EQ(latest->value().last_included_seq, 42u);
 }
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest,

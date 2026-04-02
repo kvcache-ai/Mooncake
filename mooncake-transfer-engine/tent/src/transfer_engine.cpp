@@ -25,7 +25,7 @@ TransferEngine::TransferEngine()
 
 TransferEngine::TransferEngine(const std::string config_path) {
     auto conf = std::make_shared<Config>();
-    auto status = conf->load(config_path);
+    auto status = conf->loadFile(config_path);
     if (!status.ok()) {
         LOG(WARNING) << "Failed to read config file " << config_path;
     }

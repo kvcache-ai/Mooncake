@@ -14,6 +14,7 @@
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "utils.h"
 
 #include "master_config.h"
 
@@ -91,6 +92,9 @@ DEFINE_int32(
     "Port for RPC server to listen on (0 = use port, preferred over port)");
 DEFINE_string(rpc_address, "0.0.0.0",
               "Address for RPC server to bind to, required in HA mode");
+DEFINE_string(rpc_interface, "",
+              "Network interface name for RPC server address resolution. "
+              "When set, its IPv4 address overrides rpc_address");
 DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
@@ -212,6 +216,31 @@ std::string ResolveHABackendConnstring(
     return master_config.etcd_endpoints;
 }
 
+void ResolveRpcAddressFromInterfaceOrDie(
+    mooncake::MasterConfig& master_config) {
+    if (master_config.rpc_interface.empty()) {
+        return;
+    }
+
+    if (!master_config.rpc_address.empty() &&
+        master_config.rpc_address != "0.0.0.0") {
+        LOG(WARNING) << "rpc_interface is set. Overriding rpc_address="
+                     << master_config.rpc_address;
+    }
+
+    auto resolved_address =
+        mooncake::GetInterfaceIPv4Address(master_config.rpc_interface);
+    if (!resolved_address) {
+        LOG(FATAL) << "Failed to resolve rpc_interface="
+                   << master_config.rpc_interface << ": "
+                   << resolved_address.error();
+    }
+
+    master_config.rpc_address = resolved_address.value();
+    LOG(INFO) << "Resolved rpc_interface=" << master_config.rpc_interface
+              << " to rpc_address=" << master_config.rpc_address;
+}
+
 }  // namespace
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
@@ -234,6 +263,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
                              FLAGS_rpc_address);
+    default_config.GetString("rpc_interface", &master_config.rpc_interface,
+                             FLAGS_rpc_interface);
     default_config.GetInt32("rpc_conn_timeout_seconds",
                             &master_config.rpc_conn_timeout_seconds,
                             FLAGS_rpc_conn_timeout_seconds);
@@ -436,6 +467,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_address = FLAGS_rpc_address;
+    }
+    if ((google::GetCommandLineFlagInfo("rpc_interface", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.rpc_interface = FLAGS_rpc_interface;
     }
     if ((google::GetCommandLineFlagInfo("rpc_conn_timeout_seconds", &info) &&
          !info.is_default) ||
@@ -781,6 +817,7 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     const std::string ha_backend_connstring =
         ResolveHABackendConnstring(master_config);
@@ -837,6 +874,7 @@ int main(int argc, char* argv[]) {
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address
+        << ", rpc_interface=" << master_config.rpc_interface
         << ", rpc_conn_timeout_seconds="
         << master_config.rpc_conn_timeout_seconds
         << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
@@ -913,10 +951,22 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
+        auto wrapped_master_service =
+            std::make_shared<mooncake::WrappedMasterService>(
+                mooncake::WrappedMasterServiceConfig(master_config, version));
+        mooncake::MasterAdminServer admin_server(
+            static_cast<uint16_t>(master_config.metrics_port),
+            master_config.enable_metric_reporting);
+        if (!admin_server.Start()) {
+            LOG(ERROR) << "Failed to start master admin server";
+            return 1;
+        }
+        admin_server.SetRuntimeState(
+            mooncake::ha::MasterRuntimeState::kServing);
+        admin_server.SetServiceDelegate(wrapped_master_service);
+        admin_server.SetServiceAvailable(true);
 
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
         return server.start();
     }
 }

@@ -228,6 +228,15 @@ class Client {
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<ObjectKey>& keys, bool force = false);
+
+    /**
      * @brief Notify master that a disk replica was evicted locally
      * @param key The evicted object key
      * @param replica_type DISK or LOCAL_DISK
@@ -478,6 +487,8 @@ class Client {
         return admission_sketch_->increment(key) >= admission_threshold_;
     }
 
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -672,8 +683,6 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
                                        const std::string& target);
-
-    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

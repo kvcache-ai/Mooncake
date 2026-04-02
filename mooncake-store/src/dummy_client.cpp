@@ -557,6 +557,19 @@ long DummyClient::removeAll(bool force) {
         invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
 }
 
+std::vector<int> DummyClient::batchRemove(const std::vector<std::string>& keys,
+                                          bool force) {
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchRemove_internal, void>(keys.size(),
+                                                                  keys, force);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
+}
+
 int DummyClient::isExist(const std::string& key) {
     auto result = invoke_rpc<&RealClient::isExist_internal, bool>(key);
 
