@@ -591,3 +591,22 @@ jobs:
         echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
+
+  cancel-on-check-failure:
+    name: Cancel workflow on check failure
+    needs: [spell-check, clang-format]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel workflow run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('Cancelling workflow run due to spell-check or clang-format failure');
+            await github.rest.actions.cancelWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });

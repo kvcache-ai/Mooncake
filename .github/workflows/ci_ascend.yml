@@ -6,6 +6,9 @@ on:
     types:
       - completed
 
+permissions:
+  statuses: write
+
 jobs:
   check-paths:
     runs-on: ubuntu-latest
@@ -284,3 +287,47 @@ jobs:
           /tmp/hixl-test-log/*
         retention-days: 30
         if-no-files-found: warn
+
+  report-status:
+    needs: [check-paths, build-and-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const conclusion = context.payload.workflow_run.conclusion;
+            const shouldRun = '${{ needs.check-paths.outputs.should-run }}';
+            const testResult = '${{ needs.build-and-test.result }}';
+            const isTargetRepo = '${{ github.repository }}' === 'kvcache-ai/Mooncake';
+
+            let state, description;
+            if (conclusion !== 'success') {
+              state = 'failure';
+              description = 'CI failed, Ascend test skipped';
+            } else if (!isTargetRepo) {
+              state = 'success';
+              description = 'Skipped (fork repository)';
+            } else if (shouldRun !== 'true') {
+              state = 'success';
+              description = 'Skipped (no relevant file changes)';
+            } else if (testResult === 'success') {
+              state = 'success';
+              description = 'Ascend test passed';
+            } else if (testResult === 'skipped') {
+              state = 'success';
+              description = 'Skipped';
+            } else {
+              state = 'failure';
+              description = `Ascend test ${testResult}`;
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.workflow_run.head_sha,
+              state: state,
+              context: 'CI Test on ASCEND / build-and-test',
+              description: description,
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });

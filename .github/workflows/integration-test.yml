@@ -6,6 +6,9 @@ on:
     types:
       - completed
 
+permissions:
+  statuses: write
+
 jobs:
   check-paths:
     runs-on: ubuntu-latest
@@ -147,3 +150,43 @@ jobs:
             sleep 30
           done
         shell: bash
+
+  report-status:
+    needs: [check-paths, test-sglang-integration]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const conclusion = context.payload.workflow_run.conclusion;
+            const shouldRun = '${{ needs.check-paths.outputs.should-run }}';
+            const testResult = '${{ needs.test-sglang-integration.result }}';
+
+            let state, description;
+            if (conclusion !== 'success') {
+              state = 'failure';
+              description = 'CI failed, integration test skipped';
+            } else if (shouldRun !== 'true') {
+              state = 'success';
+              description = 'Skipped (no relevant file changes)';
+            } else if (testResult === 'success') {
+              state = 'success';
+              description = 'Integration test passed';
+            } else if (testResult === 'skipped') {
+              state = 'success';
+              description = 'Skipped';
+            } else {
+              state = 'failure';
+              description = `Integration test ${testResult}`;
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.workflow_run.head_sha,
+              state: state,
+              context: 'Integration test / test-sglang-integration',
+              description: description,
+              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
