@@ -348,7 +348,7 @@ jobs:
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
 
-    - name: Test Mooncake EP Backend (CPU Only)
+    - name: Test Mooncake PyTorch Backend (CPU Only)
       env:
         MC_FORCE_TCP: "true"
       run: |
