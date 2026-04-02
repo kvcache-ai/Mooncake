@@ -95,8 +95,8 @@ inline void fillBuf(char *buf, size_t size) {
 }
 
 inline void logLoc(void *addr, size_t data_len) {
-    auto entries = getMemoryLocation(addr, std::min(data_len, size_t(4096)),
-                                     true);
+    auto entries =
+        getMemoryLocation(addr, std::min(data_len, size_t(4096)), true);
     if (entries.empty()) {
         LOG(WARNING) << "getMemoryLocation returned empty result";
         return;

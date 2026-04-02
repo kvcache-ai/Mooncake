@@ -45,8 +45,7 @@ DEFINE_string(mem_backend, "auto", "Memory backend: auto|cpu|gpu|mlu");
 DEFINE_int32(device_id, -1, "Backend device ID");
 DEFINE_bool(use_wildcard_location, false,
             "Register memory with wildcard location");
-DEFINE_string(expect_remote_location, "",
-              "Expected remote buffer location");
+DEFINE_string(expect_remote_location, "", "Expected remote buffer location");
 DEFINE_uint64(buffer_size, 64ull << 20, "Registered buffer size");
 DEFINE_uint64(data_length, 4ull << 20, "Transfer size");
 

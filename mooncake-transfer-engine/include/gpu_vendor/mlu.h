@@ -17,7 +17,8 @@ using CUmemorytype = int;
 using CUresult = CNresult;
 
 #define CUDA_SUCCESS CN_SUCCESS
-#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED CN_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED \
+    CN_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD CN_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD
 #define CU_MEMORYTYPE_HOST CN_MEMORYTYPE_HOST
 #define CU_MEMORYTYPE_DEVICE CN_MEMORYTYPE_DEVICE
@@ -126,8 +127,8 @@ static inline CUresult cuDeviceGet(CUdevice *device, int ordinal) {
 
 static inline CUresult cuDeviceGetAttribute(int *value, int attribute,
                                             CUdevice device) {
-    return cnDeviceGetAttribute(value, static_cast<CNdevice_attribute>(attribute),
-                                device);
+    return cnDeviceGetAttribute(
+        value, static_cast<CNdevice_attribute>(attribute), device);
 }
 
 static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {

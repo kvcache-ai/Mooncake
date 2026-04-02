@@ -184,9 +184,10 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
-        std::transform(
-            pci_bus_id.begin(), pci_bus_id.end(), pci_bus_id.begin(),
-            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        std::transform(pci_bus_id.begin(), pci_bus_id.end(), pci_bus_id.begin(),
+                       [](unsigned char ch) {
+                           return static_cast<char>(std::tolower(ch));
+                       });
 
         int numa_node = -1;
         snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
@@ -343,7 +344,8 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MLU)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU)
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
     char path1[PATH_MAX];
@@ -396,9 +398,9 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         char pci_bus_id[32] = {0};
         if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
             cudaSuccess) {
-            LOG(WARNING) << "discoverCudaTopology: failed to get PCI bus ID for "
-                         << GPU_PREFIX << i
-                         << ", falling back to all HCAs as available";
+            LOG(WARNING)
+                << "discoverCudaTopology: failed to get PCI bus ID for "
+                << GPU_PREFIX << i << ", falling back to all HCAs as available";
 
             std::vector<std::string> avail_hca;
             for (const auto &hca : all_hca) {
@@ -457,7 +459,8 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             }
         } else {
             for (const auto &hca : all_hca) {
-                if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
+                if (std::find(min_distance_hcas.begin(),
+                              min_distance_hcas.end(),
                               hca.name) != min_distance_hcas.end()) {
                     preferred_hca.push_back(hca.name);
                 } else {

@@ -57,8 +57,8 @@ class CpuMemOps final : public MemOps {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 inline void checkGpu(int ret, const char *msg) {
     if (ret != cudaSuccess) {
-        LOG(ERROR) << msg << " (code=" << ret << ", msg="
-                   << cudaGetErrorString(ret) << ")";
+        LOG(ERROR) << msg << " (code=" << ret
+                   << ", msg=" << cudaGetErrorString(ret) << ")";
         std::exit(EXIT_FAILURE);
     }
 }
@@ -128,15 +128,15 @@ class MluMemOps final : public MemOps {
     }
 
     void copyIn(void *dst, const void *src, size_t size) override {
-        checkMlu(cnrtMemcpy(dst, const_cast<void *>(src), size,
-                            cnrtMemcpyHostToDev),
-                 "Failed to copy host data to MLU");
+        checkMlu(
+            cnrtMemcpy(dst, const_cast<void *>(src), size, cnrtMemcpyHostToDev),
+            "Failed to copy host data to MLU");
     }
 
     void copyOut(void *dst, const void *src, size_t size) override {
-        checkMlu(cnrtMemcpy(dst, const_cast<void *>(src), size,
-                            cnrtMemcpyDevToHost),
-                 "Failed to copy MLU data to host");
+        checkMlu(
+            cnrtMemcpy(dst, const_cast<void *>(src), size, cnrtMemcpyDevToHost),
+            "Failed to copy MLU data to host");
     }
 
     std::string loc(int dev_id) const override {

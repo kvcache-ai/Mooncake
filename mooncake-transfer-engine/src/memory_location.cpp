@@ -47,10 +47,11 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     // the CPU/NUMA probe below, and returning "*" here would discard that
     // topology information and reduce routing precision.
     if (result != cudaSuccess) {
-        VLOG(1) << "getMemoryLocation: cudaPointerGetAttributes failed for addr="
-                << start << ", len=" << len
-                << ", falling back to CPU/NUMA probe (code: " << result
-                << " - " << cudaGetErrorString(result) << ")";
+        VLOG(1)
+            << "getMemoryLocation: cudaPointerGetAttributes failed for addr="
+            << start << ", len=" << len
+            << ", falling back to CPU/NUMA probe (code: " << result << " - "
+            << cudaGetErrorString(result) << ")";
     } else if (attributes.type == cudaMemoryTypeDevice) {
         entries.push_back(
             {(uint64_t)start, len, genGpuNodeName(attributes.device)});
