@@ -46,7 +46,11 @@ set(MOONCAKE_STORE_SOURCES
     oplog_applier.cpp
     hot_standby_service.cpp
     standby_state_machine.cpp
-    ha_metric_manager.cpp)
+    ha_metric_manager.cpp
+    connectors/data_connector.cpp
+    connectors/connector_importer.cpp
+    connectors/huggingface_connector.cpp
+)
 
 set(EXTRA_LIBS "")
 
@@ -73,7 +77,9 @@ set(EXTRA_LIBS ${ZSTD_LIBRARY})
 # If AWS SDK is found, add it to EXTRA_LIBS
 if(HAVE_AWS_SDK)
   list(APPEND EXTRA_LIBS ${AWSSDK_LINK_LIBRARIES})
+  list(APPEND MOONCAKE_STORE_SOURCES connectors/oss_connector.cpp)
   add_definitions(-DHAVE_AWS_SDK)
+  list(APPEND MOONCAKE_STORE_SOURCES connectors/oss_connector.cpp)
   if(AWS_S3_LIB AND AWS_CORE_LIB)
     list(APPEND EXTRA_LIBS ${AWS_S3_LIB} ${AWS_CORE_LIB})
     add_definitions(-DHAVE_AWS_SDK)
@@ -98,6 +104,21 @@ else()
     FATAL_ERROR
       "xxHash library/header not found. Please install xxhash (development headers) and try again."
   )
+endif()
+
+# Find libcurl for HuggingFace connector
+find_package(CURL REQUIRED)
+list(APPEND EXTRA_LIBS CURL::libcurl)
+
+# Find hiredis for Redis connector (optional)
+find_library(HIREDIS_LIB hiredis)
+if(HIREDIS_LIB)
+    message(STATUS "hiredis found, Redis connector enabled")
+    add_definitions(-DHAVE_REDIS)
+    list(APPEND MOONCAKE_STORE_SOURCES connectors/redis_connector.cpp)
+    list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
+else()
+    message(STATUS "hiredis not found, Redis connector disabled")
 endif()
 
 if(USE_3FS)
