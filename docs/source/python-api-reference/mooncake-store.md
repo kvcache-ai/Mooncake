@@ -264,6 +264,24 @@ def get_into(self, key: str, buffer_ptr: int, size: int) -> int
 
 **Returns:** Number of bytes read, or negative on error
 
+#### get_into_range()
+Retrieve a byte range directly into a registered buffer (zero-copy).
+
+```python
+def get_into_range(self, key: str, buffer_ptr: int, dst_offset: int, src_offset: int, size: int) -> int
+```
+
+**Parameters:**
+- `key`: Object identifier to retrieve
+- `buffer_ptr`: Memory address of a pre-allocated buffer
+- `dst_offset`: Offset in the destination buffer where data is written
+- `src_offset`: Offset in the stored object where reading starts
+- `size`: Number of bytes to read
+
+**Returns:** Number of bytes read, or negative on error
+
+Use this API for single-key partial reads into a registered buffer. The read covers `[src_offset, src_offset + size)`, writes into `(buffer_ptr + dst_offset)`, and returns an error if the requested range exceeds the stored object size.
+
 ---
 
 ## ReplicateConfig Configuration

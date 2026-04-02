@@ -224,6 +224,47 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.unregister_buffer(small_buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
 
+    def test_get_into_range_operations(self):
+        """Test single-key partial reads with source and destination offsets."""
+        import ctypes
+
+        key = "test_get_into_range_key"
+        test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        src_offset = 10
+        read_size = 8
+        dst_offset = 5
+        buffer_size = 24
+
+        self.assertEqual(self.store.put(key, test_data), 0)
+
+        buffer = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
+
+        ctypes.memset(buffer, ord("_"), buffer_size)
+
+        bytes_read = self.store.get_into_range(
+            key, buffer_ptr, dst_offset, src_offset, read_size
+        )
+        self.assertEqual(bytes_read, read_size)
+
+        expected_slice = test_data[src_offset : src_offset + read_size]
+        self.assertEqual(bytes(buffer[dst_offset : dst_offset + read_size]), expected_slice)
+        self.assertEqual(bytes(buffer[:dst_offset]), b"_" * dst_offset)
+        self.assertEqual(
+            bytes(buffer[dst_offset + read_size :]),
+            b"_" * (buffer_size - dst_offset - read_size),
+        )
+
+        overflow_result = self.store.get_into_range(
+            key, buffer_ptr, 0, len(test_data) - 2, 4
+        )
+        self.assertLess(overflow_result, 0, "overflowing range should fail")
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+        self.assertEqual(self.store.remove(key), 0)
+
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
         import ctypes

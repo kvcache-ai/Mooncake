@@ -2043,6 +2043,20 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Get object data directly into a pre-allocated buffer")
         .def(
+            "get_into_range",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t dst_offset, size_t src_offset,
+               size_t size) {
+                // Get a byte range directly into user-provided buffer
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.store_->get_into_range(key, buffer, dst_offset,
+                                                   src_offset, size);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("dst_offset"),
+            py::arg("src_offset"), py::arg("size"),
+            "Get a byte range from an object into a pre-allocated buffer")
+        .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
