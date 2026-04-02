@@ -592,12 +592,12 @@ MasterClient::BatchUpsertStart(
 
     std::vector<uint64_t> total_slice_lengths;
     total_slice_lengths.reserve(slice_lengths.size());
-    for (const auto& slice_lengths : slice_lengths) {
-        uint64_t total_slice_length = 0;
-        for (const auto& slice_length : slice_lengths) {
-            total_slice_length += slice_length;
+    for (const auto& key_slices : slice_lengths) {
+        uint64_t total = 0;
+        for (const auto& sl : key_slices) {
+            total += sl;
         }
-        total_slice_lengths.emplace_back(total_slice_length);
+        total_slice_lengths.emplace_back(total);
     }
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
