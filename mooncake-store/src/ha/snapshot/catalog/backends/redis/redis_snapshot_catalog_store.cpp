@@ -124,8 +124,15 @@ ErrorCode RedisSnapshotCatalogStore::Publish(
     const SnapshotDescriptor& snapshot) {
     if (!snapshot_catalog_store_detail::IsValidSnapshotId(
             snapshot.snapshot_id) ||
-        connstring_.empty()) {
+        connstring_.empty() || object_store_ == nullptr) {
         return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto descriptor_result = object_store_->UploadString(
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot.snapshot_id),
+        snapshot_catalog_store_detail::SerializeSnapshotDescriptor(snapshot));
+    if (!descriptor_result) {
+        return ErrorCode::PERSISTENT_FAIL;
     }
 
     auto score = ParseSnapshotScore(snapshot.snapshot_id);
@@ -152,7 +159,7 @@ ErrorCode RedisSnapshotCatalogStore::Publish(
 
 tl::expected<std::optional<SnapshotDescriptor>, ErrorCode>
 RedisSnapshotCatalogStore::GetLatest() {
-    if (connstring_.empty()) {
+    if (connstring_.empty() || object_store_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -183,9 +190,21 @@ RedisSnapshotCatalogStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return std::optional<SnapshotDescriptor>(
-        snapshot_catalog_store_detail::MakeSnapshotDescriptor(
-            latest_snapshot_id));
+    std::string descriptor_payload;
+    auto descriptor_result = object_store_->DownloadString(
+        snapshot_catalog_store_detail::BuildDescriptorKey(latest_snapshot_id),
+        descriptor_payload);
+    if (!descriptor_result) {
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    auto descriptor =
+        snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
+            latest_snapshot_id, descriptor_payload);
+    if (!descriptor) {
+        return tl::make_unexpected(descriptor.error());
+    }
+    return std::optional<SnapshotDescriptor>(std::move(descriptor.value()));
 }
 
 tl::expected<std::vector<SnapshotDescriptor>, ErrorCode>

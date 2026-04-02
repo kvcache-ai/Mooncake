@@ -24,7 +24,6 @@ NC="\033[0m" # No Color
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
 GOVER=1.23.8
-YALANTINGLIBS_VERSION=0.5.7
 
 # Function to print section headers
 print_section() {
@@ -76,8 +75,7 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - yalantinglibs"
-echo -e "  - Git submodules"
+echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
 echo -e "  - Go $GOVER"
 echo
 
@@ -138,48 +136,34 @@ apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"
 print_success "System packages installed successfully"
 
-# Install yalantinglibs
+# Initialize and update git submodules
+print_section "Initializing Git Submodules"
+
+# Check if .gitmodules exists
+if [ -f "${REPO_ROOT}/.gitmodules" ]; then
+    echo "Enter repository root: ${REPO_ROOT}"
+    cd "${REPO_ROOT}"
+    check_success "Failed to change to repository root directory"
+
+    echo "Initializing git submodules..."
+    git submodule sync --recursive
+    check_success "Failed to sync git submodules"
+    git submodule update --init --recursive
+    check_success "Failed to initialize git submodules"
+
+    print_success "Git submodules initialized and updated successfully"
+else
+    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
+    exit 1
+fi
+
+# Build and install yalantinglibs from submodule
 print_section "Installing yalantinglibs"
-
-# Check if thirdparties directory exists
-if [ ! -d "${REPO_ROOT}/thirdparties" ]; then
-    mkdir -p "${REPO_ROOT}/thirdparties"
-    check_success "Failed to create thirdparties directory"
-fi
-
-# Change to thirdparties directory
-cd "${REPO_ROOT}/thirdparties"
-check_success "Failed to change to thirdparties directory"
-
-# Check if yalantinglibs is already installed
-if [ -d "yalantinglibs-${YALANTINGLIBS_VERSION}" ]; then
-    echo -e "${YELLOW}yalantinglibs-${YALANTINGLIBS_VERSION} directory already exists. Removing for fresh install...${NC}"
-    rm -rf yalantinglibs-${YALANTINGLIBS_VERSION}
-    check_success "Failed to remove existing yalantinglibs directory"
-fi
-
-# Download yalantinglibs
-YALANTINGLIBS_ZIPFILE="yalantinglibs-${YALANTINGLIBS_VERSION}.zip"
-echo "Downloading yalantinglibs ${YALANTINGLIBS_VERSION} from ${GITHUB_PROXY}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.zip"
-wget -q --show-progress -O ${YALANTINGLIBS_ZIPFILE} ${GITHUB_PROXY}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.zip
-check_success "Failed to download yalantinglibs"
-
-# Extract yalantinglibs
-echo "Extracting yalantinglibs..."
-unzip -q ${YALANTINGLIBS_ZIPFILE}
-check_success "Failed to extract yalantinglibs"
-
-# Clean up downloaded ZIP file
-rm -f ${YALANTINGLIBS_ZIPFILE}
-check_success "Failed to clean up downloaded ZIP file"
-
-# Build and install yalantinglibs
-cd yalantinglibs-${YALANTINGLIBS_VERSION}
-check_success "Failed to change to yalantinglibs directory"
+cd "${REPO_ROOT}/extern/yalantinglibs"
+check_success "Failed to change to yalantinglibs submodule directory"
 
 mkdir -p build
 check_success "Failed to create build directory"
-
 cd build
 check_success "Failed to change to build directory"
 
@@ -196,32 +180,7 @@ cmake --install .
 check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
-
-# Initialize and update git submodules
-print_section "Initializing Git Submodules"
-
-# Check if .gitmodules exists
-if [ -f "${REPO_ROOT}/.gitmodules" ]; then
-    # Check if submodules are already initialized by looking for the .git directory in the first submodule
-    FIRST_SUBMODULE=$(grep "path" ${REPO_ROOT}/.gitmodules | head -1 | awk '{print $3}')
-
-    echo "Enter repository root: ${REPO_ROOT}"
-    cd "${REPO_ROOT}"
-    check_success "Failed to change to repository root directory"
-
-    if [ -d "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ] || [ -f "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ]; then
-        echo -e "${YELLOW}Git submodules already initialized. Skipping...${NC}"
-    else
-        echo "Initializing git submodules..."
-        git submodule update --init
-        check_success "Failed to initialize git submodules"
-
-        print_success "Git submodules initialized and updated successfully"
-    fi
-else
-    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
-    exit 1
-fi
+cd "${REPO_ROOT}"
 
 print_section "Verifying essential build tools"
 
