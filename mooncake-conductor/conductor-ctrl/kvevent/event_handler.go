@@ -14,8 +14,7 @@ import (
 // It is instantiated in event_manager.go but implemented here to keep files clean.
 type KVEventHandler struct {
 	manager   *EventManager
-	tenant_id string
-	// svcName   string
+	tenantID string
 	modelName      string
 	loraName       string
 	instanceID     string

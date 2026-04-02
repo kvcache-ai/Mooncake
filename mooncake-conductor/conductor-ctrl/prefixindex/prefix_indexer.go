@@ -245,7 +245,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 		if len(event.BlockHashes) != 1 {
 			return fmt.Errorf("block hashes and tokens length mismatch")
 		}
-		// TOOO mooncake event, only one block hash, in the furture, remove it
+		// TODO mooncake event, only one block hash, in the future, remove it
 		// prefixStore := contextData.prefixStore
 		// for _, blockHash := range event.BlockHashes {
 		// 	if existingHash, exists := proxyHashMap[blockHash]; exists {

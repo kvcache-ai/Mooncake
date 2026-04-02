@@ -172,7 +172,7 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 
 	handler := &KVEventHandler{
 		manager:        m,
-		tenant_id:      svc.TenantID,
+		tenantID:       svc.TenantID,
 		modelName:      svc.ModelName,
 		loraName:       svc.LoraName,
 		instanceID:     svc.InstanceID,
