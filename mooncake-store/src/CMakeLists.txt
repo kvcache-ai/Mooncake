@@ -44,8 +44,13 @@ set(MOONCAKE_STORE_SOURCES
     local_hot_cache.cpp
     oplog_manager.cpp
     etcd_oplog_store.cpp
-    oplog_watcher.cpp
+    etcd_oplog_change_notifier.cpp
+    oplog_serializer.cpp
+    oplog_store_factory.cpp
+    oplog_replicator.cpp
     oplog_applier.cpp
+    localfs_oplog_store.cpp
+    polling_oplog_change_notifier.cpp
     hot_standby_service.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp

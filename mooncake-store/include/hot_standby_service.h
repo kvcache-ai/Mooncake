@@ -15,7 +15,8 @@
 #include "metadata_store.h"
 #include "oplog_applier.h"
 #include "oplog_manager.h"
-#include "oplog_watcher.h"
+#include "oplog_replicator.h"
+#include "oplog_store_factory.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "standby_state_machine.h"
 #include "types.h"
@@ -45,6 +46,11 @@ struct HotStandbyConfig {
     // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
     // state.
     bool enable_oplog_following{true};
+
+    // OpLog store configuration
+    OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
+    std::string oplog_store_root_dir{kDefaultOpLogRootDir};
+    int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
 };
 
 /**
@@ -162,7 +168,7 @@ class HotStandbyService {
     }
 
     /**
-     * @brief Callback for OpLogWatcher state changes
+     * @brief Callback for OpLogReplicator state changes
      * @param event The event to process
      */
     void OnWatcherEvent(StandbyEvent event);
@@ -242,7 +248,9 @@ class HotStandbyService {
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
-    std::unique_ptr<OpLogWatcher> oplog_watcher_;
+    std::shared_ptr<OpLogStore> watcher_oplog_store_;
+    std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
+    std::unique_ptr<OpLogReplicator> oplog_replicator_;
 
     // Configuration for etcd-based OpLog sync
     std::string etcd_endpoints_;

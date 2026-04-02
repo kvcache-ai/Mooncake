@@ -268,6 +268,8 @@ enum class ErrorCode : int32_t {
     ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
+    OPLOG_ENTRY_NOT_FOUND =
+        -1004,  ///< OpLog entry not found (backend-agnostic).
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =

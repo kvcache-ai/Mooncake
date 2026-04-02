@@ -205,10 +205,10 @@ TEST_F(EtcdOpLogStoreTest, TestWriteOpLog_Fencing) {
     OpLogEntry e2 = e1;
     ASSERT_EQ(ErrorCode::OK, store_->WriteOpLog(e2));
 
-    // NOTE: Duplicate sequence_id with different content is not a supported
-    // production scenario (sequence_id is monotonic). The batching write path
-    // does not guarantee conflict detection for that case, so we don't assert
-    // on it here.
+    // Same seq, different content => conflict (ETCD_OPERATION_ERROR)
+    OpLogEntry e3 = e1;
+    e3.payload = "value2";
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, store_->WriteOpLog(e3));
 }
 
 TEST_F(EtcdOpLogStoreTest, TestWriteOpLog_Idempotent) {
@@ -237,9 +237,10 @@ TEST_F(EtcdOpLogStoreTest, TestGetMaxSequenceIdAndEmpty) {
     uint64_t max_seq = 0;
 
     // Empty cluster: after cleanup, GetMaxSequenceId should return
-    // ETCD_KEY_NOT_EXIST
+    // OPLOG_ENTRY_NOT_FOUND
     CleanupTestData();
-    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, store_->GetMaxSequenceId(max_seq));
+    EXPECT_EQ(ErrorCode::OPLOG_ENTRY_NOT_FOUND,
+              store_->GetMaxSequenceId(max_seq));
 
     // After writing several entries, MaxSequenceId should equal the last
     // entry's seq
@@ -310,8 +311,8 @@ TEST_F(EtcdOpLogStoreTest, TestCleanupOpLogBeforeAndBoundary) {
     ASSERT_EQ(ErrorCode::OK, store_->CleanupOpLogBefore(3));
 
     OpLogEntry out;
-    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, store_->ReadOpLog(1, out));
-    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, store_->ReadOpLog(2, out));
+    EXPECT_EQ(ErrorCode::OPLOG_ENTRY_NOT_FOUND, store_->ReadOpLog(1, out));
+    EXPECT_EQ(ErrorCode::OPLOG_ENTRY_NOT_FOUND, store_->ReadOpLog(2, out));
 
     ASSERT_EQ(ErrorCode::OK, store_->ReadOpLog(3, out));
     EXPECT_EQ(3u, out.sequence_id);
