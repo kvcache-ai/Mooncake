@@ -1053,9 +1053,9 @@ TEST_F(RealClientTest, UpsertFrom) {
     // Put initial data
     std::string data_v1(64, 'A');
     EXPECT_EQ(py_client_->register_buffer(data_v1.data(), data_v1.size()), 0);
-    EXPECT_EQ(py_client_->upsert_from(key, data_v1.data(), data_v1.size(),
-                                       config),
-              0);
+    EXPECT_EQ(
+        py_client_->upsert_from(key, data_v1.data(), data_v1.size(), config),
+        0);
 
     auto buf = py_client_->get_buffer(key);
     ASSERT_NE(buf, nullptr);
@@ -1065,9 +1065,9 @@ TEST_F(RealClientTest, UpsertFrom) {
     // Upsert same size with different content
     std::string data_v2(64, 'B');
     EXPECT_EQ(py_client_->register_buffer(data_v2.data(), data_v2.size()), 0);
-    EXPECT_EQ(py_client_->upsert_from(key, data_v2.data(), data_v2.size(),
-                                       config),
-              0);
+    EXPECT_EQ(
+        py_client_->upsert_from(key, data_v2.data(), data_v2.size(), config),
+        0);
 
     buf = py_client_->get_buffer(key);
     ASSERT_NE(buf, nullptr);
@@ -1155,15 +1155,15 @@ TEST_F(RealClientTest, BatchUpsertFrom) {
     EXPECT_EQ(py_client_->register_buffer(data2.data(), data2.size()), 0);
 
     std::vector<std::string> keys = {"batch_upsert_0", "batch_upsert_1",
-                                      "batch_upsert_2"};
+                                     "batch_upsert_2"};
     std::vector<void*> buffers = {data0.data(), data1.data(), data2.data()};
     std::vector<size_t> sizes = {data0.size(), data1.size(), data2.size()};
 
     auto results = py_client_->batch_upsert_from(keys, buffers, sizes, config);
     ASSERT_EQ(results.size(), 3);
     for (size_t i = 0; i < results.size(); ++i) {
-        EXPECT_EQ(results[i], 0) << "batch_upsert_from failed for key "
-                                 << keys[i];
+        EXPECT_EQ(results[i], 0)
+            << "batch_upsert_from failed for key " << keys[i];
     }
 
     // Verify each key
@@ -1199,7 +1199,7 @@ TEST_F(RealClientTest, UpsertBatch) {
     config.replica_num = 1;
 
     std::vector<std::string> keys = {"upsert_batch_0", "upsert_batch_1",
-                                      "upsert_batch_2"};
+                                     "upsert_batch_2"};
     std::string val0 = "value_for_key_0!";
     std::string val1 = "value_for_key_1!";
     std::string val2 = "value_for_key_2!";
