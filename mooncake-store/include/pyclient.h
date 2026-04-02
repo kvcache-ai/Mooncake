@@ -159,6 +159,15 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    /**
+     * Read a range [src_offset, src_offset+size) from key into
+     * (buffer + dst_offset). For zero-copy, buffer must be registered.
+     * @return bytes read on success, negative on error
+     */
+    virtual int64_t get_into_range(const std::string &key, void *buffer,
+                                   size_t dst_offset, size_t src_offset,
+                                   size_t size) = 0;
+
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,

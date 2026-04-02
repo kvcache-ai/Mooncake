@@ -2063,9 +2063,66 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
+    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
+    size_t size) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto query_result = client_->Query(key);
+    if (!query_result) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            return tl::unexpected(query_result.error());
+        }
+        LOG(ERROR) << "Query failed for key: " << key;
+        return tl::unexpected(query_result.error());
+    }
+
+    const auto &replica_list = query_result.value().replicas;
+    if (replica_list.empty()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto &res = client_->GetPreferredReplica(replica_list);
+    if (!res) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+
+    const auto &replica = res.value();
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "get_into_range only supports memory replicas";
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    uint64_t total_size = calculate_total_size(replica);
+    if (src_offset + size > total_size) {
+        LOG(ERROR) << "Range overflow: src_offset=" << src_offset
+                   << " + size=" << size << " > total=" << total_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
+
+    auto get_result =
+        client_->Get(key, query_result.value(), slices, src_offset);
+    if (!get_result) {
+        return tl::unexpected(get_result.error());
+    }
+    return static_cast<int64_t>(size);
+}
+
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
     return to_py_ret(get_into_internal(key, buffer, size));
+}
+
+int64_t RealClient::get_into_range(const std::string &key, void *buffer,
+                                   size_t dst_offset, size_t src_offset,
+                                   size_t size) {
+    return to_py_ret(
+        get_into_range_internal(key, buffer, dst_offset, src_offset, size));
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -2726,6 +2783,44 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
     return batch_get_into_multi_buffers_internal(
         keys, real_buffers_result.value(), all_sizes,
         prefer_alloc_in_same_node);
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
+    size_t src_offset, size_t size, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    uint64_t dummy_addr = dummy_buffer;
+    bool found = false;
+    void *real_buffer = nullptr;
+
+    for (const auto &shm : context.mapped_shms) {
+        if (dummy_addr >= shm.dummy_base_addr &&
+            dummy_addr + dst_offset + size <=
+                shm.dummy_base_addr + shm.shm_size) {
+            real_buffer =
+                reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset +
+                                         static_cast<uint64_t>(dst_offset));
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        LOG(ERROR) << "Dummy buffer at " << dummy_addr
+                   << " (dst_offset=" << dst_offset << ", size=" << size
+                   << ") not found in any mapped shared memory for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return get_into_range_internal(key, real_buffer, 0, src_offset, size);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>

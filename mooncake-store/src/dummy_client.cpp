@@ -760,6 +760,19 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     return -1;
 }
 
+int64_t DummyClient::get_into_range(const std::string& key, void* buffer,
+                                    size_t dst_offset, size_t src_offset,
+                                    size_t size) {
+    uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
+    auto result = invoke_rpc<&RealClient::get_into_range_dummy_helper,
+                             tl::expected<int64_t, ErrorCode>>(
+        key, buf_addr, dst_offset, src_offset, size, client_id_);
+    if (!result) {
+        return static_cast<int64_t>(toInt(result.error()));
+    }
+    return to_py_ret(*result);
+}
+
 std::string DummyClient::get_hostname() const {
     // Dummy client does not have a hostname
     return "";

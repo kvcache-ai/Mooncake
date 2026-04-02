@@ -108,6 +108,10 @@ class RealClient : public PyClient {
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
+    int64_t get_into_range(const std::string &key, void *buffer,
+                           size_t dst_offset, size_t src_offset,
+                           size_t size) override;
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys (batch version)
@@ -420,6 +424,10 @@ class RealClient : public PyClient {
         bool prefer_alloc_in_same_node, int32_t device_id,
         const UUID &client_id);
 
+    tl::expected<int64_t, ErrorCode> get_into_range_dummy_helper(
+        const std::string &key, uint64_t buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const UUID &client_id);
+
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
     tl::expected<void, ErrorCode> map_shm_internal(int fd,
@@ -481,6 +489,10 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
                                                        void *buffer,
                                                        size_t size);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_internal(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
