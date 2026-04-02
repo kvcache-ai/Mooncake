@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "ha/replication_controller.h"
+#include "ha/standby_controller.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
