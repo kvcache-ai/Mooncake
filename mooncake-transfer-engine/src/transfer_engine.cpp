@@ -505,8 +505,7 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
 PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
     if (use_tent_) {
         auto status = impl_tent_->probePeerAliveByID(target_id);
-        return status.ok() ? PeerLiveness::Alive
-                           : PeerLiveness::Unreachable;
+        return status.ok() ? PeerLiveness::Alive : PeerLiveness::Unreachable;
     }
     return impl_->probePeerAliveByID(target_id) == 0
                ? PeerLiveness::Alive

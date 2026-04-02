@@ -1234,8 +1234,7 @@ Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
     CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
     auto server_addr = desc->getMemory().rpc_server_addr;
     if (server_addr.empty()) {
-        return Status::InvalidArgument(
-            "Requested segment type error" LOC_MARK);
+        return Status::InvalidArgument("Requested segment type error" LOC_MARK);
     }
     return ControlClient::probe(server_addr);
 }
