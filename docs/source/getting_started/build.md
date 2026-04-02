@@ -18,6 +18,7 @@ pip install mooncake-transfer-engine-non-cuda
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
+> **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
 
 ## Automatic
 
@@ -112,8 +113,25 @@ pip install mooncake-transfer-engine-non-cuda
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
+    ```
 
-4. Install yalantinglibs
+4. If you want to compile Cambricon MLU support, first install the Cambricon Neuware SDK. After that:
+    1) Export `NEUWARE_HOME` or pass `-DNEUWARE_ROOT=/path/to/neuware` to CMake
+    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cnrt`, `cndrv`, and other Neuware libraries during compilation:
+    ```bash
+    export NEUWARE_HOME=/usr/local/neuware
+    export LIBRARY_PATH=$LIBRARY_PATH:${NEUWARE_HOME}/lib64
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${NEUWARE_HOME}/lib64
+    ```
+
+    If your Neuware installation lives outside the default include/library layout, you can also pass:
+    ```bash
+    cmake .. -DUSE_MLU=ON \
+      -DMLU_INCLUDE_DIR=/path/to/neuware/include \
+      -DMLU_LIB_DIR=/path/to/neuware/lib64
+    ```
+
+5. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -123,7 +141,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-5. In the root directory of this project, run the following commands:
+6. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -131,7 +149,13 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-6. Install Mooncake python package and mooncake_master executable
+   For Cambricon MLU builds, enable the MLU backend explicitly:
+   ```bash
+   cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
+   make -j
+   ```
+
+7. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
@@ -154,6 +178,10 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on.
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
+- `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
+- `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.
+- `-DMLU_INCLUDE_DIR=/path/to/include`: Override the Neuware include directory when `-DUSE_MLU=ON`.
+- `-DMLU_LIB_DIR=/path/to/lib64`: Override the Neuware library directory when `-DUSE_MLU=ON`.
 - `-DUSE_EFA=[ON|OFF]`: Enable AWS Elastic Fabric Adapter transport via libfabric. **Default: OFF.** See [EFA Transport](../design/transfer-engine/efa_transport.md) for details.
 - `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
