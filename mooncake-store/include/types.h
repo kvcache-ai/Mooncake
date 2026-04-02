@@ -177,6 +177,8 @@ enum class ErrorCode : int32_t {
 
     // Store errors (Range: -1500 to -1599)
     SHUTTING_DOWN = -1500,  ///< Store is shutting down, rejecting new requests.
+    ASYNC_ENQUEUE_FAILED =
+        -1501,  ///< Async metadata notifier enqueue failed (queue full/stopped).
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

@@ -75,8 +75,8 @@ class P2PMasterServiceTest : public ::testing::Test {
         AddReplicaRequest req;
         req.key = key;
         req.size = size;
-        req.replica.client_id = client_id;
-        req.replica.segment_id = segment_id;
+        req.client_id = client_id;
+        req.segment_id = segment_id;
         auto res = service.AddReplica(req);
         EXPECT_TRUE(res.has_value())
             << "Failed to add replica: " << res.error();
@@ -296,8 +296,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = seg.id;
+    req.client_id = client_id;
+    req.segment_id = seg.id;
     auto res = service->AddReplica(req);
     ASSERT_TRUE(res.has_value());
 
@@ -321,8 +321,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = seg.id;
+    req.client_id = client_id;
+    req.segment_id = seg.id;
 
     // First add
     auto res1 = service->AddReplica(req);
@@ -354,8 +354,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client3;
-    req.replica.segment_id = seg3.id;
+    req.client_id = client3;
+    req.segment_id = seg3.id;
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
@@ -368,8 +368,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaClientNotFound) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = generate_uuid();  // non-existent
-    req.replica.segment_id = seg.id;
+    req.client_id = generate_uuid();  // non-existent
+    req.segment_id = seg.id;
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::CLIENT_NOT_FOUND, res.error());
@@ -384,8 +384,8 @@ TEST_F(P2PMasterServiceTest, AddReplicaSegmentNotFound) {
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;
-    req.replica.client_id = client_id;
-    req.replica.segment_id = generate_uuid();  // non-existent segment
+    req.client_id = client_id;
+    req.segment_id = generate_uuid();  // non-existent segment
     auto res = service->AddReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, res.error());
@@ -662,7 +662,8 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     AddReplicaRequest a_req;
     a_req.key = "data_001";
     a_req.size = 4096;
-    a_req.replica = candidate.replica;
+    a_req.client_id = candidate.replica.client_id;
+    a_req.segment_id = candidate.replica.segment_id;
     auto a_res = service->AddReplica(a_req);
     ASSERT_TRUE(a_res.has_value());
 

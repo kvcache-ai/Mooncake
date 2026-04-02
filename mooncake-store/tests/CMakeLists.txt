@@ -54,6 +54,7 @@ add_store_test(p2p_client_meta_test p2p_client_meta_test.cpp)
 add_store_test(p2p_client_manager_test p2p_client_manager_test.cpp)
 add_store_test(centralized_client_manager_test centralized_client_manager_test.cpp)
 add_store_test(route_cache_test route_cache_test.cpp)
+add_store_test(async_metadata_notifier_test async_metadata_notifier_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
