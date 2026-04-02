@@ -339,8 +339,8 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     }
 
     if (!watcher_started) {
-        LOG(ERROR) << "Failed to start OpLogReplicator after " << kMaxStartRetries
-                   << " attempts, aborting Start()";
+        LOG(ERROR) << "Failed to start OpLogReplicator after "
+                   << kMaxStartRetries << " attempts, aborting Start()";
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return ErrorCode::INTERNAL_ERROR;
     }

@@ -270,58 +270,55 @@ void EtcdOpLogStore::FlushBatch() {
                     all_ok = false;
                 }
             }
-            }
-            if (all_ok) {
-                err = ErrorCode::OK;
-            }
-            break;  // Do not retry further; fallback already handled it.
         }
-        if (i < kFlushRetryCount) {
-            LOG(WARNING) << "Failed to flush OpLog batch (attempt " << i + 1
-                         << "/" << kFlushRetryCount + 1 << "), retrying...";
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kFlushRetryIntervalMs));
+        if (all_ok) {
+            err = ErrorCode::OK;
         }
+        break;  // Do not retry further; fallback already handled it.
     }
+    if (i < kFlushRetryCount) {
+        LOG(WARNING) << "Failed to flush OpLog batch (attempt " << i + 1 << "/"
+                     << kFlushRetryCount + 1 << "), retrying...";
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kFlushRetryIntervalMs));
+    }
+}
 
-    // Step 3: Update state under lock.
-    {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
+// Step 3: Update state under lock.
+{
+    std::lock_guard<std::mutex> lock(batch_mutex_);
 
-        if (err == ErrorCode::OK) {
-            if (max_seq > last_persisted_seq_id_.load()) {
-                last_persisted_seq_id_.store(max_seq);
-            }
+    if (err == ErrorCode::OK) {
+        if (max_seq > last_persisted_seq_id_.load()) {
+            last_persisted_seq_id_.store(max_seq);
+        }
 
-            // Update HA metrics
-            HAMetricManager::instance().inc_oplog_batch_commits();
-            if (has_sync_entry) {
-                HAMetricManager::instance().inc_oplog_sync_batch_commits();
-            }
+        // Update HA metrics
+        HAMetricManager::instance().inc_oplog_batch_commits();
+        if (has_sync_entry) {
+            HAMetricManager::instance().inc_oplog_sync_batch_commits();
+        }
 
-            if (batch_to_write.size() > 1) {
-                LOG(INFO)
-                    << "HA Strategy: Group Commit flush success. batch_size="
-                    << batch_to_write.size() << ", max_seq=" << max_seq;
-            } else {
-                VLOG(3)
-                    << "HA Strategy: Group Commit flush success. batch_size=1, "
+        if (batch_to_write.size() > 1) {
+            LOG(INFO) << "HA Strategy: Group Commit flush success. batch_size="
+                      << batch_to_write.size() << ", max_seq=" << max_seq;
+        } else {
+            VLOG(3) << "HA Strategy: Group Commit flush success. batch_size=1, "
                        "max_seq="
                     << max_seq;
-                if (!has_sync_entry) {
-                    LOG_EVERY_N(INFO, 1000)
-                        << "Note: Frequent single-entry async "
-                           "flushes detected (sample).";
-                }
+            if (!has_sync_entry) {
+                LOG_EVERY_N(INFO, 1000) << "Note: Frequent single-entry async "
+                                           "flushes detected (sample).";
             }
-        } else {
-            LOG(ERROR) << "Failed to flush OpLog batch, count="
-                       << batch_to_write.size();
         }
+    } else {
+        LOG(ERROR) << "Failed to flush OpLog batch, count="
+                   << batch_to_write.size();
     }
+}
 
-    // Wake up all waiting threads (Strategy 2+: DELETE waiters)
-    cv_sync_completed_.notify_all();
+// Wake up all waiting threads (Strategy 2+: DELETE waiters)
+cv_sync_completed_.notify_all();
 }
 
 ErrorCode EtcdOpLogStore::ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) {

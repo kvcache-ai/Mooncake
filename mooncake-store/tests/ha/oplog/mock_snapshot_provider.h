@@ -25,8 +25,8 @@ class MockSnapshotProvider : public SnapshotProvider {
 
     void SetLoadFail(bool fail) { should_fail_ = fail; }
 
-    tl::expected<std::optional<LoadedSnapshot>, ErrorCode>
-    LoadLatestSnapshot(const std::string& /*cluster_id*/) override {
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& /*cluster_id*/) override {
         if (should_fail_) {
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
