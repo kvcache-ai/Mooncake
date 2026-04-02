@@ -92,6 +92,11 @@ Status ControlClient::notify(const std::string& server_addr,
     return tl_rpc_agent.call(server_addr, Notify, request, response);
 }
 
+Status ControlClient::probe(const std::string& server_addr) {
+    std::string request, response;
+    return tl_rpc_agent.call(server_addr, Probe, request, response);
+}
+
 inline void to_json(json& j, const Request& r) {
     j = json{{"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
              {"source", reinterpret_cast<uintptr_t>(r.source)},
@@ -199,6 +204,10 @@ ControlService::ControlService(const std::string& type,
             onNotify(request, response);
         });
     rpc_server_->registerFunction(
+        Probe, [this](const std::string_view& request, std::string& response) {
+            onProbe(request, response);
+        });
+    rpc_server_->registerFunction(
         Delegate,
         [this](const std::string_view& request, std::string& response) {
             onDelegate(request, response);
@@ -283,6 +292,12 @@ void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
     Notification message = json::parse(request).get<Notification>();
     if (notify_callback_) notify_callback_(message);
+}
+
+void ControlService::onProbe(const std::string_view& request,
+                             std::string& response) {
+    (void)request;
+    (void)response;
 }
 
 void ControlService::onDelegate(const std::string_view& request,

@@ -34,6 +34,11 @@ using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 
+enum class PeerLiveness : uint8_t {
+    Alive = 0,
+    Unreachable = 1,
+};
+
 class TransferEngine {
    public:
     TransferEngine(bool auto_discover = false);
@@ -95,6 +100,8 @@ class TransferEngine {
 
     int sendNotifyByName(std::string remote_agent,
                          TransferMetadata::NotifyDesc notify_msg);
+
+    PeerLiveness probePeerAliveByID(SegmentID target_id);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);

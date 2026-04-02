@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/control_plane.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1226,6 +1227,17 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
         return transport->sendNotification(target_id, notifi);
     }
     return Status::InvalidArgument("Notification not supported" LOC_MARK);
+}
+
+Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    SegmentDesc* desc = nullptr;
+    CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
+    auto server_addr = desc->getMemory().rpc_server_addr;
+    if (server_addr.empty()) {
+        return Status::InvalidArgument(
+            "Requested segment type error" LOC_MARK);
+    }
+    return ControlClient::probe(server_addr);
 }
 
 Status TransferEngineImpl::receiveNotification(

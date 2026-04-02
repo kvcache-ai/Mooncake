@@ -150,6 +150,10 @@ Status TransferEngine::receiveNotification(
     return impl_->receiveNotification(notifi_list);
 }
 
+Status TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    return impl_->probePeerAliveByID(target_id);
+}
+
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus& task_status) {
     return impl_->getTransferStatus(batch_id, task_id, task_status);
