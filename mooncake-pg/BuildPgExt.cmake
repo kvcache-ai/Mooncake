@@ -67,7 +67,7 @@ if("${EP_TORCH_VERSIONS}" STREQUAL "")
 else()
   message(STATUS "[PG] Building for PyTorch versions: ${EP_TORCH_VERSIONS}")
   foreach(_version IN LISTS EP_TORCH_VERSIONS)
-    install_pytorch_for_version("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[PG]")
+    install_pytorch_wheel("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[PG]")
 
     execute_process(
       COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
