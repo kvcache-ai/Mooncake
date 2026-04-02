@@ -158,8 +158,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
             deconstruct();
             return -1;
         }
-
-        postNotifyRecv(i);
     }
 
     status_ = EP_HANDSHAKING;
@@ -566,7 +564,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
     if (rc) {
-        PLOG(ERROR) << "ibv_post_send";
+        LOG(ERROR) << "ibv_post_send: " << strerror(-rc) << " [" << rc << "]";
         while (bad_wr) {
             slice_list[bad_wr - wr_list.data()]->failed = true;
             cancelQuota(qp_index, 1);
@@ -595,7 +593,7 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     int rc = ibv_post_recv(qp_list_[qp_index], &wr, &bad_wr);
     if (rc) {
         cancelQuota(qp_index, 1);
-        PLOG(ERROR) << "ibv_post_recv";
+        LOG(ERROR) << "ibv_post_recv: " << strerror(-rc) << " [" << rc << "]";
         return -1;
     }
     return 1;
@@ -772,8 +770,10 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     wr.num_sge = 1;
 
     ibv_recv_wr* bad_wr = nullptr;
-    if (ibv_post_recv(notify_qp_, &wr, &bad_wr)) {
-        PLOG(ERROR) << "Failed to post notification recv";
+    int ret = ibv_post_recv(notify_qp_, &wr, &bad_wr);
+    if (ret) {
+        LOG(ERROR) << "Failed to post notification recv: " << strerror(-ret)
+                   << " [" << ret << "]";
     }
 }
 
@@ -924,10 +924,11 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
     if (ret) {
-        PLOG(ERROR) << "Failed to post notification send, "
-                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
-                    << ", endpoint: " << peer_nic_name_ << " of "
-                    << peer_server_name_ << ", error code " << ret;
+        LOG(ERROR) << "Failed to post notification send: " << strerror(-ret)
+                   << " [" << ret << "], "
+                   << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
+                   << ", endpoint: " << peer_nic_name_ << " of "
+                   << peer_server_name_;
         return false;
     }
 
