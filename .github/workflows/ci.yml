@@ -8,6 +8,7 @@ on:
     types: [opened, synchronize, reopened, labeled]
 
 permissions:
+  contents: read
   actions: write
   statuses: write
 
@@ -603,6 +604,7 @@ jobs:
     steps:
     - name: Set pending status for downstream tests
       if: github.event_name == 'pull_request'
+      continue-on-error: true
       uses: actions/github-script@v7
       with:
         script: |
@@ -614,7 +616,7 @@ jobs:
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha: context.sha,
+              sha: context.payload.pull_request.head.sha,
               state: 'pending',
               context: ctx,
               description: 'Waiting for Build & Test to complete...',
