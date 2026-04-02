@@ -333,6 +333,9 @@ void AscendDirectTransport::startTransfer(
             if (!ret.ok()) {
                 return;
             }
+        } else {
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            connected_segments_.emplace(remote_hixl);
         }
     }
     auto op = (opcode == Request::WRITE) ? hixl::WRITE : hixl::READ;
@@ -438,6 +441,9 @@ void AscendDirectTransport::disconnect(const std::string &remote_hixl,
             LOG(ERROR) << "Failed to disconnect to: " << remote_hixl
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
+        } else {
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            connected_segments_.erase(remote_hixl);
         }
         return;
     }
@@ -506,6 +512,15 @@ Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
 }
 
 Status AscendDirectTransport::removeMemoryBuffer(BufferDesc &desc) {
+    std::vector<std::string> remote_hixls;
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        remote_hixls.assign(connected_segments_.begin(),
+                            connected_segments_.end());
+    }
+    for (const auto &remote_hixl : remote_hixls) {
+        disconnect(remote_hixl, 10);
+    }
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto addr = desc.addr;
     if (addr_to_mem_handle_.find(addr) != addr_to_mem_handle_.end()) {
