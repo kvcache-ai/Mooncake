@@ -96,7 +96,6 @@ performance/ssd-offload-benchmark-results
 :maxdepth: 1
 
 python-api-reference/mooncake-store
-python-api-reference/engram
 python-api-reference/transfer-engine
 http-api-reference/http-service
 python-api-reference/ep-backend
@@ -114,7 +113,6 @@ design/p2p-store
 design/transfer-engine/index
 design/hicache-design
 design/engram
-design/deepseek-engram-paper-demo-notes
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
