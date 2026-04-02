@@ -183,6 +183,16 @@ TEST_F(RedisSnapshotCatalogStoreTest, ListSkipsSnapshotsWhenDescriptorMissing) {
     EXPECT_TRUE(snapshots->empty());
 }
 
+TEST(RedisSnapshotCatalogStoreStandaloneTest,
+     ListReturnsInvalidParamsWhenObjectStoreMissing) {
+    ha::backends::redis::RedisSnapshotCatalogStore store(
+        nullptr, "unused:6379", "snapshot-redis-null-object-store");
+
+    auto snapshots = store.List(0);
+    ASSERT_FALSE(snapshots.has_value());
+    EXPECT_EQ(snapshots.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(RedisSnapshotCatalogStoreTest,
        ListSkipsUnreadableSnapshotsAndKeepsHealthyEntries) {
     ASSERT_EQ(store_->Publish(MakeDescriptor("20240301_120000_001")),

@@ -220,9 +220,6 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
         if (metadata_store_ && metadata_store_->GetKeyCount() > 0) {
             LOG(INFO) << "Snapshot-only restart discards local metadata and "
                          "reloads the latest catalog snapshot";
-            metadata_store_ = std::make_unique<StandbyMetadataStore>();
-            oplog_applier_ = std::make_unique<OpLogApplier>(
-                metadata_store_.get(), cluster_id_);
         }
 
         auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
@@ -255,6 +252,7 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     uint64_t& baseline_seq_id) {
     baseline_seq_id = 0;
+    metadata_store_->Clear();
     oplog_applier_->Recover(0);
 
     if (!config_.enable_snapshot_bootstrap || !snapshot_provider_) {
@@ -291,7 +289,6 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
-    metadata_store_->Clear();
     for (const auto& kv : snapshot.metadata) {
         metadata_store_->PutMetadata(kv.first, kv.second);
     }

@@ -155,6 +155,10 @@ EmbeddedSnapshotCatalogStore::List(size_t limit) {
         limit == 0 ? snapshot_ids.size() : std::min(limit, snapshot_ids.size());
     snapshots.reserve(target_size);
 
+    // This does one descriptor object-store read per published snapshot id.
+    // The current design relies on MasterService::CleanupOldSnapshot() to keep
+    // the catalog bounded by snapshot retention (default 3), so the scan stays
+    // single-digit in normal deployments.
     for (const auto& snapshot_id : snapshot_ids) {
         if (limit != 0 && snapshots.size() >= limit) {
             break;

@@ -2120,31 +2120,26 @@ void MasterService::SnapshotThreadFunc() {
             continue;
         }
 
-        tl::expected<ha::SnapshotDescriptor, SerializationError> descriptor =
-            tl::make_unexpected(
-                SerializationError(ErrorCode::INTERNAL_ERROR,
-                                   "snapshot descriptor was not initialized"));
+        const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        auto descriptor =
+            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
+        if (!descriptor) {
+            LOG(ERROR) << "[Snapshot] Failed to build descriptor before fork, "
+                          "snapshot_id="
+                       << snapshot_id
+                       << ", code=" << toString(descriptor.error().code)
+                       << ", msg=" << descriptor.error().message;
+            close(log_pipe[0]);
+            close(log_pipe[1]);
+            continue;
+        }
+
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
-            const std::string path_prefix =
-                SNAPSHOT_ROOT + "/" + snapshot_id + "/";
-            const std::string manifest_path =
-                path_prefix + SNAPSHOT_MANIFEST_FILE;
-            descriptor = BuildSnapshotDescriptor(snapshot_id, manifest_path,
-                                                 path_prefix);
-            if (!descriptor) {
-                LOG(ERROR) << "[Snapshot] Failed to build descriptor before "
-                              "fork, snapshot_id="
-                           << snapshot_id
-                           << ", code=" << toString(descriptor.error().code)
-                           << ", msg=" << descriptor.error().message;
-                close(log_pipe[0]);
-                close(log_pipe[1]);
-                continue;
-            }
             pid = fork();
         }
         if (pid == -1) {
@@ -2356,6 +2351,10 @@ void MasterService::HandleChildExit(pid_t pid, int status,
 tl::expected<ha::OpLogSequenceId, SerializationError>
 MasterService::ResolveSnapshotSequenceId() const {
     if (!enable_ha_ || ha_backend_type_ != "etcd") {
+        // OpLog sequence ids start at 1. Returning 0 here is a sentinel that
+        // means "no persisted OpLog boundary", so a standby that later calls
+        // Recover(0) will replay from the first entry when oplog following is
+        // enabled.
         return ha::OpLogSequenceId{0};
     }
 
@@ -2364,31 +2363,13 @@ MasterService::ResolveSnapshotSequenceId() const {
         ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
         "etcd snapshot sequence resolution is unavailable in this build"));
 #else
-    if (ha_backend_connstring_.empty()) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::INVALID_PARAMS,
-            "etcd snapshot sequence resolution requires a backend connstring"));
-    }
-
-    auto err =
-        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_.c_str());
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to connect to etcd for snapshot boundary: "
-                             "{}",
-                             toString(err))));
-    }
-
-    EtcdOpLogStore oplog_store(cluster_id_);
-    err = oplog_store.Init();
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to initialize etcd oplog store: {}",
-                             toString(err))));
+    auto oplog_store = GetSnapshotBoundaryOpLogStore();
+    if (!oplog_store) {
+        return tl::make_unexpected(oplog_store.error());
     }
 
     uint64_t sequence_id = 0;
-    err = oplog_store.GetLatestSequenceId(sequence_id);
+    auto err = oplog_store.value()->GetLatestSequenceId(sequence_id);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
         return ha::OpLogSequenceId{0};
     }
@@ -2401,6 +2382,42 @@ MasterService::ResolveSnapshotSequenceId() const {
     return static_cast<ha::OpLogSequenceId>(sequence_id);
 #endif
 }
+
+#ifdef STORE_USE_ETCD
+tl::expected<EtcdOpLogStore*, SerializationError>
+MasterService::GetSnapshotBoundaryOpLogStore() const {
+    if (ha_backend_connstring_.empty()) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::INVALID_PARAMS,
+            "etcd snapshot sequence resolution requires a backend connstring"));
+    }
+
+    std::lock_guard<std::mutex> lock(snapshot_boundary_oplog_store_mutex_);
+    if (snapshot_boundary_oplog_store_ != nullptr) {
+        return snapshot_boundary_oplog_store_.get();
+    }
+
+    auto err =
+        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_.c_str());
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to connect to etcd for snapshot boundary: "
+                             "{}",
+                             toString(err))));
+    }
+
+    auto oplog_store = std::make_unique<EtcdOpLogStore>(cluster_id_);
+    err = oplog_store->Init();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to initialize etcd oplog store: {}",
+                             toString(err))));
+    }
+
+    snapshot_boundary_oplog_store_ = std::move(oplog_store);
+    return snapshot_boundary_oplog_store_.get();
+}
+#endif
 
 tl::expected<ha::SnapshotDescriptor, SerializationError>
 MasterService::BuildSnapshotDescriptor(const std::string& snapshot_id,
@@ -2699,6 +2716,9 @@ void MasterService::CleanupOldSnapshot(int keep_count,
         return;
     }
 
+    // List() loads one descriptor per published snapshot. This remains cheap
+    // because CleanupOldSnapshot() itself enforces snapshot_retention_count_
+    // and keeps the catalog single-digit in normal deployments.
     auto list_result = snapshot_catalog_store->List(kUnlimitedSnapshotList);
     if (!list_result) {
         SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
@@ -2764,6 +2784,9 @@ void MasterService::RestoreState() {
         candidate_ids.emplace(latest_snapshot.snapshot_id);
     }
 
+    // Snapshot ids use YYYYMMDD_HHMMSS_mmm, so lexicographic order matches
+    // creation order. List() may perform one descriptor read per published
+    // snapshot; retention cleanup keeps that set bounded in practice.
     auto snapshots_result =
         snapshot_catalog_store->List(kUnlimitedSnapshotList);
     if (!snapshots_result) {
@@ -2778,6 +2801,8 @@ void MasterService::RestoreState() {
                      << ", attempting latest marker only";
     } else {
         for (const auto& snapshot : snapshots_result.value()) {
+            // Snapshot ids are timestamp-derived, so string comparison keeps
+            // only candidates at or before the latest marker chronologically.
             if (latest_snapshot_id.has_value() &&
                 snapshot.snapshot_id > latest_snapshot_id.value()) {
                 continue;

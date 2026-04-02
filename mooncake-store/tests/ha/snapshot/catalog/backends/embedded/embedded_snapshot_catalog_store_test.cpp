@@ -202,6 +202,16 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
     ASSERT_EQ(snapshots->size(), 1u);
     EXPECT_EQ(snapshots->at(0).snapshot_id, "20240301_120000_001");
 }
+
+TEST(EmbeddedSnapshotCatalogStoreStandaloneTest,
+     ListReturnsInvalidParamsWhenObjectStoreMissing) {
+    ha::backends::embedded::EmbeddedSnapshotCatalogStore store(nullptr);
+
+    auto snapshots = store.List(0);
+    ASSERT_FALSE(snapshots.has_value());
+    EXPECT_EQ(snapshots.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(EmbeddedSnapshotCatalogStoreTest, DeleteRemovesSnapshotObjectsByPrefix) {
     PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
               "m1");

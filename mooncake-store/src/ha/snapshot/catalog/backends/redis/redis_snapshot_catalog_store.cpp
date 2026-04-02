@@ -232,7 +232,7 @@ RedisSnapshotCatalogStore::GetLatest() {
 
 tl::expected<std::vector<SnapshotDescriptor>, ErrorCode>
 RedisSnapshotCatalogStore::List(size_t limit) {
-    if (connstring_.empty()) {
+    if (connstring_.empty() || object_store_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -254,6 +254,10 @@ RedisSnapshotCatalogStore::List(size_t limit) {
 
     std::vector<SnapshotDescriptor> snapshots;
     snapshots.reserve(reply->elements);
+    // This does one descriptor object-store read per published snapshot id.
+    // The current design relies on MasterService::CleanupOldSnapshot() to keep
+    // the catalog bounded by snapshot retention (default 3), so the scan stays
+    // single-digit in normal deployments.
     for (size_t i = 0; i < reply->elements; ++i) {
         const auto* element = reply->element[i];
         if (!IsStringReply(element) || element->str == nullptr) {

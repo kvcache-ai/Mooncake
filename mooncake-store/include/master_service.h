@@ -35,6 +35,8 @@ namespace ha {
 class SnapshotCatalogStore;
 }
 
+class EtcdOpLogStore;
+
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
@@ -455,6 +457,10 @@ class MasterService {
                             const std::string& object_prefix) const;
     tl::expected<ha::OpLogSequenceId, SerializationError>
     ResolveSnapshotSequenceId() const;
+#ifdef STORE_USE_ETCD
+    tl::expected<EtcdOpLogStore*, SerializationError>
+    GetSnapshotBoundaryOpLogStore() const;
+#endif
 
     tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
@@ -1097,6 +1103,10 @@ class MasterService {
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
+#ifdef STORE_USE_ETCD
+    mutable std::mutex snapshot_boundary_oplog_store_mutex_;
+    mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;
+#endif
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
