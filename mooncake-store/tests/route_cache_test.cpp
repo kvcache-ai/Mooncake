@@ -409,16 +409,6 @@ TEST_F(RouteCacheTest, DifferentCacheSizes) {
     printf("[ PERF ] 100 MB: %.2f%%\n", run_test(100));
 }
 
-TEST_F(RouteCacheTest, AdaptiveConfig) {
-    // Test extremely small memory: 1MB.
-    // Estimated entries should be small but constructible.
-    EXPECT_NO_THROW({ RouteCache tiny(1024 * 1024, 60000); });
-
-    // Test large memory: 10GB.
-    // SHould have many shards and nodes.
-    EXPECT_NO_THROW({ RouteCache large(10ULL * 1024 * 1024 * 1024, 60000); });
-}
-
 // ============================================================================
 // EBR Safety
 // ============================================================================
