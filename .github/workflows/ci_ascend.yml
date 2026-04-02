@@ -302,9 +302,12 @@ jobs:
             const isTargetRepo = '${{ github.repository }}' === 'kvcache-ai/Mooncake';
 
             let state, description;
-            if (conclusion !== 'success') {
+            if (conclusion === 'cancelled') {
               state = 'failure';
-              description = 'CI failed, Ascend test skipped';
+              description = 'CI cancelled (format/spell check failed)';
+            } else if (conclusion !== 'success') {
+              state = 'failure';
+              description = 'CI ' + conclusion + ', Ascend test skipped';
             } else if (!isTargetRepo) {
               state = 'success';
               description = 'Skipped (fork repository)';

@@ -164,9 +164,12 @@ jobs:
             const testResult = '${{ needs.test-sglang-integration.result }}';
 
             let state, description;
-            if (conclusion !== 'success') {
+            if (conclusion === 'cancelled') {
               state = 'failure';
-              description = 'CI failed, integration test skipped';
+              description = 'CI cancelled (format/spell check failed)';
+            } else if (conclusion !== 'success') {
+              state = 'failure';
+              description = 'CI ' + conclusion + ', integration test skipped';
             } else if (shouldRun !== 'true') {
               state = 'success';
               description = 'Skipped (no relevant file changes)';
