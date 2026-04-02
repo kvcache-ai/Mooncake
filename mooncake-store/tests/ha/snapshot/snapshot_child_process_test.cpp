@@ -272,11 +272,9 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
         auto descriptor_payload =
             ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
                 descriptor);
-        ASSERT_TRUE(descriptor_payload.has_value())
-            << descriptor_payload.error();
         auto descriptor_key =
             ha::snapshot_catalog_store_detail::BuildDescriptorKey(id);
-        backend->UploadString(descriptor_key, descriptor_payload.value());
+        backend->UploadString(descriptor_key, descriptor_payload);
     }
 
     // Keep only 2, cleanup with current snapshot_id = last one
