@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Test suite for the Mooncake Engram storage/query path.
+Test suite for the Mooncake Engram backend.
 
 Tests cover:
-1. Configuration classes and construction
-2. Exact per-head table sizing exposed by get_table_vocab_sizes()
-3. Store population and embedding query
-4. Query shape / hash shape correctness
-5. Error handling for invalid table shapes
+1. Metadata and physical table layout
+2. Store population and row-id lookup
+3. Exact lookup correctness against stored tables
+4. Cleanup and error handling
 """
 
 import os
@@ -23,13 +22,12 @@ STORE_MODULE = None
 
 
 def import_store_module():
-    """Import store.so module from build/mooncake-integration."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     build_store = os.path.join(repo_root, "build", "mooncake-integration")
 
     if not os.path.isdir(build_store):
         raise ImportError(
-            "build/mooncake-integration not found. Build Mooncake with Engram: "
+            "build/mooncake-integration not found. Build Mooncake with store support: "
             "cd build && cmake .. -DWITH_STORE=ON && make -j 128"
         )
 
@@ -43,12 +41,7 @@ def import_store_module():
     return store_module
 
 
-def import_engram(store_module):
-    return store_module.Engram, store_module.EngramConfig, store_module.BackboneConfig
-
-
 def create_store_connection(store_module):
-    """Create and connect to the Store."""
     MooncakeDistributedStore = store_module.MooncakeDistributedStore
     store = MooncakeDistributedStore()
     config = MooncakeConfig.load_from_env()
@@ -67,13 +60,13 @@ def create_store_connection(store_module):
         raise RuntimeError(f"Failed to setup mooncake store, error code: {rc}")
 
     print("✅ Store connection established")
-    return store, config
+    return store
 
 
 def setUpModule():
     global GLOBAL_STORE, STORE_MODULE
     STORE_MODULE = import_store_module()
-    GLOBAL_STORE, _ = create_store_connection(STORE_MODULE)
+    GLOBAL_STORE = create_store_connection(STORE_MODULE)
 
 
 def tearDownModule():
@@ -90,78 +83,58 @@ class EngramTestBase(unittest.TestCase):
             self.skipTest("Store not initialized")
 
         self.store = GLOBAL_STORE
-        Engram, EngramConfig, BackboneConfig = import_engram(STORE_MODULE)
-        self.Engram = Engram
-        self.EngramConfig = EngramConfig
-        self.BackboneConfig = BackboneConfig
+        self.Engram = STORE_MODULE.Engram
+        self.EngramConfig = STORE_MODULE.EngramConfig
         self.store.remove_all()
 
-    def create_default_configs(self):
+    def create_config(self):
         cfg = self.EngramConfig()
-        cfg.tokenizer_name_or_path = ""
-        cfg.engram_vocab_size = [1000, 1000]
-        cfg.max_ngram_size = 3
-        cfg.n_embed_per_ngram = 64
-        cfg.n_head_per_ngram = 4
-        cfg.layer_ids = [1, 15]
-        cfg.pad_id = 2
-        cfg.seed = 0
-        cfg.kernel_size = 4
-
-        bb = self.BackboneConfig()
-        bb.hidden_size = 256
-        bb.hc_mult = 4
-        bb.vocab_size = 128000
-        bb.num_layers = 6
-        return cfg, bb
+        cfg.table_vocab_sizes = [17, 19, 23, 29]
+        cfg.embedding_dim = 8
+        return cfg
 
     def create_engram(self, layer_id=1):
-        cfg, bb = self.create_default_configs()
-        engram = self.Engram(layer_id=layer_id, config=cfg, backbone_cfg=bb, store=self.store)
-        return cfg, bb, engram
+        cfg = self.create_config()
+        engram = self.Engram(layer_id=layer_id, config=cfg, store=self.store)
+        return cfg, engram
 
     def make_embedding_tables(self, engram):
         embed_dim = engram.get_embedding_dim()
         tables = []
         for head_idx, vocab_size in enumerate(engram.get_table_vocab_sizes()):
             base = np.arange(vocab_size * embed_dim, dtype=np.float32).reshape(vocab_size, embed_dim)
-            tables.append(base + head_idx)
+            tables.append(base + head_idx * 1000)
         return tables
 
     def populate_store(self, engram):
         tables = self.make_embedding_tables(engram)
-        engram.populate_store_from_buffers(tables)
+        engram.populate(tables)
         return tables
 
 
 class TestEngramMetadata(EngramTestBase):
     def test_creation_and_metadata(self):
-        cfg, _, engram = self.create_engram()
-        num_heads = (cfg.max_ngram_size - 1) * cfg.n_head_per_ngram
-        self.assertEqual(engram.get_num_heads(), num_heads)
-        self.assertEqual(engram.get_embedding_dim(), cfg.n_embed_per_ngram // cfg.n_head_per_ngram)
-        self.assertEqual(len(engram.get_store_keys()), num_heads)
-
-    def test_table_vocab_sizes_use_per_head_primes(self):
-        cfg, _, engram = self.create_engram()
-        table_vocab_sizes = engram.get_table_vocab_sizes()
-        self.assertEqual(len(table_vocab_sizes), (cfg.max_ngram_size - 1) * cfg.n_head_per_ngram)
-        self.assertTrue(all(v >= 1000 for v in table_vocab_sizes))
-        self.assertGreater(max(table_vocab_sizes), max(cfg.engram_vocab_size))
-        self.assertEqual(len(set(table_vocab_sizes)), len(table_vocab_sizes))
+        cfg, engram = self.create_engram()
+        self.assertEqual(engram.get_num_heads(), len(cfg.table_vocab_sizes))
+        self.assertEqual(engram.get_embedding_dim(), cfg.embedding_dim)
+        self.assertEqual(engram.get_table_vocab_sizes(), cfg.table_vocab_sizes)
+        self.assertEqual(len(engram.get_store_keys()), len(cfg.table_vocab_sizes))
 
 
-class TestStorePopulateAndQuery(EngramTestBase):
-    def test_populate_and_query_shape(self):
-        _, _, engram = self.create_engram()
+class TestStorePopulateAndLookup(EngramTestBase):
+    def test_populate_and_lookup_shape(self):
+        _, engram = self.create_engram()
         self.populate_store(engram)
 
-        input_ids = [[1, 2, 3, 4], [4, 3, 2, 1]]
-        output = engram.query(input_ids)
+        row_ids = [
+            [[0, 1, 2, 3], [4, 5, 6, 7]],
+            [[1, 2, 3, 4], [8, 9, 10, 11]],
+        ]
+        output = engram.lookup(row_ids)
 
         expected_shape = (
-            len(input_ids),
-            len(input_ids[0]),
+            len(row_ids),
+            len(row_ids[0]),
             engram.get_num_heads(),
             engram.get_embedding_dim(),
         )
@@ -169,35 +142,20 @@ class TestStorePopulateAndQuery(EngramTestBase):
         self.assertFalse(np.any(np.isnan(output)))
         self.assertFalse(np.any(np.isinf(output)))
 
-    def test_hash_and_query_are_consistent(self):
-        _, _, engram = self.create_engram()
+    def test_lookup_matches_stored_rows(self):
+        _, engram = self.create_engram()
         tables = self.populate_store(engram)
 
-        input_ids = [[10, 11, 12, 13]]
-        hash_ids = engram.hash_input_ids(input_ids)
-        output = engram.query(input_ids)
+        row_ids = [[[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]]
+        output = np.asarray(engram.lookup(row_ids))
 
-        self.assertEqual(hash_ids.shape, (1, 4, engram.get_num_heads()))
-        self.assertEqual(output.shape, (1, 4, engram.get_num_heads(), engram.get_embedding_dim()))
-
-        for pos in range(hash_ids.shape[1]):
-            for head in range(hash_ids.shape[2]):
-                idx = hash_ids[0, pos, head]
+        for pos in range(len(row_ids[0])):
+            for head in range(engram.get_num_heads()):
+                idx = row_ids[0][pos][head]
                 np.testing.assert_allclose(output[0, pos, head], tables[head][idx])
 
-    def test_query_with_workspace(self):
-        _, _, engram = self.create_engram()
-        self.populate_store(engram)
-
-        input_ids = [[1, 2, 3, 4]]
-        ws_bytes = engram.get_query_workspace_size(len(input_ids), len(input_ids[0]))
-        workspace = np.empty(ws_bytes, dtype=np.uint8)
-        output = engram.query(input_ids, workspace)
-
-        self.assertEqual(output.shape, (1, 4, engram.get_num_heads(), engram.get_embedding_dim()))
-
     def test_remove_from_store(self):
-        _, _, engram = self.create_engram()
+        _, engram = self.create_engram()
         self.populate_store(engram)
 
         removed = engram.remove_from_store(force=True)
@@ -211,17 +169,23 @@ class TestStorePopulateAndQuery(EngramTestBase):
 
 class TestErrorHandling(EngramTestBase):
     def test_populate_rejects_wrong_table_shape(self):
-        _, _, engram = self.create_engram()
+        _, engram = self.create_engram()
         tables = self.make_embedding_tables(engram)
         tables[0] = tables[0][:-1]
         with self.assertRaises(Exception):
-            engram.populate_store_from_buffers(tables)
+            engram.populate(tables)
 
-    def test_query_rejects_empty_input(self):
-        _, _, engram = self.create_engram()
+    def test_lookup_rejects_empty_input(self):
+        _, engram = self.create_engram()
         self.populate_store(engram)
         with self.assertRaises(Exception):
-            engram.query([])
+            engram.lookup([])
+
+    def test_lookup_rejects_out_of_range_row_id(self):
+        _, engram = self.create_engram()
+        self.populate_store(engram)
+        with self.assertRaises(Exception):
+            engram.lookup([[[999, 1, 2, 3]]])
 
 
 if __name__ == "__main__":

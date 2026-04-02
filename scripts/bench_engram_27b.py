@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Engram-27B Performance Benchmark
+Engram backend benchmark.
 
 Scenario:
   - 1 token per request (L=1)
   - Batch sizes: 1, 4, 16, 64, 128, 256
-  - Benchmarks the Mooncake-side hash + embedding query path
+  - Benchmarks Mooncake's row-id lookup backend only
 
 Usage:
-  # Start master first (or use run_bench_engram.sh):
+  # Start master first:
   # mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true
 
   export MOONCAKE_MASTER=127.0.0.1:50051
@@ -16,13 +16,13 @@ Usage:
   python scripts/bench_engram_27b.py
 """
 
+import ctypes
 import os
 import sys
 import time
-import ctypes
+
 import numpy as np
 
-# Setup paths
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 build_dir = os.environ.get("MOONCAKE_BUILD_DIR", "build")
 build_store = os.path.join(repo_root, build_dir, "mooncake-integration")
@@ -38,38 +38,21 @@ except ImportError as e:
     print(f"❌ Import failed: {e}")
     sys.exit(1)
 
-# Engram-27B-ish config used to benchmark data lookup only.
-HC_MULT = 8
-HIDDEN_SIZE = 80
 BATCH_SIZES = [1, 4, 16, 64, 128, 256]
 NUM_WARMUP = 10
 NUM_ITER = 50
+TABLE_VOCAB_SIZES = [50000] * 8
+EMBEDDING_DIM = 16
 
 
 def create_engram_config():
-    """Engram config approximating 27B model."""
     cfg = store.EngramConfig()
-    cfg.tokenizer_name_or_path = ""
-    cfg.engram_vocab_size = [50000, 50000]  # vocab per n-gram
-    cfg.max_ngram_size = 3
-    cfg.n_embed_per_ngram = 64  # embed_D = 64/4 = 16 per head, or n_head*embed_D
-    cfg.n_head_per_ngram = 4
-    cfg.layer_ids = [1, 15]
-    cfg.pad_id = 2
-    cfg.seed = 42
-    cfg.kernel_size = 4
-
-    bb = store.BackboneConfig()
-    bb.hidden_size = HIDDEN_SIZE
-    bb.hc_mult = HC_MULT
-    bb.vocab_size = 128000
-    bb.num_layers = 6
-
-    return cfg, bb
+    cfg.table_vocab_sizes = TABLE_VOCAB_SIZES
+    cfg.embedding_dim = EMBEDDING_DIM
+    return cfg
 
 
 def populate_store_via_cxl_segment(store_obj, embedding_buffers):
-    """Populate keys by copying data into the mapped CXL file, then put_from."""
     cxl_path = os.environ.get("MC_CXL_DEV_PATH")
     if not cxl_path:
         raise RuntimeError("MC_CXL_DEV_PATH is required for CXL fallback")
@@ -99,8 +82,6 @@ def populate_store_via_cxl_segment(store_obj, embedding_buffers):
         aligned_sizes.append(aligned)
         total_aligned_bytes += aligned
 
-    # Keep the staging region away from the allocator's low-address growth to
-    # avoid overlapping source and destination inside the same CXL mapping.
     cursor = limit_addr - total_aligned_bytes
     if cursor < base_addr:
         raise RuntimeError("CXL mapping is too small for staging region")
@@ -115,31 +96,23 @@ def populate_store_via_cxl_segment(store_obj, embedding_buffers):
         key = f"engram:l1:h{head_idx}"
         rc = store_obj.put_from(key, cursor, nbytes)
         if rc != 0:
-            raise RuntimeError(
-                f"CXL put_from fallback failed for {key}, rc={rc}"
-            )
+            raise RuntimeError(f"CXL put_from fallback failed for {key}, rc={rc}")
         cursor += aligned
 
 
-def populate_store(engram, cfg, store_obj):
-    """Populate store with random embedding tables. Returns (buffers, populate_ms, mode)."""
-    embed_D = cfg.n_embed_per_ngram // cfg.n_head_per_ngram
-
+def populate_store(engram, store_obj):
     embedding_buffers = []
     for vocab_size in engram.get_table_vocab_sizes():
-        emb = np.random.randn(vocab_size, embed_D).astype(np.float32)
+        emb = np.random.randn(vocab_size, engram.get_embedding_dim()).astype(np.float32)
         embedding_buffers.append(emb)
 
     t0 = time.perf_counter()
-    mode = "engram.populate_store_from_buffers"
+    mode = "engram.populate"
     try:
-        engram.populate_store_from_buffers(embedding_buffers)
+        engram.populate(embedding_buffers)
     except RuntimeError:
         protocol = os.environ.get("MOONCAKE_PROTOCOL", "")
         if protocol == "cxl":
-            # File-backed CXL does not currently populate via the numpy
-            # register_buffer path, so stage directly through the mapped CXL
-            # region and publish with put_from.
             mode = "cxl put_from fallback"
             populate_store_via_cxl_segment(store_obj, embedding_buffers)
         else:
@@ -148,25 +121,35 @@ def populate_store(engram, cfg, store_obj):
                 key = f"engram:l1:h{head_idx}"
                 rc = store_obj.put(key, emb.tobytes())
                 if rc != 0:
-                    raise RuntimeError(
-                        f"fallback populate failed for {key}, rc={rc}"
-                    )
+                    raise RuntimeError(f"fallback populate failed for {key}, rc={rc}")
     populate_ms = (time.perf_counter() - t0) * 1000
     return embedding_buffers, populate_ms, mode
 
 
-def run_benchmark(engram, bb, batch_size, num_warmup, num_iter):
-    """Run query benchmark for given batch size."""
-    L = 1  # 1 token
-    input_ids = [[i % bb.vocab_size for _ in range(L)] for i in range(batch_size)]
+def make_row_ids(engram, batch_size, seq_len):
+    row_ids = []
+    for b in range(batch_size):
+        batch = []
+        for l in range(seq_len):
+            token_rows = []
+            for head, vocab_size in enumerate(engram.get_table_vocab_sizes()):
+                token_rows.append((b * seq_len + l + head) % vocab_size)
+            batch.append(token_rows)
+        row_ids.append(batch)
+    return row_ids
+
+
+def run_benchmark(engram, batch_size, num_warmup, num_iter):
+    seq_len = 1
+    row_ids = make_row_ids(engram, batch_size, seq_len)
 
     for _ in range(num_warmup):
-        engram.query(input_ids)
+        engram.lookup(row_ids)
 
     total_ms_list = []
     for _ in range(num_iter):
         t0 = time.perf_counter()
-        engram.query(input_ids)
+        engram.lookup(row_ids)
         t1 = time.perf_counter()
         total_ms_list.append((t1 - t0) * 1000)
 
@@ -178,7 +161,7 @@ def run_benchmark(engram, bb, batch_size, num_warmup, num_iter):
     tokens_per_sec = batch_size / (mean_total / 1000)
     bytes_per_request = (
         batch_size
-        * L
+        * seq_len
         * engram.get_num_heads()
         * engram.get_embedding_dim()
         * 4
@@ -195,15 +178,13 @@ def run_benchmark(engram, bb, batch_size, num_warmup, num_iter):
     }
 
 
-def validate_query_correctness(engram, embedding_buffers):
-    """Validate one query against the populated embedding tables."""
-    input_ids = [[0]]
-    hash_ids = np.asarray(engram.hash_input_ids(input_ids))
-    output = np.asarray(engram.query(input_ids))
+def validate_lookup_correctness(engram, embedding_buffers):
+    row_ids = make_row_ids(engram, batch_size=1, seq_len=1)
+    output = np.asarray(engram.lookup(row_ids))
 
     max_abs_err = 0.0
     for head_idx in range(output.shape[2]):
-        row_idx = int(hash_ids[0, 0, head_idx])
+        row_idx = row_ids[0][0][head_idx]
         expected = embedding_buffers[head_idx][row_idx]
         actual = output[0, 0, head_idx]
         max_abs_err = max(max_abs_err, float(np.max(np.abs(actual - expected))))
@@ -212,16 +193,15 @@ def validate_query_correctness(engram, embedding_buffers):
 
 def main():
     print("=" * 60)
-    print("Engram-27B Performance Benchmark")
-    print("  Config: 1 token, Mooncake-side hash + embedding query only")
+    print("Engram Backend Benchmark")
+    print("  Config: 1 token, Mooncake row-id lookup only")
     print("  Batch sizes: 1, 4, 16, 64, 128, 256")
     print(f"  Build dir: {build_dir}")
     print(f"  Protocol: {os.environ.get('MOONCAKE_PROTOCOL', '<unset>')}")
     print("=" * 60)
 
-    # Connect store
-    store_obj = store.MooncakeDistributedStore()
     config = MooncakeConfig.load_from_env()
+    store_obj = store.MooncakeDistributedStore()
     rc = store_obj.setup(
         config.local_hostname,
         config.metadata_server,
@@ -232,54 +212,29 @@ def main():
         config.master_server_address,
     )
     if rc != 0:
-        print(f"❌ Store setup failed: {rc}")
-        sys.exit(1)
-    print("✅ Store connected\n")
+        raise RuntimeError(f"Failed to setup Mooncake store, rc={rc}")
 
-    cfg, bb = create_engram_config()
-    engram = store.Engram(layer_id=1, config=cfg, backbone_cfg=bb, store=store_obj)
+    try:
+        cfg = create_engram_config()
+        engram = store.Engram(layer_id=1, config=cfg, store=store_obj)
+        embedding_buffers, populate_ms, mode = populate_store(engram, store_obj)
+        print(f"Populate mode: {mode}, took {populate_ms:.2f} ms")
 
-    store_obj.remove_all()
-    embedding_buffers, populate_ms, populate_mode = populate_store(
-        engram, cfg, store_obj
-    )
-    print(
-        f"✅ Embedding tables populated (store write: {populate_ms:.1f} ms, "
-        f"mode={populate_mode})\n"
-    )
+        max_abs_err = validate_lookup_correctness(engram, embedding_buffers)
+        print(f"Max abs error: {max_abs_err:.6f}")
 
-    max_abs_err = validate_query_correctness(engram, embedding_buffers)
-    print(f"✅ Correctness check max_abs_err={max_abs_err:.6f}\n")
-
-    print("Query latency (ms):")
-    print("-" * 60)
-
-    results = []
-    for batch_size in BATCH_SIZES:
-        r = run_benchmark(engram, bb, batch_size, NUM_WARMUP, NUM_ITER)
-        results.append(r)
+        print("\nResults:")
         print(
-            f"  Batch {batch_size:3d}: total={r['mean_total_ms']:.2f} "
-            f"p50={r['p50_ms']:.2f} p99={r['p99_ms']:.2f} "
-            f"| {r['tokens_per_sec']:.0f} tok/s"
+            f"{'Batch':>8} {'Mean(ms)':>10} {'P50(ms)':>10} {'P99(ms)':>10} {'Tok/s':>12} {'GB/s':>10}"
         )
-
-    print("\n" + "=" * 60)
-    print("Summary: mean latency and throughput")
-    print("-" * 60)
-    for r in results:
-        print(
-            f"  B={r['batch_size']:3d}: total={r['mean_total_ms']:.2f} ms  "
-            f"p50={r['p50_ms']:.2f} p99={r['p99_ms']:.2f}  "
-            f"throughput={r['tokens_per_sec']:.0f} tok/s  "
-            f"bandwidth={r['gbps']:.3f} GB/s"
-        )
-
-    print("\n  Store write (populate, one-time): {:.1f} ms".format(populate_ms))
-    print("=" * 60)
-
-    del engram
-    store_obj.close()
+        for batch_size in BATCH_SIZES:
+            result = run_benchmark(engram, batch_size, NUM_WARMUP, NUM_ITER)
+            print(
+                f"{result['batch_size']:>8} {result['mean_total_ms']:>10.3f} {result['p50_ms']:>10.3f} "
+                f"{result['p99_ms']:>10.3f} {result['tokens_per_sec']:>12.1f} {result['gbps']:>10.3f}"
+            )
+    finally:
+        store_obj.close()
 
 
 if __name__ == "__main__":

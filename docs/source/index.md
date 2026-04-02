@@ -114,7 +114,7 @@ design/p2p-store
 design/transfer-engine/index
 design/hicache-design
 design/engram
-design/scatter-gather-control-plane
+design/deepseek-engram-paper-demo-notes
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
