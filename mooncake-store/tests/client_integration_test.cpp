@@ -1392,7 +1392,10 @@ class EvictionNotificationTest : public ::testing::Test {
 TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
     CreateClientAndMount();
 
-    // Put 3 keys — should all fit within quota
+    // Put 3 keys — should all fit within quota.
+    // Wait for each DISK replica before putting the next key so that the
+    // FIFO write-queue order is deterministic (write_thread_pool_ has >1
+    // thread, so concurrent writes can reorder).
     std::vector<std::string> keys;
     for (int i = 0; i < 3; ++i) {
         std::string key = "evict_test_key_" + std::to_string(i);
@@ -1411,10 +1414,9 @@ TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
             << "Put(" << key << ") failed: " << toString(put.error());
         alloc_->deallocate(buf, payload.size());
         keys.push_back(key);
-    }
 
-    // Wait for DISK replicas to appear (PutToLocalFile is async)
-    for (const auto& key : keys) {
+        // Wait for this key's DISK replica before proceeding to the next
+        // Put, ensuring deterministic FIFO order in the eviction queue.
         ASSERT_TRUE(WaitForDiskReplica(key, std::chrono::seconds(10)))
             << "DISK replica did not appear for key: " << key;
     }
