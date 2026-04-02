@@ -1174,6 +1174,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // Old buffers cannot be reused.  Move them to discarded_replicas_ for
     // delayed release (readers may still hold descriptors without refcnt),
     // then allocate fresh buffers at the new size.
+    //
+    // Preserve hard_pin and soft_pin from the old metadata so that eviction
+    // protection survives a size-changing upsert (RFC §2.2.2).
+    ReplicateConfig merged_config = config;
+    merged_config.with_hard_pin = merged_config.with_hard_pin ||
+                                  metadata.IsHardPinned();
+    merged_config.with_soft_pin = merged_config.with_soft_pin ||
+                                  metadata.IsSoftPinned();
+
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {
         std::lock_guard lock(discarded_replicas_mutex_);
@@ -1184,7 +1193,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     config, now);
+                                     merged_config, now);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
