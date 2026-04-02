@@ -77,19 +77,11 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    shutting_down_.store(true);
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
-    }
-
-    storage_heartbeat_running_ = false;
-    if (storage_heartbeat_thread_.joinable()) {
-        storage_heartbeat_thread_.join();
-    }
-
-    leader_monitor_running_ = false;
-    if (leader_monitor_thread_.joinable()) {
-        leader_monitor_thread_.join();
     }
 
     // Make a copy of mounted_segments_ to avoid modifying while iterating
@@ -109,6 +101,16 @@ Client::~Client() {
             LOG(ERROR) << "Failed to unmount segment: "
                        << toString(result.error());
         }
+    }
+
+    storage_heartbeat_running_ = false;
+    if (storage_heartbeat_thread_.joinable()) {
+        storage_heartbeat_thread_.join();
+    }
+
+    leader_monitor_running_ = false;
+    if (leader_monitor_thread_.joinable()) {
+        leader_monitor_thread_.join();
     }
 
     // Clear any remaining segments
@@ -1859,10 +1861,51 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
     auto unmount_result = master_client_.UnmountSegment(segment->second.id);
     if (!unmount_result) {
-        ErrorCode err = unmount_result.error();
-        LOG(ERROR) << "Failed to unmount segment from master: "
-                   << toString(err);
-        return tl::unexpected(err);
+        const ErrorCode initial_error = unmount_result.error();
+        LOG(WARNING) << "Failed to unmount segment from master, refreshing "
+                        "control plane and retrying: "
+                     << toString(initial_error);
+
+        if (leader_coordinator_) {
+            auto current_view = leader_coordinator_->ReadCurrentView();
+            if (!current_view) {
+                LOG(ERROR)
+                    << "Failed to refresh master view before unmount retry: "
+                    << toString(current_view.error());
+                return tl::unexpected(current_view.error());
+            }
+            if (!current_view.value().has_value()) {
+                LOG(ERROR)
+                    << "No active master view is available for unmount retry";
+                return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+
+            auto err = SwitchLeader(current_view.value().value());
+            if (err != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to switch leader before unmount retry: "
+                           << toString(err);
+                return tl::unexpected(err);
+            }
+        } else if (!direct_master_address_.empty()) {
+            auto err = master_client_.Connect(direct_master_address_);
+            if (err != ErrorCode::OK) {
+                LOG(ERROR)
+                    << "Failed to reconnect master before unmount retry: "
+                    << toString(err);
+                return tl::unexpected(err);
+            }
+        } else {
+            return tl::unexpected(initial_error);
+        }
+
+        unmount_result = master_client_.UnmountSegment(segment->second.id);
+        if (!unmount_result) {
+            ErrorCode err = unmount_result.error();
+            LOG(ERROR) << "Failed to unmount segment from master after "
+                          "refresh: "
+                       << toString(err);
+            return tl::unexpected(err);
+        }
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
@@ -2489,7 +2532,8 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
-            if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
+            if (!shutting_down_.load() &&
+                ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =

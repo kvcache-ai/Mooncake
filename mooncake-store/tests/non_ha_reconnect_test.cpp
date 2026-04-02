@@ -35,6 +35,7 @@ TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
                                      std::nullopt, master_addr);
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
+    client_opt.reset();
 
     // Zero-segment clients should not start storage heartbeat immediately.
     std::this_thread::sleep_for(std::chrono::milliseconds(2200));
@@ -82,6 +83,7 @@ TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatAfterLocalDiskMount) {
                                      std::nullopt, master_addr);
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
+    client_opt.reset();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(2200));
     const auto ping_without_mount =
@@ -101,6 +103,47 @@ TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatAfterLocalDiskMount) {
     std::filesystem::remove_all(tmp_dir, ec);
 }
 
+TEST(NonHAReconnectTest, ClientResetUnmountsMountedSegments) {
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+
+    std::string local_hostname = "127.0.0.1:18013";
+    std::string master_addr = master.master_address();
+    const auto ping_before =
+        MasterMetricManager::instance().get_ping_requests();
+    auto client_opt = Client::Create(local_hostname, "P2PHANDSHAKE", "tcp",
+                                     std::nullopt, master_addr);
+    ASSERT_TRUE(client_opt.has_value());
+    auto client = client_opt.value();
+    client_opt.reset();
+
+    constexpr size_t kRamBufferSize = 16 * 1024 * 1024;
+    void* seg_ptr = allocate_buffer_allocator_memory(kRamBufferSize);
+    ASSERT_NE(seg_ptr, nullptr);
+
+    auto mount_res = client->MountSegment(seg_ptr, kRamBufferSize);
+    ASSERT_TRUE(mount_res.has_value()) << toString(mount_res.error());
+    ASSERT_EQ(MasterMetricManager::instance().get_total_mem_capacity(),
+              static_cast<int64_t>(kRamBufferSize));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    EXPECT_GT(MasterMetricManager::instance().get_ping_requests(), ping_before);
+
+    client.reset();
+
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (MasterMetricManager::instance().get_total_mem_capacity() == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    EXPECT_EQ(MasterMetricManager::instance().get_total_mem_capacity(), 0);
+    free(seg_ptr);
+}
+
 // Non-HA: client auto-reconnects to master and remounts segments
 TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     // Start master (auto-pick ports) without HTTP metadata server
@@ -114,6 +157,7 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
                                      std::nullopt, master_addr);
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
+    client_opt.reset();
 
     size_t ram_buffer_size = 16 * 1024 * 1024;  // 16MB
     void* seg_ptr = allocate_buffer_allocator_memory(ram_buffer_size);
