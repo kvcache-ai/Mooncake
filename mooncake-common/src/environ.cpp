@@ -50,7 +50,11 @@ Environ::Environ() {
     ib_port_ = GetInt("MC_IB_PORT", 1);
     ib_tc_ = GetInt("MC_IB_TC", -1);
     ib_pci_relaxed_ordering_ = GetInt("MC_IB_PCI_RELAXED_ORDERING", 0);
-    gid_index_ = GetInt("MC_GID_INDEX", 3);
+    gid_index_ = GetInt("MC_GID_INDEX", -1);
+    if (gid_index_ == -1) {
+        // Fall back to NCCL_IB_GID_INDEX when MC_GID_INDEX is not set
+        gid_index_ = GetInt("NCCL_IB_GID_INDEX", -1);
+    }
     max_cqe_per_ctx_ = GetInt("MC_MAX_CQE_PER_CTX", 4096);
     max_ep_per_ctx_ = GetInt("MC_MAX_EP_PER_CTX", 65536);
     num_qp_per_ep_ = GetInt("MC_NUM_QP_PER_EP", 2);
@@ -66,6 +70,7 @@ Environ::Environ() {
     handshake_listen_backlog_ = GetInt("MC_HANDSHAKE_LISTEN_BACKLOG", 128);
     handshake_max_length_ = GetInt("MC_HANDSHAKE_MAX_LENGTH", 1048576);
     log_dir_ = GetString("MC_LOG_DIR", "");
+    redis_username_ = GetString("MC_REDIS_USERNAME", "");
     redis_password_ = GetString("MC_REDIS_PASSWORD", "");
     redis_db_index_ = GetInt("MC_REDIS_DB_INDEX", 0);
     fragment_ratio_ = GetInt("MC_FRAGMENT_RATIO", 4);

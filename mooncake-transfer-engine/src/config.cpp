@@ -37,10 +37,6 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (port >= 0 && port < 256) config.port = uint8_t(port);
 
     int gid_index = env.GetGidIndex();
-    if (gid_index == 0) {
-        const char *nccl_gid = std::getenv("NCCL_IB_GID_INDEX");
-        if (nccl_gid) gid_index = atoi(nccl_gid);
-    }
     if (gid_index >= 0 && gid_index < 256) config.gid_index = gid_index;
 
     int max_cqe_per_ctx = env.GetMaxCqePerCtx();

@@ -314,7 +314,7 @@ static bool supportFabricMem() {
     // By default, use IPC mode
     // Fabric memory is enabled only when MC_USE_HIP_IPC=false
     bool hip_ipc = Environ::Get().GetUseHipIpc();
-    if (!hip_ipc) {
+    if (hip_ipc) {
         return false;
     }
 

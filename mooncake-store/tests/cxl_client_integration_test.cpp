@@ -424,6 +424,9 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
 
 // Test Evict operation through the client
 TEST_F(ClientIntegrationTestCxl, EvictOperation) {
+    if (!cxl_available_) {
+        GTEST_SKIP() << "CXL device not available";
+    }
     // Test data
     const size_t test_data_size = 1ULL * 1024 * 1024;
     const size_t test_total_size = 1000ULL * 1024 * 1024;

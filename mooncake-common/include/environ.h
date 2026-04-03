@@ -33,6 +33,7 @@ class Environ {
     int GetHandshakeListenBacklog() const { return handshake_listen_backlog_; }
     int GetHandshakeMaxLength() const { return handshake_max_length_; }
     std::string GetLogDir() const { return log_dir_; }
+    std::string GetRedisUsername() const { return redis_username_; }
     std::string GetRedisPassword() const { return redis_password_; }
     int GetRedisDbIndex() const { return redis_db_index_; }
     int GetFragmentRatio() const { return fragment_ratio_; }
@@ -133,6 +134,7 @@ class Environ {
     int handshake_listen_backlog_;
     int handshake_max_length_;
     std::string log_dir_;
+    std::string redis_username_;
     std::string redis_password_;
     int redis_db_index_;
     int fragment_ratio_;
