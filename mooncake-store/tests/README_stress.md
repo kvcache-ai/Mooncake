@@ -30,19 +30,6 @@
 
 先 **`put`** 预加载本节点 key，再按 **`remote_read_ratio`** 做本地/跨节点读压测。
 
-**单机直接跑（容器或本机，需已能连 master）：**
-
-```bash
-python3 real_client_stress_workload.py \
-  --workload_mode=preload_then_read \
-  --client_mode=centralized \
-  --master_address=MASTER_IP:50053 \
-  --metadata_connection_string=http://MASTER_IP:8080/metadata \
-  --local_hostname=本机可达地址 \
-  --num_nodes=1 --node_id=1 \
-  --key_count=1000 --num_threads=4 --test_operation_nums=500
-```
-
 **多机 + orchestrator（先等全部 `preload_done`，再对各节点控制口发 `READ`）：**
 
 ```bash
@@ -53,44 +40,51 @@ python3 run_stress_cluster.py run \
   --image IMAGE \
   --workload-mode preload_then_read \
   --use-orchestrated
-```
 
-**多机、非 orchestrated、按时间对齐读阶段（`--start-delay-sec` 仅在该组合下由 orchestrator 写入 `start_timestamp_ms`）：**
-
-```bash
+# centralized 示例
 python3 run_stress_cluster.py run \
-  --master-ip MASTER_IP --client-ips NODE1,NODE2 \
+  --mode centralized \
+  --master-ip 192.168.200.15 \
+  --update-script-path '/path/to/real_client_stress_workload.py' \
+  --python-script '/path/to/real_client_stress_workload.py' \
+  --local-random-all-remote local \
+  --client-ips 192.168.200.15,192.168.200.25 \
+  --image "localhost/mooncake-p2p-test:p2p_03312243" \
+  --protocol tcp \
   --workload-mode preload_then_read \
-  --start-delay-sec 5
+  --key-count 400 --value-size $((2*1024*1024)) \
+  --num-threads 2 --test-operation-nums 500 \
+  --remote-read-ratio 0.5 \
+  --global-segment-size 2147483648 \
+  --local-buffer-size $((16*1024*1024)) \
+  --use-orchestrated \
+  --ssh-password "xxxxxxxxxx" \
+  --master-rpc-port 50053
 ```
 
-相关参数要点：**`--run_mode orchestrated`**（由 `--use-orchestrated` 注入）、**`--control_listen`**（控制端口，0 表示自动选端口）、**`--start_timestamp_ms`**（once 模式对齐读开始时间）。
-
-### 2. `op_sequence`
-
-混合 **`is_exist` / get / put`** 的序列操作，用于更贴近真实访问路径的压测。
-
-```bash
-python3 run_stress_cluster.py run \
-  --master-ip MASTER_IP --client-ips NODE1,NODE2 \
-  --workload-mode op_sequence \
-  --op-sequence-max-rounds 8 \
-  --remote-read-ratio 0.5
-```
-
-多节点默认在全部客户端就绪后由 orchestrator 发 **GO**；若不需要同步，可加 **`--no-cluster-barrier`**。
-
-### 3. `concurrent_write_no_evict`
+### 2. `concurrent_write_no_evict`
 
 按全局段容量与 **`cw_target_fill_ratio`** 计算写入量，并发 **`put`**，并抽样 **`get`** 校验内容。
 
 ```bash
+# p2p 强制远端路由
 python3 run_stress_cluster.py run \
-  --master-ip MASTER_IP --client-ips NODE1 \
+  --mode p2p \
+  --master-ip 192.168.200.15 \
+  --update-script-path '/path/to/real_client_stress_workload.py' \
+  --local-random-all-remote all_remote \
+  --client-ips 192.168.200.15,192.168.200.25\
+  --image "localhost/mooncake-p2p-test:p2p_0403_log" \
+  --protocol tcp \
   --workload-mode concurrent_write_no_evict \
-  --global-segment-size 2147483648 \
+  --value-size 1048576 \
+  --num-threads 4 --test-operation-nums 500 \
   --cw-target-fill-ratio 0.15 \
-  --cw-verify-sample-limit 100
+  --global-segment-size 2147483648 \
+  --local-buffer-size $((100*1024*1024)) \
+  --tiered-backend-config '{"tiers":[{"type":"DRAM","capacity":2147483648,"priority":10}],"scheduler": {"policy": "LRU","eviction_mode": "sync","high_watermark": 0.80,"low_watermark": 0.75}}' \
+  --post-test-wait 180 \
+  --no-cleanup
 ```
 
 ### 4. `concurrent_write_with_evict`
@@ -103,6 +97,24 @@ python3 run_stress_cluster.py run \
   --workload-mode concurrent_write_with_evict \
   --cw-base-memory-bytes 1073741824 \
   --cw-evict-data-ratio 3.0
+
+# p2p 随机路由
+python3 /home/cxy/chenxiaoyan/Mooncake/mooncake-store/tests/run_stress_cluster.py run \
+  --mode p2p \
+  --master-ip 192.168.200.15 \
+  --update-script-path '/path/to/real_client_stress_workload.py' \
+  --local-random-all-remote random \
+  --client-ips 192.168.200.15,192.168.200.25\
+  --image "localhost/mooncake-p2p-test:p2p_03312243" \
+  --protocol tcp \
+  --value-size 1048576 \
+  --num-threads 8 --test-operation-nums 500 \
+  --workload-mode concurrent_write_with_evict \
+  --cw-base-memory-bytes 2147483648 \
+  --cw-evict-data-ratio 2.0 \
+  --global-segment-size 2147483648 \
+  --local-buffer-size $((100*1024*1024)) \
+  --tiered-backend-config '{"tiers":[{"type":"DRAM","capacity":2147483648,"priority":10}],"scheduler": {"policy": "LRU","eviction_mode": "sync","high_watermark": 0.80,"low_watermark": 0.75}}'
 ```
 
 ## `run_stress_cluster.py run` 常用参数说明
