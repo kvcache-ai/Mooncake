@@ -447,3 +447,93 @@ impl Drop for MooncakeStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    #[test]
+    fn replicate_config_to_ffi_empty_segments() {
+        let config = ReplicateConfig {
+            replica_num: 2,
+            with_soft_pin: true,
+            preferred_segments: Vec::new(),
+        };
+
+        let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
+        assert_eq!(ffi_cfg.replica_num, 2);
+        assert_eq!(ffi_cfg.with_soft_pin, 1);
+        assert!(ffi_cfg.preferred_segments.is_null());
+        assert_eq!(ffi_cfg.preferred_segments_count, 0);
+        assert!(strings.is_empty());
+        assert!(ptrs.is_empty());
+    }
+
+    #[test]
+    fn replicate_config_to_ffi_with_segments() {
+        let config = ReplicateConfig {
+            replica_num: 3,
+            with_soft_pin: false,
+            preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
+        };
+
+        let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
+        assert_eq!(ffi_cfg.replica_num, 3);
+        assert_eq!(ffi_cfg.with_soft_pin, 0);
+        assert!(!ffi_cfg.preferred_segments.is_null());
+        assert_eq!(ffi_cfg.preferred_segments_count, 2);
+        assert_eq!(strings.len(), 2);
+        assert_eq!(ptrs.len(), 2);
+
+        let seg0 = unsafe { CStr::from_ptr(ptrs[0]) };
+        let seg1 = unsafe { CStr::from_ptr(ptrs[1]) };
+        assert_eq!(seg0.to_str().unwrap(), "seg-a");
+        assert_eq!(seg1.to_str().unwrap(), "seg-b");
+    }
+
+    #[test]
+    fn replicate_config_to_ffi_rejects_interior_nul() {
+        let config = ReplicateConfig {
+            replica_num: 1,
+            with_soft_pin: false,
+            preferred_segments: vec!["bad\0segment".to_string()],
+        };
+
+        assert!(matches!(
+            config.to_ffi(),
+            Err(StoreError::InvalidString(_))
+        ));
+    }
+
+    #[test]
+    fn prepare_config_none_returns_null_config() {
+        let (c_cfg, strings, ptrs) = MooncakeStore::prepare_config(None).expect("prepare should succeed");
+        assert!(c_cfg.is_none());
+        assert!(strings.is_empty());
+        assert!(ptrs.is_empty());
+    }
+
+    #[test]
+    fn prepare_config_some_preserves_storage_and_values() {
+        let config = ReplicateConfig {
+            replica_num: 4,
+            with_soft_pin: true,
+            preferred_segments: vec!["x".to_string(), "y".to_string()],
+        };
+
+        let (c_cfg, strings, ptrs) =
+            MooncakeStore::prepare_config(Some(&config)).expect("prepare should succeed");
+        let cfg_ref = c_cfg.as_ref().expect("expected Some config");
+        assert_eq!(cfg_ref.replica_num, 4);
+        assert_eq!(cfg_ref.with_soft_pin, 1);
+        assert_eq!(cfg_ref.preferred_segments_count, 2);
+        assert_eq!(strings.len(), 2);
+        assert_eq!(ptrs.len(), 2);
+
+        let cfg_ptr: *const ffi::mooncake_replicate_config_t = c_cfg
+            .as_ref()
+            .map_or(std::ptr::null(), |cfg| cfg as *const _);
+        assert!(!cfg_ptr.is_null());
+    }
+}
