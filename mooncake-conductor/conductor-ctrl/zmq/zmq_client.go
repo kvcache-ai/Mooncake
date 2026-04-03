@@ -263,12 +263,7 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
 	slog.Debug("enter deal topic", "topic", topic)
 
 	var batch *EventBatch
-	switch string(topic) {
-	case "mooncake":
-		batch, err = DecodeMooncakeEventBatch(payload)
-	default:
-		batch, err = DecodeVllmEventBatch(payload)
-	}
+	batch, err = DecodeEventBatch(string(topic), payload)
 	if err != nil {
 		return fmt.Errorf("decode failed: %w", err)
 	}

@@ -3,8 +3,6 @@ package zmq
 import (
 	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 	"time"
 
 	msgpack "github.com/shamaton/msgpack/v2"
@@ -16,123 +14,14 @@ type EventParser interface {
 	Source() string
 }
 
-type mooncakeParser struct{}
-
-func (p *mooncakeParser) Source() string { return SourceMooncake }
-
-func (p *mooncakeParser) EventMappings() map[string]EventType {
-	return map[string]EventType{
-		"BlockStoreEvent":  EventTypeBlockStored,
-		"BlockUpdateEvent": EventTypeBlockUpdate,
-		"RemoveAllEvent":   EventTypeAllCleared,
-	}
-}
-
-func (p *mooncakeParser) ParseEvent(raw []interface{}, timestamp interface{}) (KVEvent, error) {
-	eventTypeStr, ok := raw[0].(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid event type format: %T", raw[0])
-	}
-
-	eventType, exists := p.EventMappings()[eventTypeStr]
-	if !exists {
-		return nil, fmt.Errorf("unknown mooncake event type: %s", eventTypeStr)
-	}
-
-	switch eventType {
-	case EventTypeBlockStored:
-		return parseMooncakeBlockStored(raw, timestamp)
-	default:
-		return nil, fmt.Errorf("unhandled event: %s", eventType)
-	}
-}
-
-func decodeCommonEventBatch(
-	data []byte,
-	expectedLength int,
-	extractEvents func([]interface{}) ([]interface{}, interface{}, error),
-	parser EventParser,
-) (*EventBatch, error) {
-
-	if len(data) > 0 {
-		slog.Debug("First byte of payload", "hex", fmt.Sprintf("%02x", data[0]))
-	}
-
-	var arr []interface{}
-	if err := msgpack.Unmarshal(data, &arr); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal event batch: %w", err)
-	}
-
-	if len(arr) != expectedLength {
-		return nil, fmt.Errorf("expected %d-element array, got %d", expectedLength, len(arr))
-	}
-
-	events, timestamp, err := extractEvents(arr)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(events) == 0 {
-		slog.Warn("Received empty event list")
-	}
-
-	var dpRank int64 = -1
-	if expectedLength == 3 {
-		dpRank, err = parseInt64(arr[2])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse dpRank: %w", err)
-		}
-	}
-
-	batch := &EventBatch{
-		Source:           parser.Source(),
-		Events:           make([]KVEvent, 0, len(events)),
-		DataParallelRank: dpRank,
-	}
-
-	for i, rawEvent := range events {
-		eventSlice, ok := rawEvent.([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("event at index %d is not a slice: %T", i, rawEvent)
-		}
-		event, err := parser.ParseEvent(eventSlice, timestamp)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse event at index %d: %w", i, err)
-		}
-		batch.Events = append(batch.Events, event)
-	}
-
-	return batch, nil
-}
-
-func newMooncakeParser() EventParser {
-	return &mooncakeParser{}
-}
-
-func DecodeMooncakeEventBatch(data []byte) (*EventBatch, error) {
-	return decodeCommonEventBatch(
-		data,
-		2,
-		func(arr []interface{}) ([]interface{}, interface{}, error) {
-			events, ok := arr[1].([]interface{})
-			if !ok {
-				return nil, nil, fmt.Errorf("invalid events type: %T", arr[1])
-			}
-			return events, arr[0], nil
-		},
-		newMooncakeParser(),
-	)
-}
-
 type vllmParser struct{}
 
 func (p *vllmParser) Source() string { return SourceVLLM }
 
 func (p *vllmParser) EventMappings() map[string]EventType {
 	return map[string]EventType{
-		"BlockStored":      EventTypeBlockStored,
-		"BlockRemoved":     EventTypeBlockRemoved,
-		"AllBlocksCleared": EventTypeAllCleared,
+		"BlockStored":  EventTypeBlockStored,
+		"BlockRemoved": EventTypeBlockRemoved,
 	}
 }
 
@@ -150,6 +39,8 @@ func (p *vllmParser) ParseEvent(raw []interface{}, timestamp interface{}) (KVEve
 	switch eventType {
 	case EventTypeBlockStored:
 		return parseVllmBlockStored(raw, timestamp)
+	case EventTypeBlockRemoved:
+		return parseVllmBlockRemoved(raw, timestamp)
 	default:
 		return nil, fmt.Errorf("unhandled event: %s", eventType)
 	}
@@ -159,72 +50,76 @@ func newVLLMParser() EventParser {
 	return &vllmParser{}
 }
 
-func DecodeVllmEventBatch(data []byte) (*EventBatch, error) {
-	return decodeCommonEventBatch(
-		data,
-		3,
-		func(arr []interface{}) ([]interface{}, interface{}, error) {
-			events, ok := arr[1].([]interface{})
-			if !ok {
-				return nil, nil, fmt.Errorf("invalid events type: %T", arr[1])
-			}
-			return events, arr[0], nil
-		},
-		newVLLMParser(),
-	)
+// Parser registry for event batch decoding
+var parsers = map[string]func([]byte) (*EventBatch, error){
+	"vllm": DecodeVllmEventBatch,
 }
 
-func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
-	event := &BlockStoredEvent{
-		Type: EventTypeBlockStored,
+func DecodeEventBatch(topic string, data []byte) (*EventBatch, error) {
+	decoder, ok := parsers[topic]
+	if !ok {
+		return nil, fmt.Errorf("unknown event topic: %s", topic)
+	}
+	return decoder(data)
+}
+
+func DecodeVllmEventBatch(data []byte) (*EventBatch, error) {
+	return decodeCommonEventBatch(data)
+}
+
+func decodeCommonEventBatch(data []byte) (*EventBatch, error) {
+	const expectedLength = 3
+
+	if len(data) > 0 {
+		slog.Debug("First byte of payload", "hex", fmt.Sprintf("%02x", data[0]))
 	}
 
-	if mooncakekey, err := safeGetString(data[1]); err == nil {
-		event.MooncakeKey = mooncakekey
-	} else {
-		return nil, fmt.Errorf("failed to parse MooncakeKey from field at index 1: %w", err)
+	var arr []interface{}
+	if err := msgpack.Unmarshal(data, &arr); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal event batch: %w", err)
 	}
 
-	if replicalist, err := convertToReplicaList(data[2]); err == nil {
-		event.ReplicaList = replicalist
-		slog.Debug("ReplicaList:", "ReplicaList", event.ReplicaList)
-	} else {
-		return nil, fmt.Errorf("failed to parse ReplicaList from field at index 2: %w", err)
+	if len(arr) != expectedLength {
+		return nil, fmt.Errorf("expected %d-element array, got %d", expectedLength, len(arr))
 	}
 
-	if blocksize, err := parseInt64(data[4]); err == nil {
-		event.BlockSize = blocksize
-		slog.Debug("BlockSize:", "BlockSize", event.BlockSize)
-	} else {
-		return nil, fmt.Errorf("failed to parse BlockSize from field at index 4: %w", err)
+	events, ok := arr[1].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid events type: %T", arr[1])
 	}
 
-	if blockhash, err := parseMooncakeParentUint64(data[5]); err == nil {
-		event.BlockHashes = blockhash
-		slog.Debug("BlockHashes:", "BlockHashes", event.BlockHashes)
-	} else {
-		return nil, fmt.Errorf("failed to parse BlockHashes from field at index 5: %w", err)
+	timestamp := arr[0]
+
+	if len(events) == 0 {
+		slog.Warn("Received empty event list")
 	}
 
-	if parentblockhash, err := parseMooncakeUint64(data[6]); err == nil {
-		event.ParentBlockHash = parentblockhash
-		slog.Debug("ParentBlockHash:", "ParentBlockHash", event.ParentBlockHash)
-	} else {
-		return nil, fmt.Errorf("failed to parse ParentBlockHash from field at index 6: %w", err)
+	dpRank, err := parseInt64(arr[2])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse dpRank: %w", err)
 	}
 
-	if tokenIDsRaw, ok := data[7].([]interface{}); ok {
-		tokens, err := parseInt32Array(tokenIDsRaw)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse TokenIDs from field at index 7: %w", err)
+	batch := &EventBatch{
+		Source:           SourceVLLM,
+		Events:           make([]KVEvent, 0, len(events)),
+		DataParallelRank: dpRank,
+	}
+
+	parser := newVLLMParser()
+
+	for i, rawEvent := range events {
+		eventSlice, ok := rawEvent.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("event at index %d is not a slice: %T", i, rawEvent)
 		}
-		event.TokenIDs = tokens
-		slog.Debug("TokenIDs:", "TokenIDs", event.TokenIDs)
-	} else {
-		return nil, fmt.Errorf("missing or invalid token_ids")
+		event, err := parser.ParseEvent(eventSlice, timestamp)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse event at index %d: %w", i, err)
+		}
+		batch.Events = append(batch.Events, event)
 	}
 
-	return event, nil
+	return batch, nil
 }
 
 // parseBlockStoredEvent parses a BlockStoredEvent from raw data
@@ -292,28 +187,26 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 	return event, nil
 }
 
-func convertToReplicaList(raw interface{}) ([][]string, error) {
-	list, ok := raw.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("expected []interface{}, got %T", raw)
+func parseVllmBlockRemoved(data []interface{}, timestamp interface{}) (*BlockRemovedEvent, error) {
+	event := &BlockRemovedEvent{
+		Type: EventTypeBlockRemoved,
 	}
 
-	result := make([][]string, len(list))
-	for i, item := range list {
-		subList, ok := item.([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("item %d is not []interface{}, got %T", i, item)
-		}
-		result[i] = make([]string, len(subList))
-		for j, v := range subList {
-			str, ok := v.(string)
-			if !ok {
-				return nil, fmt.Errorf("element [%d][%d] is not string, got %T", i, j, v)
-			}
-			result[i][j] = str
-		}
+	// Parse timestamp
+	if ts, err := parseTimestamp(timestamp); err == nil {
+		event.Timestamp = ts
+	} else {
+		return nil, fmt.Errorf("failed to parse timestamp: %w", err)
 	}
-	return result, nil
+
+	// Parse block hashes
+	if hashes, err := parseUint64Array(data[1]); err == nil {
+		event.BlockHashes = hashes
+	} else {
+		return nil, fmt.Errorf("failed to parse block_hashes: %w", err)
+	}
+
+	return event, nil
 }
 
 func safeGetString(val interface{}) (string, error) {
@@ -485,165 +378,4 @@ func parseInt32Array(v interface{}) ([]int32, error) {
 		}
 	}
 	return result, nil
-}
-
-func parseMooncakeUint64(v interface{}) (uint64, error) {
-	var s string
-	switch val := v.(type) {
-	case string:
-		s = val
-	case nil:
-		s = ""
-	case uint64:
-		return val, nil
-	case int:
-		if val < 0 {
-			return 0, fmt.Errorf("negative value %d", val)
-		}
-		return uint64(val), nil
-	case int8:
-		if val < 0 {
-			return 0, fmt.Errorf("negative value %d", val)
-		}
-		return uint64(val), nil
-	case int16:
-		if val < 0 {
-			return 0, fmt.Errorf("negative value %d", val)
-		}
-		return uint64(val), nil
-	case int32:
-		if val < 0 {
-			return 0, fmt.Errorf("negative value %d", val)
-		}
-		return uint64(val), nil
-	case int64:
-		if val < 0 {
-			return 0, fmt.Errorf("negative value %d", val)
-		}
-		return uint64(val), nil
-	case uint:
-		return uint64(val), nil
-	case uint8:
-		return uint64(val), nil
-	case uint16:
-		return uint64(val), nil
-	case uint32:
-		return uint64(val), nil
-	default:
-		s = fmt.Sprint(v)
-	}
-	if s == "" {
-		return 0, nil
-	}
-	return strconv.ParseUint(s, 10, 64)
-}
-
-func parseMooncakeParentUint64(v interface{}) ([]uint64, error) {
-	switch val := v.(type) {
-	case nil:
-		return []uint64{}, nil
-
-	case string:
-		if val == "" {
-			return []uint64{}, nil
-		}
-		parts := strings.FieldsFunc(val, func(r rune) bool {
-			return r == ',' || r == ' ' || r == '\t' || r == '\n'
-		})
-		result := make([]uint64, 0, len(parts))
-		for _, part := range parts {
-			if part == "" {
-				continue
-			}
-			u, err := strconv.ParseUint(part, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse uint64 from string %q: %w", part, err)
-			}
-			result = append(result, u)
-		}
-		return result, nil
-
-	case []interface{}:
-		result := make([]uint64, 0, len(val))
-		for _, item := range val {
-			u, err := parseSingleUint64(item)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse element %v: %w", item, err)
-			}
-			result = append(result, u)
-		}
-		return result, nil
-
-	case []uint64:
-		// already correct type
-		return val, nil
-
-	default:
-		// try parse as single uint64
-		u, err := parseSingleUint64(val)
-		if err != nil {
-			return nil, err
-		}
-		return []uint64{u}, nil
-	}
-}
-
-func parseSingleUint64(v interface{}) (uint64, error) {
-	switch val := v.(type) {
-	case uint64:
-		return val, nil
-	case int:
-		if val < 0 {
-			return 0, fmt.Errorf("negative int %d cannot convert to uint64", val)
-		}
-		return uint64(val), nil
-	case int8:
-		if val < 0 {
-			return 0, fmt.Errorf("negative int8 %d cannot convert to uint64", val)
-		}
-		return uint64(val), nil
-	case int16:
-		if val < 0 {
-			return 0, fmt.Errorf("negative int16 %d cannot convert to uint64", val)
-		}
-		return uint64(val), nil
-	case int32:
-		if val < 0 {
-			return 0, fmt.Errorf("negative int32 %d cannot convert to uint64", val)
-		}
-		return uint64(val), nil
-	case int64:
-		if val < 0 {
-			return 0, fmt.Errorf("negative int64 %d cannot convert to uint64", val)
-		}
-		return uint64(val), nil
-	case uint:
-		return uint64(val), nil
-	case uint8:
-		return uint64(val), nil
-	case uint16:
-		return uint64(val), nil
-	case uint32:
-		return uint64(val), nil
-	case float32:
-		f := float64(val)
-		if f < 0 || f != float64(uint64(f)) {
-			return 0, fmt.Errorf("float32 %v invalid for uint64", val)
-		}
-		return uint64(f), nil
-	case float64:
-		if val < 0 || val != float64(uint64(val)) {
-			return 0, fmt.Errorf("float64 %v invalid for uint64", val)
-		}
-		return uint64(val), nil
-	case string:
-		if val == "" {
-			return 0, fmt.Errorf("empty string cannot be parsed as uint64")
-		}
-		return strconv.ParseUint(val, 10, 64)
-	case nil:
-		return 0, fmt.Errorf("nil cannot be parsed as uint64")
-	default:
-		return 0, fmt.Errorf("unsupported type %T for uint64 conversion", v)
-	}
 }
