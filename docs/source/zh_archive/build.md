@@ -110,13 +110,13 @@
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
     ```
 
-4. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_HOME`（未设置时默认 `/opt/maca`）。配置链接与运行时的库路径：
+4. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_HOME`（未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`；CMake 会同时搜索 `${MACA_HOME}/lib` 与 `${MACA_HOME}/lib64`，建议在环境变量中也同时加入两者，避免链接或运行时找不到共享库：
     ```bash
     export MACA_HOME=/opt/maca
-    export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib
+    export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     ```
-    使用 `-DUSE_MACA=ON` 配置构建。如需覆盖默认链接的运行库，可在 CMake 中设置 `MACA_RUNTIME_LIBS`。
+    使用 `-DUSE_MACA=ON` 配置构建。如需覆盖默认链接的运行库，可在配置阶段传入 CMake 列表，例如 `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`（分号分隔）。该变量在 **`mooncake-transfer-engine/src/CMakeLists.txt`** 的 `if(USE_MACA)` 中用于 `target_link_libraries`，**不在** `mooncake-common/common.cmake` 中。
 
 5. 安装 yalantinglibs
     ```bash
@@ -145,7 +145,7 @@
 在执行 `cmake ..` 期间可以使用下列选项指定是否编译 Mooncake 的某些组件。
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
 - `-DUSE_MUSA=[ON|OFF]`: 通过 MUSA 启用对摩尔线程 GPU 的支持
-- `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持（`MACA_HOME` 指向 SDK 根目录，默认 `/opt/maca`；可选 `MACA_RUNTIME_LIBS` 覆盖链接库）
+- `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持（`MACA_HOME` 指向 SDK 根目录，默认 `/opt/maca`；可选 `-DMACA_RUNTIME_LIBS` 覆盖 `transfer_engine` 默认链接库，见 `mooncake-transfer-engine/src/CMakeLists.txt`）
 - `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
