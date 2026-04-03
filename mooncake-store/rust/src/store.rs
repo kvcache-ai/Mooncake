@@ -531,9 +531,6 @@ mod tests {
         assert_eq!(strings.len(), 2);
         assert_eq!(ptrs.len(), 2);
 
-        let cfg_ptr: *const ffi::mooncake_replicate_config_t = c_cfg
-            .as_ref()
-            .map_or(std::ptr::null(), |cfg| cfg as *const _);
-        assert!(!cfg_ptr.is_null());
+        assert!(c_cfg.is_some());
     }
 }
