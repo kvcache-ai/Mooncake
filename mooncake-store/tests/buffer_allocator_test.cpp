@@ -165,7 +165,7 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
         // deallocation for 1 second
         for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
             threads.emplace_back(
-                [&allocator, test_duration, &segment_name, &success_count,
+                [&allocator, test_duration, segment_name, &success_count,
                  &saw_invalid_buffer]() {
                     auto start_time = std::chrono::steady_clock::now();
 
@@ -185,6 +185,7 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
                             bufHandle->data() == nullptr) {
                             saw_invalid_buffer.store(true,
                                                      std::memory_order_relaxed);
+                            bufHandle.reset();
                             break;
                         }
                         success_count.fetch_add(1, std::memory_order_relaxed);
