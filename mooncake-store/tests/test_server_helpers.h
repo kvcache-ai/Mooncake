@@ -38,9 +38,8 @@ class InProcMaster {
             auto free_ports = getFreeTcpPorts(needed);
             if (static_cast<int>(free_ports.size()) < needed) return false;
             int idx = 0;
-            rpc_port_ = config.rpc_port.has_value()
-                            ? config.rpc_port.value()
-                            : free_ports[idx++];
+            rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
+                                                    : free_ports[idx++];
             http_metrics_port_ = config.http_metrics_port.has_value()
                                      ? config.http_metrics_port.value()
                                      : free_ports[idx++];

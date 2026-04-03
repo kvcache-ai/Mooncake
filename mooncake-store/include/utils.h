@@ -401,7 +401,8 @@ int getFreeTcpPort();
 
 // Obtain multiple unique available TCP ports atomically.
 // All ports are bound simultaneously before any are released, preventing
-// duplicate port assignments that can occur with repeated getFreeTcpPort() calls.
+// duplicate port assignments that can occur with repeated getFreeTcpPort()
+// calls.
 std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();

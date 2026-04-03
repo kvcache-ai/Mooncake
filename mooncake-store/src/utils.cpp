@@ -322,7 +322,6 @@ int getFreeTcpPort() {
     return port;
 }
 
-
 std::vector<int> getFreeTcpPorts(int count) {
     std::vector<int> ports;
     std::vector<int> sockets;
@@ -336,14 +335,14 @@ std::vector<int> getFreeTcpPorts(int count) {
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = htons(0);
-        if (::bind(sock, reinterpret_cast<sockaddr *>(&addr),
-                   sizeof(addr)) != 0) {
+        if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
+            0) {
             ::close(sock);
             break;
         }
         socklen_t len = sizeof(addr);
-        if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr),
-                          &len) != 0) {
+        if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) !=
+            0) {
             ::close(sock);
             break;
         }
