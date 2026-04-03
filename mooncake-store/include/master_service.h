@@ -466,6 +466,28 @@ class MasterService {
                                                  const std::string& target);
 
     /**
+     * @brief Create a drain job to gracefully evacuate one or more segments.
+     */
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    /**
+     * @brief Query the status of a drain job.
+     */
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    /**
+     * @brief Cancel an in-flight drain job and restore draining segments to OK.
+     */
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    /**
+     * @brief Query current segment lifecycle state by segment name.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */
@@ -529,6 +551,7 @@ class MasterService {
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
+    void JobDispatchThreadFunc();
 
     // Internal data structures
     struct ObjectMetadata {
@@ -1188,6 +1211,53 @@ class MasterService {
 
     // Task manager
     ClientTaskManager task_manager_;
+
+    struct ActiveDrainTask {
+        UUID task_id;
+        std::string key;
+        std::string source_segment;
+        std::string target_segment;
+        size_t bytes;
+        std::string unit_key;
+    };
+
+    struct DrainJob {
+        UUID id;
+        JobType type{JobType::DRAIN};
+        JobStatus status{JobStatus::CREATED};
+        CreateDrainJobRequest request;
+        std::chrono::system_clock::time_point created_at;
+        std::chrono::system_clock::time_point last_updated_at;
+        std::string message;
+        uint64_t succeeded_units{0};
+        uint64_t failed_units{0};
+        uint64_t blocked_units{0};
+        uint64_t migrated_bytes{0};
+        std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
+            active_tasks;
+        std::unordered_set<std::string> completed_unit_keys;
+        std::unordered_map<std::string, uint32_t> retry_counts;
+        std::unordered_set<std::string> terminal_failed_unit_keys;
+    };
+
+    tl::expected<void, ErrorCode> ValidateDrainRequest(
+        const CreateDrainJobRequest& request);
+    void ProcessDrainJobs();
+    void RefreshDrainJobTasks(DrainJob& job);
+    void ScheduleDrainJobTasks(DrainJob& job);
+    bool MaybeCompleteDrainJob(DrainJob& job);
+    std::optional<std::string> SelectDrainTargetForKey(
+        const ObjectMetadata& metadata, const std::string& source_segment,
+        const std::vector<std::string>& requested_targets);
+    std::string MakeDrainUnitKey(const std::string& key,
+                                 const std::string& source_segment) const;
+
+    std::thread job_dispatch_thread_;
+    std::atomic<bool> job_dispatch_running_{false};
+    static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
+    std::mutex job_mutex_;
+    std::unordered_map<UUID, DrainJob, boost::hash<UUID>> drain_jobs_
+        GUARDED_BY(job_mutex_);
 };
 
 }  // namespace mooncake

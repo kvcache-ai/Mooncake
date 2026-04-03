@@ -2,11 +2,17 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <csignal>
 #include <memory>
 #include <string>
 #include <thread>
 #include <chrono>
 #include <vector>
+
+#include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
+#include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "client_service.h"
 #include "master_client.h"
@@ -25,6 +31,65 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 
 namespace mooncake {
 namespace testing {
+
+namespace {
+
+struct HttpCreateDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    std::string status;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
+         error_message);
+
+struct HttpQueryDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    int32_t type{0};
+    std::string type_name;
+    int32_t status{0};
+    std::string status_name;
+    int64_t created_at_ms_epoch{0};
+    int64_t last_updated_at_ms_epoch{0};
+    std::vector<std::string> segments;
+    uint64_t succeeded_units{0};
+    uint64_t failed_units{0};
+    uint64_t blocked_units{0};
+    uint64_t active_units{0};
+    uint64_t migrated_bytes{0};
+    std::string message;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
+         status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
+         succeeded_units, failed_units, blocked_units, active_units,
+         migrated_bytes, message, error_code, error_message);
+
+struct HttpSegmentStatusResponse {
+    bool success{false};
+    std::string segment;
+    int32_t status{0};
+    std::string status_name;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
+         error_code, error_message);
+
+tl::expected<std::string, int> HttpPostJson(const std::string& url,
+                                            const std::string& body) {
+    coro_http::coro_http_client client;
+    auto response = client.post(url, body, coro_http::req_content_type::json);
+    if (response.status != 200) {
+        return tl::unexpected(response.status);
+    }
+    return std::string(response.resp_body);
+}
+
+}  // namespace
 
 class TaskExecutorIntegrationTest : public ::testing::Test {
    protected:
@@ -161,6 +226,69 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
                 if (task_response.status == TaskStatus::SUCCESS ||
                     task_response.status == TaskStatus::FAILED) {
                     return task_response.status == TaskStatus::SUCCESS;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
+    tl::expected<HttpCreateDrainJobResponse, int> CreateDrainJobViaHttp(
+        const CreateDrainJobRequest& request) {
+        std::string body;
+        struct_json::to_json(request, body);
+        auto response = HttpPostJson(
+            master_.http_metrics_base() + "/api/v1/drain_jobs", body);
+        if (!response.has_value()) {
+            return tl::unexpected(response.error());
+        }
+
+        HttpCreateDrainJobResponse parsed;
+        struct_json::from_json(parsed, response.value());
+        return parsed;
+    }
+
+    tl::expected<HttpQueryDrainJobResponse, int> QueryDrainJobViaHttp(
+        const std::string& job_id) {
+        auto response = httpGet(master_.http_metrics_base() +
+                                "/api/v1/drain_jobs/query?job_id=" + job_id);
+        if (!response.has_value()) {
+            return tl::unexpected(response.error());
+        }
+
+        HttpQueryDrainJobResponse parsed;
+        struct_json::from_json(parsed, response.value());
+        return parsed;
+    }
+
+    tl::expected<HttpSegmentStatusResponse, int> QuerySegmentStatusViaHttp(
+        const std::string& segment_name) {
+        auto response =
+            httpGet(master_.http_metrics_base() +
+                    "/api/v1/segments/status?segment=" + segment_name);
+        if (!response.has_value()) {
+            return tl::unexpected(response.error());
+        }
+
+        HttpSegmentStatusResponse parsed;
+        struct_json::from_json(parsed, response.value());
+        return parsed;
+    }
+
+    bool WaitForJobCompletionViaHttp(
+        const std::string& job_id, HttpQueryDrainJobResponse* final_job,
+        std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            auto query_result = QueryDrainJobViaHttp(job_id);
+            if (query_result.has_value()) {
+                if (query_result->status_name == "SUCCEEDED" ||
+                    query_result->status_name == "FAILED" ||
+                    query_result->status_name == "CANCELED") {
+                    if (final_job != nullptr) {
+                        *final_job = query_result.value();
+                    }
+                    return query_result->status_name == "SUCCEEDED";
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -405,6 +533,99 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
 }
 
 // Test copy to multiple target segments
+TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
+    const std::string source_segment = "127.0.0.1:18001";
+    const std::string target_segment = "127.0.0.1:18002";
+    const std::string test_key =
+        "test_drain_job_key_" +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+    std::string test_data =
+        "This is test data for drain job operation. "
+        "It should be drained from the source segment to the target segment.";
+
+    std::vector<Slice> slices;
+    slices.emplace_back(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = source_segment;
+
+    auto put_result = client1_->Put(test_key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Failed to put drain test data: " << toString(put_result.error());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    CreateDrainJobRequest request;
+    request.segments = {source_segment};
+    request.target_segments = {target_segment};
+    request.max_concurrency = 1;
+
+    auto create_job_result = CreateDrainJobViaHttp(request);
+    ASSERT_TRUE(create_job_result.has_value())
+        << "Failed to create drain job over HTTP, status="
+        << create_job_result.error();
+    ASSERT_TRUE(create_job_result->success)
+        << "Drain job create returned error: "
+        << create_job_result->error_message;
+    EXPECT_EQ(create_job_result->status, "CREATED");
+
+    auto draining_status = QuerySegmentStatusViaHttp(source_segment);
+    ASSERT_TRUE(draining_status.has_value())
+        << "Failed to query segment status over HTTP, status="
+        << draining_status.error();
+    EXPECT_TRUE(draining_status->success);
+    EXPECT_EQ(draining_status->status_name, "DRAINING");
+
+    HttpQueryDrainJobResponse final_job;
+    ASSERT_TRUE(
+        WaitForJobCompletionViaHttp(create_job_result->job_id, &final_job))
+        << "Drain job did not complete within timeout";
+
+    EXPECT_EQ(final_job.status_name, "SUCCEEDED");
+    EXPECT_EQ(final_job.active_units, 0u);
+    EXPECT_GE(final_job.succeeded_units, 1u);
+    EXPECT_GE(final_job.migrated_bytes, test_data.size());
+
+    auto drained_status = QuerySegmentStatusViaHttp(source_segment);
+    ASSERT_TRUE(drained_status.has_value())
+        << "Failed to query drained segment status over HTTP, status="
+        << drained_status.error();
+    EXPECT_TRUE(drained_status->success);
+    EXPECT_EQ(drained_status->status_name, "DRAINED");
+
+    auto replica_result = master_client_->GetReplicaList(test_key);
+    ASSERT_TRUE(replica_result.has_value())
+        << "Failed to query replicas after drain";
+    ASSERT_FALSE(replica_result->replicas.empty())
+        << "No replicas found after drain";
+
+    bool found_target = false;
+    for (const auto& replica : replica_result->replicas) {
+        ASSERT_TRUE(replica.is_memory_replica());
+        const auto& segment = replica.get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_;
+        EXPECT_NE(segment, source_segment);
+        if (segment == target_segment) {
+            found_target = true;
+        }
+    }
+    EXPECT_TRUE(found_target) << "Drained replica not found on target segment";
+
+    std::vector<uint8_t> read_buffer(test_data.size());
+    std::vector<Slice> read_slices;
+    read_slices.emplace_back(read_buffer.data(), read_buffer.size());
+
+    auto get_result = client2_->Get(test_key, read_slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Failed to get drained data from target client: "
+        << toString(get_result.error());
+
+    std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
+                          test_data.size());
+    ASSERT_EQ(read_data, test_data) << "Data mismatch after drain";
+}
+
 TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {
     // Step 1: Put data on client1
     std::string test_key =

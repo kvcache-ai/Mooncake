@@ -19,6 +19,8 @@ namespace mooncake {
 enum class SegmentStatus {
     UNDEFINED = 0,  // Uninitialized
     OK,             // Segment is mounted and available for allocation
+    DRAINING,       // Segment remains readable but accepts no new allocations
+    DRAINED,        // Segment has been drained and awaits unmount
     UNMOUNTING,     // Segment is under unmounting
 };
 
@@ -30,6 +32,8 @@ inline std::ostream& operator<<(std::ostream& os,
     static const std::unordered_map<SegmentStatus, std::string_view>
         status_strings{{SegmentStatus::UNDEFINED, "UNDEFINED"},
                        {SegmentStatus::OK, "OK"},
+                       {SegmentStatus::DRAINING, "DRAINING"},
+                       {SegmentStatus::DRAINED, "DRAINED"},
                        {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
 
     os << (status_strings.count(status) ? status_strings.at(status)
@@ -60,6 +64,23 @@ struct LocalDiskSegment {
 
 // Forward declarations
 class SegmentManager;
+
+/**
+ * @brief RAII-style read access to segment state guarded by segment mutex.
+ */
+class ScopedSegmentReadAccess {
+   public:
+    explicit ScopedSegmentReadAccess(SegmentManager* segment_manager,
+                                     std::shared_mutex& mutex)
+        : segment_manager_(segment_manager), lock_(mutex) {}
+
+    ErrorCode GetUnreadySegments(
+        std::vector<std::pair<Segment, UUID>>& unready_segments) const;
+
+   private:
+    SegmentManager* segment_manager_;
+    std::shared_lock<std::shared_mutex> lock_;
+};
 
 /**
  * @brief RAII-style access to segment mutex for thread-safe segment operations
@@ -148,6 +169,23 @@ class ScopedSegmentAccess {
      * @brief Check if a segment name exists
      */
     bool ExistsSegmentName(const std::string& segment_name) const;
+
+    /**
+     * @brief Check if a segment can accept new allocations.
+     */
+    bool IsSegmentAllocatable(const std::string& segment_name) const;
+
+    /**
+     * @brief Query the lifecycle status of a segment by name.
+     */
+    ErrorCode GetSegmentStatusByName(const std::string& segment_name,
+                                     SegmentStatus& status) const;
+
+    /**
+     * @brief Update the lifecycle status of a segment by name.
+     */
+    ErrorCode SetSegmentStatusByName(const std::string& segment_name,
+                                     SegmentStatus status);
 
    private:
     SegmentManager* segment_manager_;
@@ -262,6 +300,10 @@ class SegmentManager {
         return ScopedSegmentAccess(this, segment_mutex_);
     }
 
+    ScopedSegmentReadAccess getSegmentReadAccess() {
+        return ScopedSegmentReadAccess(this, segment_mutex_);
+    }
+
     /**
      * @brief Get RAII-style access to use allocators
      * @return ScopedAllocatorAccess object that holds the lock
@@ -302,6 +344,7 @@ class SegmentManager {
         client_local_disk_segment_;  // client_id -> local_disk_segment
 
     friend class ScopedSegmentAccess;
+    friend class ScopedSegmentReadAccess;
     friend class SegmentTest;        // for unit tests
     friend class SegmentView;        // for fork serialize
     friend class SegmentSerializer;  // for fork serialize

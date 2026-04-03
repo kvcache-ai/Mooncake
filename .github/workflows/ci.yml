@@ -139,6 +139,13 @@ jobs:
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
       shell: bash
 
+    - name: Drain HTTP E2E test
+      if: matrix.python-version == '3.12'
+      run: |
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        python3 scripts/test_drain_http_api.py --timeout-sec 90
+      shell: bash
+
     - name: Generate coverage report
       id: coverage
       run: |

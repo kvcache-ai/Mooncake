@@ -277,6 +277,51 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
                             empty_client_ids_vec);
 }
 
+TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
+    SegmentManager segment_manager;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "status_segment";
+    segment.size = 1024 * 1024 * 16;
+    segment.base = 0x100000000;
+
+    UUID client_id = generate_uuid();
+
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::OK);
+    EXPECT_TRUE(segment_access.IsSegmentAllocatable(segment.name));
+
+    ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
+                                                    SegmentStatus::DRAINING),
+              ErrorCode::OK);
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::DRAINING);
+    EXPECT_FALSE(segment_access.IsSegmentAllocatable(segment.name));
+
+    ASSERT_EQ(segment_access.SetSegmentStatusByName(segment.name,
+                                                    SegmentStatus::DRAINED),
+              ErrorCode::OK);
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::DRAINED);
+    EXPECT_FALSE(segment_access.IsSegmentAllocatable(segment.name));
+
+    ASSERT_EQ(
+        segment_access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
+        ErrorCode::OK);
+    ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
+              ErrorCode::OK);
+    EXPECT_EQ(status, SegmentStatus::OK);
+    EXPECT_TRUE(segment_access.IsSegmentAllocatable(segment.name));
+}
+
 // ReMountSegmentSuccess:
 // 1. Mount a segment A;
 // 2. Remount two segments: A and B where A is already mounted and B is a new

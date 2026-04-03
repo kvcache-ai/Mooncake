@@ -76,6 +76,83 @@ struct MoveStartResponse {
 };
 YLT_REFL(MoveStartResponse, source, target);
 
+enum class JobType {
+    DRAIN = 0,
+};
+
+inline std::ostream& operator<<(std::ostream& os, const JobType& type) {
+    switch (type) {
+        case JobType::DRAIN:
+            os << "DRAIN";
+            break;
+        default:
+            os << "UNKNOWN_JOB_TYPE";
+            break;
+    }
+    return os;
+}
+
+enum class JobStatus {
+    CREATED = 0,
+    PLANNING,
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    CANCELED,
+};
+
+inline std::ostream& operator<<(std::ostream& os, const JobStatus& status) {
+    switch (status) {
+        case JobStatus::CREATED:
+            os << "CREATED";
+            break;
+        case JobStatus::PLANNING:
+            os << "PLANNING";
+            break;
+        case JobStatus::RUNNING:
+            os << "RUNNING";
+            break;
+        case JobStatus::SUCCEEDED:
+            os << "SUCCEEDED";
+            break;
+        case JobStatus::FAILED:
+            os << "FAILED";
+            break;
+        case JobStatus::CANCELED:
+            os << "CANCELED";
+            break;
+        default:
+            os << "UNKNOWN_JOB_STATUS";
+            break;
+    }
+    return os;
+}
+
+struct CreateDrainJobRequest {
+    std::vector<std::string> segments;
+    std::vector<std::string> target_segments;
+    uint32_t max_concurrency{4};
+};
+YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency);
+
+struct QueryJobResponse {
+    UUID id;
+    JobType type;
+    JobStatus status;
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
+    std::vector<std::string> segments;
+    uint64_t succeeded_units;
+    uint64_t failed_units;
+    uint64_t blocked_units;
+    uint64_t active_units;
+    uint64_t migrated_bytes;
+    std::string message;
+};
+YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
+         last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
+         blocked_units, active_units, migrated_bytes, message);
+
 /**
  * @brief Response structure for QueryTask operation
  */

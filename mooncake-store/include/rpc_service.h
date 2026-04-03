@@ -148,6 +148,16 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 

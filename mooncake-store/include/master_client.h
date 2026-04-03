@@ -3,11 +3,14 @@
 #include <csignal>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
+#include <variant>
 #include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
 #include "replica.h"
@@ -19,6 +22,29 @@
 namespace mooncake {
 
 static const std::string kDefaultMasterAddress = "localhost:50051";
+
+namespace detail {
+
+template <typename Variant, typename T>
+struct variant_contains : std::false_type {};
+
+template <typename... Ts, typename T>
+struct variant_contains<std::variant<Ts...>, T>
+    : std::bool_constant<(std::is_same_v<Ts, T> || ...)> {};
+
+template <typename Variant, typename T>
+inline constexpr bool variant_contains_v =
+    variant_contains<std::decay_t<Variant>, T>::value;
+
+template <typename SocketConfigVariant>
+inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+    if constexpr (variant_contains_v<SocketConfigVariant,
+                                     coro_io::ib_socket_t::config_t>) {
+        socket_config = coro_io::ib_socket_t::config_t{};
+    }
+}
+
+}  // namespace detail
 
 /**
  * @brief Client for interacting with the mooncake master service
@@ -37,8 +63,8 @@ class MasterClient {
         pool_conf.host_alive_detect_duration = std::chrono::seconds(0);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
-            pool_conf.client_config.socket_config =
-                coro_io::ib_socket_t::config_t{};
+            detail::MaybeEnableRdmaSocketConfig(
+                pool_conf.client_config.socket_config);
         }
         client_pools_ =
             std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
