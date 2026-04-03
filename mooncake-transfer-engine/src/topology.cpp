@@ -14,7 +14,6 @@
 
 #include <glog/logging.h>
 
-#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <map>
