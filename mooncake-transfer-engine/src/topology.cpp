@@ -184,10 +184,6 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
             continue;
         }
         std::string pci_bus_id = basename(resolved_path);
-        std::transform(pci_bus_id.begin(), pci_bus_id.end(), pci_bus_id.begin(),
-                       [](unsigned char ch) {
-                           return static_cast<char>(std::tolower(ch));
-                       });
 
         int numa_node = -1;
         snprintf(path, sizeof(path), "%s/numa_node", resolved_path);
@@ -395,29 +391,12 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         device_count = 0;
     }
     for (int i = 0; i < device_count; i++) {
-        char pci_bus_id[32] = {0};
+        char pci_bus_id[20];
         if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), i) !=
             cudaSuccess) {
-            LOG(WARNING)
-                << "discoverCudaTopology: failed to get PCI bus ID for "
-                << GPU_PREFIX << i << ", falling back to all HCAs as available";
-
-            std::vector<std::string> avail_hca;
-            for (const auto &hca : all_hca) {
-                avail_hca.push_back(hca.name);
-            }
-            topology.push_back(
-                TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
-                              .preferred_hca = {},
-                              .avail_hca = std::move(avail_hca)});
             continue;
         }
-        std::string normalized_pci_bus_id = pci_bus_id;
-        std::transform(normalized_pci_bus_id.begin(),
-                       normalized_pci_bus_id.end(),
-                       normalized_pci_bus_id.begin(), [](unsigned char ch) {
-                           return static_cast<char>(std::tolower(ch));
-                       });
+        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
@@ -428,8 +407,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
         std::vector<InfinibandDevice> same_numa_hca;
         for (const auto &hca : all_hca) {
-            if (isSameNumaNode(hca.pci_bus_id.c_str(),
-                               normalized_pci_bus_id.c_str())) {
+            if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
                 same_numa_hca.push_back(hca);
             }
         }
@@ -437,35 +415,25 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             same_numa_hca.empty() ? all_hca : same_numa_hca;
 
         for (const auto &hca : candidate_preferred_hca) {
-            int distance = getPciDistance(hca.pci_bus_id.c_str(),
-                                          normalized_pci_bus_id.c_str());
-            if (distance < 0) {
-                continue;
-            }
-            if (distance < min_distance) {
-                min_distance = distance;
-                min_distance_hcas.clear();
-                min_distance_hcas.push_back(hca.name);
-            } else if (distance == min_distance) {
-                min_distance_hcas.push_back(hca.name);
+            int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
+            if (distance >= 0) {
+                if (distance < min_distance) {
+                    min_distance = distance;
+                    min_distance_hcas.clear();
+                    min_distance_hcas.push_back(hca.name);
+                } else if (distance == min_distance) {
+                    min_distance_hcas.push_back(hca.name);
+                }
             }
         }
 
-        // If PCI distance cannot be resolved, keep the device routable via the
-        // wildcard path by exposing every HCA as available.
-        if (min_distance == INT_MAX) {
-            for (const auto &hca : all_hca) {
+	// Add HCAs with minimum distance to preferred_hca, others to avail_hca
+        for (const auto &hca : all_hca) {
+            if (std::find(min_distance_hcas.begin(), min_distance_hcas.end(),
+                          hca.name) != min_distance_hcas.end()) {
+                preferred_hca.push_back(hca.name);
+            } else {
                 avail_hca.push_back(hca.name);
-            }
-        } else {
-            for (const auto &hca : all_hca) {
-                if (std::find(min_distance_hcas.begin(),
-                              min_distance_hcas.end(),
-                              hca.name) != min_distance_hcas.end()) {
-                    preferred_hca.push_back(hca.name);
-                } else {
-                    avail_hca.push_back(hca.name);
-                }
             }
         }
         topology.push_back(
