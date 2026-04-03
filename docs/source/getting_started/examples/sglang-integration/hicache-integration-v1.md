@@ -429,6 +429,22 @@ If the model is small but the GPU memory is large — especially in multi-TP (te
 
 In such cases, you should manually configure an appropriate L2 cache size based on your hardware. This can be done by setting `--hicache-ratio` or `--hicache-size`.
 
+**Memory Allocator Tuning:**
+
+Mooncake uses a lock-free arena allocator by default for mmap buffer allocations used by HiCache host KV cache memory. The arena pre-allocates a large hugepage-backed pool and serves subsequent allocations via atomic bump pointer, reducing per-allocation latency from ~1000ns to ~50ns.
+
+To tune the arena pool size (default 64GB), set `MC_MMAP_ARENA_POOL_SIZE` to match your available hugepage capacity:
+
+```bash
+export MC_MMAP_ARENA_POOL_SIZE="8gb"
+```
+
+To disable the arena and fall back to per-call `mmap()`:
+
+```bash
+export MC_DISABLE_MMAP_ARENA=1
+```
+
 **More Information:**
 
 Additional troubleshooting information can be found [here](https://kvcache-ai.github.io/Mooncake/troubleshooting/troubleshooting.html).

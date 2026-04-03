@@ -167,6 +167,16 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
 
    * **`asio::socket::close()` runs under `pool_mutex_`.** `close()` cancels outstanding async operations and posts completion handlers to the io_context. Handlers such as `returnConnection()` also acquire `pool_mutex_`, so the current code is one scheduling step away from a circular wait. No deadlock has been observed in practice, but if the transfer engine hangs with all worker threads stuck waiting on `pool_mutex_`, this is the first place to look.
 
+## Memory Allocator
+
+Mooncake Store uses a lock-free arena allocator by default for mmap buffer allocations. The arena pre-allocates a large pool (default 64GB) using hugepages and serves subsequent allocations from it. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
+
+If you encounter memory allocation issues related to the arena:
+
+- **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget.
+- **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` to fall back to per-call `mmap()`.
+- **Arena OOM during serving:** The arena logs a warning and falls back to direct `mmap()` for that allocation. If this happens frequently, increase `MC_MMAP_ARENA_POOL_SIZE`.
+
 ## SGLang Common Questions
 
 ### Do I need RDMA to run SGLang and Mooncake?

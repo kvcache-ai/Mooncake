@@ -35,6 +35,8 @@ MOONCAKE_MASTER=127.0.0.1:50051 python -m sglang.launch_server \
 
 **Key flag:** `--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}` determines when prefetching from storage should stop. `timeout` usually offers the best balance when Mooncake is the backend.
 
+**Memory allocator:** Mooncake pre-allocates a hugepage-backed arena (default 64GB) for fast buffer allocation. To adjust the pool size: `export MC_MMAP_ARENA_POOL_SIZE="8gb"`. To disable: `export MC_DISABLE_MMAP_ARENA=1`. See the [Complete Guide](hicache-integration-v1.md) for details.
+
 ## Prefill/Decode Disaggregation
 
 The disaggregated setup runs three processes—prefill worker, decode worker, and router. Launch each command below in its own terminal window.
