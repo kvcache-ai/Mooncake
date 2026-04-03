@@ -112,8 +112,17 @@ pip install mooncake-transfer-engine-non-cuda
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
+    ```
 
-4. Install yalantinglibs
+4. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_HOME` (default `/opt/maca` if unset). Configure library paths for linking and runtime:
+    ```bash
+    export MACA_HOME=/opt/maca
+    export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib
+    ```
+    Build with `-DUSE_MACA=ON`. If needed, override linked runtime libraries with `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated for CMake lists).
+
+5. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -123,7 +132,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-5. In the root directory of this project, run the following commands:
+6. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -131,7 +140,7 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-6. Install Mooncake python package and mooncake_master executable
+7. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
@@ -151,8 +160,9 @@ cd /Mooncake-main/build/mooncake-transfer-engine/example
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU memory support (GPUDirect RDMA, NVMe-oF, and GPU-aware TCP transport). **Default: OFF.** Required when transferring GPU memory (e.g., KV cache in vLLM disaggregated serving), even when using TCP protocol.
-- `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on.
+- `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on (not used when building with `-DUSE_MUSA=ON`, `-DUSE_HIP=ON`, or `-DUSE_MACA=ON`).
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
+- `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA. Use `MACA_HOME` for the SDK root (default `/opt/maca`). Optional: `-DMACA_RUNTIME_LIBS` to customize linked libraries.
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
 - `-DUSE_EFA=[ON|OFF]`: Enable AWS Elastic Fabric Adapter transport via libfabric. **Default: OFF.** See [EFA Transport](../design/transfer-engine/efa_transport.md) for details.
 - `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport

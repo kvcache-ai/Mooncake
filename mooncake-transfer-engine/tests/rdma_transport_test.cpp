@@ -39,7 +39,8 @@
 #include <cufile.h>
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 
 #include <cassert>
 
@@ -71,7 +72,8 @@ DEFINE_string(nic_priority_matrix, "",
 
 DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
@@ -80,7 +82,8 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
@@ -94,7 +97,8 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -229,6 +233,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -259,7 +266,8 @@ int initiator() {
     LOG_ASSERT(xport);
 
     void *addr = nullptr;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
     std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
     int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : 0;
