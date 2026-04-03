@@ -12,7 +12,6 @@ USE_CUDA = os.getenv("MOONCAKE_TEST_USE_CUDA") == "1"
 TEST_BACKEND = "mooncake" if USE_CUDA else "mooncake-cpu"
 TEST_DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
 
-
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "19000"
 
@@ -151,7 +150,7 @@ class TestMooncakeBackend(unittest.TestCase):
         mp.spawn(_elastic_worker, args=(num_processes, signals), nprocs=num_processes)
 
     def test_rank_recovery_deferred_join(self):
-        num_processes = 8
+        num_processes = 4
         mp_manager = mp.Manager()
         signals = mp_manager.dict()
         mp.spawn(

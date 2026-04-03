@@ -1261,11 +1261,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
         if (task.type == UNSPEC) {
-            if (resubmitTransferTask(batch, task_id).ok())
-                task_status.s = PENDING;
-            else
-                task_status.s = FAILED;
+            task_status.s = FAILED;
             task_status.transferred_bytes = 0;
+            batch->task_list[task_id].status = task_status.s;
             return Status::OK();
         }
         auto& transport = transport_list_[task.type];
@@ -1275,10 +1273,6 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         }
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
-    }
-    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        task_status.transferred_bytes = 0;
     }
     batch->task_list[task_id].status = task_status.s;
 
@@ -1330,8 +1324,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
             if (task.type == UNSPEC) {
-                if (!resubmitTransferTask(batch, task_id).ok())
-                    overall_status.s = FAILED;
+                task.status = FAILED;
+                overall_status.s = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1342,11 +1336,6 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             }
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
-        }
-        if (task_status.s == FAILED &&
-            resubmitTransferTask(batch, task_id).ok()) {
-            task_status.s = PENDING;
-            task_status.transferred_bytes = 0;
         }
         if (task_status.s == COMPLETED) {
             success_tasks++;
