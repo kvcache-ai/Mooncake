@@ -23,6 +23,8 @@ namespace mooncake::tracing {
 namespace {
 constexpr size_t kMaxRemoteBatchItems = 256;
 constexpr size_t kMaxRemoteBatchBytes = 512 * 1024;
+constexpr char kSamplingPriorityAttr[] = "sampling.priority";
+constexpr char kStructuralSamplingPriority[] = "structural";
 
 std::string BuildSpoolFileName(const TraceConfig& config) {
     std::string file_name = config.service_name;
@@ -67,12 +69,35 @@ Json::Value AttrToJson(const std::pair<std::string, std::string>& kv) {
     return attr;
 }
 
+bool IsInternalTraceAttr(const std::pair<std::string, std::string>& kv) {
+    return kv.first == kSamplingPriorityAttr;
+}
+
 Json::Value AttrsToObject(const TraceAttrs& attrs) {
     Json::Value obj(Json::objectValue);
     for (const auto& [key, value] : attrs) {
+        if (key == kSamplingPriorityAttr) {
+            continue;
+        }
         obj[key] = value;
     }
     return obj;
+}
+
+bool HasAttrValue(const TraceAttrs& attrs, const std::string& key,
+                  const std::string& value) {
+    return std::any_of(attrs.begin(), attrs.end(),
+                       [&key, &value](const auto& attr) {
+                           return attr.first == key && attr.second == value;
+                       });
+}
+
+bool IsStructuralRecord(const TraceRecord& record) {
+    if (record.force_sample) {
+        return true;
+    }
+    return HasAttrValue(record.attrs, kSamplingPriorityAttr,
+                        kStructuralSamplingPriority);
 }
 
 Json::Value RecordToJson(const TraceRecord& record) {
@@ -119,6 +144,9 @@ Json::Value RecordToOtlpSpan(const TraceRecord& record) {
         attrs.append(AttrToJson({"correlation.id", record.correlation_id}));
     }
     for (const auto& kv : record.attrs) {
+        if (IsInternalTraceAttr(kv)) {
+            continue;
+        }
         attrs.append(AttrToJson(kv));
     }
     span["attributes"] = attrs;
@@ -194,6 +222,9 @@ std::string BuildOtlpPayload(const std::vector<TraceRecord>& records) {
 }
 
 bool IsHighPriorityRecord(const TraceRecord& record, const TraceConfig& config) {
+    if (IsStructuralRecord(record)) {
+        return true;
+    }
     if (record.parent_span_id.empty()) {
         return true;
     }
@@ -370,11 +401,21 @@ AsyncRemoteTraceExporter::~AsyncRemoteTraceExporter() {
 void AsyncRemoteTraceExporter::Export(const TraceRecord& record) {
     const auto record_bytes = EstimateRecordBytes(record);
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool structural = IsStructuralRecord(record);
     const bool queue_full =
         queue_.size() >= config_.exporter_queue_max_items ||
         queued_bytes_ + record_bytes > config_.exporter_queue_max_bytes;
     if (queue_full) {
         stats_.queue_full_count++;
+
+        if (structural) {
+            queue_.push_back(record);
+            queued_bytes_ += record_bytes;
+            stats_.queued_records = queue_.size();
+            stats_.queued_bytes = queued_bytes_;
+            cv_.notify_one();
+            return;
+        }
 
         if (IsHighPriorityRecord(record, config_)) {
             bool evicted = false;

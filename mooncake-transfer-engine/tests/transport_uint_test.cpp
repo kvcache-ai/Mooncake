@@ -329,6 +329,37 @@ TEST_F(TransportTest, ActiveBatchTraceRegistryUsesProvidedParentContext) {
     EXPECT_EQ(root.context.correlation_id, parent_context.correlation_id);
 }
 
+TEST_F(TransportTest,
+       GetTransferStatusTreatsObservedSuccessfulSliceAsCompleted) {
+    std::string local_server_name = "127.0.0.1:12345";
+    MultiTransport multi_transport(nullptr, local_server_name);
+
+    auto* batch_desc = new Transport::BatchDesc();
+    batch_desc->id = reinterpret_cast<Transport::BatchID>(batch_desc);
+    batch_desc->batch_size = 1;
+    batch_desc->task_list.resize(1);
+
+    auto& task = batch_desc->task_list[0];
+    task.batch_id = batch_desc->id;
+    task.slice_count = 1;
+    task.total_bytes = 4096;
+
+    auto* slice = new Transport::Slice();
+    slice->task = &task;
+    slice->length = 4096;
+    slice->status = Transport::Slice::SUCCESS;
+    task.slice_list.push_back(slice);
+
+    Transport::TransferStatus status;
+    ASSERT_TRUE(
+        multi_transport.getTransferStatus(batch_desc->id, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 4096u);
+    EXPECT_TRUE(task.is_finished);
+
+    delete batch_desc;
+}
+
 TEST_F(TransportTest, SliceTraceLifecycleTracksSuccessAndTimeout) {
     setenv("MC_TRACING_ENABLED", "1", 1);
     setenv("MC_TRACING_EXPORTER", "jsonl", 1);

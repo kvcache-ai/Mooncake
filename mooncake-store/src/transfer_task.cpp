@@ -166,6 +166,7 @@ TransferTraceSession TransferTraceSession::Start(
     session.operation_span_ = tracing.StartSpan(
         "mooncake.transfer.operation", nullptr,
         {{"batch.size", std::to_string(batch_size)},
+         {"sampling.priority", "structural"},
          {"bytes.total", std::to_string(total_bytes)}});
     if (session.operation_span_.valid()) {
         session.parent_context_ = session.operation_span_.context();

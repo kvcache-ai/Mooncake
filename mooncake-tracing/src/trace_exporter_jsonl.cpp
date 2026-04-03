@@ -13,9 +13,16 @@
 
 namespace mooncake::tracing {
 namespace {
+constexpr char kSamplingPriorityAttr[] = "sampling.priority";
+
 Json::Value ToJson(const TraceAttrs& attrs) {
     Json::Value obj(Json::objectValue);
-    for (const auto& [k, v] : attrs) obj[k] = v;
+    for (const auto& [k, v] : attrs) {
+        if (k == kSamplingPriorityAttr) {
+            continue;
+        }
+        obj[k] = v;
+    }
     return obj;
 }
 Json::Value ToJson(const TraceRecord& record) {

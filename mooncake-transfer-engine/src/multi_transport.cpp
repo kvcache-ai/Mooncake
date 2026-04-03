@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "multi_transport.h"
+
 #include <algorithm>
 #include <sstream>
 #include <string>
@@ -105,6 +106,36 @@ const char* ToSliceStatusName(Transport::Slice::SliceStatus status) {
 const char* ToOpcodeName(Transport::TransferRequest::OpCode opcode) {
     return opcode == Transport::TransferRequest::READ ? "READ" : "WRITE";
 }
+
+struct ObservedTaskState {
+    uint64_t success_slice_count{0};
+    uint64_t failed_slice_count{0};
+    uint64_t successful_bytes{0};
+    bool timed_out{false};
+};
+
+ObservedTaskState ObserveTaskState(
+    const std::vector<Transport::Slice*>& slice_list) {
+    ObservedTaskState observed;
+    for (const auto* slice : slice_list) {
+        switch (slice->status) {
+            case Transport::Slice::SUCCESS:
+                ++observed.success_slice_count;
+                observed.successful_bytes += slice->length;
+                break;
+            case Transport::Slice::FAILED:
+                ++observed.failed_slice_count;
+                break;
+            case Transport::Slice::TIMEOUT:
+                observed.timed_out = true;
+                break;
+            case Transport::Slice::PENDING:
+            case Transport::Slice::POSTED:
+                break;
+        }
+    }
+    return observed;
+}
 }  // namespace
 
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
@@ -186,11 +217,13 @@ Status MultiTransport::submitTransfer(
                                  ? tracing.StartSpan(
                                        "te.batch.submit", &batch_context.value(),
                                        {{"te.batch_id", std::to_string(batch_id)},
+                                        {"sampling.priority", "structural"},
                                         {"task.count",
                                          std::to_string(entries.size())}})
                                  : tracing.StartSpan(
                                        "te.batch.submit", nullptr,
                                        {{"te.batch_id", std::to_string(batch_id)},
+                                        {"sampling.priority", "structural"},
                                         {"task.count",
                                          std::to_string(entries.size())}});
     auto batch_submit_context = batch_submit_span.context();
@@ -210,6 +243,7 @@ Status MultiTransport::submitTransfer(
         auto task_span = tracing.StartSpan(
             "te.task.submit", &batch_submit_context,
             {{"te.batch_id", std::to_string(batch_id)},
+             {"sampling.priority", "structural"},
              {"task.id", std::to_string(idx)},
              {"transport.name", task_transport_names[idx]},
              {"transfer.op", ToOpcodeName(task.request->opcode)},
@@ -298,12 +332,20 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
     assert(task.slice_count);
-    if (success_slice_count + failed_slice_count == task.slice_count) {
-        if (failed_slice_count) {
-            status.s = Transport::TransferStatusEnum::FAILED;
-        } else {
-            status.s = Transport::TransferStatusEnum::COMPLETED;
-        }
+    const auto observed = ObserveTaskState(task.slice_list);
+    success_slice_count =
+        std::max<uint64_t>(success_slice_count, observed.success_slice_count);
+    failed_slice_count =
+        std::max<uint64_t>(failed_slice_count, observed.failed_slice_count);
+    status.transferred_bytes =
+        std::max<uint64_t>(status.transferred_bytes, observed.successful_bytes);
+
+    if (observed.timed_out) {
+        status.s = Transport::TransferStatusEnum::TIMEOUT;
+        task.is_finished = true;
+    } else if (success_slice_count + failed_slice_count == task.slice_count) {
+        status.s = failed_slice_count ? Transport::TransferStatusEnum::FAILED
+                                      : Transport::TransferStatusEnum::COMPLETED;
         task.is_finished = true;
     } else {
         if (globalConfig().slice_timeout > 0) {
@@ -383,7 +425,9 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             for (const auto& event : pending_events) {
                 span.AddEvent(event.first, event.second);
             }
-            if (status.s != Transport::TransferStatusEnum::COMPLETED) {
+            if (status.s == Transport::TransferStatusEnum::FAILED ||
+                status.s == Transport::TransferStatusEnum::TIMEOUT ||
+                status.s == Transport::TransferStatusEnum::CANCELED) {
                 span.SetStatus("ERROR");
             }
         }

@@ -27,6 +27,7 @@ struct TraceRecord {
     int64_t start_time_unix_nano{0};
     int64_t end_time_unix_nano{0};
     std::string status{"OK"};
+    bool force_sample{false};
     TraceAttrs attrs;
     std::vector<TraceEvent> events;
 };

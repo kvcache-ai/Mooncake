@@ -216,7 +216,8 @@ TEST_F(TransferTaskTest, StartSpanFromCarrierUsesCarrierSpanAsParent) {
     mooncake::tracing::TraceCarrier carrier{
         .trace_id = "0123456789abcdef0123456789abcdef",
         .span_id = "89abcdef01234567",
-        .correlation_id = "corr-1234"};
+        .correlation_id = "corr-1234",
+        .force_sample = true};
 
     auto span = facade.StartSpanFromCarrier("child-span", carrier);
     auto context = span.context();
@@ -225,6 +226,7 @@ TEST_F(TransferTaskTest, StartSpanFromCarrierUsesCarrierSpanAsParent) {
     EXPECT_EQ(context.parent_span_id, carrier.span_id);
     EXPECT_EQ(context.correlation_id, carrier.correlation_id);
     EXPECT_NE(context.span_id, carrier.span_id);
+    EXPECT_TRUE(context.force_sample);
 }
 
 TEST_F(TransferTaskTest, TransferTraceSessionCreatesStandaloneRootWhenMissingParent) {
@@ -434,6 +436,76 @@ TEST_F(TransferTaskTest,
     EXPECT_GE(stats.dropped_records, 1u);
 }
 
+TEST_F(TransferTaskTest,
+       AsyncRemoteExporterRetainsStructuralSpanWhenQueueIsFull) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.exporter_mode = "remote";
+    config.service_name = "priority-service";
+    config.process_role = "test-role";
+    config.exporter_queue_max_items = 1;
+    config.exporter_queue_max_bytes = 2048;
+    config.exporter_retry_base_ms = 1;
+    config.exporter_retry_max_ms = 2;
+    config.exporter_retry_max_attempts = 0;
+
+    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    std::atomic<bool> release_remote{false};
+    mooncake::tracing::AsyncRemoteTraceExporter exporter(
+        config, fallback,
+        [&release_remote](const std::vector<mooncake::tracing::TraceRecord>&,
+                          std::string*) {
+            while (!release_remote.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return false;
+        });
+
+    mooncake::tracing::TraceRecord slow_inflight;
+    slow_inflight.trace_id = "trace-slow-inflight";
+    slow_inflight.span_id = "span-slow-inflight";
+    slow_inflight.parent_span_id = "parent";
+    slow_inflight.span_name = "slow-inflight";
+    slow_inflight.start_time_unix_nano = 0;
+    slow_inflight.end_time_unix_nano = 60 * 1000 * 1000;
+
+    mooncake::tracing::TraceRecord slow_queued;
+    slow_queued.trace_id = "trace-slow-queued";
+    slow_queued.span_id = "span-slow-queued";
+    slow_queued.parent_span_id = "parent";
+    slow_queued.span_name = "slow-queued";
+    slow_queued.start_time_unix_nano = 0;
+    slow_queued.end_time_unix_nano = 60 * 1000 * 1000;
+
+    mooncake::tracing::TraceRecord structural_record;
+    structural_record.trace_id = "trace-structural";
+    structural_record.span_id = "span-structural";
+    structural_record.parent_span_id = "parent";
+    structural_record.span_name = "structural-parent";
+    structural_record.attrs.emplace_back("sampling.priority", "structural");
+
+    exporter.Export(slow_inflight);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    exporter.Export(slow_queued);
+    exporter.Export(structural_record);
+
+    release_remote.store(true, std::memory_order_release);
+    EXPECT_TRUE(exporter.FlushForTest(std::chrono::milliseconds(500)));
+
+    auto exported = fallback->Snapshot();
+    bool saw_structural = false;
+    for (const auto& record : exported) {
+        if (record.span_name == "structural-parent") {
+            saw_structural = true;
+            break;
+        }
+    }
+
+    auto stats = exporter.SnapshotStats();
+    EXPECT_TRUE(saw_structural);
+    EXPECT_GE(stats.queue_full_count, 1u);
+}
+
 TEST_F(TransferTaskTest, TraceSamplerBaseModeKeepsErrorAndSlowSpan) {
     mooncake::tracing::TraceConfig config;
     config.enabled = true;
@@ -457,6 +529,24 @@ TEST_F(TransferTaskTest, TraceSamplerBaseModeKeepsErrorAndSlowSpan) {
     normal_record.start_time_unix_nano = 0;
     normal_record.end_time_unix_nano = 1 * 1000 * 1000;
     EXPECT_FALSE(sampler.ShouldSample(normal_record));
+}
+
+TEST_F(TransferTaskTest, TraceSamplerBaseModeKeepsStructuralSpan) {
+    mooncake::tracing::TraceConfig config;
+    config.enabled = true;
+    config.sampling_mode = "base";
+    config.sampling_base_ratio = 0.0;
+    config.sampling_slow_threshold_ms = 50;
+
+    mooncake::tracing::TraceSampler sampler(config);
+
+    mooncake::tracing::TraceRecord structural_record;
+    structural_record.trace_id = "trace-structural";
+    structural_record.parent_span_id = "parent";
+    structural_record.start_time_unix_nano = 0;
+    structural_record.end_time_unix_nano = 1 * 1000 * 1000;
+    structural_record.force_sample = true;
+    EXPECT_TRUE(sampler.ShouldSample(structural_record));
 }
 
 TEST_F(TransferTaskTest, TraceSamplerDiagKeepsEventfulSpan) {

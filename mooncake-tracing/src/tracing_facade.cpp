@@ -1,15 +1,27 @@
 #include "tracing_facade.h"
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <utility>
 
 namespace mooncake::tracing {
 namespace {
+constexpr char kSamplingPriorityAttr[] = "sampling.priority";
+constexpr char kStructuralSamplingPriority[] = "structural";
+
 int64_t NowUnixNano() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+bool HasAttrValue(const TraceAttrs& attrs, const std::string& key,
+                  const std::string& value) {
+    return std::any_of(attrs.begin(), attrs.end(),
+                       [&key, &value](const auto& attr) {
+                           return attr.first == key && attr.second == value;
+                       });
 }
 
 double DeterministicSampleValue(const TraceRecord& record) {
@@ -48,7 +60,7 @@ TraceContext Span::context() const {
     if (!record_) return {};
     return TraceContext{record_->trace_id, record_->span_id,
                         record_->parent_span_id, record_->correlation_id,
-                        false};
+                        record_->force_sample, false};
 }
 
 TraceSampler::TraceSampler(TraceConfig config) : config_(std::move(config)) {}
@@ -56,6 +68,13 @@ TraceSampler::TraceSampler(TraceConfig config) : config_(std::move(config)) {}
 bool TraceSampler::ShouldSample(const TraceRecord& record) const {
     if (config_.sampling_mode == "off") {
         return false;
+    }
+    if (record.force_sample) {
+        return true;
+    }
+    if (HasAttrValue(record.attrs, kSamplingPriorityAttr,
+                     kStructuralSamplingPriority)) {
+        return true;
     }
     if (config_.sampling_mode == "debug") {
         return true;
@@ -117,7 +136,11 @@ Span TracingFacade::StartSpan(const std::string& span_name,
         ctx.correlation_id =
             parent->correlation_id.empty() ? root.correlation_id
                                            : parent->correlation_id;
+        ctx.force_sample = parent->force_sample;
         ctx.context_missing = parent->context_missing;
+    }
+    if (HasAttrValue(attrs, kSamplingPriorityAttr, kStructuralSamplingPriority)) {
+        ctx.force_sample = true;
     }
     TraceRecord rec;
     rec.trace_id = ctx.trace_id;
@@ -129,6 +152,7 @@ Span TracingFacade::StartSpan(const std::string& span_name,
     rec.process_role = config_.process_role;
     rec.span_name = span_name;
     rec.start_time_unix_nano = NowUnixNano();
+    rec.force_sample = ctx.force_sample;
     rec.attrs = attrs;
     if (ctx.context_missing) rec.attrs.emplace_back("context.missing", "true");
     return Span(this, std::move(rec));
@@ -144,6 +168,7 @@ Span TracingFacade::StartSpanFromCarrier(const std::string& span_name,
     parent.trace_id = carrier.trace_id;
     parent.span_id = carrier.span_id;
     parent.correlation_id = carrier.correlation_id;
+    parent.force_sample = carrier.force_sample;
     return StartSpan(span_name, &parent, attrs);
 }
 void TracingFacade::Export(TraceRecord&& record) {

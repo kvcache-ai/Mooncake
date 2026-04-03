@@ -94,7 +94,8 @@ class ActiveBatchTraceRegistry {
         auto root = tracing.StartSpan(
             "te.batch", parent && parent->valid() ? parent : nullptr,
                                       {{"te.batch_id",
-                                        std::to_string(batch_id)}});
+                                        std::to_string(batch_id)},
+                                       {"sampling.priority", "structural"}});
         if (!root.valid()) {
             return {};
         }
@@ -119,7 +120,8 @@ class ActiveBatchTraceRegistry {
 
         auto span = tracing.StartSpan("te.batch.execute", &it->second.context,
                                       {{"te.batch_id",
-                                        std::to_string(batch_id)}});
+                                        std::to_string(batch_id)},
+                                       {"sampling.priority", "structural"}});
         if (!span.valid()) {
             return {};
         }
