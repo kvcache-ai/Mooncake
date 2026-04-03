@@ -52,6 +52,9 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
+#endif
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
         std::string shm_name;        // for nvlink and hip

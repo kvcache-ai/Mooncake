@@ -36,6 +36,26 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
+#ifdef ENABLE_MULTI_PROTOCOL
+    struct RegisteredBuffer {
+        void* addr;
+        size_t length;
+        std::string location;
+        bool remote_accessible;
+        bool update_metadata;
+
+        RegisteredBuffer(void* addr, size_t length = 0,
+                         std::string location = kWildcardLocation,
+                         bool remote_accessible = true,
+                         bool update_metadata = true)
+            : addr(addr),
+              length(length),
+              location(location),
+              remote_accessible(remote_accessible),
+              update_metadata(update_metadata) {}
+    };
+#endif
+
     TransferEngine(bool auto_discover = false);
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
@@ -72,6 +92,33 @@ class TransferEngine {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries);
+
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest>& entries,
+                                    TransferMetadata::NotifyDesc notify_msg);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol API
+    // Supports registering memory for multiple protocols (CXL, TCP / RDMA)
+    int mp_registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    int mp_unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    Status mp_submitTransfer(BatchID batch_id,
+                             const std::vector<TransferRequest>& entries,
+                             std::string& proto);
+
+    Status mp_submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg, std::string& proto);
+#endif
+
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string& location);
 
@@ -80,13 +127,6 @@ class TransferEngine {
     BatchID allocateBatchID(size_t batch_size);
 
     Status freeBatchID(BatchID batch_id);
-
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest>& entries);
-
-    Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest>& entries,
-                                    TransferMetadata::NotifyDesc notify_msg);
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 

@@ -106,7 +106,11 @@ option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If W
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
-
+option(ENABLE_MULTI_PROTOCOL "option for enabling multi-protocol support in transfer engine" OFF)
+if (ENABLE_MULTI_PROTOCOL)
+    add_compile_definitions(ENABLE_MULTI_PROTOCOL)
+    message(STATUS "Multi-protocol support is enabled")
+endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
 set(LRU_MAX_CAPACITY 1000)
