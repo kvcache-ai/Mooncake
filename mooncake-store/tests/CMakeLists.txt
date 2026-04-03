@@ -50,20 +50,6 @@ add_store_test(p2p_client_integration_test p2p_client_integration_test.cpp)
 add_store_test(peer_client_perf_test peer_client_perf_test.cpp)
 add_store_test(scheduler_integration_test scheduler_integration_test.cpp)
 add_subdirectory(e2e)
-
-add_executable(real_client_stress_workload_test real_client_stress_workload_test.cpp)
-target_link_libraries(real_client_stress_workload_test PUBLIC
-    mooncake_store
-    transfer_engine
-    cachelib_memory_allocator
-    ${ETCD_WRAPPER_LIB}
-    mooncake_common
-    glog
-    gflags
-    pthread
-    JsonCpp::JsonCpp
-)
-
 add_executable(high_availability_test high_availability_test.cpp)
 target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD)

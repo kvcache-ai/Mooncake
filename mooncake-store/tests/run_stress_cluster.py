@@ -3,8 +3,11 @@
 Cluster orchestration for real_client_stress_workload.py (nerdctl + SSH).
 
 Subcommands:
-  run   Start master + clients, optional orchestrated preload/read sync, merge STATS_JSON.
+  run   Start master + clients; preload_then_read uses existing preload/READ sync; other modes use GO barrier.
   kill  Remove mc-client-node* and mc-master on listed hosts.
+
+Multi-node and workload != preload_then_read (default): wait for client_ready on all nodes, send GO, then tests run.
+preload_then_read is unchanged (preload_done + READ only). Use --no-cluster-barrier to disable the GO barrier.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import socket
 import subprocess
@@ -28,6 +32,7 @@ DEFAULT_PY_SCRIPT_CONTAINER = os.environ.get(
 DEFAULT_IMAGE = os.environ.get("IMAGE", "localhost/mooncake-p2p-test:p2p_0328")
 MASTER_CONTAINER = "mc-master"
 PRELOAD_DONE_RE = re.compile(r"=== Phase preload_done node_id=(\d+) keys=(\d+) ===")
+CLIENT_READY_RE = re.compile(r"=== Phase client_ready node_id=(\d+) ===")
 CONTROL_ENDPOINT_RE = re.compile(r"CONTROL_ENDPOINT:([0-9.]+:\d+)")
 
 
@@ -69,7 +74,73 @@ def run_shell(
     return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=check)
 
 
+def sync_update_script_to_remote_hosts(ns: argparse.Namespace) -> None:
+    """If --update_script_path is set, copy the local file to the same path on each remote
+    client host so remote `nerdctl cp` can read it."""
+    path = (ns.update_script_path or "").strip()
+    if not path:
+        return
+    local = Path(path).expanduser().resolve()
+    if not local.is_file():
+        raise SystemExit(f"--update_script_path is not a readable file: {path}")
+
+    seen: set[str] = set()
+    for host in ns.client_hosts:
+        if is_local_host(host) or host in seen:
+            continue
+        seen.add(host)
+        remote_dir = posixpath.dirname(path)
+        if remote_dir:
+            r = run_shell(
+                f"mkdir -p {sh_quote(remote_dir)}",
+                host=host,
+                ssh_user=ns.ssh_user,
+                ssh_password=ns.ssh_password,
+            )
+            if r.returncode != 0:
+                print(r.stderr or r.stdout, file=sys.stderr)
+                raise SystemExit(f"mkdir -p on {host} for update script failed: {r.returncode}")
+        remote_spec = f"{ns.ssh_user}@{host}:{path}"
+        if ns.ssh_password:
+            cmd = [
+                "sshpass",
+                "-p",
+                ns.ssh_password,
+                "scp",
+                "-o",
+                "StrictHostKeyChecking=no",
+                str(local),
+                remote_spec,
+            ]
+        else:
+            cmd = ["scp", "-o", "StrictHostKeyChecking=no", str(local), remote_spec]
+        print(f"[INFO] Sync update script to {host}:{path} ...")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stderr or r.stdout, file=sys.stderr)
+            raise SystemExit(f"scp update script to {host} failed: {r.returncode}")
+
+
 def get_logs(container: str, host: Optional[str], ssh_user: str, ssh_password: Optional[str]) -> str:
+    # Exec-launched workload output may not show up in `nerdctl logs` when we
+    # run the command detached. For client containers, read from workload log.
+    m = re.match(r"mc-client-node(\d+)$", container)
+    if m:
+        nid = int(m.group(1))
+        workload_log_path = f"/tmp/node_{nid}_workload.log"
+        # Tail the last chunk to keep polling cheap.
+        tail_cmd = sh_quote(
+            f"tail -n 500 {workload_log_path} 2>&1 || true"
+        )
+        cmd = f"nerdctl exec {container} sh -c {tail_cmd}"
+        r = run_shell(
+            cmd,
+            host=host,
+            ssh_user=ssh_user,
+            ssh_password=ssh_password,
+        )
+        return r.stdout or r.stderr or ""
+
     cmd = f"nerdctl logs {container} 2>&1"
     r = run_shell(cmd, host=host, ssh_user=ssh_user, ssh_password=ssh_password)
     return r.stdout or r.stderr or ""
@@ -87,6 +158,49 @@ def send_read(host: str, endpoint: str, timeout: float = 10.0) -> bool:
     except OSError as e:
         print(f"[WARN] send READ to {host} {endpoint}: {e}", file=sys.stderr)
         return False
+
+
+def send_go(host: str, endpoint: str, timeout: float = 10.0) -> bool:
+    """Unblock cluster barrier after all clients finished init (non-preload_then_read multi-node)."""
+    try:
+        h, p = endpoint.rsplit(":", 1)
+        if h in ("0.0.0.0", "::"):
+            h = host
+        with socket.create_connection((h, int(p)), timeout=timeout) as s:
+            s.sendall(b"GO\n")
+        return True
+    except OSError as e:
+        print(f"[WARN] send GO to {host} {endpoint}: {e}", file=sys.stderr)
+        return False
+
+
+def wait_tcp_port(
+    host: str,
+    port: int,
+    *,
+    timeout_s: float = 60.0,
+    poll_interval_s: float = 1.0,
+) -> bool:
+    """Wait until host:port is connectable (TCP).
+
+    Used to avoid client/master startup race conditions.
+    """
+    deadline = time.time() + timeout_s
+    last_err: Optional[Exception] = None
+
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, int(port)), timeout=3.0):
+                return True
+        except OSError as e:
+            last_err = e
+            time.sleep(poll_interval_s)
+
+    print(
+        f"[ERROR] Timeout waiting for TCP {host}:{port} (timeout={timeout_s}s), last_err={last_err}",
+        file=sys.stderr,
+    )
+    return False
 
 
 def parse_client_ips(s: str) -> List[str]:
@@ -120,6 +234,7 @@ def build_python_cmd(
         "-u",
         sh_quote(script),
         f"--workload_mode={args.workload_mode}",
+        f"--local_random_all_remote={args.local_random_all_remote}",
         f"--protocol={args.protocol}",
         f"--master_address={args.master_address}",
         f"--local_hostname={args.client_hosts[node_id - 1]}",
@@ -133,14 +248,10 @@ def build_python_cmd(
         f"--value_size={args.value_size}",
         f"--random_seed={args.random_seed}",
         f"--remote_read_ratio={args.remote_read_ratio}",
-        f"--write_ratio={args.write_ratio}",
         f"--op_sequence_max_rounds={args.op_sequence_max_rounds}",
         f"--rpc_thread_num={args.rpc_thread_num}",
         f"--client_rpc_port={rpc_port}",
         f"--post_test_wait_seconds={args.post_test_wait_seconds}",
-        f"--cw_max_threads={args.cw_max_threads}",
-        f"--cw_success_rate_threshold={args.cw_success_rate_threshold}",
-        f"--cw_thread_scale_base={args.cw_thread_scale_base}",
         f"--cw_target_fill_ratio={args.cw_target_fill_ratio}",
         f"--cw_evict_data_ratio={args.cw_evict_data_ratio}",
         f"--cw_base_memory_bytes={args.cw_base_memory_bytes}",
@@ -150,13 +261,19 @@ def build_python_cmd(
     ]
     if args.device_names:
         common.append(f"--device_names={args.device_names}")
+    need_control = (args.use_orchestrated and args.workload_mode == "preload_then_read") or (
+        getattr(args, "use_cluster_barrier", False) and len(args.client_hosts) > 1
+    )
+    if need_control:
+        common.append(f"--control_listen=0.0.0.0:{control_port}")
     if args.use_orchestrated and args.workload_mode == "preload_then_read":
         common.append("--run_mode=orchestrated")
-        common.append(f"--control_listen=0.0.0.0:{control_port}")
     else:
         common.append("--run_mode=once")
         if args.start_timestamp_ms > 0:
             common.append(f"--start_timestamp_ms={args.start_timestamp_ms}")
+    if getattr(args, "no_cluster_barrier", False):
+        common.append("--no_cluster_barrier")
     if getattr(args, "latency_dump_file", ""):
         common.append(f"--latency_dump_file={args.latency_dump_file}")
     return " ".join(common)
@@ -207,11 +324,23 @@ def start_master(args: argparse.Namespace) -> None:
         f"{mooncake_args}"
     )
     print(f"[INFO] Starting master on {master}...")
+    print(inner)
     r = run_shell(inner, host=master if not is_local_host(master) else None, ssh_user=args.ssh_user, ssh_password=args.ssh_password)
     if r.returncode != 0:
         print(r.stderr or r.stdout, file=sys.stderr)
         raise SystemExit(f"start master failed: {r.returncode}")
-    time.sleep(5)
+    # Wait for master RPC bind/listen before starting clients (avoid race).
+    ready_timeout_s = float(os.environ.get("MASTER_RPC_READY_TIMEOUT_SEC", "60"))
+    poll_interval_s = float(os.environ.get("MASTER_RPC_READY_POLL_INTERVAL_SEC", "1.0"))
+    if not wait_tcp_port(
+        master,
+        int(args.master_rpc_port),
+        timeout_s=ready_timeout_s,
+        poll_interval_s=poll_interval_s,
+    ):
+        raise SystemExit(
+            f"Timeout waiting master RPC ready on {master}:{args.master_rpc_port}"
+        )
 
 
 def start_client_container(
@@ -229,19 +358,68 @@ def start_client_container(
         args.latency_dump_file = ""
     py_cmd = build_python_cmd(args, node_id, len(args.client_hosts), rpc_port, control_port)
     args.latency_dump_file = old_dump
-    py_shell = py_cmd + " && sleep infinity"
-    inner = (
+    # Redirect workload output to a fixed file so the orchestrator can poll it.
+    workload_log_path = f"/tmp/node_{node_id}_workload.log"
+    py_shell = (
+        f"rm -f {workload_log_path}; "
+        f"{py_cmd} > {workload_log_path} 2>&1 & "
+        f"(sleep infinity) &"
+    )
+    # Compose nerdctl run command
+    nerdctl_run = (
         f"nerdctl rm -f {name} 2>/dev/null || true; "
         f"nerdctl run -d --name {name} --network host "
         f"-e MOONCAKE_TIERED_CONFIG={sh_quote(args.tiered_backend_config)} "
-        f"-e PYTHONPATH=/tmp/mooncake_p2p_clean:$PYTHONPATH "
-        f"{sh_quote(args.image)} sh -c {sh_quote(py_shell)}"
+    #todo    f"-e PYTHONPATH=/tmp/mooncake_p2p_clean:$PYTHONPATH "
+        f"{sh_quote(args.image)}"
     )
+    if args.update_script_path != "":
+        inner = (
+            nerdctl_run +
+            f"; nerdctl cp {sh_quote(args.update_script_path)} {name}:{sh_quote(args.python_script)}"
+            # Start workload in background; exec returns immediately.
+            f"; nerdctl exec {name} sh -c {sh_quote(py_shell)}"
+        )
+    else:
+        inner = (
+            nerdctl_run +
+            # Start workload in background; exec returns immediately.
+            f"; nerdctl exec {name} sh -c {sh_quote(py_shell)}"
+        )
     print(f"[INFO] Starting client {name} on {host} (rpc={rpc_port})...")
+    print(inner)
     r = run_shell(inner, host=host if not is_local_host(host) else None, ssh_user=args.ssh_user, ssh_password=args.ssh_password)
     if r.returncode != 0:
         print(r.stderr or r.stdout, file=sys.stderr)
         raise SystemExit(f"start client {name} failed: {r.returncode}")
+
+
+def wait_all_clients_ready(
+    args: argparse.Namespace,
+    endpoints_out: Dict[int, str],
+    poll_interval: float = 2.0,
+    timeout: float = 3600.0,
+) -> bool:
+    """Wait until each node logs client_ready (store init + control listener up)."""
+    deadline = time.time() + timeout
+    num = len(args.client_hosts)
+    while time.time() < deadline:
+        ready_nodes = set()
+        for i, host in enumerate(args.client_hosts):
+            nid = i + 1
+            log = get_logs(f"mc-client-node{nid}", None if is_local_host(host) else host, args.ssh_user, args.ssh_password)
+            for m in CLIENT_READY_RE.finditer(log):
+                ready_nodes.add(int(m.group(1)))
+            ce = CONTROL_ENDPOINT_RE.search(log)
+            if ce:
+                endpoints_out[nid] = ce.group(1).strip()
+        if len(ready_nodes) >= num:
+            print(f"[INFO] All {num} clients reported client_ready.")
+            return True
+        print(f"[INFO] client_ready: {len(ready_nodes)}/{num} (waiting...)")
+        time.sleep(poll_interval)
+    print("[ERROR] Timeout waiting for client_ready", file=sys.stderr)
+    return False
 
 
 def wait_preload_done(
@@ -543,6 +721,13 @@ def cmd_run(ns: argparse.Namespace) -> int:
     if not ns.client_hosts:
         print("No client IPs", file=sys.stderr)
         return 1
+    ns.use_cluster_barrier = (
+        (not ns.no_cluster_barrier)
+        and len(ns.client_hosts) > 1
+        and ns.workload_mode != "preload_then_read"
+    )
+    if ns.use_cluster_barrier:
+        print("[INFO] Cluster barrier (GO): wait for all clients ready after init, then start workloads.")
     if (
         not ns.use_orchestrated
         and ns.workload_mode == "preload_then_read"
@@ -560,6 +745,7 @@ def cmd_run(ns: argparse.Namespace) -> int:
     rpc_ports = per_node_rpc_ports(ns.client_hosts, ns.client_rpc_port)
     ns._rpc_ports = rpc_ports
 
+    sync_update_script_to_remote_hosts(ns)
     start_master(ns)
     for i, host in enumerate(ns.client_hosts):
         nid = i + 1
@@ -567,6 +753,20 @@ def cmd_run(ns: argparse.Namespace) -> int:
         start_client_container(ns, host, nid, rpc_ports[i], cp)
 
     endpoints: Dict[int, str] = {}
+    if ns.use_cluster_barrier:
+        if not wait_all_clients_ready(ns, endpoints):
+            return 1
+        for i, host in enumerate(ns.client_hosts):
+            nid = i + 1
+            ep = endpoints.get(nid)
+            if not ep:
+                h, p = "0.0.0.0", str(control_port_for(rpc_ports[i], nid))
+                ep = f"{h}:{p}"
+            print(f"[INFO] Sending GO to node {nid} at {host} (control {ep})")
+            if not send_go(host, ep):
+                return 1
+        time.sleep(1)
+
     if ns.use_orchestrated and ns.workload_mode == "preload_then_read":
         if not wait_preload_done(ns, endpoints):
             return 1
@@ -631,10 +831,22 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="Deploy and run stress test")
+    pr.add_argument(
+        "--update-script-path",
+        dest="update_script_path",
+        default=os.environ.get("UPDATE_SCRIPT_PATH", ""),
+        help="Host path to real_client_stress_workload.py; if set, copied to same path on remote "
+        "client hosts before nerdctl cp into containers",
+    )
     pr.add_argument("--ssh-user", default=os.environ.get("SSH_USER", "root"))
     pr.add_argument("--ssh-password", default=os.environ.get("SSH_PASSWORD") or None)
     pr.add_argument("--mode", choices=("p2p", "centralized"), default=os.environ.get("DEPLOYMENT_MODE", "centralized"))
     pr.add_argument("--master-ip", default=os.environ.get("MASTER_IP", "192.168.200.15"))
+    pr.add_argument(
+        "--local-random-all-remote",
+        dest="local_random_all_remote",
+        default=os.environ.get("LOCAL_RANDOM_ALL_REMOTE", "local"),
+    )
     pr.add_argument("--client-ips", default=os.environ.get("CLIENT_IPS", "192.168.200.15,192.168.200.25"))
     pr.add_argument("--image", default=os.environ.get("IMAGE", DEFAULT_IMAGE))
     pr.add_argument("--workload-mode", default=os.environ.get("WORKLOAD_MODE", "op_sequence"))
@@ -645,7 +857,6 @@ def main() -> int:
     pr.add_argument("--value-size", type=int, default=int(os.environ.get("VALUE_SIZE", "1048576")))
     pr.add_argument("--random-seed", type=int, default=int(os.environ.get("RANDOM_SEED", "12345")))
     pr.add_argument("--remote-read-ratio", type=float, default=float(os.environ.get("REMOTE_READ_RATIO", "0.5")))
-    pr.add_argument("--write-ratio", type=float, default=float(os.environ.get("WRITE_RATIO", "0.3")))
     pr.add_argument("--op-sequence-max-rounds", type=int, default=int(os.environ.get("OP_SEQUENCE_MAX_ROUNDS", "8")))
     pr.add_argument("--post-test-wait", type=int, default=int(os.environ.get("POST_TEST_WAIT_SECONDS", "40")))
     pr.add_argument("--master-rpc-port", type=int, default=int(os.environ.get("MASTER_RPC_PORT", "50053")))
@@ -653,9 +864,6 @@ def main() -> int:
     pr.add_argument("--rpc-thread-num", type=int, default=int(os.environ.get("RPC_THREAD_NUM", "16")))
     pr.add_argument("--client-rpc-port", type=int, default=int(os.environ.get("CLIENT_RPC_PORT", "12345")))
     pr.add_argument("--tiered-backend-config", default=os.environ.get("TIERED_BACKEND_CONFIG", '{"tiers":[{"type":"DRAM","capacity":1073741824,"priority":10}]}'))
-    pr.add_argument("--cw-max-threads", type=int, default=int(os.environ.get("CW_MAX_THREADS", "256")))
-    pr.add_argument("--cw-success-rate-threshold", type=float, default=float(os.environ.get("CW_SUCCESS_RATE_THRESHOLD", "0.99")))
-    pr.add_argument("--cw-thread-scale-base", type=int, default=int(os.environ.get("CW_THREAD_SCALE_BASE", "2")))
     pr.add_argument("--cw-target-fill-ratio", type=float, default=float(os.environ.get("CW_TARGET_FILL_RATIO", "0.15")))
     pr.add_argument("--cw-evict-data-ratio", type=float, default=float(os.environ.get("CW_EVICT_DATA_RATIO", "3.0")))
     pr.add_argument("--cw-base-memory-bytes", type=int, default=int(os.environ.get("CW_BASE_MEMORY_BYTES", "1073741824")))
@@ -680,6 +888,11 @@ def main() -> int:
         action="store_true",
         default=os.environ.get("USE_ORCHESTRATED", "").lower() in ("1", "true", "yes"),
         help="preload_then_read: wait for preload_done then send READ (no wall-clock start_ts)",
+    )
+    pr.add_argument(
+        "--no-cluster-barrier",
+        action="store_true",
+        help="Disable GO barrier for non-preload_then_read multi-node runs (workload gets --no_cluster_barrier)",
     )
     pr.add_argument("--no-wait", action="store_true", help="Do not wait for completion")
     pr.add_argument("--no-cleanup", action="store_true", help="Do not remove containers after run")

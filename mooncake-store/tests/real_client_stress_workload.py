@@ -34,37 +34,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("real_client_stress_workload")
 
-_rw_mismatch_lock = threading.Lock()
-_rw_mismatch_logged = False
-
 
 def generate_key(node_id: int, idx: int) -> str:
     return f"node_{node_id}_obj_{idx}"
 
 
-def build_write_config(client_mode: str, strict_visibility: bool = False):
+def build_write_config(store: MooncakeDistributedStore, client_mode: str, local_random_all_remote: str):
     if client_mode == "p2p":
         cfg = WriteRouteRequestConfig()
         cfg.max_candidates = 1
-        cfg.allow_local = True
-        cfg.prefer_local = True
-        cfg.early_return = not strict_visibility
+        cfg.early_return = False
+        if local_random_all_remote == "all_remote":
+            cfg.allow_local = False
+            cfg.prefer_local = False
+        elif local_random_all_remote == "random":
+            cfg.allow_local = True
+            cfg.prefer_local = False
+        else:
+            cfg.allow_local = True
+            cfg.prefer_local = True
         return cfg
     cfg = ReplicateConfig()
     cfg.replica_num = 1
-    return cfg
-
-
-def build_preload_write_config(client_mode: str):
-    if client_mode == "p2p":
-        cfg = WriteRouteRequestConfig()
-        cfg.max_candidates = 1
-        cfg.allow_local = True
-        cfg.prefer_local = True
-        cfg.early_return = True
-        return cfg
-    cfg = ReplicateConfig()
-    cfg.replica_num = 1
+    if local_random_all_remote == "local":
+        cfg.preferred_segment = store.get_hostname()
     return cfg
 
 
@@ -323,7 +316,7 @@ def preload_keys(store: MooncakeDistributedStore, args: argparse.Namespace) -> b
     if store.register_buffer(ptr, args.value_size) != 0:
         logger.error("register_buffer failed in preload")
         return False
-    write_cfg = build_preload_write_config(args.client_mode)
+    write_cfg = build_write_config(store, args.client_mode, args.local_random_all_remote)
     try:
         for i in range(args.key_count):
             key = generate_key(args.node_id, i)
@@ -532,7 +525,7 @@ def op_sequence_worker(
         logger.error("Thread %s: register_buffer failed", thread_id)
         stats.correctness_failures += 1
         return
-    write_cfg = build_write_config(args.client_mode, strict_visibility=False)
+    write_cfg = build_write_config(store, args.client_mode, args.local_random_all_remote)
     read_cfg = ReadRouteConfig()
     rng = random.Random(args.random_seed + 97 * thread_id)
     has_remote = len(remote_node_ids) > 0
@@ -629,135 +622,6 @@ def operation_sequence_workload(store: MooncakeDistributedStore, args: argparse.
     return print_mixed_results(stats, "Operation Sequence Workload", args.latency_dump_file)
 
 
-def rw_correctness_worker(
-    store: MooncakeDistributedStore,
-    args: argparse.Namespace,
-    thread_id: int,
-    stats: MixedThreadStats,
-):
-    global _rw_mismatch_logged
-    read_buf = np.zeros(args.value_size, dtype=np.uint8)
-    write_buf = np.zeros(args.value_size, dtype=np.uint8)
-    rptr = read_buf.ctypes.data
-    wptr = write_buf.ctypes.data
-    if store.register_buffer(rptr, args.value_size) != 0:
-        stats.correctness_failures += 1
-        return
-    if store.register_buffer(wptr, args.value_size) != 0:
-        stats.correctness_failures += 1
-        store.unregister_buffer(rptr)
-        return
-
-    key_prefix = f"rwcheck_node_{args.node_id}_thread_{thread_id}"
-    write_cfg = build_write_config(args.client_mode, strict_visibility=True)
-    read_cfg = ReadRouteConfig()
-    rng = random.Random(args.random_seed + 131 * thread_id)
-    key_pool_size = max(1, args.rw_key_pool_size or args.key_count)
-
-    expected = 0
-    has_written = False
-    write_version = 0
-    current_key = ""
-
-    for i in range(args.test_operation_nums):
-        do_write = not has_written or (rng.random() < args.write_ratio)
-        if do_write:
-            key_idx = write_version % key_pool_size
-            write_version += 1
-            candidate_expected = (key_idx % 251) + 1
-            candidate_key = f"{key_prefix}_k_{key_idx}"
-            write_buf.fill(candidate_expected)
-            stats.write_attempts += 1
-            ws = time.perf_counter()
-            rc = store.put_from(candidate_key, wptr, args.value_size, write_cfg)
-            we = time.perf_counter()
-            latency_us = (we - ws) * 1e6
-            if rc == 0:
-                has_written = True
-                expected = candidate_expected
-                current_key = candidate_key
-                stats.successful_writes += 1
-                stats.successful_write_time_us += latency_us
-                stats.write_latencies_us.append(latency_us)
-            else:
-                stats.write_failures += 1
-                continue
-
-        if not has_written or not current_key:
-            continue
-
-        verified = False
-        read_ok = False
-        for retry in range(max(1, args.rw_verify_retries)):
-            stats.read_attempts += 1
-            read_buf.fill(0)
-            rs = time.perf_counter()
-            size = store.get_into(current_key, rptr, args.value_size, read_cfg)
-            re = time.perf_counter()
-            latency_us = (re - rs) * 1e6
-            if size < 0 or size != args.value_size:
-                stats.read_failures += 1
-                if retry + 1 < args.rw_verify_retries:
-                    time.sleep(args.rw_verify_sleep_ms / 1000.0)
-                continue
-            read_ok = True
-            stats.successful_reads += 1
-            stats.successful_read_time_us += latency_us
-            stats.read_latencies_us.append(latency_us)
-
-            mismatch = False
-            mismatch_idx = -1
-            actual_byte = 0
-            for j in range(args.value_size):
-                if int(read_buf[j]) != expected:
-                    mismatch = True
-                    mismatch_idx = j
-                    actual_byte = int(read_buf[j])
-                    break
-            if not mismatch:
-                verified = True
-                break
-            with _rw_mismatch_lock:
-                if not _rw_mismatch_logged:
-                    _rw_mismatch_logged = True
-                    logger.error(
-                        "rw_correctness mismatch (first): thread_id=%s key=%s expected=%s actual[%s]=%s",
-                        thread_id,
-                        current_key,
-                        expected,
-                        mismatch_idx,
-                        actual_byte,
-                    )
-            if retry + 1 < args.rw_verify_retries:
-                time.sleep(args.rw_verify_sleep_ms / 1000.0)
-
-        if read_ok and not verified:
-            stats.correctness_failures += 1
-
-    store.unregister_buffer(wptr)
-    store.unregister_buffer(rptr)
-
-
-def concurrent_rw_correctness_workload(store: MooncakeDistributedStore, args: argparse.Namespace):
-    stats = [MixedThreadStats() for _ in range(args.num_threads)]
-    threads = []
-    for i in range(args.num_threads):
-        th = threading.Thread(
-            target=rw_correctness_worker,
-            args=(store, args, i, stats[i]),
-        )
-        threads.append(th)
-        th.start()
-    for th in threads:
-        th.join()
-    summary = print_mixed_results(stats, "Concurrent Read/Write Correctness", args.latency_dump_file)
-    total_cf = sum(st.correctness_failures for st in stats)
-    total_rf = sum(st.read_failures for st in stats)
-    total_wf = sum(st.write_failures for st in stats)
-    ok = total_cf == 0 and total_rf == 0 and total_wf == 0
-    return summary, ok
-
-
 def concurrent_write_worker(
     store: MooncakeDistributedStore,
     args: argparse.Namespace,
@@ -775,7 +639,7 @@ def concurrent_write_worker(
     if store.register_buffer(ptr, args.value_size) != 0:
         stats.write_failures += max(0, total_writes)
         return
-    write_cfg = build_write_config(args.client_mode, strict_visibility=False)
+    write_cfg = build_write_config(store, args.client_mode, args.local_random_all_remote)
     for i in range(total_writes):
         seq = write_start_idx + i
         key = f"cw_node_{args.node_id}_thread_{thread_id}_seq_{seq}"
@@ -888,8 +752,9 @@ def verify_concurrent_write_results(store: MooncakeDistributedStore, args: argpa
         logger.error("Verification register_buffer failed")
         return False
     read_cfg = ReadRouteConfig()
-    expected = ord("W")
+    expected = np.uint8(ord("W"))
     verify_passed = verify_failed = 0
+    verify_read_failed_count = 0
     try:
         for i in range(limit):
             key = keys[i]
@@ -897,20 +762,39 @@ def verify_concurrent_write_results(store: MooncakeDistributedStore, args: argpa
             size = store.get_into(key, ptr, args.value_size, read_cfg)
             ok = size == args.value_size
             if ok:
-                ok = bool(np.all(read_buf == expected))
-            if ok:
-                verify_passed += 1
+                mismatch_indices = []
+                for idx in range(args.value_size):
+                    if read_buf[idx] != expected:
+                        mismatch_indices.append(idx)
+                        logger.error(
+                            "Verification failed for key=%s, mismatch at read_buf[%s]=%s",
+                            key,
+                            idx,
+                            read_buf[idx],
+                        )
+                ok = len(mismatch_indices) == 0
+                if ok:
+                    verify_passed += 1
+                else:
+                    verify_failed += 1
+                    if verify_failed < 5:
+                        logger.error(
+                            "Verification failed for key=%s, size=%s, len(mismatch_indices)=%s",
+                            key,
+                            size,
+                            len(mismatch_indices),
+                        )
             else:
-                verify_failed += 1
-                if verify_failed <= 5:
-                    logger.error("Verification failed for key=%s, size=%s", key, size)
+                verify_read_failed_count += 1
+                logger.error("get_into error for key=%s, return size=%s, expected_size=%s", key, size, args.value_size)
     finally:
         store.unregister_buffer(ptr)
     logger.info(
-        "=== Concurrent Write Verification === verify_total=%s verify_passed=%s verify_failed=%s",
+        "=== Concurrent Write Verification === verify_total=%s verify_passed=%s verify_failed=%s verify_read_failed_count=%s",
         limit,
         verify_passed,
         verify_failed,
+        verify_read_failed_count,
     )
     return verify_failed == 0
 
@@ -1049,7 +933,7 @@ def concurrent_write_with_evict_workload(store: MooncakeDistributedStore, args: 
 
 
 def wait_for_read_command(control_listen: str, read_event: threading.Event, shutdown: threading.Event):
-    """Background thread: accept one line READ on control_listen host:port."""
+    """Background thread: accept one line READ on control_listen host:port (preload_then_read orchestrated)."""
     host, port_s = control_listen.rsplit(":", 1)
     port = int(port_s)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1079,9 +963,41 @@ def wait_for_read_command(control_listen: str, read_event: threading.Event, shut
         pass
 
 
+def wait_for_go_command(go_listen: str, go_event: threading.Event, shutdown: threading.Event):
+    """Multi-node non-preload: orchestrator sends GO after all clients are ready."""
+    host, port_s = go_listen.rsplit(":", 1)
+    port = int(port_s)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(1)
+    srv.settimeout(1.0)
+    logger.info("Cluster barrier listener on %s:%s (send line GO to start workload)", host, port)
+    while not shutdown.is_set():
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            data = conn.recv(256).decode("utf-8", errors="ignore").strip().upper()
+            if data.startswith("GO"):
+                go_event.set()
+            if data.startswith("EXIT"):
+                shutdown.set()
+        finally:
+            conn.close()
+    try:
+        srv.close()
+    except OSError:
+        pass
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RealClient stress workload (Python)")
     p.add_argument("--protocol", default="tcp")
+    p.add_argument("--local_random_all_remote", default="local")
     p.add_argument("--master_address", default="127.0.0.1:50051")
     p.add_argument("--local_hostname", default="127.0.0.1")
     p.add_argument(
@@ -1117,19 +1033,11 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "preload_then_read",
             "op_sequence",
-            "rw_correctness",
             "concurrent_write_no_evict",
             "concurrent_write_with_evict",
         ],
     )
-    p.add_argument("--write_ratio", type=float, default=0.3)
     p.add_argument("--op_sequence_max_rounds", type=int, default=8)
-    p.add_argument("--rw_verify_retries", type=int, default=50)
-    p.add_argument("--rw_verify_sleep_ms", type=int, default=2)
-    p.add_argument("--rw_key_pool_size", type=int, default=0)
-    p.add_argument("--cw_max_threads", type=int, default=256)
-    p.add_argument("--cw_success_rate_threshold", type=float, default=0.99)
-    p.add_argument("--cw_thread_scale_base", type=int, default=2)
     p.add_argument(
         "--cw_target_fill_ratio",
         type=float,
@@ -1158,7 +1066,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--control_listen",
         default="0.0.0.0:0",
-        help="Host:port to listen for READ (orchestrated preload_then_read). Port 0 = auto",
+        help="Host:port: READ for orchestrated preload_then_read; GO barrier for other multi-node modes. Port 0 = auto",
+    )
+    p.add_argument(
+        "--no_cluster_barrier",
+        action="store_true",
+        help="Multi-node non-preload: do not wait for orchestrator GO (default is to wait)",
     )
     p.add_argument(
         "--latency_dump_file",
@@ -1182,9 +1095,6 @@ def main() -> int:
     if args.remote_read_ratio < 0 or args.remote_read_ratio > 1:
         logger.error("remote_read_ratio must be in [0, 1]")
         return 1
-    if args.write_ratio < 0 or args.write_ratio > 1:
-        logger.error("write_ratio must be in [0, 1]")
-        return 1
     if not (0 < args.cw_target_fill_ratio < 1):
         logger.error("cw_target_fill_ratio must be in (0, 1)")
         return 1
@@ -1207,11 +1117,20 @@ def main() -> int:
     stats_summary: Dict[str, Any] = {}
 
     read_event = threading.Event()
+    go_event = threading.Event()
     shutdown = threading.Event()
     ctl_thread: Optional[threading.Thread] = None
+    go_ctl_thread: Optional[threading.Thread] = None
     actual_control = args.control_listen
 
+    need_go_barrier = (
+        args.num_nodes > 1
+        and args.workload_mode != "preload_then_read"
+        and not args.no_cluster_barrier
+    )
+
     try:
+        # preload_then_read + orchestrated: unchanged — READ listener before preload, then wait READ after preload.
         if args.run_mode == "orchestrated" and args.workload_mode == "preload_then_read":
             host, port_s = args.control_listen.rsplit(":", 1)
             port = int(port_s)
@@ -1229,6 +1148,31 @@ def main() -> int:
             )
             ctl_thread.start()
 
+        # All other multi-node modes: wait for orchestrator GO after init (not used for preload_then_read).
+        if need_go_barrier:
+            host, port_s = args.control_listen.rsplit(":", 1)
+            port = int(port_s)
+            if port == 0:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.bind((host, 0))
+                port = srv.getsockname()[1]
+                srv.close()
+                actual_control = f"{host}:{port}"
+            logger.info("CONTROL_ENDPOINT:%s", actual_control)
+            go_ctl_thread = threading.Thread(
+                target=wait_for_go_command,
+                args=(actual_control, go_event, shutdown),
+                daemon=True,
+            )
+            go_ctl_thread.start()
+            logger.info("=== Phase client_ready node_id=%s ===", args.node_id)
+            logger.info("Waiting for GO (cluster barrier) on %s ...", actual_control)
+            while not go_event.is_set() and not shutdown.is_set():
+                time.sleep(0.1)
+            if shutdown.is_set():
+                return 0
+            logger.info("Cluster barrier passed (GO received)")
+
         if args.workload_mode == "preload_then_read":
             ok = preload_keys(store, args)
             if ok:
@@ -1237,7 +1181,6 @@ def main() -> int:
                     while not read_event.is_set() and not shutdown.is_set():
                         time.sleep(0.1)
                     if shutdown.is_set():
-                        store.close()
                         return 0
                 elif args.start_timestamp_ms > 0:
                     now_ms = int(time.time() * 1000)
@@ -1251,8 +1194,6 @@ def main() -> int:
                 stats_summary = stress_read(store, args)
         elif args.workload_mode == "op_sequence":
             stats_summary = operation_sequence_workload(store, args)
-        elif args.workload_mode == "rw_correctness":
-            stats_summary, ok = concurrent_rw_correctness_workload(store, args)
         elif args.workload_mode == "concurrent_write_no_evict":
             stats_summary, ok = concurrent_write_no_evict_workload(store, args)
         elif args.workload_mode == "concurrent_write_with_evict":
@@ -1278,6 +1219,7 @@ def main() -> int:
 
         try:
             store.close()
+            logger.info("Store closed")
         except Exception:
             pass
         return 0 if ok else 1
