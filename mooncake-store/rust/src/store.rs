@@ -198,7 +198,10 @@ impl MooncakeStore {
         config: Option<&ReplicateConfig>,
     ) -> Result<(), StoreError> {
         let key_c = CString::new(key)?;
-        let (_c_config, _strings, _ptrs, cfg_ptr) = Self::prepare_config(config)?;
+        let (_c_config, _strings, _ptrs) = Self::prepare_config(config)?;
+        let cfg_ptr = _c_config
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c as *const _);
 
         let rc = unsafe {
             ffi::mooncake_store_put(
@@ -230,7 +233,10 @@ impl MooncakeStore {
         config: Option<&ReplicateConfig>,
     ) -> Result<(), StoreError> {
         let key_c = CString::new(key)?;
-        let (_c_config, _strings, _ptrs, cfg_ptr) = Self::prepare_config(config)?;
+        let (_c_config, _strings, _ptrs) = Self::prepare_config(config)?;
+        let cfg_ptr = _c_config
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c as *const _);
 
         let rc = ffi::mooncake_store_put_from(self.handle, key_c.as_ptr(), buffer, size, cfg_ptr);
         if rc != 0 {
@@ -269,9 +275,6 @@ impl MooncakeStore {
     /// The buffer is allocated to the exact size of the stored value.
     pub fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let size = self.get_size(key)?;
-        if size < 0 {
-            return Err(StoreError::NotFound);
-        }
         let mut buf = vec![0u8; size as usize];
         let written =
             unsafe { self.get_into(key, buf.as_mut_ptr() as *mut c_void, buf.len())? };
@@ -409,8 +412,13 @@ impl MooncakeStore {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Convert an `Option<&ReplicateConfig>` into a C-compatible pointer,
+    /// Convert an `Option<&ReplicateConfig>` into a C-compatible value,
     /// returning the owning objects that keep the data alive.
+    ///
+    /// The caller must bind the returned tuple to a named variable in its own
+    /// stack frame *before* taking a raw pointer to the
+    /// `Option<mooncake_replicate_config_t>`, so that the pointer is valid for
+    /// the duration of the C call.
     #[allow(clippy::type_complexity)]
     fn prepare_config(
         config: Option<&ReplicateConfig>,
@@ -419,16 +427,14 @@ impl MooncakeStore {
             Option<ffi::mooncake_replicate_config_t>,
             Vec<CString>,
             Vec<*const libc::c_char>,
-            *const ffi::mooncake_replicate_config_t,
         ),
         StoreError,
     > {
         match config {
-            None => Ok((None, Vec::new(), Vec::new(), std::ptr::null())),
+            None => Ok((None, Vec::new(), Vec::new())),
             Some(cfg) => {
                 let (c_config, strings, ptrs) = cfg.to_ffi()?;
-                let ptr = &c_config as *const ffi::mooncake_replicate_config_t;
-                Ok((Some(c_config), strings, ptrs, ptr))
+                Ok((Some(c_config), strings, ptrs))
             }
         }
     }
