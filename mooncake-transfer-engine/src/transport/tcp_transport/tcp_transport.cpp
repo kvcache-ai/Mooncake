@@ -535,10 +535,15 @@ int TcpTransport::install(std::string& local_server_name,
 }
 
 int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    auto desc = metadata_->getSegmentDesc(local_server_name_);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "tcp";
+#else
     desc->protocol = "tcp";
+#endif
     desc->tcp_data_port = tcp_data_port;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -554,6 +559,9 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
     buffer_desc.name = local_server_name_;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "tcp";
+#endif
     return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
 }
 
