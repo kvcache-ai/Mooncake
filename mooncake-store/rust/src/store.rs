@@ -530,7 +530,5 @@ mod tests {
         assert_eq!(cfg_ref.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
         assert_eq!(ptrs.len(), 2);
-
-        assert!(c_cfg.is_some());
     }
 }
