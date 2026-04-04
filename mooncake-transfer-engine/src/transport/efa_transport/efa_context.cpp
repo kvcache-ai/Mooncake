@@ -108,17 +108,22 @@ size_t EfaEndpointStore::evictStaleLocked() {
     size_t evicted = 0;
     for (auto it = endpoints_.begin(); it != endpoints_.end();) {
         auto &ep = it->second;
-        if (ep && !ep->active() &&
-            ep->inactiveTime() > inactive_timeout_sec_ &&
-            !ep->hasOutstandingSlice()) {
+        double age = ep ? ep->lastUsedAge() : 0;
+        bool outstanding = ep ? ep->hasOutstandingSlice() : false;
+        if (ep && !outstanding && age > inactive_timeout_sec_) {
             LOG(INFO) << "Evicting stale EFA endpoint: " << it->first
-                      << " (inactive " << ep->inactiveTime() << "s)";
+                      << " (idle " << age << "s, timeout="
+                      << inactive_timeout_sec_ << "s)";
             ep->disconnect();
             it = endpoints_.erase(it);
             ++evicted;
         } else {
             ++it;
         }
+    }
+    if (endpoints_.size() > 0) {
+        VLOG(1) << "evictStale: " << endpoints_.size() << " endpoints, "
+                << evicted << " evicted";
     }
     return evicted;
 }
@@ -176,7 +181,8 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
     hints_->domain_attr->mr_mode =
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY |
+        FI_MR_HMEM;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info
@@ -417,23 +423,34 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     const std::string &peer_nic_path) {
     if (!endpoint_store_) return nullptr;
 
-    // Fast path: endpoint already exists
-    auto ep = endpoint_store_->get(peer_nic_path);
-    if (ep) return ep;
+    // Use normalized key (strip port) so the same physical peer reuses its
+    // endpoint across reconnections.  Each P2PHANDSHAKE run picks a random
+    // port, producing a different peer_nic_path for the same peer host+NIC.
+    std::string key = normalizeNicPath(peer_nic_path);
+
+    // Fast path: endpoint already exists for this physical peer.
+    // Update peer_nic_path in case the port changed (new initiator run).
+    // setPeerNicPath disconnects old connection (fi_av_remove) if needed.
+    auto ep = endpoint_store_->get(key);
+    if (ep) {
+        ep->setPeerNicPath(peer_nic_path);
+        return ep;
+    }
 
     // Slow path: create new endpoint, then atomically insert (or get existing
     // if another thread raced us).  getOrInsert prevents duplicate endpoints
     // and duplicate AV entries for the same peer.
     auto new_endpoint = std::make_shared<EfaEndPoint>(*this);
     if (!cq_list_.empty() && cq_list_[0]) {
-        int ret = new_endpoint->construct(cq_list_[0]->cq);
+        int ret = new_endpoint->construct(cq_list_[0]->cq, 1, 4, globalConfig().max_wr, 64);
         if (ret != 0) {
             LOG(ERROR) << "Failed to construct EFA endpoint";
             return nullptr;
         }
     }
+    // Still set the full peer_nic_path (with port) for handshake routing
     new_endpoint->setPeerNicPath(peer_nic_path);
-    ep = endpoint_store_->getOrInsert(peer_nic_path, new_endpoint);
+    ep = endpoint_store_->getOrInsert(key, new_endpoint);
     // If another thread won the race, new_endpoint is discarded (RAII cleanup)
     return ep;
 }
@@ -485,7 +502,16 @@ int EfaContext::submitPostSend(
     for (auto *slice : slice_list) {
         if (!slice) continue;
 
-        // Get peer segment descriptor to find dest_rkey and peer device info
+        // Fast path: peer info already resolved by submitTransferTask's
+        // striping path (dest_rkey and peer_nic_path pre-set on slice).
+        // This eliminates per-slice metadata lookup, selectDevice(), and
+        // string construction — the main bottleneck for multi-NIC striping.
+        if (!slice->peer_nic_path.empty()) {
+            slices_by_peer[slice->peer_nic_path].push_back(slice);
+            continue;
+        }
+
+        // Slow path: resolve peer info per-slice (non-striped transfers)
         auto peer_segment_desc =
             engine_.meta()->getSegmentDescByID(slice->target_id);
         if (!peer_segment_desc) {
