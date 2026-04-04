@@ -392,14 +392,14 @@ int EfaEndPoint::submitPostSend(
                               slice->length, local_desc, peer_fi_addr_,
                               slice->rdma.dest_addr,  // remote address
                               slice->rdma.dest_rkey,  // remote key
-                              &op_ctx->fi_ctx);  // context for completion
+                              &op_ctx->fi_ctx);       // context for completion
             } else {
                 ret = fi_write(ep_,
                                (void *)slice->source_addr,  // local buffer
                                slice->length, local_desc, peer_fi_addr_,
                                slice->rdma.dest_addr,  // remote address
                                slice->rdma.dest_rkey,  // remote key
-                               &op_ctx->fi_ctx);  // context for completion
+                               &op_ctx->fi_ctx);       // context for completion
             }
             post_lock_.clear(std::memory_order_release);
 

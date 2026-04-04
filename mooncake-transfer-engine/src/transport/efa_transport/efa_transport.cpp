@@ -471,26 +471,22 @@ Status EfaTransport::submitTransferTask(
             // e.g. 240MB transfer: 4-32 slices vs 3840 slices.
             std::vector<std::pair<int, std::shared_ptr<EfaContext>>>
                 active_devs;
-            for (int d = 0;
-                 d < static_cast<int>(context_list_.size()); ++d) {
+            for (int d = 0; d < static_cast<int>(context_list_.size()); ++d) {
                 auto &ctx = context_list_[d];
                 if (!ctx || !ctx->active()) continue;
                 if (static_cast<size_t>(request_buffer_id) <
                         local_segment_desc->buffers.size() &&
-                    local_segment_desc->buffers[request_buffer_id]
-                            .lkey.size() >
+                    local_segment_desc->buffers[request_buffer_id].lkey.size() >
                         static_cast<size_t>(d)) {
                     active_devs.push_back({d, ctx});
                 }
             }
 
             if (active_devs.empty()) {
-                LOG(ERROR)
-                    << "No active EFA device for striping transfer of "
-                    << request.length << " bytes";
+                LOG(ERROR) << "No active EFA device for striping transfer of "
+                           << request.length << " bytes";
                 for (auto &entry : slices_to_post)
-                    for (auto s : entry.second)
-                        getSliceCache().deallocate(s);
+                    for (auto s : entry.second) getSliceCache().deallocate(s);
                 return Status::AddressNotRegistered(
                     "No active EFA device found for striping");
             }
@@ -503,9 +499,8 @@ Status EfaTransport::submitTransferTask(
                 assert(slice);
 
                 size_t offset = i * chunk_size;
-                size_t len = (i == num_nics - 1)
-                                 ? request.length - offset
-                                 : chunk_size;
+                size_t len =
+                    (i == num_nics - 1) ? request.length - offset : chunk_size;
 
                 slice->source_addr = (char *)request.source + offset;
                 slice->length = len;
@@ -522,8 +517,7 @@ Status EfaTransport::submitTransferTask(
                 int dev_id = active_devs[i].first;
                 auto &context = active_devs[i].second;
                 slice->rdma.source_lkey =
-                    local_segment_desc->buffers[request_buffer_id]
-                        .lkey[dev_id];
+                    local_segment_desc->buffers[request_buffer_id].lkey[dev_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
@@ -533,8 +527,8 @@ Status EfaTransport::submitTransferTask(
             // Round-robin NIC selection is handled by selectDevice above.
             auto &context = context_list_[request_device_id];
             if (!context || !context->active()) {
-                LOG(ERROR)
-                    << "EFA Device " << request_device_id << " is not active";
+                LOG(ERROR) << "EFA Device " << request_device_id
+                           << " is not active";
                 return Status::InvalidArgument(
                     "EFA Device " + std::to_string(request_device_id) +
                     " is not active");
@@ -586,8 +580,7 @@ Status EfaTransport::submitTransferTask(
                               "device(s): "
                            << request.source;
                 for (auto &entry : slices_to_post)
-                    for (auto s : entry.second)
-                        getSliceCache().deallocate(s);
+                    for (auto s : entry.second) getSliceCache().deallocate(s);
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active EFA "
                     "device(s): " +

@@ -64,9 +64,9 @@ class EfaEndpointStore {
    public:
     static constexpr double kDefaultInactiveTimeoutSec = 300.0;  // 5 minutes
 
-    explicit EfaEndpointStore(size_t max_endpoints = 256,
-                              double inactive_timeout_sec =
-                                  kDefaultInactiveTimeoutSec);
+    explicit EfaEndpointStore(
+        size_t max_endpoints = 256,
+        double inactive_timeout_sec = kDefaultInactiveTimeoutSec);
 
     std::shared_ptr<EfaEndPoint> get(const std::string &peer_nic_path);
     // Atomically get-or-insert: returns existing endpoint or inserts new_ep.

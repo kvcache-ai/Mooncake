@@ -63,8 +63,7 @@ std::shared_ptr<EfaEndPoint> EfaEndpointStore::getOrInsert(
     if (endpoints_.size() >= max_endpoints_) {
         size_t evicted = evictStaleLocked();
         if (evicted == 0 && endpoints_.size() >= max_endpoints_) {
-            LOG(WARNING) << "EfaEndpointStore at capacity ("
-                         << max_endpoints_
+            LOG(WARNING) << "EfaEndpointStore at capacity (" << max_endpoints_
                          << ") with no stale endpoints to evict";
         }
     }
@@ -112,8 +111,8 @@ size_t EfaEndpointStore::evictStaleLocked() {
         bool outstanding = ep ? ep->hasOutstandingSlice() : false;
         if (ep && !outstanding && age > inactive_timeout_sec_) {
             LOG(INFO) << "Evicting stale EFA endpoint: " << it->first
-                      << " (idle " << age << "s, timeout="
-                      << inactive_timeout_sec_ << "s)";
+                      << " (idle " << age
+                      << "s, timeout=" << inactive_timeout_sec_ << "s)";
             ep->disconnect();
             it = endpoints_.erase(it);
             ++evicted;
@@ -180,9 +179,9 @@ int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     // Specify the domain (device) name - append "-rdm" for RDM endpoint
     std::string domain_name = device_name_ + "-rdm";
     hints_->domain_attr->name = strdup(domain_name.c_str());
-    hints_->domain_attr->mr_mode =
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY |
-        FI_MR_HMEM;
+    hints_->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR |
+                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY |
+                                   FI_MR_HMEM;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info
@@ -442,7 +441,8 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     // and duplicate AV entries for the same peer.
     auto new_endpoint = std::make_shared<EfaEndPoint>(*this);
     if (!cq_list_.empty() && cq_list_[0]) {
-        int ret = new_endpoint->construct(cq_list_[0]->cq, 1, 4, globalConfig().max_wr, 64);
+        int ret = new_endpoint->construct(cq_list_[0]->cq, 1, 4,
+                                          globalConfig().max_wr, 64);
         if (ret != 0) {
             LOG(ERROR) << "Failed to construct EFA endpoint";
             return nullptr;
