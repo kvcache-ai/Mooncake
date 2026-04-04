@@ -145,8 +145,24 @@ curl -s http://<master_host>:9003/metrics/summary
   - `MC_STORE_MEMCPY` (default `0`/false): Set to `1` to prefer local memcpy when source/destination are on the same client.
 
 - Memory allocator (mmap buffer path)
+  - `MC_STORE_USE_HUGEPAGE` (default unset): Set to `1` to request HugeTLB-backed `mmap()` allocations for the direct allocation path. This requires hugepages to be reserved on the host first.
+  - `MC_STORE_HUGEPAGE_SIZE` (default `2MB`): Hugepage size to request when hugepages are enabled. Supported values are `2MB` and `1GB`.
   - `MC_MMAP_ARENA_POOL_SIZE` (default `64gb`): Size of the pre-allocated arena pool for mmap buffer allocations. Accepts human-readable sizes (e.g., `8gb`, `20gb`). The arena is allocated once at first use and serves subsequent allocations via lock-free atomic bump pointer. Set this to match available hugepage capacity.
   - `MC_DISABLE_MMAP_ARENA` (default unset): Set to `1` to disable the arena and fall back to per-call `mmap()`. Useful for debugging or when hugepage capacity is limited.
+
+For HiCache-style deployments or other large buffer allocations, pre-flight the host with the sizing helper before reserving hugepages:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+```
 
 ## Set the Log Level for yalantinglibs coro_rpc and coro_http
 By default, the log level is set to warning. You can customize it using the following environment variable:

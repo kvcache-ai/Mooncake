@@ -173,9 +173,23 @@ Mooncake Store uses a lock-free arena allocator by default for mmap buffer alloc
 
 If you encounter memory allocation issues related to the arena:
 
+- **HugeTLB pool is too small for the launch:** Run `python3 scripts/check_hicache_hugepage_requirements.py ...` from a source checkout, or `mooncake-hicache-sizing ...` inside the Docker image, using your `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values. If it reports `insufficient_for_baseline`, increase `vm.nr_hugepages`, reduce `--hicache-size`, or shrink `MOONCAKE_GLOBAL_SEGMENT_SIZE`.
 - **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget.
+- **Arena only partially fits:** If the helper reports `baseline_fits_arena_may_fallback`, the baseline should start but some arena allocations may spill onto regular pages. Either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`.
 - **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` to fall back to per-call `mmap()`.
 - **Arena OOM during serving:** The arena logs a warning and falls back to direct `mmap()` for that allocation. If this happens frequently, increase `MC_MMAP_ARENA_POOL_SIZE`.
+- **Direct hugepage mmap fails immediately:** Verify the host really has hugepages reserved with `grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo`. When `MC_STORE_USE_HUGEPAGE=1` is set, direct `mmap()` allocations depend on the OS HugeTLB pool.
+
+To provision `2 MiB` hugepages on Linux:
+
+```bash
+sudo sysctl -w vm.nr_hugepages=49152
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+printf 'vm.nr_hugepages=49152\n' | sudo tee /etc/sysctl.d/90-mooncake-hugepages.conf
+sudo sysctl --system
+```
+
+`49152` pages equals `96 GiB`; for `512 GiB` use `262144` pages.
 
 ## SGLang Common Questions
 

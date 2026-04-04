@@ -429,21 +429,67 @@ If the model is small but the GPU memory is large — especially in multi-TP (te
 
 In such cases, you should manually configure an appropriate L2 cache size based on your hardware. This can be done by setting `--hicache-ratio` or `--hicache-size`.
 
+**HugeTLB Bring-up Checklist:**
+
+Before enabling HugeTLB-backed HiCache memory, size the host's hugepage pool against your planned `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values.
+
+From a source checkout:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+    --tp-size 4 \
+    --hicache-size 64gb \
+    --global-segment-size 8gb \
+    --arena-pool-size 56gb \
+    --available-hugetlb 512gb
+```
+
+From the source-built Docker image:
+
+```bash
+mooncake-hicache-sizing \
+    --tp-size 4 \
+    --hicache-size 64gb \
+    --global-segment-size 8gb \
+    --arena-pool-size 56gb
+```
+
+The helper reports two numbers:
+
+* **Baseline floor** = `hicache-size + MOONCAKE_GLOBAL_SEGMENT_SIZE` per rank. Falling below this usually means startup or allocation failure.
+* **Clean arena target** = baseline floor + `MC_MMAP_ARENA_POOL_SIZE` per rank. Reaching this target makes arena-backed launches less likely to spill onto the regular-page fallback path.
+
+Treat the helper as a planning tool rather than a hard proof: runs can still succeed between the baseline floor and the clean arena target if some arena allocations fall back to regular pages.
+
+Reserve HugeTLB pages on the host before launching SGLang:
+
+```bash
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+```
+
+With `2 MiB` pages, `262144` pages equals `512 GiB`; `49152` pages equals `96 GiB`. Persist the setting with `/etc/sysctl.d/90-mooncake-hugepages.conf` if you need it across reboots.
+
 **Memory Allocator Tuning:**
 
 Mooncake uses a lock-free arena allocator by default for mmap buffer allocations used by HiCache host KV cache memory. The arena pre-allocates a large hugepage-backed pool and serves subsequent allocations via atomic bump pointer, reducing per-allocation latency from ~1000ns to ~50ns.
 
-To tune the arena pool size (default 64GB), set `MC_MMAP_ARENA_POOL_SIZE` to match your available hugepage capacity:
+For HugeTLB-backed runs, export the hugepage and allocator settings together:
 
 ```bash
-export MC_MMAP_ARENA_POOL_SIZE="8gb"
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb
+export MC_MMAP_ARENA_POOL_SIZE=56gb
 ```
 
-To disable the arena and fall back to per-call `mmap()`:
+To disable the arena and fall back to direct `mmap()` while keeping the hugepage-backed baseline path:
 
 ```bash
 export MC_DISABLE_MMAP_ARENA=1
 ```
+
+If the helper reports `baseline_fits_arena_may_fallback`, either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`. For containerized launches, pass the same environment variables through `docker run -e ...` and use `--ipc=host --ulimit memlock=-1 --shm-size=128g`.
 
 **More Information:**
 
