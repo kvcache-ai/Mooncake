@@ -196,12 +196,12 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
     const size_t hugepage_size = get_hugepage_size_from_env(&flags);
     const size_t guaranteed_alignment =
-        hugepage_size > 0 ? hugepage_size : 4096;
+        hugepage_size > 0 ? hugepage_size : static_cast<size_t>(getpagesize());
     LOG_IF(WARNING, alignment > guaranteed_alignment)
         << "Fallback mmap cannot honor alignment=" << alignment
         << " (guaranteed=" << guaranteed_alignment
         << "); pointer may be under-aligned";
-    const size_t map_size = align_up(total_size, hugepage_size);
+    const size_t map_size = align_up(total_size, guaranteed_alignment);
 
     void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
@@ -231,7 +231,10 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
     }
 
     // Direct mmap allocation - safe to unmap
-    const size_t map_size = align_up(total_size, get_hugepage_size_from_env());
+    const size_t hugepage_size = get_hugepage_size_from_env();
+    const size_t page_alignment =
+        hugepage_size > 0 ? hugepage_size : static_cast<size_t>(getpagesize());
+    const size_t map_size = align_up(total_size, page_alignment);
     if (munmap(ptr, map_size) != 0) {
         LOG(ERROR) << "munmap hugepage failed, size=" << map_size
                    << ", errno=" << errno << " (" << strerror(errno) << ")";

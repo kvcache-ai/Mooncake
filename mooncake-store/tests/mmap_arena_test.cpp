@@ -765,6 +765,37 @@ TEST_F(MmapArenaTest, FallbackMmapHonorsPageAlignment) {
     unsetenv("MC_DISABLE_MMAP_ARENA");
 }
 
+TEST_F(MmapArenaTest, FallbackMmapNoHugepagesAllocFree) {
+    // When hugepages are disabled (MC_STORE_USE_HUGEPAGE unset),
+    // get_hugepage_size_from_env() returns 0.  The fallback mmap path
+    // must still compute a valid map_size for both mmap and munmap.
+    // Regression: align_up(total_size, 0) returned total_size unaligned
+    // to any page boundary, which could cause munmap to silently fail
+    // or leak address space on sizes that aren't page-multiples.
+    unsetenv("MC_STORE_USE_HUGEPAGE");
+    setenv("MC_DISABLE_MMAP_ARENA", "1", 1);
+
+    // Use a size that is NOT a multiple of 4096 to catch the alignment bug
+    const size_t alloc_size = 65000;  // not page-aligned
+    constexpr size_t alignment = 64;
+
+    void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
+    ASSERT_NE(ptr, nullptr);
+
+    // mmap always returns page-aligned pointers (4096)
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % 4096, 0u)
+        << "Fallback mmap pointer not page-aligned";
+
+    // Touch memory
+    memset(ptr, 0xCD, alloc_size);
+    EXPECT_EQ(static_cast<uint8_t*>(ptr)[0], 0xCD);
+
+    // free should not crash — map_size must be page-aligned for munmap
+    free_buffer_mmap_memory(ptr, alloc_size);
+
+    unsetenv("MC_DISABLE_MMAP_ARENA");
+}
+
 TEST_F(MmapArenaTest, FallbackMmapAllocateFreeCycle) {
     // Verify multiple allocate/free cycles don't leak or crash.
     // Exercises the fallback path's map_size computation consistency
