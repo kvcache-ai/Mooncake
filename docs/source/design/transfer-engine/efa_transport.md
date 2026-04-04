@@ -6,7 +6,7 @@ This document describes how to build and use Mooncake with AWS Elastic Fabric Ad
 
 ### 1. AWS EFA Driver and libfabric
 
-EFA driver and libfabric should be pre-installed on AWS instances with EFA support (e.g., p6-b200.48xlarge, p5e.48xlarge, p4d.24xlarge).
+EFA driver and libfabric should be pre-installed on AWS instances with EFA support (e.g., p6-b300.48xlarge, p6-b200.48xlarge, p5en.48xlarge, p5e.48xlarge, p5.48xlarge).
 
 Verify installation:
 ```bash
@@ -65,6 +65,8 @@ git submodule update --init --recursive
 
 ### 2. Build with EFA Enabled
 
+**GPU memory transfers (e.g., KV cache in vLLM):**
+
 ```bash
 mkdir build && cd build
 
@@ -77,6 +79,21 @@ make -j$(nproc)
 ```
 
 > **Note:** `-DUSE_CUDA=ON` is required when transferring GPU memory (e.g., KV cache in vLLM). Without it, the TCP transport (used as fallback when `mooncake_protocol` is set to `"tcp"`) cannot detect GPU memory and will fail with "Bad address" (EFAULT) errors.
+
+**CPU memory transfers only (no GPU dependency):**
+
+```bash
+mkdir build && cd build
+
+cmake .. \
+    -DUSE_EFA=ON \
+    -DUSE_CUDA=OFF \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+make -j$(nproc)
+```
+
+> **Note:** With `-DUSE_CUDA=OFF`, the benchmark tool uses DRAM buffers allocated via `numa_alloc_onnode`. This is useful for measuring EFA transport throughput independently of GPU hardware.
 
 ### 3. Install Python Package
 
@@ -196,68 +213,101 @@ Replace `<target_hostname>:<target_port>` with the target node's address shown i
 | `--block_size` | 65536 | Bytes per transfer request |
 | `--batch_size` | 128 | Requests per batch |
 | `--threads` | 12 | Concurrent submission threads |
-| `--buffer_size` | 1 GB | Total buffer size |
+| `--buffer_size` | 1 GB | Total buffer size (per GPU when `--gpu_id=-1`) |
 | `--duration` | 10 | Test duration in seconds |
-| `--operation` | read | `read` or `write` |
+| `--operation` | write | `read` or `write` |
 | `--report_unit` | GB | `GB\|GiB\|Gb\|MB\|MiB\|Mb` |
+| `--gpu_id` | 0 | GPU device ID; `-1` to use all GPUs (requires `-DUSE_CUDA=ON`) |
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `MC_SLICE_SIZE` | 65536 | Bytes per EFA slice (fi_write/fi_read unit). **256KB recommended.** |
+| `MC_EFA_STRIPING_THRESHOLD` | 2097152 | Transfers larger than this (bytes) are striped across all NICs |
+
+> **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
 ### Benchmark Results
 
-Tested on two p6-b200.48xlarge instances (8 EFA devices each, 8×400 Gbps) in the same AWS placement group.
+#### p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
-#### Optimized Results
+Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 
-With tuned parameters (`MC_SLICE_SIZE=262144`):
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
 
-| Operation | Throughput | Configuration |
-|-----------|-----------|---------------|
-| **Write** | **167.63 GB/s** | threads=48, block_size=128KB, batch_size=128, MC_SLICE_SIZE=256KB |
-| **Read**  | **171.89 GB/s** | threads=48, block_size=128KB, batch_size=128, MC_SLICE_SIZE=256KB |
+| Configuration | Write | Read |
+|---------------|-------|------|
+| threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
+| **threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
 
-#### Parameter Tuning Results
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
 
-The following table shows how different parameters affect write throughput:
+| Configuration | Write | Read |
+|---------------|-------|------|
+| threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
+
+<details>
+<summary>CPU Parameter Tuning History (p6-b200)</summary>
+
+Earlier CPU-to-CPU tuning results (block_size=128KB):
 
 | block_size | threads | batch_size | MC_SLICE_SIZE | Throughput |
 |-----------|---------|------------|---------------|-----------|
 | 64KB  | 8  | 128 | default (64KB) | 69.47 GB/s |
-| 256KB | 8  | 128 | default        | 70.09 GB/s |
-| 64KB  | 16 | 128 | default        | 78.80 GB/s |
-| 64KB  | 32 | 256 | default        | 87.65 GB/s |
-| 64KB  | 64 | 256 | default        | 85.72 GB/s |
 | 128KB | 32 | 128 | default        | 92.33 GB/s |
-| 128KB | 32 | 128 | 128KB          | 152.26 GB/s |
 | 128KB | 32 | 128 | 256KB          | 156.18 GB/s |
-| 128KB | 48 | 128 | 256KB          | **160.34 GB/s** |
-| 128KB | 64 | 128 | 256KB          | 158.82 GB/s |
+| 128KB | 48 | 128 | 256KB          | 160.34 GB/s |
 
-Key findings:
-- **MC_SLICE_SIZE** is the most impactful tuning parameter — increasing from default 64KB to 256KB nearly **doubles** throughput (92→160 GB/s)
-- **block_size=128KB** outperforms 64KB by ~10-15%
-- **threads=48** is optimal for 8 EFA devices; 64 threads shows slight diminishing returns
-- **batch_size=128** is sufficient; increasing to 256+ causes "Cannot select device" errors at higher thread counts
+Key finding: **MC_SLICE_SIZE=256KB** is the single most impactful tuning knob, nearly doubling throughput from defaults. Upgrading to block_size=1MB further improves CPU throughput to 222 GB/s.
+
+</details>
+
+#### p5en.48xlarge (H200, 16 EFA × 200 Gbps)
+
+Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| Single instance (block=1MB, threads=32, batch=128, buf=4GB) | 177 GB/s | — |
+| NUMA-split (2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
+
+> CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
+
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| threads=8, batch=128, buf=1GB/GPU | 236 GB/s | 271 GB/s |
+| threads=16, batch=128, buf=2GB/GPU | 271 GB/s | **297-308 GB/s** |
+| **threads=32, batch=64, buf=2GB/GPU** | **337-347 GB/s** | 274 GB/s |
+
+> GPU HBM bandwidth (>3 TB/s) eliminates the memory bottleneck, allowing full EFA utilization. Write and read have different optimal thread counts: write peaks at 32 threads, read peaks at 16 threads.
+
+> **Note:** EFA memory region registration (fi_mr_reg) for GPU memory segfaults at 4GB+ per GPU. Use `--buffer_size=2147483648` (2GB) as the maximum per-GPU buffer.
 
 #### Cross-Transport Comparison
 
-| Transport | Throughput | Per-NIC Bandwidth | Notes |
-|-----------|-----------|-------------------|-------|
-| **EFA (tuned)** | **168-172 GB/s** | ~207-214 Gbps × 8 NICs | MC_SLICE_SIZE=256KB, threads=48 |
-| **EFA (default)** | **69.47 GB/s** | ~86 Gbps × 8 NICs | Default parameters |
-| TCP (iperf3 baseline) | 9.5 GB/s | 76 Gbps total | Kernel TCP stack, 8 parallel streams |
-| TCP (Mooncake) | 0.11 GB/s | — | Mooncake TCP transport, unoptimized for throughput |
+| Transport | Throughput | Notes |
+|-----------|-----------|-------|
+| **EFA GPU-to-GPU (H200)** | **347 GB/s** | p5en.48xlarge, 16×200G, MC_SLICE_SIZE=256KB |
+| **EFA GPU-to-GPU (B200)** | **313 GB/s** | p6-b200.48xlarge, 8×400G, MC_SLICE_SIZE=256KB |
+| **EFA CPU-to-CPU (B200)** | **222 GB/s** | p6-b200.48xlarge, 8×400G, DRAM-limited |
+| **EFA CPU-to-CPU (H200)** | **192 GB/s** | p5en.48xlarge, NUMA-split, DRAM-limited |
+| EFA (default params) | 69.47 GB/s | Default MC_SLICE_SIZE=64KB |
+| TCP (iperf3 baseline) | 9.5 GB/s | Kernel TCP stack, 8 parallel streams |
 
-**EFA (tuned) vs TCP**: EFA delivers **17.7x** the raw TCP bandwidth by bypassing the kernel network stack.
-
-**EFA vs RoCE RDMA**: On comparable 8×400 Gbps RoCE networks, Mooncake's RDMA transport achieves ~190 GB/s. Tuned EFA reaches **~88%** of RoCE performance, demonstrating that proper parameter tuning can largely close the gap between SRD-based EFA and hardware-offloaded RDMA.
+**EFA vs RoCE RDMA**: On comparable 8×400 Gbps RoCE networks, Mooncake's RDMA transport achieves ~190 GB/s. Tuned EFA **exceeds** RoCE performance with GPU memory (313-347 GB/s) and on CPU-to-CPU (222 GB/s).
 
 ### Tuning Tips
 
 - **Set `MC_SLICE_SIZE=262144` (256KB)** — this is the single most important tuning knob, nearly doubling throughput from defaults
-- Increase `--threads` to 32-48 to saturate multiple EFA devices (6 threads per device is a good starting point)
-- Use `--block_size=131072` (128KB) for optimal per-request efficiency
-- Keep `--batch_size=128`; higher values may cause device selection failures with many threads
-- Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default)
-- Avoid `--block_size=256KB` or larger with many threads — this can trigger "Cannot select device" errors due to buffer boundary alignment across 8 EFA devices
+- Increase `--threads` to 32-48 to saturate multiple EFA devices (2-4 threads per device is a good starting point)
+- For **CPU-to-CPU**: use `--block_size=1048576` (1MB) with NUMA-split (separate instances per NUMA node) for best results
+- For **GPU-to-GPU**: use `--block_size=1048576` (1MB), `--gpu_id=-1` (all GPUs), and `--buffer_size=2147483648` (2GB max per GPU). Write peaks at threads=32, read at threads=16
+- Keep `--batch_size` such that `block_size * batch_size * threads <= buffer_size`
+- Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default for CPU mode)
+- On 16-NIC instances (p5en), writes are NUMA-sensitive: 8 local-NUMA NICs reach 90 Gbps each, while 8 cross-NUMA NICs only reach ~20 Gbps without NUMA-split
 
 ## Technical Details
 
@@ -290,11 +340,11 @@ AWS EFA exposes RDMA-like devices through the ibverbs interface, but does not su
 
 ### Thread Safety
 
-The EFA transport requests `FI_THREAD_SAFE` from the libfabric provider and adds per-endpoint spinlocks to serialize `fi_write` calls. This is necessary because:
+The EFA transport requests `FI_THREAD_SAFE` from the libfabric provider and adds per-endpoint spinlocks to serialize `fi_write`/`fi_read` calls. This is necessary because:
 
 - Multiple submission threads may route slices to the same endpoint concurrently
 - libfabric RDM endpoints default to `FI_THREAD_UNSPEC` (no thread safety guarantees)
-- Concurrent `fi_write` without serialization corrupts provider internals, causing completions to silently vanish
+- Concurrent `fi_write`/`fi_read` without serialization corrupts provider internals, causing completions to silently vanish
 
 CQ completion queues are polled by dedicated worker threads (one per EFA device) that run independently of submission threads.
 
@@ -306,14 +356,18 @@ CQ completion queues are polled by dedicated worker threads (one per EFA device)
 | Endpoint type | `FI_EP_RDM` (message-based) | Queue Pairs (true RDMA) |
 | Write operation | Software-emulated via messages + ACKs | Hardware-offloaded one-sided RDMA |
 | CPU overhead | Moderate (provider processes ACKs) | Minimal (NIC handles everything) |
-| Throughput (8×400G) | ~170 GB/s (tuned) | ~190 GB/s |
+| Throughput CPU-to-CPU (8×400G) | 222 GB/s (tuned) | ~190 GB/s |
+| Throughput GPU-to-GPU (16×200G) | 347 GB/s (tuned) | N/A |
+| Throughput GPU-to-GPU (8×400G) | 313 GB/s (tuned) | N/A |
 | AWS availability | All EFA-enabled instances | Not available on AWS |
 
 ### Supported AWS Instance Types
 
-- p6-b200.48xlarge (8 EFA devices, `rdmap*` naming)
-- p5e.48xlarge (16 EFA devices, `rdmap*` naming)
-- p4d.24xlarge (4 EFA devices)
+- p6-b300.48xlarge (16 EFA devices × 400 Gbps = 6,400 Gbps, `rdmap*` naming)
+- p6-b200.48xlarge (8 EFA devices × 400 Gbps = 3,200 Gbps, `rdmap*` naming)
+- p5en.48xlarge (16 EFA devices × 200 Gbps = 3,200 Gbps, `rdmap*` naming)
+- p5e.48xlarge (32 EFA devices × 100 Gbps = 3,200 Gbps, `rdmap*` naming)
+- p5.48xlarge (32 EFA devices × 100 Gbps = 3,200 Gbps, `rdmap*` naming)
 - Other EFA-enabled instances
 
 Use `fi_info -p efa` to list available EFA devices on your instance.

@@ -93,6 +93,12 @@ class EfaEndPoint {
         return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
     }
 
+    void touchLastUsed() { last_used_time_ = getCurrentTimeInNano(); }
+
+    double lastUsedAge() const {
+        return (getCurrentTimeInNano() - last_used_time_) / 1000000000.0;
+    }
+
    public:
     bool connected() const {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
@@ -157,6 +163,7 @@ class EfaEndPoint {
 
     volatile bool active_;
     volatile uint64_t inactive_time_;
+    volatile uint64_t last_used_time_;  // Updated on connection and I/O
 };
 
 }  // namespace mooncake

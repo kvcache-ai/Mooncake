@@ -456,6 +456,21 @@ static inline const std::string MakeNicPath(const std::string &server_name,
     return server_name + NIC_PATH_DELIM + nic_name;
 }
 
+// Strip the port from a nic_path to get a stable key for endpoint reuse.
+// "ip-172-31-45-191:15365@rdmap135s0" → "ip-172-31-45-191@rdmap135s0"
+// This allows the same physical peer to reuse endpoints across reconnections
+// (each run picks a random P2P handshake port).
+static inline std::string normalizeNicPath(const std::string &nic_path) {
+    std::string server_name = getServerNameFromNicPath(nic_path);
+    std::string nic_name = getNicNameFromNicPath(nic_path);
+    if (server_name.empty() || nic_name.empty()) return nic_path;
+    size_t colon = server_name.rfind(':');
+    if (colon != std::string::npos) {
+        server_name = server_name.substr(0, colon);
+    }
+    return server_name + NIC_PATH_DELIM + nic_name;
+}
+
 static inline bool overlap(const void *a, size_t a_len, const void *b,
                            size_t b_len) {
     return (a >= b && a < (char *)b + b_len) ||

@@ -62,7 +62,7 @@ struct EfaMemoryRegionMeta {
 // communicate with many transient peers.
 class EfaEndpointStore {
    public:
-    static constexpr double kDefaultInactiveTimeoutSec = 300.0;  // 5 minutes
+    static constexpr double kDefaultInactiveTimeoutSec = 5.0;  // 5 seconds
 
     explicit EfaEndpointStore(
         size_t max_endpoints = 256,
@@ -147,6 +147,11 @@ class EfaContext {
 
     // Poll completion queue for completed operations
     int pollCq(int max_entries, int cq_index = 0);
+
+    // Evict stale endpoints to free EFA resources
+    size_t evictStaleEndpoints() {
+        return endpoint_store_ ? endpoint_store_->evictStale() : 0;
+    }
 
     // Get CQ count
     size_t cqCount() const { return cq_list_.size(); }

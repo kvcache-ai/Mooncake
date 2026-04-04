@@ -93,6 +93,13 @@ void EfaTransport::workerThreadFunc(int thread_id) {
             }
         }
 
+        // Stale endpoint eviction happens on-demand in
+        // EfaEndpointStore::getOrInsert when the store is at capacity,
+        // not periodically here.  Periodic eviction is unsafe because
+        // target-side endpoints never get touchLastUsed() updates
+        // (the initiator writes remotely via fi_write, bypassing
+        // the target's endpoint code).
+
         // If no work was done, yield CPU briefly
         if (!did_work) {
             std::this_thread::yield();
@@ -445,8 +452,18 @@ Status EfaTransport::submitTransferTask(
     // active local NICs (one chunk per NIC) instead of creating thousands
     // of small slices.  This dramatically reduces per-slice overhead
     // (spinlock acquisition, atomic ops, MR lookup, heap allocation).
-    // Value matches NIXL's NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD.
-    static constexpr size_t kStripingThreshold = 128 * 1024;  // 128KB
+    // Configurable via MC_EFA_STRIPING_THRESHOLD env var (in bytes).
+    // Default 2MB: below this, single-NIC is faster (avoids endpoint overhead
+    // for 16 tiny chunks); above this, multi-NIC striping with pre-resolved
+    // peer info gives up to +54% throughput.
+    static const size_t kStripingThreshold = []() {
+        const char *env = std::getenv("MC_EFA_STRIPING_THRESHOLD");
+        if (env) {
+            size_t val = std::strtoull(env, nullptr, 10);
+            if (val > 0) return val;
+        }
+        return static_cast<size_t>(2 * 1024 * 1024);  // 2MB default
+    }();
 
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -494,9 +511,20 @@ Status EfaTransport::submitTransferTask(
             size_t num_nics = active_devs.size();
             size_t chunk_size = request.length / num_nics;
 
+            // Pre-resolve remote peer info ONCE for all striped slices.
+            // This eliminates per-slice overhead in submitPostSend:
+            //   - getSegmentDescByID lookup
+            //   - selectDevice() call
+            //   - string construction for peer_nic_path
+            // Using retry_count=i distributes slices across remote NICs.
+            auto peer_segment_desc =
+                metadata_->getSegmentDescByID(request.target_id);
+
             for (size_t i = 0; i < num_nics; ++i) {
                 Slice *slice = getSliceCache().allocate();
                 assert(slice);
+                slice->peer_nic_path.clear();
+                slice->rdma.dest_rkey = 0;
 
                 size_t offset = i * chunk_size;
                 size_t len =
@@ -518,6 +546,24 @@ Status EfaTransport::submitTransferTask(
                 auto &context = active_devs[i].second;
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[request_buffer_id].lkey[dev_id];
+
+                // Pre-resolve remote NIC: set dest_rkey and peer_nic_path
+                // so submitPostSend() can skip expensive per-slice lookups.
+                if (peer_segment_desc) {
+                    int remote_buffer_id = -1, remote_device_id = -1;
+                    if (selectDevice(peer_segment_desc.get(),
+                                     request.target_offset + offset, len,
+                                     remote_buffer_id, remote_device_id,
+                                     static_cast<int>(i)) == 0) {
+                        slice->rdma.dest_rkey =
+                            peer_segment_desc->buffers[remote_buffer_id]
+                                .rkey[remote_device_id];
+                        slice->peer_nic_path =
+                            peer_segment_desc->name + "@" +
+                            peer_segment_desc->devices[remote_device_id].name;
+                    }
+                }
+
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
@@ -536,6 +582,8 @@ Status EfaTransport::submitTransferTask(
 
             Slice *slice = getSliceCache().allocate();
             assert(slice);
+            slice->peer_nic_path.clear();
+            slice->rdma.dest_rkey = 0;
 
             slice->source_addr = (char *)request.source;
             slice->length = request.length;
@@ -591,6 +639,8 @@ Status EfaTransport::submitTransferTask(
             // Found a device via retry — create single slice
             Slice *slice = getSliceCache().allocate();
             assert(slice);
+            slice->peer_nic_path.clear();
+            slice->rdma.dest_rkey = 0;
 
             slice->source_addr = (char *)request.source;
             slice->length = request.length;
