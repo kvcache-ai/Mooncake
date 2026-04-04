@@ -173,12 +173,12 @@ pip install mooncake-transfer-engine-non-cuda
    ```
 
 ## Use Mooncake in Docker Containers
-Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
+Mooncake supports Docker-based deployment. What you need is to get the image by `docker pull alogfans/mooncake:v0.9.0`.
 For the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host
-sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:v0.9.0 /bin/bash
+sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i alogfans/mooncake:v0.9.0 /bin/bash
 # Run transfer engine in container
 cd /Mooncake-main/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
@@ -208,10 +208,10 @@ sudo docker run --gpus all \
   -e MC_STORE_HUGEPAGE_SIZE=2MB \
   -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
   -e MC_MMAP_ARENA_POOL_SIZE=56gb \
-  -t -i mooncake:v0.9.0 /bin/bash
+  -t -i alogfans/mooncake:v0.9.0 /bin/bash
 ```
 
-When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` and omit `MC_MMAP_ARENA_POOL_SIZE`. The source-built Docker image also installs the helper as `mooncake-hicache-sizing`.
+When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` and omit `MC_MMAP_ARENA_POOL_SIZE`. If you build the image from source with `docker/mooncake.Dockerfile`, that source-built image also installs the helper as `mooncake-hicache-sizing`.
 
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
