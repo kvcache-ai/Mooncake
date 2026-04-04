@@ -119,7 +119,8 @@ static std::unique_ptr<MmapArena> g_mmap_arena;
 static std::once_flag g_arena_init_flag;
 
 static void initializeGlobalArena() {
-    // Allow env var to override the gflag (useful when loaded as .so from Python)
+    // Allow env var to override the gflag (useful when loaded as .so from
+    // Python)
     const std::string env_disable = GetEnvStringOr("MC_DISABLE_MMAP_ARENA", "");
     if (!FLAGS_use_mmap_arena_allocator || env_disable == "1") {
         LOG(INFO) << "=== ARENA ALLOCATOR DISABLED ===";
@@ -130,7 +131,8 @@ static void initializeGlobalArena() {
     g_mmap_arena = std::make_unique<MmapArena>();
 
     // Allow env var override since gflags cannot be set from Python (pybind11).
-    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB", etc.
+    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
+    // etc.
     uint64_t arena_pool_size = FLAGS_mmap_arena_pool_size;
     const std::string env_pool_size =
         GetEnvStringOr("MC_MMAP_ARENA_POOL_SIZE", "");
@@ -152,7 +154,8 @@ static void initializeGlobalArena() {
     if (success) {
         auto stats = g_mmap_arena->getStats();
         LOG(INFO) << "=== ARENA ALLOCATOR ENABLED ===";
-        LOG(INFO) << "Arena pool size: " << (stats.pool_size / (1024.0 * 1024.0 * 1024.0)) << " GB";
+        LOG(INFO) << "Arena pool size: "
+                  << (stats.pool_size / (1024.0 * 1024.0 * 1024.0)) << " GB";
         LOG(INFO) << "Using lock-free atomic bump allocation (~48ns/alloc)";
     } else {
         LOG(ERROR) << "=== ARENA INITIALIZATION FAILED ===";
@@ -173,24 +176,27 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     // Try arena allocation first (if enabled).
     // Forward caller's alignment so the arena honors the contract.
     if (g_mmap_arena && g_mmap_arena->isInitialized()) {
-        void* ptr = g_mmap_arena->allocate(total_size, alignment);
+        void *ptr = g_mmap_arena->allocate(total_size, alignment);
         if (ptr != nullptr) {
-            VLOG(1) << "Allocated " << total_size << " bytes from arena at " << ptr;
+            VLOG(1) << "Allocated " << total_size << " bytes from arena at "
+                    << ptr;
             return ptr;
         }
         // Arena OOM, fall through to traditional mmap
-        LOG_FIRST_N(WARNING, 3) << "Arena OOM, falling back to mmap() for size="
-                                 << total_size << " (further warnings suppressed)";
+        LOG_FIRST_N(WARNING, 3)
+            << "Arena OOM, falling back to mmap() for size=" << total_size
+            << " (further warnings suppressed)";
     }
 
     // Traditional mmap allocation (fallback or arena disabled).
     // map_size is aligned to hugepage size only (not caller alignment), so that
-    // free_buffer_mmap_memory() can compute the same size without the alignment param.
-    // mmap returns page-aligned pointers (4096), or hugepage-aligned when
-    // MAP_HUGETLB is set by get_hugepage_size_from_env().
+    // free_buffer_mmap_memory() can compute the same size without the alignment
+    // param. mmap returns page-aligned pointers (4096), or hugepage-aligned
+    // when MAP_HUGETLB is set by get_hugepage_size_from_env().
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
     const size_t hugepage_size = get_hugepage_size_from_env(&flags);
-    const size_t guaranteed_alignment = hugepage_size > 0 ? hugepage_size : 4096;
+    const size_t guaranteed_alignment =
+        hugepage_size > 0 ? hugepage_size : 4096;
     LOG_IF(WARNING, alignment > guaranteed_alignment)
         << "Fallback mmap cannot honor alignment=" << alignment
         << " (guaranteed=" << guaranteed_alignment
@@ -199,8 +205,8 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
 
     void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << map_size
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        LOG(ERROR) << "mmap failed, size=" << map_size << ", errno=" << errno
+                   << " (" << strerror(errno) << ")";
         return nullptr;
     }
 
@@ -230,7 +236,8 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
         LOG(ERROR) << "munmap hugepage failed, size=" << map_size
                    << ", errno=" << errno << " (" << strerror(errno) << ")";
     } else {
-        VLOG(1) << "Freed direct mmap allocation at " << ptr << ", size=" << map_size;
+        VLOG(1) << "Freed direct mmap allocation at " << ptr
+                << ", size=" << map_size;
     }
 }
 

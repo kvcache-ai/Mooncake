@@ -1,5 +1,6 @@
 // Copyright 2026 KVCache.AI
-// Unit tests for MmapArena allocator - Production-grade security and correctness tests
+// Unit tests for MmapArena allocator - Production-grade security and
+// correctness tests
 
 #include <gtest/gtest.h>
 #include <glog/logging.h>
@@ -16,10 +17,10 @@
 namespace mooncake {
 
 class MmapArenaTest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
         FLAGS_logtostderr = 1;
-        FLAGS_minloglevel = google::WARNING; // Reduce log noise in tests
+        FLAGS_minloglevel = google::WARNING;  // Reduce log noise in tests
     }
 };
 
@@ -27,11 +28,11 @@ protected:
 
 TEST_F(MmapArenaTest, BasicInitialization) {
     MmapArena arena;
-    ASSERT_TRUE(arena.initialize(1024 * 1024)); // 1MB pool
+    ASSERT_TRUE(arena.initialize(1024 * 1024));  // 1MB pool
     ASSERT_TRUE(arena.isInitialized());
 
     auto stats = arena.getStats();
-    EXPECT_EQ(stats.pool_size, 2 * 1024 * 1024); // Aligned to 2MB (huge page)
+    EXPECT_EQ(stats.pool_size, 2 * 1024 * 1024);  // Aligned to 2MB (huge page)
     EXPECT_EQ(stats.allocated_bytes, 0);
     EXPECT_EQ(stats.num_allocations, 0);
     EXPECT_EQ(stats.num_failed_allocs, 0);
@@ -47,7 +48,7 @@ TEST_F(MmapArenaTest, BasicAllocation) {
     auto stats = arena.getStats();
     EXPECT_EQ(stats.num_allocations, 1);
     EXPECT_GE(stats.allocated_bytes, 1024);
-    EXPECT_LE(stats.allocated_bytes, 1024 + 64); // Accounting for alignment
+    EXPECT_LE(stats.allocated_bytes, 1024 + 64);  // Accounting for alignment
 }
 
 TEST_F(MmapArenaTest, AllocationAlignment) {
@@ -89,7 +90,7 @@ TEST_F(MmapArenaTest, UninitializedAllocation) {
 TEST_F(MmapArenaTest, DoubleInitialization) {
     MmapArena arena;
     ASSERT_TRUE(arena.initialize(1024 * 1024));
-    EXPECT_FALSE(arena.initialize(1024 * 1024)); // Second init should fail
+    EXPECT_FALSE(arena.initialize(1024 * 1024));  // Second init should fail
 
     // Arena should still work
     void* ptr = arena.allocate(1024);
@@ -100,10 +101,12 @@ TEST_F(MmapArenaTest, DoubleInitialization) {
 
 TEST_F(MmapArenaTest, OOMDoesNotCorruptCursor) {
     MmapArena arena;
-    ASSERT_TRUE(arena.initialize(1024)); // Requested 1KB, but aligned to 2MB (huge page)
+    ASSERT_TRUE(arena.initialize(
+        1024));  // Requested 1KB, but aligned to 2MB (huge page)
 
     auto stats_init = arena.getStats();
-    size_t pool_size = stats_init.pool_size;  // Actual pool size after alignment
+    size_t pool_size =
+        stats_init.pool_size;  // Actual pool size after alignment
 
     // Fill the arena completely
     std::vector<void*> ptrs;
@@ -129,11 +132,12 @@ TEST_F(MmapArenaTest, OOMDoesNotCorruptCursor) {
 
 TEST_F(MmapArenaTest, ConcurrentOOMStressTest) {
     MmapArena arena;
-    const size_t requested_pool_size = 1024 * 1024; // 1MB requested
+    const size_t requested_pool_size = 1024 * 1024;  // 1MB requested
     ASSERT_TRUE(arena.initialize(requested_pool_size));
 
     auto stats_init = arena.getStats();
-    size_t actual_pool_size = stats_init.pool_size;  // Actual pool after alignment
+    size_t actual_pool_size =
+        stats_init.pool_size;  // Actual pool after alignment
 
     std::atomic<int> succeeded{0};
     std::atomic<int> failed{0};
@@ -173,7 +177,8 @@ TEST_F(MmapArenaTest, ConcurrentOOMStressTest) {
     ASSERT_GT(failed.load(), 0);
 
     // Total attempts should match
-    EXPECT_EQ(succeeded.load() + failed.load(), num_threads * allocs_per_thread);
+    EXPECT_EQ(succeeded.load() + failed.load(),
+              num_threads * allocs_per_thread);
 
     LOG(INFO) << "OOM stress test: " << succeeded.load() << " succeeded, "
               << failed.load() << " failed, pool utilization: "
@@ -252,10 +257,12 @@ TEST_F(MmapArenaTest, OwnershipBoundaryTest) {
     size_t pool_size = arena.getPoolSize();
 
     // Test boundaries
-    EXPECT_TRUE(arena.owns(pool_base)); // Start of pool
-    EXPECT_TRUE(arena.owns(static_cast<char*>(pool_base) + 100)); // Middle
-    EXPECT_FALSE(arena.owns(static_cast<char*>(pool_base) + pool_size)); // Just past end
-    EXPECT_FALSE(arena.owns(static_cast<char*>(pool_base) - 1)); // Just before start
+    EXPECT_TRUE(arena.owns(pool_base));  // Start of pool
+    EXPECT_TRUE(arena.owns(static_cast<char*>(pool_base) + 100));  // Middle
+    EXPECT_FALSE(arena.owns(static_cast<char*>(pool_base) +
+                            pool_size));  // Just past end
+    EXPECT_FALSE(
+        arena.owns(static_cast<char*>(pool_base) - 1));  // Just before start
 }
 
 // ===== BUG #5: RACE CONDITION IN INITIALIZE =====
@@ -311,8 +318,8 @@ TEST_F(MmapArenaTest, AllocateAfterRacyInit) {
 
     // All allocations should either succeed or fail consistently
     int non_null = std::count_if(ptrs.begin(), ptrs.end(),
-                                  [](void* p) { return p != nullptr; });
-    EXPECT_GT(non_null, 0); // At least some should succeed
+                                 [](void* p) { return p != nullptr; });
+    EXPECT_GT(non_null, 0);  // At least some should succeed
 
     // Verify no duplicate pointers
     std::set<void*> unique_ptrs(ptrs.begin(), ptrs.end());
@@ -324,7 +331,7 @@ TEST_F(MmapArenaTest, AllocateAfterRacyInit) {
 
 TEST_F(MmapArenaTest, ConcurrentAllocations) {
     MmapArena arena;
-    ASSERT_TRUE(arena.initialize(64 * 1024 * 1024)); // 64MB
+    ASSERT_TRUE(arena.initialize(64 * 1024 * 1024));  // 64MB
 
     const int num_threads = 8;
     const int allocs_per_thread = 1000;
@@ -411,7 +418,7 @@ TEST_F(MmapArenaTest, StatsConsistencyUnderLoad) {
 
 TEST_F(MmapArenaTest, NearOOMAllocation) {
     MmapArena arena;
-    const size_t pool_size = 4096; // Small pool
+    const size_t pool_size = 4096;  // Small pool
     ASSERT_TRUE(arena.initialize(pool_size));
 
     // Fill arena almost completely
@@ -427,7 +434,8 @@ TEST_F(MmapArenaTest, NearOOMAllocation) {
     EXPECT_GT(stats.num_failed_allocs, 0);
 
     LOG(INFO) << "Near-OOM test: " << ptrs.size() << " allocations, "
-              << stats.allocated_bytes << " / " << stats.pool_size << " bytes used";
+              << stats.allocated_bytes << " / " << stats.pool_size
+              << " bytes used";
 }
 
 TEST_F(MmapArenaTest, MixedSizeAllocations) {
@@ -480,7 +488,7 @@ TEST_F(MmapArenaTest, PeakAllocationTracking) {
 
 TEST_F(MmapArenaTest, MixedAlignmentSequence) {
     MmapArena arena;
-    ASSERT_TRUE(arena.initialize(64 * 1024 * 1024)); // 64MB
+    ASSERT_TRUE(arena.initialize(64 * 1024 * 1024));  // 64MB
 
     // First allocation moves cursor to 64 (non-trivially aligned).
     // This ensures the subsequent 2MB-aligned allocation actually
@@ -498,8 +506,7 @@ TEST_F(MmapArenaTest, MixedAlignmentSequence) {
         << "Pointer not 2MB-aligned: " << p2;
 
     // p2 must not overlap p1
-    EXPECT_GT(reinterpret_cast<uintptr_t>(p2),
-              reinterpret_cast<uintptr_t>(p1));
+    EXPECT_GT(reinterpret_cast<uintptr_t>(p2), reinterpret_cast<uintptr_t>(p1));
 }
 
 // ===== INPUT VALIDATION TESTS =====
@@ -564,9 +571,7 @@ TEST_F(MmapArenaTest, ConcurrentInitMetadataConsistency) {
     std::vector<std::thread> threads;
 
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([&]() {
-            arena.initialize(4 * 1024 * 1024, 128);
-        });
+        threads.emplace_back([&]() { arena.initialize(4 * 1024 * 1024, 128); });
     }
     for (auto& t : threads) t.join();
 
@@ -617,7 +622,8 @@ TEST_F(MmapArenaTest, PagesArePhysicallyBackedAfterInit) {
         // Allow small tolerance for kernel behavior differences.
         double pct = 100.0 * resident / num_pages;
         EXPECT_GT(pct, 95.0)
-            << "Only " << pct << "% of pages resident; MAP_POPULATE may not be working. "
+            << "Only " << pct
+            << "% of pages resident; MAP_POPULATE may not be working. "
             << resident << "/" << num_pages << " pages.";
         LOG(INFO) << "mincore: " << resident << "/" << num_pages
                   << " pages resident (" << pct << "%)";
@@ -658,8 +664,7 @@ TEST_F(MmapArenaTest, AllocatedMemoryIsImmediatelyReadableWritable) {
     // Read it back — verify no corruption
     auto* bytes = static_cast<unsigned char*>(ptr);
     for (size_t i = 0; i < BUF_SIZE; i += 4096) {
-        EXPECT_EQ(bytes[i], 0xAB)
-            << "Memory corruption at offset " << i;
+        EXPECT_EQ(bytes[i], 0xAB) << "Memory corruption at offset " << i;
     }
 
     // Allocate a second buffer from remaining space
@@ -673,7 +678,8 @@ TEST_F(MmapArenaTest, AllocatedMemoryIsImmediatelyReadableWritable) {
                 << "Memory corruption in second buffer at offset " << i;
         }
         // Verify first buffer wasn't corrupted by second allocation
-        EXPECT_EQ(bytes[0], 0xAB) << "First buffer corrupted after second allocation";
+        EXPECT_EQ(bytes[0], 0xAB)
+            << "First buffer corrupted after second allocation";
     }
 }
 
@@ -781,7 +787,7 @@ TEST_F(MmapArenaTest, FallbackMmapAllocateFreeCycle) {
     unsetenv("MC_DISABLE_MMAP_ARENA");
 }
 
-} // namespace mooncake
+}  // namespace mooncake
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

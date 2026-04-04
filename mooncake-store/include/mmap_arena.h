@@ -22,7 +22,7 @@ namespace mooncake {
  * Thread-safe: allocate() is lock-free (CAS), initialize() is mutex-guarded.
  */
 class MmapArena {
-public:
+   public:
     struct Stats {
         size_t pool_size;
         size_t allocated_bytes;
@@ -88,17 +88,20 @@ public:
         return pool_size_.load(std::memory_order_acquire);
     }
 
-private:
-    std::atomic<void*> pool_base_;      // Base address of mmap'd pool (atomic for thread-safety)
-    std::atomic<size_t> pool_size_;     // Total pool size (atomic for thread-safety)
-    std::atomic<size_t> alignment_;    // Default allocation alignment (atomic for thread-safety)
+   private:
+    std::atomic<void*>
+        pool_base_;  // Base address of mmap'd pool (atomic for thread-safety)
+    std::atomic<size_t>
+        pool_size_;  // Total pool size (atomic for thread-safety)
+    std::atomic<size_t>
+        alignment_;  // Default allocation alignment (atomic for thread-safety)
 
-    std::atomic<size_t> alloc_cursor_;      // Current allocation offset
-    std::atomic<size_t> peak_allocated_;    // Peak memory usage
-    std::atomic<size_t> num_allocations_;   // Total allocations
-    std::atomic<size_t> num_failed_allocs_; // Failed allocations (OOM)
+    std::atomic<size_t> alloc_cursor_;       // Current allocation offset
+    std::atomic<size_t> peak_allocated_;     // Peak memory usage
+    std::atomic<size_t> num_allocations_;    // Total allocations
+    std::atomic<size_t> num_failed_allocs_;  // Failed allocations (OOM)
 
-    std::mutex init_mutex_;                // Guards initialize() against concurrent calls
+    std::mutex init_mutex_;  // Guards initialize() against concurrent calls
 };
 
-} // namespace mooncake
+}  // namespace mooncake

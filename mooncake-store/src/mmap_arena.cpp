@@ -11,7 +11,8 @@ namespace mooncake {
 
 // Safe alignment with overflow detection
 // Returns false if overflow would occur, true on success
-static inline bool safe_align_up(size_t size, size_t alignment, size_t* result) {
+static inline bool safe_align_up(size_t size, size_t alignment,
+                                 size_t* result) {
     if (size == 0) {
         *result = 0;
         return true;
@@ -29,15 +30,14 @@ static inline bool safe_align_up(size_t size, size_t alignment, size_t* result) 
 }
 
 MmapArena::MmapArena()
-    : pool_base_(nullptr)
-    , pool_size_(0)
-    , alignment_(64)  // Default minimum alignment (cache line)
-    , alloc_cursor_(0)
-    , peak_allocated_(0)
-    , num_allocations_(0)
-    , num_failed_allocs_(0)
-{
-}
+    : pool_base_(nullptr),
+      pool_size_(0),
+      alignment_(64)  // Default minimum alignment (cache line)
+      ,
+      alloc_cursor_(0),
+      peak_allocated_(0),
+      num_allocations_(0),
+      num_failed_allocs_(0) {}
 
 MmapArena::~MmapArena() {
     void* pool_base = pool_base_.load(std::memory_order_acquire);
@@ -88,23 +88,23 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     // on some platforms (observed on H100 80GB).
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
 
-    // Try huge pages for better TLB performance
-    #ifdef MAP_HUGETLB
+// Try huge pages for better TLB performance
+#ifdef MAP_HUGETLB
     flags |= MAP_HUGETLB;
-    #endif
+#endif
 
-    void* pool_base = mmap(nullptr, aligned_pool_size, PROT_READ | PROT_WRITE,
-                          flags, -1, 0);
+    void* pool_base =
+        mmap(nullptr, aligned_pool_size, PROT_READ | PROT_WRITE, flags, -1, 0);
 
     if (pool_base == MAP_FAILED) {
         // Retry without huge pages
         flags &= ~MAP_HUGETLB;
         pool_base = mmap(nullptr, aligned_pool_size, PROT_READ | PROT_WRITE,
-                        flags, -1, 0);
+                         flags, -1, 0);
 
         if (pool_base == MAP_FAILED) {
             LOG(ERROR) << "Arena mmap failed: size=" << aligned_pool_size
-                      << ", errno=" << errno << " (" << strerror(errno) << ")";
+                       << ", errno=" << errno << " (" << strerror(errno) << ")";
             return false;
         }
         LOG(INFO) << "Arena initialized without huge pages";
@@ -159,7 +159,7 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
     if (!safe_align_up(size, effective_alignment, &aligned_size)) {
         num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
         LOG(ERROR) << "Arena allocation size overflow: size=" << size
-                  << ", alignment=" << effective_alignment;
+                   << ", alignment=" << effective_alignment;
         return nullptr;
     }
 
@@ -178,7 +178,7 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
         if (!safe_align_up(raw, effective_alignment, &aligned_offset)) {
             num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "Arena offset alignment overflow: raw=" << raw
-                      << ", alignment=" << effective_alignment;
+                       << ", alignment=" << effective_alignment;
             return nullptr;
         }
 
@@ -188,9 +188,9 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
         if (next < aligned_offset || next > pool_size) {
             num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "Arena OOM: requested=" << size
-                      << ", aligned_size=" << aligned_size
-                      << ", aligned_offset=" << aligned_offset
-                      << ", pool_size=" << pool_size;
+                       << ", aligned_size=" << aligned_size
+                       << ", aligned_offset=" << aligned_offset
+                       << ", pool_size=" << pool_size;
             return nullptr;
         }
 
@@ -211,10 +211,9 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
     // Update peak statistics using `next` (the actual end of reservation,
     // including any alignment padding before aligned_offset)
     size_t old_peak = peak_allocated_.load(std::memory_order_relaxed);
-    while (next > old_peak &&
-           !peak_allocated_.compare_exchange_weak(old_peak, next,
-                                                   std::memory_order_relaxed,
-                                                   std::memory_order_relaxed)) {
+    while (next > old_peak && !peak_allocated_.compare_exchange_weak(
+                                  old_peak, next, std::memory_order_relaxed,
+                                  std::memory_order_relaxed)) {
         // CAS loop for peak tracking
     }
 
@@ -222,8 +221,7 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
 
     VLOG(2) << "[ARENA] Allocated: size=" << size
             << ", aligned_size=" << aligned_size
-            << ", aligned_offset=" << aligned_offset
-            << ", ptr=" << ptr
+            << ", aligned_offset=" << aligned_offset << ", ptr=" << ptr
             << ", utilization=" << (100.0 * next / pool_size) << "%";
 
     return ptr;
@@ -235,7 +233,8 @@ MmapArena::Stats MmapArena::getStats() const {
     stats.allocated_bytes = alloc_cursor_.load(std::memory_order_relaxed);
     stats.peak_allocated = peak_allocated_.load(std::memory_order_relaxed);
     stats.num_allocations = num_allocations_.load(std::memory_order_relaxed);
-    stats.num_failed_allocs = num_failed_allocs_.load(std::memory_order_relaxed);
+    stats.num_failed_allocs =
+        num_failed_allocs_.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -251,4 +250,4 @@ bool MmapArena::owns(const void* ptr) const {
     return addr >= base && addr < base + pool_size;
 }
 
-} // namespace mooncake
+}  // namespace mooncake

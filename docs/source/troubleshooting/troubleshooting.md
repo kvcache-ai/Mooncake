@@ -11,7 +11,7 @@ This document lists common errors that may occur when using Mooncake Store and p
 
 ## Metadata and Out-of-Band Communication
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
-2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method. 
+2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
 
 Errors in this part usually indicate that the error occurred within the `mooncake-transfer-engine/src/transfer_metadata.cpp` file.
 
