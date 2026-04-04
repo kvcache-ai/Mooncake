@@ -14,6 +14,7 @@ endif()
 
 option(WITH_TE "build mooncake transfer engine and sample code" ON)
 option(WITH_STORE "build mooncake store library and sample code" ON)
+option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
@@ -140,6 +141,17 @@ if (WITH_EP)
 endif()
 
 add_subdirectory(mooncake-integration)
+
+if (WITH_STORE_GO AND WITH_STORE)
+  add_custom_target(build_store_go DEPENDS mooncake_store transfer_engine)
+  add_custom_command(
+      TARGET build_store_go
+      COMMAND bash build.sh ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${USE_ETCD} ${USE_REDIS} ${USE_HTTP} ${USE_ETCD_LEGACY}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/mooncake-store/go
+  )
+  set_property(TARGET build_store_go PROPERTY EXCLUDE_FROM_ALL FALSE)
+  message(STATUS "Mooncake Store Go bindings will be built")
+endif()
 
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)

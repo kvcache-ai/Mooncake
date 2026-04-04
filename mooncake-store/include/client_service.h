@@ -202,6 +202,28 @@ class Client {
         const ReplicateConfig& config);
 
     /**
+     * @brief Upserts data: inserts if key doesn't exist, updates if it does
+     * @param key Object key
+     * @param slices Vector of data slices to store
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                         std::vector<Slice>& slices,
+                                         const ReplicateConfig& config);
+
+    /**
+     * @brief Batch upsert data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices
+     * @param config Replication configuration
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
+    /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
      * @param force If true, skip lease and replication task checks
@@ -590,6 +612,9 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void StartBatchUpsert(std::vector<PutOperation>& ops,
+                          const ReplicateConfig& config);
+    void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 

@@ -255,6 +255,7 @@ enum class ErrorCode : int32_t {
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
     REPLICA_NOT_IN_LOCAL_MEMORY =
         -713,  ///< Replica does not reside in current node memory.
+    OBJECT_REPLICA_BUSY = -714,  ///< Object replicas have non-zero refcnt.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

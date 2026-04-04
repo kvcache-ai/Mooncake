@@ -239,6 +239,53 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
+     * @brief Start an upsert operation. If the key does not exist, behaves
+     * like PutStart. If the key exists with the same size, performs in-place
+     * update (reuses existing buffers). If the key exists with a different
+     * size, deletes old replicas and allocates new ones.
+     * @return Replica descriptors on success, or error code on failure.
+     * Possible errors: OBJECT_HAS_REPLICATION_TASK (Copy/Move/Offload in
+     * progress), OBJECT_REPLICA_BUSY (replicas have non-zero refcnt).
+     */
+    auto UpsertStart(const UUID& client_id, const std::string& key,
+                     const uint64_t slice_length, const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    /**
+     * @brief Complete an upsert operation. Delegates to PutEnd.
+     */
+    auto UpsertEnd(const UUID& client_id, const std::string& key,
+                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Revoke an upsert operation. Delegates to PutRevoke.
+     */
+    auto UpsertRevoke(const UUID& client_id, const std::string& key,
+                      ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Start a batch of upsert operations.
+     */
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config);
+
+    /**
+     * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    /**
+     * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    /**
      * @brief Evict a disk replica for a key (triggered by client-side disk
      * eviction).
      * @param client_id The client performing the eviction
@@ -520,8 +567,10 @@ class MasterService {
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
-        const UUID client_id;
-        const std::chrono::system_clock::time_point put_start_time;
+        // Updated by UpsertStart (Case B) to reflect the new writer.
+        UUID client_id;
+        // Updated by UpsertStart (Case B) to reset the discard timeout.
+        std::chrono::system_clock::time_point put_start_time;
         const size_t size;
 
         mutable SpinLock lock;
@@ -801,6 +850,15 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
+
+    // Helper: allocate replicas, create ObjectMetadata, insert into shard,
+    // and return descriptor list.  Shared by PutStart and UpsertStart.
+    auto AllocateAndInsertMetadata(
+        MetadataShardAccessorRW& shard, const UUID& client_id,
+        const std::string& key, uint64_t value_length,
+        const ReplicateConfig& config,
+        const std::chrono::system_clock::time_point& now)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
      * @brief Helper to discard expired processing keys.

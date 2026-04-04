@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <hiredis/hiredis.h>
@@ -36,21 +37,30 @@ class FakeObjectStore final : public SnapshotObjectStore {
 
     tl::expected<void, std::string> UploadString(
         const std::string& key, const std::string& data) override {
-        (void)key;
-        (void)data;
+        objects_[key] = data;
         return {};
     }
 
     tl::expected<void, std::string> DownloadString(const std::string& key,
                                                    std::string& data) override {
-        (void)key;
-        (void)data;
-        return tl::make_unexpected("unused");
+        auto iter = objects_.find(key);
+        if (iter == objects_.end()) {
+            return tl::make_unexpected("object not found");
+        }
+        data = iter->second;
+        return {};
     }
 
     tl::expected<void, std::string> DeleteObjectsWithPrefix(
         const std::string& prefix) override {
         deleted_prefixes.push_back(prefix);
+        for (auto iter = objects_.begin(); iter != objects_.end();) {
+            if (iter->first.starts_with(prefix)) {
+                iter = objects_.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
         return {};
     }
 
@@ -65,6 +75,7 @@ class FakeObjectStore final : public SnapshotObjectStore {
     std::string GetConnectionInfo() const override { return "fake://object"; }
 
     std::vector<std::string> deleted_prefixes;
+    std::unordered_map<std::string, std::string> objects_;
 };
 
 ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_id) {
@@ -73,6 +84,9 @@ ha::SnapshotDescriptor MakeDescriptor(const std::string& snapshot_id) {
     descriptor.manifest_key =
         "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
     descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    descriptor.last_included_seq = 42;
+    descriptor.producer_view_version = 7;
+    descriptor.created_at_ms = 1700000000000;
     return descriptor;
 }
 
@@ -131,6 +145,9 @@ TEST_F(RedisSnapshotCatalogStoreTest, PublishListAndGetLatestRoundTrip) {
     EXPECT_EQ(latest->value().snapshot_id, "20240302_120000_001");
     EXPECT_EQ(latest->value().manifest_key,
               "mooncake_master_snapshot/20240302_120000_001/manifest.txt");
+    EXPECT_EQ(latest->value().last_included_seq, 42u);
+    EXPECT_EQ(latest->value().producer_view_version, 7u);
+    EXPECT_EQ(latest->value().created_at_ms, 1700000000000);
 
     auto snapshots = store_->List(0);
     ASSERT_TRUE(snapshots.has_value());

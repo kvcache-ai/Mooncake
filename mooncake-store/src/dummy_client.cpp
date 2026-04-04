@@ -542,6 +542,51 @@ int DummyClient::put_parts(const std::string& key,
         key, values, config, client_id_));
 }
 
+int DummyClient::upsert(const std::string& key, std::span<const char> value,
+                        const ReplicateConfig& config) {
+    return to_py_ret(invoke_rpc<&RealClient::upsert_dummy_helper, void>(
+        key, value, config, client_id_));
+}
+
+int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
+                             const ReplicateConfig& config) {
+    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
+    return to_py_ret(invoke_rpc<&RealClient::upsert_from_dummy_helper, void>(
+        key, dummy_addr, size, config, client_id_));
+}
+
+std::vector<int> DummyClient::batch_upsert_from(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
+    const std::vector<size_t>& sizes, const ReplicateConfig& config) {
+    std::vector<uint64_t> buffers;
+    for (auto ptr : buffer_ptrs) {
+        buffers.push_back(reinterpret_cast<uint64_t>(ptr));
+    }
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_upsert_from_dummy_helper, void>(
+            keys.size(), keys, buffers, sizes, config, client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
+}
+
+int DummyClient::upsert_parts(const std::string& key,
+                              std::vector<std::span<const char>> values,
+                              const ReplicateConfig& config) {
+    return to_py_ret(invoke_rpc<&RealClient::upsert_parts_dummy_helper, void>(
+        key, values, config, client_id_));
+}
+
+int DummyClient::upsert_batch(const std::vector<std::string>& keys,
+                              const std::vector<std::span<const char>>& values,
+                              const ReplicateConfig& config) {
+    return to_py_ret(invoke_rpc<&RealClient::upsert_batch_dummy_helper, void>(
+        keys, values, config, client_id_));
+}
+
 int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
         invoke_rpc<&RealClient::remove_internal, void>(key, force));

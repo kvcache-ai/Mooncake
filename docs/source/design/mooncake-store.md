@@ -105,6 +105,25 @@ struct ReplicateConfig {
 };
 ```
 
+### Upsert
+
+```C++
+tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                     std::vector<Slice>& slices,
+                                     const ReplicateConfig& config);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config);
+```
+
+`Upsert` inserts `key` if it does not exist and updates the existing object if
+it does. It uses the same replication configuration model as `Put`, while
+allowing the store to reuse existing placement for in-place updates when the
+current layout permits it. `BatchUpsert` performs the same operation for
+multiple keys using a shared replication configuration.
+
 ### Remove
 
 ```C++
@@ -515,6 +534,40 @@ The Master Service handles object-related interfaces as follows:
 ```
 
 Before writing an object, the Client calls PutStart to request storage space allocation from the Master Service. After completing data writing, the Client calls PutEnd to notify the Master Service to mark the object write as completed.
+
+- Upsert
+
+```C++
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    const std::string& key,
+    const std::vector<size_t>& slice_lengths,
+    const ReplicateConfig& config);
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchUpsertStart(const std::vector<std::string>& keys,
+                 const std::vector<std::vector<uint64_t>>& slice_lengths,
+                 const ReplicateConfig& config);
+
+tl::expected<void, ErrorCode> UpsertEnd(
+    const std::string& key, ReplicaType replica_type);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+    const std::vector<std::string>& keys);
+
+tl::expected<void, ErrorCode> UpsertRevoke(
+    const std::string& key, ReplicaType replica_type);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+    const std::vector<std::string>& keys);
+```
+
+`UpsertStart` / `UpsertEnd` / `UpsertRevoke` mirror the existing put lifecycle
+but operate on insert-or-update semantics. If the key does not exist, the flow
+behaves like `PutStart`. If the key already exists, the Master may reuse the
+current allocation for an in-place update or allocate new space when the object
+layout changes. The batch variants provide the same control flow for multiple
+keys and are the lower-level primitives used by the high-level `BatchUpsert`
+path.
 
 - GetReplicaList
 

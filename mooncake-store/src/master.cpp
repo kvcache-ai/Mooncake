@@ -951,10 +951,22 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
+        auto wrapped_master_service =
+            std::make_shared<mooncake::WrappedMasterService>(
+                mooncake::WrappedMasterServiceConfig(master_config, version));
+        mooncake::MasterAdminServer admin_server(
+            static_cast<uint16_t>(master_config.metrics_port),
+            master_config.enable_metric_reporting);
+        if (!admin_server.Start()) {
+            LOG(ERROR) << "Failed to start master admin server";
+            return 1;
+        }
+        admin_server.SetRuntimeState(
+            mooncake::ha::MasterRuntimeState::kServing);
+        admin_server.SetServiceDelegate(wrapped_master_service);
+        admin_server.SetServiceAvailable(true);
 
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
         return server.start();
     }
 }
