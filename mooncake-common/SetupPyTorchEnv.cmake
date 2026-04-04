@@ -9,12 +9,10 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 # Install PyTorch for a specific version with proper CUDA compatibility handling.
 #
 # Usage:
-#   install_pytorch_wheel (
-#     VERSION         "2.11.0"
-#     CUDA_MAJOR      12
-#     CUDA_MINOR      8
-#     MODULE_PREFIX   "[EP]"
-#   )
+#   install_pytorch_wheel("<VERSION>" <CUDA_MAJOR> <CUDA_MINOR> "<MODULE_PREFIX>")
+#
+# Example:
+#   install_pytorch_wheel("2.11.0" 12 8 "[EP]")
 function(install_pytorch_wheel _version _cuda_major _cuda_minor _module_prefix)
   message(STATUS "${_module_prefix} Installing PyTorch ${_version} via pip...")
 
@@ -34,8 +32,8 @@ function(install_pytorch_wheel _version _cuda_major _cuda_minor _module_prefix)
       set(_cu_tag "cu126")
     else()
       message(FATAL_ERROR
-              "${_module_prefix} Can't find a matching PyTorch wheel for version ${_version} "
-              "with CUDA ${_cuda_major}.${_cuda_minor}"
+        "${_module_prefix} Can't find a matching PyTorch wheel for version ${_version} "
+        "with CUDA ${_cuda_major}.${_cuda_minor}"
       )
     endif()
   endif()
@@ -53,8 +51,8 @@ function(install_pytorch_wheel _version _cuda_major _cuda_minor _module_prefix)
 
   # Execute pip install
   execute_process(
-          COMMAND ${_pip_cmd}
-          RESULT_VARIABLE _ret
+    COMMAND ${_pip_cmd}
+    RESULT_VARIABLE _ret
   )
 
   if(NOT _ret EQUAL 0)
