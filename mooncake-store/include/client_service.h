@@ -396,7 +396,8 @@ class ClientService {
     bool HandleHeartbeatResponse(const HeartbeatResponse& response,
                                  const std::string& current_master_address,
                                  const std::function<void()>& register_client,
-                                 std::future<void>& register_client_future);
+                                 std::future<void>& register_client_future,
+                                 bool& master_reachable);
 
     /**
      * @brief Handles the result of a task received in a heartbeat response.
@@ -426,6 +427,12 @@ class ClientService {
      */
     virtual tl::expected<RegisterClientResponse, ErrorCode>
     RegisterClient() = 0;
+
+    /**
+     * @brief Single hook for all HA-related events from the heartbeat loop.
+     * Subclasses override to handle state transitions.
+     */
+    virtual void OnHAEvent(HAEvent event) { (void)event; }
 
    protected:
     /**

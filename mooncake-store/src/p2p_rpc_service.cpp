@@ -23,6 +23,9 @@ void RegisterP2PRpcService(
     server.register_handler<
         &mooncake::WrappedP2PMasterService::BatchSyncReplica>(
         &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedP2PMasterService::SetSyncCompleted>(
+            &wrapped_master_service);
 }
 
 tl::expected<WriteRouteResponse, ErrorCode>
@@ -109,6 +112,18 @@ BatchSyncReplicaResponse WrappedP2PMasterService::BatchSyncReplica(
     timer.LogResponse("add_failures=", add_failures,
                       ", remove_failures=", remove_failures);
     return response;
+}
+
+tl::expected<void, ErrorCode> WrappedP2PMasterService::SetSyncCompleted(
+    UUID client_id) {
+    ScopedVLogTimer timer(1, "SetSyncCompleted");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result = master_service_.SetSyncCompleted(client_id);
+    if (!result) {
+        LOG(ERROR) << "SetSyncCompleted failed: " << toString(result.error());
+    }
+    return result;
 }
 
 }  // namespace mooncake

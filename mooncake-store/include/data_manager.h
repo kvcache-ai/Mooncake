@@ -94,6 +94,24 @@ class DataManager {
     std::vector<TierView> GetTierViews() const;
 
     /**
+     * @brief Iterate all keys in batches.
+     * Delegates to TieredBackend::ForEachKeyBatch().
+     */
+    void ForEachKeyBatch(
+        const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)
+        const;
+
+    /**
+     * @brief Get hot key statistics
+     */
+    AccessStats GetHotKeyStats() const;
+
+    /**
+     * @brief Get all tier IDs where a key has replicas.
+     */
+    std::vector<UUID> GetReplicaTierIds(const std::string& key) const;
+
+    /**
      * @brief Read data and transfer to remote destination buffers
      *
      * This is the core method for remote data access:

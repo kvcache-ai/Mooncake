@@ -28,6 +28,11 @@ void P2PClientService::Stop() {
 
     LOG(INFO) << "P2PClientService::Stop() — begin";
 
+    // Stop HA recovery thread first
+    if (ha_manager_) {
+        ha_manager_->Stop();
+    }
+
     // Stop RPC server so no new requests arrive.
     if (client_rpc_server_) {
         client_rpc_server_->stop();
@@ -61,6 +66,7 @@ void P2PClientService::Destroy() {
     }
 
     client_rpc_service_.reset();
+    ha_manager_.reset();
     async_route_notifier_.reset();
     if (data_manager_.has_value()) {
         data_manager_->Destroy();
@@ -171,6 +177,13 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // Give RPC server a moment to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
+
+    // 6. Initialize HA recovery manager
+    ha_manager_ = std::make_unique<HARecoveryManager>(
+        client_id_, master_client_, data_manager_, async_route_notifier_,
+        view_version_);
+    // First-time registration: no keys to sync, clear is_syncing_ on Master
+    ha_manager_->SetSyncCompleted();
 
     return ErrorCode::OK;
 }
@@ -416,6 +429,14 @@ P2PClientService::RegisterClient() {
 }
 
 // ============================================================================
+// HA Recovery — delegate to HARecoveryManager
+// ============================================================================
+
+void P2PClientService::OnHAEvent(HAEvent event) {
+    if (ha_manager_) ha_manager_->HandleEvent(event);
+}
+
+// ============================================================================
 // Put Operations
 // ============================================================================
 
@@ -446,6 +467,11 @@ tl::expected<void, ErrorCode> P2PClientService::PutLocal(
 tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
     const std::string& key, std::vector<Slice>& slices,
     const WriteRouteRequestConfig& config) {
+    // DEGRADED: Master unreachable, only allow local writes
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return PutLocal(key, slices);
+    }
+
     size_t total_size = ClientService::CalculateSliceSize(slices);
 
     // 1. Get write route from master
@@ -717,6 +743,11 @@ tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
         }
     }
 
+    // DEGRADED: local + cache both missed, cannot query Master
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return tl::unexpected(ErrorCode::INACCESSIBLE_MASTER);
+    }
+
     // Local miss and Cache miss/fail — query Master for replicas and size
     auto size_result = QueryReplicaSize(key, config);
     if (!size_result) {
@@ -827,6 +858,11 @@ tl::expected<int64_t, ErrorCode> P2PClientService::Get(
                 return static_cast<int64_t>(total_size);
             }
         }
+    }
+
+    // DEGRADED: local + cache both missed, cannot query Master
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return tl::unexpected(ErrorCode::INACCESSIBLE_MASTER);
     }
 
     // Step 2: Local miss and cache miss — query Master for replicas and size
@@ -1009,6 +1045,11 @@ tl::expected<bool, ErrorCode> P2PClientService::IsExist(
         }
     }
 
+    // DEGRADED: skip Master fallback, return local-only result
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return false;
+    }
+
     // Fallback to master
     return master_client_.ExistKey(key);
 }
@@ -1065,9 +1106,19 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
+
+    // DEGRADED: return empty result (local-only, no Master query)
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        LOG(WARNING) << "fail to access master"
+                     << ", key=" << object_key;
+        return tl::make_unexpected(ErrorCode::INACCESSIBLE_MASTER);
+    }
+
     // Query master for replica list
     auto result = master_client_.GetReplicaList(object_key, config);
     if (!result) {
+        LOG(WARNING) << "fail to get replica list"
+                     << ", key=" << object_key << ", error=" << result.error();
         return tl::unexpected(result.error());
     }
 

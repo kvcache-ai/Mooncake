@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 
 #include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/data_copier.h"
+#include "tiered_cache/scheduler/stats_collector.h"
 #include "rpc_types.h"
 
 namespace mooncake {
@@ -213,6 +215,21 @@ class TieredBackend {
     const CacheTier* GetTier(UUID tier_id) const;
     const DataCopier& GetDataCopier() const;
 
+    /**
+     * @brief Iterate all keys in batches.
+     * Iterates per-shard to minimize lock hold time.
+     * @param callback Receives each batch; return false to stop iteration.
+     * @param batch_size Max entries per batch before releasing lock.
+     */
+    void ForEachKeyBatch(
+        const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)
+        const;
+
+    /**
+     * @brief Get hot key statistics from the scheduler's StatsCollector.
+     */
+    AccessStats GetHotKeyStats() const;
+
    private:
     tl::expected<void, ErrorCode> MountSegment(
         UUID id, size_t capacity, int priority,
@@ -250,12 +267,24 @@ class TieredBackend {
     // Map from tier ID to static config info
     std::unordered_map<UUID, TierInfo> tier_info_;
 
-    // Global Metadata Index: Key -> Entry
-    // map_mutex_ only protects the structure of this map (insertions/deletions
-    // of keys). Accessing existing keys is highly concurrent.
-    std::unordered_map<std::string, std::shared_ptr<MetadataEntry>>
-        metadata_index_;
-    mutable std::shared_mutex map_mutex_;
+    // Sharded Metadata Index: Key -> Entry
+    // Each shard has its own mutex for fine-grained locking.
+    struct MetadataShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, std::shared_ptr<MetadataEntry>> index;
+    };
+
+    static constexpr size_t kMetadataShardCount = 64;
+    std::array<MetadataShard, kMetadataShardCount> metadata_shards_;
+
+    MetadataShard& GetMetadataShard(const std::string& key) {
+        return metadata_shards_[std::hash<std::string>{}(key) %
+                                kMetadataShardCount];
+    }
+    const MetadataShard& GetMetadataShard(const std::string& key) const {
+        return metadata_shards_[std::hash<std::string>{}(key) %
+                                kMetadataShardCount];
+    }
 
     std::unique_ptr<DataCopier> data_copier_;
     // Callbacks for metadata synchronization with Master

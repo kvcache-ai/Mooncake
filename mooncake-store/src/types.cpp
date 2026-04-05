@@ -57,7 +57,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
         {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
         {ErrorCode::SHUTTING_DOWN, "SHUTTING_DOWN"},
-        {ErrorCode::ASYNC_ENQUEUE_FAILED, "ASYNC_ENQUEUE_FAILED"}};
+        {ErrorCode::ASYNC_ENQUEUE_FAILED, "ASYNC_ENQUEUE_FAILED"},
+        {ErrorCode::INACCESSIBLE_MASTER, "INACCESSIBLE_MASTER"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

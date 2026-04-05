@@ -9,6 +9,7 @@
 #include "client_service.h"
 #include "data_manager.h"
 #include "client_rpc_service.h"
+#include "ha_recovery_manager.h"
 #include "peer_client.h"
 #include "p2p_master_client.h"
 #include "route_cache.h"
@@ -269,6 +270,9 @@ class P2PClientService final : public ClientService {
     PeerClient& GetOrCreatePeerClient(const std::string& endpoint);
 
    private:
+    void OnHAEvent(HAEvent event) override;
+
+   private:
     P2PMasterClient master_client_;
     uint16_t client_rpc_port_ = 12345;
 
@@ -286,6 +290,9 @@ class P2PClientService final : public ClientService {
 
     // Async route notifier (nullptr when disabled)
     std::unique_ptr<AsyncMetadataNotifier> async_route_notifier_;
+
+    // HA recovery manager
+    std::unique_ptr<HARecoveryManager> ha_manager_;
 };
 
 }  // namespace mooncake

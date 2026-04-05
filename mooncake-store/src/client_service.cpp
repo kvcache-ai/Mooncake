@@ -448,13 +448,14 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
 void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                                         std::string current_master_address) {
     // How many failed heartbeats before getting latest master view from etcd
-    const int max_heartbeat_fail_count = 3;
+    const int max_heartbeat_fail_count = 10;
     // How long to wait for next heartbeat after success
     const int success_heartbeat_interval_ms = 1000;
     // How long to wait for next heartbeat after failure
     const int fail_heartbeat_interval_ms = 1000;
     // Increment after a heartbeat failure, reset after a heartbeat success
     int heartbeat_fail_count = 0;
+    bool master_reachable = true;
 
     auto register_client = [this]() {
         LOG(INFO) << "Sending RegisterClientRequest"
@@ -468,6 +469,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             LOG(INFO) << "Client registered successfully"
                       << ", client_id=" << client_id_
                       << ", view_version=" << res.value().view_version;
+            OnHAEvent(HAEvent::MASTER_REACHABLE);
         }
     };
     // Use another thread to register client to avoid blocking the heartbeat
@@ -489,7 +491,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             heartbeat_fail_count = 0;
             HandleHeartbeatResponse(heartbeat_result.value(),
                                     current_master_address, register_client,
-                                    register_client_future);
+                                    register_client_future, master_reachable);
             WaitForNextHeartbeat(success_heartbeat_interval_ms);
         } else {  // Heartbeat failed
             heartbeat_fail_count++;
@@ -497,7 +499,11 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                 // just retry
                 LOG(ERROR) << "Failed to send heartbeat to master";
             } else {
-                // Exceeded failure threshold, attempt reconnect
+                if (master_reachable) {
+                    OnHAEvent(HAEvent::MASTER_UNREACHABLE);
+                    master_reachable = false;
+                }
+                // Attempt reconnect
                 if (ReconnectToMaster(is_ha_mode, current_master_address)) {
                     heartbeat_fail_count = 0;
                     // Do NOT sleep here, immediately loop back to send
@@ -526,7 +532,7 @@ bool ClientService::HandleHeartbeatResponse(
     const HeartbeatResponse& response,
     const std::string& current_master_address,
     const std::function<void()>& register_client,
-    std::future<void>& register_client_future) {
+    std::future<void>& register_client_future, bool& master_reachable) {
     if (response.view_version != view_version_) {
         LOG(WARNING) << "Master view_version changed"
                      << ", client status in master: " << (int)response.status
@@ -537,8 +543,15 @@ bool ClientService::HandleHeartbeatResponse(
     for (auto& task_result : response.task_results) {
         HandleHeartbeatTaskResult(task_result);
     }
-    if (response.status == ClientStatus::UNDEFINED &&
-        !register_client_future.valid()) {
+    if (response.status == ClientStatus::HEALTH) {
+        // Heartbeat recovered after degraded: Master still knows this client.
+        // Enter SYNCING to re-sync any keys whose callbacks failed.
+        if (!master_reachable) {
+            OnHAEvent(HAEvent::MASTER_REACHABLE);
+            master_reachable = true;
+        }
+    } else if (response.status == ClientStatus::UNDEFINED &&
+               !register_client_future.valid()) {
         // Ensure at most one register client thread is running
         register_client_future =
             std::async(std::launch::async, register_client);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client_manager.h"
+#include "p2p_client_meta.h"
 
 namespace mooncake {
 class P2PClientManager final : public ClientManager {
@@ -18,6 +19,14 @@ class P2PClientManager final : public ClientManager {
         ObjectIterateStrategy strategy) override;
     std::shared_ptr<ClientMeta> CreateClientMeta(
         const RegisterClientRequest& req) override;
+
+    void OnClientRegistered(
+        const std::shared_ptr<ClientMeta>& meta) override {
+        auto p2p_meta = std::dynamic_pointer_cast<P2PClientMeta>(meta);
+        if (p2p_meta) {
+            p2p_meta->SetSyncing(true);
+        }
+    }
 
     HeartbeatTaskResult ProcessTask(const UUID& client_id,
                                     const HeartbeatTask& task) override;

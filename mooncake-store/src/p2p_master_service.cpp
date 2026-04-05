@@ -387,6 +387,25 @@ auto P2PMasterService::BatchSyncReplica(const BatchSyncReplicaRequest& req)
     return response;
 }
 
+auto P2PMasterService::SetSyncCompleted(UUID client_id)
+    -> tl::expected<void, ErrorCode> {
+    auto client = client_manager_->GetClient(client_id);
+    if (!client) {
+        LOG(WARNING) << "SetSyncCompleted: client not found"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    if (!p2p_client) {
+        LOG(ERROR) << "SetSyncCompleted: client is not P2PClientMeta"
+                   << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    p2p_client->SetSyncing(false);
+    LOG(INFO) << "SetSyncCompleted: client_id=" << client_id;
+    return {};
+}
+
 void P2PMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
     // do nothing
 }
