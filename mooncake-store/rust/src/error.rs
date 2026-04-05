@@ -32,6 +32,12 @@ pub enum StoreError {
     OperationFailed(i32),
 
     /// The requested key does not exist in the store.
+    ///
+    /// This variant is available for consumers that perform an explicit
+    /// existence check (e.g. via [`crate::MooncakeStore::is_exist`]) before
+    /// acting on the result. The C API itself does not expose a distinct
+    /// "not found" error code, so internal methods return
+    /// [`OperationFailed`](StoreError::OperationFailed) instead.
     #[error("key not found")]
     NotFound,
 }
