@@ -1,4 +1,5 @@
 import os
+import signal
 import socket
 import time
 import unittest
