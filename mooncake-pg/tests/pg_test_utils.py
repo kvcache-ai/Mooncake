@@ -390,7 +390,6 @@ def wait_for_spawn_context(ctx, timeout_s: float) -> None:
     for process in ctx.processes:
         if process.is_alive():
             try:
-                import signal
                 os.kill(process.pid, signal.SIGKILL)
             except Exception:
                 pass
