@@ -296,43 +296,7 @@ def collect_rank_results(result_map, count: int) -> list[dict]:
 
 
 def finalize_worker_results(result_map, count: int, *groups) -> None:
-    missing_ranks = []
-    try:
-        wait_until(
-            lambda: len(result_map) >= count,
-            timeout_s=DEFAULT_WAIT_TIMEOUT_S,
-            description=f"{count} rank results",
-        )
-    except TimeoutError as e:
-        # Record which ranks are missing for better diagnostics
-        missing_ranks = [r for r in range(count) if r not in result_map]
-        for rank in missing_ranks:
-            if rank not in result_map:
-                record_rank_result(
-                    result_map,
-                    rank,
-                    {
-                        "ok": False,
-                        "rank": rank,
-                        "error_type": "Timeout",
-                        "error": f"Rank {rank} did not report within {DEFAULT_WAIT_TIMEOUT_S}s (wait timeout)",
-                    },
-                )
-    except Exception as e:
-        # Log unexpected errors but don't block cleanup
-        missing_ranks = [r for r in range(count) if r not in result_map]
-        for rank in missing_ranks:
-            if rank not in result_map:
-                record_rank_result(
-                    result_map,
-                    rank,
-                    {
-                        "ok": False,
-                        "rank": rank,
-                        "error_type": type(e).__name__,
-                        "error": f"Rank {rank} wait failed: {e}",
-                    },
-                )
+    # Clean up process groups; result collection and timeouts are handled by the parent process.
     destroy_process_groups(*groups)
 
 
