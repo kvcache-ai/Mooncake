@@ -457,6 +457,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
                     write_result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
                     LOG(WARNING) << "Remote write to " << endpoint
                                  << " failed: " << write_result.error();
+                    result = tl::unexpected(write_result.error());
                     continue;  // write failed, attempt next candidate
                 } else {
                     // ErrorCode::REPLICA_NUM_EXCEEDED or
@@ -504,7 +505,7 @@ tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
             result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
             LOG(ERROR) << "Failed to put key: " << key
                        << " error: " << result.error();
-            return tl::unexpected(result.error());
+            return result;
         }
         // REPLICA_NUM_EXCEEDED / REPLICA_ALREADY_EXISTS: object already
         // stored, treat as success so callers don't retry needlessly.
