@@ -84,6 +84,7 @@ class Status final {
         kDeviceNotFound = 4,
         kInvalidEntry = 5,
         kInvalidMetadataType = 6,
+        kNeedsRefreshCache = 7,
 
         kRdmaError = 100,
         kCudaError = 101,
@@ -138,6 +139,7 @@ class Status final {
     TYPE_CHECK(DeviceNotFound);
     TYPE_CHECK(InvalidEntry);
     TYPE_CHECK(InvalidMetadataType);
+    TYPE_CHECK(NeedsRefreshCache);
 
     TYPE_CHECK(RdmaError);
     TYPE_CHECK(CudaError);

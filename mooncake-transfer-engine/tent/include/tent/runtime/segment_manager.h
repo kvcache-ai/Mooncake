@@ -47,11 +47,51 @@ class SegmentManager {
 
     Status closeRemote(SegmentID handle);
 
+    // Use `withCachedSegment()` when you want automatic
+    // cache invalidation and retry on stale segment cache.
     Status getRemoteCached(SegmentDesc *&desc, SegmentID handle);
 
     Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
 
     Status invalidateRemote(SegmentID handle);
+
+    template <typename Func>
+    Status withCachedSegment(SegmentID segment_id, Func operation) {
+        static_assert(
+            std::is_same_v<std::invoke_result_t<Func &, SegmentDesc *>, Status>,
+            "operation must return Status");
+
+        // Local segment: no cache lookup or retry required.
+        if (segment_id == LOCAL_SEGMENT_ID) {
+            return operation(getLocal().get());
+        }
+
+        // First get a cached version.
+        SegmentDesc *desc = nullptr;
+        CHECK_STATUS(getRemoteCached(desc, segment_id));
+
+        // Do operation under the cached segment.
+        Status res = operation(desc);
+        if (!res.IsNeedsRefreshCache()) {
+            return res;
+        }
+
+        // If result status is IsNeedsRefreshCache, invalidate cache and retry
+        invalidateRemote(segment_id);
+        CHECK_STATUS(getRemoteCached(desc, segment_id));
+
+        // Do operation again
+        res = operation(desc);
+
+        // If the operation still fails, return the error.
+        // Convert the status to InvalidEntry if it is NeedsRefreshCache.
+        if (res.IsNeedsRefreshCache()) {
+            res = Status::InvalidEntry(
+                "Segment refetched from registry but still invalid: " +
+                std::string{res.message()});
+        }
+        return res;
+    }
 
    public:
     SegmentDescRef getLocal() { return local_desc_; }

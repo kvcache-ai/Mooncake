@@ -458,13 +458,17 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
-    SegmentDesc *desc = nullptr;
-    CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
 
-    auto buffer = desc->findBuffer(dest_addr, length);
-    if (!buffer || buffer->mnnvl_handle.empty())
-        return Status::InvalidArgument(
-            "Requested address is not in registered buffer" LOC_MARK);
+    BufferDesc *buffer;
+    auto &segment_manager = metadata_->segmentManager();
+    CHECK_STATUS(
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc *segment) {
+            buffer = segment->findBuffer(dest_addr, length);
+            if (!buffer || buffer->mnnvl_handle.empty())
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        }));
 
     if (!relocate_map_[target_id].count(buffer->addr)) {
         CUmemGenericAllocationHandle handle;
