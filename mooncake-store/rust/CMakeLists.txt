@@ -21,3 +21,19 @@ add_custom_command(
     COMMENT "Building mooncake_store Rust crate"
     VERBATIM
 )
+
+# Build the basic_usage example so that CI can verify it compiles.
+add_custom_target(build_mooncake_store_rust_example DEPENDS mooncake_store)
+
+add_custom_command(
+    TARGET build_mooncake_store_rust_example
+    COMMAND
+        ${CMAKE_COMMAND} -E env
+            CARGO_TARGET_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            MOONCAKE_STORE_LIB_DIR=${CMAKE_CURRENT_BINARY_DIR}/../src
+            MOONCAKE_STORE_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../include
+        cargo build --example basic_usage --release
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Building mooncake_store Rust basic_usage example"
+    VERBATIM
+)
