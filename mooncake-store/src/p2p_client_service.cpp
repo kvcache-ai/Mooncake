@@ -504,9 +504,10 @@ tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
             result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
             LOG(ERROR) << "Failed to put key: " << key
                        << " error: " << result.error();
-        } else {
-            // the key exists, just ignore the error
+            return tl::unexpected(result.error());
         }
+        // REPLICA_NUM_EXCEEDED / REPLICA_ALREADY_EXISTS: object already
+        // stored, treat as success so callers don't retry needlessly.
     }
 
     return {};
