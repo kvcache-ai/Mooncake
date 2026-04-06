@@ -513,6 +513,12 @@ class ClientService {
         return local_ip_ + ":" + std::to_string(te_port_);
     }
 
+    // The segment endpoint that the transfer engine registered with the
+    // metadata backend.
+    std::string te_endpoint_;
+    void initTeEndpoint();
+    const std::string& get_te_endpoint() const { return te_endpoint_; }
+
     const std::string metadata_connstring_;
     // For high availability
     MasterViewHelper master_view_helper_;

@@ -151,6 +151,7 @@ ErrorCode CentralizedClientService::Init(
         LOG(INFO) << "Use existing transfer engine instance. Skip its "
                      "initialization.";
     }
+    initTeEndpoint();
 
     InitTransferSubmitter();
 
@@ -1639,14 +1640,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
     CentralizedSegmentExtraData extra;
     extra.base = reinterpret_cast<uintptr_t>(buffer);
 
-    // For P2P handshake mode, publish the actual transport endpoint that was
-    // negotiated by the transfer engine. Otherwise, keep the logical hostname
-    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
-    if (metadata_connstring_ == P2PHANDSHAKE) {
-        extra.te_endpoint = transfer_engine_->getLocalIpAndPort();
-    } else {
-        extra.te_endpoint = local_endpoint();
-    }
+    extra.te_endpoint = get_te_endpoint();
     segment.extra = extra;
 
     auto mount_result = master_client_.MountSegment(segment);

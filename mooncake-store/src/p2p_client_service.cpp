@@ -95,6 +95,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         LOG(INFO) << "Use existing transfer engine instance. Skip its "
                      "initialization.";
     }
+    initTeEndpoint();
 
     // 3. Register with master BEFORE InitStorage, because InitStorage
     //    triggers TieredBackend::MountSegment which requires the client to
@@ -445,7 +446,7 @@ tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
             write_req.key = key;
             for (const auto& slice : slices) {
                 RemoteBufferDesc buf;
-                buf.segment_endpoint = transfer_engine_->getLocalIpAndPort();
+                buf.segment_endpoint = get_te_endpoint();
                 buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
                 buf.size = slice.size;
                 write_req.src_buffers.push_back(buf);
@@ -894,7 +895,7 @@ tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
             read_req.key = key;
             for (const auto& slice : slices) {
                 RemoteBufferDesc buf;
-                buf.segment_endpoint = transfer_engine_->getLocalIpAndPort();
+                buf.segment_endpoint = get_te_endpoint();
                 buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
                 buf.size = slice.size;
                 read_req.dest_buffers.push_back(buf);

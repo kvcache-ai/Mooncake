@@ -10,11 +10,24 @@
 #include <thread>
 
 #include "config.h"
+#include "transfer_engine.h"
 #include "types.h"
 #include "p2p_client_service.h"
 #include "centralized_client_service.h"
 
 namespace mooncake {
+
+void ClientService::initTeEndpoint() {
+    // For P2PHANDSHAKE the TE picks a random port and updates
+    // local_server_name_ accordingly, so getLocalIpAndPort() is authoritative.
+    // For HTTP/etcd/redis metadata the segment is published under the
+    // configured local_endpoint().
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        te_endpoint_ = transfer_engine_->getLocalIpAndPort();
+    } else {
+        te_endpoint_ = local_endpoint();
+    }
+}
 
 size_t ClientService::CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
