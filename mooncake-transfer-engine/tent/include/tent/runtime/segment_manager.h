@@ -55,6 +55,14 @@ class SegmentManager {
 
     Status invalidateRemote(SegmentID handle);
 
+    // Execute an operation with automatic cache invalidation and retry.
+    //
+    // This helper wraps segment cache lookups with automatic retry logic:
+    // 1. For local segment, the operation is executed directly without
+    //    caching or retrying.
+    // 2. For remote segments, it first tries the cached segment.
+    //    If the operation returns NeedsRefreshCache, the cache is
+    //    invalidated, the segment is refetched and the operation is retried.
     template <typename Func>
     Status withCachedSegment(SegmentID segment_id, Func operation) {
         static_assert(
