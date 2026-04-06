@@ -1,5 +1,3 @@
-#include "p2p_master_service.h"
-
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -7,7 +5,14 @@
 #include <string>
 #include <vector>
 
+#define private public
+#define protected public
+#include "p2p_master_service.h"
+#undef protected
+#undef private
+
 #include "master_config.h"
+#include "p2p_client_meta.h"
 #include "p2p_rpc_types.h"
 #include "rpc_types.h"
 #include "types.h"
@@ -684,6 +689,51 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     auto r_res2 = service->GetReplicaList("data_001");
     EXPECT_FALSE(r_res2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, r_res2.error());
+}
+
+// ============================================================
+// SetSyncCompleted Tests
+// ============================================================
+
+TEST_F(P2PMasterServiceTest, SetSyncCompletedSuccess) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    // After registration, OnClientRegistered sets is_syncing = true
+    auto client = service->client_manager_->GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    ASSERT_NE(p2p_client, nullptr);
+    EXPECT_TRUE(p2p_client->IsSyncing());
+
+    // SetSyncCompleted should clear is_syncing
+    auto result = service->SetSyncCompleted(client_id);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(p2p_client->IsSyncing());
+}
+
+TEST_F(P2PMasterServiceTest, SetSyncCompletedClientNotFound) {
+    auto service = CreateService();
+    auto result = service->SetSyncCompleted(generate_uuid());
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::CLIENT_NOT_FOUND);
+}
+
+TEST_F(P2PMasterServiceTest, SetSyncCompletedIdempotent) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    // Call twice — should succeed both times
+    EXPECT_TRUE(service->SetSyncCompleted(client_id).has_value());
+    EXPECT_TRUE(service->SetSyncCompleted(client_id).has_value());
+
+    auto client = service->client_manager_->GetClient(client_id);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    EXPECT_FALSE(p2p_client->IsSyncing());
 }
 
 }  // namespace mooncake::test

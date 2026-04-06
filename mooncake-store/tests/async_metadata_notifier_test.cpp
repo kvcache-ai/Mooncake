@@ -139,12 +139,12 @@ TEST_F(AsyncMetadataNotifierTest, CoalesceAddThenRemove) {
 
     auto r1 = notifier.EnqueueAdd("coalesce_key", segment_.id, 512);
     ASSERT_TRUE(r1.has_value());
-    EXPECT_EQ(notifier.shards_[0]->count, 1u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 1u);
 
     // REMOVE should cancel the pending ADD — queue becomes empty
     auto r2 = notifier.EnqueueRemove("coalesce_key", segment_.id);
     ASSERT_TRUE(r2.has_value());
-    EXPECT_EQ(notifier.shards_[0]->count, 0u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);
     EXPECT_TRUE(notifier.shards_[0]->coalesce_index.empty());
 
     notifier.running_.store(false, std::memory_order_release);
@@ -161,11 +161,11 @@ TEST_F(AsyncMetadataNotifierTest, CoalesceRemoveThenAdd) {
     // REMOVE then ADD for same key — ADD should cancel the pending REMOVE
     auto r1 = notifier.EnqueueRemove("coalesce_ra_key", segment_.id);
     ASSERT_TRUE(r1.has_value());
-    EXPECT_EQ(notifier.shards_[0]->count, 1u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 1u);
 
     auto r2 = notifier.EnqueueAdd("coalesce_ra_key", segment_.id, 512);
     ASSERT_TRUE(r2.has_value());
-    EXPECT_EQ(notifier.shards_[0]->count, 0u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);
     EXPECT_TRUE(notifier.shards_[0]->coalesce_index.empty());
 
     notifier.running_.store(false, std::memory_order_release);
@@ -319,14 +319,277 @@ TEST_F(AsyncMetadataNotifierTest, DuplicateAddIsIdempotent) {
 
     auto r1 = notifier.EnqueueAdd("dup_key", segment_.id, 256);
     ASSERT_TRUE(r1.has_value());
-    EXPECT_EQ(notifier.shards_[0]->count, 1u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 1u);
 
     // Second ADD for same key+segment — should be silently skipped
     auto r2 = notifier.EnqueueAdd("dup_key", segment_.id, 256);
     ASSERT_TRUE(r2.has_value());
-    EXPECT_EQ(notifier.shards_[0]->count, 1u);  // still 1, not 2
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 1u);  // still 1, not 2
 
     notifier.running_.store(false, std::memory_order_release);
+}
+
+// ============================================================================
+// Recovery Queue Tests
+// ============================================================================
+
+TEST_F(AsyncMetadataNotifierTest, RecoveryAddEnqueueAndFlush) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.Start();
+
+    auto r = notifier.EnqueueRecoveryAdd("recovery_key1", segment_.id, 1024);
+    ASSERT_TRUE(r.has_value());
+
+    // Give sender time to flush
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(CountReplicas("recovery_key1"), 1u);
+
+    notifier.Stop();
+}
+
+TEST_F(AsyncMetadataNotifierTest, RecoveryEnqueueGoesToRecoveryList) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.running_.store(true, std::memory_order_release);
+
+    auto r = notifier.EnqueueRecoveryAdd("rec_list_key", segment_.id, 512);
+    ASSERT_TRUE(r.has_value());
+
+    // Should be in recovery list, not normal list
+    EXPECT_EQ(notifier.shards_[0]->recovery_count, 1u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);
+
+    notifier.running_.store(false, std::memory_order_release);
+}
+
+TEST_F(AsyncMetadataNotifierTest, NormalAndRecoveryCoexist) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.running_.store(true, std::memory_order_release);
+
+    // Enqueue normal + recovery ops for different keys
+    notifier.EnqueueAdd("normal_key", segment_.id, 256);
+    notifier.EnqueueRecoveryAdd("recovery_key", segment_.id, 512);
+
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 1u);
+    EXPECT_EQ(notifier.shards_[0]->recovery_count, 1u);
+
+    notifier.running_.store(false, std::memory_order_release);
+}
+
+TEST_F(AsyncMetadataNotifierTest, RecoveryQueueReservesSlots) {
+    // Use tiny capacity to test reservation logic
+    // normal_reserved = capacity / 4 = 1
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/1,
+                                   /*queue_capacity=*/4);
+    notifier.running_.store(true, std::memory_order_release);
+
+    auto& shard = *notifier.shards_[0];
+    EXPECT_EQ(shard.normal_reserved, 1u);  // capacity/4
+
+    // Fill recovery slots up to the limit (capacity - normal_reserved = 3)
+    auto r1 = notifier.EnqueueRecoveryAdd("rr_key1", segment_.id, 100);
+    auto r2 = notifier.EnqueueRecoveryAdd("rr_key2", segment_.id, 200);
+    auto r3 = notifier.EnqueueRecoveryAdd("rr_key3", segment_.id, 300);
+    EXPECT_TRUE(r1.has_value());
+    EXPECT_TRUE(r2.has_value());
+    EXPECT_TRUE(r3.has_value());
+
+    // Next recovery enqueue should fail (non-blocking)
+    auto r4 = notifier.EnqueueRecoveryAdd("rr_key4", segment_.id, 400);
+    EXPECT_FALSE(r4.has_value());
+    EXPECT_EQ(r4.error(), ErrorCode::ASYNC_ENQUEUE_FAILED);
+
+    // But normal enqueue should still work (reserved slot)
+    auto r5 = notifier.EnqueueAdd("normal_reserved_key", segment_.id, 500);
+    EXPECT_TRUE(r5.has_value());
+
+    notifier.running_.store(false, std::memory_order_release);
+}
+
+TEST_F(AsyncMetadataNotifierTest, NormalPriorityOverRecovery) {
+    // Verify that normal ops are sent before recovery ops
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.Start();
+
+    // Enqueue recovery first, then normal
+    for (int i = 0; i < 10; ++i) {
+        notifier.EnqueueRecoveryAdd("rec_prio_" + std::to_string(i),
+                                    segment_.id, 64);
+    }
+    for (int i = 0; i < 10; ++i) {
+        notifier.EnqueueAdd("norm_prio_" + std::to_string(i), segment_.id, 64);
+    }
+
+    // Wait for flush
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // All should be flushed
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(CountReplicas("rec_prio_" + std::to_string(i)), 1u);
+        EXPECT_EQ(CountReplicas("norm_prio_" + std::to_string(i)), 1u);
+    }
+
+    notifier.Stop();
+}
+
+TEST_F(AsyncMetadataNotifierTest, WaitForRecoveryDrainSuccess) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.Start();
+
+    // Enqueue some recovery ops
+    for (int i = 0; i < 5; ++i) {
+        notifier.EnqueueRecoveryAdd("wfd_key_" + std::to_string(i),
+                                    segment_.id, 64);
+    }
+
+    // Wait for drain with generous timeout
+    bool drained = notifier.WaitForRecoveryDrain(
+        nullptr, std::chrono::milliseconds(5000));
+    EXPECT_TRUE(drained);
+
+    notifier.Stop();
+
+    // All should be flushed
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(CountReplicas("wfd_key_" + std::to_string(i)), 1u);
+    }
+}
+
+TEST_F(AsyncMetadataNotifierTest, WaitForRecoveryDrainAbort) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.running_.store(true, std::memory_order_release);
+
+    // Enqueue a recovery op but don't start sender
+    notifier.EnqueueRecoveryAdd("abort_drain_key", segment_.id, 64);
+
+    // Abort immediately
+    std::atomic<bool> abort{true};
+    bool drained = notifier.WaitForRecoveryDrain(
+        [&]() { return abort.load(); }, std::chrono::milliseconds(1000));
+    EXPECT_FALSE(drained);
+
+    notifier.running_.store(false, std::memory_order_release);
+}
+
+TEST_F(AsyncMetadataNotifierTest, WaitForRecoveryDrainTimeout) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.running_.store(true, std::memory_order_release);
+
+    // Enqueue but don't start sender — will never drain
+    notifier.EnqueueRecoveryAdd("timeout_key", segment_.id, 64);
+
+    bool drained = notifier.WaitForRecoveryDrain(
+        nullptr, std::chrono::milliseconds(200));
+    EXPECT_FALSE(drained);
+
+    notifier.running_.store(false, std::memory_order_release);
+}
+
+TEST_F(AsyncMetadataNotifierTest, WaitForRecoveryDrainEmptyImmediate) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.Start();
+
+    // No recovery ops — should return immediately
+    bool drained = notifier.WaitForRecoveryDrain(
+        nullptr, std::chrono::milliseconds(100));
+    EXPECT_TRUE(drained);
+
+    notifier.Stop();
+}
+
+TEST_F(AsyncMetadataNotifierTest, RecoveryCoalesceWithNormalRemove) {
+    // A normal REMOVE should cancel a pending recovery ADD for the same key
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.running_.store(true, std::memory_order_release);
+
+    auto r1 = notifier.EnqueueRecoveryAdd("cross_coalesce", segment_.id, 256);
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(notifier.shards_[0]->recovery_count, 1u);
+
+    // Normal REMOVE for the same key should cancel the recovery ADD
+    auto r2 = notifier.EnqueueRemove("cross_coalesce", segment_.id);
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(notifier.shards_[0]->recovery_count, 0u);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);
+
+    notifier.running_.store(false, std::memory_order_release);
+}
+
+TEST_F(AsyncMetadataNotifierTest, RecoveryBatchMultipleKeys) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/2,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/8000);
+    notifier.Start();
+
+    constexpr int kNumKeys = 50;
+    for (int i = 0; i < kNumKeys; ++i) {
+        auto r = notifier.EnqueueRecoveryAdd(
+            "rec_batch_" + std::to_string(i), segment_.id, 128);
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // Wait for drain
+    bool drained = notifier.WaitForRecoveryDrain(
+        nullptr, std::chrono::milliseconds(5000));
+    EXPECT_TRUE(drained);
+
+    notifier.Stop();
+
+    for (int i = 0; i < kNumKeys; ++i) {
+        EXPECT_EQ(CountReplicas("rec_batch_" + std::to_string(i)), 1u)
+            << "Missing replica for rec_batch_" << i;
+    }
+}
+
+TEST_F(AsyncMetadataNotifierTest, StopDrainsRecoveryQueue) {
+    AsyncMetadataNotifier notifier(*master_client_, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000);
+    notifier.Start();
+
+    for (int i = 0; i < 10; ++i) {
+        notifier.EnqueueRecoveryAdd("rec_drain_stop_" + std::to_string(i),
+                                    segment_.id, 64);
+    }
+    notifier.Stop();
+
+    int found = 0;
+    for (int i = 0; i < 10; ++i) {
+        if (CountReplicas("rec_drain_stop_" + std::to_string(i)) == 1) {
+            ++found;
+        }
+    }
+    EXPECT_EQ(found, 10) << "Only " << found << "/10 recovery ops drained";
 }
 
 }  // namespace test
