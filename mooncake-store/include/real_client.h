@@ -424,7 +424,7 @@ class RealClient : public PyClient {
         bool prefer_alloc_in_same_node, int32_t device_id,
         const UUID &client_id);
 
-    tl::expected<int64_t, ErrorCode> get_into_range_dummy_helper(
+    tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
         size_t src_offset, size_t size, const UUID &client_id);
 

@@ -2753,7 +2753,7 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
         prefer_alloc_in_same_node);
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::get_into_range_dummy_helper(
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
     size_t src_offset, size_t size, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);

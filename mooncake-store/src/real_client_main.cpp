@@ -52,7 +52,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
-    server.register_handler<&RealClient::get_into_range_dummy_helper>(
+    server.register_handler<&RealClient::get_into_range_shm_helper>(
         &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_shm_internal>(&real_client);

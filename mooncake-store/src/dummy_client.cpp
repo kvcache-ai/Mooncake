@@ -763,7 +763,7 @@ int64_t DummyClient::get_into_range(const std::string& key, void* buffer,
                                     size_t dst_offset, size_t src_offset,
                                     size_t size) {
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
-    auto result = invoke_rpc<&RealClient::get_into_range_dummy_helper,
+    auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
                              tl::expected<int64_t, ErrorCode>>(
         key, buf_addr, dst_offset, src_offset, size, client_id_);
     if (!result) {
