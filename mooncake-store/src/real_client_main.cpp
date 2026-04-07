@@ -1,5 +1,6 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <filesystem>
 #include <fstream>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -21,7 +22,9 @@ DEFINE_int32(port, 50052, "Real Client service port (0 = auto allocate)");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
-DEFINE_string(endpoint_file, "", "File to save the endpoint address for Dummy Client discovery (empty = default path)");
+DEFINE_string(endpoint_file, "",
+              "File to save the endpoint address for Dummy Client discovery "
+              "(empty = default path)");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -78,16 +81,21 @@ static bool SaveEndpointToFile(int port, const std::string &endpoint_file) {
         if (home) {
             path = std::string(home) + "/.mooncake/real_client.endpoint";
         } else {
-            path = "/var/run/mooncake/real_client.endpoint";
+            path = "/tmp/mooncake/real_client.endpoint";
         }
     }
 
     // Create parent directory if needed
-    auto slash_pos = path.rfind('/');
-    if (slash_pos != std::string::npos) {
-        std::string dir = path.substr(0, slash_pos);
-        std::string mkdir_cmd = "mkdir -p " + dir;
-        (void)system(mkdir_cmd.c_str());
+    std::filesystem::path filepath(path);
+    auto parent = filepath.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            LOG(WARNING) << "Failed to create directory " << parent << ": "
+                         << ec.message();
+            return false;
+        }
     }
 
     std::ofstream ofs(path);
@@ -116,18 +124,27 @@ int main(int argc, char *argv[]) {
     globalConfig().ascend_agent_mode = true;
 #endif
 
-    // Determine RPC port: use AutoPortBinder if --port=0
+    // Determine RPC port:
+    // - If --port=0, always auto-allocate.
+    // - Otherwise, try the specified port first; if occupied, auto-fallback.
     int rpc_port = FLAGS_port;
     std::unique_ptr<AutoPortBinder> rpc_port_binder;
 
-    if (rpc_port == 0) {
+    if (rpc_port == 0 || !isPortAvailable(rpc_port)) {
+        if (rpc_port != 0) {
+            LOG(INFO) << "Port " << rpc_port
+                      << " is already in use, auto-allocating a new port";
+        }
         rpc_port_binder = std::make_unique<AutoPortBinder>();
         rpc_port = rpc_port_binder->getPort();
         if (rpc_port < 0) {
             LOG(FATAL) << "Failed to auto-allocate RPC port";
             return -1;
         }
-        LOG(INFO) << "Auto-allocated RPC port: " << rpc_port;
+        LOG(INFO) << "Using RPC port: " << rpc_port
+                  << (FLAGS_port != 0 ? " (auto-fallback from " +
+                                            std::to_string(FLAGS_port) + ")"
+                                      : " (auto-allocated)");
     }
 
     auto client_inst = RealClient::create();
