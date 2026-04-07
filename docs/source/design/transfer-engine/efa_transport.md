@@ -22,36 +22,23 @@ If not installed, follow [AWS EFA documentation](https://docs.aws.amazon.com/AWS
 
 ### 2. Build Dependencies
 
-```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y \
-    build-essential \
-    cmake \
-    git \
-    libgflags-dev \
-    libgoogle-glog-dev \
-    libjsoncpp-dev \
-    libnuma-dev \
-    libibverbs-dev \
-    libboost-all-dev \
-    libcurl4-openssl-dev \
-    libgtest-dev \
-    libmsgpack-dev \
-    libxxhash-dev \
-    libyaml-cpp-dev \
-    pybind11-dev \
-    python3-dev
+Install all Mooncake dependencies using the provided script:
 
-# Install yalantinglibs (required)
-cd /tmp
-git clone https://github.com/alibaba/yalantinglibs.git
-cd yalantinglibs
-mkdir build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
-make -j$(nproc)
-sudo make install
+```bash
+cd Mooncake
+sudo ./dependencies.sh -y
 ```
+
+This installs all system packages, git submodules (including pybind11 and yalantinglibs), and Go.
+
+**Additional EFA-specific dependencies** (not covered by `dependencies.sh`):
+
+```bash
+# gflags is needed by transfer_engine_bench and EFA unit tests
+sudo apt-get install -y libgflags-dev
+```
+
+> **Note:** The EFA driver and libfabric are **not** installed by `dependencies.sh`. They must be pre-installed on the instance (see section 1 above).
 
 ## Building Mooncake with EFA Support
 
