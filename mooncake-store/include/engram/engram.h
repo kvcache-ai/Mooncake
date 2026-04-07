@@ -2,14 +2,16 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 #include "engram/engram_config.h"
-#include "pyclient.h"
 
 namespace mooncake {
+
+class BufferHandle;
+class PyClient;
+
 namespace engram {
 
 /**
@@ -41,6 +43,12 @@ class Engram {
         const std::vector<std::vector<std::vector<int64_t>>>& row_ids,
         void* output, size_t output_size) const;
 
+    /**
+     * Fast path for contiguous row-id buffers with shape [B, L, H].
+     */
+    int lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
+                               void* output, size_t output_size) const;
+
     std::vector<int64_t> get_table_vocab_sizes() const;
     std::vector<std::string> get_store_keys() const;
     int get_num_heads() const;
@@ -63,45 +71,13 @@ class Engram {
                  const std::vector<size_t>& buffer_sizes);
 
    private:
-    struct LookupRowRef {
-        int64_t idx = 0;
-        size_t output_offset = 0;
-    };
-
     std::shared_ptr<PyClient> store_;
     std::vector<int64_t> table_vocab_sizes_;
     int embedding_dim_;
     std::vector<std::string> embed_keys_;
 
-    mutable std::mutex query_result_cache_mu_;
-    mutable std::vector<QueryResult> cached_query_results_;
-    mutable bool query_result_cache_valid_ = false;
-
-    bool copy_cached_query_results(
-        std::vector<tl::expected<QueryResult, ErrorCode>>& query_results) const;
-    void update_query_result_cache(
-        const std::vector<tl::expected<QueryResult, ErrorCode>>& query_results)
-        const;
-    std::vector<tl::expected<QueryResult, ErrorCode>> get_query_results() const;
-    void invalidate_query_result_cache() const;
-
-    int prepare_lookup_rows(
-        const std::vector<std::vector<std::vector<int64_t>>>& row_ids,
-        int& B, int& L,
-        std::vector<std::vector<LookupRowRef>>& head_refs) const;
-
-    void resolve_local_tables(
-        const std::vector<tl::expected<QueryResult, ErrorCode>>& query_results,
-        std::vector<const float*>& tables, size_t row_bytes) const;
-    bool fetch_missing_tables(std::vector<const float*>& tables,
-                              size_t row_bytes) const;
-    void materialize_output(
-        const std::vector<std::vector<LookupRowRef>>& head_refs,
-        const std::vector<const float*>& tables, float* output,
-        size_t row_bytes) const;
-    int lookup_rows_flat(
-        const std::vector<std::vector<LookupRowRef>>& head_refs, int B, int L,
-        void* output_buffer, size_t output_size) const;
+    bool load_tables(std::vector<std::shared_ptr<BufferHandle>>& tables,
+                     size_t row_bytes) const;
 };
 
 }  // namespace engram

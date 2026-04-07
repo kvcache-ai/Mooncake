@@ -21,7 +21,6 @@
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/time.h>
-#include <sys/uio.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -37,7 +36,6 @@
 #include <sstream>
 #include <string_view>
 #include <thread>
-#include <vector>
 
 #include "error.h"
 
@@ -380,65 +378,6 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     }
     if (writeFully(fd, str.data(), str.size()) != (ssize_t)str.size())
         return ERR_SOCKET;
-    return 0;
-}
-
-static inline int writeStringGathered(int fd, const HandShakeRequestType type,
-                                      const std::string &str) {
-    uint8_t byte = static_cast<uint8_t>(type);
-    uint64_t length =
-        str.size() +
-        (type == HandShakeRequestType::OldProtocol ? 0 : sizeof(byte));
-
-    struct iovec iov[3];
-    int iovcnt = 0;
-    iov[iovcnt].iov_base = &length;
-    iov[iovcnt].iov_len = sizeof(length);
-    ++iovcnt;
-    if (type != HandShakeRequestType::OldProtocol) {
-        iov[iovcnt].iov_base = &byte;
-        iov[iovcnt].iov_len = sizeof(byte);
-        ++iovcnt;
-    }
-    if (!str.empty()) {
-        iov[iovcnt].iov_base = const_cast<char *>(str.data());
-        iov[iovcnt].iov_len = str.size();
-        ++iovcnt;
-    }
-
-    size_t remaining = sizeof(length);
-    if (type != HandShakeRequestType::OldProtocol) {
-        remaining += sizeof(byte);
-    }
-    remaining += str.size();
-    int current_iov = 0;
-    while (remaining > 0) {
-        ssize_t rc = writev(fd, &iov[current_iov], iovcnt - current_iov);
-        if (rc < 0 && (errno == EAGAIN || errno == EINTR)) {
-            continue;
-        } else if (rc < 0) {
-            PLOG(ERROR) << "Socket writev failed";
-            return ERR_SOCKET;
-        } else if (rc == 0) {
-            LOG(ERROR) << "Socket writev returned 0 while sending " << remaining
-                       << " bytes";
-            return ERR_SOCKET;
-        }
-
-        remaining -= rc;
-        ssize_t consumed = rc;
-        while (consumed > 0 && current_iov < iovcnt) {
-            if (consumed >= static_cast<ssize_t>(iov[current_iov].iov_len)) {
-                consumed -= static_cast<ssize_t>(iov[current_iov].iov_len);
-                ++current_iov;
-                continue;
-            }
-            iov[current_iov].iov_base =
-                static_cast<char *>(iov[current_iov].iov_base) + consumed;
-            iov[current_iov].iov_len -= consumed;
-            consumed = 0;
-        }
-    }
     return 0;
 }
 

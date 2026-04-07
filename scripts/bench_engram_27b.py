@@ -14,6 +14,9 @@ Usage:
   export MOONCAKE_MASTER=127.0.0.1:50051
   export MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata
   python scripts/bench_engram_27b.py
+
+Optional:
+  export ENGRAM_ALLOW_POPULATE_FALLBACK=1
 """
 
 import ctypes
@@ -43,6 +46,9 @@ NUM_WARMUP = 10
 NUM_ITER = 50
 TABLE_VOCAB_SIZES = [50000] * 8
 EMBEDDING_DIM = 16
+ALLOW_POPULATE_FALLBACK = (
+    os.environ.get("ENGRAM_ALLOW_POPULATE_FALLBACK", "0") == "1"
+)
 
 
 def create_engram_config():
@@ -87,12 +93,11 @@ def populate_store_via_cxl_segment(store_obj, embedding_buffers):
         raise RuntimeError("CXL mapping is too small for staging region")
 
     for head_idx, emb in enumerate(embedding_buffers):
-        raw = emb.tobytes(order="C")
-        nbytes = len(raw)
+        nbytes = emb.nbytes
         aligned = aligned_sizes[head_idx]
         if cursor + aligned > limit_addr:
             raise RuntimeError("CXL mapping is too small for benchmark tables")
-        ctypes.memmove(cursor, raw, nbytes)
+        ctypes.memmove(cursor, emb.ctypes.data, nbytes)
         key = f"engram:l1:h{head_idx}"
         rc = store_obj.put_from(key, cursor, nbytes)
         if rc != 0:
@@ -111,6 +116,8 @@ def populate_store(engram, store_obj):
     try:
         engram.populate(embedding_buffers)
     except RuntimeError:
+        if not ALLOW_POPULATE_FALLBACK:
+            raise
         protocol = os.environ.get("MOONCAKE_PROTOCOL", "")
         if protocol == "cxl":
             mode = "cxl put_from fallback"
@@ -119,7 +126,7 @@ def populate_store(engram, store_obj):
             mode = "store.put fallback"
             for head_idx, emb in enumerate(embedding_buffers):
                 key = f"engram:l1:h{head_idx}"
-                rc = store_obj.put(key, emb.tobytes())
+                rc = store_obj.put(key, emb)
                 if rc != 0:
                     raise RuntimeError(f"fallback populate failed for {key}, rc={rc}")
     populate_ms = (time.perf_counter() - t0) * 1000
@@ -198,6 +205,7 @@ def main():
     print("  Batch sizes: 1, 4, 16, 64, 128, 256")
     print(f"  Build dir: {build_dir}")
     print(f"  Protocol: {os.environ.get('MOONCAKE_PROTOCOL', '<unset>')}")
+    print(f"  Allow populate fallback: {ALLOW_POPULATE_FALLBACK}")
     print("=" * 60)
 
     config = MooncakeConfig.load_from_env()

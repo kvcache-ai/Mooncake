@@ -528,51 +528,6 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
-std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
-    const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset) {
-    std::optional<TransferFuture> future;
-
-    if (replica.is_memory_replica()) {
-        auto& mem_desc = replica.get_memory_descriptor();
-        auto& handle = mem_desc.buffer_descriptor;
-
-        size_t slices_size = 0;
-        for (const auto& s : slices) slices_size += s.size;
-        if (src_offset + slices_size > handle.size_) {
-            LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
-                       << " + slices_size=" << slices_size
-                       << " > handle.size_=" << handle.size_;
-            return std::nullopt;
-        }
-
-        TransferStrategy strategy = selectStrategy(handle, slices);
-
-        if (strategy == TransferStrategy::LOCAL_MEMCPY) {
-            future = submitMemcpyOperation(handle, slices,
-                                           TransferRequest::READ, src_offset);
-        } else if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-            future = submitTransferEngineOperation(
-                handle, slices, TransferRequest::READ, src_offset);
-        } else {
-            LOG(ERROR) << "Range read only supports LOCAL_MEMCPY or "
-                          "TRANSFER_ENGINE, got: "
-                       << strategy;
-            return std::nullopt;
-        }
-    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
-        LOG(ERROR)
-            << "Range read not supported for disk replicas (use full read)";
-        return std::nullopt;
-    }
-
-    if (future.has_value()) {
-        updateTransferMetrics(slices, TransferRequest::READ);
-    }
-
-    return future;
-}
-
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
@@ -642,87 +597,16 @@ TransferSubmitter::submit_batch_get_offload_object(
     return submitTransfer(requests);
 }
 
-std::optional<TransferFuture> TransferSubmitter::submitBatchReadRanges(
-    void* dest_buffer,
-    const std::vector<std::pair<
-        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
-        key_ranges,
-    bool enable_task_grouping) {
-    std::vector<TransferRequest> requests;
-    size_t total_ranges = 0;
-    for (const auto& [_, ranges] : key_ranges) {
-        total_ranges += ranges.size();
-    }
-    requests.reserve(total_ranges);
-    size_t grouped_task_count = 0;
-    uint64_t next_task_group_id = 0;
-
-    for (const auto& [replica, ranges] : key_ranges) {
-        if (!replica.is_memory_replica()) {
-            LOG(ERROR) << "submitBatchReadRanges: disk replicas not supported";
-            return std::nullopt;
-        }
-        const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
-        if (handle.transport_endpoint_.empty()) {
-            LOG(ERROR) << "submitBatchReadRanges: empty transport endpoint";
-            return std::nullopt;
-        }
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment for "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
-        }
-        uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-        char* dest_base = static_cast<char*>(dest_buffer);
-        const uint64_t task_group_id = enable_task_grouping
-                                           ? next_task_group_id++
-                                           : TransferRequest::kNoTaskGroup;
-        bool group_has_request = false;
-
-        for (const auto& [dest_offset, src_offset, size] : ranges) {
-            if (size == 0) continue;
-            TransferRequest request;
-            request.opcode = TransferRequest::READ;
-            request.source = dest_base + dest_offset;
-            request.target_id = seg;
-            request.target_offset = base_address + src_offset;
-            request.length = size;
-            request.task_group_id = task_group_id;
-            requests.emplace_back(request);
-            group_has_request = true;
-        }
-        if (group_has_request) {
-            grouped_task_count++;
-        }
-    }
-
-    if (requests.empty()) {
-        return TransferFuture(std::make_shared<EmptyOperationState>());
-    }
-
-    auto future =
-        submitTransfer(requests, enable_task_grouping ? grouped_task_count : 0);
-    if (future && transfer_metric_) {
-        size_t total_bytes = 0;
-        for (const auto& request : requests) {
-            total_bytes += request.length;
-        }
-        transfer_metric_->total_read_bytes.inc(total_bytes);
-    }
-    return future;
-}
-
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = src_offset;
+    uint64_t offset = 0;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -733,11 +617,13 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const void* src;
 
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local buffer)
+            // READ: from handle (remote buffer) to slice (local
+            // buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote buffer)
+            // WRITE: from slice (local buffer) to handle (remote
+            // buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
@@ -757,11 +643,9 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests, size_t batch_task_count) {
-    // Allocate batch ID using the actual logical task count when callers
-    // intentionally group multiple requests into one transfer task.
-    const size_t batch_size =
-        batch_task_count == 0 ? requests.size() : batch_task_count;
+    std::vector<TransferRequest>& requests) {
+    // Allocate batch ID
+    const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
@@ -795,7 +679,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -813,7 +697,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = src_offset;
+    uint64_t offset = 0;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];

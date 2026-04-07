@@ -2,6 +2,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstring>
+
 #include "engram/engram.h"
 #include "engram/engram_config.h"
 #include "pyclient.h"
@@ -11,6 +13,9 @@ using namespace mooncake;
 using namespace mooncake::engram;
 
 namespace {
+
+constexpr char kPyClientCapsuleName[] = "mooncake.PyClient.shared_ptr";
+constexpr char kPyClientCapsuleMethod[] = "_get_pyclient_capsule";
 
 std::vector<std::vector<std::vector<int64_t>>> py_obj_to_vec3d(py::object obj) {
     std::vector<std::vector<std::vector<int64_t>>> result;
@@ -28,32 +33,31 @@ std::vector<std::vector<std::vector<int64_t>>> py_obj_to_vec3d(py::object obj) {
     return result;
 }
 
-std::vector<std::vector<std::vector<int64_t>>> py_array_to_vec3d(
-    const py::array_t<int64_t, py::array::c_style | py::array::forcecast>&
-        arr) {
-    auto req = arr.request();
-    if (req.ndim != 3) {
-        throw std::runtime_error("row_ids array must have shape [B, L, H]");
+std::shared_ptr<PyClient> unwrap_pyclient_capsule(py::object capsule) {
+    if (capsule.is_none()) {
+        return nullptr;
     }
 
-    const auto B = static_cast<size_t>(req.shape[0]);
-    const auto L = static_cast<size_t>(req.shape[1]);
-    const auto H = static_cast<size_t>(req.shape[2]);
-    auto* data = static_cast<const int64_t*>(req.ptr);
-
-    std::vector<std::vector<std::vector<int64_t>>> result(
-        B, std::vector<std::vector<int64_t>>(L, std::vector<int64_t>(H)));
-    for (size_t b = 0; b < B; ++b) {
-        for (size_t l = 0; l < L; ++l) {
-            const size_t offset = (b * L + l) * H;
-            std::copy_n(data + offset, H, result[b][l].begin());
-        }
+    if (!PyCapsule_CheckExact(capsule.ptr())) {
+        throw std::runtime_error(
+            "store wrapper returned a non-capsule PyClient handle");
     }
-    return result;
-}
 
-std::string py_type_name(const py::handle& obj) {
-    return py::str(obj.get_type().attr("__name__"));
+    py::capsule py_client_capsule(capsule);
+    const char* capsule_name = py_client_capsule.name();
+    if (capsule_name == nullptr ||
+        std::strcmp(capsule_name, kPyClientCapsuleName) != 0) {
+        throw std::runtime_error(
+            "store wrapper returned an unexpected PyClient capsule type");
+    }
+
+    auto* ptr = static_cast<std::shared_ptr<PyClient>*>(
+        py_client_capsule.get_pointer());
+    if (ptr == nullptr) {
+        throw std::runtime_error(
+            "store wrapper returned an empty PyClient capsule");
+    }
+    return *ptr;
 }
 
 std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
@@ -66,31 +70,19 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
     } catch (const py::cast_error&) {
     }
 
-    const std::string type_name = py_type_name(store_obj);
-    if (type_name != "MooncakeDistributedStore") {
-        throw std::runtime_error("Engram store parameter must be a PyClient or "
-                                 "MooncakeDistributedStore. Got: " +
-                                 type_name);
+    if (!py::hasattr(store_obj, kPyClientCapsuleMethod)) {
+        throw std::runtime_error(
+            "Engram store parameter must be a PyClient or store wrapper that "
+            "implements _get_pyclient_capsule()");
     }
 
     try {
-        py::module store_mod = py::module::import("store");
-        py::object helper_func = store_mod.attr("_get_pyclient_from_wrapper");
-        py::object capsule = helper_func(store_obj);
-        if (capsule.is_none()) {
-            return nullptr;
-        }
-
-        auto* ptr = static_cast<std::shared_ptr<PyClient>*>(
-            py::capsule(capsule).get_pointer());
-        if (ptr == nullptr) {
-            throw std::runtime_error(
-                "store wrapper returned an empty PyClient capsule");
-        }
-        return *ptr;
+        py::object capsule =
+            store_obj.attr(kPyClientCapsuleMethod)();
+        return unwrap_pyclient_capsule(capsule);
     } catch (const py::error_already_set& e) {
         throw std::runtime_error(
-            "Failed to unwrap MooncakeDistributedStore for Engram: " +
+            "Failed to unwrap store wrapper for Engram: " +
             std::string(e.what()));
     }
 }
@@ -135,6 +127,35 @@ py::array_t<float> lookup_to_numpy(
 
     int ret = self.lookup_rows(row_ids, out_buf.ptr,
                                out_buf.size * sizeof(float));
+    if (ret != 0) {
+        throw std::runtime_error("Engram lookup failed");
+    }
+    return output;
+}
+
+py::array_t<float> lookup_array_to_numpy(
+    Engram& self,
+    const py::array_t<int64_t, py::array::c_style | py::array::forcecast>&
+        row_ids) {
+    auto req = row_ids.request();
+    if (req.ndim != 3) {
+        throw std::runtime_error("row_ids array must have shape [B, L, H]");
+    }
+
+    const int B = static_cast<int>(req.shape[0]);
+    const int L = static_cast<int>(req.shape[1]);
+    const int H = static_cast<int>(req.shape[2]);
+    if (H != self.get_num_heads()) {
+        throw std::runtime_error("row_ids last dimension must match num_heads");
+    }
+
+    const int D = self.get_embedding_dim();
+    py::array_t<float> output({B, L, H, D});
+    auto out_buf = output.request();
+
+    int ret = self.lookup_rows_contiguous(static_cast<const int64_t*>(req.ptr),
+                                          B, L, out_buf.ptr,
+                                          out_buf.size * sizeof(float));
     if (ret != 0) {
         throw std::runtime_error("Engram lookup failed");
     }
@@ -191,8 +212,7 @@ void bind_engram(py::module& m) {
                         throw std::runtime_error(
                             "row_ids array must be convertible to int64");
                     }
-                    return lookup_to_numpy(self,
-                                           py_array_to_vec3d(row_ids_array));
+                    return lookup_array_to_numpy(self, row_ids_array);
                 }
                 return lookup_to_numpy(self, py_obj_to_vec3d(row_ids_obj));
             },

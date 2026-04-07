@@ -168,10 +168,6 @@ class Client {
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices);
-    tl::expected<void, ErrorCode> Get(const std::string& object_key,
-                                      const QueryResult& query_result,
-                                      std::vector<Slice>& slices,
-                                      uint64_t src_offset);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -184,47 +180,6 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool prefer_same_node = false);
-
-    /**
-     * @brief Batch transfer read of multiple non-contiguous ranges from
-     * multiple keys in a single transfer batch.
-     * @param dest_buffer Base pointer of destination buffer
-     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
-     * size), ...])
-     * @return ErrorCode::OK on success
-     */
-    ErrorCode BatchTransferReadRanges(
-        void* dest_buffer,
-        const std::vector<
-            std::pair<Replica::Descriptor,
-                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
-            key_ranges);
-
-    /**
-     * @brief Batch transfer read of multiple remote registered buffers into
-     * local registered buffers.
-     * @param src_buffers Remote source buffer descriptors
-     * @param dest_buffers Local destination buffers
-     * @param sizes Number of bytes to read for each buffer
-     * @return ErrorCode::OK on success
-     */
-    ErrorCode BatchTransferReadBuffers(
-        const std::vector<AllocatedBuffer::Descriptor>& src_buffers,
-        const std::vector<void*>& dest_buffers,
-        const std::vector<size_t>& sizes);
-
-    /**
-     * @brief Batch transfer write of multiple local buffers into remote
-     * registered buffers.
-     * @param dest_buffers Remote destination buffer descriptors
-     * @param src_buffers Local registered source buffers
-     * @param sizes Number of bytes to write for each buffer
-     * @return ErrorCode::OK on success
-     */
-    ErrorCode BatchTransferWriteBuffers(
-        const std::vector<AllocatedBuffer::Descriptor>& dest_buffers,
-        const std::vector<void*>& src_buffers,
-        const std::vector<size_t>& sizes);
 
     /**
      * @brief Stores data with replication
@@ -588,29 +543,6 @@ class Client {
     }
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
-    /**
-     * Resolve a buffer descriptor to a directly accessible local virtual
-     * address when it lives in one of this client's mounted segments.
-     * Returns INVALID_REPLICA when no matching local mapping exists.
-     */
-    tl::expected<void*, ErrorCode> ResolveLocalBufferAddress(
-        const AllocatedBuffer::Descriptor& buffer_desc, size_t min_size = 0);
-
-    /**
-     * Resolve a memory replica to a directly accessible local virtual address
-     * when the object lives in one of this client's mounted segments.
-     * Returns INVALID_REPLICA when no matching local mapping exists.
-     */
-    tl::expected<void*, ErrorCode> ResolveLocalMemoryAddress(
-        const QueryResult& query_result, size_t min_size = 0);
-
-    int SendTransferNotifyByName(const std::string& remote_agent,
-                                 const std::string& name,
-                                 const std::string& notify_msg);
-
-    int GetTransferNotifies(
-        std::vector<TransferMetadata::NotifyDesc>& notifies);
-    const std::string& GetProtocol() const { return protocol_; }
 
    private:
     /**
@@ -639,9 +571,6 @@ class Client {
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
-    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices,
-                                uint64_t src_offset);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
