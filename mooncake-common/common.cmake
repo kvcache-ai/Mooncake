@@ -161,12 +161,20 @@ if (NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
   endif()
 endif()
 
+if (NOT DEFINED MLU_INCLUDE_DIR OR MLU_INCLUDE_DIR STREQUAL "")
+  set(MLU_INCLUDE_DIR "${NEUWARE_ROOT}/include")
+endif()
+
+if (NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
+  set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
+endif()
+
 if (USE_MLU)
   add_compile_definitions(USE_MLU)
   message(STATUS "MLU support is enabled")
-  include_directories(${NEUWARE_ROOT}/include)
-  if (EXISTS "${NEUWARE_ROOT}/lib64")
-    link_directories(${NEUWARE_ROOT}/lib64)
+  include_directories(${MLU_INCLUDE_DIR})
+  if (EXISTS "${MLU_LIB_DIR}")
+    link_directories(${MLU_LIB_DIR})
   endif()
 endif()
 
