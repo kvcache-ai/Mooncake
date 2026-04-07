@@ -315,6 +315,20 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
     }
 
+    void *real_addr;
+    size_t real_size;
+    result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
+                                  (CUdeviceptr)desc.addr);
+    if (result != CUDA_SUCCESS) {
+        LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed: "
+                     << result;
+        const uint64_t granularity = 2 * 1024 * 1024;
+        real_addr = (void *)desc.addr;
+        real_size = (desc.length + granularity - 1) & ~(granularity - 1);
+    }
+    desc.addr = (uint64_t)real_addr;
+    desc.length = real_size;
+
     desc.transports.push_back(TransportType::MNNVL);
     return Status::OK();
 }
