@@ -102,27 +102,6 @@ print(f'Initialize result: {result}')  # Should be 0
 # EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, provider: efa
 ```
 
-## Usage with vLLM
-
-### Prefill Instance
-
-```bash
-VLLM_MOONCAKE_BOOTSTRAP_PORT=8998 \
-vllm serve <model_path> -tp 8 \
-   --port 8010 \
-   --trust-remote-code \
-   --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
-```
-
-### Decode Instance
-
-```bash
-vllm serve <model_path> -tp 8 \
-   --port 8020 \
-   --trust-remote-code \
-   --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
-```
-
 ## Unit Tests
 
 Run the EFA transport unit tests (requires EFA hardware):
@@ -247,15 +226,6 @@ Key finding: **MC_SLICE_SIZE=256KB** is the single most impactful tuning knob, n
 
 Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA devices) in the same AWS placement group.
 
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
-
-| Configuration | Write | Read |
-|---------------|-------|------|
-| Single instance (block=1MB, threads=32, batch=128, buf=4GB) | 177 GB/s | — |
-| NUMA-split (block=1MB, 2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
-
-> CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
-
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs):
 
 | Configuration | Write | Read |
@@ -267,6 +237,15 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 > GPU HBM bandwidth (>3 TB/s) eliminates the memory bottleneck, allowing full EFA utilization. Write and read have different optimal thread counts: write peaks at 32 threads, read peaks at 16 threads.
 
 > **Note:** EFA memory region registration (fi_mr_reg) for GPU memory segfaults at 4GB+ per GPU. Use `--buffer_size=2147483648` (2GB) as the maximum per-GPU buffer.
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| Single instance (block=1MB, threads=32, batch=128, buf=4GB) | 179 GB/s | 185 GB/s |
+| NUMA-split (block=1MB, 2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
+
+> CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
 
 #### Cross-Transport Comparison
 
@@ -290,6 +269,74 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 - Keep `--batch_size` such that `block_size * batch_size * threads <= buffer_size`
 - Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default for CPU mode)
 - On 16-NIC instances (p5en), writes are NUMA-sensitive: 8 local-NUMA NICs reach 90 Gbps each, while 8 cross-NUMA NICs only reach ~20 Gbps without NUMA-split
+
+## Usage with vLLM
+
+### Prefill Instance
+
+```bash
+VLLM_MOONCAKE_BOOTSTRAP_PORT=8998 \
+vllm serve <model_path> -tp 8 \
+   --port 8010 \
+   --trust-remote-code \
+   --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
+```
+
+### Decode Instance
+
+```bash
+vllm serve <model_path> -tp 8 \
+   --port 8020 \
+   --trust-remote-code \
+   --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
+```
+
+## Usage with SGLang
+
+SGLang's Mooncake integration currently hardcodes the `"rdma"` protocol. To use EFA transport, apply the provided patch and set environment variables.
+
+### 1. Apply EFA Patch
+
+SGLang's transfer engine initialization needs to be patched to read the protocol from an environment variable instead of using hardcoded `"rdma"`. Use the [patch script](https://github.com/whn09/kimi-k2-sglang):
+
+```bash
+bash patch_sglang_efa.sh
+```
+
+This is idempotent and safe to rerun.
+
+### 2. Environment Variables
+
+```bash
+export MOONCAKE_PROTOCOL=efa
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export GLOO_SOCKET_IFNAME=enp71s0  # adjust to your instance's primary interface
+```
+
+For multi-node expert parallelism (EP) deployments, also set:
+
+```bash
+export NVSHMEM_REMOTE_TRANSPORT=libfabric
+export NVSHMEM_LIBFABRIC_PROVIDER=efa
+```
+
+> **Warning:** Do **not** set NVSHMEM variables on single-node deployments — doing so causes segmentation faults.
+
+### 3. Docker Launch Example
+
+```bash
+docker run -d --name sglang \
+  --runtime=nvidia --gpus all --network host \
+  --privileged --shm-size=600g \
+  --device=/dev/infiniband \
+  -e MOONCAKE_PROTOCOL=efa \
+  -e FI_PROVIDER=efa \
+  -e FI_EFA_USE_DEVICE_RDMA=1 \
+  <image> bash start.sh
+```
+
+> **Note:** Ensure the Docker image's libfabric version matches the host's EFA driver. If not, mount the host's EFA libraries into the container (see [Troubleshooting](#libfabric-version-mismatch-in-docker)).
 
 ## Technical Details
 
@@ -418,3 +465,31 @@ Without activating the environment, you may encounter:
 - `fatal error: cuda.h: No such file or directory` — CUDA headers not in include path, set `CPLUS_INCLUDE_PATH`
 - `cannot find -lcudart: No such file or directory` — CUDA libs not in library path, set `LIBRARY_PATH` and `LD_LIBRARY_PATH`
 - `ModuleNotFoundError: No module named 'mooncake.engine'` — `.so` built against wrong Python version (e.g., 3.12 vs 3.13)
+
+### libfabric version mismatch in Docker
+
+```
+fi_ep_bind (av) failed: Function not implemented
+```
+
+or:
+
+```
+undefined reference to `efadv_query_qp_wqs@EFA_1.4'
+```
+
+This happens when the Docker container's libfabric version is older than the host's EFA driver. Check with `fi_info --version` on both host and container.
+
+Solution: Mount the host's EFA libraries into the container:
+
+```bash
+docker run --gpus all --device=/dev/infiniband --net=host --privileged \
+  -v /opt/amazon/efa:/opt/amazon/efa \
+  -v /lib/x86_64-linux-gnu/libefa.so.1:/lib/x86_64-linux-gnu/libefa.so.1 \
+  -v /lib/x86_64-linux-gnu/libefa.so:/lib/x86_64-linux-gnu/libefa.so \
+  -v /lib/x86_64-linux-gnu/libibverbs.so.1:/lib/x86_64-linux-gnu/libibverbs.so.1 \
+  -e LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH \
+  -it <image>
+```
+
+Then rebuild Mooncake inside the container to link against the host's libfabric.
