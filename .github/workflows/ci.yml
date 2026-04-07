@@ -131,6 +131,23 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
+    - name: Run Go store binding integration tests
+      run: |
+        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
+          --eviction_high_watermark_ratio=0.95 \
+          --cluster_id=ci_go_test_cluster \
+          --port 50051 &
+        MASTER_PID=$!
+        sleep 3
+        cd mooncake-store/go
+        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
+        export CGO_ENABLED=1
+        export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
+        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-asio -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov"
+        ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
+        kill $MASTER_PID 2>/dev/null || true
+      shell: bash
+
     - name: Test (in build env) with coverage
       run: |
         cd build
@@ -386,6 +403,14 @@ jobs:
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
 
+    - name: Test Mooncake PyTorch Backend (CPU Only)
+      env:
+        MC_FORCE_TCP: "true"
+      run: |
+        source test_env/bin/activate
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+      shell: bash
+
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
@@ -520,7 +545,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0;2.11.0"
       shell: bash
 
     - name: Build project

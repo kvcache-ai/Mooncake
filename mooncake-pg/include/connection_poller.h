@@ -25,8 +25,8 @@ enum class PeerConnectionState {
 };
 
 struct PeerConnection {
-    static constexpr size_t CHECK_STORE_INITIAL_BACKOFF_MS = 8;
-    static constexpr size_t CHECK_STORE_MAX_BACKOFF_MS = 1024;
+    static constexpr size_t kCheckStoreInitialBackoffMs = 8;
+    static constexpr size_t kCheckStoreMaxBackoffMs = 1024;
 
     PeerConnectionState state{PeerConnectionState::WAITING_STORE};
     std::optional<BatchID> warmupBatchId{std::nullopt};
@@ -34,21 +34,21 @@ struct PeerConnection {
 
     // Back off to avoid frequently checking store.
     std::chrono::steady_clock::time_point last_check_store;
-    size_t check_store_backoff_ms{CHECK_STORE_INITIAL_BACKOFF_MS};
+    size_t check_store_backoff_ms{kCheckStoreInitialBackoffMs};
 
     void increaseCheckStoreBackoff() {
         check_store_backoff_ms =
             (std::min)(check_store_backoff_ms * 2,
-                       PeerConnection::CHECK_STORE_MAX_BACKOFF_MS);
+                       PeerConnection::kCheckStoreMaxBackoffMs);
     }
 
     void resetCheckStoreBackoff() {
-        check_store_backoff_ms = CHECK_STORE_INITIAL_BACKOFF_MS;
+        check_store_backoff_ms = kCheckStoreInitialBackoffMs;
     }
 };
 
 class ConnectionContext {
-   private:
+    static constexpr size_t kDrainPollerTimeoutMs = 5000;  // 5s
     friend class ConnectionPoller;
 
     int backendIndex_;
@@ -87,6 +87,8 @@ class ConnectionContext {
 
     std::mutex backend_wakeup_mutex_;
     std::condition_variable backend_wakeup_cv_;
+
+    bool resource_abandoned_{false};
 
    public:
     ConnectionContext(int backendIndex, int rank, int size, bool isDummy,
@@ -155,6 +157,25 @@ class ConnectionContext {
 
     void setDummy(bool isDummy) { isDummy_ = isDummy; }
 
+    /**
+     * @brief Waits for the poller to stop all peer connections gracefully.
+     *
+     * Blocks until all peer connections have transitioned to the EXPIRING state
+     * or the timeout expires. Used during shutdown to ensure no pending
+     * transfers are active before resource cleanup.
+     *
+     * @return True if all peers stopped within the timeout; false otherwise.
+     */
+    bool drainPoller() const;
+
+    /**
+     * @brief Abandons resources instead of releasing them properly.
+     *
+     * When a hung operation prevents clean shutdown, this method marks
+     * resources as abandoned to prevent crashes during cleanup.
+     */
+    void abandonResources();
+
     static std::string getServerNameStoreKey(int backendIndex, int rank) {
         return "server_name_" + std::to_string(backendIndex) + "_" +
                std::to_string(rank);
@@ -178,14 +199,15 @@ class ConnectionContext {
     // For ConnectionManager
     bool poll();
     bool tryStop();
+    bool isStopped() const;
 
     // Internal helpers
     bool pollPeer(int pollingRank);
 };
 
 class ConnectionPoller {
-    static constexpr size_t CONNECTING_IDLE_SLEEP_MS = 50;
-    static constexpr size_t ALL_CONNECTED_IDLE_SLEEP_MS = 200;
+    static constexpr size_t kConnectingIdleSleepMs = 50;
+    static constexpr size_t kAllConnectedIdleSleepMs = 200;
 
    public:
     static ConnectionPoller& GetInstance() {

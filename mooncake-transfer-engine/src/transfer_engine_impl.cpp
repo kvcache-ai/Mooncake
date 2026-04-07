@@ -242,6 +242,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_UB
+        Transport* ub_transport =
+            multi_transports_->installTransport("ub", local_topology_);
+        if (!ub_transport) {
+            LOG(ERROR) << "Failed to install ub transport";
+            return -1;
+        }
+#endif
+
 #ifdef USE_ASCEND_HETEROGENEOUS
         Transport* ascend_transport =
             multi_transports_->installTransport("ascend", local_topology_);
