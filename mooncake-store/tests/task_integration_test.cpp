@@ -580,8 +580,8 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
                 << toString(put_result.error());
         };
 
-    const auto query_segments = [&](const std::string& key)
-                                    -> std::vector<std::string> {
+    const auto query_segments =
+        [&](const std::string& key) -> std::vector<std::string> {
         auto query_result = client2_->Query(key);
         if (!query_result.has_value()) {
             ADD_FAILURE() << "Failed to query key=" << key << ": "
@@ -600,37 +600,36 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
         return segments;
     };
 
-    const auto wait_for_segments =
-        [&](const std::string& key, const std::string& required_segment,
-            const std::string& forbidden_segment) {
-            auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::seconds(10);
-            std::vector<std::string> last_segments;
-            while (std::chrono::steady_clock::now() < deadline) {
-                last_segments = query_segments(key);
-                bool has_required = false;
-                bool has_forbidden = false;
-                for (const auto& segment : last_segments) {
-                    if (segment == required_segment) {
-                        has_required = true;
-                    }
-                    if (!forbidden_segment.empty() &&
-                        segment == forbidden_segment) {
-                        has_forbidden = true;
-                    }
+    const auto wait_for_segments = [&](const std::string& key,
+                                       const std::string& required_segment,
+                                       const std::string& forbidden_segment) {
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::vector<std::string> last_segments;
+        while (std::chrono::steady_clock::now() < deadline) {
+            last_segments = query_segments(key);
+            bool has_required = false;
+            bool has_forbidden = false;
+            for (const auto& segment : last_segments) {
+                if (segment == required_segment) {
+                    has_required = true;
                 }
-                if (has_required && !has_forbidden) {
-                    return;
+                if (!forbidden_segment.empty() &&
+                    segment == forbidden_segment) {
+                    has_forbidden = true;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-            FAIL() << "Replica placement mismatch for key=" << key
-                   << ", required_segment=" << required_segment
-                   << ", forbidden_segment=" << forbidden_segment
-                   << ", last_seen="
-                   << (last_segments.empty() ? std::string("<empty>")
-                                             : last_segments.front());
-        };
+            if (has_required && !has_forbidden) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        FAIL() << "Replica placement mismatch for key=" << key
+               << ", required_segment=" << required_segment
+               << ", forbidden_segment=" << forbidden_segment << ", last_seen="
+               << (last_segments.empty() ? std::string("<empty>")
+                                         : last_segments.front());
+    };
 
     const auto assert_key_data = [&](const std::string& key,
                                      const std::string& expected_value) {
@@ -645,8 +644,7 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
 
         std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
                               expected_value.size());
-        ASSERT_EQ(read_data, expected_value)
-            << "Data mismatch for key=" << key;
+        ASSERT_EQ(read_data, expected_value) << "Data mismatch for key=" << key;
     };
 
     size_t expected_migrated_bytes = 0;
