@@ -4,6 +4,23 @@
 #include "utils/zstd_util.h"
 
 namespace mooncake {
+namespace {
+
+bool HasAllocator(const AllocatorManager& allocator_manager,
+                  const std::string& segment_name,
+                  const std::shared_ptr<BufferAllocatorBase>& allocator) {
+    if (!allocator) {
+        return false;
+    }
+    const auto* allocators = allocator_manager.getAllocators(segment_name);
+    if (allocators == nullptr) {
+        return false;
+    }
+    return std::find(allocators->begin(), allocators->end(), allocator) !=
+           allocators->end();
+}
+
+}  // namespace
 
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                                             const UUID& client_id) {
@@ -177,11 +194,11 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     std::shared_ptr<BufferAllocatorBase> allocator =
         mounted_segment.buf_allocator;
 
-    // 1. Remove from allocators
-    if (!segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                              allocator)) {
-        LOG(ERROR) << "Allocator " << segment.id << " of segment "
-                   << segment.name << " not found in allocator manager";
+    // 1. Remove from allocators if the segment is still allocatable.
+    if (HasAllocator(segment_manager_->allocator_manager_, segment.name,
+                     allocator)) {
+        segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                             allocator);
     }
 
     // 2. Remove from mounted_segment
@@ -320,34 +337,6 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
 
     used = total_used;
     capacity = total_capacity;
-
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentReadAccess::GetUnreadySegments(
-    std::vector<std::pair<Segment, UUID>>& unready_segments) const {
-    unready_segments.clear();
-
-    for (const auto& pair : segment_manager_->mounted_segments_) {
-        const auto& mounted_segment = pair.second;
-        if (mounted_segment.status != SegmentStatus::OK) {
-            UUID client_id = UUID{0, 0};
-
-            for (const auto& client_pair : segment_manager_->client_segments_) {
-                const auto& client_id_tmp = client_pair.first;
-                const auto& segment_ids = client_pair.second;
-
-                if (std::find(segment_ids.begin(), segment_ids.end(),
-                              mounted_segment.segment.id) !=
-                    segment_ids.end()) {
-                    client_id = client_id_tmp;
-                    break;
-                }
-            }
-
-            unready_segments.emplace_back(mounted_segment.segment, client_id);
-        }
-    }
 
     return ErrorCode::OK;
 }
@@ -952,13 +941,30 @@ ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
 ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const std::string& segment_name, SegmentStatus status) {
     for (auto& [_, mounted_segment] : segment_manager_->mounted_segments_) {
-        if (mounted_segment.segment.name == segment_name) {
-            if (mounted_segment.status == SegmentStatus::UNMOUNTING) {
-                return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-            }
-            mounted_segment.status = status;
+        if (mounted_segment.segment.name != segment_name) {
+            continue;
+        }
+        if (mounted_segment.status == SegmentStatus::UNMOUNTING) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        if (mounted_segment.status == status) {
             return ErrorCode::OK;
         }
+
+        auto& allocator_manager = segment_manager_->allocator_manager_;
+        const auto& allocator = mounted_segment.buf_allocator;
+        const auto& name = mounted_segment.segment.name;
+        const bool should_be_allocatable = status == SegmentStatus::OK;
+        const bool is_allocatable =
+            HasAllocator(allocator_manager, name, allocator);
+        if (should_be_allocatable && !is_allocatable && allocator) {
+            allocator_manager.addAllocator(name, allocator);
+        } else if (!should_be_allocatable && is_allocatable) {
+            allocator_manager.removeAllocator(name, allocator);
+        }
+
+        mounted_segment.status = status;
+        return ErrorCode::OK;
     }
     return ErrorCode::SEGMENT_NOT_FOUND;
 }

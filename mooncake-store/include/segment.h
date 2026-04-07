@@ -66,23 +66,6 @@ struct LocalDiskSegment {
 class SegmentManager;
 
 /**
- * @brief RAII-style read access to segment state guarded by segment mutex.
- */
-class ScopedSegmentReadAccess {
-   public:
-    explicit ScopedSegmentReadAccess(SegmentManager* segment_manager,
-                                     std::shared_mutex& mutex)
-        : segment_manager_(segment_manager), lock_(mutex) {}
-
-    ErrorCode GetUnreadySegments(
-        std::vector<std::pair<Segment, UUID>>& unready_segments) const;
-
-   private:
-    SegmentManager* segment_manager_;
-    std::shared_lock<std::shared_mutex> lock_;
-};
-
-/**
  * @brief RAII-style access to segment mutex for thread-safe segment operations
  */
 class ScopedSegmentAccess {
@@ -300,10 +283,6 @@ class SegmentManager {
         return ScopedSegmentAccess(this, segment_mutex_);
     }
 
-    ScopedSegmentReadAccess getSegmentReadAccess() {
-        return ScopedSegmentReadAccess(this, segment_mutex_);
-    }
-
     /**
      * @brief Get RAII-style access to use allocators
      * @return ScopedAllocatorAccess object that holds the lock
@@ -344,7 +323,6 @@ class SegmentManager {
         client_local_disk_segment_;  // client_id -> local_disk_segment
 
     friend class ScopedSegmentAccess;
-    friend class ScopedSegmentReadAccess;
     friend class SegmentTest;        // for unit tests
     friend class SegmentView;        // for fork serialize
     friend class SegmentSerializer;  // for fork serialize

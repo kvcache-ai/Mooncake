@@ -756,19 +756,6 @@ auto MasterService::AllocateAndInsertMetadata(
     const ReplicateConfig& config,
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    std::set<std::string> excluded_segments;
-    {
-        ScopedSegmentReadAccess segment_access =
-            segment_manager_.getSegmentReadAccess();
-        std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
-            for (const auto& [segment, _] : unready_segments) {
-                excluded_segments.insert(segment.name);
-            }
-        }
-    }
-
     std::vector<Replica> replicas;
     {
         ScopedAllocatorAccess allocator_access =
@@ -784,7 +771,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
-            preferred_segments, excluded_segments);
+            preferred_segments);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
