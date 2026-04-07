@@ -225,14 +225,14 @@ Tested on two p6-b200.48xlarge instances in the same AWS placement group.
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
-| **threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
+| block=1MB, threads=32, batch=64, buf=2GB/GPU | 285-296 GB/s | 312 GB/s |
+| **block=1MB, threads=16, batch=128, buf=2GB/GPU** | **302 GB/s** | **313 GB/s** |
 
 **CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
+| block=1MB, threads=32, batch=128, buf=4GB | **222 GB/s** (stable over 6 runs) | **226 GB/s** |
 
 <details>
 <summary>CPU Parameter Tuning History (p6-b200)</summary>
@@ -259,7 +259,7 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 | Configuration | Write | Read |
 |---------------|-------|------|
 | Single instance (block=1MB, threads=32, batch=128, buf=4GB) | 177 GB/s | — |
-| NUMA-split (2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
+| NUMA-split (block=1MB, 2 instances, 8 NICs each, threads=16, buf=2GB) | **192 GB/s** | **182 GB/s** |
 
 > CPU-to-CPU throughput is bottlenecked by DRAM bandwidth (~155 GB/s per NUMA node, measured with STREAM Copy).
 
@@ -267,9 +267,9 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| threads=8, batch=128, buf=1GB/GPU | 236 GB/s | 271 GB/s |
-| threads=16, batch=128, buf=2GB/GPU | 271 GB/s | **297-308 GB/s** |
-| **threads=32, batch=64, buf=2GB/GPU** | **337-347 GB/s** | 274 GB/s |
+| block=1MB, threads=8, batch=128, buf=1GB/GPU | 236 GB/s | 271 GB/s |
+| block=1MB, threads=16, batch=128, buf=2GB/GPU | 271 GB/s | **297-308 GB/s** |
+| **block=1MB, threads=32, batch=64, buf=2GB/GPU** | **337-347 GB/s** | 274 GB/s |
 
 > GPU HBM bandwidth (>3 TB/s) eliminates the memory bottleneck, allowing full EFA utilization. Write and read have different optimal thread counts: write peaks at 32 threads, read peaks at 16 threads.
 
