@@ -2002,7 +2002,7 @@ int RealClient::unregister_buffer(void *buffer) {
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size) {
+    size_t size, bool size_is_buffer_capacity) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2036,7 +2036,15 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
     const auto &replica = res.value();
     uint64_t total_size = calculate_total_size(replica);
-    if (size > total_size || src_offset > total_size - size) {
+
+    if (size_is_buffer_capacity) {
+        if (size < total_size) {
+            LOG(ERROR) << "User buffer too small. Required: " << total_size
+                       << ", provided: " << size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        size = total_size;
+    } else if (size > total_size || src_offset > total_size - size) {
         LOG(ERROR) << "Range overflow: src_offset=" << src_offset
                    << " + size=" << size << " > total=" << total_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2074,7 +2082,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
-    return to_py_ret(get_into_range_internal(key, buffer, 0, 0, size));
+    return to_py_ret(
+        get_into_range_internal(key, buffer, 0, 0, size, true));
 }
 
 int64_t RealClient::get_into_range(const std::string &key, void *buffer,

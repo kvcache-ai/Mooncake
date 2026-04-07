@@ -488,7 +488,7 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
