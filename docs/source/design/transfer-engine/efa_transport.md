@@ -406,20 +406,22 @@ On AWS Deep Learning AMI (e.g., Ubuntu 24.04), the system Python and CUDA toolki
 # Activate the PyTorch environment (provides Python 3.13 + CUDA toolkit)
 source /opt/pytorch/bin/activate
 
-# Set CUDA paths (nvcc and headers are inside the pip-installed nvidia packages)
+# Set CUDA paths (nvcc, headers and libs are inside the pip-installed nvidia packages)
 export CUDA_HOME=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13
 export PATH=$CUDA_HOME/bin:$PATH
 export CPLUS_INCLUDE_PATH=$CUDA_HOME/include:$CPLUS_INCLUDE_PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
+export LIBRARY_PATH=$CUDA_HOME/lib:$LIBRARY_PATH
 
 # Build with CUDA support
 cd ~/Mooncake
 mkdir -p build && cd build
-cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DCUDAToolkit_ROOT=$CUDA_HOME
+cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 make -j$(nproc)
 ```
 
 Without activating the environment, you may encounter:
 - `Could not find nvcc, please set CUDAToolkit_ROOT` — nvcc is not in PATH
-- `fatal error: cuda.h: No such file or directory` — CUDA headers not in include path
+- `fatal error: cuda.h: No such file or directory` — CUDA headers not in include path, set `CPLUS_INCLUDE_PATH`
+- `cannot find -lcudart: No such file or directory` — CUDA libs not in library path, set `LIBRARY_PATH` and `LD_LIBRARY_PATH`
 - `ModuleNotFoundError: No module named 'mooncake.engine'` — `.so` built against wrong Python version (e.g., 3.12 vs 3.13)
