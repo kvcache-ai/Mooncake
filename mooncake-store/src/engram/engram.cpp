@@ -27,7 +27,8 @@ Engram::Engram(int layer_id, const EngramConfig& config,
     for (int64_t vocab_size : table_vocab_sizes_) {
         if (vocab_size <= 0) {
             throw std::invalid_argument(
-                "EngramConfig.table_vocab_sizes must contain only positive values");
+                "EngramConfig.table_vocab_sizes must contain only positive "
+                "values");
         }
     }
 
@@ -70,7 +71,8 @@ int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
     }
 
     const int num_heads = static_cast<int>(table_vocab_sizes_.size());
-    const size_t row_bytes = static_cast<size_t>(embedding_dim_) * sizeof(float);
+    const size_t row_bytes =
+        static_cast<size_t>(embedding_dim_) * sizeof(float);
     const size_t expected_size =
         static_cast<size_t>(B) * L * num_heads * embedding_dim_ * sizeof(float);
     if (output_size < expected_size) {
@@ -94,7 +96,8 @@ int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
             const size_t row_offset =
                 token_index * static_cast<size_t>(num_heads);
             for (int h = 0; h < num_heads; ++h) {
-                const int64_t idx = row_ids[row_offset + static_cast<size_t>(h)];
+                const int64_t idx =
+                    row_ids[row_offset + static_cast<size_t>(h)];
                 if (idx < 0 || idx >= table_vocab_sizes_[h]) {
                     return fail_lookup();
                 }
@@ -103,9 +106,8 @@ int Engram::lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
                     static_cast<const float*>(tables[h]->ptr());
                 const float* src =
                     table + static_cast<size_t>(idx) * embedding_dim_;
-                float* dst =
-                    output +
-                    (row_offset + static_cast<size_t>(h)) * embedding_dim_;
+                float* dst = output + (row_offset + static_cast<size_t>(h)) *
+                                          embedding_dim_;
                 std::memcpy(dst, src, row_bytes);
             }
         }
@@ -125,7 +127,8 @@ int Engram::lookup_rows(
     const int B = static_cast<int>(row_ids.size());
     const int L = static_cast<int>(row_ids[0].size());
     const int num_heads = static_cast<int>(table_vocab_sizes_.size());
-    const size_t row_bytes = static_cast<size_t>(embedding_dim_) * sizeof(float);
+    const size_t row_bytes =
+        static_cast<size_t>(embedding_dim_) * sizeof(float);
     const size_t expected_size =
         static_cast<size_t>(B) * L * num_heads * embedding_dim_ * sizeof(float);
     if (output_size < expected_size) {
@@ -165,9 +168,8 @@ int Engram::lookup_rows(
                     static_cast<const float*>(tables[h]->ptr());
                 const float* src =
                     table + static_cast<size_t>(idx) * embedding_dim_;
-                float* dst =
-                    output +
-                    (row_offset + static_cast<size_t>(h)) * embedding_dim_;
+                float* dst = output + (row_offset + static_cast<size_t>(h)) *
+                                          embedding_dim_;
                 std::memcpy(dst, src, row_bytes);
             }
         }
@@ -226,9 +228,8 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
     }
 
     for (size_t i = 0; i < buffer_sizes.size(); ++i) {
-        const size_t expected =
-            static_cast<size_t>(table_vocab_sizes_[i]) * embedding_dim_ *
-            sizeof(float);
+        const size_t expected = static_cast<size_t>(table_vocab_sizes_[i]) *
+                                embedding_dim_ * sizeof(float);
         if (embedding_buffers[i] == nullptr || buffer_sizes[i] != expected) {
             return -1;
         }
@@ -268,7 +269,8 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
     };
 
     for (size_t i = 0; i < embedding_buffers.size(); ++i) {
-        int ret = store_->register_buffer(embedding_buffers[i], buffer_sizes[i]);
+        int ret =
+            store_->register_buffer(embedding_buffers[i], buffer_sizes[i]);
         if (ret != 0) {
             if (cleanup_registered_buffers(i)) {
                 LOG(ERROR) << "Failed to clean up registered embedding buffers "

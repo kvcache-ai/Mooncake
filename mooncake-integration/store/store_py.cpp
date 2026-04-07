@@ -1740,6 +1740,21 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("expert_id", &ParallelAxisSpec::expert_id)
         .def_readwrite("stage_id", &ParallelAxisSpec::stage_id);
 
+    auto make_pyclient_capsule =
+        [](const std::shared_ptr<PyClient> &store) -> py::object {
+        if (!store) {
+            return py::none();
+        }
+        auto ptr = std::make_unique<std::shared_ptr<PyClient>>(store);
+        std::shared_ptr<PyClient> *raw_ptr = ptr.get();
+        py::object cap =
+            py::capsule(raw_ptr, "mooncake.PyClient.shared_ptr", [](void *p) {
+                delete static_cast<std::shared_ptr<PyClient> *>(p);
+            });
+        (void)ptr.release();  // Transfer ownership to capsule
+        return cap;
+    };
+
     py::class_<TensorParallelismSpec>(m, "TensorParallelism")
         .def(py::init<>())
         .def_readwrite("axes", &TensorParallelismSpec::axes);
@@ -1799,6 +1814,12 @@ PYBIND11_MODULE(store, m) {
 
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        .def(
+            "_get_pyclient_capsule",
+            [make_pyclient_capsule](MooncakeStorePyWrapper &self)
+                -> py::object { return make_pyclient_capsule(self.store_); },
+            "Internal use: expose the underlying PyClient handle as a typed "
+            "capsule")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,

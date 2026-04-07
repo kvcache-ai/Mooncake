@@ -77,17 +77,16 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
     }
 
     try {
-        py::object capsule =
-            store_obj.attr(kPyClientCapsuleMethod)();
+        py::object capsule = store_obj.attr(kPyClientCapsuleMethod)();
         return unwrap_pyclient_capsule(capsule);
     } catch (const py::error_already_set& e) {
-        throw std::runtime_error(
-            "Failed to unwrap store wrapper for Engram: " +
-            std::string(e.what()));
+        throw std::runtime_error("Failed to unwrap store wrapper for Engram: " +
+                                 std::string(e.what()));
     }
 }
 
-py::array_t<float> require_embedding_buffer(py::handle buf, int64_t expected_rows,
+py::array_t<float> require_embedding_buffer(py::handle buf,
+                                            int64_t expected_rows,
                                             int expected_cols) {
     if (!py::isinstance<py::array>(buf)) {
         throw std::runtime_error("embedding_buffers must be NumPy arrays");
@@ -113,7 +112,8 @@ py::array_t<float> require_embedding_buffer(py::handle buf, int64_t expected_row
 }
 
 py::array_t<float> lookup_to_numpy(
-    Engram& self, const std::vector<std::vector<std::vector<int64_t>>>& row_ids) {
+    Engram& self,
+    const std::vector<std::vector<std::vector<int64_t>>>& row_ids) {
     if (row_ids.empty() || row_ids[0].empty()) {
         throw std::runtime_error("row_ids must not be empty");
     }
@@ -125,8 +125,8 @@ py::array_t<float> lookup_to_numpy(
     py::array_t<float> output({B, L, H, D});
     auto out_buf = output.request();
 
-    int ret = self.lookup_rows(row_ids, out_buf.ptr,
-                               out_buf.size * sizeof(float));
+    int ret =
+        self.lookup_rows(row_ids, out_buf.ptr, out_buf.size * sizeof(float));
     if (ret != 0) {
         throw std::runtime_error("Engram lookup failed");
     }
@@ -153,9 +153,9 @@ py::array_t<float> lookup_array_to_numpy(
     py::array_t<float> output({B, L, H, D});
     auto out_buf = output.request();
 
-    int ret = self.lookup_rows_contiguous(static_cast<const int64_t*>(req.ptr),
-                                          B, L, out_buf.ptr,
-                                          out_buf.size * sizeof(float));
+    int ret =
+        self.lookup_rows_contiguous(static_cast<const int64_t*>(req.ptr), B, L,
+                                    out_buf.ptr, out_buf.size * sizeof(float));
     if (ret != 0) {
         throw std::runtime_error("Engram lookup failed");
     }
@@ -192,22 +192,20 @@ void bind_engram(py::module& m) {
             "Remove all Mooncake Store tables owned by this Engram layer. "
             "Returns the number of removed head tables; missing keys are "
             "ignored.")
-        .def(
-            py::init([](int layer_id, const EngramConfig& cfg,
-                        py::object store_obj) {
-                std::shared_ptr<PyClient> store = unwrap_store(store_obj);
-                return new Engram(layer_id, cfg, store);
-            }),
-            py::arg("layer_id"), py::arg("config"),
-            py::arg("store") = py::none())
+        .def(py::init([](int layer_id, const EngramConfig& cfg,
+                         py::object store_obj) {
+                 std::shared_ptr<PyClient> store = unwrap_store(store_obj);
+                 return new Engram(layer_id, cfg, store);
+             }),
+             py::arg("layer_id"), py::arg("config"),
+             py::arg("store") = py::none())
         .def(
             "lookup",
             [](Engram& self, py::object row_ids_obj) {
                 if (py::isinstance<py::array>(row_ids_obj)) {
-                    auto row_ids_array =
-                        py::array_t<int64_t, py::array::c_style |
-                                                 py::array::forcecast>::ensure(
-                            row_ids_obj);
+                    auto row_ids_array = py::array_t<
+                        int64_t, py::array::c_style |
+                                     py::array::forcecast>::ensure(row_ids_obj);
                     if (!row_ids_array) {
                         throw std::runtime_error(
                             "row_ids array must be convertible to int64");
@@ -237,9 +235,8 @@ void bind_engram(py::module& m) {
                 bufs.reserve(vocab_sizes.size());
                 sizes.reserve(vocab_sizes.size());
                 for (size_t i = 0; i < vocab_sizes.size(); ++i) {
-                    auto arr = require_embedding_buffer(embedding_buffers[i],
-                                                        vocab_sizes[i],
-                                                        embed_dim);
+                    auto arr = require_embedding_buffer(
+                        embedding_buffers[i], vocab_sizes[i], embed_dim);
                     auto req = arr.request();
                     arrays.push_back(arr);
                     bufs.push_back(req.ptr);
