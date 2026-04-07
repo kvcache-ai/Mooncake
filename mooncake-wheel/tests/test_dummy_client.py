@@ -19,7 +19,7 @@ def get_client(store, local_buffer_size_param=None):
         local_buffer_size_param if local_buffer_size_param is not None
         else 512 * 1024 * 1024  # 512 MB
     )
-    real_client_address = "127.0.0.1:50052"
+    real_client_address = os.getenv("MOONCAKE_REAL_CLIENT_ENDPOINT", "127.0.0.1:50052")
 
     retcode = store.setup_dummy(
         mem_pool_size,
