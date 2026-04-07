@@ -222,8 +222,8 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
         // segment, so we need to register at segment granularity.
         CUdeviceptr base_ptr = 0;
         size_t alloc_size = 0;
-        CUresult cu_err =
-            cuMemGetAddressRange(&base_ptr, &alloc_size, (CUdeviceptr)desc.addr);
+        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
+                                               (CUdeviceptr)desc.addr);
         if (cu_err != CUDA_SUCCESS) {
             LOG(ERROR) << "NVLinkTransport: cuMemGetAddressRange failed for "
                        << "addr 0x" << std::hex << desc.addr << std::dec
@@ -273,8 +273,8 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
         // remove the right entry even for sub-allocated addresses.
         CUdeviceptr base_ptr = 0;
         size_t alloc_size = 0;
-        CUresult cu_err =
-            cuMemGetAddressRange(&base_ptr, &alloc_size, (CUdeviceptr)desc.addr);
+        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
+                                               (CUdeviceptr)desc.addr);
 
         uint64_t key = desc.addr;
         if (cu_err == CUDA_SUCCESS) {
