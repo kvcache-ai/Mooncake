@@ -31,6 +31,7 @@
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/common/utils/string_builder.h"
+#include "cuda_loader/cuda_loader.h"
 
 namespace mooncake {
 namespace tent {
@@ -62,6 +63,16 @@ static Status roundGranularity(CUmemAllocationProp &prop, size_t granularity,
 }
 
 static bool supportFabricMem() {
+    if (!cuda_loader_driver_available()) {
+        LOG(ERROR) << "CUDA Driver API not available";
+        return false;
+    }
+
+    if (!cuda_loader_is_available()) {
+        LOG(ERROR) << "CUDA Runtime API not available";
+        return false;
+    }
+
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
     if (err != cudaSuccess || num_devices == 0) {
@@ -345,8 +356,6 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     void *ptr = nullptr;
     auto result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
-        // return Status::InternalError(std::string("cuMemCreate: ") +
-        //                              std::to_string(result) + LOC_MARK);
         LOG(WARNING) << "Fallback to cudaMalloc because the platform does not "
                         "support fabric";
         return Platform::getLoader().allocate(addr, size, options);

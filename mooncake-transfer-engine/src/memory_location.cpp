@@ -37,19 +37,22 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MLU)
-    cudaPointerAttributes attributes;
-    cudaError_t result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
-                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        return entries;
-    }
+    if (gpu_runtime_available()) {
+        cudaPointerAttributes attributes;
+        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: "
+                       << result << " - " << cudaGetErrorString(result) << ")"
+                       << std::endl;
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
 
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genGpuNodeName(attributes.device)});
-        return entries;
+        if (attributes.type == cudaMemoryTypeDevice) {
+            entries.push_back(
+                {(uint64_t)start, len, genGpuNodeName(attributes.device)});
+            return entries;
+        }
     }
 #endif
 

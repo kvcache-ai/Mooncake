@@ -16,6 +16,8 @@
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
+#include "tent/platform/cpu.h"
+#include "cuda_loader/cuda_loader.h"
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
 #include "tent/platform/ascend.h"
 #else
@@ -30,7 +32,15 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     static std::once_flag flag;
     std::call_once(flag, [&]() {
 #ifdef USE_CUDA
-        g_instance = std::make_shared<CudaPlatform>(conf);
+        if (cuda_loader_is_available()) {
+            g_instance = std::make_shared<CudaPlatform>(conf);
+        } else {
+            LOG(WARNING) << "CUDA runtime libraries are not available. "
+                            "Falling back to CPU-only mode. "
+                            "GPU-related transport capabilities "
+                            "will be disabled.";
+            g_instance = std::make_shared<CpuPlatform>(conf);
+        }
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
         g_instance = std::make_shared<AscendPlatform>(conf);
 #else

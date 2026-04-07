@@ -34,6 +34,8 @@ fi
 # Add include directory for cuda_alike.h (relative to build.sh location)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 INCLUDE_LIST="${INCLUDE_LIST:+${INCLUDE_LIST} }${SCRIPT_DIR}/../include"
+# Add include directory for cuda_loader.h
+INCLUDE_LIST="${INCLUDE_LIST:+${INCLUDE_LIST} }${SCRIPT_DIR}/../../mooncake-common/cuda_loader/include"
 
 # Process include directories into flags
 INCLUDE_FLAGS=""

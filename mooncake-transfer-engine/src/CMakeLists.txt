@@ -63,9 +63,9 @@ endif()
 
 if(USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
-  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+  target_link_libraries(transfer_engine PUBLIC cuda_loader rt)
   if(USE_NVMEOF)
-    target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
+    target_link_libraries(transfer_engine PUBLIC nvmeof_transport)
   endif()
 endif()
 

@@ -214,19 +214,22 @@ static void freeMemoryPool(void *addr, size_t size) {
 #endif
     } else {
 #ifndef USE_UBSHMEM
-        // check pointer on GPU
-        cudaPointerAttributes attributes;
-        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                       "Failed to get pointer attributes");
+        if (gpu_runtime_available()) {
+            // check pointer on GPU
+            cudaPointerAttributes attributes;
+            checkCudaError(cudaPointerGetAttributes(&attributes, addr),
+                           "Failed to get pointer attributes");
 
-        if (attributes.type == cudaMemoryTypeDevice) {
-            cudaFree(addr);
-        } else if (attributes.type == cudaMemoryTypeHost ||
-                   attributes.type == cudaMemoryTypeUnregistered) {
-            numa_free(addr, size);
-        } else {
-            LOG(ERROR) << "Unknown memory type, " << addr << " "
-                       << attributes.type;
+            if (attributes.type == cudaMemoryTypeDevice) {
+                cudaFree(addr);
+            } else if (attributes.type == cudaMemoryTypeHost ||
+                       attributes.type == cudaMemoryTypeUnregistered) {
+                numa_free(addr, size);
+            } else {
+                LOG(ERROR) << "Unknown memory type, " << addr << " "
+                           << attributes.type;
+            }
+            return;
         }
 #endif
     }
@@ -234,8 +237,8 @@ static void freeMemoryPool(void *addr, size_t size) {
     if (FLAGS_protocol == "ub") {
         munmap(addr, size);  // for urma
     }
-    numa_free(addr, size);
 #endif
+    numa_free(addr, size);
 }
 
 const static std::unordered_map<std::string, uint64_t> RATE_UNIT_MP = {
