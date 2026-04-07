@@ -213,8 +213,8 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
         LOG(ERROR) << "length is 0";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Only RDMA is limited by max_mr_size due to ibv_reg_mr() hardware limits.
-    if (protocol == "rdma") {
+    // Only RDMA/EFA is limited by max_mr_size due to ibv_reg_mr() hardware limits.
+    if (protocol == "rdma" || protocol == "efa") {
         auto max_mr_size = globalConfig().max_mr_size;
         if (length > max_mr_size) {
             LOG(ERROR) << "length " << length
@@ -2041,7 +2041,7 @@ std::vector<int> Client::GetNicNumaNodes() const {
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
-    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol_);
+    auto check_result = CheckRegisterMemoryParams(buffer, size, protocol);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }

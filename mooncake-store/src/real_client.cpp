@@ -459,11 +459,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return tl::unexpected(mount_result.error());
         }
     } else {
-        // Only RDMA needs splitting due to ibv_reg_mr() hardware limits.
+        // Only RDMA/EFA needs splitting due to ibv_reg_mr() hardware limits.
         // Other transports mount as a single segment to avoid unnecessary
-        // allocator fragmentation. RDMA splits into equal-sized segments
+        // allocator fragmentation. RDMA/EFA splits into equal-sized segments
         // for balanced allocation (e.g. 1.4TB → 2×0.7TB).
-        size_t max_segment_size = (protocol == "rdma")
+        size_t max_segment_size = (protocol == "rdma" || protocol == "efa")
                                       ? globalConfig().max_mr_size
                                       : global_segment_size;
         size_t num_segments =
