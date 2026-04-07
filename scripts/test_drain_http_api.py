@@ -77,10 +77,12 @@ def ensure_non_asan(argv: list[str]) -> None:
 
 ensure_non_asan(sys.argv)
 
-if str(BUILD_PYTHON_DIR) not in sys.path:
-    sys.path.insert(0, str(BUILD_PYTHON_DIR))
-
-import store  # noqa: E402
+try:
+    from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+except ModuleNotFoundError:
+    if str(BUILD_PYTHON_DIR) not in sys.path:
+        sys.path.insert(0, str(BUILD_PYTHON_DIR))
+    from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
 
 
 class TestFailure(RuntimeError):
@@ -139,7 +141,7 @@ def wait_until(description: str, timeout_sec: float, callback):
 
 
 def endpoint_list(
-    store_client: store.MooncakeDistributedStore,
+    store_client: MooncakeDistributedStore,
     key: str,
 ) -> list[str]:
     endpoints = []
@@ -155,8 +157,8 @@ def create_store(
     metadata_url: str,
     master_addr: str,
     protocol: str,
-) -> store.MooncakeDistributedStore:
-    client = store.MooncakeDistributedStore()
+) -> MooncakeDistributedStore:
+    client = MooncakeDistributedStore()
     rc = client.setup(
         local_hostname,
         metadata_url,
@@ -172,12 +174,12 @@ def create_store(
 
 
 def put_key(
-    store_client: store.MooncakeDistributedStore,
+    store_client: MooncakeDistributedStore,
     key: str,
     value: bytes,
     preferred_segment: str,
 ) -> None:
-    replicate_config = store.ReplicateConfig()
+    replicate_config = ReplicateConfig()
     replicate_config.replica_num = 1
     replicate_config.preferred_segment = preferred_segment
     rc = store_client.put(key, value, replicate_config)
@@ -186,7 +188,7 @@ def put_key(
 
 
 def assert_key_data(
-    store_client: store.MooncakeDistributedStore,
+    store_client: MooncakeDistributedStore,
     key: str,
     expected_value: bytes,
 ) -> None:
@@ -196,7 +198,7 @@ def assert_key_data(
 
 
 def assert_key_segments(
-    store_client: store.MooncakeDistributedStore,
+    store_client: MooncakeDistributedStore,
     key: str,
     must_include: set[str] | None = None,
     must_exclude: set[str] | None = None,
@@ -218,7 +220,7 @@ def assert_key_segments(
 
 
 def wait_key_segments(
-    store_client: store.MooncakeDistributedStore,
+    store_client: MooncakeDistributedStore,
     key: str,
     timeout_sec: float,
     must_include: set[str] | None = None,
