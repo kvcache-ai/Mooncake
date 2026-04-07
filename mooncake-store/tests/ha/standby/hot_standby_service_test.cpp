@@ -55,7 +55,7 @@ class HotStandbyServiceTest : public ::testing::Test {
         config_.max_replication_lag_entries = 1000;
 
         service_ = std::make_unique<HotStandbyService>(config_);
-        etcd_endpoints_ = "http://localhost:2379";
+        oplog_endpoints_ = "http://localhost:2379";
         cluster_id_ = "test_cluster_001";
     }
 
@@ -68,7 +68,7 @@ class HotStandbyServiceTest : public ::testing::Test {
 
     HotStandbyConfig config_;
     std::unique_ptr<HotStandbyService> service_;
-    std::string etcd_endpoints_;
+    std::string oplog_endpoints_;
     std::string cluster_id_;
 };
 
@@ -109,7 +109,7 @@ TEST_F(HotStandbyServiceTest, TestStart) {
         << "Requires real etcd connection, run in integration environment.";
 #else
     ErrorCode err =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
@@ -123,10 +123,10 @@ TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
     // After the first Start fails and state becomes FAILED, the second Start
     // should still return INTERNAL_ERROR
     ErrorCode err1 =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err1);
     ErrorCode err2 =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err2);
 #endif
 }
@@ -166,7 +166,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
     // to FAILED
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
     ErrorCode err =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
@@ -193,7 +193,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
     // In non-etcd mode, the sync phase is not actually executed; just ensure
     // the call is safe
     ErrorCode err =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 #endif
 }
@@ -217,7 +217,7 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
 #else
     // In non-etcd mode, calling Start will not change applied/primary, but the
     // state machine enters FAILED
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     StandbySyncStatus status = service_->GetSyncStatus();
     EXPECT_EQ(StandbyState::FAILED, status.state);
 #endif
@@ -292,7 +292,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
                     "test warm start.";
 #else
     // In non-etcd mode, only verify that Start is safe to call
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -301,7 +301,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd and snapshot provider configuration.";
 #else
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -314,7 +314,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
     config_.enable_snapshot_bootstrap = true;
     // Recreate service to apply the new configuration
     service_.reset(new HotStandbyService(config_));
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -444,7 +444,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
 #else
     config_.enable_verification = true;
     service_.reset(new HotStandbyService(config_));
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     service_->Stop();
     SUCCEED();
 #endif
@@ -456,7 +456,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd connection to start service.";
 #else
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     service_->Stop();
     SUCCEED();
 #endif

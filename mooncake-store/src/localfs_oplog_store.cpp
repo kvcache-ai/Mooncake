@@ -29,7 +29,15 @@ LocalFsOpLogStore::LocalFsOpLogStore(const std::string& cluster_id,
       root_dir_(root_dir),
       cluster_dir_(root_dir + "/" + cluster_id),
       enable_batch_write_(enable_batch_write),
-      poll_interval_ms_(poll_interval_ms) {}
+      poll_interval_ms_(poll_interval_ms) {
+    if (!NormalizeAndValidateClusterId(cluster_id_)) {
+        LOG(FATAL) << "Invalid cluster_id for LocalFsOpLogStore: '"
+                   << cluster_id
+                   << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
+    }
+    // Rebuild cluster_dir_ after normalization.
+    cluster_dir_ = root_dir_ + "/" + cluster_id_;
+}
 
 LocalFsOpLogStore::~LocalFsOpLogStore() {
     if (batch_write_running_.load()) {

@@ -134,7 +134,7 @@ HotStandbyService::~HotStandbyService() {
 }
 
 ErrorCode HotStandbyService::Start(const std::string& primary_address,
-                                   const std::string& etcd_endpoints,
+                                   const std::string& oplog_endpoints,
                                    const std::string& cluster_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -152,7 +152,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     }
 
     config_.primary_address = primary_address;
-    etcd_endpoints_ = etcd_endpoints;
+    oplog_endpoints_ = oplog_endpoints;
     cluster_id_ = cluster_id;
 
     if (config_.enable_oplog_following) {
@@ -160,9 +160,9 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         if (config_.oplog_store_type == OpLogStoreType::ETCD) {
 #ifdef STORE_USE_ETCD
             ErrorCode err =
-                EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
+                EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
             if (err != ErrorCode::OK) {
-                LOG(ERROR) << "Failed to connect to etcd: " << etcd_endpoints;
+                LOG(ERROR) << "Failed to connect to etcd: " << oplog_endpoints;
                 state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
                 return err;
             }
@@ -511,13 +511,12 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
         return ErrorCode::OK;
     }
 
-#ifdef STORE_USE_ETCD
-    LOG(INFO) << "Final catch-up sync from etcd before promotion...";
+    LOG(INFO) << "Final catch-up sync before promotion...";
     auto catch_up_store = OpLogStoreFactory::Create(
         config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
         config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
-    if (!catch_up_store || catch_up_store->Init() != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to initialize oplog_store for final catch-up";
+    if (!catch_up_store) {
+        LOG(ERROR) << "Failed to create oplog_store for final catch-up";
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -572,11 +571,6 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     LOG(INFO) << "Final catch-up sync done. total_applied=" << total_applied
               << ", batches=" << batch_count;
     return ErrorCode::OK;
-#else
-    LOG(ERROR) << "STORE_USE_ETCD is not enabled, cannot run final OpLog "
-                  "catch-up during promotion";
-    return ErrorCode::INTERNAL_ERROR;
-#endif
 }
 
 ErrorCode HotStandbyService::Promote() {
@@ -675,11 +669,10 @@ void HotStandbyService::SetSnapshotProvider(
 }
 
 void HotStandbyService::ReplicationLoop() {
-    LOG(INFO) << "Replication loop started (etcd-based OpLog sync)";
+    LOG(INFO) << "Replication loop started (OpLog sync)";
 
-    // With etcd-based OpLog sync, OpLogReplicator handles the actual watching
-    // in its own thread. This loop now just monitors the status and updates
-    // metrics.
+    // OpLogReplicator handles the actual watching in its own thread.
+    // This loop monitors the status and updates metrics.
 
     // Create OpLogStore once before the loop to query primary sequence_id.
     // Reuse watcher_oplog_store_ if available, otherwise create a new one.
@@ -688,10 +681,8 @@ void HotStandbyService::ReplicationLoop() {
         repl_oplog_store = OpLogStoreFactory::Create(
             config_.oplog_store_type, cluster_id_, OpLogStoreRole::READER,
             config_.oplog_store_root_dir, config_.oplog_poll_interval_ms);
-        if (repl_oplog_store && repl_oplog_store->Init() != ErrorCode::OK) {
-            LOG(ERROR)
-                << "Failed to initialize oplog_store in replication loop";
-            repl_oplog_store.reset();
+        if (!repl_oplog_store) {
+            LOG(ERROR) << "Failed to create oplog_store in replication loop";
         }
     }
 

@@ -164,7 +164,7 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestPrimaryStandbySync) {
     StandbyServiceGuard guard(&standby);
 
     ASSERT_EQ(ErrorCode::OK,
-              standby.Start("", /*etcd_endpoints=*/"", cluster_id_));
+              standby.Start("", /*oplog_endpoints=*/"", cluster_id_));
 
     // 3. Wait for sync
     ASSERT_TRUE(WaitForSync(standby, last_seq_id))

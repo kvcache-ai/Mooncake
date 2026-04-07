@@ -57,6 +57,14 @@ static constexpr int kDefaultOpLogPollIntervalMs = 1000;
 
 class OpLogStoreFactory {
    public:
+    /**
+     * @brief Create and initialize an OpLogStore instance.
+     *
+     * The returned instance is fully initialized (Init() has already been
+     * called internally). Callers must NOT call Init() again.
+     * Returns nullptr if the requested backend is unavailable or
+     * initialization fails.
+     */
     static std::unique_ptr<OpLogStore> Create(
         OpLogStoreType type, const std::string& cluster_id, OpLogStoreRole role,
         const std::string& oplog_root_dir = kDefaultOpLogRootDir,

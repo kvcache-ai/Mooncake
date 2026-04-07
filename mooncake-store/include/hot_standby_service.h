@@ -91,12 +91,12 @@ class HotStandbyService {
      * following
      * @param primary_address Address of the Primary Master (not used with
      * OpLog backend-based sync)
-     * @param etcd_endpoints Comma-separated OpLog backend endpoints
+     * @param oplog_endpoints Comma-separated OpLog backend endpoints
      * @param cluster_id Cluster identifier for OpLog path
      * @return ErrorCode::OK on success
      */
     ErrorCode Start(const std::string& primary_address,
-                    const std::string& etcd_endpoints,
+                    const std::string& oplog_endpoints,
                     const std::string& cluster_id);
 
     /**
@@ -252,8 +252,8 @@ class HotStandbyService {
     std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
     std::unique_ptr<OpLogReplicator> oplog_replicator_;
 
-    // Configuration for etcd-based OpLog sync
-    std::string etcd_endpoints_;
+    // Configuration for OpLog sync
+    std::string oplog_endpoints_;
     std::string cluster_id_;
 
     // Replication state

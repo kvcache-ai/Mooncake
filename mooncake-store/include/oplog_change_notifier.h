@@ -10,9 +10,20 @@
 namespace mooncake {
 
 // Abstract interface for watching OpLog changes.
+//
+// Delivery semantics:
+//   The notifier provides **at-most-once delivery**. Its internal cursor
+//   tracks *fetch progress* (where to read from next), NOT consumer
+//   processing progress. The cursor advances unconditionally after entries
+//   are dispatched to EntryCallback, regardless of whether the callback
+//   processed them successfully.
+//
+//   Consumers (e.g. OpLogApplier) must maintain their own cursor
+//   (expected_sequence_id_) and handle gaps, duplicates, and late arrivals
+//   independently.
+//
 // Implementations: EtcdOpLogChangeNotifier (push via Watch),
-//                  (future) PollingOpLogChangeNotifier (poll via
-//                  ReadOpLogSince)
+//                  PollingOpLogChangeNotifier (poll via ReadOpLogSince)
 class OpLogChangeNotifier {
    public:
     virtual ~OpLogChangeNotifier() = default;
