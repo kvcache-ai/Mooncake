@@ -29,9 +29,12 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
 sleep 1
-mooncake_client &
+mooncake_client --endpoint_file=/tmp/mooncake_real_client.endpoint &
 CLIENT_PID=$!
-sleep 1
+sleep 3
+MOONCAKE_REAL_CLIENT_ENDPOINT=$(cat /tmp/mooncake_real_client.endpoint 2>/dev/null || echo "127.0.0.1:50052")
+export MOONCAKE_REAL_CLIENT_ENDPOINT
+echo "Real Client endpoint: $MOONCAKE_REAL_CLIENT_ENDPOINT"
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_dummy_client.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_multi_dummy_clients.py --client-id client1 &
 DUMMY_TEST_PID_1=$!
