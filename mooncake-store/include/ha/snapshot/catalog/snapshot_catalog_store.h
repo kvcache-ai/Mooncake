@@ -1,10 +1,12 @@
 #pragma once
 
+#include <charconv>
 #include <cctype>
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -19,6 +21,7 @@ namespace snapshot_catalog_store_detail {
 constexpr std::string_view kSnapshotRoot = "mooncake_master_snapshot/";
 constexpr std::string_view kSnapshotLatest = "latest.txt";
 constexpr std::string_view kSnapshotManifest = "manifest.txt";
+constexpr std::string_view kSnapshotDescriptor = "descriptor.txt";
 
 inline bool IsAsciiDigit(char ch) {
     return std::isdigit(static_cast<unsigned char>(ch)) != 0;
@@ -64,6 +67,10 @@ inline std::string BuildManifestKey(const SnapshotId& snapshot_id) {
     return BuildSnapshotPrefix(snapshot_id) + std::string(kSnapshotManifest);
 }
 
+inline std::string BuildDescriptorKey(const SnapshotId& snapshot_id) {
+    return BuildSnapshotPrefix(snapshot_id) + std::string(kSnapshotDescriptor);
+}
+
 inline std::string BuildLatestKey() {
     return std::string(kSnapshotRoot) + std::string(kSnapshotLatest);
 }
@@ -74,6 +81,42 @@ inline SnapshotDescriptor MakeSnapshotDescriptor(
     descriptor.snapshot_id = snapshot_id;
     descriptor.manifest_key = BuildManifestKey(snapshot_id);
     descriptor.object_prefix = BuildSnapshotPrefix(snapshot_id);
+    return descriptor;
+}
+
+template <typename Integer>
+inline bool ParseDecimal(std::string_view text, Integer& value) {
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto result = std::from_chars(begin, end, value);
+    return result.ec == std::errc() && result.ptr == end;
+}
+
+inline std::string SerializeSnapshotDescriptor(
+    const SnapshotDescriptor& descriptor) {
+    return std::to_string(descriptor.last_included_seq) + "|" +
+           std::to_string(descriptor.producer_view_version) + "|" +
+           std::to_string(descriptor.created_at_ms);
+}
+
+inline tl::expected<SnapshotDescriptor, ErrorCode>
+DeserializeSnapshotDescriptor(const SnapshotId& snapshot_id,
+                              std::string_view payload) {
+    const auto first = payload.find('|');
+    const auto second = first == std::string_view::npos
+                            ? std::string_view::npos
+                            : payload.find('|', first + 1);
+    if (first == std::string_view::npos || second == std::string_view::npos) {
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+
+    SnapshotDescriptor descriptor = MakeSnapshotDescriptor(snapshot_id);
+    if (!ParseDecimal(payload.substr(0, first), descriptor.last_included_seq) ||
+        !ParseDecimal(payload.substr(first + 1, second - first - 1),
+                      descriptor.producer_view_version) ||
+        !ParseDecimal(payload.substr(second + 1), descriptor.created_at_ms)) {
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
     return descriptor;
 }
 

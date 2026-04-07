@@ -12,6 +12,7 @@
 #include "connection_poller.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
+#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -68,18 +69,18 @@ class MooncakeP2PWork : public ::c10d::Work {
             return true;
         }
 
-        auto start = std::chrono::steady_clock::now();
-        while (!completed_->load(std::memory_order_acquire)) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                      start);
-            if (timeout.count() > 0 && elapsed >= timeout) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        BackoffWaiterConfig cfg{};
+        cfg.max_sleep = std::chrono::microseconds(10);
+        BackoffWaiter waiter(cfg);
+
+        if (timeout.count() > 0) {
+            return waiter.wait_for(timeout, [this] {
+                return completed_->load(std::memory_order_acquire);
+            });
         }
 
+        waiter.wait(
+            [this] { return completed_->load(std::memory_order_acquire); });
         return true;
     }
 
@@ -617,7 +618,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
             [=](void*, size_t, size_t) {});
     } else {
         auto device_index = at::cuda::current_device();
-        auto stream = c10::cuda::getDefaultCUDAStream(device_index);
+        auto stream = at::cuda::getCurrentCUDAStream(device_index);
         return worker_->putTaskCuda(
             c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
             connection_ctx_, stream, [=](void*, size_t, size_t) {},
@@ -775,28 +776,52 @@ void MooncakeBackend::shutdown() {
     }
     isShutdown_ = true;
 
-    p2p_device_worker_->removeProxy(p2p_proxy_);
-    p2p_proxy_.reset();
+    // If we encounter any hung operations, don't release resources
+    // to avoid potential crash. Instead, we allow those resources to leak
+    // and rely on the OS to reclaim them later.
+    bool has_hung_operation = false;
 
+    // Phase 1: Drain P2P tasks
+    p2p_device_worker_->removeProxy(p2p_proxy_);
+    has_hung_operation |= !p2p_proxy_->DrainTasks();
+
+    // Phase 2: Drain collective tasks for this backend
+    has_hung_operation |= !worker_->drainTasks(meta_.get());
+
+    // Phase 3: Drain warm-up transfers for connection poller
     connection_ctx_->shutdown();
     if (connectionPollerRegistered_) {
         ConnectionPoller::GetInstance().removeContext(connection_ctx_);
+        has_hung_operation |= !connection_ctx_->drainPoller();
         connectionPollerRegistered_ = false;
     }
 
-    for (size_t i = 0; i < 2; i++) {
-        engine_->unregisterLocalMemory(cpu_sync_send_region_[i]);
-        engine_->unregisterLocalMemory(cpu_sync_recv_region_[i]);
-        engine_->unregisterLocalMemory(send_buffer_[i]);
-        engine_->unregisterLocalMemory(recv_buffer_[i]);
-        delete[] cpu_sync_send_region_[i];
-        delete[] cpu_sync_recv_region_[i];
-        if (isCpu_) {
-            free(send_buffer_[i]);
-            free(recv_buffer_[i]);
-        } else {
-            cudaFree(send_buffer_[i]);
-            cudaFree(recv_buffer_[i]);
+    // Phase 4: CUDA synchronization
+    if (!isCpu_ && !has_hung_operation) {
+        cudaDeviceSynchronize();
+    }
+
+    // Phase 5: Release resources if no hung operations
+    if (has_hung_operation) {
+        p2p_proxy_->AbandonResources();
+        connection_ctx_->abandonResources();
+    }
+
+    if (!has_hung_operation) {
+        for (size_t i = 0; i < 2; i++) {
+            engine_->unregisterLocalMemory(cpu_sync_send_region_[i]);
+            engine_->unregisterLocalMemory(cpu_sync_recv_region_[i]);
+            engine_->unregisterLocalMemory(send_buffer_[i]);
+            engine_->unregisterLocalMemory(recv_buffer_[i]);
+            delete[] cpu_sync_send_region_[i];
+            delete[] cpu_sync_recv_region_[i];
+            if (isCpu_) {
+                free(send_buffer_[i]);
+                free(recv_buffer_[i]);
+            } else {
+                cudaFree(send_buffer_[i]);
+                cudaFree(recv_buffer_[i]);
+            }
         }
     }
 }
@@ -854,21 +879,20 @@ void MooncakeBackend::waitForExtensionState() {
     auto active_ranks_key = ConnectionContext::getExtensionActiveRanksStoreKey(
         meta_->backendIndex, rank_);
 
-    while (true) {
-        if (meta_->store->check({task_count_key, active_ranks_key})) {
-            auto task_count_data = meta_->store->get(task_count_key);
-            std::string task_count(task_count_data.begin(),
-                                   task_count_data.end());
-            meta_->taskCount = std::stoi(task_count);
+    BackoffWaiter waiter(
+        BackoffWaiterConfig::constantSleep(std::chrono::milliseconds(50)));
 
-            auto active_ranks = meta_->store->get(active_ranks_key);
-            deserializeActiveRanks(active_ranks, meta_->activeRanks,
-                                   meta_->size);
-            syncActiveRanksTensor();
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    waiter.wait([&] {
+        return meta_->store->check({task_count_key, active_ranks_key});
+    });
+
+    auto task_count_data = meta_->store->get(task_count_key);
+    std::string task_count(task_count_data.begin(), task_count_data.end());
+    meta_->taskCount = std::stoi(task_count);
+
+    auto active_ranks = meta_->store->get(active_ranks_key);
+    deserializeActiveRanks(active_ranks, meta_->activeRanks, meta_->size);
+    syncActiveRanksTensor();
 }
 
 int MooncakeBackend::getNumSyncedRanks() {

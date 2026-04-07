@@ -23,11 +23,20 @@ RUN apt-get install -y libibverbs-dev \
     libhiredis-dev \
     libyaml-cpp-dev \
     libjemalloc-dev \
+    libzstd-dev \
+    libmsgpack-dev \
+    libgflags-dev \
     pkg-config \
     patchelf
 
-RUN wget https://go.dev/dl/go1.22.12.linux-amd64.tar.gz \
-    && tar -C /usr/local -xzf go1.22.12.linux-amd64.tar.gz
+RUN GO_VERSION="1.23.8" && \
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then GOARCH="arm64"; \
+    elif [ "$ARCH" = "x86_64" ]; then GOARCH="amd64"; \
+    else echo "Unsupported architecture: $ARCH" && exit 1; fi && \
+    wget https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz \
+    && tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz \
+    && rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
 
 RUN git clone https://github.com/alibaba/yalantinglibs.git \
     && cd yalantinglibs \

@@ -219,6 +219,25 @@ class RealClient : public PyClient {
                   const std::vector<std::span<const char>> &values,
                   const ReplicateConfig &config = ReplicateConfig{});
 
+    int upsert(const std::string &key, std::span<const char> value,
+               const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_from(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_parts(const std::string &key,
+                     std::vector<std::span<const char>> values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
     [[nodiscard]] std::string get_hostname() const;
 
     /**
@@ -342,6 +361,29 @@ class RealClient : public PyClient {
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);
 
+    tl::expected<void, ErrorCode> upsert_dummy_helper(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_parts_dummy_helper(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_from_dummy_helper(
+        const std::string &key, uint64_t dummy_buffer, size_t size,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_batch_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config, const UUID &client_id);
+
     tl::expected<void, ErrorCode> put_batch_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<std::span<const char>> &values,
@@ -454,6 +496,34 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> upsert_internal(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> upsert_parts_internal(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_batch_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,

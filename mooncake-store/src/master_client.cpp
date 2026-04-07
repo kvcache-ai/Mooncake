@@ -93,6 +93,36 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UpsertStart> {
+    static constexpr const char* value = "UpsertStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpsertStart> {
+    static constexpr const char* value = "BatchUpsertStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UpsertEnd> {
+    static constexpr const char* value = "UpsertEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpsertEnd> {
+    static constexpr const char* value = "BatchUpsertEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UpsertRevoke> {
+    static constexpr const char* value = "UpsertRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchUpsertRevoke> {
+    static constexpr const char* value = "BatchUpsertRevoke";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
 };
@@ -529,6 +559,95 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterClient::UpsertStart(const std::string& key,
+                          const std::vector<size_t>& slice_lengths,
+                          const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::UpsertStart");
+    timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
+
+    uint64_t total_slice_length = 0;
+    for (const auto& slice_length : slice_lengths) {
+        total_slice_length += slice_length;
+    }
+
+    auto result = invoke_rpc<&WrappedMasterService::UpsertStart,
+                             std::vector<Replica::Descriptor>>(
+        client_id_, key, total_slice_length, config);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterClient::BatchUpsertStart(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<uint64_t>>& slice_lengths,
+    const ReplicateConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchUpsertStart");
+    timer.LogRequest("keys_count=", keys.size());
+
+    std::vector<uint64_t> total_slice_lengths;
+    total_slice_lengths.reserve(slice_lengths.size());
+    for (const auto& key_slices : slice_lengths) {
+        uint64_t total = 0;
+        for (const auto& sl : key_slices) {
+            total += sl;
+        }
+        total_slice_lengths.emplace_back(total);
+    }
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
+                                   std::vector<Replica::Descriptor>>(
+        keys.size(), client_id_, keys, total_slice_lengths, config);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
+    const std::string& key, ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
+    timer.LogRequest("key=", key);
+
+    auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
+        client_id_, key, replica_type);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
+    timer.LogRequest("keys_count=", keys.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
+        keys.size(), client_id_, keys);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
+    const std::string& key, ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
+    timer.LogRequest("key=", key);
+
+    auto result = invoke_rpc<&WrappedMasterService::UpsertRevoke, void>(
+        client_id_, key, replica_type);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
+    timer.LogRequest("keys_count=", keys.size());
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
+            keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

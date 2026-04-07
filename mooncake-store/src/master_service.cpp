@@ -729,6 +729,64 @@ auto MasterService::GetReplicaList(const std::string& key)
                                   default_kv_lease_ttl_);
 }
 
+auto MasterService::AllocateAndInsertMetadata(
+    MetadataShardAccessorRW& shard, const UUID& client_id,
+    const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config,
+    const std::chrono::system_clock::time_point& now)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    std::vector<Replica> replicas;
+    {
+        ScopedAllocatorAccess allocator_access =
+            segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+        std::vector<std::string> preferred_segments;
+        if (!config.preferred_segment.empty()) {
+            preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
+        }
+
+        auto allocation_result = allocation_strategy_->Allocate(
+            allocator_manager, value_length, config.replica_num,
+            preferred_segments);
+
+        if (!allocation_result.has_value()) {
+            VLOG(1) << "Failed to allocate replicas for key=" << key
+                    << ", error: " << allocation_result.error();
+            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            need_eviction_ = true;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        replicas = std::move(allocation_result.value());
+    }
+
+    if (use_disk_replica_) {
+        std::string file_path =
+            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
+        replicas.emplace_back(file_path, value_length,
+                              ReplicaStatus::PROCESSING);
+    }
+
+    std::vector<Replica::Descriptor> replica_list;
+    replica_list.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        replica_list.emplace_back(replica.get_descriptor());
+    }
+
+    shard->metadata.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
+                              config.with_soft_pin, config.with_hard_pin));
+    shard->processing_keys.insert(key);
+
+    return replica_list;
+}
+
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
@@ -740,8 +798,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate slice lengths
-    uint64_t total_length = 0;
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
         LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
@@ -749,11 +805,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                    << ", error=invalid_slice_size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    total_length += slice_length;
 
-    VLOG(1) << "key=" << key << ", value_length=" << total_length
-            << ", slice_length=" << slice_length << ", config=" << config
-            << ", action=put_start_begin";
+    VLOG(1) << "key=" << key << ", value_length=" << slice_length
+            << ", config=" << config << ", action=put_start_begin";
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
@@ -783,62 +837,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
     }
 
-    // Allocate replicas
-    std::vector<Replica> replicas;
-    {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-
-        std::vector<std::string> preferred_segments;
-        if (!config.preferred_segment.empty()) {
-            preferred_segments.push_back(config.preferred_segment);
-        } else if (!config.preferred_segments.empty()) {
-            preferred_segments = config.preferred_segments;
-        }
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, slice_length, config.replica_num,
-            preferred_segments);
-
-        if (!allocation_result.has_value()) {
-            VLOG(1) << "Failed to allocate all replicas for key=" << key
-                    << ", error: " << allocation_result.error();
-            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            need_eviction_ = true;
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        replicas = std::move(allocation_result.value());
-    }
-
-    // If disk replica is enabled, allocate a disk replica
-    if (use_disk_replica_) {
-        // Allocate a file path for the disk replica
-        std::string file_path =
-            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
-        replicas.emplace_back(file_path, total_length,
-                              ReplicaStatus::PROCESSING);
-    }
-
-    std::vector<Replica::Descriptor> replica_list;
-    replica_list.reserve(replicas.size());
-    for (const auto& replica : replicas) {
-        replica_list.emplace_back(replica.get_descriptor());
-    }
-
-    // No need to set lease here. The object will not be evicted until
-    // PutEnd is called.
-    shard->metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
-    // Also insert the metadata into processing set for monitoring.
-    shard->processing_keys.insert(key);
-
-    return replica_list;
+    return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                     config, now);
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
@@ -1008,6 +1008,236 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
         results.emplace_back(PutRevoke(client_id, key, ReplicaType::MEMORY));
     }
     return results;
+}
+
+// UpsertStart — insert-or-update entry point.
+//
+// Three-way dispatch depending on key state:
+//   Case A: key does not exist  → allocate new buffers (same as PutStart)
+//   Case B: key exists, same size → in-place update (reuse existing buffers)
+//   Case C: key exists, different size → discard old + allocate new
+//
+// Before reaching Case B/C the function runs safety checks and may preempt
+// an in-progress Put/Upsert on the same key.  Preempted PROCESSING replicas
+// are moved to discarded_replicas_ for delayed release (the previous writer
+// may still be performing RDMA writes to those buffers).
+//
+// Note: during Case B the key is temporarily unreadable (all replicas are
+// PROCESSING).  Readers will get REPLICA_IS_NOT_READY until UpsertEnd.
+auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
+                                const uint64_t slice_length,
+                                const ReplicateConfig& config)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    // --- Parameter validation (same as PutStart) ---
+    if (config.replica_num == 0 || key.empty() || slice_length == 0) {
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", slice_length=" << slice_length
+                   << ", key_size=" << key.size() << ", error=invalid_params";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
+        (slice_length > kMaxSliceSize)) {
+        LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
+                   << ", max_size=" << kMaxSliceSize
+                   << ", error=invalid_slice_size";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    VLOG(1) << "key=" << key << ", value_length=" << slice_length
+            << ", config=" << config << ", action=upsert_start_begin";
+
+    // --- Lock acquisition ---
+    // snapshot_mutex_ (shared): allows concurrent reads/writes, blocks only
+    //   during full metadata snapshots.
+    // shard lock (exclusive via MetadataShardAccessorRW): serializes all
+    //   operations on keys that hash to the same shard.
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRW shard(this, getShardIndex(key));
+
+    const auto now = std::chrono::system_clock::now();
+    auto it = shard->metadata.find(key);
+
+    // --- Step 0: stale handle cleanup ---
+    // If all memory replicas point to unmounted segments (node crashed and
+    // restarted), the metadata is useless — erase it and treat as new key.
+    if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
+        shard->processing_keys.erase(key);
+        shard->metadata.erase(it);
+        it = shard->metadata.end();
+    }
+
+    // --- Step 1: safety checks and preemption (only if key exists) ---
+    if (it != shard->metadata.end()) {
+        auto& metadata = it->second;
+
+        // Reject if a Copy/Move task is actively reading this key's replicas.
+        // Writing during replication would corrupt the copy.
+        if (shard->replication_tasks.count(key) > 0) {
+            LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
+            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        }
+
+        // Reject if an offload-to-disk task is in progress (same reason).
+        if (shard->offloading_tasks.count(key) > 0) {
+            LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
+            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        }
+
+        // Preempt an in-progress Put/Upsert on the same key.  The previous
+        // writer's PROCESSING replicas are moved to discarded_replicas_ with a
+        // TTL so they are not freed while the old writer may still be doing
+        // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
+        // UpsertStart preempts immediately.
+        if (shard->processing_keys.count(key) > 0) {
+            auto processing_replicas =
+                metadata.PopReplicas(&Replica::fn_is_processing);
+            if (!processing_replicas.empty()) {
+                std::lock_guard lock(discarded_replicas_mutex_);
+                discarded_replicas_.emplace_back(
+                    std::move(processing_replicas),
+                    now + put_start_release_timeout_sec_);
+            }
+            shard->processing_keys.erase(key);
+
+            // If no COMPLETE replicas survive the preemption, this key
+            // effectively does not exist — fall through to Case A.
+            if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                shard->metadata.erase(it);
+                it = shard->metadata.end();
+            }
+        }
+    }
+
+    // --- Case A: key does not exist (or was erased above) ---
+    // Allocate fresh buffers, identical to PutStart.
+    if (it == shard->metadata.end()) {
+        VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
+        return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                         config, now);
+    }
+
+    // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
+    auto& metadata = it->second;
+
+    // Reject if any reader holds a reference (refcnt > 0).  Overwriting a
+    // buffer that an RDMA read is streaming from would cause data corruption.
+    // The client should retry after readers finish.
+    if (metadata.HasReplica(&Replica::fn_is_busy)) {
+        LOG(INFO) << "key=" << key << ", error=object_replica_busy";
+        return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+    }
+
+    if (metadata.size == slice_length) {
+        // --- Case B: same size — in-place update ---
+        // Reuse existing buffer addresses.  No allocation or deallocation.
+        // The client will RDMA-write new data to the same addresses.
+        //
+        // hard_pinned is const and preserved automatically — upsert does not
+        // change the eviction protection level of an existing object.
+        metadata.client_id = client_id;
+        metadata.put_start_time = now;
+
+        // Reconcile soft_pin state with the incoming config.
+        {
+            SpinLocker locker(&metadata.lock);
+            if (config.with_soft_pin && !metadata.soft_pin_timeout) {
+                metadata.soft_pin_timeout.emplace();
+                MasterMetricManager::instance().inc_soft_pin_key_count(1);
+            } else if (!config.with_soft_pin && metadata.soft_pin_timeout) {
+                metadata.soft_pin_timeout.reset();
+                MasterMetricManager::instance().dec_soft_pin_key_count(1);
+            }
+        }
+
+        // Mark COMPLETE → PROCESSING so readers won't see stale data
+        // mid-transfer.  The key becomes unreadable until UpsertEnd.
+        metadata.VisitReplicas(&Replica::fn_is_completed, [](Replica& replica) {
+            replica.mark_processing();
+        });
+
+        shard->processing_keys.insert(key);
+
+        // Return the existing descriptors — same buffer addresses as before.
+        std::vector<Replica::Descriptor> replica_list;
+        const auto& all_replicas = metadata.GetAllReplicas();
+        replica_list.reserve(all_replicas.size());
+        for (const auto& replica : all_replicas) {
+            replica_list.emplace_back(replica.get_descriptor());
+        }
+
+        VLOG(1) << "key=" << key << ", action=upsert_start_case_b_inplace";
+        return replica_list;
+    }
+
+    // --- Case C: different size — discard old replicas and reallocate ---
+    // Old buffers cannot be reused.  Move them to discarded_replicas_ for
+    // delayed release (readers may still hold descriptors without refcnt),
+    // then allocate fresh buffers at the new size.
+    //
+    // Preserve hard_pin and soft_pin from the old metadata so that eviction
+    // protection survives a size-changing upsert (RFC §2.2.2).
+    ReplicateConfig merged_config = config;
+    merged_config.with_hard_pin =
+        merged_config.with_hard_pin || metadata.IsHardPinned();
+    merged_config.with_soft_pin =
+        merged_config.with_soft_pin || metadata.IsSoftPinned();
+
+    auto old_replicas = metadata.PopReplicas();
+    if (!old_replicas.empty()) {
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.emplace_back(std::move(old_replicas),
+                                         now + put_start_release_timeout_sec_);
+    }
+    shard->metadata.erase(it);
+
+    VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
+    return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
+                                     merged_config, now);
+}
+
+auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
+                              ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, key, replica_type);
+}
+
+auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
+                                 ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutRevoke(client_id, key, replica_type);
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterService::BatchUpsertStart(const UUID& client_id,
+                                const std::vector<std::string>& keys,
+                                const std::vector<uint64_t>& slice_lengths,
+                                const ReplicateConfig& config) {
+    if (keys.size() != slice_lengths.size()) {
+        LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
+                   << " != slice_lengths.size()=" << slice_lengths.size();
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results;
+    results.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results.emplace_back(
+            UpsertStart(client_id, keys[i], slice_lengths[i], config));
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
+    const UUID& client_id, const std::vector<std::string>& keys) {
+    return BatchPutEnd(client_id, keys);
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys) {
+    return BatchPutRevoke(client_id, keys);
 }
 
 auto MasterService::EvictDiskReplica(const UUID& client_id,

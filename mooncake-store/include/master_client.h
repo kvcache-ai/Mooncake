@@ -198,6 +198,36 @@ class MasterClient {
         const std::vector<std::string>& keys);
 
     /**
+     * @brief Starts an upsert operation (insert or update)
+     * @param key Object key
+     * @param slice_lengths Vector of slice lengths
+     * @param config Replication configuration
+     * @return Replica descriptors on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    UpsertStart(const std::string& key,
+                const std::vector<size_t>& slice_lengths,
+                const ReplicateConfig& config);
+
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const std::vector<std::string>& keys,
+                     const std::vector<std::vector<uint64_t>>& slice_lengths,
+                     const ReplicateConfig& config);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
+        const std::string& key, ReplicaType replica_type);
+
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const std::vector<std::string>& keys);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
+        const std::string& key, ReplicaType replica_type);
+
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const std::vector<std::string>& keys);
+
+    /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
      * @param force If true, skip lease and replication task checks

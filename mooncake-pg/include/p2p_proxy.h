@@ -5,6 +5,7 @@
 #include <torch/torch.h>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -57,6 +58,8 @@ struct P2PControlSlot {
 
 class P2PDeviceWorker;
 class P2PProxy {
+    static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
+
    public:
     friend class P2PDeviceWorker;
 
@@ -100,6 +103,26 @@ class P2PProxy {
     void EnqueueRecv(RecvOp op);
 
     void ResetPeerState(int peer_rank);
+
+    /**
+     * @brief Waits for all active P2P send and receive tasks to complete.
+     *
+     * Used during graceful shutdown to ensure no pending P2P operations
+     * are active before releasing resources. Blocks until all tasks complete
+     * or the timeout expires.
+     *
+     * @return True if all tasks completed within the timeout; false if timed
+     * out.
+     */
+    bool DrainTasks() const;
+
+    /**
+     * @brief Abandons resources instead of releasing them properly.
+     *
+     * When a hung operation prevents clean shutdown, this method marks
+     * resources as abandoned to prevent crashes during destructor.
+     */
+    void AbandonResources();
 
    private:
     enum class TransferState {
@@ -233,6 +256,7 @@ class P2PProxy {
     int cuda_device_index_ = -1;
     std::string location_;
     P2PResources resources_;
+    bool resource_abandoned_{false};
 
     std::queue<SendOpContext> send_queue_;
     std::mutex send_queue_mutex_;

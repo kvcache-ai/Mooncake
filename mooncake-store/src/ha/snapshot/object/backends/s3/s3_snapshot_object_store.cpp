@@ -44,6 +44,8 @@ class S3SnapshotObjectStore::Impl {
     S3Helper s3_helper_;
 };
 
+S3SnapshotObjectStore::~S3SnapshotObjectStore() = default;
+
 S3SnapshotObjectStore::S3SnapshotObjectStore()
     : impl_(std::make_unique<Impl>()) {
     LOG(INFO) << "S3SnapshotObjectStore initialized";

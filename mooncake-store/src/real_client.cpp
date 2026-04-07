@@ -2220,6 +2220,396 @@ int RealClient::put_from(const std::string &key, void *buffer, size_t size,
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
+// --- Upsert implementations ---
+
+tl::expected<void, ErrorCode> RealClient::upsert_internal(
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
+    if (!alloc_result) {
+        LOG(ERROR) << "Failed to allocate buffer for upsert operation, key: "
+                   << key << ", value size: " << value.size();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &buffer_handle = *alloc_result;
+    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+
+    std::vector<Slice> slices = split_into_slices(buffer_handle);
+
+    auto result = client_->Upsert(key, slices, config);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+int RealClient::upsert(const std::string &key, std::span<const char> value,
+                       const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_internal(key, value, config, client_buffer_allocator_));
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_dummy_helper(
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+    return upsert_internal(key, value, config, context.client_buffer_allocator);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
+    const std::string &key, void *buffer, size_t size,
+    const ReplicateConfig &config) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (size == 0) {
+        LOG(WARNING) << "Attempting to upsert empty data for key: " << key;
+        return {};
+    }
+
+    std::vector<mooncake::Slice> slices;
+    uint64_t offset = 0;
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    auto result = client_->Upsert(key, slices, config);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+int RealClient::upsert_from(const std::string &key, void *buffer, size_t size,
+                            const ReplicateConfig &config) {
+    return to_py_ret(upsert_from_internal(key, buffer, size, config));
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
+                                       const std::vector<void *> &buffers,
+                                       const std::vector<size_t> &sizes,
+                                       const ReplicateConfig &config) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<mooncake::Slice> slices;
+        uint64_t offset = 0;
+        while (offset < sizes[i]) {
+            auto chunk_size = std::min(sizes[i] - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+        ordered_batched_slices.emplace_back(std::move(slices));
+    }
+
+    return client_->BatchUpsert(keys, ordered_batched_slices, config);
+}
+
+std::vector<int> RealClient::batch_upsert_from(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    auto internal_results =
+        batch_upsert_from_internal(keys, buffers, sizes, config);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto &result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t size,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    for (const auto &shm : context.mapped_shms) {
+        if (dummy_buffer >= shm.dummy_base_addr &&
+            dummy_buffer + size <= shm.dummy_base_addr + shm.shm_size) {
+            void *real_buffer =
+                reinterpret_cast<void *>(dummy_buffer + shm.shm_addr_offset);
+            return upsert_from_internal(key, real_buffer, size, config);
+        }
+    }
+
+    LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
+               << ") not found in any mapped shared memory for client "
+               << client_id;
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    std::vector<void *> buffers;
+    buffers.reserve(dummy_buffers.size());
+    const MappedShm *last_hit_shm = nullptr;
+
+    for (size_t i = 0; i < dummy_buffers.size(); ++i) {
+        uint64_t dummy_addr = dummy_buffers[i];
+        size_t size = sizes[i];
+        bool found = false;
+
+        if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
+            dummy_addr + size <=
+                last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
+            buffers.push_back(reinterpret_cast<void *>(
+                dummy_addr + last_hit_shm->shm_addr_offset));
+            found = true;
+        } else {
+            for (const auto &shm : context.mapped_shms) {
+                if (dummy_addr >= shm.dummy_base_addr &&
+                    dummy_addr + size <= shm.dummy_base_addr + shm.shm_size) {
+                    buffers.push_back(reinterpret_cast<void *>(
+                        dummy_addr + shm.shm_addr_offset));
+                    found = true;
+                    last_hit_shm = &shm;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            LOG(ERROR) << "Dummy buffer at " << dummy_addr << " (size " << size
+                       << ") not found in any mapped shared memory for client "
+                       << client_id;
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+    return batch_upsert_from_internal(keys, buffers, sizes, config);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    size_t total_size = 0;
+    for (const auto &value : values) {
+        total_size += value.size_bytes();
+    }
+    if (total_size == 0) {
+        LOG(WARNING) << "Attempting to upsert empty data for key: " << key;
+        return {};
+    }
+
+    auto alloc_result = client_buffer_allocator->allocate(total_size);
+    if (!alloc_result) {
+        LOG(ERROR)
+            << "Failed to allocate buffer for upsert_parts operation, key: "
+            << key << ", total size: " << total_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &buffer_handle = *alloc_result;
+    size_t offset = 0;
+    for (const auto &value : values) {
+        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+               value.size_bytes());
+        offset += value.size_bytes();
+    }
+
+    std::vector<Slice> slices = split_into_slices(buffer_handle);
+
+    auto result = client_->Upsert(key, slices, config);
+    if (!result) {
+        LOG(ERROR) << "Upsert operation failed with error: "
+                   << toString(result.error());
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+int RealClient::upsert_parts(const std::string &key,
+                             std::vector<std::span<const char>> values,
+                             const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_parts_internal(key, values, config, client_buffer_allocator_));
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_parts_dummy_helper(
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+    return upsert_parts_internal(key, values, config,
+                                 context.client_buffer_allocator);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (keys.size() != values.size()) {
+        LOG(ERROR) << "Key and value size mismatch";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<BufferHandle> buffer_handles;
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto &key = keys[i];
+        auto &value = values[i];
+        auto alloc_result =
+            client_buffer_allocator->allocate(value.size_bytes());
+        if (!alloc_result) {
+            LOG(ERROR)
+                << "Failed to allocate buffer for upsert_batch operation, key: "
+                << key << ", value size: " << value.size();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto &buffer_handle = *alloc_result;
+        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto slices = split_into_slices(buffer_handle);
+        buffer_handles.emplace_back(std::move(*alloc_result));
+        batched_slices.emplace(key, std::move(slices));
+    }
+
+    // Convert unordered_map to vector format expected by BatchUpsert
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+    for (const auto &key : keys) {
+        auto it = batched_slices.find(key);
+        if (it != batched_slices.end()) {
+            ordered_batched_slices.emplace_back(it->second);
+        } else {
+            LOG(ERROR) << "Missing slices for key: " << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
+
+    // Check if any operations failed
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            return tl::unexpected(results[i].error());
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_batch_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    return upsert_batch_internal(keys, values, config,
+                                 context.client_buffer_allocator);
+}
+
+int RealClient::upsert_batch(const std::vector<std::string> &keys,
+                             const std::vector<std::span<const char>> &values,
+                             const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_batch_internal(keys, values, config, client_buffer_allocator_));
+}
+
+// --- End Upsert implementations ---
+
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
