@@ -536,25 +536,125 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
 TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
     const std::string source_segment = "127.0.0.1:18001";
     const std::string target_segment = "127.0.0.1:18002";
-    const std::string test_key =
+    const auto key_prefix =
         "test_drain_job_key_" +
         std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count());
-    std::string test_data =
-        "This is test data for drain job operation. "
-        "It should be drained from the source segment to the target segment.";
 
-    std::vector<Slice> slices;
-    slices.emplace_back(test_data.data(), test_data.size());
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.preferred_segment = source_segment;
+    const auto make_payload = [](const std::string& prefix, size_t payload_size,
+                                 char fill) {
+        std::string payload = prefix;
+        if (payload.size() < payload_size) {
+            payload.resize(payload_size, fill);
+        }
+        return payload;
+    };
 
-    auto put_result = client1_->Put(test_key, slices, config);
-    ASSERT_TRUE(put_result.has_value())
-        << "Failed to put drain test data: " << toString(put_result.error());
+    std::vector<std::pair<std::string, std::string>> preload_items;
+    std::vector<std::pair<std::string, std::string>> redirected_items;
+    for (int i = 0; i < 12; ++i) {
+        preload_items.emplace_back(
+            key_prefix + "_preload_" + std::to_string(i),
+            make_payload("preload-" + std::to_string(i) + "-", 128 * 1024,
+                         static_cast<char>('a' + (i % 26))));
+    }
+    for (int i = 0; i < 4; ++i) {
+        redirected_items.emplace_back(
+            key_prefix + "_redirect_" + std::to_string(i),
+            make_payload("redirect-" + std::to_string(i) + "-", 32 * 1024,
+                         static_cast<char>('A' + (i % 26))));
+    }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto put_to_preferred_segment =
+        [&](const std::string& key, const std::string& value,
+            const std::string& preferred_segment) {
+            std::vector<Slice> slices;
+            slices.emplace_back(const_cast<char*>(value.data()), value.size());
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.preferred_segment = preferred_segment;
+
+            auto put_result = client1_->Put(key, slices, config);
+            ASSERT_TRUE(put_result.has_value())
+                << "Failed to put key=" << key << ": "
+                << toString(put_result.error());
+        };
+
+    const auto query_segments = [&](const std::string& key)
+                                    -> std::vector<std::string> {
+        auto query_result = client2_->Query(key);
+        if (!query_result.has_value()) {
+            ADD_FAILURE() << "Failed to query key=" << key << ": "
+                          << toString(query_result.error());
+            return {};
+        }
+        std::vector<std::string> segments;
+        for (const auto& replica : query_result->replicas) {
+            if (!replica.is_memory_replica()) {
+                ADD_FAILURE() << "Expected memory replica for key=" << key;
+                return {};
+            }
+            segments.push_back(replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_);
+        }
+        return segments;
+    };
+
+    const auto wait_for_segments =
+        [&](const std::string& key, const std::string& required_segment,
+            const std::string& forbidden_segment) {
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(10);
+            std::vector<std::string> last_segments;
+            while (std::chrono::steady_clock::now() < deadline) {
+                last_segments = query_segments(key);
+                bool has_required = false;
+                bool has_forbidden = false;
+                for (const auto& segment : last_segments) {
+                    if (segment == required_segment) {
+                        has_required = true;
+                    }
+                    if (!forbidden_segment.empty() &&
+                        segment == forbidden_segment) {
+                        has_forbidden = true;
+                    }
+                }
+                if (has_required && !has_forbidden) {
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            FAIL() << "Replica placement mismatch for key=" << key
+                   << ", required_segment=" << required_segment
+                   << ", forbidden_segment=" << forbidden_segment
+                   << ", last_seen="
+                   << (last_segments.empty() ? std::string("<empty>")
+                                             : last_segments.front());
+        };
+
+    const auto assert_key_data = [&](const std::string& key,
+                                     const std::string& expected_value) {
+        std::vector<uint8_t> read_buffer(expected_value.size());
+        std::vector<Slice> read_slices;
+        read_slices.emplace_back(read_buffer.data(), read_buffer.size());
+
+        auto get_result = client2_->Get(key, read_slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Failed to get key=" << key << ": "
+            << toString(get_result.error());
+
+        std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
+                              expected_value.size());
+        ASSERT_EQ(read_data, expected_value)
+            << "Data mismatch for key=" << key;
+    };
+
+    size_t expected_migrated_bytes = 0;
+    for (const auto& [key, value] : preload_items) {
+        put_to_preferred_segment(key, value, source_segment);
+        wait_for_segments(key, source_segment, "");
+        expected_migrated_bytes += value.size();
+    }
 
     CreateDrainJobRequest request;
     request.segments = {source_segment};
@@ -577,6 +677,11 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
     EXPECT_TRUE(draining_status->success);
     EXPECT_EQ(draining_status->status_name, "DRAINING");
 
+    for (const auto& [key, value] : redirected_items) {
+        put_to_preferred_segment(key, value, source_segment);
+        wait_for_segments(key, target_segment, source_segment);
+    }
+
     HttpQueryDrainJobResponse final_job;
     ASSERT_TRUE(
         WaitForJobCompletionViaHttp(create_job_result->job_id, &final_job))
@@ -584,8 +689,9 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
 
     EXPECT_EQ(final_job.status_name, "SUCCEEDED");
     EXPECT_EQ(final_job.active_units, 0u);
-    EXPECT_GE(final_job.succeeded_units, 1u);
-    EXPECT_GE(final_job.migrated_bytes, test_data.size());
+    EXPECT_EQ(final_job.failed_units, 0u);
+    EXPECT_GE(final_job.succeeded_units, preload_items.size());
+    EXPECT_GE(final_job.migrated_bytes, expected_migrated_bytes);
 
     auto drained_status = QuerySegmentStatusViaHttp(source_segment);
     ASSERT_TRUE(drained_status.has_value())
@@ -594,36 +700,30 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
     EXPECT_TRUE(drained_status->success);
     EXPECT_EQ(drained_status->status_name, "DRAINED");
 
-    auto replica_result = master_client_->GetReplicaList(test_key);
-    ASSERT_TRUE(replica_result.has_value())
-        << "Failed to query replicas after drain";
-    ASSERT_FALSE(replica_result->replicas.empty())
-        << "No replicas found after drain";
-
-    bool found_target = false;
-    for (const auto& replica : replica_result->replicas) {
-        ASSERT_TRUE(replica.is_memory_replica());
-        const auto& segment = replica.get_memory_descriptor()
-                                  .buffer_descriptor.transport_endpoint_;
-        EXPECT_NE(segment, source_segment);
-        if (segment == target_segment) {
-            found_target = true;
-        }
+    for (const auto& [key, value] : preload_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
     }
-    EXPECT_TRUE(found_target) << "Drained replica not found on target segment";
+    for (const auto& [key, value] : redirected_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
 
-    std::vector<uint8_t> read_buffer(test_data.size());
-    std::vector<Slice> read_slices;
-    read_slices.emplace_back(read_buffer.data(), read_buffer.size());
+    client1_.reset();
+    if (client1_segment_ptr_ != nullptr) {
+        free(client1_segment_ptr_);
+        client1_segment_ptr_ = nullptr;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    auto get_result = client2_->Get(test_key, read_slices);
-    ASSERT_TRUE(get_result.has_value())
-        << "Failed to get drained data from target client: "
-        << toString(get_result.error());
-
-    std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
-                          test_data.size());
-    ASSERT_EQ(read_data, test_data) << "Data mismatch after drain";
+    for (const auto& [key, value] : preload_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
+    for (const auto& [key, value] : redirected_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
 }
 
 TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {

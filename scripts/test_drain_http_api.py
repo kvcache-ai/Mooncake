@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""Manual/nightly drain HTTP verification script.
+
+This script intentionally targets non-ASan builds only. The ASan CI gate uses
+TaskExecutorIntegrationTest.DrainJobCompleteFlow instead, because running the
+pybind store client inside a Python host process is not stable under ASan.
+"""
+
 import argparse
 import json
 import os
-import shlex
-import shutil
 import socket
 import subprocess
 import sys
@@ -16,7 +21,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_PYTHON_DIR = REPO_ROOT / "build" / "mooncake-integration"
 DEFAULT_MASTER_BINARY = REPO_ROOT / "build" / "mooncake-store" / "src" / "mooncake_master"
-ASAN_ENV_READY = "_MOONCAKE_DRAIN_HTTP_ASAN_READY"
 
 
 def _find_store_extension() -> Path:
@@ -53,54 +57,25 @@ def _artifact_needs_asan_runtime(path: Path) -> bool:
     return "libasan" in result.stdout or "libasan" in result.stderr
 
 
-def _resolve_asan_runtime() -> str | None:
-    cxx = shutil.which("c++") or shutil.which("g++") or shutil.which("gcc")
-    if cxx is None:
-        return None
-    try:
-        result = subprocess.run(
-            [cxx, "-print-file-name=libasan.so"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError:
-        return None
-    candidate = result.stdout.strip()
-    if not candidate or candidate == "libasan.so":
-        return None
-    if not Path(candidate).exists():
-        return None
-    return candidate
-
-
-def ensure_asan_preloaded(argv: list[str]) -> None:
-    if os.environ.get(ASAN_ENV_READY) == "1":
-        return
+def ensure_non_asan(argv: list[str]) -> None:
     master_binary = _extract_master_binary(argv)
-    needs_asan = any(
-        _artifact_needs_asan_runtime(path)
+    asan_artifacts = [
+        str(path)
         for path in (STORE_EXTENSION, master_binary)
+        if _artifact_needs_asan_runtime(path)
+    ]
+    if not asan_artifacts:
+        return
+    artifact_list = ", ".join(asan_artifacts)
+    raise RuntimeError(
+        "scripts/test_drain_http_api.py is manual/nightly only and does not "
+        "support ASan builds. Use "
+        "TaskExecutorIntegrationTest.DrainJobCompleteFlow for sanitizer CI. "
+        f"ASan-linked artifacts: {artifact_list}"
     )
-    if not needs_asan:
-        return
-
-    current_preload = os.environ.get("LD_PRELOAD", "")
-    preload_entries = [entry for entry in shlex.split(current_preload) if entry]
-    if any("libasan" in Path(entry).name for entry in preload_entries):
-        os.environ[ASAN_ENV_READY] = "1"
-        return
-
-    asan_runtime = _resolve_asan_runtime()
-    if asan_runtime is None:
-        raise RuntimeError("ASan build detected but libasan.so could not be resolved")
-
-    os.environ["LD_PRELOAD"] = " ".join([asan_runtime, *preload_entries]).strip()
-    os.environ[ASAN_ENV_READY] = "1"
-    os.execvpe(sys.executable, [sys.executable, *argv], os.environ)
 
 
-ensure_asan_preloaded(sys.argv)
+ensure_non_asan(sys.argv)
 
 if str(BUILD_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(BUILD_PYTHON_DIR))
@@ -303,7 +278,7 @@ def wait_job_succeeded(control_base: str, job_id: str, timeout_sec: float) -> di
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Verify master drain HTTP control plane"
+        description="Verify master drain HTTP control plane (manual/nightly, non-ASan only)"
     )
     parser.add_argument(
         "--master-binary",
