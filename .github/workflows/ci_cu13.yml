@@ -3,9 +3,23 @@ name: 'Build Wheel (CUDA 13)'
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'CMakeLists.txt'
+      - 'dependencies.sh'
+      - 'scripts/**'
+      - '.github/workflows/ci_cu13.yml'
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'mooncake-*/**'
+      - 'extern/**'
+      - 'CMakeLists.txt'
+      - 'dependencies.sh'
+      - 'scripts/**'
+      - '.github/workflows/ci_cu13.yml'
 
 jobs:
   build-wheel-cu13:
@@ -81,7 +95,7 @@ jobs:
           -DWITH_STORE=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_EP=ON \
-          -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0" \
+          -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0;2.11.0" \
           -DWITH_METRICS=ON \
           -DBUILD_UNIT_TESTS=OFF \
           -DBUILD_EXAMPLES=ON \

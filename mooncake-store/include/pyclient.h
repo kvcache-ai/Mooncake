@@ -204,6 +204,27 @@ class PyClient {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    virtual int upsert(const std::string &key, std::span<const char> value,
+                       const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_from(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_parts(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_batch(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
     virtual int remove(const std::string &key, bool force = false) = 0;
@@ -211,6 +232,9 @@ class PyClient {
     virtual long removeByRegex(const std::string &str, bool force = false) = 0;
 
     virtual long removeAll(bool force = false) = 0;
+
+    virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                         bool force = false) = 0;
 
     virtual int isExist(const std::string &key) = 0;
 

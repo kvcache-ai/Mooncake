@@ -1,5 +1,7 @@
 #include <mooncake_backend.h>
+#include <cstdio>
 #include <memory>
+#include <thread>
 #include <mooncake_worker.cuh>
 
 namespace mooncake {
@@ -37,9 +39,34 @@ class MooncakeWorkCuda : public ::c10d::Work {
         return true;  // This should be a no-op
     }
 
-   private:
+   protected:
     std::shared_ptr<torch::Event> event_;
     std::shared_ptr<TransferGroupMeta> meta_;
+};
+
+class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
+   public:
+    using MooncakeWorkCuda::MooncakeWorkCuda;
+
+    bool wait(std::chrono::milliseconds timeout) override {
+        if (timeout == kNoTimeout) {
+            event_->synchronize();
+            return true;
+        }
+
+        auto start = std::chrono::steady_clock::now();
+        while (!event_->query()) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                      start);
+            if (elapsed >= timeout) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        return true;
+    }
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
@@ -107,6 +134,19 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         dst[elem_idx] = acc;
     }
 }
+
+namespace {
+
+template <typename scalar_t>
+void preload_reduce_kernel(const char* name) {
+    cudaFuncAttributes attr{};
+    auto err = cudaFuncGetAttributes(
+        &attr, reinterpret_cast<const void*>(reduceKernel<scalar_t>));
+    TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
+                cudaGetErrorString(err));
+}
+
+}  // namespace
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
@@ -244,6 +284,18 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
+void preloadReduceKernels() {
+    preload_reduce_kernel<uint8_t>("reduceKernel<uint8_t>");
+    preload_reduce_kernel<int8_t>("reduceKernel<int8_t>");
+    preload_reduce_kernel<int16_t>("reduceKernel<int16_t>");
+    preload_reduce_kernel<int>("reduceKernel<int>");
+    preload_reduce_kernel<int64_t>("reduceKernel<int64_t>");
+    preload_reduce_kernel<float>("reduceKernel<float>");
+    preload_reduce_kernel<double>("reduceKernel<double>");
+    preload_reduce_kernel<bool>("reduceKernel<bool>");
+    preload_reduce_kernel<at::BFloat16>("reduceKernel<BFloat16>");
+}
+
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
     : cuda_device_index_(cuda_device_index) {
     int deviceCount = 0;
@@ -259,6 +311,13 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
+    }
+}
+
+MooncakeWorker::~MooncakeWorker() {
+    running_ = false;
+    if (worker_thread_.joinable()) {
+        worker_thread_.join();
     }
 }
 
@@ -375,6 +434,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
+    if (opType == c10d::OpType::BARRIER) {
+        return c10::make_intrusive<MooncakeBarrierWorkCuda>(opType, event,
+                                                            meta);
+    }
     return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta);
 }
 

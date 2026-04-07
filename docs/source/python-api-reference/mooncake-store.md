@@ -629,6 +629,120 @@ result = store.put_batch(keys, values)
 
 ---
 
+#### upsert()
+
+Insert a new object if the key does not exist, or update the existing object in place when possible. They use the same replication configuration model as `put()`.
+
+Upsert binary data in the distributed storage.
+
+```python
+def upsert(self, key: str, value: bytes, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Unique object identifier
+- `value` (bytes): Binary data to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+config = ReplicateConfig()
+config.replica_num = 2
+
+rc = store.upsert("weights", b"new-bytes", config)
+if rc == 0:
+    print("Upsert succeeded")
+```
+
+#### upsert_from()
+
+Upsert object data directly from a pre-allocated buffer (zero-copy).
+
+```python
+def upsert_from(self, key: str, buffer_ptr: int, size: int, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Memory address of the source buffer
+- `size` (int): Number of bytes to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This is the zero-copy counterpart of `upsert()`. As with
+`put_from()`, register the buffer before issuing the request.
+
+#### batch_upsert_from()
+
+Upsert multiple objects directly from pre-allocated buffers.
+
+```python
+def batch_upsert_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int],
+                      config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `buffer_ptrs` (List[int]): List of source buffer addresses
+- `sizes` (List[int]): List of byte lengths for each buffer
+- `config` (ReplicateConfig, optional): Replication configuration shared by all objects
+
+**Returns:**
+- `List[int]`: List of status codes for each upsert
+
+#### upsert_parts()
+
+Upsert data from multiple buffer parts as a single object (insert or update).
+
+```python
+def upsert_parts(self, key: str, *parts, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `*parts`: Variable number of bytes-like objects to concatenate
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+part1 = b"Hello, "
+part2 = b"World!"
+result = store.upsert_parts("greeting", part1, part2)
+```
+
+#### upsert_batch()
+
+Upsert multiple objects in a single batch operation.
+
+```python
+def upsert_batch(self, keys: List[str], values: List[bytes], config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `values` (List[bytes]): List of binary data to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration for all objects
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+keys = ["key1", "key2", "key3"]
+values = [b"value1", b"value2", b"value3"]
+result = store.upsert_batch(keys, values)
+```
+
+---
+
 #### get_batch()
 Retrieve multiple objects in a single batch operation.
 
@@ -717,6 +831,39 @@ def remove_all(self) -> int
 ```python
 count = store.remove_all()
 print(f"Removed {count} objects")
+```
+
+---
+
+#### batch_remove()
+Remove multiple objects by their keys in a single batch operation.
+
+```python
+def batch_remove(self, keys: List[str], force: bool = False) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to remove
+- `force` (bool): If True, skip lease and replication task checks (default: False)
+
+**Returns:**
+- `List[int]`: List of status codes for each key (0 = success, negative = error code)
+
+**Example:**
+```python
+# Remove multiple keys in one batch
+keys = ["key1", "key2", "key3", "key4", "key5"]
+results = store.batch_remove(keys)
+
+# Check results
+for key, result in zip(keys, results):
+    if result == 0:
+        print(f"✓ {key} removed successfully")
+    else:
+        print(f"✗ {key} failed with error code: {result}")
+
+# Force remove (bypass lease checks)
+results = store.batch_remove(keys, force=True)
 ```
 
 ---
@@ -1500,6 +1647,133 @@ def batch_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], co
 
 ---
 
+#### upsert_tensor()
+
+Insert a tensor if its key is missing, or update the existing tensor if the key already exists. The current tensor upsert helpers use the default `ReplicateConfig` and therefore do not take a `config` parameter.
+
+Upsert a PyTorch tensor into the store.
+
+```python
+def upsert_tensor(self, key: str, tensor: torch.Tensor) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `tensor` (torch.Tensor): The PyTorch tensor to insert or update
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+#### upsert_tensor_from()
+
+Upsert a tensor directly from a pre-allocated buffer. The buffer layout must be
+`[TensorMetadata][tensor data]`, matching the layout used by
+`get_tensor_into()`.
+
+```python
+def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Buffer pointer containing serialized tensor metadata and payload
+- `size` (int): Actual serialized byte length of the tensor buffer
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function is not supported for dummy client.
+
+#### batch_upsert_tensor_from()
+
+Upsert multiple tensors directly from pre-allocated buffers. Each buffer must
+use layout `[TensorMetadata][tensor data]`.
+
+```python
+def batch_upsert_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `buffer_ptrs` (List[int]): List of serialized tensor buffer pointers
+- `sizes` (List[int]): List of actual serialized byte lengths
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor upsert
+
+#### batch_upsert_tensor()
+
+Upsert a batch of PyTorch tensors into the store (insert or update).
+
+```python
+def batch_upsert_tensor(self, keys: List[str], tensors_list: List[torch.Tensor]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `tensors_list` (List[torch.Tensor]): List of tensors to insert or update
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
+
+**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
+#### upsert_pub_tensor()
+
+Upsert a PyTorch tensor with configurable replication settings (insert or update).
+
+```python
+def upsert_pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Unique object identifier
+- `tensor` (torch.Tensor): PyTorch tensor to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
+**Example:**
+```python
+import torch
+from mooncake.store import ReplicateConfig
+
+tensor = torch.randn(100, 100)
+
+config = ReplicateConfig()
+config.replica_num = 2
+config.with_soft_pin = True
+
+result = store.upsert_pub_tensor("my_tensor", tensor, config)
+if result == 0:
+    print("Tensor upserted successfully")
+```
+
+#### batch_upsert_pub_tensor()
+
+Batch upsert PyTorch tensors with configurable replication settings (insert or update).
+
+```python
+def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `tensors_list` (List[torch.Tensor]): List of tensors to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
+
+**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
+---
+
 ### PyTorch Tensor Operations (Zero Copy)
 
 These methods provide direct support for storing and retrieving PyTorch tensors. They automatically handle serialization and metadata, and include built-in support for **Tensor Parallelism (TP)** by automatically splitting and reconstructing tensor shards.
@@ -1621,7 +1895,7 @@ def batch_put_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: 
 
 #### put_tensor_with_tp_from()
 
-Put a tensor shard into the store directly from a pre-allocated buffer (zero-copy), for use with Tensor Parallelism. The data is stored under the key for the given `tp_rank` (e.g., `key_tp_0`). Buffer layout must be **\[TensorMetadata\]\[tensor data\]**.
+Put a **full tensor** into the store directly from a pre-allocated buffer (zero-copy), for use with Tensor Parallelism. This is the zero-copy counterpart of `put_tensor_with_tp()`: the buffer must contain the complete tensor in layout **\[TensorMetadata\]\[tensor data\]**, and Mooncake will split it internally and store all shards under `key_tp_<rank>`.
 
 ```python
 def put_tensor_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
@@ -1631,10 +1905,10 @@ def put_tensor_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank:
 
   - `key` (str): Base identifier for the tensor.
   - `buffer_ptr` (int): The buffer pointer; the buffer should be registered.
-  - `size` (int): **Actual serialized byte length** of the shard data in the buffer.
-  - `tp_rank` (int): Tensor parallel rank for this shard (default: 0). Data is stored under `key_tp_{tp_rank}`.
+  - `size` (int): **Actual serialized byte length** of the full tensor in the buffer.
+  - `tp_rank` (int): Kept for signature compatibility with `put_tensor_with_tp()` (default: 0). It does **not** mean "only write one shard".
   - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `put_tensor_from(key, buffer_ptr, size)`.
-  - `split_dim` (int): Present for API consistency with other tensor-parallel methods but currently ignored; this API assumes `buffer_ptr` already points to a single pre-split shard.
+  - `split_dim` (int): Dimension along which the full tensor is split before storing shards.
 
 **Returns:**
 
@@ -1642,19 +1916,20 @@ def put_tensor_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank:
 
 #### batch_put_tensor_with_tp_from()
 
-Put a batch of tensor shards into the store directly from pre-allocated buffers (zero-copy), for a given Tensor Parallel rank. Each buffer must contain one shard in layout **\[TensorMetadata\]\[tensor data\]**.
+Put a batch of **full tensors** into the store directly from pre-allocated buffers (zero-copy). This is the zero-copy counterpart of `batch_put_tensor_with_tp()`: each buffer contains one full tensor in layout **\[TensorMetadata\]\[tensor data\]**, and Mooncake splits each tensor internally and stores all TP shards.
 
 ```python
-def batch_put_tensor_with_tp_from(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[int]
+def batch_put_tensor_with_tp_from(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[int]
 ```
 
 **Parameters:**
 
   - `base_keys` (List[str]): List of base identifiers.
   - `buffer_ptrs` (List[int]): List of buffer pointers; buffers should be registered.
-  - `sizes` (List[int]): List of **actual serialized byte lengths** for each shard buffer.
-  - `tp_rank` (int): Tensor parallel rank for these shards (default: 0).
+  - `sizes` (List[int]): List of **actual serialized byte lengths** for each full-tensor buffer.
+  - `tp_rank` (int): Kept for signature compatibility with `batch_put_tensor_with_tp()` (default: 0). It does **not** select a single shard to write.
   - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `batch_put_tensor_from(base_keys, buffer_ptrs, sizes)`.
+  - `split_dim` (int): Dimension along which each full tensor is split before storing shards.
 
 **Returns:**
 

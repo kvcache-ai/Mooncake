@@ -19,6 +19,7 @@ set(PYTHON_PACKAGE_NAME "tent-core")
 
 pybind11_add_module(tentpy ${SOURCES})
 set_target_properties(tentpy PROPERTIES
+    OUTPUT_NAME "tent"
     INSTALL_RPATH "$ORIGIN" 
 )
 

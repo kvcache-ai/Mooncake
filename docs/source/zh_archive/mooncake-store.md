@@ -779,6 +779,8 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+如果 Master 运行在容器中，而容器 IP 可能动态变化，建议使用 `--rpc-interface=<网卡名>`（例如 `--rpc-interface=eth0`）而不是写死 `--rpc-address`。Master 会在启动时解析该网卡当前的 IPv4 地址，并将其作为最终的 `rpc_address` 使用。
+
 **高可用模式**:
 
 高可用模式依赖于 etcd 服务进行协调。如果 Transfer Engine 也使用 etcd 作为其元数据服务，那么 Mooncake Store 使用的 etcd 集群可以与 Transfer Engine 使用的集群共用，也可以是独立的。
@@ -788,6 +790,7 @@ Master service listening on 0.0.0.0:50051
 --enable-ha：启用高可用模式
 --etcd-endpoints：指定 etcd 服务的多个入口，使用分号 ';' 分隔
 --rpc-address：该实例的 RPC 地址。注意，这里填写的地址应当是客户端可访问的地址。
+--rpc-interface：按网卡名解析当前实例的 IPv4 地址。设置后会覆盖 --rpc-address，适合容器 IP 会变化的场景。
 ```
 
 例如:
@@ -796,6 +799,14 @@ Master service listening on 0.0.0.0:50051
     --enable-ha=true \
     --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
     --rpc-address=10.0.0.1
+```
+
+容器部署示例：
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-interface=eth0
 ```
 
 ### 启动验证程序

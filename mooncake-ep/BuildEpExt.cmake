@@ -13,6 +13,9 @@
 
 cmake_minimum_required(VERSION 3.16)
 
+# Include common build utilities.
+include("${SOURCE_DIR}/../mooncake-common/SetupPyTorchEnv.cmake")
+
 # Restore pipe-separated strings back to CMake semicolon-separated lists.
 if(EP_TORCH_VERSIONS)
   string(REPLACE "|" ";" EP_TORCH_VERSIONS "${EP_TORCH_VERSIONS}")
@@ -53,7 +56,7 @@ endif()
 if("${EP_TORCH_VERSIONS}" STREQUAL "")
   message(STATUS "[EP] Building with currently-installed PyTorch")
   execute_process(
-    COMMAND python setup.py build_ext --build-lib .
+    COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib .
     WORKING_DIRECTORY "${SOURCE_DIR}"
     RESULT_VARIABLE _ret
   )
@@ -63,26 +66,10 @@ if("${EP_TORCH_VERSIONS}" STREQUAL "")
 else()
   message(STATUS "[EP] Building for PyTorch versions: ${EP_TORCH_VERSIONS}")
   foreach(_version IN LISTS EP_TORCH_VERSIONS)
-    message(STATUS "[EP] Installing PyTorch ${_version}")
-    if(EP_CUDA_MAJOR GREATER_EQUAL 13)
-      # TODO: Fix when we need to support more CUDA 13 versions or when the CI
-      #       env is fixed.
-      execute_process(
-        COMMAND pip install "torch==${_version}" --index-url https://download.pytorch.org/whl/cu130
-        RESULT_VARIABLE _ret
-      )
-    else()
-      execute_process(
-        COMMAND pip install "torch==${_version}"
-        RESULT_VARIABLE _ret
-      )
-    endif()
-    if(NOT _ret EQUAL 0)
-      message(FATAL_ERROR "[EP] Failed to install PyTorch ${_version}")
-    endif()
+    install_pytorch_wheel("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[EP]")
 
     execute_process(
-      COMMAND python setup.py build_ext --build-lib . --force
+      COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
       WORKING_DIRECTORY "${SOURCE_DIR}"
       RESULT_VARIABLE _ret
     )

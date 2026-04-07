@@ -991,6 +991,236 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
     }
 }
 
+// ===================== Upsert Interface Tests =====================
+
+// Test upsert(key, span) — copy semantics, single key
+TEST_F(RealClientTest, UpsertBasic) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Case A: upsert a new key
+    const std::string data_v1 = "upsert_basic_v1!";
+    const std::string key = "upsert_basic_key";
+    std::span<const char> span_v1(data_v1.data(), data_v1.size());
+    EXPECT_EQ(py_client_->upsert(key, span_v1, config), 0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v1);
+
+    // Case B: upsert same size — in-place update
+    const std::string data_v2 = "upsert_basic_v2!";
+    std::span<const char> span_v2(data_v2.data(), data_v2.size());
+    EXPECT_EQ(py_client_->upsert(key, span_v2, config), 0);
+
+    buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v2);
+}
+
+// Test upsert_from(key, buffer, size) — zero-copy, single key
+TEST_F(RealClientTest, UpsertFrom) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "upsert_from_key";
+
+    // Put initial data
+    std::string data_v1(64, 'A');
+    EXPECT_EQ(py_client_->register_buffer(data_v1.data(), data_v1.size()), 0);
+    EXPECT_EQ(
+        py_client_->upsert_from(key, data_v1.data(), data_v1.size(), config),
+        0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v1);
+
+    // Upsert same size with different content
+    std::string data_v2(64, 'B');
+    EXPECT_EQ(py_client_->register_buffer(data_v2.data(), data_v2.size()), 0);
+    EXPECT_EQ(
+        py_client_->upsert_from(key, data_v2.data(), data_v2.size(), config),
+        0);
+
+    buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v2);
+
+    py_client_->unregister_buffer(data_v1.data());
+    py_client_->unregister_buffer(data_v2.data());
+}
+
+// Test upsert_parts(key, spans) — multi-part copy, single key
+TEST_F(RealClientTest, UpsertParts) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "upsert_parts_key";
+
+    // Upsert from multiple parts
+    const std::string part1 = "Hello, ";
+    const std::string part2 = "World!";
+    const std::string expected = part1 + part2;
+    std::vector<std::span<const char>> parts;
+    parts.emplace_back(part1.data(), part1.size());
+    parts.emplace_back(part2.data(), part2.size());
+
+    EXPECT_EQ(py_client_->upsert_parts(key, parts, config), 0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(buf->size(), expected.size());
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              expected);
+
+    // Upsert again with different parts, same total size
+    const std::string part3 = "Goodbye";
+    const std::string part4 = "Moon!!";
+    const std::string expected2 = part3 + part4;
+    ASSERT_EQ(expected2.size(), expected.size());
+    std::vector<std::span<const char>> parts2;
+    parts2.emplace_back(part3.data(), part3.size());
+    parts2.emplace_back(part4.data(), part4.size());
+
+    EXPECT_EQ(py_client_->upsert_parts(key, parts2, config), 0);
+
+    buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              expected2);
+}
+
+// Test batch_upsert_from(keys, buffers, sizes) — zero-copy, batch
+TEST_F(RealClientTest, BatchUpsertFrom) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Prepare 3 keys with registered buffers
+    std::string data0(32, 'X');
+    std::string data1(32, 'Y');
+    std::string data2(32, 'Z');
+    EXPECT_EQ(py_client_->register_buffer(data0.data(), data0.size()), 0);
+    EXPECT_EQ(py_client_->register_buffer(data1.data(), data1.size()), 0);
+    EXPECT_EQ(py_client_->register_buffer(data2.data(), data2.size()), 0);
+
+    std::vector<std::string> keys = {"batch_upsert_0", "batch_upsert_1",
+                                     "batch_upsert_2"};
+    std::vector<void*> buffers = {data0.data(), data1.data(), data2.data()};
+    std::vector<size_t> sizes = {data0.size(), data1.size(), data2.size()};
+
+    auto results = py_client_->batch_upsert_from(keys, buffers, sizes, config);
+    ASSERT_EQ(results.size(), 3);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_EQ(results[i], 0)
+            << "batch_upsert_from failed for key " << keys[i];
+    }
+
+    // Verify each key
+    std::vector<std::string*> expected = {&data0, &data1, &data2};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto buf = py_client_->get_buffer(keys[i]);
+        ASSERT_NE(buf, nullptr) << "get_buffer failed for " << keys[i];
+        EXPECT_EQ(
+            std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+            *expected[i]);
+    }
+
+    py_client_->unregister_buffer(data0.data());
+    py_client_->unregister_buffer(data1.data());
+    py_client_->unregister_buffer(data2.data());
+}
+
+// Test upsert_batch(keys, spans) — copy semantics, batch
+TEST_F(RealClientTest, UpsertBatch) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<std::string> keys = {"upsert_batch_0", "upsert_batch_1",
+                                     "upsert_batch_2"};
+    std::string val0 = "value_for_key_0!";
+    std::string val1 = "value_for_key_1!";
+    std::string val2 = "value_for_key_2!";
+    std::vector<std::span<const char>> values;
+    values.emplace_back(val0.data(), val0.size());
+    values.emplace_back(val1.data(), val1.size());
+    values.emplace_back(val2.data(), val2.size());
+
+    EXPECT_EQ(py_client_->upsert_batch(keys, values, config), 0);
+
+    // Verify each key
+    std::vector<std::string*> expected = {&val0, &val1, &val2};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto buf = py_client_->get_buffer(keys[i]);
+        ASSERT_NE(buf, nullptr) << "get_buffer failed for " << keys[i];
+        EXPECT_EQ(
+            std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+            *expected[i]);
+    }
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

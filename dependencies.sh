@@ -24,7 +24,6 @@ NC="\033[0m" # No Color
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
 GOVER=1.23.8
-YALANTINGLIBS_VERSION=0.5.7
 
 # Function to print section headers
 print_section() {
@@ -76,8 +75,7 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - yalantinglibs"
-echo -e "  - Git submodules"
+echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
 echo -e "  - Go $GOVER"
 echo
 
@@ -138,48 +136,34 @@ apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"
 print_success "System packages installed successfully"
 
-# Install yalantinglibs
+# Initialize and update git submodules
+print_section "Initializing Git Submodules"
+
+# Check if .gitmodules exists
+if [ -f "${REPO_ROOT}/.gitmodules" ]; then
+    echo "Enter repository root: ${REPO_ROOT}"
+    cd "${REPO_ROOT}"
+    check_success "Failed to change to repository root directory"
+
+    echo "Initializing git submodules..."
+    git submodule sync --recursive
+    check_success "Failed to sync git submodules"
+    git submodule update --init --recursive
+    check_success "Failed to initialize git submodules"
+
+    print_success "Git submodules initialized and updated successfully"
+else
+    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
+    exit 1
+fi
+
+# Build and install yalantinglibs from submodule
 print_section "Installing yalantinglibs"
-
-# Check if thirdparties directory exists
-if [ ! -d "${REPO_ROOT}/thirdparties" ]; then
-    mkdir -p "${REPO_ROOT}/thirdparties"
-    check_success "Failed to create thirdparties directory"
-fi
-
-# Change to thirdparties directory
-cd "${REPO_ROOT}/thirdparties"
-check_success "Failed to change to thirdparties directory"
-
-# Check if yalantinglibs is already installed
-if [ -d "yalantinglibs-${YALANTINGLIBS_VERSION}" ]; then
-    echo -e "${YELLOW}yalantinglibs-${YALANTINGLIBS_VERSION} directory already exists. Removing for fresh install...${NC}"
-    rm -rf yalantinglibs-${YALANTINGLIBS_VERSION}
-    check_success "Failed to remove existing yalantinglibs directory"
-fi
-
-# Download yalantinglibs
-YALANTINGLIBS_ZIPFILE="yalantinglibs-${YALANTINGLIBS_VERSION}.zip"
-echo "Downloading yalantinglibs ${YALANTINGLIBS_VERSION} from ${GITHUB_PROXY}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.zip"
-wget -q --show-progress -O ${YALANTINGLIBS_ZIPFILE} ${GITHUB_PROXY}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.zip
-check_success "Failed to download yalantinglibs"
-
-# Extract yalantinglibs
-echo "Extracting yalantinglibs..."
-unzip -q ${YALANTINGLIBS_ZIPFILE}
-check_success "Failed to extract yalantinglibs"
-
-# Clean up downloaded ZIP file
-rm -f ${YALANTINGLIBS_ZIPFILE}
-check_success "Failed to clean up downloaded ZIP file"
-
-# Build and install yalantinglibs
-cd yalantinglibs-${YALANTINGLIBS_VERSION}
-check_success "Failed to change to yalantinglibs directory"
+cd "${REPO_ROOT}/extern/yalantinglibs"
+check_success "Failed to change to yalantinglibs submodule directory"
 
 mkdir -p build
 check_success "Failed to create build directory"
-
 cd build
 check_success "Failed to change to build directory"
 
@@ -196,32 +180,7 @@ cmake --install .
 check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
-
-# Initialize and update git submodules
-print_section "Initializing Git Submodules"
-
-# Check if .gitmodules exists
-if [ -f "${REPO_ROOT}/.gitmodules" ]; then
-    # Check if submodules are already initialized by looking for the .git directory in the first submodule
-    FIRST_SUBMODULE=$(grep "path" ${REPO_ROOT}/.gitmodules | head -1 | awk '{print $3}')
-
-    echo "Enter repository root: ${REPO_ROOT}"
-    cd "${REPO_ROOT}"
-    check_success "Failed to change to repository root directory"
-
-    if [ -d "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ] || [ -f "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ]; then
-        echo -e "${YELLOW}Git submodules already initialized. Skipping...${NC}"
-    else
-        echo "Initializing git submodules..."
-        git submodule update --init
-        check_success "Failed to initialize git submodules"
-
-        print_success "Git submodules initialized and updated successfully"
-    fi
-else
-    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
-    exit 1
-fi
+cd "${REPO_ROOT}"
 
 print_section "Verifying essential build tools"
 
@@ -238,6 +197,8 @@ print_success "ldd found: $(ldd --version 2>&1 | head -1)"
 
 print_section "Installing Go $GOVER"
 
+USED_CN_MIRROR=false
+
 install_go() {
     ARCH=$(uname -m)
     if [ "$ARCH" = "aarch64" ]; then
@@ -248,18 +209,45 @@ install_go() {
         echo "Unsupported architecture: $ARCH"
         exit 1
     fi
-    # Download Go
-    echo "Downloading Go $GOVER..."
-    wget -q --show-progress https://go.dev/dl/go$GOVER.linux-$ARCH.tar.gz
-    check_success "Failed to download Go $GOVER"
+
+    GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
+
+    # Try multiple download mirrors with fallback
+    GO_DOWNLOAD_URLS=(
+        "https://go.dev/dl/${GO_TARBALL}"
+        "https://golang.google.cn/dl/${GO_TARBALL}"
+        "https://mirrors.aliyun.com/golang/${GO_TARBALL}"
+    )
+
+    DOWNLOAD_SUCCESS=false
+    for url in "${GO_DOWNLOAD_URLS[@]}"; do
+        echo "Downloading Go $GOVER from ${url}..."
+        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
+            DOWNLOAD_SUCCESS=true
+            # If the official source (go.dev) failed and we fell back to a CN mirror,
+            # it likely means the network has restricted access to international sites.
+            if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
+                USED_CN_MIRROR=true
+            fi
+            print_success "Downloaded Go $GOVER from ${url}"
+            break
+        else
+            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
+            rm -f "${GO_TARBALL}"
+        fi
+    done
+
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+        print_error "Failed to download Go $GOVER from all mirrors"
+    fi
 
     # Install Go
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf go$GOVER.linux-$ARCH.tar.gz
+    tar -C /usr/local -xzf "${GO_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
     # Clean up downloaded file
-    rm -f go$GOVER.linux-$ARCH.tar.gz
+    rm -f "${GO_TARBALL}"
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"
@@ -283,6 +271,20 @@ if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
     echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
     echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
     echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
+fi
+
+# Set GOPROXY only if Go download fell back to a CN mirror, indicating restricted
+# network access to international sites. Skip if user already configured GOPROXY.
+if [ "$USED_CN_MIRROR" = true ] && [ -z "$GOPROXY" ]; then
+    export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+    echo -e "${YELLOW}Detected restricted network (Go was downloaded from a CN mirror).${NC}"
+    echo -e "${YELLOW}GOPROXY set to: ${GOPROXY}${NC}"
+    if ! grep -q "export GOPROXY=" ~/.bashrc; then
+        echo 'export GOPROXY=https://goproxy.cn,https://goproxy.io,direct' >> ~/.bashrc
+        echo -e "${YELLOW}GOPROXY added to ~/.bashrc for future sessions${NC}"
+    fi
+elif [ -n "$GOPROXY" ]; then
+    echo -e "${GREEN}GOPROXY already set to: ${GOPROXY}${NC}"
 fi
 
 # Return to the repository root

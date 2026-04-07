@@ -13,7 +13,6 @@
 #include "master_config.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils.h"
 #include <ylt/util/tl/expected.hpp>
 #include "utils.h"
 
@@ -122,11 +121,27 @@ class InProcMaster {
                 }
             }
 
-            wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
+            wrapped_ = std::make_shared<WrappedMasterService>(wms_cfg);
+            admin_server_ = std::make_unique<MasterAdminServer>(
+                static_cast<uint16_t>(http_metrics_port_),
+                /*enable_metric_reporting=*/false);
+            if (!admin_server_->Start()) {
+                admin_server_.reset();
+                wrapped_.reset();
+                server_.reset();
+                return false;
+            }
+            admin_server_->SetRuntimeState(ha::MasterRuntimeState::kServing);
+            admin_server_->SetServiceDelegate(wrapped_);
+            admin_server_->SetServiceAvailable(true);
             RegisterRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();
             if (ec.hasResult()) {
+                admin_server_->Stop();
+                admin_server_.reset();
+                wrapped_.reset();
+                server_.reset();
                 return false;
             }
             // Allow server to bind
@@ -138,6 +153,10 @@ class InProcMaster {
     }
 
     void Stop() {
+        if (admin_server_) {
+            admin_server_->Stop();
+            admin_server_.reset();
+        }
         if (server_) {
             server_->stop();
             server_.reset();
@@ -168,7 +187,8 @@ class InProcMaster {
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-    std::unique_ptr<WrappedMasterService> wrapped_;
+    std::shared_ptr<WrappedMasterService> wrapped_;
+    std::unique_ptr<MasterAdminServer> admin_server_;
     std::unique_ptr<HttpMetadataServer> meta_server_;
     int rpc_port_ = 0;
     int http_metrics_port_ = 0;

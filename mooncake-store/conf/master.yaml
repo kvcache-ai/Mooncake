@@ -3,6 +3,7 @@ metrics_port: 9003
 rpc_port: 50051
 rpc_thread_num: 4
 rpc_address: "0.0.0.0"
+rpc_interface: ""
 rpc_conn_timeout_seconds: 0
 rpc_enable_tcp_no_delay: true
 

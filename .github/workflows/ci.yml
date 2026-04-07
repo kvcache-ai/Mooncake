@@ -7,9 +7,14 @@ on:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
 
+permissions:
+  contents: read
+  actions: write
+  statuses: write
 
 jobs:
   build:
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
@@ -23,6 +28,20 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
+    - name: Cancel workflow if checks failed
+      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
+      uses: actions/github-script@v7
+      with:
+        script: |
+          console.log('Cancelling workflow run due to spell-check or clang-format failure');
+          await github.rest.actions.cancelWorkflowRun({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId
+          });
+          // Wait for cancel to propagate
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          process.exit(1);
     - uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python-version }}
@@ -112,6 +131,23 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
+    - name: Run Go store binding integration tests
+      run: |
+        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
+          --eviction_high_watermark_ratio=0.95 \
+          --cluster_id=ci_go_test_cluster \
+          --port 50051 &
+        MASTER_PID=$!
+        sleep 3
+        cd mooncake-store/go
+        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
+        export CGO_ENABLED=1
+        export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
+        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-asio -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov"
+        ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
+        kill $MASTER_PID 2>/dev/null || true
+      shell: bash
+
     - name: Test (in build env) with coverage
       run: |
         cd build
@@ -193,6 +229,7 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   build-musa:
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
@@ -200,6 +237,19 @@ jobs:
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
     steps:
+    - name: Cancel workflow if checks failed
+      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
+      uses: actions/github-script@v7
+      with:
+        script: |
+          console.log('Cancelling workflow run due to spell-check or clang-format failure');
+          await github.rest.actions.cancelWorkflowRun({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId
+          });
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          process.exit(1);
     - uses: actions/checkout@v4
 
     - name: Mark repository as safe
@@ -225,7 +275,12 @@ jobs:
       shell: bash
 
   test-wheel-ubuntu:
-    needs: build-flags
+    needs: [spell-check, clang-format, build-flags]
+    if: >-
+      needs.build-flags.result == 'success' &&
+      (github.event_name == 'push' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
@@ -348,6 +403,14 @@ jobs:
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
 
+    - name: Test Mooncake PyTorch Backend (CPU Only)
+      env:
+        MC_FORCE_TCP: "true"
+      run: |
+        source test_env/bin/activate
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+      shell: bash
+
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
@@ -356,6 +419,7 @@ jobs:
       shell: bash
 
   build-flags:
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
@@ -371,6 +435,19 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
+    - name: Cancel workflow if checks failed
+      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
+      uses: actions/github-script@v7
+      with:
+        script: |
+          console.log('Cancelling workflow run due to spell-check or clang-format failure');
+          await github.rest.actions.cancelWorkflowRun({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId
+          });
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          process.exit(1);
     - uses: actions/checkout@v4
 
     - name: Set up Python ${{ matrix.python-version }}
@@ -452,7 +529,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0;2.11.0"
       shell: bash
 
     - name: Build project
@@ -510,12 +587,26 @@ jobs:
 
   build-docker:
     name: Build Docker Image
+    needs: [spell-check, clang-format]
     if: >-
       github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
+    - name: Cancel workflow if checks failed
+      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
+      uses: actions/github-script@v7
+      with:
+        script: |
+          console.log('Cancelling workflow run due to spell-check or clang-format failure');
+          await github.rest.actions.cancelWorkflowRun({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId
+          });
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          process.exit(1);
     - uses: actions/checkout@v4
 
     - name: Set up Docker Buildx
@@ -536,6 +627,27 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
+    - name: Set pending status for downstream tests
+      if: github.event_name == 'pull_request'
+      continue-on-error: true
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const contexts = [
+            'CI Test on ASCEND / build-and-test',
+            'Integration test / test-sglang-integration'
+          ];
+          for (const ctx of contexts) {
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: ctx,
+              description: 'Waiting for Build & Test to complete...',
+              target_url: 'https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
+            });
+          }
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
     - name: Spell Check Repo
@@ -587,3 +699,4 @@ jobs:
         echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
+

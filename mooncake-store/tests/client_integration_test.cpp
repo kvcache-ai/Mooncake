@@ -1392,7 +1392,10 @@ class EvictionNotificationTest : public ::testing::Test {
 TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
     CreateClientAndMount();
 
-    // Put 3 keys — should all fit within quota
+    // Put 3 keys — should all fit within quota.
+    // Wait for each DISK replica before putting the next key so that the
+    // FIFO write-queue order is deterministic (write_thread_pool_ has >1
+    // thread, so concurrent writes can reorder).
     std::vector<std::string> keys;
     for (int i = 0; i < 3; ++i) {
         std::string key = "evict_test_key_" + std::to_string(i);
@@ -1411,10 +1414,9 @@ TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
             << "Put(" << key << ") failed: " << toString(put.error());
         alloc_->deallocate(buf, payload.size());
         keys.push_back(key);
-    }
 
-    // Wait for DISK replicas to appear (PutToLocalFile is async)
-    for (const auto& key : keys) {
+        // Wait for this key's DISK replica before proceeding to the next
+        // Put, ensuring deterministic FIFO order in the eviction queue.
         ASSERT_TRUE(WaitForDiskReplica(key, std::chrono::seconds(10)))
             << "DISK replica did not appear for key: " << key;
     }
@@ -1458,6 +1460,278 @@ TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
     EXPECT_TRUE(unmount.has_value()) << "UnmountSegment failed";
     std::free(seg_ptr_);
     seg_ptr_ = nullptr;
+}
+
+// Test Upsert Case A: key does not exist — equivalent to Put
+TEST_F(ClientIntegrationTest, UpsertNewKey) {
+    const std::string test_data = "upsert_new_key_data";
+    const std::string key = "upsert_case_a_key";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    ASSERT_NE(buffer, nullptr);
+
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Upsert on a non-existent key should succeed (Case A)
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case A) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Verify data through Get
+    buffer = client_buffer_allocator_->allocate(test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test Upsert Case B: key exists, same size — in-place update
+TEST_F(ClientIntegrationTest, UpsertSameSize) {
+    const std::string key = "upsert_case_b_key";
+    const size_t data_size = 64;
+
+    // Initial data: all 'A'
+    std::string initial_data(data_size, 'A');
+    void* buffer = client_buffer_allocator_->allocate(data_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, initial_data.data(), data_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, data_size});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // First Put to create the key
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Initial Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Wait for lease to expire so refcnt drops to 0
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Upsert with same size but different content: all 'B'
+    std::string updated_data(data_size, 'B');
+    buffer = client_buffer_allocator_->allocate(data_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, updated_data.data(), data_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, data_size});
+
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case B) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Verify the data was updated
+    buffer = client_buffer_allocator_->allocate(data_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, data_size});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(memcmp(slices[0].ptr, updated_data.data(), data_size), 0)
+        << "Data should be updated to 'B's after in-place upsert";
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test Upsert Case C: key exists, different size — delete and reallocate
+TEST_F(ClientIntegrationTest, UpsertDifferentSize) {
+    const std::string key = "upsert_case_c_key";
+    const size_t initial_size = 64;
+    const size_t updated_size = 128;
+
+    // Initial data: 64 bytes of 'X'
+    std::string initial_data(initial_size, 'X');
+    void* buffer = client_buffer_allocator_->allocate(initial_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, initial_data.data(), initial_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, initial_size});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Initial Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, initial_size);
+
+    // Wait for lease to expire so refcnt drops to 0
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Upsert with different (larger) size: 128 bytes of 'Y'
+    std::string updated_data(updated_size, 'Y');
+    buffer = client_buffer_allocator_->allocate(updated_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, updated_data.data(), updated_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, updated_size});
+
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case C) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, updated_size);
+
+    // Verify the data was updated with new size
+    buffer = client_buffer_allocator_->allocate(updated_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, updated_size});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(slices[0].size, updated_size);
+    ASSERT_EQ(memcmp(slices[0].ptr, updated_data.data(), updated_size), 0)
+        << "Data should be updated to 'Y's with new size";
+    client_buffer_allocator_->deallocate(buffer, updated_size);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test BatchUpsert with mixed cases (A + B + C)
+TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
+    const size_t data_size = 64;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Pre-create key_b (for Case B: same size) and key_c (for Case C: diff
+    // size)
+    std::string key_b = "batch_upsert_case_b";
+    std::string key_c = "batch_upsert_case_c";
+
+    // Put key_b: 64 bytes of 'M'
+    {
+        std::string data(data_size, 'M');
+        void* buf = client_buffer_allocator_->allocate(data_size);
+        memcpy(buf, data.data(), data_size);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, data_size});
+        auto r = test_client_->Put(key_b, sl, config);
+        ASSERT_TRUE(r.has_value())
+            << "Put key_b failed: " << toString(r.error());
+        client_buffer_allocator_->deallocate(buf, data_size);
+    }
+
+    // Put key_c: 64 bytes of 'N'
+    {
+        std::string data(data_size, 'N');
+        void* buf = client_buffer_allocator_->allocate(data_size);
+        memcpy(buf, data.data(), data_size);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, data_size});
+        auto r = test_client_->Put(key_c, sl, config);
+        ASSERT_TRUE(r.has_value())
+            << "Put key_c failed: " << toString(r.error());
+        client_buffer_allocator_->deallocate(buf, data_size);
+    }
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Now BatchUpsert:
+    //   key_a (new)            → Case A, 64 bytes of 'P'
+    //   key_b (exists, same)   → Case B, 64 bytes of 'Q'
+    //   key_c (exists, larger) → Case C, 128 bytes of 'R'
+    std::string key_a = "batch_upsert_case_a";
+    std::vector<std::string> keys = {key_a, key_b, key_c};
+
+    const size_t size_a = data_size;
+    const size_t size_b = data_size;
+    const size_t size_c = data_size * 2;
+    std::string data_a(size_a, 'P');
+    std::string data_b(size_b, 'Q');
+    std::string data_c(size_c, 'R');
+
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<void*> alloc_ptrs;  // track for cleanup
+
+    auto alloc_and_fill = [&](const std::string& data, size_t sz) {
+        void* buf = client_buffer_allocator_->allocate(sz);
+        EXPECT_NE(buf, nullptr);
+        memcpy(buf, data.data(), sz);
+        alloc_ptrs.push_back(buf);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, sz});
+        batched_slices.push_back(std::move(sl));
+    };
+
+    alloc_and_fill(data_a, size_a);
+    alloc_and_fill(data_b, size_b);
+    alloc_and_fill(data_c, size_c);
+
+    auto batch_results =
+        test_client_->BatchUpsert(keys, batched_slices, config);
+    ASSERT_EQ(batch_results.size(), 3);
+    for (size_t i = 0; i < batch_results.size(); ++i) {
+        ASSERT_TRUE(batch_results[i].has_value())
+            << "BatchUpsert failed for key " << keys[i] << ": "
+            << toString(batch_results[i].error());
+    }
+
+    // Free write buffers
+    client_buffer_allocator_->deallocate(alloc_ptrs[0], size_a);
+    client_buffer_allocator_->deallocate(alloc_ptrs[1], size_b);
+    client_buffer_allocator_->deallocate(alloc_ptrs[2], size_c);
+
+    // Verify each key's data
+    auto verify = [&](const std::string& key, const std::string& expected,
+                      size_t sz) {
+        void* buf = client_buffer_allocator_->allocate(sz);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, sz});
+        auto get_result = test_client_->Get(key, sl);
+        EXPECT_TRUE(get_result.has_value())
+            << "Get failed for " << key << ": " << toString(get_result.error());
+        if (get_result.has_value()) {
+            EXPECT_EQ(sl[0].size, sz);
+            EXPECT_EQ(memcmp(sl[0].ptr, expected.data(), sz), 0)
+                << "Data mismatch for " << key;
+        }
+        client_buffer_allocator_->deallocate(buf, sz);
+    };
+
+    verify(key_a, data_a, size_a);
+    verify(key_b, data_b, size_b);
+    verify(key_c, data_c, size_c);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    for (const auto& key : keys) {
+        auto r = test_client_->Remove(key);
+        EXPECT_TRUE(r.has_value())
+            << "Remove failed for " << key << ": " << toString(r.error());
+    }
 }
 
 }  // namespace testing

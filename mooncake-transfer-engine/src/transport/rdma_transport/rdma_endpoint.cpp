@@ -457,53 +457,79 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
-    int qp_index = SimpleRandom::Get().next(qp_list_.size());
-    int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
-                            (int)slice_list.size());
-    wr_count =
-        std::min(int(globalConfig().max_cqe) - *cq_outstanding_, wr_count);
-    if (wr_count <= 0) return 0;
 
-    std::vector<ibv_send_wr> wr_list(wr_count, ibv_send_wr{});
-    std::vector<ibv_sge> sge_list(wr_count);
-    ibv_send_wr *bad_wr = nullptr;
-    for (int i = 0; i < wr_count; ++i) {
-        auto slice = slice_list[i];
-        auto &sge = sge_list[i];
-        sge.addr = (uint64_t)slice->source_addr;
-        sge.length = slice->length;
-        sge.lkey = slice->rdma.source_lkey;
+    const size_t num_qp = qp_list_.size();
+    if (slice_list.empty()) return 0;
+    const size_t requested = slice_list.size();
+    int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
+    std::vector<ibv_send_wr> wr_list(requested, ibv_send_wr{});
+    std::vector<ibv_sge> sge_list(requested);
+    size_t total_posted = 0;
+    size_t cursor = 0;
 
-        auto &wr = wr_list[i];
-        wr.wr_id = (uint64_t)slice;
-        wr.opcode = slice->opcode == Transport::TransferRequest::READ
-                        ? IBV_WR_RDMA_READ
-                        : IBV_WR_RDMA_WRITE;
-        wr.num_sge = 1;
-        wr.sg_list = &sge;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
-        wr.imm_data = 0;
-        wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
-        wr.wr.rdma.rkey = slice->rdma.dest_rkey;
-        slice->ts = getCurrentTimeInNano();
-        slice->status = Transport::Slice::POSTED;
-        slice->rdma.qp_depth = &wr_depth_list_[qp_index];
-    }
-    __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
-    __sync_fetch_and_add(cq_outstanding_, wr_count);
-    int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
-    if (rc) {
-        PLOG(ERROR) << "Failed to ibv_post_send";
-        while (bad_wr) {
-            int i = bad_wr - wr_list.data();
-            failed_slice_list.push_back(slice_list[i]);
-            __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-            __sync_fetch_and_sub(cq_outstanding_, 1);
-            bad_wr = bad_wr->next;
+    for (size_t qp_index = 0;
+         qp_index < num_qp && cq_remaining > 0 && cursor < requested;
+         ++qp_index) {
+        int qp_avail = max_wr_depth_ - wr_depth_list_[qp_index];
+        if (qp_avail <= 0) continue;
+
+        size_t remaining_qps = num_qp - qp_index;
+        size_t remaining_slices = requested - cursor;
+        size_t chunk = (remaining_slices + remaining_qps - 1) / remaining_qps;
+        size_t start = cursor;
+        size_t end = std::min(start + chunk, requested);
+        int assigned_count = (int)(end - start);
+
+        int wr_count = std::min(assigned_count, qp_avail);
+        wr_count = std::min(wr_count, cq_remaining);
+
+        for (int i = 0; i < wr_count; ++i) {
+            auto *slice = slice_list[start + i];
+            auto &sge = sge_list[i];
+            sge.addr = (uint64_t)slice->source_addr;
+            sge.length = slice->length;
+            sge.lkey = slice->rdma.source_lkey;
+
+            auto &wr = wr_list[i];
+            memset(&wr, 0, sizeof(ibv_send_wr));
+            wr.wr_id = (uint64_t)slice;
+            wr.opcode = slice->opcode == Transport::TransferRequest::READ
+                            ? IBV_WR_RDMA_READ
+                            : IBV_WR_RDMA_WRITE;
+            wr.num_sge = 1;
+            wr.sg_list = &sge;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
+            wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
+            wr.wr.rdma.rkey = slice->rdma.dest_rkey;
+            slice->ts = getCurrentTimeInNano();
+            slice->status = Transport::Slice::POSTED;
+            slice->rdma.qp_depth = &wr_depth_list_[qp_index];
         }
+
+        ibv_send_wr *bad_wr = nullptr;
+        __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
+        __sync_fetch_and_add(cq_outstanding_, wr_count);
+        int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+        if (rc) {
+            PLOG(ERROR) << "Failed to ibv_post_send";
+            while (bad_wr) {
+                int i = bad_wr - wr_list.data();
+                failed_slice_list.push_back(slice_list[start + i]);
+                __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
+                __sync_fetch_and_sub(cq_outstanding_, 1);
+                bad_wr = bad_wr->next;
+            }
+            total_posted += wr_count;
+            cursor += wr_count;
+            break;
+        }
+        total_posted += wr_count;
+        cursor += wr_count;
+        cq_remaining -= wr_count;
     }
-    slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);
+    slice_list.erase(slice_list.begin(),
+                     slice_list.begin() + (ptrdiff_t)total_posted);
     return 0;
 }
 

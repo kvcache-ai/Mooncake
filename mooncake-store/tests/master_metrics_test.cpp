@@ -1,9 +1,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <csignal>
 #include <thread>
 #include <vector>
 
+#include <ylt/coro_http/coro_http_client.hpp>
+
+#include "utils.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
@@ -13,6 +17,11 @@ namespace mooncake::test {
 
 class MasterMetricsTest : public ::testing::Test {
    protected:
+    struct HttpResponse {
+        int http_status;
+        std::string body;
+    };
+
     void SetUp() override {
         google::InitGoogleLogging("MasterMetricsTest");
         FLAGS_logtostderr = true;
@@ -21,6 +30,13 @@ class MasterMetricsTest : public ::testing::Test {
     std::vector<Replica::Descriptor> replica_list;
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    HttpResponse FetchUrl(int port, const std::string& path) {
+        coro_http::coro_http_client client;
+        auto result =
+            client.get("http://127.0.0.1:" + std::to_string(port) + path);
+        return {result.status, std::string(result.resp_body)};
+    }
 };
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
@@ -313,6 +329,74 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
         std::chrono::milliseconds(default_kv_lease_ttl));
     auto remove_result = service_.Remove(key);
     ASSERT_TRUE(remove_result.has_value());
+}
+
+TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
+    const int http_port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+    admin_server.SetObservedLeader(ha::MasterView{
+        .leader_address = "127.0.0.1:19000",
+        .view_version = 7,
+    });
+
+    auto role_resp = FetchUrl(http_port, "/role");
+    EXPECT_EQ(role_resp.http_status, 200);
+    EXPECT_EQ(role_resp.body, "standby");
+
+    auto status_resp = FetchUrl(http_port, "/ha_status");
+    EXPECT_EQ(status_resp.http_status, 200);
+    EXPECT_EQ(status_resp.body, "standby");
+
+    auto leader_resp = FetchUrl(http_port, "/leader");
+    EXPECT_EQ(leader_resp.http_status, 200);
+    EXPECT_NE(leader_resp.body.find("\"present\":true"), std::string::npos);
+    EXPECT_NE(leader_resp.body.find("127.0.0.1:19000"), std::string::npos);
+    EXPECT_NE(leader_resp.body.find("\"view_version\":7"), std::string::npos);
+
+    auto segments_resp = FetchUrl(http_port, "/get_all_segments");
+    EXPECT_EQ(segments_resp.http_status, 503);
+    EXPECT_NE(segments_resp.body.find("service plane is not active"),
+              std::string::npos);
+
+    admin_server.Stop();
+}
+
+TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "admin_test_segment";
+    segment.base = 0x300000000;
+    segment.size = 8 * 1024 * 1024;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+
+    const int http_port = getFreeTcpPort();
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/false);
+    ASSERT_TRUE(admin_server.Start());
+    admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin_server.SetServiceDelegate(service);
+    admin_server.SetServiceAvailable(true);
+
+    auto segments_resp = FetchUrl(http_port, "/get_all_segments");
+    EXPECT_EQ(segments_resp.http_status, 200);
+    EXPECT_NE(segments_resp.body.find(segment.name), std::string::npos);
+
+    auto query_resp =
+        FetchUrl(http_port, "/query_segment?segment=" + segment.name);
+    EXPECT_EQ(query_resp.http_status, 200);
+    EXPECT_NE(query_resp.body.find(segment.name), std::string::npos);
+    EXPECT_NE(query_resp.body.find("Capacity(bytes)"), std::string::npos);
+
+    admin_server.Stop();
 }
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {

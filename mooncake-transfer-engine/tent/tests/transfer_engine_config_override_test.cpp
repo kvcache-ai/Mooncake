@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -180,7 +181,7 @@ class TestHttpMetadataServer {
         server_->set_http_handler<GET>(
             "/metadata",
             [this](coro_http_request& req, coro_http_response& resp) {
-                auto key = std::string(req.get_query_value("key"));
+                auto key = req.get_decode_query_value("key");
                 if (key.empty()) {
                     resp.set_status_and_content(status_type::bad_request,
                                                 "Missing key parameter");
@@ -202,7 +203,7 @@ class TestHttpMetadataServer {
         server_->set_http_handler<PUT>(
             "/metadata",
             [this](coro_http_request& req, coro_http_response& resp) {
-                auto key = std::string(req.get_query_value("key"));
+                auto key = req.get_decode_query_value("key");
                 if (key.empty()) {
                     resp.set_status_and_content(status_type::bad_request,
                                                 "Missing key parameter");
@@ -218,7 +219,7 @@ class TestHttpMetadataServer {
         server_->set_http_handler<coro_http::http_method::DEL>(
             "/metadata",
             [this](coro_http_request& req, coro_http_response& resp) {
-                auto key = std::string(req.get_query_value("key"));
+                auto key = req.get_decode_query_value("key");
                 if (key.empty()) {
                     resp.set_status_and_content(status_type::bad_request,
                                                 "Missing key parameter");
