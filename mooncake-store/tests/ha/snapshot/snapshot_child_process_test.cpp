@@ -370,8 +370,9 @@ TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {
               "mooncake_master_snapshot/" + snapshot_id + "/");
     EXPECT_EQ(latest->value().last_included_seq, 0u);
     EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
-    EXPECT_GE(latest->value().created_at_ms, before_ms);
-    EXPECT_LE(latest->value().created_at_ms, after_ms);
+    const auto created_at_ms = latest->value().created_at_ms;
+    EXPECT_GE(created_at_ms, before_ms);
+    EXPECT_LE(created_at_ms, after_ms);
 }
 
 TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
