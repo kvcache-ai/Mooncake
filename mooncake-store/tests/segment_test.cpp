@@ -90,14 +90,16 @@ class SegmentTest : public ::testing::Test {
 
     bool HasAllocatorForSegment(const SegmentManager& segment_manager,
                                 const UUID& segment_id) {
-        const auto mounted_it = segment_manager.mounted_segments_.find(segment_id);
+        const auto mounted_it =
+            segment_manager.mounted_segments_.find(segment_id);
         if (mounted_it == segment_manager.mounted_segments_.end()) {
             return false;
         }
 
         const auto& mounted_segment = mounted_it->second;
-        const auto* allocators = segment_manager.allocator_manager_.getAllocators(
-            mounted_segment.segment.name);
+        const auto* allocators =
+            segment_manager.allocator_manager_.getAllocators(
+                mounted_segment.segment.name);
         if (allocators == nullptr) {
             return false;
         }
@@ -362,9 +364,9 @@ TEST_F(SegmentTest, PrepareUnmountDrainedSegment) {
               ErrorCode::OK);
 
     size_t metrics_dec_capacity = 0;
-    ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
-                                                   metrics_dec_capacity),
-              ErrorCode::OK);
+    ASSERT_EQ(
+        segment_access.PrepareUnmountSegment(segment.id, metrics_dec_capacity),
+        ErrorCode::OK);
     ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
                                                   metrics_dec_capacity),
               ErrorCode::OK);
