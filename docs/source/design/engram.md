@@ -93,12 +93,17 @@ Populate follows the existing Store write path:
 
 1. validate that exactly one table is provided for each head
 2. validate that every table matches `[N_h, D]`
-3. register each embedding table buffer
-4. upload all head tables with `batch_put_from(...)`
-5. unregister the staging buffers
+3. verify that the target head-table keys do not already exist
+4. register each embedding table buffer
+5. upload all head tables with `batch_put_from(...)`
+6. unregister the staging buffers
 
-If upload fails after some head tables have already been written, the backend
-best-effort removes the partially populated keys before returning an error.
+`populate(...)` is defined as a create-only operation for one Engram layer. To
+reuse a `layer_id`, first remove the old tables with `remove_from_store(...)`.
+
+If upload fails after some head tables have already been written, or if publish
+finishes but post-write buffer cleanup fails, the backend best-effort removes
+the keys written by the failed populate attempt before returning an error.
 
 ## Lookup Flow
 

@@ -229,7 +229,27 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
         const size_t expected =
             static_cast<size_t>(table_vocab_sizes_[i]) * embedding_dim_ *
             sizeof(float);
-        if (buffer_sizes[i] != expected) {
+        if (embedding_buffers[i] == nullptr || buffer_sizes[i] != expected) {
+            return -1;
+        }
+    }
+
+    std::vector<int> exists_results = store_->batchIsExist(embed_keys_);
+    if (exists_results.size() != embed_keys_.size()) {
+        LOG(ERROR) << "Failed to preflight Engram populate key existence";
+        return -1;
+    }
+    for (size_t i = 0; i < exists_results.size(); ++i) {
+        const int exists = exists_results[i];
+        if (exists < 0) {
+            LOG(ERROR) << "Failed to query Engram key '" << embed_keys_[i]
+                       << "' before populate, rc=" << exists;
+            return -1;
+        }
+        if (exists != 0) {
+            LOG(ERROR) << "Engram populate requires empty destination key '"
+                       << embed_keys_[i]
+                       << "'. Remove the existing layer first.";
             return -1;
         }
     }
@@ -260,7 +280,7 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
 
     std::vector<int> put_results =
         store_->batch_put_from(embed_keys_, embedding_buffers, buffer_sizes);
-    const bool ok =
+    const bool put_succeeded =
         put_results.size() == embed_keys_.size() &&
         std::all_of(put_results.begin(), put_results.end(),
                     [](int result) { return result == 0; });
@@ -268,18 +288,28 @@ int Engram::populate(const std::vector<void*>& embedding_buffers,
     const bool unregister_failed =
         cleanup_registered_buffers(embedding_buffers.size());
 
-    if (!ok) {
-        for (const auto& key : embed_keys_) {
-            int rc = store_->remove(key, true);
+    if (!put_succeeded || unregister_failed) {
+        const bool put_results_complete =
+            put_results.size() == embed_keys_.size();
+        for (size_t i = 0; i < embed_keys_.size(); ++i) {
+            if (put_results_complete && put_results[i] != 0) {
+                continue;
+            }
+            int rc = store_->remove(embed_keys_[i], true);
             if (rc != 0 &&
                 rc != static_cast<int>(ErrorCode::OBJECT_NOT_FOUND)) {
                 LOG(ERROR) << "Failed to roll back partially populated Engram "
-                           << "key '" << key << "', rc=" << rc;
+                           << "key '" << embed_keys_[i] << "', rc=" << rc;
             }
         }
+        if (unregister_failed) {
+            LOG(ERROR) << "Rolling back Engram populate because buffer cleanup "
+                          "failed after publish";
+        }
+        return -1;
     }
 
-    return (ok && !unregister_failed) ? 0 : -1;
+    return 0;
 }
 
 }  // namespace engram

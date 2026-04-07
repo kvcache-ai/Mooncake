@@ -225,8 +225,12 @@ def create_store_connection(store_module, config):
 def setUpModule():
     global GLOBAL_STORE, STORE_MODULE, TEST_CONFIG
     STORE_MODULE = import_store_module()
-    TEST_CONFIG = load_test_config()
-    GLOBAL_STORE = create_store_connection(STORE_MODULE, TEST_CONFIG)
+    try:
+        TEST_CONFIG = load_test_config()
+        GLOBAL_STORE = create_store_connection(STORE_MODULE, TEST_CONFIG)
+    except Exception:
+        stop_local_master()
+        raise
 
 
 def tearDownModule():
@@ -373,6 +377,12 @@ class TestStorePopulateAndLookup(EngramTestBase):
 
 
 class TestErrorHandling(EngramTestBase):
+    def test_populate_rejects_reusing_existing_layer_keys(self):
+        _, engram = self.create_engram()
+        self.populate_store(engram)
+        with self.assertRaises(Exception):
+            engram.populate(self.make_embedding_tables(engram))
+
     def test_lookup_rejects_missing_tables(self):
         _, engram = self.create_engram()
         with self.assertRaises(Exception):

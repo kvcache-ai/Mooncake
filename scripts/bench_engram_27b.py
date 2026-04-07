@@ -23,6 +23,7 @@ import ctypes
 import os
 import sys
 import time
+import uuid
 
 import numpy as np
 
@@ -58,7 +59,14 @@ def create_engram_config():
     return cfg
 
 
-def populate_store_via_cxl_segment(store_obj, embedding_buffers):
+def rollback_keys(store_obj, keys):
+    for key in keys:
+        rc = store_obj.remove(key, True)
+        if rc not in (0, -704):
+            print(f"Warning: failed to remove benchmark key {key}, rc={rc}")
+
+
+def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
     cxl_path = os.environ.get("MC_CXL_DEV_PATH")
     if not cxl_path:
         raise RuntimeError("MC_CXL_DEV_PATH is required for CXL fallback")
@@ -92,20 +100,29 @@ def populate_store_via_cxl_segment(store_obj, embedding_buffers):
     if cursor < base_addr:
         raise RuntimeError("CXL mapping is too small for staging region")
 
-    for head_idx, emb in enumerate(embedding_buffers):
-        nbytes = emb.nbytes
-        aligned = aligned_sizes[head_idx]
-        if cursor + aligned > limit_addr:
-            raise RuntimeError("CXL mapping is too small for benchmark tables")
-        ctypes.memmove(cursor, emb.ctypes.data, nbytes)
-        key = f"engram:l1:h{head_idx}"
-        rc = store_obj.put_from(key, cursor, nbytes)
-        if rc != 0:
-            raise RuntimeError(f"CXL put_from fallback failed for {key}, rc={rc}")
-        cursor += aligned
+    published_keys = []
+    try:
+        for head_idx, emb in enumerate(embedding_buffers):
+            nbytes = emb.nbytes
+            aligned = aligned_sizes[head_idx]
+            if cursor + aligned > limit_addr:
+                raise RuntimeError("CXL mapping is too small for benchmark tables")
+            ctypes.memmove(cursor, emb.ctypes.data, nbytes)
+            key = keys[head_idx]
+            rc = store_obj.put_from(key, cursor, nbytes)
+            if rc != 0:
+                raise RuntimeError(
+                    f"CXL put_from fallback failed for {key}, rc={rc}"
+                )
+            published_keys.append(key)
+            cursor += aligned
+    except Exception:
+        rollback_keys(store_obj, published_keys)
+        raise
 
 
 def populate_store(engram, store_obj):
+    keys = engram.get_store_keys()
     embedding_buffers = []
     for vocab_size in engram.get_table_vocab_sizes():
         emb = np.random.randn(vocab_size, engram.get_embedding_dim()).astype(np.float32)
@@ -121,14 +138,22 @@ def populate_store(engram, store_obj):
         protocol = os.environ.get("MOONCAKE_PROTOCOL", "")
         if protocol == "cxl":
             mode = "cxl put_from fallback"
-            populate_store_via_cxl_segment(store_obj, embedding_buffers)
+            populate_store_via_cxl_segment(store_obj, keys, embedding_buffers)
         else:
             mode = "store.put fallback"
-            for head_idx, emb in enumerate(embedding_buffers):
-                key = f"engram:l1:h{head_idx}"
-                rc = store_obj.put(key, emb)
-                if rc != 0:
-                    raise RuntimeError(f"fallback populate failed for {key}, rc={rc}")
+            published_keys = []
+            try:
+                for head_idx, emb in enumerate(embedding_buffers):
+                    key = keys[head_idx]
+                    rc = store_obj.put(key, emb)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"fallback populate failed for {key}, rc={rc}"
+                        )
+                    published_keys.append(key)
+            except Exception:
+                rollback_keys(store_obj, published_keys)
+                raise
     populate_ms = (time.perf_counter() - t0) * 1000
     return embedding_buffers, populate_ms, mode
 
@@ -222,9 +247,11 @@ def main():
     if rc != 0:
         raise RuntimeError(f"Failed to setup Mooncake store, rc={rc}")
 
+    engram = None
     try:
         cfg = create_engram_config()
-        engram = store.Engram(layer_id=1, config=cfg, store=store_obj)
+        layer_id = uuid.uuid4().int & 0x7FFFFFFF
+        engram = store.Engram(layer_id=layer_id, config=cfg, store=store_obj)
         embedding_buffers, populate_ms, mode = populate_store(engram, store_obj)
         print(f"Populate mode: {mode}, took {populate_ms:.2f} ms")
 
@@ -242,6 +269,11 @@ def main():
                 f"{result['p99_ms']:>10.3f} {result['tokens_per_sec']:>12.1f} {result['gbps']:>10.3f}"
             )
     finally:
+        if engram is not None:
+            try:
+                engram.remove_from_store(force=True)
+            except Exception as exc:
+                print(f"Warning: failed to clean up benchmark layer: {exc}")
         store_obj.close()
 
 
