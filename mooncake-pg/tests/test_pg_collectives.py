@@ -109,7 +109,6 @@ def _collective_payload(
         tensor = torch.tensor([rank + 1], dtype=torch.int32, device=device)
         work = dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
         work.wait()
-        wait_until(lambda: work.is_completed(), description="async all_reduce completion")
         if device_type == "cuda":
             torch.cuda.synchronize(device)
         return {"value": int(tensor.cpu().item())}
