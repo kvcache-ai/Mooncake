@@ -14,15 +14,15 @@
             "dp_rank": 0,
             "additionalsalt": ""
         },
-        "mooncake":
+        "vllm-prefill-node2":
         {
             "endpoint": "tcp://127.0.0.1:6667",
             "replay_endpoint": "tcp://127.0.0.1:6668",
-            "type": "Mooncake",
+            "type": "vLLM",
             "modelname": "qwen2.5",
             "lora_name": "xx-adapter",
             "tenant_id": "default",
-            "instance_id":  "vllm-prefill-node1",
+            "instance_id":  "vllm-prefill-node2",
             "block_size": 128,
             "dp_rank": 0,
             "additionalsalt": ""

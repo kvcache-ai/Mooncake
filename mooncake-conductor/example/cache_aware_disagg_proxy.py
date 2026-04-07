@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
         })
 
     # Create conductor client
-    app.state.conductor_client = CacheAwareRouter(global_args.conductor_address, "/cache")
+    app.state.conductor_client = CacheAwareRouter(global_args.conductor_address, "/query")
 
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(

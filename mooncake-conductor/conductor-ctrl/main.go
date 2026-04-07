@@ -13,7 +13,6 @@ import (
 )
 
 var (
-	// TODO change default config path
 	conductorConfigPath = common.LoadEnv("CONDUCTOR_CONFIG_PATH", "~/.mooncake/conductor_config.json")
 	httpServerPort      = 13333
 )
