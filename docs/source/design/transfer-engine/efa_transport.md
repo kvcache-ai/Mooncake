@@ -191,6 +191,8 @@ Use `transfer_engine_bench` to measure EFA transport throughput between two node
     --report_unit=GB
 ```
 
+> **Tip:** For CPU-to-CPU benchmarks, prepend `CUDA_VISIBLE_DEVICES=""` to prevent the CUDA runtime from being initialized. Without it, `nvidia-smi` may show GPU memory usage (due to CUDA context initialization) even though the benchmark only uses DRAM.
+
 Replace `<target_hostname>:<target_port>` with the target node's address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 ### Key Parameters
