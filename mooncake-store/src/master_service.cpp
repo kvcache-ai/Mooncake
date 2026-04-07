@@ -1316,6 +1316,11 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         for (const auto& tgt_segment : tgt_segments) {
+            if (!segment_access.ExistsSegmentName(tgt_segment)) {
+                LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                           << ", error=target_segment_not_found";
+                return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            }
             if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_allocatable";
@@ -1534,6 +1539,11 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
+        if (!segment_access.ExistsSegmentName(tgt_segment)) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", error=target_segment_not_found";
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
         if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", error=target_segment_not_allocatable";
