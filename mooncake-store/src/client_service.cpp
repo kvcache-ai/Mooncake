@@ -213,7 +213,8 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
         LOG(ERROR) << "length is 0";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // Only RDMA/EFA is limited by max_mr_size due to ibv_reg_mr() hardware limits.
+    // Only RDMA/EFA is limited by max_mr_size due to ibv_reg_mr() hardware
+    // limits.
     if (protocol == "rdma" || protocol == "efa") {
         auto max_mr_size = globalConfig().max_mr_size;
         if (length > max_mr_size) {
