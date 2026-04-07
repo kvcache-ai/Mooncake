@@ -527,7 +527,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
             }
 
             if (target_id != LOCAL_SEGMENT_ID) {
-                rpc_server_addr = segment->getMemory().rpc_server_addr;
+                rpc_server_addr = segment->rpc_server_addr;
             }
 
             auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;

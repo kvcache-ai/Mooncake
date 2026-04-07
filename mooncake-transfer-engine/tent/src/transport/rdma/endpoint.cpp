@@ -283,7 +283,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             SegmentDescRef segment_desc;
             auto& manager = transport.metadata_->segmentManager();
             CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
-            rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
+            rpc_server_addr = segment_desc->rpc_server_addr;
         }
         if (rpc_server_addr.empty()) {
             return Status::InvalidArgument(

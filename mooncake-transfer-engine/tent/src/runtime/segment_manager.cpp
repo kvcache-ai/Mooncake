@@ -72,7 +72,22 @@ Status SegmentManager::getRemoteCached(SegmentDesc *&desc, SegmentID handle) {
         SegmentDescRef desc_ref;
         auto status = getRemote(desc_ref, handle);
         if (!status.ok()) return status;
-        cache.id_to_desc_map[handle] = std::move(desc_ref);
+        cache.id_to_desc_map[handle] = desc_ref;
+
+        std::string peer_rpc_addr = desc_ref->rpc_server_addr;
+        std::string local_rpc_addr = local_desc_->rpc_server_addr;
+        if (!peer_rpc_addr.empty() && !local_rpc_addr.empty()) {
+            // Send a subscription request to enable proactive cache
+            // invalidation. This is a best-effort mechanism to reduce stale
+            // cache hits. Errors are logged and ignored; correctness should not
+            // depend on this.
+            ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
+                                                       local_rpc_addr);
+        } else {
+            LOG(ERROR) << "Unexpected empty RPC address, peer: '"
+                       << peer_rpc_addr << "', local: '" << local_rpc_addr
+                       << "'.";
+        }
     }
     desc = cache.id_to_desc_map[handle].get();
     assert(desc);
@@ -101,8 +116,27 @@ Status SegmentManager::getRemote(SegmentDescRef &desc,
 Status SegmentManager::invalidateRemote(SegmentID handle) {
     if (handle == LOCAL_SEGMENT_ID) return Status::OK();
     auto &cache = tl_remote_cache_.get();
-    if (cache.id_to_desc_map.count(handle)) cache.id_to_desc_map.erase(handle);
+    cache.id_to_desc_map.erase(handle);
     return Status::OK();
+}
+
+Status SegmentManager::invalidateAllCacheForRemote(
+    const std::string &segment_name) {
+    // TODO: Optimize if this becomes a bottleneck.
+    // Currently, this invalidates all cached segments globally instead of
+    // targeting just the specified segment. This is acceptable because
+    // segment updates should be infrequent.
+    // A per-segment versioning scheme could be more precise but it could
+    // introduce additional complexity and might slightly degrade the
+    // fast-path performance of `getRemoteCached`.
+    (void)segment_name;
+    version_.fetch_add(1, std::memory_order_relaxed);
+    return Status::OK();
+}
+
+void SegmentManager::addSubscriber(const std::string &subscriber_addr) {
+    RWSpinlock::WriteGuard guard(subscribers_lock_);
+    subscribers_.insert(subscriber_addr);
 }
 
 Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
@@ -134,7 +168,21 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
 }
 
 Status SegmentManager::synchronizeLocal() {
-    return registry_->putSegmentDesc(local_desc_);
+    CHECK_STATUS(registry_->putSegmentDesc(local_desc_));
+
+    RWSpinlock::ReadGuard guard(subscribers_lock_);
+    if (subscribers_.empty()) return Status::OK();
+
+    for (const auto &subscriber : subscribers_) {
+        // Remove subscribers that have failed (e.g., peer might shutdown)
+        // to avoid repeated RPC failures.
+        ControlClient::notifySegmentUpdatedAsync(
+            subscriber, local_desc_->name, [this, subscriber] {
+                RWSpinlock::WriteGuard guard(subscribers_lock_);
+                subscribers_.erase(subscriber);
+            });
+    }
+    return Status::OK();
 }
 
 Status SegmentManager::deleteLocal() {

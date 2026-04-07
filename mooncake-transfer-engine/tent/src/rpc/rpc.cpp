@@ -11,14 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-// TODO the implementation needs to be updated
-// - Caching sockets, and supporting multiple calls
-// - Keep it lightweighted and tidy
-
 #include "tent/rpc/rpc.h"
 
 #include <glog/logging.h>
+#include <async_simple/executors/SimpleExecutor.h>
 
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -44,7 +40,49 @@ struct RpcHandlerScope {
 };
 }  // namespace
 
-CoroRpcAgent::CoroRpcAgent() {}
+class ClientPool {
+   public:
+    std::unique_ptr<coro_rpc_client> acquire() {
+        std::lock_guard<std::mutex> guard(lock_);
+        if (!idle_clients_.empty()) {
+            auto client = std::move(idle_clients_.back());
+            idle_clients_.pop_back();
+            return client;
+        }
+        return nullptr;
+    }
+
+    void release(std::unique_ptr<coro_rpc_client> client) {
+        if (!client) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        idle_clients_.push_back(std::move(client));
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> guard(lock_);
+        idle_clients_.clear();
+    }
+
+   private:
+    std::mutex lock_;
+    std::vector<std::unique_ptr<coro_rpc_client>> idle_clients_;
+};
+
+struct ClientLease {
+    std::unique_ptr<coro_rpc_client> client;
+    std::shared_ptr<ClientPool> pool;
+    bool broken = false;
+
+    ~ClientLease() {
+        if (client && !broken) {
+            pool->release(std::move(client));
+        }
+    }
+
+    coro_rpc_client* operator->() const { return client.get(); }
+};
+
+CoroRpcAgent::CoroRpcAgent() = default;
 
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
@@ -96,10 +134,12 @@ Status CoroRpcAgent::stop() {
         delete server_;
         server_ = nullptr;
     }
-    for (auto& entry : sessions_) {
-        delete entry.second;
+
+    std::lock_guard<std::mutex> lock(pools_mutex_);
+    for (auto& entry : pools_) {
+        entry.second->clear();
     }
-    sessions_.clear();
+    pools_.clear();
     return Status::OK();
 }
 
@@ -115,45 +155,83 @@ void CoroRpcAgent::process(int func_id) {
     }
 }
 
+std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
+    const std::string& server_addr) {
+    std::lock_guard<std::mutex> lock(pools_mutex_);
+    auto it = pools_.find(server_addr);
+    if (it == pools_.end()) {
+        it = pools_.emplace(server_addr, std::make_shared<ClientPool>()).first;
+    }
+    return it->second;
+}
+
+Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
+    std::string server_addr, int func_id, std::string request) {
+    if (tl_inside_rpc_handler) {
+        co_return std::make_pair(
+            Status::InvalidArgument(
+                "RPC call from RPC handler is forbidden" LOC_MARK),
+            "");
+    }
+
+    auto pool = getOrCreatePool(server_addr);
+    ClientLease lease{pool->acquire(), pool, false};
+
+    if (!lease.client) {
+        lease.client = std::make_unique<coro_rpc_client>();
+        auto conn_result = co_await lease.client->connect(server_addr);
+        if (conn_result.val() != 0) {
+            lease.broken = true;
+            auto msg = "Failed to connect RPC server. server: " + server_addr +
+                       ", func_id: " + std::to_string(func_id) +
+                       ", message: " + std::string{conn_result.message()};
+            co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
+                                     "");
+        }
+    }
+
+    lease->set_req_attachment(request);
+
+    auto call_result = co_await lease->call<&CoroRpcAgent::process>(func_id);
+
+    if (!call_result.has_value()) {
+        lease.broken = true;
+        auto msg = "Failed to call RPC function. server: " + server_addr +
+                   ", func_id: " + std::to_string(func_id) +
+                   ", message: " + std::string{call_result.error().msg};
+        co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK), "");
+    }
+
+    std::string response{lease->get_resp_attachment()};
+    lease->release_resp_attachment();
+
+    co_return std::make_pair(Status::OK(), std::move(response));
+}
+
 Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
                           const std::string_view& request,
                           std::string& response) {
-    if (tl_inside_rpc_handler) {
-        return Status::InvalidArgument(
-            "Synchronous RPC call from RPC handler is forbidden" LOC_MARK);
+    auto [status, resp] = async_simple::coro::syncAwait(
+        callCoroutine(server_addr, func_id, std::string(request)));
+
+    if (status.ok()) {
+        response = std::move(resp);
     }
-    coro_rpc::coro_rpc_client* client = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        auto it = sessions_.find(server_addr);
-        if (it == sessions_.end()) {
-            coro_rpc_client* client = new coro_rpc_client();
-            auto conn_result =
-                async_simple::coro::syncAwait(client->connect(server_addr));
-            if (conn_result.val() != 0) {
-                LOG(ERROR) << "Failed to connect RPC server. "
-                           << "server " << server_addr << ", "
-                           << "func_id " << func_id << ", "
-                           << "message " << conn_result.message();
-                return Status::RpcServiceError(
-                    "Failed to connect RPC server" LOC_MARK);
+    return status;
+}
+
+void CoroRpcAgent::callAsync(const std::string& server_addr, int func_id,
+                             const std::string& request,
+                             AsyncCallback callback) {
+    callCoroutine(server_addr, func_id, request)
+        .start([cb = std::move(callback)](auto&& try_result) {
+            if (try_result.hasError()) {
+                cb(Status::RpcServiceError("Async RPC exception" LOC_MARK), "");
+            } else {
+                auto& val = try_result.value();
+                cb(val.first, std::move(val.second));
             }
-            it = sessions_.emplace(server_addr, client).first;
-        }
-        client = it->second;
-    }
-    client->set_req_attachment(request);
-    auto call_result = async_simple::coro::syncAwait(
-        client->call<&CoroRpcAgent::process>(func_id));
-    if (!call_result.has_value()) {
-        // LOG(ERROR) << "Failed to call RPC function."
-        //            << "server " << server_addr << ", "
-        //            << "func_id " << func_id;
-        return Status::RpcServiceError("Failed to call RPC function" LOC_MARK);
-    }
-    response = client->get_resp_attachment();
-    client->release_resp_attachment();
-    return Status::OK();
+        });
 }
 }  // namespace tent
 }  // namespace mooncake

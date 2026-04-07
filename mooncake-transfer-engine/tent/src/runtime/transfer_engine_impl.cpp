@@ -248,9 +248,9 @@ Status TransferEngineImpl::setupLocalSegment() {
     segment->name = local_segment_name_;
     segment->type = SegmentType::Memory;
     segment->machine_id = getMachineID();
+    segment->rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     auto& detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
-    detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
     return manager.synchronizeLocal();
 }
@@ -1004,7 +1004,7 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     auto remote = entry->location;
     auto local_mtype = getTypeEnum(LocationParser(local).type());
     auto remote_mtype = getTypeEnum(LocationParser(remote).type());
-    auto server_addr = desc->getMemory().rpc_server_addr;
+    auto server_addr = desc->rpc_server_addr;
     policy.clear();
     // case 1: rdma without gpu direct
     if (transport_list_[RDMA] && transport_list_[NVLINK]) {

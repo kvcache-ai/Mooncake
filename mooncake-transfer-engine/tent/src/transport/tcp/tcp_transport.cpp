@@ -195,7 +195,7 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc *segment) {
             auto buffer = segment->findBuffer(dest_addr, length);
-            rpc_server_addr = segment->getMemory().rpc_server_addr;
+            rpc_server_addr = segment->rpc_server_addr;
             if (!buffer) {
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
@@ -213,14 +213,14 @@ Status TcpTransport::sendNotification(SegmentID target_id,
     std::string rpc_server_addr;
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc *segment) {
-            rpc_server_addr = segment->getMemory().rpc_server_addr;
+            rpc_server_addr = segment->rpc_server_addr;
             if (rpc_server_addr.empty()) {
                 return Status::NeedsRefreshCache(
                     "Empty RPC server addr" LOC_MARK);
             }
             auto status = ControlClient::notify(rpc_server_addr, message);
             if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr is updated
+                // Perhaps rpc_server_addr can be updated in the future
                 return Status::NeedsRefreshCache(
                     "RPC service error: " + std::string{status.message()} +
                     LOC_MARK);

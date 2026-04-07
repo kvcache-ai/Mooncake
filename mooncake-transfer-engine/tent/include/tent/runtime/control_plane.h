@@ -97,6 +97,14 @@ class ControlClient {
 
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);
+
+    static void subscribeSegmentUpdateAsync(const std::string& server_addr,
+                                            const std::string& subscriber_addr);
+
+    using onNotifySegmentUpdateFailure = std::function<void()>;
+    static void notifySegmentUpdatedAsync(
+        const std::string& server_addr, const std::string& segment_name,
+        const onNotifySegmentUpdateFailure& on_failure);
 };
 
 class ControlService {
@@ -149,6 +157,12 @@ class ControlService {
 
     void onUnpinStageBuffer(const std::string_view& request,
                             std::string& response);
+
+    void onSubscribeSegmentUpdate(const std::string_view& request,
+                                  std::string& response);
+
+    void onSegmentUpdated(const std::string_view& request,
+                          std::string& response);
 
    private:
     std::unique_ptr<SegmentManager> manager_;

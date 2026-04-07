@@ -211,6 +211,16 @@ ControlService::ControlService(const std::string& type,
         Unpin, [this](const std::string_view& request, std::string& response) {
             onUnpinStageBuffer(request, response);
         });
+    rpc_server_->registerFunction(
+        SubscribeSegmentUpdate,
+        [this](const std::string_view& request, std::string& response) {
+            onSubscribeSegmentUpdate(request, response);
+        });
+    rpc_server_->registerFunction(
+        NotifySegmentUpdated,
+        [this](const std::string_view& request, std::string& response) {
+            onSegmentUpdated(request, response);
+        });
 }
 
 ControlService::~ControlService() {}
@@ -304,6 +314,52 @@ void ControlService::onUnpinStageBuffer(const std::string_view& request,
                                         std::string& response) {
     uint64_t addr = json::parse(request).get<uint64_t>();
     impl_->unlockStageBuffer(addr);
+}
+
+void ControlService::onSubscribeSegmentUpdate(const std::string_view& request,
+                                              std::string& response) {
+    std::string peer_addr =
+        json::parse(std::string(request)).get<std::string>();
+    manager_->addSubscriber(peer_addr);
+}
+
+void ControlService::onSegmentUpdated(const std::string_view& request,
+                                      std::string& response) {
+    std::string segment_name =
+        json::parse(std::string(request)).get<std::string>();
+
+    manager_->invalidateAllCacheForRemote(segment_name);
+
+    VLOG(1) << "Invalidated cache for segment " << segment_name
+            << " due to remote update notification";
+}
+
+void ControlClient::subscribeSegmentUpdateAsync(
+    const std::string& server_addr, const std::string& subscriber_addr) {
+    json j = subscriber_addr;
+    std::string request = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, SubscribeSegmentUpdate, request,
+        [](const Status& status, const std::string&) {
+            if (!status.ok()) {
+                LOG(ERROR) << "SubscribeSegmentUpdate RPC failed with: "
+                           << status.ToString();
+            }
+        });
+}
+
+void ControlClient::notifySegmentUpdatedAsync(
+    const std::string& server_addr, const std::string& segment_name,
+    const onNotifySegmentUpdateFailure& on_failure) {
+    json j = segment_name;
+    std::string request = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, NotifySegmentUpdated, request,
+        [on_failure](const Status& status, const std::string&) {
+            if (!status.ok()) {
+                on_failure();
+            }
+        });
 }
 
 }  // namespace tent

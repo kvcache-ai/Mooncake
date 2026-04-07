@@ -137,7 +137,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
             }
             hint.topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
             if (target_id != LOCAL_SEGMENT_ID) {
-                rpc_server_addr = segment->getMemory().rpc_server_addr;
+                rpc_server_addr = segment->rpc_server_addr;
             }
             target_seg_name = segment->name;
             target_dev_name = hint.topo->getNicName(device_id);

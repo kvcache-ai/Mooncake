@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 #include "tent/runtime/segment.h"
@@ -53,7 +54,12 @@ class SegmentManager {
 
     Status getRemote(SegmentDescRef &desc, const std::string &segment_name);
 
+    // Invalidates the thread-local cache.
+    // This only affects the calling thread's cache.
     Status invalidateRemote(SegmentID handle);
+
+    // Invalidates all threads' caches.
+    Status invalidateAllCacheForRemote(const std::string &segment_name);
 
     // Execute an operation with automatic cache invalidation and retry.
     //
@@ -108,6 +114,10 @@ class SegmentManager {
 
     Status deleteLocal();
 
+    // Registers a peer's RPC address to receive proactive cache invalidation
+    // notifications when the local segment is updated.
+    void addSubscriber(const std::string &subscriber_addr);
+
    private:
     Status getRemote(SegmentDescRef &desc, SegmentID handle);
 
@@ -136,6 +146,9 @@ class SegmentManager {
 
     std::string file_desc_basepath_;
     uint64_t ttl_ms_ = 10 * 1000;  // N.B. Frequent TTL harms p999
+
+    RWSpinlock subscribers_lock_;
+    std::unordered_set<std::string> subscribers_;
 };
 }  // namespace tent
 }  // namespace mooncake
