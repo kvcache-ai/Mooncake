@@ -22,9 +22,10 @@ If not installed, follow [AWS EFA documentation](https://docs.aws.amazon.com/AWS
 
 ### 2. Build Dependencies
 
-Install all Mooncake dependencies using the provided script:
+Clone the repository and install all dependencies:
 
 ```bash
+git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 sudo ./dependencies.sh -y
 ```
@@ -42,15 +43,7 @@ sudo apt-get install -y libgflags-dev
 
 ## Building Mooncake with EFA Support
 
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/kvcache-ai/Mooncake.git
-cd Mooncake
-git submodule update --init --recursive
-```
-
-### 2. Build with EFA Enabled
+### 1. Build with EFA Enabled
 
 **GPU memory transfers (e.g., KV cache in vLLM):**
 
@@ -82,7 +75,7 @@ make -j$(nproc)
 
 > **Note:** With `-DUSE_CUDA=OFF`, the benchmark tool uses DRAM buffers allocated via `numa_alloc_onnode`. This is useful for measuring EFA transport throughput independently of GPU hardware.
 
-### 3. Install Python Package
+### 2. Install Python Package
 
 ```bash
 # Copy built modules to wheel directory
