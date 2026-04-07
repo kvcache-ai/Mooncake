@@ -2082,8 +2082,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
-    return to_py_ret(
-        get_into_range_internal(key, buffer, 0, 0, size, true));
+    return to_py_ret(get_into_range_internal(key, buffer, 0, 0, size, true));
 }
 
 int64_t RealClient::get_into_range(const std::string &key, void *buffer,
