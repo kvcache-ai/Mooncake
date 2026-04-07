@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import json
 import os
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -11,6 +15,93 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_PYTHON_DIR = REPO_ROOT / "build" / "mooncake-integration"
+DEFAULT_MASTER_BINARY = REPO_ROOT / "build" / "mooncake-store" / "src" / "mooncake_master"
+ASAN_ENV_READY = "_MOONCAKE_DRAIN_HTTP_ASAN_READY"
+
+
+def _find_store_extension() -> Path:
+    candidates = sorted(BUILD_PYTHON_DIR.glob("store*.so"))
+    if not candidates:
+        return BUILD_PYTHON_DIR / "store.so"
+    return candidates[0]
+
+
+STORE_EXTENSION = _find_store_extension()
+
+
+def _extract_master_binary(argv: list[str]) -> Path:
+    for index, arg in enumerate(argv[1:], start=1):
+        if arg.startswith("--master-binary="):
+            return Path(arg.split("=", 1)[1]).resolve()
+        if arg == "--master-binary" and index + 1 < len(argv):
+            return Path(argv[index + 1]).resolve()
+    return DEFAULT_MASTER_BINARY.resolve()
+
+
+def _artifact_needs_asan_runtime(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["ldd", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return "libasan" in result.stdout or "libasan" in result.stderr
+
+
+def _resolve_asan_runtime() -> str | None:
+    cxx = shutil.which("c++") or shutil.which("g++") or shutil.which("gcc")
+    if cxx is None:
+        return None
+    try:
+        result = subprocess.run(
+            [cxx, "-print-file-name=libasan.so"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    candidate = result.stdout.strip()
+    if not candidate or candidate == "libasan.so":
+        return None
+    if not Path(candidate).exists():
+        return None
+    return candidate
+
+
+def ensure_asan_preloaded(argv: list[str]) -> None:
+    if os.environ.get(ASAN_ENV_READY) == "1":
+        return
+    master_binary = _extract_master_binary(argv)
+    needs_asan = any(
+        _artifact_needs_asan_runtime(path)
+        for path in (STORE_EXTENSION, master_binary)
+    )
+    if not needs_asan:
+        return
+
+    current_preload = os.environ.get("LD_PRELOAD", "")
+    preload_entries = [entry for entry in shlex.split(current_preload) if entry]
+    if any("libasan" in Path(entry).name for entry in preload_entries):
+        os.environ[ASAN_ENV_READY] = "1"
+        return
+
+    asan_runtime = _resolve_asan_runtime()
+    if asan_runtime is None:
+        raise RuntimeError("ASan build detected but libasan.so could not be resolved")
+
+    os.environ["LD_PRELOAD"] = " ".join([asan_runtime, *preload_entries]).strip()
+    os.environ[ASAN_ENV_READY] = "1"
+    os.execvpe(sys.executable, [sys.executable, *argv], os.environ)
+
+
+ensure_asan_preloaded(sys.argv)
+
 if str(BUILD_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(BUILD_PYTHON_DIR))
 
