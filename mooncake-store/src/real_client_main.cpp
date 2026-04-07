@@ -1,10 +1,12 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <fstream>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
 #include "config.h"
 #include "real_client.h"
+#include "utils.h"
 
 using namespace mooncake;
 
@@ -15,10 +17,11 @@ DEFINE_string(device_names, "", "Device names");
 DEFINE_string(master_server_address, "127.0.0.1:50051",
               "Master server address");
 DEFINE_string(protocol, "tcp", "Protocol");
-DEFINE_int32(port, 50052, "Real Client service port");
+DEFINE_int32(port, 50052, "Real Client service port (0 = auto allocate)");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_string(endpoint_file, "", "File to save the endpoint address for Dummy Client discovery (empty = default path)");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -67,6 +70,36 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::release_offload_buffer>(&real_client);
 }
+
+static bool SaveEndpointToFile(int port, const std::string &endpoint_file) {
+    std::string path = endpoint_file;
+    if (path.empty()) {
+        const char *home = getenv("HOME");
+        if (home) {
+            path = std::string(home) + "/.mooncake/real_client.endpoint";
+        } else {
+            path = "/var/run/mooncake/real_client.endpoint";
+        }
+    }
+
+    // Create parent directory if needed
+    auto slash_pos = path.rfind('/');
+    if (slash_pos != std::string::npos) {
+        std::string dir = path.substr(0, slash_pos);
+        std::string mkdir_cmd = "mkdir -p " + dir;
+        (void)system(mkdir_cmd.c_str());
+    }
+
+    std::ofstream ofs(path);
+    if (!ofs) {
+        LOG(WARNING) << "Failed to write endpoint file: " << path;
+        return false;
+    }
+    ofs << "127.0.0.1:" << port << std::endl;
+    LOG(INFO) << "Endpoint saved to " << path;
+    return true;
+}
+
 }  // namespace mooncake
 
 int main(int argc, char *argv[]) {
@@ -83,12 +116,26 @@ int main(int argc, char *argv[]) {
     globalConfig().ascend_agent_mode = true;
 #endif
 
+    // Determine RPC port: use AutoPortBinder if --port=0
+    int rpc_port = FLAGS_port;
+    std::unique_ptr<AutoPortBinder> rpc_port_binder;
+
+    if (rpc_port == 0) {
+        rpc_port_binder = std::make_unique<AutoPortBinder>();
+        rpc_port = rpc_port_binder->getPort();
+        if (rpc_port < 0) {
+            LOG(FATAL) << "Failed to auto-allocate RPC port";
+            return -1;
+        }
+        LOG(INFO) << "Auto-allocated RPC port: " << rpc_port;
+    }
+
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
-        nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-        FLAGS_port, FLAGS_enable_offload);
+        nullptr, "@mooncake_client_" + std::to_string(rpc_port) + ".sock",
+        rpc_port, FLAGS_enable_offload);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
@@ -99,10 +146,18 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, "127.0.0.1");
+    // Release the port binder before starting the RPC server so the server
+    // can bind the same port. The window between release and server.start()
+    // is very small, making port-steal unlikely.
+    rpc_port_binder.reset();
+
+    coro_rpc::coro_rpc_server server(FLAGS_threads, rpc_port, "127.0.0.1");
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on 127.0.0.1:" << FLAGS_port;
+    // Save endpoint file for Dummy Client discovery
+    SaveEndpointToFile(rpc_port, FLAGS_endpoint_file);
+
+    LOG(INFO) << "Starting real client service on 127.0.0.1:" << rpc_port;
 
     return server.start();
 }
