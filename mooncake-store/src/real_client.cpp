@@ -2000,21 +2000,21 @@ int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
-    const std::string &key, void *buffer, size_t size) {
-    // NOTE: The buffer address must be previously registered with
-    // register_buffer() for zero-copy RDMA operations to work correctly
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
+    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
+    size_t size) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Step 1: Get object info
     auto query_result = client_->Query(key);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            VLOG(1) << "Object not found for key: " << key;
+            if (src_offset == 0) {
+                VLOG(1) << "Object not found for key: " << key;
+            }
             return tl::unexpected(query_result.error());
         }
         LOG(ERROR) << "Query failed for key: " << key
@@ -2022,10 +2022,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(query_result.error());
     }
 
-    const std::vector<Replica::Descriptor> &replica_list =
-        query_result.value().replicas;
-
-    // Calculate total size from replica list
+    const auto &replica_list = query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Internal error: replica_list is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2039,67 +2036,29 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
 
     const auto &replica = res.value();
     uint64_t total_size = calculate_total_size(replica);
-
-    // Check if user buffer is large enough
-    if (size < total_size) {
-        LOG(ERROR) << "User buffer too small. Required: " << total_size
-                   << ", provided: " << size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Step 2: Split user buffer according to object info and create
-    // slices
-    std::vector<mooncake::Slice> slices;
-    allocateSlices(slices, replica, buffer);
-
-    // Step 3: Read data directly into user buffer
-    auto get_result = client_->Get(key, query_result.value(), slices);
-    if (!get_result) {
-        LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(get_result.error());
-        return tl::unexpected(get_result.error());
-    }
-
-    return static_cast<int64_t>(total_size);
-}
-
-tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
-    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto query_result = client_->Query(key);
-    if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return tl::unexpected(query_result.error());
-        }
-        LOG(ERROR) << "Query failed for key: " << key;
-        return tl::unexpected(query_result.error());
-    }
-
-    const auto &replica_list = query_result.value().replicas;
-    if (replica_list.empty()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const auto &res = client_->GetPreferredReplica(replica_list);
-    if (!res) return tl::unexpected(ErrorCode::INVALID_PARAMS);
-
-    const auto &replica = res.value();
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "get_into_range only supports memory replicas";
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
-    }
-
-    uint64_t total_size = calculate_total_size(replica);
-    if (src_offset + size > total_size) {
+    if (size > total_size || src_offset > total_size - size) {
         LOG(ERROR) << "Range overflow: src_offset=" << src_offset
                    << " + size=" << size << " > total=" << total_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (src_offset == 0 && size == total_size) {
+        std::vector<mooncake::Slice> slices;
+        allocateSlices(slices, replica,
+                       static_cast<char *>(buffer) + dst_offset);
+
+        auto get_result = client_->Get(key, query_result.value(), slices);
+        if (!get_result) {
+            LOG(ERROR) << "Get failed for key: " << key
+                       << " with error: " << toString(get_result.error());
+            return tl::unexpected(get_result.error());
+        }
+        return static_cast<int64_t>(total_size);
+    }
+
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "get_into_range only supports memory replicas";
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
     std::vector<Slice> slices;
@@ -2115,7 +2074,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
-    return to_py_ret(get_into_internal(key, buffer, size));
+    return to_py_ret(get_into_range_internal(key, buffer, 0, 0, size));
 }
 
 int64_t RealClient::get_into_range(const std::string &key, void *buffer,

@@ -756,8 +756,7 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
-    // TODO: implement this function
-    return -1;
+    return get_into_range(key, buffer, 0, 0, size);
 }
 
 int64_t DummyClient::get_into_range(const std::string& key, void* buffer,

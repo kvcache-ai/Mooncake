@@ -486,10 +486,6 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
                                                            size_t size);
 
-    tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
-                                                       void *buffer,
-                                                       size_t size);
-
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size);
