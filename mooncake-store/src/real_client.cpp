@@ -465,10 +465,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
 
-        // In standalone mode with RDMA, auto-discover NUMA nodes with NICs
-        // and distribute global_segment across them for full NIC utilization.
+        // For RDMA, auto-discover NUMA nodes with NICs and distribute
+        // global_segment across them for full NIC utilization.
         std::vector<int> seg_numa_nodes;
-        if (!ipc_socket_path_.empty() && protocol == "rdma") {
+        if (protocol == "rdma") {
             seg_numa_nodes = client_->GetNicNumaNodes();
             if (seg_numa_nodes.size() > 1) {
                 std::string nodes_str;
