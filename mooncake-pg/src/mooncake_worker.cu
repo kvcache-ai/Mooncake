@@ -1,5 +1,7 @@
 #include <mooncake_backend.h>
+#include <cstdio>
 #include <memory>
+#include <thread>
 #include <mooncake_worker.cuh>
 
 namespace mooncake {
@@ -37,9 +39,34 @@ class MooncakeWorkCuda : public ::c10d::Work {
         return true;  // This should be a no-op
     }
 
-   private:
+   protected:
     std::shared_ptr<torch::Event> event_;
     std::shared_ptr<TransferGroupMeta> meta_;
+};
+
+class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
+   public:
+    using MooncakeWorkCuda::MooncakeWorkCuda;
+
+    bool wait(std::chrono::milliseconds timeout) override {
+        if (timeout == kNoTimeout) {
+            event_->synchronize();
+            return true;
+        }
+
+        auto start = std::chrono::steady_clock::now();
+        while (!event_->query()) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                      start);
+            if (elapsed >= timeout) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        return true;
+    }
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
@@ -287,6 +314,13 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
 }
 
+MooncakeWorker::~MooncakeWorker() {
+    running_ = false;
+    if (worker_thread_.joinable()) {
+        worker_thread_.join();
+    }
+}
+
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
@@ -400,6 +434,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
+    if (opType == c10d::OpType::BARRIER) {
+        return c10::make_intrusive<MooncakeBarrierWorkCuda>(opType, event,
+                                                            meta);
+    }
     return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta);
 }
 

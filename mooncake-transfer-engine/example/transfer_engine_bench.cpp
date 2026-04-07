@@ -231,6 +231,9 @@ static void freeMemoryPool(void *addr, size_t size) {
 #endif
     }
 #else
+    if (FLAGS_protocol == "ub") {
+        munmap(addr, size);  // for urma
+    }
     numa_free(addr, size);
 #endif
 }
@@ -459,6 +462,9 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[0] = const_cast<char *>(nic_priority_matrix.c_str());
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
+    } else if (FLAGS_protocol == "ub") {
+        engine->getLocalTopology()->discover({FLAGS_device_name});
+        xport = engine->installTransport(FLAGS_protocol, nullptr);
     } else if (FLAGS_protocol == "efa") {
         // EFA needs topology discovery to find devices, but auto_discovery
         // would auto-install RDMA transport. Manually discover instead.

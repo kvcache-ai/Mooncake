@@ -313,6 +313,9 @@ int initiator() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             xport = engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            xport = engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
@@ -412,6 +415,9 @@ int target() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {

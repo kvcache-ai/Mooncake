@@ -65,6 +65,15 @@ struct TransferHandshakeUtil {
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
+
+#ifdef USE_UB
+        Json::Value jettyNums(Json::arrayValue);
+        for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
+        root["jetty_num"] = jettyNums;
+        LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
+                  << " peer_nic_path is " << desc.peer_nic_path
+                  << " jetty_num size is " << desc.jetty_num.size();
+#endif
         return root;
     }
 
@@ -79,6 +88,15 @@ struct TransferHandshakeUtil {
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
+#endif
+
+#ifdef USE_UB
+        for (const auto &jetty : root["jetty_num"]) {
+            desc.jetty_num.push_back(jetty.asUInt());
+        }
+        LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
+                  << " peer_nic_path is " << desc.peer_nic_path
+                  << " jetty_num size is " << desc.jetty_num.size();
 #endif
         return 0;
     }
@@ -194,6 +212,29 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+        segmentJSON["priority_matrix"] = desc.topology.toJson();
+    } else if (segmentJSON["protocol"] == "ub") {
+        Json::Value devicesJSON(Json::arrayValue);
+        for (const auto &device : desc.devices) {
+            Json::Value deviceJSON;
+            deviceJSON["name"] = device.name;
+            deviceJSON["eid"] = device.eid;
+            devicesJSON.append(deviceJSON);
+        }
+        segmentJSON["devices"] = devicesJSON;
+
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            Json::Value tsegJSON(Json::arrayValue);
+            for (auto &entry : buffer.tseg) tsegJSON.append(entry);
+            bufferJSON["tseg"] = tsegJSON;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -370,6 +411,42 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                     << " protocol " << desc->protocol << ", " << buffer.name
                     << ", " << buffer.addr << ", " << buffer.length << ", "
                     << buffer.rkey.size() << ", " << buffer.lkey.size();
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+
+        int ret = desc->topology.parse(
+            segmentJSON["priority_matrix"].toStyledString());
+        if (ret) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+        }
+    } else if (desc->protocol == "ub") {
+        for (const auto &deviceJSON : segmentJSON["devices"]) {
+            DeviceDesc device;
+            device.name = deviceJSON["name"].asString();
+            device.eid = deviceJSON["eid"].asString();
+            if (device.name.empty() || device.eid.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->devices.push_back(device);
+        }
+
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            for (const auto &tsegJSON : bufferJSON["tseg"]) {
+                buffer.tseg.push_back(tsegJSON.asString());
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.tseg.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);

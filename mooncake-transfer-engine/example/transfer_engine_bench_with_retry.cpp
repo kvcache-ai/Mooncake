@@ -386,6 +386,9 @@ int target() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            xport = engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else {

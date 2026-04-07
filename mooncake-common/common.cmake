@@ -73,7 +73,12 @@ option(USE_ASCEND_HETEROGENEOUS "option for transferring between ascend npu and 
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
+option(USE_UB "option for using UB protocol transport" OFF)
 
+if (USE_UB)
+  add_compile_definitions(USE_UB)
+  message(STATUS "ub transport is enabled")
+endif()
 if (USE_EFA)
   # Find libfabric headers and library; default to AWS EFA installer path
   find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h

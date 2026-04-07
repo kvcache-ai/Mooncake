@@ -403,6 +403,14 @@ jobs:
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
 
+    - name: Test Mooncake PyTorch Backend (CPU Only)
+      env:
+        MC_FORCE_TCP: "true"
+      run: |
+        source test_env/bin/activate
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+      shell: bash
+
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
@@ -537,7 +545,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0;2.11.0"
       shell: bash
 
     - name: Build project
