@@ -397,3 +397,29 @@ If `transfer_engine_bench` hangs with some workers never completing:
 1. **Ensure both nodes are running the same build** — the CQ backpressure and thread-safety fixes must be present on both sides
 2. **Reduce concurrency** to verify basic connectivity: `--threads=1 --batch_size=16`
 3. **Check CQ poller threads**: logs should show "Started N CQ polling worker threads" where N matches the number of EFA devices
+
+### Building on AWS Deep Learning AMI
+
+On AWS Deep Learning AMI (e.g., Ubuntu 24.04), the system Python and CUDA toolkit are bundled inside the `/opt/pytorch` virtual environment. You must activate it and set CUDA paths before building:
+
+```bash
+# Activate the PyTorch environment (provides Python 3.13 + CUDA toolkit)
+source /opt/pytorch/bin/activate
+
+# Set CUDA paths (nvcc and headers are inside the pip-installed nvidia packages)
+export CUDA_HOME=/opt/pytorch/lib/python3.13/site-packages/nvidia/cu13
+export PATH=$CUDA_HOME/bin:$PATH
+export CPLUS_INCLUDE_PATH=$CUDA_HOME/include:$CPLUS_INCLUDE_PATH
+
+# Build with CUDA support
+cd ~/Mooncake
+mkdir -p build && cd build
+cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCUDAToolkit_ROOT=$CUDA_HOME
+make -j$(nproc)
+```
+
+Without activating the environment, you may encounter:
+- `Could not find nvcc, please set CUDAToolkit_ROOT` — nvcc is not in PATH
+- `fatal error: cuda.h: No such file or directory` — CUDA headers not in include path
+- `ModuleNotFoundError: No module named 'mooncake.engine'` — `.so` built against wrong Python version (e.g., 3.12 vs 3.13)
