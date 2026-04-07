@@ -116,9 +116,7 @@ int pickDevId(const std::string &backend) {
     return 0;
 }
 
-bool usesDeviceMemory(const std::string &backend) {
-    return backend != "cpu";
-}
+bool usesDeviceMemory(const std::string &backend) { return backend != "cpu"; }
 
 void validateBackend(const std::string &backend) {
     if (backend == "cpu") {
@@ -179,7 +177,8 @@ void setBackendDevice(const std::string &backend) {
 #endif
 }
 
-void *allocateMemoryPool(size_t size, int socket_id, const std::string &backend) {
+void *allocateMemoryPool(size_t size, int socket_id,
+                         const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MLU)
@@ -369,9 +368,9 @@ std::string loadNicPriorityMatrix(const std::string &backend) {
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
-    std::string matrix = "{\"cpu:0\": [[" + device_names + "], []], "
-                         " \"cpu:1\": [[" +
-                         device_names + "], []]";
+    std::string matrix =
+        "{\"cpu:0\": [[" + device_names + "], []], "
+        " \"cpu:1\": [[" + device_names + "], []]";
     if (usesDeviceMemory(backend)) {
         matrix += ", \"" + explicitLocation(backend) + "\": [[" + device_names +
                   "], []]";
@@ -380,7 +379,8 @@ std::string loadNicPriorityMatrix(const std::string &backend) {
     return matrix;
 }
 
-Transport *installTransport(TransferEngine *engine, const std::string &backend) {
+Transport *installTransport(TransferEngine *engine,
+                            const std::string &backend) {
     if (FLAGS_protocol == "rdma") {
         auto nic_priority_matrix = loadNicPriorityMatrix(backend);
         void *args[2] = {const_cast<char *>(nic_priority_matrix.c_str()),
