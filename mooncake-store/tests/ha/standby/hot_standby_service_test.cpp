@@ -508,6 +508,9 @@ TEST_F(HotStandbyServiceTest, TestSnapshotOnlyStartAndPromoteUpdateMetrics) {
     const auto promote_before = metrics.get_runtime_phase_runs_total(
         HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyPromote,
         HARuntimePhaseResult::kSuccess);
+    const auto stop_before = metrics.get_runtime_phase_runs_total(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStop,
+        HARuntimePhaseResult::kSuccess);
 
     service_->SetSnapshotProvider(
         std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
@@ -546,6 +549,19 @@ TEST_F(HotStandbyServiceTest, TestSnapshotOnlyStartAndPromoteUpdateMetrics) {
     EXPECT_EQ(
         42, metrics.get_runtime_phase_last_applied_seq_id(
                 HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyPromote));
+    EXPECT_EQ(stop_before + 1,
+              metrics.get_runtime_phase_runs_total(
+                  HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStop,
+                  HARuntimePhaseResult::kSuccess));
+    EXPECT_EQ(1,
+              metrics.get_runtime_phase_last_key_count(
+                  HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStop));
+    EXPECT_EQ(4096,
+              metrics.get_runtime_phase_last_logical_bytes(
+                  HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStop));
+    EXPECT_EQ(42,
+              metrics.get_runtime_phase_last_applied_seq_id(
+                  HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStop));
 }
 
 TEST_F(HotStandbyServiceTest,

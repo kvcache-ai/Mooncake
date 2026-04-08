@@ -99,8 +99,8 @@ std::optional<uint64_t> ReadPrimarySequenceWatermark(
 
     auto latest_seq = oplog_store->GetLatestSequence();
     if (!latest_seq) {
-        LOG(INFO) << "Standby primary watermark unavailable: "
-                  << "applied_seq=" << applied_seq_id
+        LOG(INFO) << "Standby primary watermark unavailable: " << "applied_seq="
+                  << applied_seq_id
                   << ", error=" << toString(latest_seq.error());
         return std::nullopt;
     }
@@ -593,6 +593,10 @@ void HotStandbyService::Stop() {
     std::unique_ptr<OpLogWatcher> watcher_to_stop;
     std::thread replication_thread_to_join;
     std::thread verification_thread_to_join;
+    const auto runtime_mode =
+        ResolveRuntimeMode(config_.enable_oplog_following);
+    ScopedHARuntimePhaseRecorder stop_recorder(runtime_mode,
+                                               HARuntimePhase::kStandbyStop);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -627,6 +631,12 @@ void HotStandbyService::Stop() {
     if (verification_thread_to_join.joinable()) {
         verification_thread_to_join.join();
     }
+
+    const auto stop_stats = [&]() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return CollectLocalRuntimePhaseStatsLocked();
+    }();
+    stop_recorder.FinishSuccess(stop_stats);
 
     LOG(INFO) << "HotStandbyService stopped, final_state="
               << StandbyStateToString(GetState());
@@ -867,6 +877,12 @@ ErrorCode HotStandbyService::Promote() {
 
     const auto promote_stats = CollectLocalRuntimePhaseStatsLocked();
     lock.unlock();
+
+    // Promotion and local standby teardown are separate costs. Record the
+    // promote critical path first, then let Stop() publish the standby_stop
+    // phase for watcher/thread shutdown latency.
+    promote_recorder.FinishSuccess(promote_stats);
+
     Stop();
 
     if (config_.enable_oplog_following) {
@@ -875,7 +891,6 @@ ErrorCode HotStandbyService::Promote() {
     } else {
         LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
     }
-    promote_recorder.FinishSuccess(promote_stats);
     return ErrorCode::OK;
 }
 

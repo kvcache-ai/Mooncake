@@ -55,6 +55,8 @@ const char* HARuntimePhaseToString(HARuntimePhase phase) {
             return "final_catchup";
         case HARuntimePhase::kStandbyPromote:
             return "standby_promote";
+        case HARuntimePhase::kStandbyStop:
+            return "standby_stop";
         case HARuntimePhase::kLeaderWarmup:
             return "leader_warmup";
         case HARuntimePhase::kMasterStart:

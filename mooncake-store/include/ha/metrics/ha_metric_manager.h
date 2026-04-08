@@ -27,8 +27,9 @@ enum class HARuntimePhase : uint8_t {
     kOplogFollowingStart = 3,
     kFinalCatchup = 4,
     kStandbyPromote = 5,
-    kLeaderWarmup = 6,
-    kMasterStart = 7,
+    kStandbyStop = 6,
+    kLeaderWarmup = 7,
+    kMasterStart = 8,
 };
 
 const char* HARuntimePhaseToString(HARuntimePhase phase);

@@ -178,12 +178,16 @@ TEST_F(HAMetricManagerTest, TestSerializeMetricsIncludesRuntimePhaseMetrics) {
     M().ObserveRuntimePhase(
         HARuntimeMode::kSnapshotWithOplog, HARuntimePhase::kFinalCatchup,
         HARuntimePhaseResult::kSuccess, std::chrono::microseconds(5000), stats);
+    M().ObserveRuntimePhase(
+        HARuntimeMode::kSnapshotOnly, HARuntimePhase::kStandbyStop,
+        HARuntimePhaseResult::kSuccess, std::chrono::microseconds(1200), {});
 
     std::string text = M().serialize_metrics();
     EXPECT_NE(std::string::npos, text.find("ha_runtime_phase_runs_total"));
     EXPECT_NE(std::string::npos, text.find("ha_runtime_phase_duration_us"));
     EXPECT_NE(std::string::npos,
               text.find("ha_runtime_phase_last_oplog_entries"));
+    EXPECT_NE(std::string::npos, text.find("phase=\"standby_stop\""));
 
     std::string summary = M().get_summary_string();
     EXPECT_NE(std::string::npos, summary.find("last_runtime_phase"));
