@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:  # TODO: remove before merging - temporary for testing ci-gate
 
 permissions:
   contents: read
@@ -686,3 +687,33 @@ jobs:
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
+
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - spell-check
+      - clang-format
+      - build
+      - build-musa
+      - build-flags
+      - build-docker
+      - test-wheel-ubuntu
+      - ascend-test
+      - integration-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required job results
+        run: |
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[] |
+            select(.value.result != "success" and .value.result != "skipped") |
+            "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "::error::The following jobs failed or were cancelled:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All checks passed or were acceptably skipped."
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
