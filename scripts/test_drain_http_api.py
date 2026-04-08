@@ -11,16 +11,15 @@ pybind store client inside a Python host process is not stable under ASan.
 import argparse
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_PYTHON_DIR = REPO_ROOT / "build" / "mooncake-integration"
-DEFAULT_MASTER_BINARY = REPO_ROOT / "build" / "mooncake-store" / "src" / "mooncake_master"
 
 
 def _find_store_extension() -> Path:
@@ -31,15 +30,6 @@ def _find_store_extension() -> Path:
 
 
 STORE_EXTENSION = _find_store_extension()
-
-
-def _extract_master_binary(argv: list[str]) -> Path:
-    for index, arg in enumerate(argv[1:], start=1):
-        if arg.startswith("--master-binary="):
-            return Path(arg.split("=", 1)[1]).resolve()
-        if arg == "--master-binary" and index + 1 < len(argv):
-            return Path(argv[index + 1]).resolve()
-    return DEFAULT_MASTER_BINARY.resolve()
 
 
 def _artifact_needs_asan_runtime(path: Path) -> bool:
@@ -58,12 +48,10 @@ def _artifact_needs_asan_runtime(path: Path) -> bool:
 
 
 def ensure_non_asan(argv: list[str]) -> None:
-    master_binary = _extract_master_binary(argv)
-    asan_artifacts = [
-        str(path)
-        for path in (STORE_EXTENSION, master_binary)
-        if _artifact_needs_asan_runtime(path)
-    ]
+    del argv
+    asan_artifacts = (
+        [str(STORE_EXTENSION)] if _artifact_needs_asan_runtime(STORE_EXTENSION) else []
+    )
     if not asan_artifacts:
         return
     artifact_list = ", ".join(asan_artifacts)
@@ -79,20 +67,26 @@ ensure_non_asan(sys.argv)
 
 try:
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+    from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
 except ModuleNotFoundError:
+    wheel_dir = REPO_ROOT / "mooncake-wheel"
     if str(BUILD_PYTHON_DIR) not in sys.path:
         sys.path.insert(0, str(BUILD_PYTHON_DIR))
-    from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+    if str(wheel_dir) not in sys.path:
+        sys.path.insert(0, str(wheel_dir))
+    try:
+        from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+        from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
+    except ModuleNotFoundError:
+        import store as store_module  # noqa: E402
+        from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
+
+        MooncakeDistributedStore = store_module.MooncakeDistributedStore
+        ReplicateConfig = store_module.ReplicateConfig
 
 
 class TestFailure(RuntimeError):
     pass
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def wait_http_ok(url: str, timeout_sec: float) -> None:
@@ -278,59 +272,60 @@ def wait_job_succeeded(control_base: str, job_id: str, timeout_sec: float) -> di
     raise TestFailure(f"job did not finish in time, last={last}")
 
 
+def resolve_runtime_config(
+    protocol_override: str | None,
+    control_base_override: str | None,
+) -> tuple[str, str, str, str, str | None]:
+    config = MooncakeConfig.load_from_env()
+    protocol = protocol_override or config.protocol
+    control_base = control_base_override or os.getenv("MOONCAKE_MASTER_CONTROL_BASE")
+    if not control_base:
+        host = config.master_server_address
+        if host.startswith("[") and "]" in host:
+            host = host.split("]", 1)[0].lstrip("[")
+        elif ":" in host:
+            host = host.rsplit(":", 1)[0]
+        control_base = f"http://{host}:9003"
+    parsed_metadata = urlparse(config.metadata_server)
+    metadata_health_url = None
+    if parsed_metadata.scheme in {"http", "https"} and parsed_metadata.netloc:
+        metadata_health_url = urlunparse(
+            parsed_metadata._replace(path="/health", params="", query="", fragment="")
+        )
+    return (
+        config.master_server_address,
+        config.metadata_server,
+        protocol,
+        control_base.rstrip("/"),
+        metadata_health_url,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Verify master drain HTTP control plane (manual/nightly, non-ASan only)"
     )
-    parser.add_argument(
-        "--master-binary",
-        default=str(REPO_ROOT / "build" / "mooncake-store" / "src" / "mooncake_master"),
-    )
-    parser.add_argument("--protocol", default="tcp")
+    parser.add_argument("--protocol", default=None)
+    parser.add_argument("--control-base", default=None)
     parser.add_argument("--timeout-sec", type=float, default=30.0)
     args = parser.parse_args()
 
-    master_binary = Path(args.master_binary)
-    if not master_binary.exists():
-        raise TestFailure(f"master binary not found: {master_binary}")
-
-    rpc_port = find_free_port()
-    metrics_port = find_free_port()
-    metadata_port = find_free_port()
-    master_addr = f"127.0.0.1:{rpc_port}"
-    control_base = f"http://127.0.0.1:{metrics_port}"
-    metadata_url = f"http://127.0.0.1:{metadata_port}/metadata"
-
-    env = os.environ.copy()
-    env.setdefault("MC_RPC_PROTOCOL", args.protocol)
-
-    master_proc = subprocess.Popen(
-        [
-            str(master_binary),
-            f"--rpc_port={rpc_port}",
-            "--rpc_address=127.0.0.1",
-            f"--metrics_port={metrics_port}",
-            "--enable_metric_reporting=false",
-            "--enable_http_metadata_server=true",
-            f"--http_metadata_server_port={metadata_port}",
-            "--http_metadata_server_host=127.0.0.1",
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    master_addr, metadata_url, protocol, control_base, metadata_health_url = (
+        resolve_runtime_config(args.protocol, args.control_base)
     )
+
+    os.environ.setdefault("MC_RPC_PROTOCOL", protocol)
 
     stores = []
     try:
         wait_http_ok(f"{control_base}/health", timeout_sec=10.0)
-        wait_http_ok(f"http://127.0.0.1:{metadata_port}/health", timeout_sec=10.0)
+        if metadata_health_url:
+            wait_http_ok(metadata_health_url, timeout_sec=10.0)
 
         source_segment = "127.0.0.1:19001"
         target_segment = "127.0.0.1:19002"
-        source_store = create_store(source_segment, metadata_url, master_addr, args.protocol)
-        target_store = create_store(target_segment, metadata_url, master_addr, args.protocol)
+        source_store = create_store(source_segment, metadata_url, master_addr, protocol)
+        target_store = create_store(target_segment, metadata_url, master_addr, protocol)
         stores.extend([source_store, target_store])
 
         time.sleep(1.0)
@@ -339,16 +334,14 @@ def main() -> int:
         preload_items = [
             (
                 f"{prefix}-preload-{index:02d}",
-                f"preload-value-{index:02d}-".encode("utf-8")
-                + os.urandom(256 * 1024),
+                f"preload-value-{index:02d}-".encode("utf-8") + os.urandom(256 * 1024),
             )
             for index in range(24)
         ]
         redirected_items = [
             (
                 f"{prefix}-redirect-{index:02d}",
-                f"redirect-value-{index:02d}-".encode("utf-8")
-                + os.urandom(64 * 1024),
+                f"redirect-value-{index:02d}-".encode("utf-8") + os.urandom(64 * 1024),
             )
             for index in range(8)
         ]
@@ -442,17 +435,6 @@ def main() -> int:
                 client.close()
             except Exception:
                 pass
-        if master_proc.poll() is None:
-            master_proc.terminate()
-            try:
-                master_proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                master_proc.kill()
-                master_proc.wait(timeout=5.0)
-        if master_proc.returncode not in (0, -15):
-            output = master_proc.stdout.read() if master_proc.stdout else ""
-            if output:
-                print(output, file=sys.stderr)
 
 
 if __name__ == "__main__":
