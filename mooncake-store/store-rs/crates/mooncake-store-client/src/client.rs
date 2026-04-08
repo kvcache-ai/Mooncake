@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::ffi::c_void;
 use std::ptr;
+use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +50,30 @@ impl<'a> PutRequest<'a> {
             tenant: None,
             key,
             value,
+        }
+    }
+
+    pub fn tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PutFromRequest<'a> {
+    pub tenant: Option<&'a str>,
+    pub key: &'a str,
+    pub buffer: *const c_void,
+    pub size: usize,
+}
+
+impl<'a> PutFromRequest<'a> {
+    pub fn new(key: &'a str, buffer: *const c_void, size: usize) -> Self {
+        Self {
+            tenant: None,
+            key,
+            buffer,
+            size,
         }
     }
 
@@ -226,14 +252,26 @@ pub trait MooncakeCompatibilityFacade {
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult>;
     fn register_local_memory(&self) -> Result<()>;
+    fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
+    fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
     fn put(&self, key: &str, value: &[u8]) -> Result<ObjectRoute>;
     fn put_in_tenant(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute>;
+    fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute>;
+    fn put_from_in_tenant(
+        &self,
+        tenant: &str,
+        key: &str,
+        buffer: *const c_void,
+        size: usize,
+    ) -> Result<ObjectRoute>;
     fn batch_put(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>>;
+    fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
     fn get_in_tenant(&self, tenant: &str, key: &str) -> Result<Vec<u8>>;
     fn get_into(&self, key: &str, buffer: &mut [u8]) -> Result<usize>;
     fn get_into_in_tenant(&self, tenant: &str, key: &str, buffer: &mut [u8]) -> Result<usize>;
     fn batch_get(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>>;
+    fn batch_get_buffer(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>>;
     fn batch_get_into(&self, requests: &mut [GetRequest<'_>]) -> Result<Vec<usize>>;
 }
 
@@ -383,10 +421,6 @@ impl StoreClient {
             .iter()
             .map(|entry| entry.replica.length as usize)
             .collect::<Vec<_>>();
-        let scratch = {
-            let state = self.state.lock();
-            state.memory_ref()?.plan_scratch(&lengths)?
-        };
         for (index, buffer) in buffers.iter().enumerate() {
             let needed = lengths[index];
             if buffer.len() < needed {
@@ -399,14 +433,48 @@ impl StoreClient {
             }
         }
 
+        let direct_paths = {
+            let state = self.state.lock();
+            buffers
+                .iter()
+                .zip(lengths.iter())
+                .map(|(buffer, length)| {
+                    state.buffer_is_registered(buffer.as_ptr().cast_mut().cast::<c_void>(), *length)
+                })
+                .collect::<Vec<_>>()
+        };
+        let scratch_lengths = direct_paths
+            .iter()
+            .zip(lengths.iter())
+            .filter_map(|(direct, length)| (!*direct).then_some(*length))
+            .collect::<Vec<_>>();
+        let scratch = if scratch_lengths.is_empty() {
+            Vec::new()
+        } else {
+            let state = self.state.lock();
+            state.memory_ref()?.plan_scratch(&scratch_lengths)?
+        };
+
         let requests = {
             let mut state = self.state.lock();
             let mut batch = Vec::with_capacity(resolved.len());
-            for (entry, slot) in resolved.iter().zip(scratch.iter()) {
+            let mut scratch_index = 0usize;
+            for ((entry, buffer), direct) in resolved
+                .iter()
+                .zip(buffers.iter_mut())
+                .zip(direct_paths.iter())
+            {
+                let source = if *direct {
+                    buffer.as_mut_ptr().cast::<c_void>()
+                } else {
+                    let addr = scratch[scratch_index].addr;
+                    scratch_index += 1;
+                    addr
+                };
                 let segment = state.open_segment(transport, &entry.replica.segment_name.0)?;
                 batch.push(TransferRequest {
                     opcode: Opcode::Read,
-                    source: slot.addr,
+                    source,
                     target_id: segment,
                     target_offset: entry.replica.offset,
                     length: entry.replica.length,
@@ -427,9 +495,21 @@ impl StoreClient {
         free_result?;
 
         let mut sizes = Vec::with_capacity(buffers.len());
-        for ((buffer, slot), length) in buffers.iter_mut().zip(scratch.iter()).zip(lengths) {
-            unsafe {
-                ptr::copy_nonoverlapping(slot.addr.cast::<u8>(), buffer.as_mut_ptr(), length);
+        let mut scratch_index = 0usize;
+        for ((buffer, direct), length) in buffers
+            .iter_mut()
+            .zip(direct_paths.iter())
+            .zip(lengths)
+        {
+            if !*direct {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        scratch[scratch_index].addr.cast::<u8>(),
+                        buffer.as_mut_ptr(),
+                        length,
+                    );
+                }
+                scratch_index += 1;
             }
             sizes.push(length);
         }
@@ -541,6 +621,23 @@ impl MooncakeCompatibilityFacade for StoreClient {
         self.ensure_local_memory()
     }
 
+    fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()> {
+        if size == 0 {
+            return Err(StoreError::Allocator(
+                "registered buffer size must be greater than zero".to_string(),
+            ));
+        }
+        let transport = self.transport()?;
+        let mut state = self.state.lock();
+        state.register_external_buffer(transport, buffer, size)
+    }
+
+    fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()> {
+        let transport = self.transport()?;
+        let mut state = self.state.lock();
+        state.unregister_external_buffer(transport, buffer, size)
+    }
+
     fn put(&self, key: &str, value: &[u8]) -> Result<ObjectRoute> {
         self.put_in_tenant(self.default_tenant(), key, value)
     }
@@ -549,11 +646,48 @@ impl MooncakeCompatibilityFacade for StoreClient {
         self.put_scoped(tenant, key, value)
     }
 
+    fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute> {
+        self.put_from_in_tenant(self.default_tenant(), key, buffer, size)
+    }
+
+    fn put_from_in_tenant(
+        &self,
+        tenant: &str,
+        key: &str,
+        buffer: *const c_void,
+        size: usize,
+    ) -> Result<ObjectRoute> {
+        if buffer.is_null() {
+            return Err(StoreError::Allocator(
+                "put_from buffer must not be null".to_string(),
+            ));
+        }
+        {
+            let state = self.state.lock();
+            if !state.buffer_is_registered(buffer.cast_mut(), size) {
+                return Err(StoreError::Allocator(format!(
+                    "put_from buffer is not registered for tenant={tenant} key={key}"
+                )));
+            }
+        }
+        let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
+        self.put_in_tenant(tenant, key, value)
+    }
+
     fn batch_put(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>> {
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
             routes.push(self.put_in_tenant(tenant, request.key, request.value)?);
+        }
+        Ok(routes)
+    }
+
+    fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>> {
+        let mut routes = Vec::with_capacity(requests.len());
+        for request in requests {
+            let tenant = request.tenant.unwrap_or(self.default_tenant());
+            routes.push(self.put_from_in_tenant(tenant, request.key, request.buffer, request.size)?);
         }
         Ok(routes)
     }
@@ -596,6 +730,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         Ok(buffers)
     }
 
+    fn batch_get_buffer(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>> {
+        self.batch_get(objects)
+    }
+
     fn batch_get_into(&self, requests: &mut [GetRequest<'_>]) -> Result<Vec<usize>> {
         let objects = requests
             .iter()
@@ -634,6 +772,7 @@ impl Drop for StoreClient {
 #[derive(Default)]
 struct StoreState {
     memory: Option<LocalMemoryState>,
+    registered_buffers: BTreeMap<usize, usize>,
     remote_segments: BTreeMap<String, u64>,
 }
 
@@ -661,6 +800,83 @@ impl StoreState {
         let handle = transport.open_segment(segment_name)?;
         self.remote_segments.insert(segment_name.to_string(), handle);
         Ok(handle)
+    }
+
+    fn register_external_buffer(
+        &mut self,
+        transport: &dyn StoreTransport,
+        buffer: *mut c_void,
+        size: usize,
+    ) -> Result<()> {
+        self.ensure_non_overlapping(buffer, size)?;
+        transport.register_memory(buffer, size)?;
+        self.registered_buffers.insert(buffer as usize, size);
+        Ok(())
+    }
+
+    fn unregister_external_buffer(
+        &mut self,
+        transport: &dyn StoreTransport,
+        buffer: *mut c_void,
+        size: usize,
+    ) -> Result<()> {
+        match self.registered_buffers.remove(&(buffer as usize)) {
+            Some(registered) if registered == size => {
+                transport.unregister_memory(buffer, size)?;
+                Ok(())
+            }
+            Some(registered) => {
+                self.registered_buffers.insert(buffer as usize, registered);
+                Err(StoreError::Allocator(format!(
+                    "registered buffer size mismatch: requested={size} registered={registered}"
+                )))
+            }
+            None => Err(StoreError::NotFound(format!(
+                "registered buffer {:p} not found",
+                buffer
+            ))),
+        }
+    }
+
+    fn buffer_is_registered(&self, buffer: *mut c_void, size: usize) -> bool {
+        self.registered_buffers
+            .get(&(buffer as usize))
+            .is_some_and(|registered| *registered >= size)
+    }
+
+    fn ensure_non_overlapping(&self, buffer: *mut c_void, size: usize) -> Result<()> {
+        let start = buffer as usize;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| StoreError::Allocator("registered buffer range overflow".to_string()))?;
+        if let Some((other_start, other_size)) = self
+            .registered_buffers
+            .range(..=start)
+            .next_back()
+            .map(|(key, value)| (*key, *value))
+        {
+            let other_end = other_start.saturating_add(other_size);
+            if start < other_end {
+                return Err(StoreError::Allocator(format!(
+                    "registered buffer overlaps existing range {:x}..{:x}",
+                    other_start, other_end
+                )));
+            }
+        }
+        if let Some((other_start, _)) = self
+            .registered_buffers
+            .range(start..)
+            .next()
+            .map(|(key, value)| (*key, *value))
+        {
+            if end > other_start {
+                return Err(StoreError::Allocator(format!(
+                    "registered buffer overlaps existing range starting at {:x}",
+                    other_start
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
