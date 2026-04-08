@@ -440,8 +440,9 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     // if another thread raced us).  getOrInsert prevents duplicate endpoints
     // and duplicate AV entries for the same peer.
     auto new_endpoint = std::make_shared<EfaEndPoint>(*this);
-    if (!cq_list_.empty() && cq_list_[0]) {
-        int ret = new_endpoint->construct(cq_list_[0]->cq, 1, 4,
+    auto cq = nextCq();
+    if (cq) {
+        int ret = new_endpoint->construct(cq->cq, &cq->outstanding, 1, 4,
                                           globalConfig().max_wr, 64);
         if (ret != 0) {
             LOG(ERROR) << "Failed to construct EFA endpoint";

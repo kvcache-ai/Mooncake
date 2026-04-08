@@ -46,7 +46,8 @@ EfaEndPoint::~EfaEndPoint() {
     if (ep_) deconstruct();
 }
 
-int EfaEndPoint::construct(struct fid_cq *cq, size_t num_qp_list,
+int EfaEndPoint::construct(struct fid_cq *cq, volatile int *cq_outstanding,
+                           size_t num_qp_list,
                            size_t max_sge, size_t max_wr, size_t max_inline) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "EFA Endpoint has already been constructed";
@@ -56,7 +57,7 @@ int EfaEndPoint::construct(struct fid_cq *cq, size_t num_qp_list,
     tx_cq_ = cq;
     rx_cq_ = cq;  // Use same CQ for TX and RX
     max_wr_depth_ = max_wr;
-    cq_outstanding_ = context_.cqOutstandingCount(0);
+    cq_outstanding_ = cq_outstanding;
 
     // Create endpoint
     int ret = fi_endpoint(context_.domain(), context_.info(), &ep_, nullptr);

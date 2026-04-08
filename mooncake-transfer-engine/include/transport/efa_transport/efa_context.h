@@ -65,7 +65,7 @@ class EfaEndpointStore {
     static constexpr double kDefaultInactiveTimeoutSec = 5.0;  // 5 seconds
 
     explicit EfaEndpointStore(
-        size_t max_endpoints = 256,
+        size_t max_endpoints = 65536,
         double inactive_timeout_sec = kDefaultInactiveTimeoutSec);
 
     std::shared_ptr<EfaEndPoint> get(const std::string &peer_nic_path);
@@ -108,7 +108,7 @@ class EfaContext {
 
     int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
                   uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
-                  int max_endpoints = 256);
+                  int max_endpoints = 65536);
 
    private:
     int deconstruct();
@@ -156,6 +156,12 @@ class EfaContext {
     // Get CQ count
     size_t cqCount() const { return cq_list_.size(); }
 
+    // Round-robin CQ assignment for new endpoints (mirrors RDMA transport)
+    std::shared_ptr<EfaCq> nextCq() {
+        int index = (next_cq_index_++) % cq_list_.size();
+        return cq_list_[index];
+    }
+
     // Get CQ outstanding count pointer
     volatile int *cqOutstandingCount(int cq_index) {
         if (cq_index < 0 || (size_t)cq_index >= cq_list_.size()) return nullptr;
@@ -196,6 +202,7 @@ class EfaContext {
 
     std::shared_ptr<EfaEndpointStore> endpoint_store_;
     std::vector<std::shared_ptr<EfaCq>> cq_list_;
+    std::atomic<int> next_cq_index_{0};
 
     RWSpinlock mr_lock_;
     std::unordered_map<uint64_t, EfaMemoryRegionMeta> mr_map_;

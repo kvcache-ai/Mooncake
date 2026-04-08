@@ -59,7 +59,8 @@ class EfaEndPoint {
     ~EfaEndPoint();
 
     // Construct endpoint with specified completion queue
-    int construct(struct fid_cq *cq, size_t num_qp_list = 1, size_t max_sge = 4,
+    int construct(struct fid_cq *cq, volatile int *cq_outstanding,
+                  size_t num_qp_list = 1, size_t max_sge = 4,
                   size_t max_wr = 256, size_t max_inline = 64);
 
    private:
