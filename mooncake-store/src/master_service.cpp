@@ -4301,7 +4301,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     std::vector<std::string> draining_segments;
     {
-        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
         auto valid = ValidateDrainRequestLocked(segment_access, request);
         if (!valid.has_value()) {
             return tl::make_unexpected(valid.error());
@@ -4313,8 +4314,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
                 segment_name, SegmentStatus::DRAINING);
             if (err != ErrorCode::OK) {
                 for (const auto& updated_segment : draining_segments) {
-                    (void)segment_access.SetSegmentStatusByName(updated_segment,
-                                                                SegmentStatus::OK);
+                    (void)segment_access.SetSegmentStatusByName(
+                        updated_segment, SegmentStatus::OK);
                 }
                 return tl::make_unexpected(err);
             }
@@ -4390,8 +4391,7 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
         std::lock_guard<std::mutex> job_lock(job->mutex);
         if (job->status == JobStatus::SUCCEEDED ||
             job->status == JobStatus::FAILED ||
-            job->status == JobStatus::CANCELED ||
-            !job->active_tasks.empty()) {
+            job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
@@ -4633,7 +4633,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     {
-        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
         for (const auto& segment_name : job.request.segments) {
             if (!remaining_segments.contains(segment_name)) {
                 (void)segment_access.SetSegmentStatusByName(
@@ -4661,7 +4662,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     {
-        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
         for (const auto& segment_name : job.request.segments) {
             SegmentStatus status = SegmentStatus::UNDEFINED;
             if (segment_access.GetSegmentStatusByName(segment_name, status) ==

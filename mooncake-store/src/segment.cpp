@@ -345,8 +345,8 @@ ErrorCode ScopedSegmentAccess::GetUnreadySegments(
         }
 
         UUID client_id{0, 0};
-        auto client_it =
-            segment_manager_->client_by_name_.find(mounted_segment.segment.name);
+        auto client_it = segment_manager_->client_by_name_.find(
+            mounted_segment.segment.name);
         if (client_it != segment_manager_->client_by_name_.end()) {
             client_id = client_it->second;
         }
@@ -904,7 +904,8 @@ bool ScopedSegmentAccess::ExistsSegmentName(
 
 bool ScopedSegmentAccess::IsSegmentAllocatable(
     const std::string& segment_name) const {
-    auto segment_id_it = segment_manager_->segment_id_by_name_.find(segment_name);
+    auto segment_id_it =
+        segment_manager_->segment_id_by_name_.find(segment_name);
     if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {
         return false;
     }
@@ -916,7 +917,8 @@ bool ScopedSegmentAccess::IsSegmentAllocatable(
 
 ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
     const std::string& segment_name, SegmentStatus& status) const {
-    auto segment_id_it = segment_manager_->segment_id_by_name_.find(segment_name);
+    auto segment_id_it =
+        segment_manager_->segment_id_by_name_.find(segment_name);
     if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
@@ -931,7 +933,8 @@ ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
 
 ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const std::string& segment_name, SegmentStatus status) {
-    auto segment_id_it = segment_manager_->segment_id_by_name_.find(segment_name);
+    auto segment_id_it =
+        segment_manager_->segment_id_by_name_.find(segment_name);
     if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
@@ -953,7 +956,8 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const auto& allocator = mounted_segment.buf_allocator;
     const auto& name = mounted_segment.segment.name;
     const bool should_be_allocatable = status == SegmentStatus::OK;
-    const bool is_allocatable = HasAllocator(allocator_manager, name, allocator);
+    const bool is_allocatable =
+        HasAllocator(allocator_manager, name, allocator);
     if (should_be_allocatable && !is_allocatable && allocator) {
         allocator_manager.addAllocator(name, allocator);
     } else if (!should_be_allocatable && is_allocatable) {
