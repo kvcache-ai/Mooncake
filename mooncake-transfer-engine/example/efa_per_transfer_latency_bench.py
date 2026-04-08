@@ -46,6 +46,10 @@ def parse_args():
     )
     parser.add_argument("--threads", type=int, default=1, help="Number of threads")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument(
+        "--env", action="append", default=[],
+        help="Environment variables to pass to remote bench (e.g. --env MC_EFA_STRIPING_THRESHOLD=67108864)",
+    )
     parser.add_argument("--output", default=None, help="Output file for results")
     return parser.parse_args()
 
@@ -101,13 +105,15 @@ def start_target(host, build_dir, user, ssh_opts):
 
 def run_single_bench(host, build_dir, target_addr, block_size,
                      duration, operation, user, ssh_opts,
-                     threads=1, batch_size=1):
+                     threads=1, batch_size=1, env_vars=None):
     """Run bench with configurable threads and batch_size."""
     bench_bin = os.path.join(
         build_dir, "mooncake-transfer-engine/example/transfer_engine_bench"
     )
+    env_prefix = " ".join(env_vars) + " " if env_vars else ""
     bench_cmd = (
         f"cd {build_dir} && "
+        f"{env_prefix}"
         f"{bench_bin} "
         f"--mode=initiator --protocol=efa --metadata_server=P2PHANDSHAKE "
         f"--segment_id={target_addr} "
@@ -182,6 +188,7 @@ def main():
             block_size, args.duration, args.operation,
             args.ssh_user, args.ssh_opts,
             threads=args.threads, batch_size=args.batch_size,
+            env_vars=args.env,
         )
 
         if tp is None or tp == 0:
