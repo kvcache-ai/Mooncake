@@ -339,8 +339,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MACA)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
