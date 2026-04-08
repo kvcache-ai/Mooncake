@@ -15,7 +15,7 @@
 #include "segment.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
-#include "etcd_oplog_store.h"
+#include "ha/oplog/etcd_oplog_store.h"
 #endif
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"

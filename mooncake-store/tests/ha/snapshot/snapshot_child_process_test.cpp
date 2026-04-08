@@ -4,7 +4,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
-#include "etcd_oplog_store.h"
+#include "ha/oplog/etcd_oplog_store.h"
 #endif
 
 #include <glog/logging.h>
