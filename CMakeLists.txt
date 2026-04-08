@@ -18,8 +18,8 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
