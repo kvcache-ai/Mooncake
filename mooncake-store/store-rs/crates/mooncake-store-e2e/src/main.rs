@@ -159,7 +159,13 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
     verify_routed_scale_out(&router, &reader, value_size)?;
     verify_multi_replica_route_publish(&router_replica, &reader, value_size)?;
-    verify_hot_upgrade(&mut target_a, &mut target_upgrade, &reader, value_size)?;
+    verify_hot_upgrade(
+        &mut target_a,
+        &mut target_upgrade,
+        &router_replica,
+        &reader,
+        value_size,
+    )?;
 
     run_batch_put_benchmark(&router, value_size, batch_bench_iters)?;
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
@@ -560,6 +566,7 @@ fn verify_multi_replica_route_publish(
 fn verify_hot_upgrade(
     writer_a: &mut StoreClient,
     writer_upgrade: &mut StoreClient,
+    routed_writer: &StoreClient,
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
@@ -585,6 +592,32 @@ fn verify_hot_upgrade(
     let results = reader.batch_get(&keys)?;
     ensure_payload("upgrade old", &preserved, &results[0])?;
     ensure_payload("upgrade new", &promoted, &results[1])?;
+
+    let routed = payload("upgrade-routed", value_size);
+    routed_writer.put("upgrade-routed-key", &routed)?;
+    let routed_route = routed_writer
+        .query_route("upgrade-routed-key")?
+        .ok_or_else(|| StoreError::NotFound("upgrade-routed-key".to_string()))?;
+    if routed_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *writer_a.runtime_id())
+    {
+        return Err(StoreError::InvalidState(
+            "routed write still selected draining old runtime after upgrade".to_string(),
+        ));
+    }
+    if !routed_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *writer_upgrade.runtime_id())
+    {
+        return Err(StoreError::InvalidState(
+            "routed write did not select activated upgrade runtime".to_string(),
+        ));
+    }
+    let actual = reader.get("upgrade-routed-key")?;
+    ensure_payload("upgrade routed", &routed, &actual)?;
     Ok(())
 }
 
