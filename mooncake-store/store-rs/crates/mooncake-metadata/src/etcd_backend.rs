@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement, SegmentName,
-    SegmentReservation, StoreError,
+    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
+    SegmentName, SegmentReservation, StoreError,
 };
 
 use crate::MetadataKeyspace;
@@ -38,6 +38,12 @@ pub struct EtcdMetadataBackend {
     config: EtcdMetadataConfig,
 }
 
+impl Default for EtcdMetadataBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EtcdMetadataBackend {
     pub fn new() -> Self {
         Self::from_config(EtcdMetadataConfig::localhost())
@@ -50,10 +56,7 @@ impl EtcdMetadataBackend {
         Ok(Self { runtime, config })
     }
 
-    fn block_on<T>(
-        &self,
-        work: impl std::future::Future<Output = Result<T>>,
-    ) -> Result<T> {
+    fn block_on<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
         self.runtime.block_on(work)
     }
 
@@ -94,8 +97,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                 .kvs()
                 .first()
                 .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-            let mut lease: ClientLease =
-                serde_json::from_slice(kv.value()).map_err(json_error)?;
+            let mut lease: ClientLease = serde_json::from_slice(kv.value()).map_err(json_error)?;
             lease.state = next;
             let payload = serde_json::to_string(&lease).map_err(json_error)?;
             client
@@ -107,7 +109,12 @@ impl MetadataBackend for EtcdMetadataBackend {
     }
 
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
-        let prefix = self.config.keyspace.client_pattern().trim_end_matches('*').to_string();
+        let prefix = self
+            .config
+            .keyspace
+            .client_pattern()
+            .trim_end_matches('*')
+            .to_string();
         self.block_on(async {
             let mut client = self.client().await?;
             let response = client
@@ -129,7 +136,10 @@ impl MetadataBackend for EtcdMetadataBackend {
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
-        let key = self.config.keyspace.segment(&segment.owner, &segment.segment_name);
+        let key = self
+            .config
+            .keyspace
+            .segment(&segment.owner, &segment.segment_name);
         let payload = serde_json::to_string(segment).map_err(json_error)?;
         self.block_on(async {
             let mut client = self.client().await?;
@@ -260,11 +270,8 @@ impl MetadataBackend for EtcdMetadataBackend {
                 }
 
                 let txn = if let Some(kv) = response.kvs().first() {
-                    let compare = Compare::mod_revision(
-                        key.clone(),
-                        CompareOp::Equal,
-                        kv.mod_revision(),
-                    );
+                    let compare =
+                        Compare::mod_revision(key.clone(), CompareOp::Equal, kv.mod_revision());
                     let op = match next {
                         Some(route) => TxnOp::put(
                             key.clone(),
@@ -285,7 +292,8 @@ impl MetadataBackend for EtcdMetadataBackend {
                         .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
                         .and_then([TxnOp::put(
                             key.clone(),
-                            serde_json::to_string(next.expect("checked above")).map_err(json_error)?,
+                            serde_json::to_string(next.expect("checked above"))
+                                .map_err(json_error)?,
                             None,
                         )])
                 };

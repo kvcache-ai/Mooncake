@@ -298,8 +298,10 @@ mod tests {
             "true",
             CompatibilityDescriptor::default(),
         );
-        let mut incompatible = CompatibilityDescriptor::default();
-        incompatible.transport_api_version = 2;
+        let incompatible = CompatibilityDescriptor {
+            transport_api_version: 2,
+            ..CompatibilityDescriptor::default()
+        };
         publish_client_with_compat(
             metadata.as_ref(),
             "storage-b",

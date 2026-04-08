@@ -84,8 +84,9 @@ impl TentEngine {
     pub fn rpc_server_address(&self) -> Result<(String, u16)> {
         let mut buffer = vec![0 as c_char; 256];
         let mut port = 0u16;
-        let rc =
-            unsafe { ffi::tent_rpc_server_addr_port(self.raw, buffer.as_mut_ptr(), buffer.len(), &mut port) };
+        let rc = unsafe {
+            ffi::tent_rpc_server_addr_port(self.raw, buffer.as_mut_ptr(), buffer.len(), &mut port)
+        };
         check_zero(rc, "tent_rpc_server_addr_port")?;
         Ok((read_string(&buffer), port))
     }
@@ -130,16 +131,19 @@ impl TentEngine {
         Ok(addr)
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn free_memory(&self, addr: *mut c_void) -> Result<()> {
         let rc = unsafe { ffi::tent_free_memory(self.raw, addr) };
         check_zero(rc, "tent_free_memory")
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
         let rc = unsafe { ffi::tent_register_memory(self.raw, addr, size) };
         check_zero(rc, "tent_register_memory")
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
         let rc = unsafe { ffi::tent_unregister_memory(self.raw, addr, size) };
         check_zero(rc, "tent_unregister_memory")
@@ -171,7 +175,14 @@ impl TentEngine {
                 length: request.length,
             })
             .collect::<Vec<_>>();
-        let rc = unsafe { ffi::tent_submit(self.raw, batch_id, native_requests.as_mut_ptr(), native_requests.len()) };
+        let rc = unsafe {
+            ffi::tent_submit(
+                self.raw,
+                batch_id,
+                native_requests.as_mut_ptr(),
+                native_requests.len(),
+            )
+        };
         check_zero(rc, "tent_submit")
     }
 
@@ -218,7 +229,9 @@ fn check_zero(rc: i32, operation: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(StoreError::Transport(format!("{operation} failed with rc={rc}")))
+        Err(StoreError::Transport(format!(
+            "{operation} failed with rc={rc}"
+        )))
     }
 }
 
