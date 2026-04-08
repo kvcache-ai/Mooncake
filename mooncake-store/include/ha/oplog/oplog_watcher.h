@@ -8,7 +8,7 @@
 #include <thread>
 
 #include "ha/oplog/oplog_store.h"
-#include "standby_state_machine.h"
+#include "ha/standby/standby_state_machine.h"
 
 namespace mooncake {
 

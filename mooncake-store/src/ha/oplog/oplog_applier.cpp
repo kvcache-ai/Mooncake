@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <chrono>
 
-#include "ha_metric_manager.h"
+#include "ha/metrics/ha_metric_manager.h"
 #include "ha/oplog/oplog_codec.h"
 #include "metadata_store.h"
 #include "ha/oplog/oplog_manager.h"

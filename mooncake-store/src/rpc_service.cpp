@@ -15,7 +15,7 @@
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "ha_metric_manager.h"
+#include "ha/metrics/ha_metric_manager.h"
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "rpc_helper.h"

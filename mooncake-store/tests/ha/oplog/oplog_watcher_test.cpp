@@ -21,7 +21,7 @@
 #include "metadata_store.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_manager.h"
-#include "standby_state_machine.h"
+#include "ha/standby/standby_state_machine.h"
 #include "types.h"
 #include "ha/oplog/oplog_store.h"
 

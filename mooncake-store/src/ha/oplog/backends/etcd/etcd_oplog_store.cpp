@@ -5,7 +5,7 @@
 #include <iomanip>
 
 #include "ha/oplog/oplog_codec.h"
-#include "ha_metric_manager.h"
+#include "ha/metrics/ha_metric_manager.h"
 #include "utils/base64.h"
 
 #if __has_include(<jsoncpp/json/json.h>)

@@ -1,4 +1,4 @@
-#include "hot_standby_service.h"
+#include "ha/standby/hot_standby_service.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>

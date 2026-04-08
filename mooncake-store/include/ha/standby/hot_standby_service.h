@@ -19,9 +19,9 @@
 #include "ha/oplog/oplog_store.h"
 #include "ha/oplog/oplog_watcher.h"
 #include "metadata_store.h"
-#include "ha_metric_manager.h"
+#include "ha/metrics/ha_metric_manager.h"
 #include "ha/snapshot/snapshot_provider.h"
-#include "standby_state_machine.h"
+#include "ha/standby/standby_state_machine.h"
 #include "types.h"
 
 namespace mooncake {

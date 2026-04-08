@@ -1,4 +1,4 @@
-#include "standby_state_machine.h"
+#include "ha/standby/standby_state_machine.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

@@ -11,7 +11,7 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "ha_metric_manager.h"
+#include "ha/metrics/ha_metric_manager.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/replication_controller.h"
 #include "rpc_service.h"

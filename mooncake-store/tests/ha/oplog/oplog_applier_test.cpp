@@ -13,7 +13,7 @@
 
 #include <xxhash.h>
 
-#include "ha_metric_manager.h"
+#include "ha/metrics/ha_metric_manager.h"
 #include "metadata_store.h"
 #include "ha/oplog/oplog_manager.h"
 #include "types.h"

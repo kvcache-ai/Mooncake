@@ -9,7 +9,7 @@
 
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
 #include "ha/oplog/oplog_store_factory.h"
-#include "hot_standby_service.h"
+#include "ha/standby/hot_standby_service.h"
 
 namespace mooncake {
 namespace ha {
