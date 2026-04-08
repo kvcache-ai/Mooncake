@@ -45,7 +45,6 @@ void MooncakeWorker::startWorker() {
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
-        TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -159,8 +158,9 @@ void MooncakeWorker::startWorker() {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (j != group->rank &&
                                      diff.count() > kPingTimeoutMicroseconds_ &&
-                                     group->engine->sendNotifyByID(
-                                         group->segmentIDs[j], msg))) {
+                                     group->engine->probePeerAliveByID(
+                                         group->segmentIDs[j]) !=
+                                         PeerLiveness::Alive)) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
@@ -248,8 +248,9 @@ void MooncakeWorker::startWorker() {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
                                  diff.count() > kPingTimeoutMicroseconds_ &&
-                                 group->engine->sendNotifyByID(
-                                     group->segmentIDs[j], msg))) {
+                                 group->engine->probePeerAliveByID(
+                                     group->segmentIDs[j]) !=
+                                     PeerLiveness::Alive)) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "

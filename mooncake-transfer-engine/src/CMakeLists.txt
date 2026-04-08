@@ -92,6 +92,10 @@ if(USE_HIP)
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
+if(USE_MLU)
+  target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
+endif()
+
 if (USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()

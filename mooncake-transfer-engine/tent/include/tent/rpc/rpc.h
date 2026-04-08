@@ -38,6 +38,7 @@ enum RpcFuncID {
     SendData,
     RecvData,
     Notify,
+    Probe,
     Delegate,
     Pin,
     Unpin

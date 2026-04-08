@@ -173,6 +173,8 @@ class TransferEngineImpl {
     int sendNotifyByName(std::string remote_agent,
                          TransferMetadata::NotifyDesc notify_msg);
 
+    int probePeerAliveByID(SegmentID target_id);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) {
         Status result =

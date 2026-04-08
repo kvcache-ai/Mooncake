@@ -408,6 +408,14 @@ int TransferEngineImpl::sendNotifyByName(
     return ret;
 }
 
+int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        return ERR_METADATA;
+    }
+    return metadata_->sendProbe(desc->name);
+}
+
 Transport::SegmentHandle TransferEngineImpl::openSegment(
     const std::string& segment_name) {
     if (segment_name.empty()) return ERR_INVALID_ARGUMENT;

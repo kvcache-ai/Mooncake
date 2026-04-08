@@ -401,18 +401,18 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
 
-        // Find HCAs with minimum distance in one pass
+        // Find HCAs with minimum distance in one pass.
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
 
-        std::vector<InfinibandDevice> sameNuma_hca;
+        std::vector<InfinibandDevice> same_numa_hca;
         for (const auto &hca : all_hca) {
             if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
-                sameNuma_hca.push_back(hca);
+                same_numa_hca.push_back(hca);
             }
         }
         const auto &candidate_preferred_hca =
-            sameNuma_hca.empty() ? all_hca : sameNuma_hca;
+            same_numa_hca.empty() ? all_hca : same_numa_hca;
 
         for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
@@ -443,8 +443,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
     }
     return topology;
 }
-
-#endif  // USE_CUDA
+#endif
 
 Topology::Topology() {
     auto str = getenv("MC_PATH_ROUNDROBIN");

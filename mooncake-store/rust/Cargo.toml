@@ -1,0 +1,22 @@
+[package]
+name = "mooncake_store"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for the Mooncake distributed KV cache store"
+license = "Apache-2.0"
+
+[lib]
+name = "mooncake_store"
+# rlib for use as a Rust dependency, cdylib if a shared-library artifact is needed
+crate-type = ["rlib"]
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[dependencies]
+thiserror = "2.0"
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.70"

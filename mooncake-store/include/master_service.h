@@ -26,6 +26,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 
@@ -33,6 +34,8 @@ namespace mooncake {
 namespace ha {
 class SnapshotCatalogStore;
 }
+
+class EtcdOpLogStore;
 
 // Forward declarations
 class AllocationStrategy;
@@ -493,6 +496,18 @@ class MasterService {
     // Persist master state
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
+    tl::expected<void, SerializationError> PersistState(
+        const ha::SnapshotDescriptor& descriptor);
+    tl::expected<ha::SnapshotDescriptor, SerializationError>
+    BuildSnapshotDescriptor(const std::string& snapshot_id,
+                            const std::string& manifest_path,
+                            const std::string& object_prefix) const;
+    tl::expected<ha::OpLogSequenceId, SerializationError>
+    ResolveSnapshotSequenceId() const;
+#ifdef STORE_USE_ETCD
+    tl::expected<EtcdOpLogStore*, SerializationError>
+    GetSnapshotBoundaryOpLogStore() const;
+#endif
 
     tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
@@ -504,6 +519,10 @@ class MasterService {
 
     // Restore master state
     void RestoreState();
+    bool TryRestoreStateFromSnapshot(
+        const ha::SnapshotDescriptor& snapshot,
+        const std::chrono::system_clock::time_point& now);
+    void ResetStateAfterFailedRestoreAttempt();
 
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
@@ -1107,6 +1126,8 @@ class MasterService {
 
     const bool enable_offload_;
 
+    const std::string ha_backend_type_;
+
     const std::string ha_backend_connstring_;
 
     // cluster id for persistent sub directory
@@ -1140,6 +1161,10 @@ class MasterService {
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
+#ifdef STORE_USE_ETCD
+    mutable std::mutex snapshot_boundary_oplog_store_mutex_;
+    mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;
+#endif
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

@@ -297,6 +297,8 @@ class TransferEngine {
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
+    Status probePeerAliveByID(SegmentID target_id);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 

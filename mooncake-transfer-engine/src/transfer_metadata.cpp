@@ -171,6 +171,14 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     return 0;
 }
 
+int TransferMetadata::receivePeerProbe(const Json::Value &peer_json,
+                                       Json::Value &local_json) {
+    (void)peer_json;
+    local_json = Json::Value(Json::objectValue);
+    local_json["status"] = "success";
+    return 0;
+}
+
 int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     RWSpinlock::WriteGuard guard(notify_lock_);
     if (notifys.size() > 0) {
@@ -839,6 +847,10 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerNotify(peer, local);
             });
+        handshake_plugin_->registerOnProbeCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerProbe(peer, local);
+            });
 
         int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
         if (rc != 0) {
@@ -915,6 +927,10 @@ int TransferMetadata::startHandshakeDaemon(
         [this](const Json::Value &peer, Json::Value &local) -> int {
             return receivePeerNotify(peer, local);
         });
+    handshake_plugin_->registerOnProbeCallBack(
+        [this](const Json::Value &peer, Json::Value &local) -> int {
+            return receivePeerProbe(peer, local);
+        });
 
     int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
     if (rc != 0) {
@@ -962,6 +978,18 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
                    << peer_desc.notify_msg;
         return ERR_METADATA;
     }
+    return 0;
+}
+
+int TransferMetadata::sendProbe(const std::string &peer_server_name) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        return ERR_METADATA;
+    }
+    Json::Value local(Json::objectValue), peer;
+    int ret = handshake_plugin_->sendProbe(peer_location.ip_or_host_name,
+                                           peer_location.rpc_port, local, peer);
+    if (ret) return ret;
     return 0;
 }
 

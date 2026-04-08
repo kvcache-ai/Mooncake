@@ -89,6 +89,8 @@ class ControlClient {
     static Status notify(const std::string& server_addr,
                          const Notification& message);
 
+    static Status probe(const std::string& server_addr);
+
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
@@ -141,6 +143,8 @@ class ControlService {
     void onRecvData(const std::string_view& request, std::string& response);
 
     void onNotify(const std::string_view& request, std::string& response);
+
+    void onProbe(const std::string_view& request, std::string& response);
 
     void onDelegate(const std::string_view& request, std::string& response);
 

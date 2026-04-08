@@ -45,6 +45,29 @@ tl::expected<long long, ErrorCode> ParseSnapshotScore(
     }
 }
 
+tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
+    SnapshotObjectStore* object_store, const SnapshotId& snapshot_id) {
+    if (object_store == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::string descriptor_payload;
+    auto get_result = object_store->DownloadString(
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id),
+        descriptor_payload);
+    if (!get_result) {
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    auto descriptor =
+        snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
+            snapshot_id, descriptor_payload);
+    if (!descriptor) {
+        return tl::make_unexpected(descriptor.error());
+    }
+    return descriptor.value();
+}
+
 #ifdef STORE_USE_REDIS
 
 constexpr char kPublishSnapshotScript[] = R"LUA(
@@ -209,7 +232,7 @@ RedisSnapshotCatalogStore::GetLatest() {
 
 tl::expected<std::vector<SnapshotDescriptor>, ErrorCode>
 RedisSnapshotCatalogStore::List(size_t limit) {
-    if (connstring_.empty()) {
+    if (connstring_.empty() || object_store_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -231,6 +254,10 @@ RedisSnapshotCatalogStore::List(size_t limit) {
 
     std::vector<SnapshotDescriptor> snapshots;
     snapshots.reserve(reply->elements);
+    // This does one descriptor object-store read per published snapshot id.
+    // The current design relies on MasterService::CleanupOldSnapshot() to keep
+    // the catalog bounded by snapshot retention (default 3), so the scan stays
+    // single-digit in normal deployments.
     for (size_t i = 0; i < reply->elements; ++i) {
         const auto* element = reply->element[i];
         if (!IsStringReply(element) || element->str == nullptr) {
@@ -242,8 +269,14 @@ RedisSnapshotCatalogStore::List(size_t limit) {
             continue;
         }
 
-        snapshots.emplace_back(
-            snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id));
+        auto descriptor = LoadSnapshotDescriptor(object_store_, snapshot_id);
+        if (!descriptor) {
+            LOG(WARNING) << "Skipping unreadable Redis snapshot descriptor, "
+                         << "snapshot_id=" << snapshot_id
+                         << ", error=" << toString(descriptor.error());
+            continue;
+        }
+        snapshots.emplace_back(descriptor.value());
     }
 
     return snapshots;

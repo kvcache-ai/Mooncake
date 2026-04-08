@@ -18,6 +18,7 @@ pip install mooncake-transfer-engine-non-cuda
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
+> **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
 
 ## Automatic
 
@@ -164,6 +165,10 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
 - `-DUSE_MACA=[ON|OFF]`: Enable MetaX (Muxi) GPU support via MACA. Use `MACA_HOME` for the SDK root (default `/opt/maca`). Optional: `-DMACA_RUNTIME_LIBS` (CMake list) overrides default `mcruntime;mxc-runtime64;rt` for `transfer_engine` in `mooncake-transfer-engine/src/CMakeLists.txt`.
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
+- `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
+- `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.
+- `-DMLU_INCLUDE_DIR=/path/to/include`: Override the Neuware include directory when `-DUSE_MLU=ON`.
+- `-DMLU_LIB_DIR=/path/to/lib64`: Override the Neuware library directory when `-DUSE_MLU=ON`.
 - `-DUSE_EFA=[ON|OFF]`: Enable AWS Elastic Fabric Adapter transport via libfabric. **Default: OFF.** See [EFA Transport](../design/transfer-engine/efa_transport.md) for details.
 - `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support

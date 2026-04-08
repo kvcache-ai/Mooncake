@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/control_plane.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1228,6 +1229,16 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
     return Status::InvalidArgument("Notification not supported" LOC_MARK);
 }
 
+Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    SegmentDesc* desc = nullptr;
+    CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
+    auto server_addr = desc->getMemory().rpc_server_addr;
+    if (server_addr.empty()) {
+        return Status::InvalidArgument("Requested segment type error" LOC_MARK);
+    }
+    return ControlClient::probe(server_addr);
+}
+
 Status TransferEngineImpl::receiveNotification(
     std::vector<Notification>& notifi_list) {
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -1250,11 +1261,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
         if (task.type == UNSPEC) {
-            if (resubmitTransferTask(batch, task_id).ok())
-                task_status.s = PENDING;
-            else
-                task_status.s = FAILED;
+            task_status.s = FAILED;
             task_status.transferred_bytes = 0;
+            batch->task_list[task_id].status = task_status.s;
             return Status::OK();
         }
         auto& transport = transport_list_[task.type];
@@ -1264,10 +1273,6 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         }
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
-    }
-    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        task_status.transferred_bytes = 0;
     }
     batch->task_list[task_id].status = task_status.s;
 
@@ -1319,8 +1324,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
             if (task.type == UNSPEC) {
-                if (!resubmitTransferTask(batch, task_id).ok())
-                    overall_status.s = FAILED;
+                task.status = FAILED;
+                overall_status.s = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1331,11 +1336,6 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             }
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
-        }
-        if (task_status.s == FAILED &&
-            resubmitTransferTask(batch, task_id).ok()) {
-            task_status.s = PENDING;
-            task_status.transferred_bytes = 0;
         }
         if (task_status.s == COMPLETED) {
             success_tasks++;

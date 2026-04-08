@@ -154,6 +154,60 @@ TEST_F(RedisSnapshotCatalogStoreTest, PublishListAndGetLatestRoundTrip) {
     ASSERT_EQ(snapshots->size(), 2u);
     EXPECT_EQ(snapshots->at(0).snapshot_id, "20240302_120000_001");
     EXPECT_EQ(snapshots->at(1).snapshot_id, "20240301_120000_001");
+    EXPECT_EQ(snapshots->at(0).last_included_seq, 42u);
+    EXPECT_EQ(snapshots->at(1).last_included_seq, 42u);
+}
+
+TEST_F(RedisSnapshotCatalogStoreTest,
+       GetLatestReturnsErrorWhenDescriptorMissing) {
+    const std::string snapshot_id = "20240302_120000_001";
+    ASSERT_EQ(store_->Publish(MakeDescriptor(snapshot_id)), ErrorCode::OK);
+
+    object_store_.objects_.erase(
+        ha::snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id));
+
+    auto latest = store_->GetLatest();
+    ASSERT_FALSE(latest.has_value());
+    EXPECT_EQ(latest.error(), ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST_F(RedisSnapshotCatalogStoreTest, ListSkipsSnapshotsWhenDescriptorMissing) {
+    const std::string snapshot_id = "20240302_120000_001";
+    ASSERT_EQ(store_->Publish(MakeDescriptor(snapshot_id)), ErrorCode::OK);
+
+    object_store_.objects_.erase(
+        ha::snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id));
+
+    auto snapshots = store_->List(0);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_TRUE(snapshots->empty());
+}
+
+TEST(RedisSnapshotCatalogStoreStandaloneTest,
+     ListReturnsInvalidParamsWhenObjectStoreMissing) {
+    ha::backends::redis::RedisSnapshotCatalogStore store(
+        nullptr, "unused:6379", "snapshot-redis-null-object-store");
+
+    auto snapshots = store.List(0);
+    ASSERT_FALSE(snapshots.has_value());
+    EXPECT_EQ(snapshots.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(RedisSnapshotCatalogStoreTest,
+       ListSkipsUnreadableSnapshotsAndKeepsHealthyEntries) {
+    ASSERT_EQ(store_->Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_->Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
+
+    object_store_.objects_.erase(
+        ha::snapshot_catalog_store_detail::BuildDescriptorKey(
+            "20240302_120000_001"));
+
+    auto snapshots = store_->List(0);
+    ASSERT_TRUE(snapshots.has_value());
+    ASSERT_EQ(snapshots->size(), 1u);
+    EXPECT_EQ(snapshots->at(0).snapshot_id, "20240301_120000_001");
 }
 
 TEST_F(RedisSnapshotCatalogStoreTest,
