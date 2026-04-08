@@ -339,7 +339,8 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -485,7 +486,8 @@ int Topology::discover(const std::vector<std::string> &filter) {
         matrix_[ent.name] = ent;
     }
 #endif
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     for (auto &ent : discoverCudaTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
