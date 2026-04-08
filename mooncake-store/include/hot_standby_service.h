@@ -13,10 +13,10 @@
 #include <vector>
 
 #include "metadata_store.h"
-#include "oplog_applier.h"
-#include "oplog_manager.h"
-#include "oplog_replicator.h"
-#include "oplog_store_factory.h"
+#include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_replicator.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "standby_state_machine.h"
 #include "types.h"

@@ -1,4 +1,4 @@
-#include "localfs_oplog_store.h"
+#include "ha/oplog/localfs_oplog_store.h"
 
 #include <glog/logging.h>
 
@@ -10,8 +10,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "oplog_serializer.h"
-#include "polling_oplog_change_notifier.h"
+#include "ha/oplog/oplog_serializer.h"
+#include "ha/oplog/polling_oplog_change_notifier.h"
 
 namespace fs = std::filesystem;
 

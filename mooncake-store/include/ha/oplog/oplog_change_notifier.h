@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <functional>
 
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 #include "types.h"
 
 namespace mooncake {

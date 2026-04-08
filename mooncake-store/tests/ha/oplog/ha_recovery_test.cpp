@@ -17,8 +17,8 @@
 #include "mock_metadata_store.h"
 #include "mock_oplog_store.h"
 #include "mock_snapshot_provider.h"
-#include "oplog_applier.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_manager.h"
 
 using namespace mooncake;
 using namespace mooncake::test;

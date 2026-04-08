@@ -1,4 +1,4 @@
-#include "oplog_serializer.h"
+#include "ha/oplog/oplog_serializer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

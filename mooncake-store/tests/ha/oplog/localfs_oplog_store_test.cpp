@@ -3,8 +3,8 @@
 #include <filesystem>
 #include <fstream>
 
-#include "localfs_oplog_store.h"
-#include "oplog_store_factory.h"
+#include "ha/oplog/localfs_oplog_store.h"
+#include "ha/oplog/oplog_store_factory.h"
 
 namespace fs = std::filesystem;
 

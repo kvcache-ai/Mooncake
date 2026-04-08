@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 #include "metadata_store.h"
 
 namespace mooncake {

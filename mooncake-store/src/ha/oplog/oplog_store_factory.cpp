@@ -1,12 +1,12 @@
-#include "oplog_store_factory.h"
+#include "ha/oplog/oplog_store_factory.h"
 
 #include <glog/logging.h>
 
 #ifdef STORE_USE_ETCD
-#include "etcd_oplog_store.h"
+#include "ha/oplog/etcd_oplog_store.h"
 #endif
 
-#include "localfs_oplog_store.h"
+#include "ha/oplog/localfs_oplog_store.h"
 
 namespace mooncake {
 

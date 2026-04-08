@@ -1,4 +1,4 @@
-#include "oplog_replicator.h"
+#include "ha/oplog/oplog_replicator.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -12,10 +12,10 @@
 #include <xxhash.h>
 
 #include "metadata_store.h"
-#include "oplog_applier.h"
-#include "oplog_change_notifier.h"
-#include "oplog_manager.h"
-#include "oplog_serializer.h"
+#include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_change_notifier.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_serializer.h"
 #include "types.h"
 
 namespace mooncake::test {

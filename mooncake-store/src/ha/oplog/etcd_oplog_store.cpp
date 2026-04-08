@@ -1,12 +1,12 @@
-#include "etcd_oplog_store.h"
+#include "ha/oplog/etcd_oplog_store.h"
 
 #include <glog/logging.h>
 #include <sstream>
 #include <iomanip>
 
 #include "ha_metric_manager.h"
-#include "oplog_serializer.h"
-#include "etcd_oplog_change_notifier.h"
+#include "ha/oplog/oplog_serializer.h"
+#include "ha/oplog/etcd_oplog_change_notifier.h"
 #include "utils/base64.h"
 
 #if __has_include(<jsoncpp/json/json.h>)

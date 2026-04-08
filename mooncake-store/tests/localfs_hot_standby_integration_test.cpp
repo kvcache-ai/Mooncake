@@ -27,8 +27,8 @@
 #include <vector>
 
 #include "hot_standby_service.h"
-#include "oplog_manager.h"
-#include "oplog_store_factory.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "standby_state_machine.h"
 
 namespace mooncake {

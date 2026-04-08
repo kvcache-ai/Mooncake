@@ -1,14 +1,14 @@
-#include "oplog_applier.h"
+#include "ha/oplog/oplog_applier.h"
 
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <chrono>
 
-#include "oplog_store.h"
+#include "ha/oplog/oplog_store.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 namespace mooncake {
 

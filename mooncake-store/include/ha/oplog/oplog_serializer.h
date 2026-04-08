@@ -3,7 +3,7 @@
 
 #include <string>
 
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 namespace mooncake {
 

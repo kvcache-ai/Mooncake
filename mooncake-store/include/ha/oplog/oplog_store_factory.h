@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "oplog_store.h"
+#include "ha/oplog/oplog_store.h"
 
 namespace mooncake {
 

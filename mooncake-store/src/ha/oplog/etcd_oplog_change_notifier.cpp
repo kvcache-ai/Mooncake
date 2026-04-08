@@ -1,4 +1,4 @@
-#include "etcd_oplog_change_notifier.h"
+#include "ha/oplog/etcd_oplog_change_notifier.h"
 
 #include <algorithm>
 #include <chrono>
@@ -9,8 +9,8 @@
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha_metric_manager.h"
-#include "oplog_manager.h"
-#include "oplog_serializer.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_serializer.h"
 
 namespace mooncake {
 

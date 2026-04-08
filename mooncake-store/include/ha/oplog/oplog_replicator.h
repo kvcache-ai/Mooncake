@@ -6,8 +6,8 @@
 #include <memory>
 #include <string>
 
-#include "oplog_change_notifier.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_change_notifier.h"
+#include "ha/oplog/oplog_manager.h"
 #include "standby_state_machine.h"
 #include "types.h"
 

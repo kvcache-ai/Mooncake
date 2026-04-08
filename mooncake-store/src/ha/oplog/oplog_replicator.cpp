@@ -1,8 +1,8 @@
-#include "oplog_replicator.h"
+#include "ha/oplog/oplog_replicator.h"
 
 #include <glog/logging.h>
 
-#include "oplog_applier.h"
+#include "ha/oplog/oplog_applier.h"
 
 namespace mooncake {
 

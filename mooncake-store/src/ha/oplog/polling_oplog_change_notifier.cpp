@@ -1,4 +1,4 @@
-#include "polling_oplog_change_notifier.h"
+#include "ha/oplog/polling_oplog_change_notifier.h"
 
 #include <glog/logging.h>
 

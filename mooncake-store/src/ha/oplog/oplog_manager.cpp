@@ -1,11 +1,11 @@
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 #include <algorithm>
 #include <chrono>
 #include <xxhash.h>
 #include <glog/logging.h>
 
-#include "oplog_store.h"
+#include "ha/oplog/oplog_store.h"
 
 namespace mooncake {
 

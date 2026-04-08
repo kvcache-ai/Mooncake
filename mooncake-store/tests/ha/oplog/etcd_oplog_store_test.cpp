@@ -1,4 +1,4 @@
-#include "etcd_oplog_store.h"
+#include "ha/oplog/etcd_oplog_store.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>

@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "oplog_manager.h"
-#include "oplog_store.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store.h"
 #include "types.h"
 
 namespace mooncake::test {

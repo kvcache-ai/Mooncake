@@ -6,8 +6,8 @@
 #include <mutex>
 #include <thread>
 
-#include "oplog_change_notifier.h"
-#include "oplog_store.h"
+#include "ha/oplog/oplog_change_notifier.h"
+#include "ha/oplog/oplog_store.h"
 
 namespace mooncake {
 

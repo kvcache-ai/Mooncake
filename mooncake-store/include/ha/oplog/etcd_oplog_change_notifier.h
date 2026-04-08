@@ -10,9 +10,9 @@
 #include <thread>
 #include <vector>
 
-#include "etcd_oplog_store.h"
-#include "oplog_change_notifier.h"
-#include "oplog_manager.h"
+#include "ha/oplog/etcd_oplog_store.h"
+#include "ha/oplog/oplog_change_notifier.h"
+#include "ha/oplog/oplog_manager.h"
 #include "types.h"
 
 namespace mooncake {
