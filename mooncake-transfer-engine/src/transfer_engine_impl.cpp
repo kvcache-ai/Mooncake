@@ -242,6 +242,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_UB
+        Transport* ub_transport =
+            multi_transports_->installTransport("ub", local_topology_);
+        if (!ub_transport) {
+            LOG(ERROR) << "Failed to install ub transport";
+            return -1;
+        }
+#endif
+
 #ifdef USE_ASCEND_HETEROGENEOUS
         Transport* ascend_transport =
             multi_transports_->installTransport("ascend", local_topology_);
@@ -397,6 +406,14 @@ int TransferEngineImpl::sendNotifyByName(
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
     return ret;
+}
+
+int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        return ERR_METADATA;
+    }
+    return metadata_->sendProbe(desc->name);
 }
 
 Transport::SegmentHandle TransferEngineImpl::openSegment(

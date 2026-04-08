@@ -65,6 +65,15 @@ struct TransferHandshakeUtil {
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
 #endif
+
+#ifdef USE_UB
+        Json::Value jettyNums(Json::arrayValue);
+        for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
+        root["jetty_num"] = jettyNums;
+        LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
+                  << " peer_nic_path is " << desc.peer_nic_path
+                  << " jetty_num size is " << desc.jetty_num.size();
+#endif
         return root;
     }
 
@@ -79,6 +88,15 @@ struct TransferHandshakeUtil {
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
+#endif
+
+#ifdef USE_UB
+        for (const auto &jetty : root["jetty_num"]) {
+            desc.jetty_num.push_back(jetty.asUInt());
+        }
+        LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
+                  << " peer_nic_path is " << desc.peer_nic_path
+                  << " jetty_num size is " << desc.jetty_num.size();
 #endif
         return 0;
     }
@@ -153,6 +171,14 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     return 0;
 }
 
+int TransferMetadata::receivePeerProbe(const Json::Value &peer_json,
+                                       Json::Value &local_json) {
+    (void)peer_json;
+    local_json = Json::Value(Json::objectValue);
+    local_json["status"] = "success";
+    return 0;
+}
+
 int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     RWSpinlock::WriteGuard guard(notify_lock_);
     if (notifys.size() > 0) {
@@ -194,6 +220,29 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+        segmentJSON["priority_matrix"] = desc.topology.toJson();
+    } else if (segmentJSON["protocol"] == "ub") {
+        Json::Value devicesJSON(Json::arrayValue);
+        for (const auto &device : desc.devices) {
+            Json::Value deviceJSON;
+            deviceJSON["name"] = device.name;
+            deviceJSON["eid"] = device.eid;
+            devicesJSON.append(deviceJSON);
+        }
+        segmentJSON["devices"] = devicesJSON;
+
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            Json::Value tsegJSON(Json::arrayValue);
+            for (auto &entry : buffer.tseg) tsegJSON.append(entry);
+            bufferJSON["tseg"] = tsegJSON;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -370,6 +419,42 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                     << " protocol " << desc->protocol << ", " << buffer.name
                     << ", " << buffer.addr << ", " << buffer.length << ", "
                     << buffer.rkey.size() << ", " << buffer.lkey.size();
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+
+        int ret = desc->topology.parse(
+            segmentJSON["priority_matrix"].toStyledString());
+        if (ret) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+        }
+    } else if (desc->protocol == "ub") {
+        for (const auto &deviceJSON : segmentJSON["devices"]) {
+            DeviceDesc device;
+            device.name = deviceJSON["name"].asString();
+            device.eid = deviceJSON["eid"].asString();
+            if (device.name.empty() || device.eid.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->devices.push_back(device);
+        }
+
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            for (const auto &tsegJSON : bufferJSON["tseg"]) {
+                buffer.tseg.push_back(tsegJSON.asString());
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.tseg.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -762,6 +847,10 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerNotify(peer, local);
             });
+        handshake_plugin_->registerOnProbeCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerProbe(peer, local);
+            });
 
         int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
         if (rc != 0) {
@@ -838,6 +927,10 @@ int TransferMetadata::startHandshakeDaemon(
         [this](const Json::Value &peer, Json::Value &local) -> int {
             return receivePeerNotify(peer, local);
         });
+    handshake_plugin_->registerOnProbeCallBack(
+        [this](const Json::Value &peer, Json::Value &local) -> int {
+            return receivePeerProbe(peer, local);
+        });
 
     int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
     if (rc != 0) {
@@ -885,6 +978,18 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
                    << peer_desc.notify_msg;
         return ERR_METADATA;
     }
+    return 0;
+}
+
+int TransferMetadata::sendProbe(const std::string &peer_server_name) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        return ERR_METADATA;
+    }
+    Json::Value local(Json::objectValue), peer;
+    int ret = handshake_plugin_->sendProbe(peer_location.ip_or_host_name,
+                                           peer_location.rpc_port, local, peer);
+    if (ret) return ret;
     return 0;
 }
 

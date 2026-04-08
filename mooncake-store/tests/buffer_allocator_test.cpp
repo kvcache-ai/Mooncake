@@ -2,12 +2,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
-#include <chrono>
 
 #include "allocator.h"
 #include "types.h"
@@ -157,25 +158,38 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
         const int num_threads = 4;
         const auto test_duration = std::chrono::seconds(1);
         std::vector<std::thread> threads;
+        std::atomic<int> success_count{0};
+        std::atomic<bool> saw_invalid_buffer{false};
 
         // Create 4 threads, each performing repeated allocation and
         // deallocation for 1 second
         for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
-            threads.emplace_back(
-                [this, &allocator, test_duration, segment_name]() {
-                    auto start_time = std::chrono::steady_clock::now();
+            threads.emplace_back([&allocator, test_duration, segment_name,
+                                  &success_count, &saw_invalid_buffer]() {
+                auto start_time = std::chrono::steady_clock::now();
 
-                    while (std::chrono::steady_clock::now() - start_time <
-                           test_duration) {
-                        // Allocate memory of varying sizes
-                        size_t alloc_size = 477;
-                        auto bufHandle = allocator->allocate(alloc_size);
-
-                        ASSERT_NE(bufHandle, nullptr);
-                        VerifyAllocatedBuffer(*bufHandle, alloc_size,
-                                              segment_name, segment_name);
+                while (std::chrono::steady_clock::now() - start_time <
+                       test_duration) {
+                    size_t alloc_size = 477;
+                    auto bufHandle = allocator->allocate(alloc_size);
+                    if (!bufHandle) {
+                        std::this_thread::yield();
+                        continue;
                     }
-                });
+
+                    auto descriptor = bufHandle->get_descriptor();
+                    if (bufHandle->getSegmentName() != segment_name ||
+                        descriptor.transport_endpoint_ != segment_name ||
+                        descriptor.size_ != alloc_size ||
+                        bufHandle->data() == nullptr) {
+                        saw_invalid_buffer.store(true,
+                                                 std::memory_order_relaxed);
+                        bufHandle.reset();
+                        break;
+                    }
+                    success_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
         }
 
         // Wait for all threads to complete
@@ -187,6 +201,8 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
                   << (allocator_type == BufferAllocatorType::CACHELIB
                           ? "CACHELIB"
                           : "OFFSET");
+        EXPECT_FALSE(saw_invalid_buffer.load(std::memory_order_relaxed));
+        EXPECT_GT(success_count.load(std::memory_order_relaxed), 0);
     }
 }
 

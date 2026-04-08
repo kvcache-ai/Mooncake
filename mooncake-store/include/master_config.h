@@ -267,6 +267,7 @@ class WrappedMasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -321,7 +322,11 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        if (ha_backend_connstring.empty()) {
+            ha_backend_connstring = config.etcd_endpoints;
+        }
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -395,7 +400,11 @@ class WrappedMasterServiceConfig {
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        if (ha_backend_connstring.empty()) {
+            ha_backend_connstring = config.etcd_endpoints;
+        }
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -445,6 +454,7 @@ class MasterServiceConfigBuilder {
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
@@ -524,6 +534,12 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_backend_type(
+        const std::string& backend_type) {
+        ha_backend_type_ = backend_type;
         return *this;
     }
 
@@ -720,6 +736,7 @@ class MasterServiceConfig {
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
     bool enable_offload = false;
+    std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -770,6 +787,7 @@ class MasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -825,6 +843,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;

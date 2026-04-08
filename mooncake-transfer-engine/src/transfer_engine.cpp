@@ -131,6 +131,12 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
     return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
 }
 
+PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    return impl_->probePeerAliveByID(target_id) == 0
+               ? PeerLiveness::Alive
+               : PeerLiveness::Unreachable;
+}
+
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus& status) {
     return impl_->getTransferStatus(batch_id, task_id, status);
@@ -494,6 +500,16 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
         return (int)status.code();
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
+}
+
+PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    if (use_tent_) {
+        auto status = impl_tent_->probePeerAliveByID(target_id);
+        return status.ok() ? PeerLiveness::Alive : PeerLiveness::Unreachable;
+    }
+    return impl_->probePeerAliveByID(target_id) == 0
+               ? PeerLiveness::Alive
+               : PeerLiveness::Unreachable;
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,

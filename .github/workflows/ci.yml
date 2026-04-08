@@ -494,6 +494,9 @@ jobs:
         df -h
       shell: bash
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
@@ -528,9 +531,8 @@ jobs:
     - name: Configure project with unit tests and examples
       run: |
         cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON
       shell: bash
-      # TODO: lack WITH_RUST_EXAMPLE
 
     - name: Build project with unit tests and examples
       run: |
@@ -539,6 +541,14 @@ jobs:
         cd build
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    - name: Check Mooncake Store Rust bindings and example
+      run: |
+        cd mooncake-store/rust
+        MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
+        MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
+          cargo check --example basic_usage --tests
       shell: bash
 
     - name: Configure project

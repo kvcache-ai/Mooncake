@@ -55,6 +55,9 @@
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
+#ifdef USE_UB
+#include "transport/kunpeng_transport/ub_transport.h"
+#endif
 
 #include <cassert>
 
@@ -228,6 +231,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
     }
+#ifdef USE_UB
+    else if (std::string(proto) == "ub") {
+        transport = new UbTransport();
+    }
+#endif
 #ifdef USE_BAREX
     else if (std::string(proto) == "barex") {
         transport = new BarexTransport();
