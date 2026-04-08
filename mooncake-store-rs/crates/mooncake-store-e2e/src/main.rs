@@ -4,8 +4,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, ObjectRef, PutRequest,
-    StoreClient, StoreClientBuilder,
+    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, ObjectRef, PutFromRequest,
+    PutRequest, StoreClient, StoreClientBuilder,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result, StoreError,
@@ -99,6 +99,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
     verify_batch_put_get(&target_a, &reader, value_size)?;
+    verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
     verify_dynamic_scale_out(&target_a, &target_b, &reader, value_size)?;
     verify_hot_upgrade(&mut target_a, &mut target_upgrade, &reader, value_size)?;
 
@@ -237,6 +238,70 @@ fn verify_batch_put_get(
     Ok(())
 }
 
+fn verify_batch_put_from_get_into(
+    writer: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let items = build_items("tenant-a", "batch-from", 8, value_size);
+    let mut input_buffers = items
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    for buffer in &mut input_buffers {
+        writer.register_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
+    }
+    let put_result = (|| {
+        let puts = items
+            .iter()
+            .zip(input_buffers.iter())
+            .map(|(item, buffer)| {
+                PutFromRequest::new(item.key.as_str(), buffer.as_ptr().cast(), buffer.len())
+                    .tenant(item.tenant.as_str())
+            })
+            .collect::<Vec<_>>();
+        writer.batch_put_from(&puts)
+    })();
+    for buffer in &mut input_buffers {
+        writer.unregister_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
+    }
+    put_result?;
+
+    let mut output_buffers = items
+        .iter()
+        .map(|item| vec![0u8; item.value.len()])
+        .collect::<Vec<_>>();
+    for buffer in &mut output_buffers {
+        reader.register_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
+    }
+    let get_result = (|| {
+        let mut gets = items
+            .iter()
+            .zip(output_buffers.iter_mut())
+            .map(|(item, buffer)| {
+                GetRequest::new(item.key.as_str(), buffer.as_mut_slice()).tenant(item.tenant.as_str())
+            })
+            .collect::<Vec<_>>();
+        reader.batch_get_into(&mut gets)
+    })();
+    for buffer in &mut output_buffers {
+        reader.unregister_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
+    }
+    let sizes = get_result?;
+    for (size, item) in sizes.iter().zip(items.iter()) {
+        if *size != item.value.len() {
+            return Err(StoreError::Transport(format!(
+                "batch_put_from/get_into size mismatch for {}: got={} expected={}",
+                item.key,
+                size,
+                item.value.len()
+            )));
+        }
+    }
+    ensure_batch_payloads("batch_put_from_get_into", &items, &output_buffers)?;
+    Ok(())
+}
+
 fn verify_dynamic_scale_out(
     writer_a: &StoreClient,
     writer_b: &StoreClient,
@@ -346,28 +411,38 @@ fn run_batch_get_benchmark(
             .iter()
             .map(|item| vec![0u8; item.value.len()])
             .collect::<Vec<_>>();
+        for buffer in &mut buffers {
+            reader.register_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
+        }
         let start = Instant::now();
-        for _ in 0..iterations {
-            let mut gets = subset
-                .iter()
-                .zip(buffers.iter_mut())
-                .map(|(item, buffer)| {
-                    GetRequest::new(item.key.as_str(), buffer.as_mut_slice())
-                        .tenant(item.tenant.as_str())
-                })
-                .collect::<Vec<_>>();
-            let sizes = reader.batch_get_into(&mut gets)?;
-            for (size, item) in sizes.iter().zip(subset.iter()) {
-                if *size != item.value.len() {
-                    return Err(StoreError::Transport(format!(
-                        "bench batch_get_into size mismatch for {}: got={} expected={}",
-                        item.key,
-                        size,
-                        item.value.len()
-                    )));
+        let bench_result = (|| {
+            for _ in 0..iterations {
+                let mut gets = subset
+                    .iter()
+                    .zip(buffers.iter_mut())
+                    .map(|(item, buffer)| {
+                        GetRequest::new(item.key.as_str(), buffer.as_mut_slice())
+                            .tenant(item.tenant.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                let sizes = reader.batch_get_into(&mut gets)?;
+                for (size, item) in sizes.iter().zip(subset.iter()) {
+                    if *size != item.value.len() {
+                        return Err(StoreError::Transport(format!(
+                            "bench batch_get_into size mismatch for {}: got={} expected={}",
+                            item.key,
+                            size,
+                            item.value.len()
+                        )));
+                    }
                 }
             }
+            Ok(())
+        })();
+        for buffer in &mut buffers {
+            reader.unregister_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
         }
+        bench_result?;
         ensure_batch_payloads("bench_get", subset, &buffers)?;
         print_bench(
             "get",
