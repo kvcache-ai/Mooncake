@@ -15,6 +15,7 @@ use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
 
 use crate::memory::{LocalMemoryConfig, LocalMemoryState, RegionAllocation};
+use crate::placement::PlacementPlanner;
 use crate::transport::{wait_for_batch_completion, StoreTransport};
 
 const DEFAULT_TENANT: &str = "default";
@@ -90,6 +91,48 @@ pub struct GetRequest<'a> {
     pub buffer: &'a mut [u8],
 }
 
+pub struct MultiBufferPutRequest<'a> {
+    pub tenant: Option<&'a str>,
+    pub key: &'a str,
+    pub buffers: &'a [&'a [u8]],
+}
+
+impl<'a> MultiBufferPutRequest<'a> {
+    pub fn new(key: &'a str, buffers: &'a [&'a [u8]]) -> Self {
+        Self {
+            tenant: None,
+            key,
+            buffers,
+        }
+    }
+
+    pub fn tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+}
+
+pub struct MultiBufferGetRequest<'a> {
+    pub tenant: Option<&'a str>,
+    pub key: &'a str,
+    pub buffers: &'a mut [&'a mut [u8]],
+}
+
+impl<'a> MultiBufferGetRequest<'a> {
+    pub fn new(key: &'a str, buffers: &'a mut [&'a mut [u8]]) -> Self {
+        Self {
+            tenant: None,
+            key,
+            buffers,
+        }
+    }
+
+    pub fn tenant(mut self, tenant: &'a str) -> Self {
+        self.tenant = Some(tenant);
+        self
+    }
+}
+
 impl<'a> GetRequest<'a> {
     pub fn new(key: &'a str, buffer: &'a mut [u8]) -> Self {
         Self {
@@ -115,6 +158,7 @@ pub struct StoreClientBuilder {
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,
+    write_mode: WriteMode,
 }
 
 impl StoreClientBuilder {
@@ -129,6 +173,7 @@ impl StoreClientBuilder {
             default_tenant: DEFAULT_TENANT.to_string(),
             local_memory: LocalMemoryConfig::default(),
             transport: None,
+            write_mode: WriteMode::LocalOnly,
         }
     }
 
@@ -182,6 +227,14 @@ impl StoreClientBuilder {
         self
     }
 
+    pub fn routed_writes(mut self, planner: PlacementPlanner, replica_count: usize) -> Self {
+        self.write_mode = WriteMode::Routed {
+            planner,
+            replica_count: replica_count.max(1),
+        };
+        self
+    }
+
     pub fn build(self, expires_at_ms: u64) -> Result<StoreClient> {
         if self.default_tenant.is_empty() {
             return Err(StoreError::InvalidState(
@@ -217,6 +270,7 @@ impl StoreClientBuilder {
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,
+            write_mode: self.write_mode,
             state: Mutex::new(StoreState::default()),
         })
     }
@@ -266,6 +320,10 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<ObjectRoute>;
     fn batch_put(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>>;
     fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>>;
+    fn batch_put_from_multi_buffers(
+        &self,
+        requests: &[MultiBufferPutRequest<'_>],
+    ) -> Result<Vec<ObjectRoute>>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
     fn get_in_tenant(&self, tenant: &str, key: &str) -> Result<Vec<u8>>;
     fn get_into(&self, key: &str, buffer: &mut [u8]) -> Result<usize>;
@@ -273,6 +331,10 @@ pub trait MooncakeCompatibilityFacade {
     fn batch_get(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>>;
     fn batch_get_buffer(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>>;
     fn batch_get_into(&self, requests: &mut [GetRequest<'_>]) -> Result<Vec<usize>>;
+    fn batch_get_into_multi_buffers(
+        &self,
+        requests: &mut [MultiBufferGetRequest<'_>],
+    ) -> Result<Vec<usize>>;
 }
 
 pub struct StoreClient {
@@ -281,6 +343,7 @@ pub struct StoreClient {
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,
+    write_mode: WriteMode,
     state: Mutex<StoreState>,
 }
 
@@ -371,6 +434,60 @@ impl StoreClient {
             state.memory_mut()?.storage_used_bytes() as u64
         };
         self.mount_segment(self.storage_capacity_bytes()? as u64, used_bytes, self.local_memory.tags.clone())?;
+        Ok(route)
+    }
+
+    fn put_scoped_routed(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
+        self.ensure_local_memory()?;
+        let scoped_key = self.scoped_key(tenant, key);
+        let targets = self.resolve_routed_targets(tenant, key)?;
+        let reservations = targets
+            .iter()
+            .map(|target| {
+                self.metadata.reserve_segment(
+                    &target.runtime,
+                    &target.segment_name,
+                    value.len() as u64,
+                    self.local_memory.alignment as u64,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let offsets = self.write_reserved_replicas(&targets, &reservations, value)?;
+
+        let current = self.metadata.get_object_route(&scoped_key)?;
+        let expected_version = current.as_ref().map(|route| route.version);
+        let next_version = current
+            .as_ref()
+            .map(|route| route.version.next())
+            .unwrap_or(RouteVersion(1));
+        let route = ObjectRoute {
+            key: scoped_key,
+            version: next_version,
+            state: RouteState::Active,
+            compatibility: self.lease.compatibility.clone(),
+            replicas: targets
+                .iter()
+                .zip(offsets.iter())
+                .enumerate()
+                .map(|(priority, (target, offset))| ReplicaRoute {
+                    owner: target.runtime.clone(),
+                    segment_name: target.segment_name.clone(),
+                    offset: *offset,
+                    length: value.len() as u64,
+                    checksum: None,
+                    tier: ReplicaTier::Dram,
+                    priority: priority as u16,
+                })
+                .collect(),
+        };
+        let cas = self
+            .metadata
+            .compare_and_swap_object_route(&route.key, expected_version, Some(&route))?;
+        if !cas.applied {
+            return Err(StoreError::Conflict(format!(
+                "route update lost race for tenant={tenant} key={key}"
+            )));
+        }
         Ok(route)
     }
 
@@ -552,6 +669,358 @@ impl StoreClient {
             self.local_memory.reclaim_grace_ms,
         )
     }
+
+    fn resolve_routed_targets(&self, tenant: &str, key: &str) -> Result<Vec<ReplicaWriteTarget>> {
+        let WriteMode::Routed {
+            planner,
+            replica_count,
+        } = &self.write_mode
+        else {
+            return Err(StoreError::InvalidState(
+                "routed target resolution requires routed write mode".to_string(),
+            ));
+        };
+        let plan = planner.plan(
+            self,
+            &[ObjectRef::new(key).tenant(tenant)],
+            *replica_count,
+        )?;
+        let owners = plan
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::InvalidState("placement returned no plan".to_string()))?
+            .owners;
+        let leases = self
+            .metadata
+            .list_live_clients()?
+            .into_iter()
+            .map(|lease| (lease.runtime.clone(), lease))
+            .collect::<BTreeMap<_, _>>();
+        owners
+            .into_iter()
+            .map(|runtime| {
+                let lease = leases.get(&runtime).ok_or_else(|| {
+                    StoreError::NotFound(format!("placement target {} disappeared", runtime))
+                })?;
+                let segment_name = lease.endpoints.segment_name.clone().ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "placement target {} does not publish a segment",
+                        runtime
+                    ))
+                })?;
+                Ok(ReplicaWriteTarget {
+                    runtime,
+                    segment_name,
+                })
+            })
+            .collect()
+    }
+
+    fn write_reserved_replicas(
+        &self,
+        targets: &[ReplicaWriteTarget],
+        reservations: &[mooncake_store_core::SegmentReservation],
+        value: &[u8],
+    ) -> Result<Vec<u64>> {
+        if targets.len() != reservations.len() {
+            return Err(StoreError::InvalidState(
+                "targets and reservations length mismatch".to_string(),
+            ));
+        }
+        let transport = self.transport()?;
+        let local_segment = self.segment_name()?;
+        let mut absolute_offsets = vec![0u64; targets.len()];
+        let mut remote_requests = Vec::new();
+
+        for (index, (target, reservation)) in targets.iter().zip(reservations.iter()).enumerate() {
+            if target.runtime == self.lease.runtime && target.segment_name == local_segment {
+                let addr = {
+                    let state = self.state.lock();
+                    state
+                        .memory_ref()?
+                        .storage_address(reservation.offset_bytes as usize)?
+                };
+                unsafe {
+                    ptr::copy_nonoverlapping(value.as_ptr(), addr.cast::<u8>(), value.len());
+                }
+                absolute_offsets[index] = addr as u64;
+                continue;
+            }
+
+            let handle = {
+                let mut state = self.state.lock();
+                state.open_segment(transport, &target.segment_name.0)?
+            };
+            let info = transport.get_segment_info(handle)?;
+            let buffer = info.buffers.first().ok_or_else(|| {
+                StoreError::Transport(format!(
+                    "segment {} exposes no buffers",
+                    target.segment_name.0
+                ))
+            })?;
+            let target_offset = buffer
+                .base
+                .checked_add(reservation.offset_bytes)
+                .ok_or_else(|| StoreError::Transport("remote target offset overflow".to_string()))?;
+            remote_requests.push((index, handle, target_offset));
+            absolute_offsets[index] = target_offset;
+        }
+
+        if !remote_requests.is_empty() {
+            let scratch = {
+                let state = self.state.lock();
+                state.memory_ref()?.plan_scratch(&[value.len()])?
+            };
+            copy_into_region(scratch[0], value);
+            let batch_id = transport.allocate_batch(remote_requests.len())?;
+            let requests = remote_requests
+                .iter()
+                .map(|(_, handle, target_offset)| TransferRequest {
+                    opcode: Opcode::Write,
+                    source: scratch[0].addr,
+                    target_id: *handle,
+                    target_offset: *target_offset,
+                    length: value.len() as u64,
+                })
+                .collect::<Vec<_>>();
+            let submit_result = transport.submit(batch_id, &requests);
+            if let Err(error) = submit_result {
+                let _ = transport.free_batch(batch_id);
+                return Err(error);
+            }
+            let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let free_result = transport.free_batch(batch_id);
+            wait_result?;
+            free_result?;
+        }
+
+        Ok(absolute_offsets)
+    }
+
+    fn batch_put_scoped_routed(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>> {
+        self.ensure_local_memory()?;
+        self.validate_unique_requests(requests)?;
+        let transport = self.transport()?;
+        let WriteMode::Routed {
+            planner,
+            replica_count,
+        } = &self.write_mode
+        else {
+            return Err(StoreError::InvalidState(
+                "batch routed put requires routed write mode".to_string(),
+            ));
+        };
+
+        let object_refs = requests
+            .iter()
+            .map(|request| {
+                let mut object = ObjectRef::new(request.key);
+                if let Some(tenant) = request.tenant {
+                    object = object.tenant(tenant);
+                }
+                object
+            })
+            .collect::<Vec<_>>();
+        let plans = planner.plan(self, &object_refs, *replica_count)?;
+        let leases = self
+            .metadata
+            .list_live_clients()?
+            .into_iter()
+            .map(|lease| (lease.runtime.clone(), lease))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut prepared = Vec::with_capacity(requests.len());
+        let mut scratch_lengths = Vec::new();
+        for (request, plan) in requests.iter().zip(plans.iter()) {
+            let tenant = request.tenant.unwrap_or(self.default_tenant());
+            let scoped_key = self.scoped_key(tenant, request.key);
+            let targets = plan
+                .owners
+                .iter()
+                .map(|runtime| {
+                    let lease = leases.get(runtime).ok_or_else(|| {
+                        StoreError::NotFound(format!("placement target {} disappeared", runtime))
+                    })?;
+                    let segment_name = lease.endpoints.segment_name.clone().ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "placement target {} does not publish a segment",
+                            runtime
+                        ))
+                    })?;
+                    Ok(ReplicaWriteTarget {
+                        runtime: runtime.clone(),
+                        segment_name,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let reservations = targets
+                .iter()
+                .map(|target| {
+                    self.metadata.reserve_segment(
+                        &target.runtime,
+                        &target.segment_name,
+                        request.value.len() as u64,
+                        self.local_memory.alignment as u64,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let has_remote = targets.iter().any(|target| {
+                !(target.runtime == self.lease.runtime
+                    && Some(target.segment_name.clone()) == self.lease.endpoints.segment_name)
+            });
+            let scratch_index = has_remote.then(|| {
+                let index = scratch_lengths.len();
+                scratch_lengths.push(request.value.len());
+                index
+            });
+            prepared.push(PreparedObjectWrite {
+                scoped_key,
+                value: request.value,
+                targets,
+                reservations,
+                scratch_index,
+            });
+        }
+
+        let scratch_slots = if scratch_lengths.is_empty() {
+            Vec::new()
+        } else {
+            let state = self.state.lock();
+            state.memory_ref()?.plan_scratch(&scratch_lengths)?
+        };
+        for entry in &prepared {
+            if let Some(index) = entry.scratch_index {
+                copy_into_region(scratch_slots[index], entry.value);
+            }
+        }
+
+        let local_segment = self.segment_name()?;
+        let mut remote_requests = Vec::new();
+        let mut routes = Vec::with_capacity(prepared.len());
+
+        for entry in &prepared {
+            let mut replicas = Vec::with_capacity(entry.targets.len());
+            for (priority, (target, reservation)) in entry
+                .targets
+                .iter()
+                .zip(entry.reservations.iter())
+                .enumerate()
+            {
+                let is_local = target.runtime == self.lease.runtime && target.segment_name == local_segment;
+                let offset = if is_local {
+                    let addr = {
+                        let state = self.state.lock();
+                        state
+                            .memory_ref()?
+                            .storage_address(reservation.offset_bytes as usize)?
+                    };
+                    unsafe {
+                        ptr::copy_nonoverlapping(entry.value.as_ptr(), addr.cast::<u8>(), entry.value.len());
+                    }
+                    addr as u64
+                } else {
+                    let handle = {
+                        let mut state = self.state.lock();
+                        state.open_segment(transport, &target.segment_name.0)?
+                    };
+                    let info = transport.get_segment_info(handle)?;
+                    let buffer = info.buffers.first().ok_or_else(|| {
+                        StoreError::Transport(format!(
+                            "segment {} exposes no buffers",
+                            target.segment_name.0
+                        ))
+                    })?;
+                    let target_offset = buffer.base.checked_add(reservation.offset_bytes).ok_or_else(|| {
+                        StoreError::Transport("remote target offset overflow".to_string())
+                    })?;
+                    let scratch = scratch_slots[entry
+                        .scratch_index
+                        .ok_or_else(|| {
+                            StoreError::InvalidState(
+                                "remote write is missing a scratch slot".to_string(),
+                            )
+                        })?];
+                    remote_requests.push(TransferRequest {
+                        opcode: Opcode::Write,
+                        source: scratch.addr,
+                        target_id: handle,
+                        target_offset,
+                        length: entry.value.len() as u64,
+                    });
+                    target_offset
+                };
+                replicas.push(ReplicaRoute {
+                    owner: target.runtime.clone(),
+                    segment_name: target.segment_name.clone(),
+                    offset,
+                    length: entry.value.len() as u64,
+                    checksum: None,
+                    tier: ReplicaTier::Dram,
+                    priority: priority as u16,
+                });
+            }
+
+            let current = self.metadata.get_object_route(&entry.scoped_key)?;
+            let expected_version = current.as_ref().map(|route| route.version);
+            let next_version = current
+                .as_ref()
+                .map(|route| route.version.next())
+                .unwrap_or(RouteVersion(1));
+            routes.push(PendingRoutePublish {
+                key: entry.scoped_key.clone(),
+                expected_version,
+                route: ObjectRoute {
+                    key: entry.scoped_key.clone(),
+                    version: next_version,
+                    state: RouteState::Active,
+                    compatibility: self.lease.compatibility.clone(),
+                    replicas,
+                },
+            });
+        }
+
+        if !remote_requests.is_empty() {
+            let batch_id = transport.allocate_batch(remote_requests.len())?;
+            let submit_result = transport.submit(batch_id, &remote_requests);
+            if let Err(error) = submit_result {
+                let _ = transport.free_batch(batch_id);
+                return Err(error);
+            }
+            let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let free_result = transport.free_batch(batch_id);
+            wait_result?;
+            free_result?;
+        }
+
+        let mut published = Vec::with_capacity(routes.len());
+        for pending in routes {
+            let cas = self
+                .metadata
+                .compare_and_swap_object_route(&pending.key, pending.expected_version, Some(&pending.route))?;
+            if !cas.applied {
+                return Err(StoreError::Conflict(format!(
+                    "route update lost race for key {}",
+                    pending.key.0
+                )));
+            }
+            published.push(pending.route);
+        }
+        Ok(published)
+    }
+
+    fn validate_unique_requests(&self, requests: &[PutRequest<'_>]) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for request in requests {
+            let tenant = request.tenant.unwrap_or(self.default_tenant());
+            let key = format!("{tenant}::{}", request.key);
+            if !seen.insert(key.clone()) {
+                return Err(StoreError::Conflict(format!(
+                    "batch_put contains duplicate scoped key {key}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl MooncakeCompatibilityFacade for StoreClient {
@@ -667,7 +1136,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn put_in_tenant(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
-        self.put_scoped(tenant, key, value)
+        match &self.write_mode {
+            WriteMode::LocalOnly => self.put_scoped(tenant, key, value),
+            WriteMode::Routed { .. } => self.put_scoped_routed(tenant, key, value),
+        }
     }
 
     fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute> {
@@ -699,6 +1171,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_put(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>> {
+        if matches!(self.write_mode, WriteMode::Routed { .. }) {
+            return self.batch_put_scoped_routed(requests);
+        }
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
@@ -712,6 +1187,19 @@ impl MooncakeCompatibilityFacade for StoreClient {
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
             routes.push(self.put_from_in_tenant(tenant, request.key, request.buffer, request.size)?);
+        }
+        Ok(routes)
+    }
+
+    fn batch_put_from_multi_buffers(
+        &self,
+        requests: &[MultiBufferPutRequest<'_>],
+    ) -> Result<Vec<ObjectRoute>> {
+        let mut routes = Vec::with_capacity(requests.len());
+        for request in requests {
+            let tenant = request.tenant.unwrap_or(self.default_tenant());
+            let payload = flatten_slices(request.buffers);
+            routes.push(self.put_in_tenant(tenant, request.key, &payload)?);
         }
         Ok(routes)
     }
@@ -776,6 +1264,38 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .collect::<Vec<_>>();
         self.execute_batch_get_into(&resolved, &mut buffers)
     }
+
+    fn batch_get_into_multi_buffers(
+        &self,
+        requests: &mut [MultiBufferGetRequest<'_>],
+    ) -> Result<Vec<usize>> {
+        let objects = requests
+            .iter()
+            .map(|request| {
+                let mut object = ObjectRef::new(request.key);
+                if let Some(tenant) = request.tenant {
+                    object = object.tenant(tenant);
+                }
+                object
+            })
+            .collect::<Vec<_>>();
+        let payloads = self.batch_get(&objects)?;
+        let mut sizes = Vec::with_capacity(requests.len());
+        for (request, payload) in requests.iter_mut().zip(payloads.iter()) {
+            let total = request.buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+            if total < payload.len() {
+                return Err(StoreError::Allocator(format!(
+                    "multi-buffer capacity too small for key {}: have={} need={}",
+                    request.key,
+                    total,
+                    payload.len()
+                )));
+            }
+            scatter_into_buffers(payload, request.buffers);
+            sizes.push(payload.len());
+        }
+        Ok(sizes)
+    }
 }
 
 impl Drop for StoreClient {
@@ -798,6 +1318,35 @@ struct StoreState {
     memory: Option<LocalMemoryState>,
     registered_buffers: BTreeMap<usize, usize>,
     remote_segments: BTreeMap<String, u64>,
+}
+
+#[derive(Clone)]
+enum WriteMode {
+    LocalOnly,
+    Routed {
+        planner: PlacementPlanner,
+        replica_count: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ReplicaWriteTarget {
+    runtime: ClientRuntimeId,
+    segment_name: SegmentName,
+}
+
+struct PreparedObjectWrite<'a> {
+    scoped_key: ObjectKey,
+    value: &'a [u8],
+    targets: Vec<ReplicaWriteTarget>,
+    reservations: Vec<mooncake_store_core::SegmentReservation>,
+    scratch_index: Option<usize>,
+}
+
+struct PendingRoutePublish {
+    key: ObjectKey,
+    expected_version: Option<RouteVersion>,
+    route: ObjectRoute,
 }
 
 impl StoreState {
@@ -914,6 +1463,32 @@ struct ResolvedObject {
 fn copy_into_region(allocation: RegionAllocation, value: &[u8]) {
     unsafe {
         ptr::copy_nonoverlapping(value.as_ptr(), allocation.addr.cast::<u8>(), value.len());
+    }
+}
+
+fn flatten_slices(buffers: &[&[u8]]) -> Vec<u8> {
+    let total = buffers.iter().map(|buffer| buffer.len()).sum();
+    let mut payload = Vec::with_capacity(total);
+    for buffer in buffers {
+        payload.extend_from_slice(buffer);
+    }
+    payload
+}
+
+fn scatter_into_buffers(payload: &[u8], buffers: &mut [&mut [u8]]) {
+    let mut cursor = 0usize;
+    for buffer in buffers {
+        if cursor >= payload.len() {
+            buffer.fill(0);
+            continue;
+        }
+        let remaining = payload.len() - cursor;
+        let to_copy = remaining.min(buffer.len());
+        buffer[..to_copy].copy_from_slice(&payload[cursor..cursor + to_copy]);
+        if to_copy < buffer.len() {
+            buffer[to_copy..].fill(0);
+        }
+        cursor += to_copy;
     }
 }
 

@@ -145,6 +145,10 @@ impl LocalMemoryState {
         self.storage.used_bytes()
     }
 
+    pub fn storage_address(&self, relative_offset: usize) -> Result<*mut c_void> {
+        self.storage.address_at(relative_offset)
+    }
+
     pub fn release(self, transport: &dyn StoreTransport) -> Result<()> {
         self.scratch.release(transport)?;
         self.storage.release(transport)
@@ -335,6 +339,16 @@ impl RegisteredRegion {
         Ok(relative)
     }
 
+    fn address_at(&self, offset: usize) -> Result<*mut c_void> {
+        if offset >= self.capacity {
+            return Err(StoreError::Allocator(format!(
+                "offset {offset} exceeds region capacity {}",
+                self.capacity
+            )));
+        }
+        Ok(unsafe { self.base.cast::<u8>().add(offset).cast::<c_void>() })
+    }
+
     fn release(self, transport: &dyn StoreTransport) -> Result<()> {
         transport.unregister_memory(self.base, self.capacity)?;
         transport.free_memory(self.base)
@@ -355,12 +369,33 @@ fn align_up(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::align_up;
+    use std::collections::BTreeMap;
+    use std::ptr;
+
+    use super::{align_up, RegisteredRegion};
 
     #[test]
     fn alignment_rounds_up_without_branch_explosion() {
         assert_eq!(align_up(1, 64), 64);
         assert_eq!(align_up(64, 64), 64);
         assert_eq!(align_up(65, 64), 128);
+    }
+
+    #[test]
+    fn free_spans_merge_without_special_cases() {
+        let mut region = RegisteredRegion {
+            base: ptr::null_mut(),
+            capacity: 1024,
+            committed: 256,
+            alignment: 64,
+            free: BTreeMap::new(),
+            retired: Vec::new(),
+        };
+        region.insert_free_span(0, 64);
+        region.insert_free_span(128, 64);
+        region.insert_free_span(64, 64);
+
+        let spans = region.free.into_iter().collect::<Vec<_>>();
+        assert_eq!(spans, vec![(0, 192)]);
     }
 }

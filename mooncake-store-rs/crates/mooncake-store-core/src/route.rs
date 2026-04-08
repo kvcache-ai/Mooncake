@@ -87,6 +87,14 @@ pub struct SegmentAnnouncement {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SegmentReservation {
+    pub owner: ClientRuntimeId,
+    pub segment_name: SegmentName,
+    pub offset_bytes: u64,
+    pub length_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CasResult {
     pub applied: bool,
     pub current: Option<ObjectRoute>,

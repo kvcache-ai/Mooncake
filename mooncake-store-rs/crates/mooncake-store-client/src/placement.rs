@@ -15,6 +15,7 @@ pub struct PlacementChoice {
     pub owners: Vec<ClientRuntimeId>,
 }
 
+#[derive(Clone)]
 pub struct PlacementPlanner {
     metadata: Arc<dyn MetadataBackend>,
     scope_label_key: String,
@@ -137,4 +138,154 @@ fn rendezvous_score(tenant: &str, key: &str, runtime: &ClientRuntimeId) -> u64 {
     key.hash(&mut hasher);
     runtime.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        CompatibilityDescriptor, MetadataBackend, SegmentName,
+    };
+
+    use super::PlacementPlanner;
+    use crate::ObjectRef;
+
+    #[test]
+    fn planner_filters_to_active_storage_nodes_in_same_pool() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        publish_client(
+            metadata.as_ref(),
+            "writer",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "false",
+        );
+        publish_client(
+            metadata.as_ref(),
+            "storage-a",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "true",
+        );
+        publish_client(
+            metadata.as_ref(),
+            "storage-b",
+            1,
+            ClientLifecycleState::Standby,
+            "pool-a",
+            "true",
+        );
+        publish_client(
+            metadata.as_ref(),
+            "storage-c",
+            1,
+            ClientLifecycleState::Active,
+            "pool-b",
+            "true",
+        );
+
+        let observer = metadata
+            .list_live_clients()
+            .expect("list should work")
+            .into_iter()
+            .find(|lease| lease.runtime.stable_id.0 == "writer")
+            .expect("writer should exist");
+
+        let planner = PlacementPlanner::new(metadata).require_label("storage", "true");
+        let plans = planner
+            .plan_from_lease(
+                &observer,
+                "tenant-a",
+                &[ObjectRef::new("key-1").tenant("tenant-a")],
+                1,
+            )
+            .expect("plan should work");
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].owners.len(), 1);
+        assert_eq!(plans[0].owners[0].stable_id.0, "storage-a");
+    }
+
+    #[test]
+    fn planner_spreads_keys_across_active_nodes() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        publish_client(
+            metadata.as_ref(),
+            "writer",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "false",
+        );
+        publish_client(
+            metadata.as_ref(),
+            "storage-a",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "true",
+        );
+        publish_client(
+            metadata.as_ref(),
+            "storage-b",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "true",
+        );
+
+        let observer = metadata
+            .list_live_clients()
+            .expect("list should work")
+            .into_iter()
+            .find(|lease| lease.runtime.stable_id.0 == "writer")
+            .expect("writer should exist");
+        let planner = PlacementPlanner::new(metadata).require_label("storage", "true");
+        let refs = (0..64)
+            .map(|index| ObjectRef::new(Box::leak(format!("key-{index}").into_boxed_str())).tenant("tenant-a"))
+            .collect::<Vec<_>>();
+        let plans = planner
+            .plan_from_lease(&observer, "tenant-a", &refs, 1)
+            .expect("plan should work");
+
+        let mut owners = std::collections::BTreeMap::<String, usize>::new();
+        for plan in plans {
+            *owners.entry(plan.owners[0].stable_id.0.clone()).or_default() += 1;
+        }
+        assert_eq!(owners.len(), 2);
+    }
+
+    fn publish_client(
+        metadata: &InMemoryMetadataBackend,
+        stable_id: &str,
+        epoch: u64,
+        state: ClientLifecycleState,
+        pool: &str,
+        storage: &str,
+    ) {
+        let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
+        let mut endpoints = ClientEndpointSet {
+            rpc_address: "127.0.0.1:0".to_string(),
+            segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
+            labels: Default::default(),
+        };
+        endpoints.labels.insert("pool".to_string(), pool.to_string());
+        endpoints
+            .labels
+            .insert("storage".to_string(), storage.to_string());
+        metadata
+            .upsert_client_lease(&ClientLease {
+                runtime,
+                state,
+                compatibility: CompatibilityDescriptor::default(),
+                endpoints,
+                expires_at_ms: 10_000,
+            })
+            .expect("lease should upsert");
+    }
 }

@@ -1,7 +1,7 @@
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement, SegmentName,
-    StoreError,
+    SegmentReservation, StoreError,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -35,6 +35,16 @@ impl MetadataBackend for EtcdMetadataBackend {
     }
 
     fn unpublish_segment(&self, _owner: &ClientRuntimeId, _segment: &SegmentName) -> Result<()> {
+        unsupported()
+    }
+
+    fn reserve_segment(
+        &self,
+        _owner: &ClientRuntimeId,
+        _segment: &SegmentName,
+        _length_bytes: u64,
+        _alignment: u64,
+    ) -> Result<SegmentReservation> {
         unsupported()
     }
 
