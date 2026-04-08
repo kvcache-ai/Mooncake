@@ -48,6 +48,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let engine_target_a = build_tent_engine(redis_port, "target-a-segment")?;
     let engine_target_b = build_tent_engine(redis_port, "target-b-segment")?;
     let engine_upgrade = build_tent_engine(redis_port, "target-a-upgrade-segment")?;
+    let engine_reclaim = build_tent_engine(redis_port, "target-reclaim-segment")?;
     let engine_reader = build_tent_engine(redis_port, "reader-segment")?;
 
     let mut target_a = build_client(
@@ -80,6 +81,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "tenant-a",
         &[("pool", "pool-a"), ("role", "upgrade")],
     )?;
+    let reclaim_writer = build_client(
+        metadata.clone(),
+        "store-reclaim",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        engine_reclaim,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 2)
+            .scratch_bytes(value_size * 2)
+            .location("cpu:0")
+            .reclaim_grace_ms(0)
+            .tags(vec!["dram".to_string(), "overwrite-reclaim".to_string()]),
+        "tenant-a",
+        &[("pool", "pool-a"), ("role", "reclaim")],
+    )?;
     let reader = build_client(
         metadata,
         "reader",
@@ -94,19 +110,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     target_a.register_local_memory()?;
     target_b.register_local_memory()?;
     target_upgrade.register_local_memory()?;
+    reclaim_writer.register_local_memory()?;
     reader.register_local_memory()?;
 
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
     verify_batch_put_get(&target_a, &reader, value_size)?;
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
+    verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
     verify_dynamic_scale_out(&target_a, &target_b, &reader, value_size)?;
     verify_hot_upgrade(&mut target_a, &mut target_upgrade, &reader, value_size)?;
 
     run_batch_put_benchmark(&target_b, value_size, batch_bench_iters)?;
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
 
-    println!("e2e ok: single put/get, batch put/get, multi-tenant, scale-out, hot-upgrade");
+    println!(
+        "e2e ok: single put/get, batch put/get, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, hot-upgrade"
+    );
     Ok(())
 }
 
@@ -299,6 +319,22 @@ fn verify_batch_put_from_get_into(
         }
     }
     ensure_batch_payloads("batch_put_from_get_into", &items, &output_buffers)?;
+    Ok(())
+}
+
+fn verify_overwrite_reclaims_capacity(
+    writer: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let mut expected = Vec::new();
+    for round in 0..64usize {
+        let value = payload(&format!("overwrite-{round}"), value_size);
+        writer.put("overwrite-key", &value)?;
+        expected = value;
+    }
+    let actual = reader.get("overwrite-key")?;
+    ensure_payload("overwrite reclaim", &expected, &actual)?;
     Ok(())
 }
 

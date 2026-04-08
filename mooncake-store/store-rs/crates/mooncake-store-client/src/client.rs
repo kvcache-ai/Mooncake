@@ -326,14 +326,16 @@ impl StoreClient {
         self.ensure_local_memory()?;
         let scoped_key = self.scoped_key(tenant, key);
         let segment_name = self.segment_name()?;
+        let now_ms = now_ms();
         let allocation = {
             let mut state = self.state.lock();
             let memory = state.memory_mut()?;
-            memory.allocate_storage(value.len())?
+            memory.allocate_storage(value.len(), now_ms)?
         };
         copy_into_region(allocation, value);
 
         let current = self.metadata.get_object_route(&scoped_key)?;
+        let expected_version = current.as_ref().map(|route| route.version);
         let next_version = current
             .as_ref()
             .map(|route| route.version.next())
@@ -355,11 +357,14 @@ impl StoreClient {
         };
         let cas = self
             .metadata
-            .compare_and_swap_object_route(&scoped_key, current.map(|route| route.version), Some(&route))?;
+            .compare_and_swap_object_route(&scoped_key, expected_version, Some(&route))?;
         if !cas.applied {
             return Err(StoreError::Conflict(format!(
                 "route update lost race for tenant={tenant} key={key}"
             )));
+        }
+        if let Some(previous) = current.as_ref() {
+            self.retire_route_if_local(previous, now_ms)?;
         }
         let used_bytes = {
             let mut state = self.state.lock();
@@ -527,6 +532,25 @@ impl StoreClient {
     fn storage_capacity_bytes(&self) -> Result<usize> {
         let state = self.state.lock();
         Ok(state.memory_ref()?.storage_capacity_bytes())
+    }
+
+    fn retire_route_if_local(&self, route: &ObjectRoute, now_ms: u64) -> Result<()> {
+        let Some(replica) = route.replicas.first() else {
+            return Ok(());
+        };
+        if replica.owner != self.lease.runtime {
+            return Ok(());
+        }
+        if replica.segment_name != self.segment_name()? {
+            return Ok(());
+        }
+        let mut state = self.state.lock();
+        state.memory_mut()?.retire_storage(
+            replica.offset,
+            replica.length as usize,
+            now_ms,
+            self.local_memory.reclaim_grace_ms,
+        )
     }
 }
 
@@ -891,6 +915,13 @@ fn copy_into_region(allocation: RegionAllocation, value: &[u8]) {
     unsafe {
         ptr::copy_nonoverlapping(value.as_ptr(), allocation.addr.cast::<u8>(), value.len());
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
