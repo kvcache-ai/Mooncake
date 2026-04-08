@@ -6,7 +6,7 @@ use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataCon
 use mooncake_store_client::{
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
-    StoreClientBuilder, TentTransportFactory,
+    StoreClientBuilder, TentTransportFactory, init_tracing_from_env, render_prometheus_metrics,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result,
@@ -19,6 +19,7 @@ const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    init_tracing_from_env("MC_STORE_RS_TRACE", "MC_STORE_RS_TRACE_FILTER")?;
     let redis_url = env::var("MC_STORE_RS_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6380/0".to_string());
     let redis_port = env::var("MC_STORE_RS_REDIS_PORT")
@@ -229,6 +230,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!(
         "e2e ok: single put/get, batch put/get, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, hot-upgrade"
     );
+    if env::var("MC_STORE_RS_PRINT_METRICS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        println!("{}", render_prometheus_metrics());
+    }
     Ok(())
 }
 
