@@ -330,6 +330,10 @@ class PyClient {
     virtual std::vector<Replica::Descriptor> get_replica_desc(
         const std::string &key) = 0;
 
+    virtual std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") = 0;
+
     virtual int tearDownAll() = 0;
 
     virtual int health_check() = 0;

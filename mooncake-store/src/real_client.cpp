@@ -3892,6 +3892,17 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
     return replica_map;
 }
 
+std::vector<std::string> RealClient::batch_replica_clear(
+    const std::vector<std::string> &keys, const std::string &segment_name) {
+    auto result =
+        client_->BatchReplicaClear(keys, client_->getClientId(), segment_name);
+    if (result) {
+        return result.value();
+    }
+    LOG(ERROR) << "batch_replica_clear failed: " << toString(result.error());
+    return {};
+}
+
 tl::expected<UUID, ErrorCode> RealClient::create_copy_task(
     const std::string &key, const std::vector<std::string> &targets) {
     return client_->CreateCopyTask(key, targets);

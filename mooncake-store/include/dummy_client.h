@@ -149,6 +149,12 @@ class DummyClient : public PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override {
+        return {};
+    }
+
     int tearDownAll();
 
     int health_check() override;
