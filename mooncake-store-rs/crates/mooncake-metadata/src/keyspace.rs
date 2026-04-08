@@ -24,6 +24,17 @@ impl MetadataKeyspace {
         format!("{}/segments/{}:{}", self.prefix, owner.storage_key(), segment.0)
     }
 
+    pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
+        match owner {
+            Some(owner) => format!("{}/segments/{}:", self.prefix, owner.storage_key()),
+            None => format!("{}/segments/", self.prefix),
+        }
+    }
+
+    pub fn segment_pattern(&self, owner: Option<&ClientRuntimeId>) -> String {
+        format!("{}*", self.segment_prefix(owner))
+    }
+
     pub fn object(&self, key: &ObjectKey) -> String {
         format!("{}/objects/{}", self.prefix, key.0)
     }

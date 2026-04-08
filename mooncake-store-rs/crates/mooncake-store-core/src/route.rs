@@ -48,11 +48,21 @@ pub enum ReplicaTier {
     Unknown,
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SegmentLifecycleState {
+    #[default]
+    Active,
+    Draining,
+    Retired,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReplicaRoute {
     pub owner: ClientRuntimeId,
     pub segment_name: SegmentName,
     pub offset: u64,
+    #[serde(default)]
+    pub segment_offset: u64,
     pub length: u64,
     pub checksum: Option<u64>,
     pub tier: ReplicaTier,
@@ -83,6 +93,10 @@ pub struct SegmentAnnouncement {
     pub segment_name: SegmentName,
     pub capacity_bytes: u64,
     pub used_bytes: u64,
+    #[serde(default)]
+    pub state: SegmentLifecycleState,
+    #[serde(default = "default_segment_alignment_bytes")]
+    pub alignment_bytes: u64,
     pub tags: Vec<String>,
 }
 
@@ -98,4 +112,8 @@ pub struct SegmentReservation {
 pub struct CasResult {
     pub applied: bool,
     pub current: Option<ObjectRoute>,
+}
+
+fn default_segment_alignment_bytes() -> u64 {
+    1
 }

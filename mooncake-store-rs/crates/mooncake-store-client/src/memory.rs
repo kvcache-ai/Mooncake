@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 
-use mooncake_store_core::{Result, StoreError};
+use mooncake_store_core::{Result, SegmentLifecycleState, SegmentName, StoreError};
 
 use crate::transport::StoreTransport;
 
@@ -89,12 +89,26 @@ impl Default for LocalMemoryConfig {
 
 #[derive(Debug)]
 pub struct LocalMemoryState {
-    storage: RegisteredRegion,
+    storage: BTreeMap<SegmentName, StorageExtent>,
     scratch: RegisteredRegion,
 }
 
+#[derive(Clone, Debug)]
+pub struct StorageSegmentSpec {
+    pub segment_name: SegmentName,
+    pub capacity_bytes: usize,
+    pub state: SegmentLifecycleState,
+    pub tags: Vec<String>,
+    pub location: String,
+    pub alignment: usize,
+}
+
 impl LocalMemoryState {
-    pub fn register(transport: &dyn StoreTransport, config: &LocalMemoryConfig) -> Result<Self> {
+    pub fn register(
+        transport: &dyn StoreTransport,
+        primary_segment: &SegmentName,
+        config: &LocalMemoryConfig,
+    ) -> Result<Self> {
         config.validate()?;
         let storage = RegisteredRegion::register(
             transport,
@@ -108,21 +122,47 @@ impl LocalMemoryState {
             &config.location,
             config.alignment,
         )?;
-        Ok(Self { storage, scratch })
+        let mut segments = BTreeMap::new();
+        segments.insert(
+            primary_segment.clone(),
+            StorageExtent {
+                region: storage,
+                state: SegmentLifecycleState::Active,
+                tags: config.tags.clone(),
+            },
+        );
+        Ok(Self {
+            storage: segments,
+            scratch,
+        })
     }
 
-    pub fn allocate_storage(&mut self, length: usize, now_ms: u64) -> Result<RegionAllocation> {
-        self.storage.allocate(length, now_ms)
-    }
-
-    pub fn retire_storage(
+    pub fn add_storage_segment(
         &mut self,
-        absolute_offset: u64,
-        length: usize,
-        now_ms: u64,
-        grace_ms: u64,
+        transport: &dyn StoreTransport,
+        spec: StorageSegmentSpec,
     ) -> Result<()> {
-        self.storage.retire(absolute_offset, length, now_ms, grace_ms)
+        if self.storage.contains_key(&spec.segment_name) {
+            return Err(StoreError::Conflict(format!(
+                "storage segment {} already exists",
+                spec.segment_name.0
+            )));
+        }
+        let region = RegisteredRegion::register(
+            transport,
+            spec.capacity_bytes,
+            &spec.location,
+            spec.alignment,
+        )?;
+        self.storage.insert(
+            spec.segment_name,
+            StorageExtent {
+                region,
+                state: spec.state,
+                tags: spec.tags,
+            },
+        );
+        Ok(())
     }
 
     pub fn plan_scratch(&self, lengths: &[usize]) -> Result<Vec<RegionAllocation>> {
@@ -137,38 +177,91 @@ impl LocalMemoryState {
         Ok(allocations)
     }
 
-    pub fn storage_capacity_bytes(&self) -> usize {
-        self.storage.capacity
+    pub fn has_storage_segment(&self, segment: &SegmentName) -> bool {
+        self.storage.contains_key(segment)
     }
 
-    pub fn storage_used_bytes(&self) -> usize {
-        self.storage.used_bytes()
+    pub fn storage_address(
+        &self,
+        segment: &SegmentName,
+        relative_offset: usize,
+    ) -> Result<*mut c_void> {
+        self.storage
+            .get(segment)
+            .ok_or_else(|| StoreError::NotFound(format!("storage segment {} not found", segment.0)))?
+            .region
+            .address_at(relative_offset)
     }
 
-    pub fn storage_address(&self, relative_offset: usize) -> Result<*mut c_void> {
-        self.storage.address_at(relative_offset)
+    pub fn update_storage_state(
+        &mut self,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> Result<()> {
+        let extent = self
+            .storage
+            .get_mut(segment)
+            .ok_or_else(|| StoreError::NotFound(format!("storage segment {} not found", segment.0)))?;
+        extent.state = next;
+        Ok(())
     }
 
-    pub fn release(self, transport: &dyn StoreTransport) -> Result<()> {
-        self.scratch.release(transport)?;
-        self.storage.release(transport)
+    pub fn storage_segments(&self) -> Vec<StorageExtentInfo> {
+        self.storage
+            .iter()
+            .map(|(segment_name, extent)| StorageExtentInfo {
+                segment_name: segment_name.clone(),
+                capacity_bytes: extent.region.capacity as u64,
+                alignment_bytes: extent.region.alignment as u64,
+                state: extent.state,
+                tags: extent.tags.clone(),
+            })
+            .collect()
     }
+
+    pub fn remove_storage_segment(
+        &mut self,
+        transport: &dyn StoreTransport,
+        segment: &SegmentName,
+    ) -> Result<()> {
+        let extent = self
+            .storage
+            .remove(segment)
+            .ok_or_else(|| StoreError::NotFound(format!("storage segment {} not found", segment.0)))?;
+        extent.region.release(transport)
+    }
+
+    pub fn release_scratch(self, transport: &dyn StoreTransport) -> Result<()> {
+        self.scratch.release(transport)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageExtentInfo {
+    pub segment_name: SegmentName,
+    pub capacity_bytes: u64,
+    pub alignment_bytes: u64,
+    pub state: SegmentLifecycleState,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug)]
+struct StorageExtent {
+    region: RegisteredRegion,
+    state: SegmentLifecycleState,
+    tags: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct RegionAllocation {
     pub addr: *mut c_void,
-    pub absolute_offset: u64,
 }
 
 #[derive(Debug)]
 struct RegisteredRegion {
     base: *mut c_void,
     capacity: usize,
-    committed: usize,
     alignment: usize,
-    free: BTreeMap<usize, usize>,
-    retired: Vec<RetiredSpan>,
 }
 
 impl RegisteredRegion {
@@ -186,35 +279,8 @@ impl RegisteredRegion {
         Ok(Self {
             base,
             capacity,
-            committed: 0,
             alignment: alignment.max(1),
-            free: BTreeMap::new(),
-            retired: Vec::new(),
         })
-    }
-
-    fn allocate(&mut self, length: usize, now_ms: u64) -> Result<RegionAllocation> {
-        self.reclaim_expired(now_ms);
-        let reserved_len = align_up(length, self.alignment);
-        if let Some((offset, span_len)) = self
-            .free
-            .iter()
-            .find(|(_, span_len)| **span_len >= reserved_len)
-            .map(|(offset, span_len)| (*offset, *span_len))
-        {
-            self.free.remove(&offset);
-            if span_len > reserved_len {
-                self.free.insert(offset + reserved_len, span_len - reserved_len);
-            }
-            return self.allocation_at(offset);
-        }
-
-        let allocation = self.plan(self.committed, length)?;
-        self.committed = self
-            .committed
-            .checked_add(reserved_len)
-            .ok_or_else(|| StoreError::Allocator("storage cursor overflow".to_string()))?;
-        Ok(allocation)
     }
 
     fn plan(&self, cursor: usize, length: usize) -> Result<RegionAllocation> {
@@ -237,106 +303,9 @@ impl RegisteredRegion {
         self.allocation_at(offset)
     }
 
-    fn retire(
-        &mut self,
-        absolute_offset: u64,
-        length: usize,
-        now_ms: u64,
-        grace_ms: u64,
-    ) -> Result<()> {
-        let offset = self.relative_offset(absolute_offset)?;
-        let reserved_len = align_up(length, self.alignment);
-        if grace_ms == 0 {
-            self.insert_free_span(offset, reserved_len);
-            return Ok(());
-        }
-        self.retired.push(RetiredSpan {
-            offset,
-            len: reserved_len,
-            reclaim_at_ms: now_ms.saturating_add(grace_ms),
-        });
-        Ok(())
-    }
-
-    fn used_bytes(&self) -> usize {
-        self.committed
-            .saturating_sub(self.free.values().copied().sum::<usize>())
-    }
-
-    fn reclaim_expired(&mut self, now_ms: u64) {
-        let mut retained = Vec::with_capacity(self.retired.len());
-        let mut reclaim = Vec::new();
-        for span in self.retired.drain(..) {
-            if span.reclaim_at_ms <= now_ms {
-                reclaim.push((span.offset, span.len));
-            } else {
-                retained.push(span);
-            }
-        }
-        self.retired = retained;
-        for (offset, len) in reclaim {
-            self.insert_free_span(offset, len);
-        }
-    }
-
-    fn insert_free_span(&mut self, offset: usize, len: usize) {
-        let mut merged_start = offset;
-        let mut merged_len = len;
-
-        if let Some((prev_start, prev_len)) = self
-            .free
-            .range(..=offset)
-            .next_back()
-            .map(|(start, len)| (*start, *len))
-        {
-            if prev_start + prev_len == offset {
-                merged_start = prev_start;
-                merged_len = prev_len + len;
-                self.free.remove(&prev_start);
-            }
-        }
-
-        if let Some((next_start, next_len)) = self
-            .free
-            .range(offset..)
-            .next()
-            .map(|(start, len)| (*start, *len))
-        {
-            if merged_start + merged_len == next_start {
-                merged_len += next_len;
-                self.free.remove(&next_start);
-            }
-        }
-
-        self.free.insert(merged_start, merged_len);
-    }
-
     fn allocation_at(&self, offset: usize) -> Result<RegionAllocation> {
         let addr = unsafe { self.base.cast::<u8>().add(offset).cast::<c_void>() };
-        Ok(RegionAllocation {
-            addr,
-            absolute_offset: addr as u64,
-        })
-    }
-
-    fn relative_offset(&self, absolute_offset: u64) -> Result<usize> {
-        let base = self.base as usize;
-        let absolute = usize::try_from(absolute_offset).map_err(|_| {
-            StoreError::Allocator(format!("absolute offset {absolute_offset} does not fit usize"))
-        })?;
-        if absolute < base {
-            return Err(StoreError::Allocator(format!(
-                "absolute offset {absolute_offset} is before region base {base}"
-            )));
-        }
-        let relative = absolute - base;
-        if relative >= self.capacity {
-            return Err(StoreError::Allocator(format!(
-                "absolute offset {absolute_offset} exceeds region capacity {}",
-                self.capacity
-            )));
-        }
-        Ok(relative)
+        Ok(RegionAllocation { addr })
     }
 
     fn address_at(&self, offset: usize) -> Result<*mut c_void> {
@@ -355,13 +324,6 @@ impl RegisteredRegion {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RetiredSpan {
-    offset: usize,
-    len: usize,
-    reclaim_at_ms: u64,
-}
-
 fn align_up(value: usize, alignment: usize) -> usize {
     let mask = alignment.saturating_sub(1);
     value.saturating_add(mask) & !mask
@@ -369,33 +331,12 @@ fn align_up(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::ptr;
-
-    use super::{align_up, RegisteredRegion};
+    use super::align_up;
 
     #[test]
     fn alignment_rounds_up_without_branch_explosion() {
         assert_eq!(align_up(1, 64), 64);
         assert_eq!(align_up(64, 64), 64);
         assert_eq!(align_up(65, 64), 128);
-    }
-
-    #[test]
-    fn free_spans_merge_without_special_cases() {
-        let mut region = RegisteredRegion {
-            base: ptr::null_mut(),
-            capacity: 1024,
-            committed: 256,
-            alignment: 64,
-            free: BTreeMap::new(),
-            retired: Vec::new(),
-        };
-        region.insert_free_span(0, 64);
-        region.insert_free_span(128, 64);
-        region.insert_free_span(64, 64);
-
-        let spans = region.free.into_iter().collect::<Vec<_>>();
-        assert_eq!(spans, vec![(0, 192)]);
     }
 }

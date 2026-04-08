@@ -4,9 +4,10 @@ use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
-    SegmentName, SegmentReservation, StoreError,
+    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 
+use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
 #[derive(Clone, Debug)]
@@ -140,9 +141,20 @@ impl MetadataBackend for EtcdMetadataBackend {
             .config
             .keyspace
             .segment(&segment.owner, &segment.segment_name);
-        let payload = serde_json::to_string(segment).map_err(json_error)?;
         self.block_on(async {
             let mut client = self.client().await?;
+            let current = client
+                .get(key.clone(), None)
+                .await
+                .map_err(etcd_error("etcd get segment before publish"))?;
+            let mut state = current
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice::<StoredSegmentState>(kv.value()).map_err(json_error))
+                .transpose()?
+                .unwrap_or_else(|| StoredSegmentState::new(segment.clone()));
+            state.merge_announcement(segment);
+            let payload = serde_json::to_string(&state).map_err(json_error)?;
             client
                 .put(key, payload, None)
                 .await
@@ -163,12 +175,71 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
+        let prefix = self.config.keyspace.segment_prefix(owner);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(prefix, Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(etcd_error("etcd list segments"))?;
+            response
+                .kvs()
+                .iter()
+                .map(|kv| {
+                    serde_json::from_slice::<StoredSegmentState>(kv.value())
+                        .map(|state| state.announcement)
+                        .map_err(json_error)
+                })
+                .collect()
+        })
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> Result<()> {
+        let key = self.config.keyspace.segment(owner, segment);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get segment"))?;
+                let kv = response
+                    .kvs()
+                    .first()
+                    .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+                let mut state: StoredSegmentState =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                state.announcement.state = next;
+                let payload = serde_json::to_string(&state).map_err(json_error)?;
+                let txn = Txn::new()
+                    .when([Compare::mod_revision(
+                        key.clone(),
+                        CompareOp::Equal,
+                        kv.mod_revision(),
+                    )])
+                    .and_then([TxnOp::put(key.clone(), payload, None)]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd update segment state"))?;
+                if txn_response.succeeded() {
+                    return Ok(());
+                }
+            }
+        })
+    }
+
     fn reserve_segment(
         &self,
         owner: &ClientRuntimeId,
         segment: &SegmentName,
         length_bytes: u64,
-        alignment: u64,
     ) -> Result<SegmentReservation> {
         let key = self.config.keyspace.segment(owner, segment);
         self.block_on(async {
@@ -182,23 +253,10 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .kvs()
                     .first()
                     .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-                let mut announcement: SegmentAnnouncement =
+                let mut state: StoredSegmentState =
                     serde_json::from_slice(kv.value()).map_err(json_error)?;
-                let offset = align_up_u64(announcement.used_bytes, alignment.max(1));
-                let next_used = offset.checked_add(length_bytes).ok_or_else(|| {
-                    StoreError::Allocator("segment reservation overflow".to_string())
-                })?;
-                if next_used > announcement.capacity_bytes {
-                    return Err(StoreError::Allocator(format!(
-                        "segment capacity exhausted for {}:{} requested={} remaining={}",
-                        owner,
-                        segment.0,
-                        length_bytes,
-                        announcement.capacity_bytes.saturating_sub(offset)
-                    )));
-                }
-                announcement.used_bytes = next_used;
-                let payload = serde_json::to_string(&announcement).map_err(json_error)?;
+                let reservation = state.reserve(owner, segment, length_bytes)?;
+                let payload = serde_json::to_string(&state).map_err(json_error)?;
                 let txn = Txn::new()
                     .when([Compare::mod_revision(
                         key.clone(),
@@ -211,12 +269,48 @@ impl MetadataBackend for EtcdMetadataBackend {
                     .await
                     .map_err(etcd_error("etcd reserve segment"))?;
                 if txn_response.succeeded() {
-                    return Ok(SegmentReservation {
-                        owner: owner.clone(),
-                        segment_name: segment.clone(),
-                        offset_bytes: offset,
-                        length_bytes,
-                    });
+                    return Ok(reservation);
+                }
+            }
+        })
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        let key = self.config.keyspace.segment(owner, segment);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get segment"))?;
+                let kv = response
+                    .kvs()
+                    .first()
+                    .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+                let mut state: StoredSegmentState =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                state.release(owner, segment, offset_bytes, length_bytes)?;
+                let payload = serde_json::to_string(&state).map_err(json_error)?;
+                let txn = Txn::new()
+                    .when([Compare::mod_revision(
+                        key.clone(),
+                        CompareOp::Equal,
+                        kv.mod_revision(),
+                    )])
+                    .and_then([TxnOp::put(key.clone(), payload, None)]);
+                let txn_response = client
+                    .txn(txn)
+                    .await
+                    .map_err(etcd_error("etcd release segment"))?;
+                if txn_response.succeeded() {
+                    return Ok(());
                 }
             }
         })
@@ -346,11 +440,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn align_up_u64(value: u64, alignment: u64) -> u64 {
-    let mask = alignment.saturating_sub(1);
-    value.saturating_add(mask) & !mask
 }
 
 fn etcd_error(operation: &'static str) -> impl FnOnce(etcd_client::Error) -> StoreError {

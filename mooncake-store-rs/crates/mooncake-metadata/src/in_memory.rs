@@ -2,17 +2,19 @@ use std::collections::BTreeMap;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement, SegmentName,
-    SegmentReservation, StoreError,
+    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 use parking_lot::RwLock;
+
+use crate::segment_state::StoredSegmentState;
 
 #[derive(Default)]
 struct InMemoryState {
     clients: BTreeMap<String, ClientLease>,
     handoffs: BTreeMap<String, HandoffPlan>,
     objects: BTreeMap<String, ObjectRoute>,
-    segments: BTreeMap<String, SegmentAnnouncement>,
+    segments: BTreeMap<String, StoredSegmentState>,
 }
 
 #[derive(Default)]
@@ -57,10 +59,16 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
-        self.state.write().segments.insert(
-            Self::segment_key(&segment.owner, &segment.segment_name),
-            segment.clone(),
-        );
+        let key = Self::segment_key(&segment.owner, &segment.segment_name);
+        let mut state = self.state.write();
+        match state.segments.get_mut(&key) {
+            Some(current) => current.merge_announcement(segment),
+            None => {
+                state
+                    .segments
+                    .insert(key, StoredSegmentState::new(segment.clone()));
+            }
+        }
         Ok(())
     }
 
@@ -72,39 +80,62 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(())
     }
 
+    fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
+        Ok(self
+            .state
+            .read()
+            .segments
+            .values()
+            .filter(|segment| owner.is_none_or(|owner| &segment.announcement.owner == owner))
+            .map(|segment| segment.announcement.clone())
+            .collect())
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> Result<()> {
+        let key = Self::segment_key(owner, segment);
+        let mut state = self.state.write();
+        let segment_state = state
+            .segments
+            .get_mut(&key)
+            .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+        segment_state.announcement.state = next;
+        Ok(())
+    }
+
     fn reserve_segment(
         &self,
         owner: &ClientRuntimeId,
         segment: &SegmentName,
         length_bytes: u64,
-        alignment: u64,
     ) -> Result<SegmentReservation> {
         let mut state = self.state.write();
         let key = Self::segment_key(owner, segment);
-        let announcement = state
+        let segment_state = state
             .segments
             .get_mut(&key)
             .ok_or_else(|| StoreError::NotFound(key.clone()))?;
-        let offset = align_up_u64(announcement.used_bytes, alignment.max(1));
-        let next_used = offset
-            .checked_add(length_bytes)
-            .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
-        if next_used > announcement.capacity_bytes {
-            return Err(StoreError::Allocator(format!(
-                "segment capacity exhausted for {}:{} requested={} remaining={}",
-                owner,
-                segment.0,
-                length_bytes,
-                announcement.capacity_bytes.saturating_sub(offset)
-            )));
-        }
-        announcement.used_bytes = next_used;
-        Ok(SegmentReservation {
-            owner: owner.clone(),
-            segment_name: segment.clone(),
-            offset_bytes: offset,
-            length_bytes,
-        })
+        segment_state.reserve(owner, segment, length_bytes)
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        let mut state = self.state.write();
+        let key = Self::segment_key(owner, segment);
+        let segment_state = state
+            .segments
+            .get_mut(&key)
+            .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+        segment_state.release(owner, segment, offset_bytes, length_bytes)
     }
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
@@ -160,16 +191,12 @@ impl MetadataBackend for InMemoryMetadataBackend {
     }
 }
 
-fn align_up_u64(value: u64, alignment: u64) -> u64 {
-    let mask = alignment.saturating_sub(1);
-    value.saturating_add(mask) & !mask
-}
-
 #[cfg(test)]
 mod tests {
     use mooncake_store_core::{
         ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
-        CompatibilityDescriptor, MetadataBackend, SegmentAnnouncement, SegmentName,
+        CompatibilityDescriptor, MetadataBackend, SegmentAnnouncement, SegmentLifecycleState,
+        SegmentName,
     };
 
     use super::InMemoryMetadataBackend;
@@ -193,15 +220,17 @@ mod tests {
                 segment_name: SegmentName::new("seg-a"),
                 capacity_bytes: 1024,
                 used_bytes: 0,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 64,
                 tags: vec![],
             })
             .expect("segment should publish");
 
         let first = metadata
-            .reserve_segment(&owner, &SegmentName::new("seg-a"), 17, 64)
+            .reserve_segment(&owner, &SegmentName::new("seg-a"), 17)
             .expect("first reserve should work");
         let second = metadata
-            .reserve_segment(&owner, &SegmentName::new("seg-a"), 17, 64)
+            .reserve_segment(&owner, &SegmentName::new("seg-a"), 17)
             .expect("second reserve should work");
 
         assert_eq!(first.offset_bytes, 0);
@@ -221,13 +250,51 @@ mod tests {
                 segment_name: SegmentName::new("seg-b"),
                 capacity_bytes: 32,
                 used_bytes: 0,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 1,
                 tags: vec![],
             })
             .expect("segment should publish");
 
         let error = metadata
-            .reserve_segment(&owner, &SegmentName::new("seg-b"), 64, 1)
+            .reserve_segment(&owner, &SegmentName::new("seg-b"), 64)
             .expect_err("reserve should fail");
         assert!(error.to_string().contains("segment capacity exhausted"));
+    }
+
+    #[test]
+    fn released_segment_space_is_reused() {
+        let metadata = InMemoryMetadataBackend::new();
+        let owner = ClientRuntimeId::new("node-c", ClientEpoch(1));
+        metadata
+            .publish_segment(&SegmentAnnouncement {
+                owner: owner.clone(),
+                segment_name: SegmentName::new("seg-c"),
+                capacity_bytes: 256,
+                used_bytes: 0,
+                state: SegmentLifecycleState::Active,
+                alignment_bytes: 64,
+                tags: vec![],
+            })
+            .expect("segment should publish");
+
+        let first = metadata
+            .reserve_segment(&owner, &SegmentName::new("seg-c"), 33)
+            .expect("first reserve should work");
+        metadata
+            .release_segment(
+                &owner,
+                &SegmentName::new("seg-c"),
+                first.offset_bytes,
+                first.length_bytes,
+            )
+            .expect("release should work");
+        let second = metadata
+            .reserve_segment(&owner, &SegmentName::new("seg-c"), 17)
+            .expect("second reserve should work");
+
+        assert_eq!(second.offset_bytes, first.offset_bytes);
+        let segments = metadata.list_segments(Some(&owner)).expect("list should work");
+        assert_eq!(segments[0].used_bytes, 64);
     }
 }

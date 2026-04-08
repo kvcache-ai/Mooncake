@@ -9,4 +9,6 @@ pub use client::{
 };
 pub use memory::LocalMemoryConfig;
 pub use placement::{PlacementChoice, PlacementPlanner};
-pub use transport::{wait_for_batch_completion, StoreTransport};
+pub use transport::{
+    wait_for_batch_completion, StoreTransport, StoreTransportFactory, TentTransportFactory,
+};

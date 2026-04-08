@@ -2,11 +2,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement, SegmentName,
-    SegmentReservation, StoreError,
+    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 use redis::{Commands, Script};
 
+use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
 const CAS_OBJECT_ROUTE_SCRIPT: &str = r#"
@@ -40,30 +41,166 @@ return {1, payload}
 const RESERVE_SEGMENT_SCRIPT: &str = r#"
 local key = KEYS[1]
 local requested = tonumber(ARGV[1])
-local alignment = tonumber(ARGV[2])
 
-local capacity = tonumber(redis.call('HGET', key, 'capacity_bytes'))
-local used = tonumber(redis.call('HGET', key, 'used_bytes'))
-
-if not capacity or not used then
+local payload = redis.call('HGET', key, 'state_json')
+if not payload then
     return {0, -1}
 end
 
-local offset = used
-if alignment > 1 then
-    local rem = offset % alignment
-    if rem ~= 0 then
-        offset = offset + (alignment - rem)
+local state = cjson.decode(payload)
+local announcement = state["announcement"]
+if announcement["state"] ~= "Active" then
+    return {0, -2}
+end
+
+local alignment = tonumber(announcement["alignment_bytes"] or 1)
+if alignment < 1 then
+    alignment = 1
+end
+
+local function align_up(value, align)
+    if align <= 1 then
+        return value
+    end
+    local rem = value % align
+    if rem == 0 then
+        return value
+    end
+    return value + (align - rem)
+end
+
+local reserved = align_up(requested, alignment)
+local offset = nil
+local free_spans = state["free_spans"] or {}
+for index, span in ipairs(free_spans) do
+    if tonumber(span["length_bytes"]) >= reserved then
+        offset = tonumber(span["offset_bytes"])
+        local remaining = tonumber(span["length_bytes"]) - reserved
+        if remaining > 0 then
+            span["offset_bytes"] = offset + reserved
+            span["length_bytes"] = remaining
+        else
+            table.remove(free_spans, index)
+        end
+        break
     end
 end
 
-local next_used = offset + requested
-if next_used > capacity then
-    return {0, capacity - offset}
+if offset == nil then
+    local cursor = tonumber(state["cursor_bytes"] or 0)
+    offset = align_up(cursor, alignment)
+    local next_cursor = offset + reserved
+    local capacity = tonumber(announcement["capacity_bytes"])
+    if next_cursor > capacity then
+        return {0, capacity - offset}
+    end
+    state["cursor_bytes"] = next_cursor
 end
 
-redis.call('HSET', key, 'used_bytes', tostring(next_used))
+announcement["used_bytes"] = tonumber(announcement["used_bytes"] or 0) + reserved
+state["announcement"] = announcement
+state["free_spans"] = free_spans
+
+local next_payload = cjson.encode(state)
+redis.call('HSET', key,
+    'state_json', next_payload,
+    'used_bytes', tostring(announcement["used_bytes"]),
+    'state', announcement["state"],
+    'alignment_bytes', tostring(announcement["alignment_bytes"] or 1),
+    'capacity_bytes', tostring(announcement["capacity_bytes"]))
 return {1, offset}
+"#;
+
+const RELEASE_SEGMENT_SCRIPT: &str = r#"
+local key = KEYS[1]
+local offset = tonumber(ARGV[1])
+local requested = tonumber(ARGV[2])
+
+local payload = redis.call('HGET', key, 'state_json')
+if not payload then
+    return {0, -1}
+end
+
+local state = cjson.decode(payload)
+local announcement = state["announcement"]
+local alignment = tonumber(announcement["alignment_bytes"] or 1)
+if alignment < 1 then
+    alignment = 1
+end
+
+local function align_up(value, align)
+    if align <= 1 then
+        return value
+    end
+    local rem = value % align
+    if rem == 0 then
+        return value
+    end
+    return value + (align - rem)
+end
+
+local reserved = align_up(requested, alignment)
+local capacity = tonumber(announcement["capacity_bytes"])
+if offset + reserved > capacity then
+    return {0, -2}
+end
+
+local free_spans = state["free_spans"] or {}
+table.insert(free_spans, { offset_bytes = offset, length_bytes = reserved })
+table.sort(free_spans, function(left, right)
+    return tonumber(left["offset_bytes"]) < tonumber(right["offset_bytes"])
+end)
+
+local merged = {}
+for _, span in ipairs(free_spans) do
+    local current_offset = tonumber(span["offset_bytes"])
+    local current_length = tonumber(span["length_bytes"])
+    local previous = merged[#merged]
+    if previous then
+        local previous_end = tonumber(previous["offset_bytes"]) + tonumber(previous["length_bytes"])
+        if previous_end >= current_offset then
+            local merged_end = math.max(previous_end, current_offset + current_length)
+            previous["length_bytes"] = merged_end - tonumber(previous["offset_bytes"])
+        else
+            table.insert(merged, { offset_bytes = current_offset, length_bytes = current_length })
+        end
+    else
+        table.insert(merged, { offset_bytes = current_offset, length_bytes = current_length })
+    end
+end
+
+local cursor = tonumber(state["cursor_bytes"] or 0)
+while #merged > 0 do
+    local last = merged[#merged]
+    local last_end = tonumber(last["offset_bytes"]) + tonumber(last["length_bytes"])
+    if last_end ~= cursor then
+        break
+    end
+    cursor = tonumber(last["offset_bytes"])
+    table.remove(merged, #merged)
+end
+
+local used = tonumber(announcement["used_bytes"] or 0) - reserved
+if used < 0 then
+    used = 0
+end
+announcement["used_bytes"] = used
+if used == 0 then
+    cursor = 0
+    merged = {}
+end
+
+state["announcement"] = announcement
+state["cursor_bytes"] = cursor
+state["free_spans"] = merged
+local next_payload = cjson.encode(state)
+redis.call('HSET', key,
+    'state_json', next_payload,
+    'used_bytes', tostring(announcement["used_bytes"]),
+    'state', announcement["state"],
+    'alignment_bytes', tostring(announcement["alignment_bytes"] or 1),
+    'capacity_bytes', tostring(announcement["capacity_bytes"]))
+return {1, used}
 "#;
 
 #[derive(Clone, Debug)]
@@ -105,6 +242,55 @@ impl RedisMetadataBackend {
         self.client
             .get_connection()
             .map_err(|error| metadata_error("redis get_connection", error))
+    }
+
+    fn load_segment_state(
+        &self,
+        connection: &mut redis::Connection,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> Result<StoredSegmentState> {
+        let key = self.keyspace.segment(owner, segment);
+        let payload: Option<String> = redis::cmd("HGET")
+            .arg(&key)
+            .arg("state_json")
+            .query(connection)
+            .map_err(|error| metadata_error("redis hget segment state", error))?;
+        let payload = payload.ok_or(StoreError::NotFound(key))?;
+        serde_json::from_str(&payload).map_err(json_error)
+    }
+
+    fn store_segment_state(
+        &self,
+        connection: &mut redis::Connection,
+        state: &StoredSegmentState,
+    ) -> Result<()> {
+        let key = self
+            .keyspace
+            .segment(&state.announcement.owner, &state.announcement.segment_name);
+        let payload = serde_json::to_string(state).map_err(json_error)?;
+        let tags = serde_json::to_string(&state.announcement.tags).map_err(json_error)?;
+        connection
+            .hset_multiple::<_, _, _, ()>(
+                key,
+                &[
+                    ("owner", state.announcement.owner.storage_key()),
+                    ("segment_name", state.announcement.segment_name.0.clone()),
+                    (
+                        "capacity_bytes",
+                        state.announcement.capacity_bytes.to_string(),
+                    ),
+                    ("used_bytes", state.announcement.used_bytes.to_string()),
+                    ("state", format!("{:?}", state.announcement.state)),
+                    (
+                        "alignment_bytes",
+                        state.announcement.alignment_bytes.to_string(),
+                    ),
+                    ("tags_json", tags),
+                    ("state_json", payload),
+                ],
+            )
+            .map_err(|error| metadata_error("redis hset segment state", error))
     }
 }
 
@@ -164,19 +350,17 @@ impl MetadataBackend for RedisMetadataBackend {
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
         let mut connection = self.connection()?;
         let key = self.keyspace.segment(&segment.owner, &segment.segment_name);
-        let tags = serde_json::to_string(&segment.tags).map_err(json_error)?;
-        connection
-            .hset_multiple::<_, _, _, ()>(
-                key,
-                &[
-                    ("owner", segment.owner.storage_key()),
-                    ("segment_name", segment.segment_name.0.clone()),
-                    ("capacity_bytes", segment.capacity_bytes.to_string()),
-                    ("used_bytes", segment.used_bytes.to_string()),
-                    ("tags_json", tags),
-                ],
-            )
-            .map_err(|error| metadata_error("redis set segment", error))
+        let current_payload: Option<String> = redis::cmd("HGET")
+            .arg(&key)
+            .arg("state_json")
+            .query(&mut connection)
+            .map_err(|error| metadata_error("redis hget segment state", error))?;
+        let mut state = match current_payload {
+            Some(payload) => serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?,
+            None => StoredSegmentState::new(segment.clone()),
+        };
+        state.merge_announcement(segment);
+        self.store_segment_state(&mut connection, &state)
     }
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
@@ -187,36 +371,94 @@ impl MetadataBackend for RedisMetadataBackend {
             .map_err(|error| metadata_error("redis del segment", error))
     }
 
+    fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
+        let mut connection = self.connection()?;
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(self.keyspace.segment_pattern(owner))
+            .query(&mut connection)
+            .map_err(|error| metadata_error("redis keys segments", error))?;
+        let mut segments = Vec::with_capacity(keys.len());
+        for key in keys {
+            let payload: Option<String> = redis::cmd("HGET")
+                .arg(key)
+                .arg("state_json")
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis hget segment state", error))?;
+            if let Some(payload) = payload {
+                let state = serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?;
+                segments.push(state.announcement);
+            }
+        }
+        Ok(segments)
+    }
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let mut state = self.load_segment_state(&mut connection, owner, segment)?;
+        state.announcement.state = next;
+        self.store_segment_state(&mut connection, &state)
+    }
+
     fn reserve_segment(
         &self,
         owner: &ClientRuntimeId,
         segment: &SegmentName,
         length_bytes: u64,
-        alignment: u64,
     ) -> Result<SegmentReservation> {
         let mut connection = self.connection()?;
         let key = self.keyspace.segment(owner, segment);
         let result = Script::new(RESERVE_SEGMENT_SCRIPT)
             .key(&key)
             .arg(length_bytes)
-            .arg(alignment.max(1))
             .invoke::<(i32, i64)>(&mut connection)
             .map_err(|error| metadata_error("redis reserve segment", error))?;
-        if result.0 != 1 {
-            if result.1 < 0 {
-                return Err(StoreError::NotFound(key));
-            }
-            return Err(StoreError::Allocator(format!(
+        match result.0 {
+            1 => Ok(SegmentReservation {
+                owner: owner.clone(),
+                segment_name: segment.clone(),
+                offset_bytes: result.1 as u64,
+                length_bytes,
+            }),
+            _ if result.1 == -1 => Err(StoreError::NotFound(key)),
+            _ if result.1 == -2 => Err(StoreError::InvalidState(format!(
+                "segment {}:{} is not active",
+                owner, segment.0
+            ))),
+            _ => Err(StoreError::Allocator(format!(
                 "segment capacity exhausted for {}:{} requested={} remaining={}",
                 owner, segment.0, length_bytes, result.1
-            )));
+            ))),
         }
-        Ok(SegmentReservation {
-            owner: owner.clone(),
-            segment_name: segment.clone(),
-            offset_bytes: result.1 as u64,
-            length_bytes,
-        })
+    }
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.segment(owner, segment);
+        let result = Script::new(RELEASE_SEGMENT_SCRIPT)
+            .key(&key)
+            .arg(offset_bytes)
+            .arg(length_bytes)
+            .invoke::<(i32, i64)>(&mut connection)
+            .map_err(|error| metadata_error("redis release segment", error))?;
+        match result.0 {
+            1 => Ok(()),
+            _ if result.1 == -1 => Err(StoreError::NotFound(key)),
+            _ => Err(StoreError::Allocator(format!(
+                "segment release rejected for {}:{} offset={} len={}",
+                owner, segment.0, offset_bytes, length_bytes
+            ))),
+        }
     }
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
@@ -245,7 +487,11 @@ impl MetadataBackend for RedisMetadataBackend {
         let next_version = next.map(|route| route.version.0).unwrap_or_default();
         let current_payload = Script::new(CAS_OBJECT_ROUTE_SCRIPT)
             .key(self.keyspace.object(key))
-            .arg(expected.map(|version| version.0.to_string()).unwrap_or_else(|| "__none__".to_string()))
+            .arg(
+                expected
+                    .map(|version| version.0.to_string())
+                    .unwrap_or_else(|| "__none__".to_string()),
+            )
             .arg(next_version.to_string())
             .arg(payload.clone().unwrap_or_else(|| "__delete__".to_string()))
             .invoke::<(i32, String)>(&mut connection)
