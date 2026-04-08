@@ -484,8 +484,7 @@ int Topology::discover(const std::vector<std::string> &filter) {
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || defined(USE_MACA)
     for (auto &ent : discoverCudaTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
