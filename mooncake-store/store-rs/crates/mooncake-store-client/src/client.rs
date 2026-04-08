@@ -13,10 +13,12 @@ use mooncake_store_core::{
 };
 use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
+use tracing::{debug, info, info_span};
 
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, StorageExtentInfo, StorageSegmentSpec,
 };
+use crate::observability::OperationTracker;
 use crate::placement::PlacementPlanner;
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
@@ -419,6 +421,14 @@ impl StoreClient {
     }
 
     fn publish_local_segment(&self, segment: &StorageExtentInfo, used_bytes: u64) -> Result<()> {
+        debug!(
+            runtime = %self.lease.runtime,
+            segment = %segment.segment_name.0,
+            capacity_bytes = segment.capacity_bytes,
+            used_bytes,
+            state = ?segment.state,
+            "publishing local segment"
+        );
         self.metadata.publish_segment(&SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
             segment_name: segment.segment_name.clone(),
@@ -465,6 +475,13 @@ impl StoreClient {
                 .reserve_segment(owner, &segment.segment_name, length_bytes as u64)
             {
                 Ok(reservation) => {
+                    debug!(
+                        owner = %owner,
+                        segment = %segment.segment_name.0,
+                        offset_bytes = reservation.offset_bytes,
+                        length_bytes = reservation.length_bytes,
+                        "reserved segment space"
+                    );
                     return Ok((
                         ReplicaWriteTarget {
                             runtime: owner.clone(),
@@ -486,6 +503,13 @@ impl StoreClient {
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {
         for replica in &route.replicas {
+            debug!(
+                owner = %replica.owner,
+                segment = %replica.segment_name.0,
+                offset_bytes = replica.segment_offset,
+                length_bytes = replica.length,
+                "releasing route allocation"
+            );
             self.metadata.release_segment(
                 &replica.owner,
                 &replica.segment_name,
@@ -669,20 +693,68 @@ impl StoreClient {
             }
         }
 
+        let local_paths = {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            resolved
+                .iter()
+                .map(|entry| {
+                    entry.replica.owner == self.lease.runtime
+                        && memory.has_storage_segment(&entry.replica.segment_name)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            for ((entry, buffer), local) in resolved
+                .iter()
+                .zip(buffers.iter_mut())
+                .zip(local_paths.iter())
+            {
+                if !*local {
+                    continue;
+                }
+                let source = memory.storage_address(
+                    &entry.replica.segment_name,
+                    entry.replica.segment_offset as usize,
+                )?;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        source.cast::<u8>(),
+                        buffer.as_mut_ptr(),
+                        entry.replica.length as usize,
+                    );
+                }
+            }
+        }
+
+        let remote_indices = local_paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, local)| (!*local).then_some(index))
+            .collect::<Vec<_>>();
+        if remote_indices.is_empty() {
+            return Ok(lengths);
+        }
+
         let direct_paths = {
             let state = self.state.lock();
-            buffers
+            remote_indices
                 .iter()
-                .zip(lengths.iter())
-                .map(|(buffer, length)| {
-                    state.buffer_is_registered(buffer.as_ptr().cast_mut().cast::<c_void>(), *length)
+                .map(|index| {
+                    state.buffer_is_registered(
+                        buffers[*index].as_ptr().cast_mut().cast::<c_void>(),
+                        lengths[*index],
+                    )
                 })
                 .collect::<Vec<_>>()
         };
         let scratch_lengths = direct_paths
             .iter()
-            .zip(lengths.iter())
-            .filter_map(|(direct, length)| (!*direct).then_some(*length))
+            .zip(remote_indices.iter())
+            .filter_map(|(direct, index)| (!*direct).then_some(lengths[*index]))
             .collect::<Vec<_>>();
         let scratch = if scratch_lengths.is_empty() {
             Vec::new()
@@ -693,15 +765,12 @@ impl StoreClient {
 
         let requests = {
             let mut state = self.state.lock();
-            let mut batch = Vec::with_capacity(resolved.len());
+            let mut batch = Vec::with_capacity(remote_indices.len());
             let mut scratch_index = 0usize;
-            for ((entry, buffer), direct) in resolved
-                .iter()
-                .zip(buffers.iter_mut())
-                .zip(direct_paths.iter())
-            {
-                let source = if *direct {
-                    buffer.as_mut_ptr().cast::<c_void>()
+            for (position, index) in remote_indices.iter().enumerate() {
+                let entry = &resolved[*index];
+                let source = if direct_paths[position] {
+                    buffers[*index].as_mut_ptr().cast::<c_void>()
                 } else {
                     let addr = scratch[scratch_index].addr;
                     scratch_index += 1;
@@ -730,22 +799,21 @@ impl StoreClient {
         wait_result?;
         free_result?;
 
-        let mut sizes = Vec::with_capacity(buffers.len());
         let mut scratch_index = 0usize;
-        for ((buffer, direct), length) in buffers.iter_mut().zip(direct_paths.iter()).zip(lengths) {
-            if !*direct {
+        for (position, index) in remote_indices.iter().enumerate() {
+            if !direct_paths[position] {
                 unsafe {
                     ptr::copy_nonoverlapping(
                         scratch[scratch_index].addr.cast::<u8>(),
-                        buffer.as_mut_ptr(),
-                        length,
+                        buffers[*index].as_mut_ptr(),
+                        lengths[*index],
                     );
                 }
                 scratch_index += 1;
             }
-            sizes.push(length);
         }
-        Ok(sizes)
+
+        Ok(lengths)
     }
 
     fn segment_name(&self) -> Result<SegmentName> {
@@ -1092,26 +1160,50 @@ impl StoreClient {
 
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
+        let _span = info_span!(
+            "store.heartbeat",
+            runtime = %self.lease.runtime,
+            expires_at_ms
+        )
+        .entered();
+        let tracker = OperationTracker::new("heartbeat");
         self.lease.expires_at_ms = expires_at_ms;
-        self.metadata.upsert_client_lease(&self.lease)
+        let result = self.metadata.upsert_client_lease(&self.lease);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn enter_standby(&mut self) -> Result<()> {
+        let _span = info_span!("store.enter_standby", runtime = %self.lease.runtime).entered();
+        let tracker = OperationTracker::new("enter_standby");
         self.lease.state = ClientLifecycleState::Standby;
-        self.metadata
-            .update_client_state(&self.lease.runtime, self.lease.state)
+        let result = self
+            .metadata
+            .update_client_state(&self.lease.runtime, self.lease.state);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn activate(&mut self) -> Result<()> {
+        let _span = info_span!("store.activate", runtime = %self.lease.runtime).entered();
+        let tracker = OperationTracker::new("activate");
         self.lease.state = ClientLifecycleState::Active;
-        self.metadata
-            .update_client_state(&self.lease.runtime, self.lease.state)
+        let result = self
+            .metadata
+            .update_client_state(&self.lease.runtime, self.lease.state);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn enter_draining(&mut self) -> Result<()> {
+        let _span = info_span!("store.enter_draining", runtime = %self.lease.runtime).entered();
+        let tracker = OperationTracker::new("enter_draining");
         self.lease.state = ClientLifecycleState::Draining;
-        self.metadata
-            .update_client_state(&self.lease.runtime, self.lease.state)
+        let result = self
+            .metadata
+            .update_client_state(&self.lease.runtime, self.lease.state);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn plan_handoff(
@@ -1122,6 +1214,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
         created_at_ms: u64,
         deadline_ms: Option<u64>,
     ) -> Result<HandoffPlan> {
+        let _span = info_span!(
+            "store.plan_handoff",
+            runtime = %self.lease.runtime,
+            successor_epoch = successor_epoch.0,
+            barrier_version,
+            kind = ?kind
+        )
+        .entered();
+        let tracker = OperationTracker::new("plan_handoff");
         let plan = HandoffPlan {
             stable_id: self.lease.runtime.stable_id.clone(),
             from: self.lease.runtime.clone(),
@@ -1134,11 +1235,21 @@ impl MooncakeCompatibilityFacade for StoreClient {
             created_at_ms,
             deadline_ms,
         };
-        self.metadata.put_handoff(&plan)?;
+        let put_result = self.metadata.put_handoff(&plan);
+        tracker.finish(&put_result, 0);
+        put_result?;
         Ok(plan)
     }
 
     fn mount_segment(&self, capacity_bytes: u64, used_bytes: u64, tags: Vec<String>) -> Result<()> {
+        let _span = info_span!(
+            "store.mount_segment",
+            runtime = %self.lease.runtime,
+            capacity_bytes,
+            used_bytes
+        )
+        .entered();
+        let tracker = OperationTracker::new("mount_segment").input_bytes(capacity_bytes);
         let segment = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
             segment_name: self.segment_name()?,
@@ -1148,7 +1259,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             alignment_bytes: self.local_memory.alignment as u64,
             tags,
         };
-        self.metadata.publish_segment(&segment)
+        let result = self.metadata.publish_segment(&segment);
+        tracker.finish(&result, used_bytes);
+        result
     }
 
     fn list_segments(&self) -> Result<Vec<SegmentAnnouncement>> {
@@ -1156,11 +1269,20 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn expand_local_memory(&self, storage_bytes: usize) -> Result<SegmentAnnouncement> {
+        let _span = info_span!(
+            "store.expand_local_memory",
+            runtime = %self.lease.runtime,
+            storage_bytes
+        )
+        .entered();
+        let tracker = OperationTracker::new("expand_local_memory").input_bytes(storage_bytes as u64);
         self.ensure_local_memory()?;
         if storage_bytes == 0 {
-            return Err(StoreError::Allocator(
+            let result = Err(StoreError::Allocator(
                 "expanded storage_bytes must be greater than zero".to_string(),
             ));
+            tracker.finish(&result, 0);
+            return result;
         }
         let primary = self.segment_name()?;
         let segment_name = {
@@ -1194,11 +1316,26 @@ impl MooncakeCompatibilityFacade for StoreClient {
             alignment_bytes: self.local_memory.alignment as u64,
             tags: self.local_memory.tags.clone(),
         };
-        self.metadata.publish_segment(&announcement)?;
+        info!(
+            runtime = %self.lease.runtime,
+            segment = %announcement.segment_name.0,
+            storage_bytes,
+            "expanded local memory with a new active segment"
+        );
+        let publish_result = self.metadata.publish_segment(&announcement);
+        tracker.finish(&publish_result, 0);
+        publish_result?;
         Ok(announcement)
     }
 
     fn drain_segment(&self, segment: &SegmentName) -> Result<()> {
+        let _span = info_span!(
+            "store.drain_segment",
+            runtime = %self.lease.runtime,
+            segment = %segment.0
+        )
+        .entered();
+        let tracker = OperationTracker::new("drain_segment");
         self.ensure_local_memory()?;
         let primary = self.segment_name()?;
         let active_count = {
@@ -1211,9 +1348,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .count()
         };
         if active_count <= 1 && *segment == primary {
-            return Err(StoreError::InvalidState(
+            let result = Err(StoreError::InvalidState(
                 "cannot drain the last active local segment".to_string(),
             ));
+            tracker.finish(&result, 0);
+            return result;
         }
         {
             let mut state = self.state.lock();
@@ -1221,14 +1360,28 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .memory_mut()?
                 .update_storage_state(segment, SegmentLifecycleState::Draining)?;
         }
-        self.metadata.update_segment_state(
+        info!(
+            runtime = %self.lease.runtime,
+            segment = %segment.0,
+            "segment entered draining state"
+        );
+        let result = self.metadata.update_segment_state(
             &self.lease.runtime,
             segment,
             SegmentLifecycleState::Draining,
-        )
+        );
+        tracker.finish(&result, 0);
+        result
     }
 
     fn retire_segment(&self, segment: &SegmentName) -> Result<bool> {
+        let _span = info_span!(
+            "store.retire_segment",
+            runtime = %self.lease.runtime,
+            segment = %segment.0
+        )
+        .entered();
+        let tracker = OperationTracker::new("retire_segment");
         self.ensure_local_memory()?;
         let segments = self.metadata.list_segments(Some(&self.lease.runtime))?;
         let announcement = segments
@@ -1236,13 +1389,17 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .find(|entry| entry.segment_name == *segment)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment.0)))?;
         if announcement.state != SegmentLifecycleState::Draining {
-            return Err(StoreError::InvalidState(format!(
+            let result = Err(StoreError::InvalidState(format!(
                 "segment {} is not draining",
                 segment.0
             )));
+            tracker.finish(&result, 0);
+            return result;
         }
         if announcement.used_bytes != 0 {
-            return Ok(false);
+            let result = Ok(false);
+            tracker.finish(&result, 0);
+            return result;
         }
         {
             let mut state = self.state.lock();
@@ -1265,8 +1422,17 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .memory_mut()?
                 .remove_storage_segment(transport.as_ref(), segment)?;
         }
-        self.metadata.unpublish_segment(&self.lease.runtime, segment)?;
-        Ok(true)
+        info!(
+            runtime = %self.lease.runtime,
+            segment = %segment.0,
+            "retired drained segment"
+        );
+        let result = self
+            .metadata
+            .unpublish_segment(&self.lease.runtime, segment)
+            .map(|_| true);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn query_route(&self, key: &str) -> Result<Option<ObjectRoute>> {
@@ -1299,24 +1465,48 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn register_local_memory(&self) -> Result<()> {
-        self.ensure_local_memory()
+        let _span = info_span!("store.register_local_memory", runtime = %self.lease.runtime).entered();
+        let tracker = OperationTracker::new("register_local_memory");
+        let result = self.ensure_local_memory();
+        tracker.finish(&result, 0);
+        result
     }
 
     fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()> {
+        let _span = info_span!(
+            "store.register_buffer",
+            runtime = %self.lease.runtime,
+            size
+        )
+        .entered();
+        let tracker = OperationTracker::new("register_buffer").input_bytes(size as u64);
         if size == 0 {
-            return Err(StoreError::Allocator(
+            let result = Err(StoreError::Allocator(
                 "registered buffer size must be greater than zero".to_string(),
             ));
+            tracker.finish(&result, 0);
+            return result;
         }
         let transport = self.transport()?;
         let mut state = self.state.lock();
-        state.register_external_buffer(transport, buffer, size)
+        let result = state.register_external_buffer(transport, buffer, size);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()> {
+        let _span = info_span!(
+            "store.unregister_buffer",
+            runtime = %self.lease.runtime,
+            size
+        )
+        .entered();
+        let tracker = OperationTracker::new("unregister_buffer").input_bytes(size as u64);
         let transport = self.transport()?;
         let mut state = self.state.lock();
-        state.unregister_external_buffer(transport, buffer, size)
+        let result = state.unregister_external_buffer(transport, buffer, size);
+        tracker.finish(&result, 0);
+        result
     }
 
     fn put(&self, key: &str, value: &[u8]) -> Result<ObjectRoute> {
@@ -1324,10 +1514,21 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn put_in_tenant(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
-        match &self.write_mode {
+        let _span = info_span!(
+            "store.put",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            bytes = value.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
+        let result = match &self.write_mode {
             WriteMode::LocalOnly => self.put_scoped(tenant, key, value),
             WriteMode::Routed { .. } => self.put_scoped_routed(tenant, key, value),
-        }
+        };
+        tracker.finish(&result, value.len() as u64);
+        result
     }
 
     fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute> {
@@ -1341,36 +1542,76 @@ impl MooncakeCompatibilityFacade for StoreClient {
         buffer: *const c_void,
         size: usize,
     ) -> Result<ObjectRoute> {
+        let _span = info_span!(
+            "store.put_from",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            size
+        )
+        .entered();
+        let tracker = OperationTracker::new("put_from").input_bytes(size as u64);
         if buffer.is_null() {
-            return Err(StoreError::Allocator(
+            let result = Err(StoreError::Allocator(
                 "put_from buffer must not be null".to_string(),
             ));
+            tracker.finish(&result, 0);
+            return result;
         }
         {
             let state = self.state.lock();
             if !state.buffer_is_registered(buffer.cast_mut(), size) {
-                return Err(StoreError::Allocator(format!(
+                let result = Err(StoreError::Allocator(format!(
                     "put_from buffer is not registered for tenant={tenant} key={key}"
                 )));
+                tracker.finish(&result, 0);
+                return result;
             }
         }
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
-        self.put_in_tenant(tenant, key, value)
+        let result = self.put_in_tenant(tenant, key, value);
+        tracker.finish(&result, size as u64);
+        result
     }
 
     fn batch_put(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>> {
+        let bytes_in = requests
+            .iter()
+            .map(|request| request.value.len() as u64)
+            .sum::<u64>();
+        let _span = info_span!(
+            "store.batch_put",
+            runtime = %self.lease.runtime,
+            items = requests.len(),
+            bytes_in
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_put").input_bytes(bytes_in);
         if matches!(self.write_mode, WriteMode::Routed { .. }) {
-            return self.batch_put_scoped_routed(requests);
+            let result = self.batch_put_scoped_routed(requests);
+            tracker.finish(&result, bytes_in);
+            return result;
         }
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
             routes.push(self.put_in_tenant(tenant, request.key, request.value)?);
         }
-        Ok(routes)
+        let result = Ok(routes);
+        tracker.finish(&result, bytes_in);
+        result
     }
 
     fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>> {
+        let bytes_in = requests.iter().map(|request| request.size as u64).sum::<u64>();
+        let _span = info_span!(
+            "store.batch_put_from",
+            runtime = %self.lease.runtime,
+            items = requests.len(),
+            bytes_in
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
@@ -1381,20 +1622,37 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 request.size,
             )?);
         }
-        Ok(routes)
+        let result = Ok(routes);
+        tracker.finish(&result, bytes_in);
+        result
     }
 
     fn batch_put_from_multi_buffers(
         &self,
         requests: &[MultiBufferPutRequest<'_>],
     ) -> Result<Vec<ObjectRoute>> {
+        let bytes_in = requests
+            .iter()
+            .flat_map(|request| request.buffers.iter())
+            .map(|buffer| buffer.len() as u64)
+            .sum::<u64>();
+        let _span = info_span!(
+            "store.batch_put_from_multi_buffers",
+            runtime = %self.lease.runtime,
+            items = requests.len(),
+            bytes_in
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_put_from_multi_buffers").input_bytes(bytes_in);
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
             let payload = flatten_slices(request.buffers);
             routes.push(self.put_in_tenant(tenant, request.key, &payload)?);
         }
-        Ok(routes)
+        let result = Ok(routes);
+        tracker.finish(&result, bytes_in);
+        result
     }
 
     fn get(&self, key: &str) -> Result<Vec<u8>> {
@@ -1402,11 +1660,22 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn get_in_tenant(&self, tenant: &str, key: &str) -> Result<Vec<u8>> {
+        let _span = info_span!(
+            "store.get",
+            runtime = %self.lease.runtime,
+            tenant,
+            key
+        )
+        .entered();
+        let tracker = OperationTracker::new("get");
         let objects = [ObjectRef::new(key).tenant(tenant)];
         let mut results = self.batch_get(&objects)?;
-        results
+        let result = results
             .pop()
-            .ok_or_else(|| StoreError::InvalidState("missing batch_get result".to_string()))
+            .ok_or_else(|| StoreError::InvalidState("missing batch_get result".to_string()));
+        let bytes_out = result.as_ref().map(|value| value.len() as u64).unwrap_or(0);
+        tracker.finish(&result, bytes_out);
+        result
     }
 
     fn get_into(&self, key: &str, buffer: &mut [u8]) -> Result<usize> {
@@ -1414,14 +1683,33 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn get_into_in_tenant(&self, tenant: &str, key: &str, buffer: &mut [u8]) -> Result<usize> {
+        let _span = info_span!(
+            "store.get_into",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            buffer_capacity = buffer.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("get_into");
         let mut requests = [GetRequest::new(key, buffer).tenant(tenant)];
         let mut sizes = self.batch_get_into(&mut requests)?;
-        sizes
+        let result = sizes
             .pop()
-            .ok_or_else(|| StoreError::InvalidState("missing batch_get_into result".to_string()))
+            .ok_or_else(|| StoreError::InvalidState("missing batch_get_into result".to_string()));
+        let bytes_out = result.as_ref().copied().unwrap_or(0) as u64;
+        tracker.finish(&result, bytes_out);
+        result
     }
 
     fn batch_get(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>> {
+        let _span = info_span!(
+            "store.batch_get",
+            runtime = %self.lease.runtime,
+            items = objects.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_get");
         let resolved = self.resolve_objects(objects)?;
         let mut buffers = resolved
             .iter()
@@ -1432,7 +1720,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .map(|buffer| buffer.as_mut_slice())
             .collect::<Vec<_>>();
         self.execute_batch_get_into(&resolved, &mut slices)?;
-        Ok(buffers)
+        let bytes_out = buffers.iter().map(|buffer| buffer.len() as u64).sum::<u64>();
+        let result = Ok(buffers);
+        tracker.finish(&result, bytes_out);
+        result
     }
 
     fn batch_get_buffer(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<Vec<u8>>> {
@@ -1440,6 +1731,13 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_get_into(&self, requests: &mut [GetRequest<'_>]) -> Result<Vec<usize>> {
+        let _span = info_span!(
+            "store.batch_get_into",
+            runtime = %self.lease.runtime,
+            items = requests.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_get_into");
         let objects = requests
             .iter()
             .map(|request| {
@@ -1455,13 +1753,26 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .iter_mut()
             .map(|request| &mut *request.buffer)
             .collect::<Vec<_>>();
-        self.execute_batch_get_into(&resolved, &mut buffers)
+        let result = self.execute_batch_get_into(&resolved, &mut buffers);
+        let bytes_out = result
+            .as_ref()
+            .map(|sizes| sizes.iter().copied().sum::<usize>() as u64)
+            .unwrap_or(0);
+        tracker.finish(&result, bytes_out);
+        result
     }
 
     fn batch_get_into_multi_buffers(
         &self,
         requests: &mut [MultiBufferGetRequest<'_>],
     ) -> Result<Vec<usize>> {
+        let _span = info_span!(
+            "store.batch_get_into_multi_buffers",
+            runtime = %self.lease.runtime,
+            items = requests.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_get_into_multi_buffers");
         let objects = requests
             .iter()
             .map(|request| {
@@ -1491,7 +1802,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             scatter_into_buffers(payload, request.buffers);
             sizes.push(payload.len());
         }
-        Ok(sizes)
+        let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
+        let result = Ok(sizes);
+        tracker.finish(&result, bytes_out);
+        result
     }
 }
 
@@ -1740,8 +2054,9 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::{
-        transport::StoreTransport, LocalMemoryConfig, MooncakeCompatibilityFacade,
-        MultiBufferGetRequest, PlacementPlanner, PutRequest, StoreClientBuilder,
+        render_prometheus_metrics, reset_metrics, transport::StoreTransport, LocalMemoryConfig,
+        MooncakeCompatibilityFacade, MultiBufferGetRequest, PlacementPlanner, PutRequest,
+        StoreClientBuilder,
     };
 
     struct TestTransport {
@@ -2184,6 +2499,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("multi-buffer capacity too small"));
+    }
+
+    #[test]
+    fn observability_metrics_render_after_put_and_get() {
+        reset_metrics();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("metrics-segment"));
+        let client = StoreClientBuilder::new(metadata, "client-metrics")
+            .state(ClientLifecycleState::Active)
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("client build should succeed");
+
+        client.put("metrics-key", b"abcdefgh").expect("put should succeed");
+        let value = client.get("metrics-key").expect("get should succeed");
+        assert_eq!(value, b"abcdefgh");
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains("mooncake_store_client_operation_total"));
+        assert!(metrics.contains("operation=\"put\",status=\"ok\""));
+        assert!(metrics.contains("operation=\"get\",status=\"ok\""));
+        assert!(metrics.contains("mooncake_store_client_operation_bytes_out_total"));
     }
 
     #[test]
