@@ -117,7 +117,11 @@ std::string SerializeOpLogEntry(const OpLogEntry& entry) {
 class OpLogWatcherTest : public ::testing::Test {
    protected:
     void SetUp() override {
+#ifndef STORE_USE_ETCD
+        GTEST_SKIP() << "STORE_USE_ETCD not enabled";
+#else
         google::InitGoogleLogging("OpLogWatcherTest");
+        logging_initialized_ = true;
         FLAGS_logtostderr = 1;
         etcd_endpoints_ = "http://localhost:2379";
         cluster_id_ = "test_cluster_001";
@@ -125,13 +129,17 @@ class OpLogWatcherTest : public ::testing::Test {
         mock_store_ = std::make_shared<NoopOpLogStore>();
         watcher_ =
             std::make_unique<OpLogWatcher>(mock_store_, mock_applier_.get());
+#endif
     }
 
     void TearDown() override {
         if (watcher_) {
             watcher_->Stop();
         }
-        google::ShutdownGoogleLogging();
+        if (logging_initialized_) {
+            google::ShutdownGoogleLogging();
+            logging_initialized_ = false;
+        }
     }
 
     std::string etcd_endpoints_;
@@ -139,6 +147,7 @@ class OpLogWatcherTest : public ::testing::Test {
     std::shared_ptr<NoopOpLogStore> mock_store_;
     std::unique_ptr<MockOpLogApplier> mock_applier_;
     std::unique_ptr<OpLogWatcher> watcher_;
+    bool logging_initialized_{false};
 };
 
 // ========== 5.1.1 Start/Stop tests ==========
