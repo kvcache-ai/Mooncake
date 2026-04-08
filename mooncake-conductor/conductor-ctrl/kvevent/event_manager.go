@@ -289,20 +289,19 @@ func (m *EventManager) StartHTTPServer() error {
 			cacheSalt = *req.CacheSalt
 		}
 
-		modelContext := &prefixindex.ModelContext{
-			TenantID:       tenantID,
-			ModelName:      req.ModelName,
-			LoraName:       loraName,
-			BlockSize:      req.BlockSize,
-			AdditionalSalt: cacheSalt,
-		}
-
-		// cacheHitResult := m.indexer.CacheHitCompute(modelContext, req.TokenIDs, req.InstanceID)
 		response_result := make(map[string]map[string]prefixindex.CacheHitResult)
 
 		if req.InstanceID != nil {
 			slog.Info("search all engine instance for tenant. ", "instance_id", req.InstanceID)
-			result := m.indexer.CacheHitCompute(modelContext, req.TokenIDs, *req.InstanceID)
+			modelContext := &prefixindex.ModelContext{
+				TenantID:       tenantID,
+				ModelName:      req.ModelName,
+				LoraName:       loraName,
+				BlockSize:      req.BlockSize,
+				AdditionalSalt: cacheSalt,
+				InstanceID:     *req.InstanceID,
+			}
+			result := m.indexer.CacheHitCompute(modelContext, req.TokenIDs)
 			if result != nil {
 				if response_result[tenantID] == nil {
 					response_result[tenantID] = make(map[string]prefixindex.CacheHitResult)
@@ -312,7 +311,15 @@ func (m *EventManager) StartHTTPServer() error {
 		} else {
 			if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
 				for instanceID := range instanceSet {
-					result := m.indexer.CacheHitCompute(modelContext, req.TokenIDs, instanceID)
+					modelContext := &prefixindex.ModelContext{
+						TenantID:       tenantID,
+						ModelName:      req.ModelName,
+						LoraName:       loraName,
+						BlockSize:      req.BlockSize,
+						AdditionalSalt: cacheSalt,
+						InstanceID:     instanceID,
+					}
+					result := m.indexer.CacheHitCompute(modelContext, req.TokenIDs)
 					if result != nil {
 						if response_result[tenantID] == nil {
 							response_result[tenantID] = make(map[string]prefixindex.CacheHitResult)
@@ -391,9 +398,10 @@ func (m *EventManager) StartHTTPServer() error {
 			LoraName:       loraName,
 			BlockSize:      req.BlockSize,
 			AdditionalSalt: additionalSalt,
+			InstanceID:     svc.InstanceID,
 		}
 
-		m.indexer.AddDpSize(modelContext, svc.InstanceID, int64(svc.DPRank))
+		m.indexer.AddDpSize(modelContext, int64(svc.DPRank))
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{

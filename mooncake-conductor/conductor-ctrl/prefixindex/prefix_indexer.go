@@ -24,6 +24,7 @@ type ModelContext struct {
 	// and it seems it can be directly added to additionalSalt.
 	AdditionalSalt string
 	TenantID       string
+	InstanceID     string // unique identifier for each API server
 }
 
 type CacheStoreInfo struct {
@@ -51,7 +52,6 @@ type ContextData struct {
 
 	prefixStore *HashMapStore
 	seed        uint64
-	instanceID  string // unique identifier for each API server
 
 	DpSize map[int64]struct{}
 
@@ -79,6 +79,7 @@ type ModelContextView struct {
 	BlockSize      int64  `json:"block_size"`
 	AdditionalSalt string `json:"additional_salt"`
 	TenantID       string `json:"tenant_id"`
+	InstanceID     string `json:"instance_id"`
 }
 
 type GlobalView struct {
@@ -105,7 +106,7 @@ func NewPrefixCacheTable() *PrefixCacheTable {
 	return p
 }
 
-func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext, instanceID string) *ContextData {
+func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext) *ContextData {
 	ctx_value := *modelcontext
 	value, exists := p.contextMap.Load(ctx_value)
 	if exists {
@@ -121,7 +122,6 @@ func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext, instanceID
 		proxyHashMapping: make(map[uint64]uint64),
 		seed:             seedValue,
 		DpSize:           make(map[int64]struct{}),
-		instanceID:       instanceID,
 	}
 	newContextData.prefixStore.lastAccess.Store(time.Now().Unix())
 	p.contextMap.Store(ctx_value, newContextData)
@@ -130,9 +130,9 @@ func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext, instanceID
 	return newContextData
 }
 
-func (p *PrefixCacheTable) AddDpSize(modelcontext *ModelContext, instanceID string, dpRank int64) {
+func (p *PrefixCacheTable) AddDpSize(modelcontext *ModelContext, dpRank int64) {
 	// value, exists := p.contextMap.Load(modelcontext)
-	contextData := p.getContextData(modelcontext, instanceID)
+	contextData := p.getContextData(modelcontext)
 	contextData.DpSize[dpRank] = struct{}{}
 }
 
@@ -156,7 +156,7 @@ func (p *PrefixCacheTable) ComputePrefixHash(modelcontext *ModelContext, tokenId
 	return prefixHashes
 }
 
-func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds []int32, instanceID string) *CacheHitResult {
+func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds []int32) *CacheHitResult {
 	// slog.Debug("In CacheHitCompute", "modelName", modelcontext.ModelName, "loraName", modelcontext.LoraName)
 	value, exists := p.contextMap.Load(*modelcontext)
 	prefixMatchResult := &CacheHitResult{
@@ -222,20 +222,21 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 	return prefixMatchResult
 }
 
-func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank int64, instanceID string) error {
+func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank int64) error {
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
 	tenantID := "default"
 
-	slog.Debug("In ProcessStoreEvent", "modelName", event.ModelName, "instanceID", instanceID, "dpRank", dpRank)
+	slog.Debug("In ProcessStoreEvent", "modelName", event.ModelName, "instanceID", event.InstanceID, "dpRank", dpRank)
 	contextData := p.getContextData(&ModelContext{
 		ModelName:      event.ModelName,
 		LoraName:       event.LoraName,
 		BlockSize:      event.BlockSize,
 		TenantID:       tenantID,
 		AdditionalSalt: "",
-	}, instanceID)
+		InstanceID:     event.InstanceID,
+	})
 
 	contextData.hashmapMu.Lock()
 	defer contextData.hashmapMu.Unlock()
@@ -321,7 +322,8 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 		BlockSize:      event.BlockSize,
 		TenantID:       "default",
 		AdditionalSalt: "",
-	}, instanceID)
+		InstanceID:     instanceID,
+	})
 
 	contextData.hashmapMu.Lock()
 	defer contextData.hashmapMu.Unlock()
@@ -405,6 +407,7 @@ func (p *PrefixCacheTable) GetGlobalView() *GlobalView {
 			BlockSize:      ctx.BlockSize,
 			AdditionalSalt: ctx.AdditionalSalt,
 			TenantID:       ctx.TenantID,
+			InstanceID:     ctx.InstanceID,
 		}
 
 		contextData.prefixMu.RLock()
