@@ -59,6 +59,7 @@ RUN mkdir -p build && \
         -DUSE_CUDA=ON \
         -DWITH_EP=ON \
         -DSTORE_USE_ETCD=ON \
+        -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
     cmake --build .
@@ -83,11 +84,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install runtime dependencies required by Mooncake
+# Inherit PYTHON_VERSION so the runtime stage installs the matching interpreter
+ARG PYTHON_VERSION=3.10
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+# Install runtime dependencies and the requested Python version
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
+        ca-certificates \
+        curl \
+        software-properties-common \
         ibverbs-providers \
         rdma-core \
         libibverbs1 \
@@ -96,10 +102,18 @@ RUN apt-get update && \
         liburing2 \
         libyaml-0-2 \
         libcurl4 && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-RUN python3 -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
+RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]

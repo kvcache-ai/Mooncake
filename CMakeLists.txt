@@ -19,7 +19,7 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
-set(PYTHON_EXECUTABLE "python3")
+include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
