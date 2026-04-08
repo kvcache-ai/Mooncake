@@ -6,7 +6,6 @@ on:
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
-  workflow_dispatch:  # TODO: remove before merging - temporary for testing ci-gate
 
 permissions:
   contents: read
