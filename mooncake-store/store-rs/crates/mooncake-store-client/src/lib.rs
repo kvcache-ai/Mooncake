@@ -210,3 +210,42 @@ impl MooncakeCompatibilityFacade for StoreClient {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, HandoffKind, MetadataBackend};
+
+    use crate::{MooncakeCompatibilityFacade, StoreClientBuilder};
+
+    #[test]
+    fn hot_upgrade_handoff_is_published_after_draining() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let mut client = StoreClientBuilder::new(metadata.clone(), "client-a")
+            .epoch(ClientEpoch(1))
+            .state(ClientLifecycleState::Active)
+            .rpc_address("127.0.0.1:7001")
+            .segment_name("client-a-segment")
+            .build(10_000)
+            .expect("client build should succeed");
+
+        client.enter_draining().expect("draining should succeed");
+        let handoff = client
+            .plan_handoff(ClientEpoch(2), HandoffKind::HotUpgrade, 7, 100, Some(1_000))
+            .expect("handoff planning should succeed");
+
+        let leases = metadata.list_live_clients().expect("list clients should succeed");
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].state, ClientLifecycleState::Draining);
+
+        let stored = metadata
+            .get_handoff(&handoff.stable_id)
+            .expect("get handoff should succeed")
+            .expect("handoff should exist");
+        assert_eq!(stored.from.epoch, ClientEpoch(1));
+        assert_eq!(stored.to.epoch, ClientEpoch(2));
+        assert_eq!(stored.kind, HandoffKind::HotUpgrade);
+    }
+}

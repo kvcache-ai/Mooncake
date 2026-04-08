@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mooncake-metadata = { path = "../mooncake-metadata" }
 mooncake-store-client = { path = "../mooncake-store-client" }
 mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-transport = { path = "../mooncake-transport" }
