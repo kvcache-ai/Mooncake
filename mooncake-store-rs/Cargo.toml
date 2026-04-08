@@ -6,6 +6,7 @@ members = [
     "crates/mooncake-metadata",
     "crates/mooncake-store-client",
     "crates/mooncake-store-e2e",
+    "crates/mooncake-store-py",
 ]
 resolver = "2"
 
@@ -16,6 +17,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 parking_lot = "0.12"
+pyo3 = { version = "0.24", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
