@@ -10,7 +10,6 @@ on:
 permissions:
   contents: read
   actions: write
-  statuses: write
 
 jobs:
   build:
@@ -602,27 +601,6 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
-    - name: Set pending status for downstream tests
-      if: github.event_name == 'pull_request'
-      continue-on-error: true
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const contexts = [
-            'CI Test on ASCEND / build-and-test',
-            'Integration test / test-sglang-integration'
-          ];
-          for (const ctx of contexts) {
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.pull_request.head.sha,
-              state: 'pending',
-              context: ctx,
-              description: 'Waiting for Build & Test to complete...',
-              target_url: 'https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
-            });
-          }
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
     - name: Spell Check Repo
@@ -675,3 +653,36 @@ jobs:
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
 
+
+  check-paths:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      should-run-downstream: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            src:
+              - 'mooncake-*/**'
+              - 'extern/**'
+              - 'CMakeLists.txt'
+              - 'scripts/**'
+              - '.github/workflows/**'
+
+  ascend-test:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    uses: ./.github/workflows/ci_ascend.yml
+    secrets: inherit
+
+  integration-test:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    uses: ./.github/workflows/integration-test.yml
+    secrets: inherit

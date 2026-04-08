@@ -1,43 +1,10 @@
 name: 'Integration test (Linux)'
 
 on:
-  workflow_run:
-    workflows: ["Build & Test (Linux)"]
-    types:
-      - completed
-
-permissions:
-  statuses: write
+  workflow_call: {}
 
 jobs:
-  check-paths:
-    runs-on: ubuntu-latest
-    outputs:
-      should-run: ${{ steps.filter.outputs.changed }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0
-
-      - name: Check changed files
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          base: ${{ github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.pull_requests[0].base.ref || 'main' }}
-          ref: ${{ github.event.workflow_run.head_sha }}
-          filters: |
-            changed:
-              - 'mooncake-*/**'
-              - 'extern/**'
-              - 'CMakeLists.txt'
-              - 'scripts/**'
-              - '.github/workflows/**'
-
   test-sglang-integration:
-    needs: check-paths
-    if: ${{ github.event.workflow_run.conclusion == 'success' && needs.check-paths.outputs.should-run == 'true' }}
     runs-on: ubuntu-latest
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
@@ -45,10 +12,10 @@ jobs:
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
         run: |
-          SHA="${{ github.event.workflow_run.head_sha }}"
-          PR_ID="${{ github.event.workflow_run.pull_requests[0].number }}"
+          SHA="${{ github.event.pull_request.head.sha }}"
+          PR_ID="${{ github.event.pull_request.number }}"
 
-          if [ "${{ github.event.workflow_run.event }}" = "push" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
             SHA="${{ github.sha }}"
             PR_ID=""
           fi
@@ -150,46 +117,3 @@ jobs:
             sleep 30
           done
         shell: bash
-
-  report-status:
-    needs: [check-paths, test-sglang-integration]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/github-script@v7
-        with:
-          script: |
-            const conclusion = context.payload.workflow_run.conclusion;
-            const shouldRun = '${{ needs.check-paths.outputs.should-run }}';
-            const testResult = '${{ needs.test-sglang-integration.result }}';
-
-            let state, description;
-            if (conclusion === 'cancelled') {
-              state = 'failure';
-              description = 'CI cancelled (format/spell check failed)';
-            } else if (conclusion !== 'success') {
-              state = 'failure';
-              description = 'CI ' + conclusion + ', integration test skipped';
-            } else if (shouldRun !== 'true') {
-              state = 'success';
-              description = 'Skipped (no relevant file changes)';
-            } else if (testResult === 'success') {
-              state = 'success';
-              description = 'Integration test passed';
-            } else if (testResult === 'skipped') {
-              state = 'success';
-              description = 'Skipped';
-            } else {
-              state = 'failure';
-              description = `Integration test ${testResult}`;
-            }
-
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.workflow_run.head_sha,
-              state: state,
-              context: 'Integration test / test-sglang-integration',
-              description: description,
-              target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
-            });
