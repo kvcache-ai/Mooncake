@@ -36,12 +36,15 @@ EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-asio"
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -ljsoncpp"
 
-if [ -d "/usr/local/cuda/lib64/stubs" ]; then
-    EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"
-fi
-
-if [ -d "/usr/local/cuda/lib64" ]; then
+# cuda_loader provides CUDA API wrappers via dlopen (no hard dependency on libcudart)
+if [ -f "$BUILD_DIR/mooncake-common/cuda_loader/libcuda_loader.so" ]; then
+    EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/cuda_loader -lcuda_loader"
+elif [ -d "/usr/local/cuda/lib64" ]; then
+    # Fallback: link real CUDA libs directly (non-cuda_loader builds)
     EXT_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcuda -lcudart"
+    if [ -d "/usr/local/cuda/lib64/stubs" ]; then
+        EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"
+    fi
 fi
 
 if [ -d "/opt/rocm/lib" ]; then

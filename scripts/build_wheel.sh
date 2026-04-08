@@ -15,8 +15,8 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 BUILD_DIR="${BUILD_DIR:-build}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
-# Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-asio:/usr/local/lib
+# Ensure LD_LIBRARY_PATH includes /usr/local/lib and build artifacts
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-asio:/$(pwd)/build/mooncake-common/cuda_loader:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -30,6 +30,12 @@ cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp build/mooncake-asio/libasio.so mooncake-wheel/mooncake/libasio.so
+
+# Copy libcuda_loader.so to mooncake directory (runtime dependency of engine.so, CUDA builds only)
+if [ -f build/mooncake-common/cuda_loader/libcuda_loader.so ]; then
+    echo "Copying libcuda_loader.so..."
+    cp build/mooncake-common/cuda_loader/libcuda_loader.so mooncake-wheel/mooncake/
+fi
 
 # Copy store.so to mooncake directory
 if [ -f build/mooncake-integration/store.*.so ]; then

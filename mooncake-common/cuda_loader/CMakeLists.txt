@@ -46,5 +46,6 @@ target_link_libraries(cuda_loader
 
 set_target_properties(cuda_loader PROPERTIES
     POSITION_INDEPENDENT_CODE ON
-    SOVERSION 1
 )
+
+install(TARGETS cuda_loader DESTINATION lib)
