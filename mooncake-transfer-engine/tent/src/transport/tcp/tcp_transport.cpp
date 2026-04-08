@@ -210,10 +210,9 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
 
 Status TcpTransport::sendNotification(SegmentID target_id,
                                       const Notification &message) {
-    std::string rpc_server_addr;
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc *segment) {
-            rpc_server_addr = segment->rpc_server_addr;
+            auto rpc_server_addr = segment->rpc_server_addr;
             if (rpc_server_addr.empty()) {
                 return Status::NeedsRefreshCache(
                     "Empty RPC server addr" LOC_MARK);

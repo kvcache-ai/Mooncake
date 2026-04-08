@@ -1240,13 +1240,22 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
 }
 
 Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
-    SegmentDesc* desc = nullptr;
-    CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
-    auto server_addr = desc->getMemory().rpc_server_addr;
-    if (server_addr.empty()) {
-        return Status::InvalidArgument("Requested segment type error" LOC_MARK);
-    }
-    return ControlClient::probe(server_addr);
+    return metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            auto rpc_server_addr = segment->rpc_server_addr;
+            if (rpc_server_addr.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty RPC server addr" LOC_MARK);
+            }
+            auto status = ControlClient::probe(rpc_server_addr);
+            if (status.IsRpcServiceError()) {
+                // Perhaps rpc_server_addr can be updated in the future
+                return Status::NeedsRefreshCache(
+                    "RPC service error: " + std::string{status.message()} +
+                    LOC_MARK);
+            }
+            return status;
+        });
 }
 
 Status TransferEngineImpl::receiveNotification(
