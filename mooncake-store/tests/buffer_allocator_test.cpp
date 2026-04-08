@@ -150,7 +150,7 @@ TEST_F(BufferAllocatorTest, RepeatAllocateAndDeallocate) {
 TEST_F(BufferAllocatorTest, ParallelAllocation) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "test";
-        size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+        size_t size = 1024 * 1024 * 32;  // 32MB (must be multiple of 4MB)
         auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size,
                                              allocator_type);
 
