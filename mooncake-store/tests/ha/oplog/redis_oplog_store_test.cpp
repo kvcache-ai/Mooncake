@@ -84,6 +84,37 @@ TEST(RedisOpLogStoreTest, AppendPollAndResolveLatest) {
     EXPECT_EQ(second.sequence_id, latest.value());
 }
 
+TEST(RedisOpLogStoreTest, CleanupBeforeDeletesSafePrefixOnly) {
+    if (FLAGS_redis_endpoint.empty()) {
+        GTEST_SKIP() << "Redis endpoint is not configured";
+    }
+
+    const auto cluster_namespace = MakeClusterNamespace();
+    ha::backends::redis::RedisOpLogStore store(FLAGS_redis_endpoint,
+                                               cluster_namespace);
+    OpLogManager manager;
+
+    for (int index = 0; index < 5; ++index) {
+        auto entry =
+            MakeEntry(manager, OpType::PUT_END, "key-" + std::to_string(index),
+                      "payload-" + std::to_string(index));
+        auto append_result = store.Append(ha::oplog::BuildAppendRequest(entry));
+        ASSERT_TRUE(append_result.has_value());
+    }
+
+    EXPECT_EQ(ErrorCode::OK, store.CleanupBefore(4));
+
+    auto poll_result = store.PollFrom(0, 10, std::chrono::milliseconds(0));
+    ASSERT_TRUE(poll_result.has_value());
+    ASSERT_EQ(2u, poll_result->records.size());
+    EXPECT_EQ(4u, poll_result->records[0].seq);
+    EXPECT_EQ(5u, poll_result->records[1].seq);
+
+    auto latest = store.GetLatestSequence();
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_EQ(5u, latest.value());
+}
+
 }  // namespace testing
 }  // namespace mooncake
 

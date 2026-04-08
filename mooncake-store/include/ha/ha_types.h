@@ -179,6 +179,30 @@ struct SnapshotDescriptor {
     int64_t created_at_ms = 0;
 };
 
+enum class StandbyProgressMode {
+    kSnapshotOnly,
+    kOplogFollowing,
+};
+
+inline const char* StandbyProgressModeToString(StandbyProgressMode mode) {
+    switch (mode) {
+        case StandbyProgressMode::kSnapshotOnly:
+            return "snapshot_only";
+        case StandbyProgressMode::kOplogFollowing:
+            return "oplog_following";
+    }
+    return "unknown";
+}
+
+struct StandbyProgressRecord {
+    std::string standby_id;
+    StandbyProgressMode mode = StandbyProgressMode::kSnapshotOnly;
+    ViewVersionId view_version = 0;
+    OpLogSequenceId applied_seq_id = 0;
+    OpLogSequenceId required_seq_id = 0;
+    int64_t updated_at_ms = 0;
+};
+
 struct PromotedStandbyState {
     std::vector<std::pair<std::string, StandbyObjectMetadata>>
         metadata_snapshot;

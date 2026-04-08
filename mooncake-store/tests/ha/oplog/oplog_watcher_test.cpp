@@ -74,6 +74,10 @@ class NoopOpLogStore final : public ha::OpLogStore {
     tl::expected<ha::OpLogSequenceId, ErrorCode> GetLatestSequence() override {
         return ha::OpLogSequenceId{0};
     }
+
+    ErrorCode CleanupBefore(ha::OpLogSequenceId) override {
+        return ErrorCode::OK;
+    }
 };
 
 // Helper function to create a valid OpLogEntry with checksum

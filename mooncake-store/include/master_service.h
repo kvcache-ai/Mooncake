@@ -34,8 +34,10 @@
 
 namespace mooncake {
 namespace ha {
+class OpLogGcController;
 class SnapshotCatalogStore;
-}
+class StandbyProgressStore;
+}  // namespace ha
 
 // Forward declarations
 class AllocationStrategy;
@@ -467,6 +469,8 @@ class MasterService {
     void ResetStateAfterFailedRestoreAttempt();
     void LoadPreloadedState(const ha::PromotedStandbyState& state);
     void InitializePersistentOpLogManager();
+    void InitializeStandbyProgressStore();
+    void InitializeOpLogGcController();
     bool ShouldReplicateToStandby() const;
     void AppendOpLogAndNotify(OpType type, const std::string& key,
                               const std::string& payload = std::string());
@@ -476,7 +480,7 @@ class MasterService {
                                    const std::string& transport_endpoint);
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
 
-    void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
+    bool WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
 
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
@@ -1076,6 +1080,8 @@ class MasterService {
     std::unordered_set<std::string> invalid_replica_endpoints_;
     OpLogManager oplog_manager_;
     std::shared_ptr<ha::OpLogStore> persistent_oplog_store_;
+    std::unique_ptr<ha::OpLogGcController> oplog_gc_controller_;
+    std::shared_ptr<ha::StandbyProgressStore> standby_progress_store_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size

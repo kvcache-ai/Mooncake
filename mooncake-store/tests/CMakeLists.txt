@@ -142,6 +142,7 @@ add_ha_test(replication_controller_test
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
+add_ha_test(oplog_gc_controller_test ha/oplog/oplog_gc_controller_test.cpp)
 add_ha_test(oplog_manager_test ha/oplog/oplog_manager_test.cpp)
 add_ha_test(master_service_etcd_oplog_test
             ha/oplog/master_service_etcd_oplog_test.cpp)

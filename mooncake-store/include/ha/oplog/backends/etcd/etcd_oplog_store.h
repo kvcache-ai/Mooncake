@@ -143,6 +143,8 @@ class EtcdOpLogStore : public ha::OpLogStore {
 
     tl::expected<ha::OpLogSequenceId, ErrorCode> GetLatestSequence() override;
 
+    ErrorCode CleanupBefore(ha::OpLogSequenceId before_sequence_id) override;
+
    private:
     /**
      * @brief Build the etcd key for an OpLog entry.

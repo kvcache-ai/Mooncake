@@ -22,6 +22,8 @@ class RedisOpLogStore final : public OpLogStore {
 
     tl::expected<OpLogSequenceId, ErrorCode> GetLatestSequence() override;
 
+    ErrorCode CleanupBefore(OpLogSequenceId before_sequence_id) override;
+
    private:
     static ClusterNamespace ResolveClusterNamespace(
         const ClusterNamespace& cluster_namespace);

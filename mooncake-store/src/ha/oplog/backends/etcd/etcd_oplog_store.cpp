@@ -626,6 +626,11 @@ EtcdOpLogStore::GetLatestSequence() {
     return static_cast<ha::OpLogSequenceId>(sequence_id);
 }
 
+ErrorCode EtcdOpLogStore::CleanupBefore(
+    ha::OpLogSequenceId before_sequence_id) {
+    return CleanupOpLogBefore(static_cast<uint64_t>(before_sequence_id));
+}
+
 std::string EtcdOpLogStore::BuildOpLogKey(uint64_t sequence_id) const {
     std::ostringstream oss;
     // Fixed-width encoding for correct etcd lexicographical range operations.

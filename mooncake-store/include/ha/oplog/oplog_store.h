@@ -22,6 +22,8 @@ class OpLogStore {
         std::chrono::milliseconds timeout) = 0;
 
     virtual tl::expected<OpLogSequenceId, ErrorCode> GetLatestSequence() = 0;
+
+    virtual ErrorCode CleanupBefore(OpLogSequenceId before_sequence_id) = 0;
 };
 
 }  // namespace ha

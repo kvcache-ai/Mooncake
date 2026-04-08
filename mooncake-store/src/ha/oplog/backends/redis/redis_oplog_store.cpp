@@ -7,6 +7,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 #ifdef STORE_USE_REDIS
@@ -68,6 +69,24 @@ void ResetCachedRedisContext(std::string_view connstring) {
     g_redis_context_cache.erase(std::string(connstring));
 }
 
+#ifdef STORE_USE_REDIS
+
+RedisReplyPtr ExecuteRedisCommandArgv(redisContext* context,
+                                      const std::vector<std::string>& args) {
+    std::vector<const char*> argv;
+    std::vector<size_t> argvlen;
+    argv.reserve(args.size());
+    argvlen.reserve(args.size());
+    for (const auto& arg : args) {
+        argv.push_back(arg.data());
+        argvlen.push_back(arg.size());
+    }
+    return RedisReplyPtr(static_cast<redisReply*>(redisCommandArgv(
+        context, static_cast<int>(argv.size()), argv.data(), argvlen.data())));
+}
+
+#endif
+
 std::string DescribeRedisCommandFailure(redisContext* context,
                                         const redisReply* reply) {
     if (reply != nullptr && reply->type == REDIS_REPLY_ERROR &&
@@ -110,6 +129,11 @@ tl::expected<OpLogPollResult, ErrorCode> RedisOpLogStore::PollFrom(
 
 tl::expected<OpLogSequenceId, ErrorCode> RedisOpLogStore::GetLatestSequence() {
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+}
+
+ErrorCode RedisOpLogStore::CleanupBefore(OpLogSequenceId before_sequence_id) {
+    (void)before_sequence_id;
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 }
 
 ClusterNamespace RedisOpLogStore::ResolveClusterNamespace(
@@ -348,6 +372,140 @@ tl::expected<OpLogSequenceId, ErrorCode> RedisOpLogStore::GetLatestSequence() {
         return tl::make_unexpected(sequence.error());
     }
     return sequence.value();
+}
+
+ErrorCode RedisOpLogStore::CleanupBefore(OpLogSequenceId before_sequence_id) {
+    if (connstring_.empty() || before_sequence_id == 0) {
+        return ErrorCode::OK;
+    }
+
+    constexpr size_t kCleanupBatchSize = 1024;
+    const auto max_score =
+        static_cast<unsigned long long>(before_sequence_id - 1);
+
+    auto cleanup_once = [&]() -> ErrorCode {
+        for (;;) {
+            auto context = AcquireCachedRedisContext(connstring_);
+            if (!context) {
+                return context.error();
+            }
+
+            RedisReplyPtr range_reply(static_cast<redisReply*>(redisCommand(
+                context.value(), "ZRANGEBYSCORE %b -inf %llu LIMIT 0 %llu",
+                index_key_.data(), index_key_.size(), max_score,
+                static_cast<unsigned long long>(kCleanupBatchSize))));
+            if (range_reply == nullptr) {
+                LOG(WARNING)
+                    << "Redis OpLog cleanup range query failed, "
+                    << "before_sequence_id=" << before_sequence_id << ", error="
+                    << DescribeRedisCommandFailure(context.value(),
+                                                   range_reply.get());
+                ResetCachedRedisContext(connstring_);
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+            if (range_reply->type == REDIS_REPLY_ERROR) {
+                LOG(WARNING) << "Redis OpLog cleanup range query returned "
+                                "error, before_sequence_id="
+                             << before_sequence_id << ", error="
+                             << DescribeRedisCommandFailure(context.value(),
+                                                            range_reply.get());
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+            if (range_reply->type != REDIS_REPLY_ARRAY) {
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+            if (range_reply->elements == 0) {
+                return ErrorCode::OK;
+            }
+
+            std::vector<std::string> members;
+            members.reserve(range_reply->elements);
+            std::vector<std::string> entry_keys;
+            entry_keys.reserve(range_reply->elements);
+            for (size_t i = 0; i < range_reply->elements; ++i) {
+                const auto* member = range_reply->element[i];
+                if (!IsStringReply(member) || member->str == nullptr) {
+                    return ErrorCode::PERSISTENT_FAIL;
+                }
+
+                std::string member_text(member->str, member->len);
+                auto seq = ParseSequenceMember(member_text);
+                if (!seq) {
+                    return seq.error();
+                }
+
+                members.push_back(std::move(member_text));
+                entry_keys.push_back(BuildEntryKey(cluster_namespace_, *seq));
+            }
+
+            std::vector<std::string> zrem_args;
+            zrem_args.reserve(2 + members.size());
+            zrem_args.push_back("ZREM");
+            zrem_args.push_back(index_key_);
+            zrem_args.insert(zrem_args.end(), members.begin(), members.end());
+            RedisReplyPtr zrem_reply =
+                ExecuteRedisCommandArgv(context.value(), zrem_args);
+            if (zrem_reply == nullptr) {
+                LOG(WARNING)
+                    << "Redis OpLog cleanup ZREM failed, "
+                    << "before_sequence_id=" << before_sequence_id << ", error="
+                    << DescribeRedisCommandFailure(context.value(),
+                                                   zrem_reply.get());
+                ResetCachedRedisContext(connstring_);
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+            if (zrem_reply->type == REDIS_REPLY_ERROR) {
+                LOG(WARNING)
+                    << "Redis OpLog cleanup ZREM returned error, "
+                    << "before_sequence_id=" << before_sequence_id << ", error="
+                    << DescribeRedisCommandFailure(context.value(),
+                                                   zrem_reply.get());
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+
+            std::vector<std::string> del_args;
+            del_args.reserve(1 + entry_keys.size());
+            del_args.push_back("DEL");
+            del_args.insert(del_args.end(), entry_keys.begin(),
+                            entry_keys.end());
+            RedisReplyPtr del_reply =
+                ExecuteRedisCommandArgv(context.value(), del_args);
+            if (del_reply == nullptr) {
+                LOG(WARNING)
+                    << "Redis OpLog cleanup DEL failed, "
+                    << "before_sequence_id=" << before_sequence_id << ", error="
+                    << DescribeRedisCommandFailure(context.value(),
+                                                   del_reply.get());
+                ResetCachedRedisContext(connstring_);
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+            if (del_reply->type == REDIS_REPLY_ERROR) {
+                LOG(WARNING)
+                    << "Redis OpLog cleanup DEL returned error, "
+                    << "before_sequence_id=" << before_sequence_id << ", error="
+                    << DescribeRedisCommandFailure(context.value(),
+                                                   del_reply.get());
+                return ErrorCode::PERSISTENT_FAIL;
+            }
+
+            if (range_reply->elements < kCleanupBatchSize) {
+                return ErrorCode::OK;
+            }
+        }
+    };
+
+    auto err = cleanup_once();
+    if (err == ErrorCode::OK) {
+        return ErrorCode::OK;
+    }
+
+    err = cleanup_once();
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Redis OpLog cleanup failed after retry, "
+                     << "before_sequence_id=" << before_sequence_id
+                     << ", error=" << toString(err);
+    }
+    return err;
 }
 
 ClusterNamespace RedisOpLogStore::ResolveClusterNamespace(

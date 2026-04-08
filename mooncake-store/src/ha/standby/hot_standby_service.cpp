@@ -12,6 +12,7 @@
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/oplog_watcher.h"
+#include "ha/progress/standby_progress_store_factory.h"
 #include "master_service.h"
 
 namespace mooncake {
@@ -79,6 +80,30 @@ int64_t SumLogicalBytes(
         total += static_cast<int64_t>(value.size);
     }
     return total;
+}
+
+int64_t CurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+void PublishStandbyProgressRecord(
+    const std::shared_ptr<ha::StandbyProgressStore>& store,
+    const std::optional<ha::StandbyProgressRecord>& record) {
+    if (!store || !record.has_value()) {
+        return;
+    }
+
+    auto err = store->Publish(record.value());
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to publish standby progress, standby_id="
+                     << record->standby_id << ", mode="
+                     << ha::StandbyProgressModeToString(record->mode)
+                     << ", applied_seq_id=" << record->applied_seq_id
+                     << ", required_seq_id=" << record->required_seq_id
+                     << ", error=" << toString(err);
+    }
 }
 
 HARuntimePhaseStats BuildLoadedSnapshotPhaseStats(
@@ -231,7 +256,7 @@ HotStandbyService::~HotStandbyService() {
 ErrorCode HotStandbyService::Start(const std::string& primary_address,
                                    const std::string& oplog_backend_connstring,
                                    const std::string& cluster_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     // Use state machine to check if already running
     if (IsRunning()) {
         LOG(WARNING) << "HotStandbyService is already running";
@@ -244,7 +269,14 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
                                                 HARuntimePhase::kStandbyStart);
     auto finish_start = [&](ErrorCode err) {
         if (err == ErrorCode::OK) {
-            start_recorder.FinishSuccess(CollectLocalRuntimePhaseStatsLocked());
+            HARuntimePhaseStats stats;
+            if (lock.owns_lock()) {
+                stats = CollectLocalRuntimePhaseStatsLocked();
+            } else {
+                std::lock_guard<std::mutex> state_lock(mutex_);
+                stats = CollectLocalRuntimePhaseStatsLocked();
+            }
+            start_recorder.FinishSuccess(stats);
         } else {
             start_recorder.FinishFailure();
         }
@@ -263,6 +295,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     oplog_backend_connstring_ = oplog_backend_connstring;
     cluster_id_ = cluster_id;
     oplog_store_.reset();
+    standby_progress_store_.reset();
     loaded_snapshot_id_.clear();
     loaded_snapshot_seq_id_ = 0;
     {
@@ -289,6 +322,8 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         oplog_store_ = std::move(store.value());
     }
 
+    InitializeStandbyProgressStoreLocked();
+
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
 
     uint64_t baseline_seq_id = 0;
@@ -300,10 +335,23 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
 
     if (!config_.enable_oplog_following) {
         ActivateSnapshotOnlyStandbyLocked(baseline_seq_id);
+        auto progress_store = standby_progress_store_;
+        auto progress_record = BuildStandbyProgressRecordLocked();
+        lock.unlock();
+        PublishStandbyProgressRecord(progress_store, progress_record);
         return finish_start(ErrorCode::OK);
     }
 
-    return finish_start(StartOplogFollowingLocked(baseline_seq_id));
+    auto start_err = StartOplogFollowingLocked(baseline_seq_id);
+    auto progress_store = start_err == ErrorCode::OK
+                              ? standby_progress_store_
+                              : std::shared_ptr<ha::StandbyProgressStore>();
+    auto progress_record = start_err == ErrorCode::OK
+                               ? BuildStandbyProgressRecordLocked()
+                               : std::optional<ha::StandbyProgressRecord>();
+    lock.unlock();
+    PublishStandbyProgressRecord(progress_store, progress_record);
+    return finish_start(start_err);
 }
 
 uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
@@ -593,6 +641,8 @@ void HotStandbyService::Stop() {
     std::unique_ptr<OpLogWatcher> watcher_to_stop;
     std::thread replication_thread_to_join;
     std::thread verification_thread_to_join;
+    std::shared_ptr<ha::StandbyProgressStore> progress_store_to_cleanup;
+    std::string standby_id_to_cleanup;
     const auto runtime_mode =
         ResolveRuntimeMode(config_.enable_oplog_following);
     ScopedHARuntimePhaseRecorder stop_recorder(runtime_mode,
@@ -619,6 +669,8 @@ void HotStandbyService::Stop() {
         watcher_to_stop = std::move(oplog_watcher_);
         replication_thread_to_join = std::move(replication_thread_);
         verification_thread_to_join = std::move(verification_thread_);
+        progress_store_to_cleanup = standby_progress_store_;
+        standby_id_to_cleanup = config_.standby_id;
     }
 
     if (watcher_to_stop) {
@@ -630,6 +682,20 @@ void HotStandbyService::Stop() {
     }
     if (verification_thread_to_join.joinable()) {
         verification_thread_to_join.join();
+    }
+
+    if (progress_store_to_cleanup && !standby_id_to_cleanup.empty()) {
+        auto err = progress_store_to_cleanup->Delete(standby_id_to_cleanup);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "Failed to delete standby progress, standby_id="
+                         << standby_id_to_cleanup
+                         << ", error=" << toString(err);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        standby_progress_store_.reset();
     }
 
     const auto stop_stats = [&]() {
@@ -819,6 +885,66 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
     final_catchup_recorder.FinishSuccess(
         build_final_catchup_stats(total_applied));
     return ErrorCode::OK;
+}
+
+std::optional<ha::StandbyProgressRecord>
+HotStandbyService::BuildStandbyProgressRecordLocked() const {
+    if (!standby_progress_store_ || config_.standby_id.empty()) {
+        return std::nullopt;
+    }
+
+    ha::StandbyProgressRecord record;
+    record.standby_id = config_.standby_id;
+    record.updated_at_ms = CurrentTimeMs();
+    record.applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+
+    if (!config_.enable_oplog_following) {
+        record.mode = ha::StandbyProgressMode::kSnapshotOnly;
+        record.required_seq_id = 0;
+        return record;
+    }
+
+    record.mode = ha::StandbyProgressMode::kOplogFollowing;
+    record.required_seq_id =
+        record.applied_seq_id > 0 ? record.applied_seq_id + 1 : 0;
+    return record;
+}
+
+void HotStandbyService::InitializeStandbyProgressStoreLocked() {
+    standby_progress_store_.reset();
+
+    if (config_.standby_id.empty() || cluster_id_.empty() ||
+        oplog_backend_connstring_.empty()) {
+        return;
+    }
+
+    ha::HABackendSpec spec{
+        .type = config_.oplog_backend_type,
+        .connstring = oplog_backend_connstring_,
+        .cluster_namespace = cluster_id_,
+    };
+    auto progress_store = ha::CreateStandbyProgressStore(spec);
+    if (!progress_store) {
+        LOG(WARNING) << "Failed to initialize standby progress store, "
+                     << "backend="
+                     << ha::HABackendTypeToString(config_.oplog_backend_type)
+                     << ", cluster=" << cluster_id_
+                     << ", error=" << toString(progress_store.error());
+        return;
+    }
+
+    standby_progress_store_ = std::move(progress_store.value());
+}
+
+void HotStandbyService::PublishStandbyProgress() {
+    std::shared_ptr<ha::StandbyProgressStore> progress_store;
+    std::optional<ha::StandbyProgressRecord> progress_record;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        progress_store = standby_progress_store_;
+        progress_record = BuildStandbyProgressRecordLocked();
+    }
+    PublishStandbyProgressRecord(progress_store, progress_record);
 }
 
 ErrorCode HotStandbyService::Promote() {
@@ -1071,6 +1197,7 @@ void HotStandbyService::ReplicationLoop() {
     while (IsRunning()) {
         if (!config_.enable_oplog_following) {
             RefreshSnapshotOnlyBaseline();
+            PublishStandbyProgress();
             if (WaitForShutdownOrTimeout(std::chrono::milliseconds(
                     config_.snapshot_refresh_interval_ms))) {
                 break;
@@ -1121,6 +1248,8 @@ void HotStandbyService::ReplicationLoop() {
             last_reported_primary_seq_id = primary_seq_id;
             NotifySyncStatus();
         }
+
+        PublishStandbyProgress();
 
         // Sleep and check again
         if (WaitForShutdownOrTimeout(std::chrono::milliseconds(1000))) {

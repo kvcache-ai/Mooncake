@@ -13,7 +13,9 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
+#include "ha/oplog/oplog_gc_controller.h"
 #include "ha/oplog/oplog_store_factory.h"
+#include "ha/progress/standby_progress_store_factory.h"
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -170,6 +172,10 @@ void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
 }
 
 void MasterService::InitializePersistentOpLogManager() {
+    persistent_oplog_store_.reset();
+    oplog_manager_.SetPersistentStore(nullptr);
+    InitializeOpLogGcController();
+
     if (!enable_ha_) {
         return;
     }
@@ -212,6 +218,48 @@ void MasterService::InitializePersistentOpLogManager() {
     if (latest_seq && latest_seq.value() > 0) {
         oplog_manager_.SetInitialSequenceId(latest_seq.value());
     }
+
+    InitializeOpLogGcController();
+}
+
+void MasterService::InitializeStandbyProgressStore() {
+    standby_progress_store_.reset();
+    InitializeOpLogGcController();
+
+    if (!enable_ha_ || cluster_id_.empty() || !persistent_oplog_store_) {
+        return;
+    }
+
+    auto backend_type = ha::ParseHABackendType(ha_backend_type_);
+    if (!backend_type || !ha::SupportsOpLogFollowing(*backend_type)) {
+        return;
+    }
+
+    ha::HABackendSpec spec{
+        .type = *backend_type,
+        .connstring = ha_backend_connstring_,
+        .cluster_namespace = cluster_id_,
+    };
+    auto progress_store = ha::CreateStandbyProgressStore(spec);
+    if (!progress_store) {
+        LOG(WARNING) << "Failed to initialize standby progress store, backend="
+                     << ha_backend_type_ << ", cluster_id=" << cluster_id_
+                     << ", error=" << toString(progress_store.error());
+        return;
+    }
+
+    standby_progress_store_ = std::move(progress_store.value());
+    InitializeOpLogGcController();
+}
+
+void MasterService::InitializeOpLogGcController() {
+    oplog_gc_controller_.reset();
+    if (!persistent_oplog_store_ || !standby_progress_store_) {
+        return;
+    }
+
+    oplog_gc_controller_ = std::make_unique<ha::OpLogGcController>(
+        persistent_oplog_store_, standby_progress_store_);
 }
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -268,6 +316,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     InitializePersistentOpLogManager();
+    InitializeStandbyProgressStore();
 
     if (config.preloaded_state.has_value()) {
         LoadPreloadedState(config.preloaded_state.value());
@@ -2326,14 +2375,18 @@ void MasterService::SnapshotThreadFunc() {
             // Parent process
             // Close write end, pass read end to wait function
             close(log_pipe[1]);
-            WaitForSnapshotChild(pid, snapshot_id, log_pipe[0]);
+            if (WaitForSnapshotChild(pid, snapshot_id, log_pipe[0]) &&
+                oplog_gc_controller_) {
+                (void)oplog_gc_controller_->CleanupAfterSnapshot(
+                    descriptor.value());
+            }
             close(log_pipe[0]);
         }
     }
     LOG(INFO) << "[Snapshot] snapshot_thread stopped";
 }
 
-void MasterService::WaitForSnapshotChild(pid_t pid,
+bool MasterService::WaitForSnapshotChild(pid_t pid,
                                          const std::string& snapshot_id,
                                          int log_pipe_fd) {
     // Default 5 minute timeout
@@ -2393,7 +2446,7 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
                        << strerror(errno) << ", snapshot_id=" << snapshot_id
                        << ", child_pid=" << pid;
             MasterMetricManager::instance().inc_snapshot_fail();
-            return;
+            return false;
         } else if (result == 0) {
             // Child process is still running
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -2408,7 +2461,7 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
                 }
                 HandleChildTimeout(pid, snapshot_id);
                 MasterMetricManager::instance().inc_snapshot_fail();
-                return;
+                return false;
             }
 
             // Brief sleep before checking again
@@ -2428,7 +2481,7 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
                     std::chrono::steady_clock::now() - start_time)
                     .count();
             MasterMetricManager::instance().set_snapshot_duration_ms(elapsed);
-            return;
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
         }
     }
 }

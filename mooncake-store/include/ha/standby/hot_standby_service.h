@@ -25,6 +25,9 @@
 #include "types.h"
 
 namespace mooncake {
+namespace ha {
+class StandbyProgressStore;
+}
 
 // Forward declarations
 class MasterService;
@@ -193,6 +196,10 @@ class HotStandbyService {
     HARuntimePhaseStats CollectLocalRuntimePhaseStatsLocked() const;
     void ResolvePromotionGapsLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+    std::optional<ha::StandbyProgressRecord> BuildStandbyProgressRecordLocked()
+        const;
+    void InitializeStandbyProgressStoreLocked();
+    void PublishStandbyProgress();
     void NotifySyncStatus();
     bool WaitForShutdownOrTimeout(std::chrono::milliseconds timeout);
 
@@ -267,6 +274,7 @@ class HotStandbyService {
     std::string oplog_backend_connstring_;
     std::string cluster_id_;
     std::shared_ptr<ha::OpLogStore> oplog_store_;
+    std::shared_ptr<ha::StandbyProgressStore> standby_progress_store_;
 
     // Replication state
     std::shared_ptr<ReplicationStream> replication_stream_;
