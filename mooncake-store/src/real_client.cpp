@@ -288,6 +288,10 @@ RealClient::RealClient() {
 }
 
 RealClient::~RealClient() {
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
     tearDownAll_internal();
@@ -320,7 +324,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
-    bool enable_offload) {
+    bool enable_offload,
+    bool start_offload_rpc_server) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage = use_hugepage_ &&
@@ -550,6 +555,59 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
+    if (enable_offload && start_offload_rpc_server) {
+        // Start RPC server for offload operations (batch_get / release_buffer).
+        // Use AutoPortBinder to find an available port, then start the server.
+        const int kMaxRetries = 10;
+        bool rpc_started = false;
+        for (int retry = 0; retry < kMaxRetries; ++retry) {
+            int port;
+            {
+                AutoPortBinder port_binder;
+                port = port_binder.getPort();
+                if (port < 0) {
+                    LOG(WARNING) << "Failed to bind offload RPC port, retry "
+                                 << (retry + 1) << "/" << kMaxRetries;
+                    continue;
+                }
+            }  // port_binder destroyed here, releasing the port
+
+            offload_rpc_server_ =
+                std::make_unique<coro_rpc::coro_rpc_server>(1, port, "0.0.0.0");
+            offload_rpc_server_->register_handler<
+                &RealClient::batch_get_offload_object>(this);
+            offload_rpc_server_->register_handler<
+                &RealClient::release_offload_buffer>(this);
+            offload_rpc_server_->async_start();
+            auto err = offload_rpc_server_->get_errc();
+            if (err) {
+                LOG(WARNING) << "Failed to start offload RPC server on port "
+                             << port << ": " << err.message()
+                             << ", retry " << (retry + 1) << "/" << kMaxRetries;
+                offload_rpc_server_.reset();
+                continue;
+            }
+            offload_rpc_port_ = port;
+            rpc_started = true;
+            LOG(INFO) << "Offload RPC server started on port " << port;
+            break;
+        }
+        if (!rpc_started) {
+            LOG(ERROR) << "Failed to start offload RPC server after "
+                       << kMaxRetries << " retries";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // Extract hostname (without port) for local_rpc_addr
+        std::string rpc_host = this->local_hostname;
+        auto pos = rpc_host.find(':');
+        if (pos != std::string::npos) {
+            rpc_host = rpc_host.substr(0, pos);
+        }
+        this->local_rpc_addr =
+            rpc_host + ":" + std::to_string(offload_rpc_port_);
+
+    }
     if (enable_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
         file_storage_ = std::make_shared<FileStorage>(
@@ -578,11 +636,12 @@ int RealClient::setup_real(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path) {
+    const std::string &ipc_socket_path, bool enable_offload) {
     return to_py_ret(setup_internal(local_hostname, metadata_server,
                                     global_segment_size, local_buffer_size,
                                     protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path));
+                                    transfer_engine, ipc_socket_path,
+                                    50052, enable_offload, true));
 }
 
 namespace {
@@ -673,9 +732,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::string enable_offload_str =
+        get_config(config, "enable_offload", "false");
+    bool enable_offload =
+        (enable_offload_str == "true" || enable_offload_str == "1");
+
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path);
+                          master_server_addr, nullptr, ipc_socket_path,
+                          50052, enable_offload, true);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
