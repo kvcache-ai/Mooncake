@@ -1,0 +1,8 @@
+[package]
+name = "mooncake-store-e2e"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mooncake-store-client = { path = "../mooncake-store-client" }
+mooncake-store-core = { path = "../mooncake-store-core" }
