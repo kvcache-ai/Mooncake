@@ -355,8 +355,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (user_specified_port) {
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
-        this->local_rpc_addr =
-            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+        if (local_rpc_port > 0) {
+            this->local_rpc_addr =
+                hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+        } else {
+            auto rpc_binder = std::make_unique<AutoPortBinder>();
+            int rpc_auto = rpc_binder->getPort();
+            int specified_port = std::stoi(hostname.substr(colon_pos + 1));
+            if (rpc_auto > 0 && rpc_auto != specified_port) {
+                this->local_rpc_addr =
+                    hostname.substr(0, colon_pos + 1) + std::to_string(rpc_auto);
+                rpc_port_binder_ = std::move(rpc_binder);
+            } else {
+                this->local_rpc_addr =
+                    hostname.substr(0, colon_pos + 1) + std::to_string(specified_port);
+            }
+        }
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine);
@@ -384,8 +398,24 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
 
             this->local_hostname = hostname + ":" + std::to_string(port);
-            this->local_rpc_addr =
-                hostname + ":" + std::to_string(local_rpc_port);
+            if (local_rpc_port > 0) {
+                this->local_rpc_addr =
+                    hostname + ":" + std::to_string(local_rpc_port);
+            } else {
+                // Auto-assign a separate port for client RPC (must differ from TE port)
+                auto rpc_binder = std::make_unique<AutoPortBinder>();
+                int rpc_auto = rpc_binder->getPort();
+                if (rpc_auto > 0 && rpc_auto != port) {
+                    this->local_rpc_addr =
+                        hostname + ":" + std::to_string(rpc_auto);
+                    rpc_port_binder_ = std::move(rpc_binder);
+                } else {
+                    LOG(WARNING) << "Could not auto-assign separate RPC port, "
+                                 << "falling back to TE port " << port;
+                    this->local_rpc_addr =
+                        hostname + ":" + std::to_string(port);
+                }
+            }
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine);
@@ -562,6 +592,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
+
+    // Release RPC port binder so the client RPC server can bind the same port.
+    // rpc_port_binder_ holds the port via bind() to prevent reuse; we must
+    // release it before coro_rpc_server tries to bind.
+    if (rpc_port_binder_) {
+        rpc_port_binder_.reset();
+    }
+
     if (FLAGS_enable_http_server) {
         if (start_http_server() != 0) {
             LOG(ERROR) << "Failed to start HTTP server on port "
@@ -578,11 +616,13 @@ int RealClient::setup_real(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path) {
+    const std::string &ipc_socket_path,
+    bool enable_offload) {
     return to_py_ret(setup_internal(local_hostname, metadata_server,
                                     global_segment_size, local_buffer_size,
                                     protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path));
+                                    transfer_engine, ipc_socket_path,
+                                    0, enable_offload));
 }
 
 namespace {

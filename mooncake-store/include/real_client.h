@@ -75,7 +75,8 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "");
+        const std::string &ipc_socket_path = "",
+        bool enable_offload = false);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -610,6 +611,7 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, Slice> &objects);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
+    std::unique_ptr<AutoPortBinder> rpc_port_binder_ = nullptr;
 
     struct SegmentDeleter {
         void operator()(void *ptr) {
