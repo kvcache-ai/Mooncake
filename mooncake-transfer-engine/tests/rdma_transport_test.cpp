@@ -49,8 +49,7 @@
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || \
-    defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA)
 
 #include <cassert>
 
@@ -176,8 +175,7 @@ void setBackendDevice(const std::string &backend) {
         return;
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || \
-    defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA)
     checkCudaError(cudaSetDevice(pickDevId(backend)), "Failed to set device");
 #else
     LOG(FATAL) << "Device memory backend is not available in this build";
@@ -188,8 +186,7 @@ void *allocateMemoryPool(size_t size, int socket_id,
                          const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || \
-    defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA)
         setBackendDevice(backend);
         void *d_buf = nullptr;
         checkCudaError(cudaMalloc(&d_buf, size),
@@ -206,8 +203,7 @@ void *allocateMemoryPool(size_t size, int socket_id,
 void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || \
-    defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA)
         cudaFree(addr);
         return;
 #else
@@ -221,8 +217,7 @@ void copyFromHost(void *dst, const void *src, size_t size,
                   const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || \
-    defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice),
                        "Failed to copy host data to device");
         return;
@@ -237,8 +232,7 @@ void copyToHost(void *dst, const void *src, size_t size,
                 const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || \
-    defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost),
                        "Failed to copy device data to host");
         return;
