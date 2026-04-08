@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-transport = { path = "../mooncake-transport" }
+parking_lot.workspace = true
 
 [dev-dependencies]
 mooncake-metadata = { path = "../mooncake-metadata" }
