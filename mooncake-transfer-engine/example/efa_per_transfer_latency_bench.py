@@ -44,6 +44,8 @@ def parse_args():
         default="65536,131072,262144,524288,1048576,2097152,4194304,8388608,16777216",
         help="Comma-separated block sizes in bytes",
     )
+    parser.add_argument("--threads", type=int, default=1, help="Number of threads")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--output", default=None, help="Output file for results")
     return parser.parse_args()
 
@@ -98,8 +100,9 @@ def start_target(host, build_dir, user, ssh_opts):
 
 
 def run_single_bench(host, build_dir, target_addr, block_size,
-                     duration, operation, user, ssh_opts):
-    """Run bench with threads=1, batch_size=1 for single-transfer latency."""
+                     duration, operation, user, ssh_opts,
+                     threads=1, batch_size=1):
+    """Run bench with configurable threads and batch_size."""
     bench_bin = os.path.join(
         build_dir, "mooncake-transfer-engine/example/transfer_engine_bench"
     )
@@ -110,9 +113,9 @@ def run_single_bench(host, build_dir, target_addr, block_size,
         f"--segment_id={target_addr} "
         f"--operation={operation} "
         f"--duration={duration} "
-        f"--threads=1 "
+        f"--threads={threads} "
         f"--block_size={block_size} "
-        f"--batch_size=1 "
+        f"--batch_size={batch_size} "
         f"2>&1"
     )
     timeout = duration + 60
@@ -153,7 +156,7 @@ def main():
     print(f"  Build dir:  {args.build_dir}")
     print(f"  Duration:   {args.duration}s per point")
     print(f"  Operation:  {args.operation}")
-    print(f"  Mode:       threads=1, batch_size=1 (single-transfer latency)")
+    print(f"  Mode:       threads={args.threads}, batch_size={args.batch_size}")
     print(f"  Block sizes: {[format_size(b) for b in block_sizes]}")
     print()
 
@@ -178,6 +181,7 @@ def main():
             args.initiator_host, args.build_dir, target_addr,
             block_size, args.duration, args.operation,
             args.ssh_user, args.ssh_opts,
+            threads=args.threads, batch_size=args.batch_size,
         )
 
         if tp is None or tp == 0:
@@ -214,7 +218,7 @@ def main():
             f.write(f"# EFA Per-Transfer Latency Benchmark\n")
             f.write(f"# Operation: {args.operation}\n")
             f.write(f"# Duration: {args.duration}s per point\n")
-            f.write(f"# Mode: threads=1, batch_size=1\n")
+            f.write(f"# Mode: threads={args.threads}, batch_size={args.batch_size}\n")
             f.write(f"#\n")
             f.write(f"{'block_bytes':>12}  {'block_size':>10}  {'gbps':>10}  {'latency_us':>12}\n")
             for block_size, tp, lat in results:
