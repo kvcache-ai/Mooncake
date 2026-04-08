@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 mooncake-store-core = { path = "../mooncake-store-core" }
 parking_lot.workspace = true
+redis = "0.27"
+serde_json.workspace = true
