@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+etcd-client = "0.14"
 mooncake-store-core = { path = "../mooncake-store-core" }
 parking_lot.workspace = true
 redis = "0.27"
 serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
