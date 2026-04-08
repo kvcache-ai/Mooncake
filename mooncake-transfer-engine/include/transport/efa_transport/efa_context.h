@@ -44,14 +44,14 @@ class EfaTransport;
 
 struct EfaCq {
     EfaCq() : cq(nullptr), outstanding(0) {}
-    struct fid_cq *cq;
+    struct fid_cq* cq;
     volatile int outstanding;
 };
 
 struct EfaMemoryRegionMeta {
-    void *addr;
+    void* addr;
     size_t length;
-    struct fid_mr *mr;
+    struct fid_mr* mr;
     uint64_t key;
 };
 
@@ -68,15 +68,15 @@ class EfaEndpointStore {
         size_t max_endpoints = 65536,
         double inactive_timeout_sec = kDefaultInactiveTimeoutSec);
 
-    std::shared_ptr<EfaEndPoint> get(const std::string &peer_nic_path);
+    std::shared_ptr<EfaEndPoint> get(const std::string& peer_nic_path);
     // Atomically get-or-insert: returns existing endpoint or inserts new_ep.
     // Prevents duplicate endpoint creation from concurrent callers.
     // Triggers eviction when the store is at or above max_endpoints.
     std::shared_ptr<EfaEndPoint> getOrInsert(
-        const std::string &peer_nic_path, std::shared_ptr<EfaEndPoint> new_ep);
-    void add(const std::string &peer_nic_path,
+        const std::string& peer_nic_path, std::shared_ptr<EfaEndPoint> new_ep);
+    void add(const std::string& peer_nic_path,
              std::shared_ptr<EfaEndPoint> endpoint);
-    void remove(const std::string &peer_nic_path);
+    void remove(const std::string& peer_nic_path);
     int disconnectAll();
     size_t size() const;
 
@@ -102,7 +102,7 @@ class EfaEndpointStore {
 // device, including Memory Region, CQ, EndPoint, etc. using libfabric
 class EfaContext {
    public:
-    EfaContext(EfaTransport &engine, const std::string &device_name);
+    EfaContext(EfaTransport& engine, const std::string& device_name);
 
     ~EfaContext();
 
@@ -115,16 +115,16 @@ class EfaContext {
 
    public:
     // Memory Region Management
-    int registerMemoryRegion(void *addr, size_t length, int access);
-    int unregisterMemoryRegion(void *addr);
-    int preTouchMemory(void *addr, size_t length);
-    uint64_t rkey(void *addr);
-    uint64_t lkey(void *addr);
-    void *mrDesc(void *addr);  // Get MR descriptor for fi_write local_desc
+    int registerMemoryRegion(void* addr, size_t length, int access);
+    int unregisterMemoryRegion(void* addr);
+    int preTouchMemory(void* addr, size_t length);
+    uint64_t rkey(void* addr);
+    uint64_t lkey(void* addr);
+    void* mrDesc(void* addr);  // Get MR descriptor for fi_write local_desc
 
    private:
-    int registerMemoryRegionInternal(void *addr, size_t length, int access,
-                                     EfaMemoryRegionMeta &mrMeta);
+    int registerMemoryRegionInternal(void* addr, size_t length, int access,
+                                     EfaMemoryRegionMeta& mrMeta);
 
    public:
     bool active() const { return active_; }
@@ -132,18 +132,18 @@ class EfaContext {
 
    public:
     // EndPoint Management
-    std::shared_ptr<EfaEndPoint> endpoint(const std::string &peer_nic_path);
-    int deleteEndpoint(const std::string &peer_nic_path);
+    std::shared_ptr<EfaEndPoint> endpoint(const std::string& peer_nic_path);
+    int deleteEndpoint(const std::string& peer_nic_path);
     int disconnectAllEndpoints();
     size_t getTotalQPNumber() const;
 
    public:
     // Access to engine for endpoint handshake
-    EfaTransport &engine() { return engine_; }
-    const EfaTransport &engine() const { return engine_; }
+    EfaTransport& engine() { return engine_; }
+    const EfaTransport& engine() const { return engine_; }
 
     // Submit slices for transfer
-    int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
     // Poll completion queue for completed operations
     int pollCq(int max_entries, int cq_index = 0);
@@ -163,7 +163,7 @@ class EfaContext {
     }
 
     // Get CQ outstanding count pointer
-    volatile int *cqOutstandingCount(int cq_index) {
+    volatile int* cqOutstandingCount(int cq_index) {
         if (cq_index < 0 || (size_t)cq_index >= cq_list_.size()) return nullptr;
         return &cq_list_[cq_index]->outstanding;
     }
@@ -177,10 +177,10 @@ class EfaContext {
 
    public:
     // Libfabric accessors
-    struct fid_fabric *fabric() const { return fabric_; }
-    struct fid_domain *domain() const { return domain_; }
-    struct fid_av *av() const { return av_; }
-    struct fi_info *info() const { return fi_info_; }
+    struct fid_fabric* fabric() const { return fabric_; }
+    struct fid_domain* domain() const { return domain_; }
+    struct fid_av* av() const { return av_; }
+    struct fi_info* info() const { return fi_info_; }
     std::string localAddr() const;
 
     // Compatibility methods (libfabric doesn't use lid/gid like ibverbs)
@@ -188,15 +188,15 @@ class EfaContext {
     std::string gid() const { return localAddr(); }
 
    private:
-    EfaTransport &engine_;
+    EfaTransport& engine_;
     std::string device_name_;
 
     // Libfabric objects
-    struct fi_info *fi_info_;
-    struct fi_info *hints_;
-    struct fid_fabric *fabric_;
-    struct fid_domain *domain_;
-    struct fid_av *av_;  // Address vector for peer addressing
+    struct fi_info* fi_info_;
+    struct fi_info* hints_;
+    struct fid_fabric* fabric_;
+    struct fid_domain* domain_;
+    struct fid_av* av_;  // Address vector for peer addressing
 
     bool active_;
 

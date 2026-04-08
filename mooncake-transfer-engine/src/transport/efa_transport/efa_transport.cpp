@@ -64,7 +64,7 @@ void EfaTransport::stopWorkerThreads() {
     if (!worker_running_) return;
 
     worker_running_ = false;
-    for (auto &thread : worker_threads_) {
+    for (auto& thread : worker_threads_) {
         if (thread.joinable()) {
             thread.join();
         }
@@ -82,7 +82,7 @@ void EfaTransport::workerThreadFunc(int thread_id) {
         // Poll CQs from all contexts
         for (size_t ctx_idx = thread_id; ctx_idx < context_list_.size();
              ctx_idx += worker_threads_.size()) {
-            auto &context = context_list_[ctx_idx];
+            auto& context = context_list_[ctx_idx];
             if (!context || !context->active()) continue;
 
             for (size_t cq_idx = 0; cq_idx < context->cqCount(); cq_idx++) {
@@ -107,7 +107,7 @@ void EfaTransport::workerThreadFunc(int thread_id) {
     }
 }
 
-int EfaTransport::install(std::string &local_server_name,
+int EfaTransport::install(std::string& local_server_name,
                           std::shared_ptr<TransferMetadata> meta,
                           std::shared_ptr<Topology> topo) {
     if (topo == nullptr) {
@@ -150,7 +150,7 @@ int EfaTransport::install(std::string &local_server_name,
     return 0;
 }
 
-int EfaTransport::preTouchMemory(void *addr, size_t length) {
+int EfaTransport::preTouchMemory(void* addr, size_t length) {
     if (context_list_.size() == 0) {
         return 0;
     }
@@ -170,7 +170,7 @@ int EfaTransport::preTouchMemory(void *addr, size_t length) {
     std::vector<int> thread_results(num_threads, 0);
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
-        void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
+        void* block_addr = static_cast<char*>(addr) + thread_i * block_size;
         threads.emplace_back([this, thread_i, block_addr, block_size,
                               &thread_results]() {
             int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
@@ -178,7 +178,7 @@ int EfaTransport::preTouchMemory(void *addr, size_t length) {
         });
     }
 
-    for (auto &thread : threads) {
+    for (auto& thread : threads) {
         thread.join();
     }
 
@@ -191,16 +191,16 @@ int EfaTransport::preTouchMemory(void *addr, size_t length) {
     return 0;
 }
 
-int EfaTransport::registerLocalMemory(void *addr, size_t length,
-                                      const std::string &name,
+int EfaTransport::registerLocalMemory(void* addr, size_t length,
+                                      const std::string& name,
                                       bool remote_accessible,
                                       bool update_metadata) {
     return registerLocalMemoryInternal(addr, length, name, remote_accessible,
                                        update_metadata, false);
 }
 
-int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
-                                              const std::string &name,
+int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
+                                              const std::string& name,
                                               bool remote_accessible,
                                               bool update_metadata,
                                               bool force_sequential) {
@@ -245,7 +245,7 @@ int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             });
         }
 
-        for (auto &thread : reg_threads) {
+        for (auto& thread : reg_threads) {
             thread.join();
         }
 
@@ -285,7 +285,7 @@ int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     }
 
     // Collect keys from all contexts
-    for (auto &context : context_list_) {
+    for (auto& context : context_list_) {
         buffer_desc.lkey.push_back(context->lkey(addr));
         buffer_desc.rkey.push_back(context->rkey(addr));
     }
@@ -307,11 +307,11 @@ int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     return 0;
 }
 
-int EfaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+int EfaTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     return unregisterLocalMemoryInternal(addr, update_metadata, false);
 }
 
-int EfaTransport::unregisterLocalMemoryInternal(void *addr,
+int EfaTransport::unregisterLocalMemoryInternal(void* addr,
                                                 bool update_metadata,
                                                 bool force_sequential) {
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
@@ -336,7 +336,7 @@ int EfaTransport::unregisterLocalMemoryInternal(void *addr,
             });
         }
 
-        for (auto &thread : unreg_threads) {
+        for (auto& thread : unreg_threads) {
             thread.join();
         }
 
@@ -368,7 +368,7 @@ int EfaTransport::allocateLocalSegmentID() {
     if (!desc) return ERR_MEMORY;
     desc->name = local_server_name_;
     desc->protocol = "efa";
-    for (auto &entry : context_list_) {
+    for (auto& entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
         device_desc.lid = entry->lid();
@@ -382,10 +382,10 @@ int EfaTransport::allocateLocalSegmentID() {
 }
 
 int EfaTransport::registerLocalMemoryBatch(
-    const std::vector<EfaTransport::BufferEntry> &buffer_list,
-    const std::string &location) {
+    const std::vector<EfaTransport::BufferEntry>& buffer_list,
+    const std::string& location) {
     std::vector<std::future<int>> results;
-    for (auto &buffer : buffer_list) {
+    for (auto& buffer : buffer_list) {
         results.emplace_back(
             std::async(std::launch::async, [this, buffer, location]() -> int {
                 return registerLocalMemoryInternal(buffer.addr, buffer.length,
@@ -405,9 +405,9 @@ int EfaTransport::registerLocalMemoryBatch(
 }
 
 int EfaTransport::unregisterLocalMemoryBatch(
-    const std::vector<void *> &addr_list) {
+    const std::vector<void*>& addr_list) {
     std::vector<std::future<int>> results;
-    for (auto &addr : addr_list) {
+    for (auto& addr : addr_list) {
         results.emplace_back(
             std::async(std::launch::async, [this, addr]() -> int {
                 return unregisterLocalMemoryInternal(addr, false, true);
@@ -424,8 +424,8 @@ int EfaTransport::unregisterLocalMemoryBatch(
 }
 
 Status EfaTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "EfaTransport: Exceed the limitation of current batch's "
                       "capacity";
@@ -436,14 +436,14 @@ Status EfaTransport::submitTransfer(
 
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-    std::vector<TransferTask *> task_list;
-    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    std::vector<TransferTask*> task_list;
+    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
     return submitTransferTask(task_list);
 }
 
 Status EfaTransport::submitTransferTask(
-    const std::vector<TransferTask *> &task_list) {
-    std::unordered_map<std::shared_ptr<EfaContext>, std::vector<Slice *>>
+    const std::vector<TransferTask*>& task_list) {
+    std::unordered_map<std::shared_ptr<EfaContext>, std::vector<Slice*>>
         slices_to_post;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
@@ -452,24 +452,17 @@ Status EfaTransport::submitTransferTask(
     // active local NICs (one chunk per NIC) instead of creating thousands
     // of small slices.  This dramatically reduces per-slice overhead
     // (spinlock acquisition, atomic ops, MR lookup, heap allocation).
-    // Configurable via MC_EFA_STRIPING_THRESHOLD env var (in bytes).
+    // Configurable via GlobalConfig (MC_EFA_STRIPING_THRESHOLD env var).
     // Default 2MB: below this, single-NIC is faster (avoids endpoint overhead
     // for 16 tiny chunks); above this, multi-NIC striping with pre-resolved
     // peer info gives up to +54% throughput.
-    static const size_t kStripingThreshold = []() {
-        const char *env = std::getenv("MC_EFA_STRIPING_THRESHOLD");
-        if (env) {
-            size_t val = std::strtoull(env, nullptr, 10);
-            if (val > 0) return val;
-        }
-        return static_cast<size_t>(2 * 1024 * 1024);  // 2MB default
-    }();
+    const size_t kStripingThreshold = globalConfig().efa_striping_threshold;
 
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
-        auto &task = *task_list[index];
+        auto& task = *task_list[index];
         assert(task.request);
-        auto &request = *task.request;
+        auto& request = *task.request;
 
         if (request.length == 0) continue;
 
@@ -489,7 +482,7 @@ Status EfaTransport::submitTransferTask(
             std::vector<std::pair<int, std::shared_ptr<EfaContext>>>
                 active_devs;
             for (int d = 0; d < static_cast<int>(context_list_.size()); ++d) {
-                auto &ctx = context_list_[d];
+                auto& ctx = context_list_[d];
                 if (!ctx || !ctx->active()) continue;
                 if (static_cast<size_t>(request_buffer_id) <
                         local_segment_desc->buffers.size() &&
@@ -502,7 +495,7 @@ Status EfaTransport::submitTransferTask(
             if (active_devs.empty()) {
                 LOG(ERROR) << "No active EFA device for striping transfer of "
                            << request.length << " bytes";
-                for (auto &entry : slices_to_post)
+                for (auto& entry : slices_to_post)
                     for (auto s : entry.second) getSliceCache().deallocate(s);
                 return Status::AddressNotRegistered(
                     "No active EFA device found for striping");
@@ -521,7 +514,7 @@ Status EfaTransport::submitTransferTask(
                 metadata_->getSegmentDescByID(request.target_id);
 
             for (size_t i = 0; i < num_nics; ++i) {
-                Slice *slice = getSliceCache().allocate();
+                Slice* slice = getSliceCache().allocate();
                 assert(slice);
                 slice->peer_nic_path.clear();
                 slice->rdma.dest_rkey = 0;
@@ -530,7 +523,7 @@ Status EfaTransport::submitTransferTask(
                 size_t len =
                     (i == num_nics - 1) ? request.length - offset : chunk_size;
 
-                slice->source_addr = (char *)request.source + offset;
+                slice->source_addr = (char*)request.source + offset;
                 slice->length = len;
                 slice->opcode = request.opcode;
                 slice->rdma.dest_addr = request.target_offset + offset;
@@ -543,7 +536,7 @@ Status EfaTransport::submitTransferTask(
                 task.slice_list.push_back(slice);
 
                 int dev_id = active_devs[i].first;
-                auto &context = active_devs[i].second;
+                auto& context = active_devs[i].second;
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[request_buffer_id].lkey[dev_id];
 
@@ -571,7 +564,7 @@ Status EfaTransport::submitTransferTask(
         } else if (request_buffer_id >= 0 && request_device_id >= 0) {
             // SMALL TRANSFER (or single-NIC): one slice, no sub-slicing.
             // Round-robin NIC selection is handled by selectDevice above.
-            auto &context = context_list_[request_device_id];
+            auto& context = context_list_[request_device_id];
             if (!context || !context->active()) {
                 LOG(ERROR) << "EFA Device " << request_device_id
                            << " is not active";
@@ -580,12 +573,12 @@ Status EfaTransport::submitTransferTask(
                     " is not active");
             }
 
-            Slice *slice = getSliceCache().allocate();
+            Slice* slice = getSliceCache().allocate();
             assert(slice);
             slice->peer_nic_path.clear();
             slice->rdma.dest_rkey = 0;
 
-            slice->source_addr = (char *)request.source;
+            slice->source_addr = (char*)request.source;
             slice->length = request.length;
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset;
@@ -627,7 +620,7 @@ Status EfaTransport::submitTransferTask(
                 LOG(ERROR) << "Memory region not registered by any active EFA "
                               "device(s): "
                            << request.source;
-                for (auto &entry : slices_to_post)
+                for (auto& entry : slices_to_post)
                     for (auto s : entry.second) getSliceCache().deallocate(s);
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active EFA "
@@ -637,12 +630,12 @@ Status EfaTransport::submitTransferTask(
             }
 
             // Found a device via retry — create single slice
-            Slice *slice = getSliceCache().allocate();
+            Slice* slice = getSliceCache().allocate();
             assert(slice);
             slice->peer_nic_path.clear();
             slice->rdma.dest_rkey = 0;
 
-            slice->source_addr = (char *)request.source;
+            slice->source_addr = (char*)request.source;
             slice->length = request.length;
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset;
@@ -654,7 +647,7 @@ Status EfaTransport::submitTransferTask(
             slice->ts = 0;
             task.slice_list.push_back(slice);
 
-            auto &context = context_list_[device_id];
+            auto& context = context_list_[device_id];
             slice->rdma.source_lkey =
                 local_segment_desc->buffers[buffer_id].lkey[device_id];
             slices_to_post[context].push_back(slice);
@@ -663,18 +656,18 @@ Status EfaTransport::submitTransferTask(
         }
     }
 
-    for (auto &entry : slices_to_post)
+    for (auto& entry : slices_to_post)
         if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
     return Status::OK();
 }
 
 Status EfaTransport::getTransferStatus(BatchID batch_id,
-                                       std::vector<TransferStatus> &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                       std::vector<TransferStatus>& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.resize(task_count);
     for (size_t task_id = 0; task_id < task_count; task_id++) {
-        auto &task = batch_desc.task_list[task_id];
+        auto& task = batch_desc.task_list[task_id];
         status[task_id].transferred_bytes = task.transferred_bytes;
         uint64_t success_slice_count = task.success_slice_count;
         uint64_t failed_slice_count = task.failed_slice_count;
@@ -692,15 +685,15 @@ Status EfaTransport::getTransferStatus(BatchID batch_id,
 }
 
 Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                       TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                       TransferStatus& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
         return Status::InvalidArgument(
             "EfaTransport::getTransportStatus invalid argument, batch id: " +
             std::to_string(batch_id));
     }
-    auto &task = batch_desc.task_list[task_id];
+    auto& task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -717,12 +710,12 @@ Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 EfaTransport::SegmentID EfaTransport::getSegmentID(
-    const std::string &segment_name) {
+    const std::string& segment_name) {
     return metadata_->getSegmentID(segment_name);
 }
 
-int EfaTransport::onSetupEfaConnections(const HandShakeDesc &peer_desc,
-                                        HandShakeDesc &local_desc) {
+int EfaTransport::onSetupEfaConnections(const HandShakeDesc& peer_desc,
+                                        HandShakeDesc& local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
 
@@ -730,7 +723,7 @@ int EfaTransport::onSetupEfaConnections(const HandShakeDesc &peer_desc,
     // context_list_ only contains EFA devices and may have different
     // indexing than the full hca_list.
     std::shared_ptr<EfaContext> context;
-    for (auto &entry : context_list_) {
+    for (auto& entry : context_list_) {
         if (entry->deviceName() == local_nic_name) {
             context = entry;
             break;
@@ -749,7 +742,7 @@ int EfaTransport::initializeEfaResources() {
     // Filter for EFA devices (names typically start with "rdmap" on AWS)
     std::vector<std::string> efa_devices;
     std::vector<std::string> non_efa_devices;
-    for (auto &device_name : hca_list) {
+    for (auto& device_name : hca_list) {
         if (device_name.find("rdmap") != std::string::npos ||
             device_name.find("efa") != std::string::npos) {
             efa_devices.push_back(device_name);
@@ -770,15 +763,15 @@ int EfaTransport::initializeEfaResources() {
     // Without this, selectDevice() can return an index from the full topology
     // (which includes non-EFA devices), causing out-of-bounds access on
     // context_list_ which only contains EFA devices.
-    for (auto &device_name : non_efa_devices) {
+    for (auto& device_name : non_efa_devices) {
         local_topology_->disableDevice(device_name);
         LOG(INFO) << "EfaTransport: Disabled non-EFA device " << device_name
                   << " in topology";
     }
 
-    for (auto &device_name : efa_devices) {
+    for (auto& device_name : efa_devices) {
         auto context = std::make_shared<EfaContext>(*this, device_name);
-        auto &config = globalConfig();
+        auto& config = globalConfig();
         int ret = context->construct(config.num_cq_per_ctx,
                                      config.num_comp_channels_per_ctx,
                                      config.port, config.gid_index,
@@ -798,22 +791,22 @@ int EfaTransport::initializeEfaResources() {
     return 0;
 }
 
-int EfaTransport::startHandshakeDaemon(std::string &local_server_name) {
+int EfaTransport::startHandshakeDaemon(std::string& local_server_name) {
     return metadata_->startHandshakeDaemon(
         std::bind(&EfaTransport::onSetupEfaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
 }
 
-int EfaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
+int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
                                size_t length, std::string_view hint,
-                               int &buffer_id, int &device_id,
+                               int& buffer_id, int& device_id,
                                int retry_count) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
-    const auto &buffers = desc->buffers;
+    const auto& buffers = desc->buffers;
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
          ++buffer_id) {
-        const auto &buffer = buffers[buffer_id];
+        const auto& buffer = buffers[buffer_id];
 
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
@@ -834,8 +827,8 @@ int EfaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
-int EfaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                               size_t length, int &buffer_id, int &device_id,
+int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
+                               size_t length, int& buffer_id, int& device_id,
                                int retry_count) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
                         retry_count);

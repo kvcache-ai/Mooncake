@@ -27,7 +27,7 @@
 
 namespace mooncake {
 
-EfaEndPoint::EfaEndPoint(EfaContext &context)
+EfaEndPoint::EfaEndPoint(EfaContext& context)
     : context_(context),
       status_(INITIALIZING),
       ep_(nullptr),
@@ -46,9 +46,9 @@ EfaEndPoint::~EfaEndPoint() {
     if (ep_) deconstruct();
 }
 
-int EfaEndPoint::construct(struct fid_cq *cq, volatile int *cq_outstanding,
-                           size_t num_qp_list,
-                           size_t max_sge, size_t max_wr, size_t max_inline) {
+int EfaEndPoint::construct(struct fid_cq* cq, volatile int* cq_outstanding,
+                           size_t num_qp_list, size_t max_sge, size_t max_wr,
+                           size_t max_inline) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "EFA Endpoint has already been constructed";
         return ERR_ENDPOINT;
@@ -128,7 +128,7 @@ int EfaEndPoint::deconstruct() {
 
 int EfaEndPoint::destroyQP() { return deconstruct(); }
 
-void EfaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
+void EfaEndPoint::setPeerNicPath(const std::string& peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
     if (peer_nic_path_ == peer_nic_path) return;  // No change
     if (connected()) {
@@ -148,7 +148,7 @@ std::string EfaEndPoint::getLocalAddr() const {
     return oss.str();
 }
 
-int EfaEndPoint::insertPeerAddr(const std::string &peer_addr) {
+int EfaEndPoint::insertPeerAddr(const std::string& peer_addr) {
     // Convert hex string to binary address
     std::vector<uint8_t> addr_bin;
     addr_bin.reserve(peer_addr.size() / 2);
@@ -225,8 +225,8 @@ int EfaEndPoint::setupConnectionsByActive() {
     return 0;
 }
 
-int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                           HandShakeDesc &local_desc) {
+int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
+                                           HandShakeDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(WARNING) << "Re-establish EFA connection: " << toString();
@@ -295,8 +295,8 @@ const std::string EfaEndPoint::toString() const {
 
 bool EfaEndPoint::hasOutstandingSlice() const { return wr_depth_ > 0; }
 
-int EfaEndPoint::doSetupConnection(const std::string &peer_addr,
-                                   std::string *reply_msg) {
+int EfaEndPoint::doSetupConnection(const std::string& peer_addr,
+                                   std::string* reply_msg) {
     int ret = insertPeerAddr(peer_addr);
     if (ret != 0) {
         if (reply_msg) *reply_msg = "Failed to insert peer address into AV";
@@ -308,14 +308,14 @@ int EfaEndPoint::doSetupConnection(const std::string &peer_addr,
 }
 
 int EfaEndPoint::submitPostSend(
-    std::vector<Transport::Slice *> &slice_list,
-    std::vector<Transport::Slice *> &failed_slice_list) {
+    std::vector<Transport::Slice*>& slice_list,
+    std::vector<Transport::Slice*>& failed_slice_list) {
     if (!connected()) {
         // Try to establish connection first
         int ret = setupConnectionsByActive();
         if (ret != 0) {
             // Move all slices to failed list
-            for (auto *slice : slice_list) {
+            for (auto* slice : slice_list) {
                 failed_slice_list.push_back(slice);
             }
             slice_list.clear();
@@ -333,9 +333,9 @@ int EfaEndPoint::submitPostSend(
     const int cq_limit = static_cast<int>(globalConfig().max_cqe);
 
     struct BatchEntry {
-        Transport::Slice *slice;
-        void *local_desc;
-        EfaOpContext *op_ctx;
+        Transport::Slice* slice;
+        void* local_desc;
+        EfaOpContext* op_ctx;
     };
 
     while (!slice_list.empty()) {
@@ -397,7 +397,7 @@ int EfaEndPoint::submitPostSend(
                          << ", max=" << max_wr_depth_ << ", cq_outstanding="
                          << (cq_outstanding_ ? *cq_outstanding_ : -1)
                          << ", max_cqe=" << cq_limit << ")";
-            for (auto *slice : slice_list) {
+            for (auto* slice : slice_list) {
                 failed_slice_list.push_back(slice);
             }
             slice_list.clear();
@@ -409,15 +409,15 @@ int EfaEndPoint::submitPostSend(
         int valid_count = 0;
 
         for (int i = 0; i < batch_count; i++) {
-            Transport::Slice *slice = slice_list[i];
-            void *local_desc = context_.mrDesc(slice->source_addr);
+            Transport::Slice* slice = slice_list[i];
+            void* local_desc = context_.mrDesc(slice->source_addr);
             if (!local_desc) {
                 LOG(ERROR) << "No MR descriptor found for address "
                            << slice->source_addr;
                 failed_slice_list.push_back(slice);
                 continue;
             }
-            EfaOpContext *op_ctx = new EfaOpContext();
+            EfaOpContext* op_ctx = new EfaOpContext();
             memset(op_ctx, 0, sizeof(EfaOpContext));
             op_ctx->slice = slice;
             op_ctx->wr_depth = &wr_depth_;
@@ -433,21 +433,21 @@ int EfaEndPoint::submitPostSend(
         }
 
         // --- Step 3: Post entire batch under a single lock hold ---
-        std::vector<Transport::Slice *> retry_slices;
+        std::vector<Transport::Slice*> retry_slices;
         if (valid_count > 0) {
             while (post_lock_.test_and_set(std::memory_order_acquire)) {
             }
             for (int i = 0; i < valid_count; i++) {
-                auto &entry = batch[i];
+                auto& entry = batch[i];
                 ssize_t ret;
                 if (entry.slice->opcode == Transport::TransferRequest::READ) {
-                    ret = fi_read(ep_, (void *)entry.slice->source_addr,
+                    ret = fi_read(ep_, (void*)entry.slice->source_addr,
                                   entry.slice->length, entry.local_desc,
                                   peer_fi_addr_, entry.slice->rdma.dest_addr,
                                   entry.slice->rdma.dest_rkey,
                                   &entry.op_ctx->fi_ctx);
                 } else {
-                    ret = fi_write(ep_, (void *)entry.slice->source_addr,
+                    ret = fi_write(ep_, (void*)entry.slice->source_addr,
                                    entry.slice->length, entry.local_desc,
                                    peer_fi_addr_, entry.slice->rdma.dest_addr,
                                    entry.slice->rdma.dest_rkey,
@@ -471,7 +471,7 @@ int EfaEndPoint::submitPostSend(
                         << "fi_read/fi_write failed: " << fi_strerror(-ret)
                         << " (source=" << entry.slice->source_addr
                         << ", len=" << entry.slice->length
-                        << ", dest=" << (void *)entry.slice->rdma.dest_addr
+                        << ", dest=" << (void*)entry.slice->rdma.dest_addr
                         << ", rkey=" << entry.slice->rdma.dest_rkey << ")";
                     delete entry.op_ctx;
                     __sync_fetch_and_sub(&wr_depth_, 1);
