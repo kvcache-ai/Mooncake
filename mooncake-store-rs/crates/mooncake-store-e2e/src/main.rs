@@ -73,7 +73,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         engine_target_b,
         memory.clone(),
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "scaleout"), ("storage", "true")],
+        &[
+            ("pool", "pool-a"),
+            ("role", "scaleout"),
+            ("storage", "true"),
+        ],
     )?;
     let mut target_upgrade = build_client(
         metadata.clone(),
@@ -98,7 +102,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .reclaim_grace_ms(0)
             .tags(vec!["dram".to_string(), "overwrite-reclaim".to_string()]),
         "tenant-a",
-        &[("pool", "pool-reclaim"), ("role", "reclaim"), ("storage", "true")],
+        &[
+            ("pool", "pool-reclaim"),
+            ("role", "reclaim"),
+            ("storage", "true"),
+        ],
     )?;
     let router = build_routed_client(
         metadata.clone(),
@@ -126,9 +134,17 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .storage_bytes(value_size * 8)
             .scratch_bytes(SCRATCH_BYTES)
             .location("cpu:0")
-            .tags(vec!["dram".to_string(), "router".to_string(), "replicated".to_string()]),
+            .tags(vec![
+                "dram".to_string(),
+                "router".to_string(),
+                "replicated".to_string(),
+            ]),
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "router-replica"), ("storage", "false")],
+        &[
+            ("pool", "pool-a"),
+            ("role", "router-replica"),
+            ("storage", "false"),
+        ],
         planner.clone(),
         2,
     )?;
@@ -176,6 +192,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::arc_with_non_send_sync)]
 fn build_tent_engine(redis_port: u16, local_segment_name: &str) -> Result<Arc<TentEngine>> {
     Ok(Arc::new(TentEngine::new(
         &TentEngineConfig::new()
@@ -193,6 +210,7 @@ fn build_tent_engine(redis_port: u16, local_segment_name: &str) -> Result<Arc<Te
     )?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_client(
     metadata: Arc<RedisMetadataBackend>,
     stable_id: &str,
@@ -216,6 +234,7 @@ fn build_client(
     builder.build(now_ms() + LEASE_MS)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_routed_client(
     metadata: Arc<RedisMetadataBackend>,
     stable_id: &str,
@@ -293,7 +312,9 @@ fn verify_batch_put_get(
     let items = build_items("tenant-a", "batch-local", 8, value_size);
     let puts = items
         .iter()
-        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
+        .map(|item| {
+            PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str())
+        })
         .collect::<Vec<_>>();
     writer.batch_put(&puts)?;
 
@@ -343,7 +364,7 @@ fn verify_batch_put_from_get_into(
     for buffer in &mut input_buffers {
         writer.register_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
     }
-    let put_result = (|| {
+    let put_result = {
         let puts = items
             .iter()
             .zip(input_buffers.iter())
@@ -353,7 +374,7 @@ fn verify_batch_put_from_get_into(
             })
             .collect::<Vec<_>>();
         writer.batch_put_from(&puts)
-    })();
+    };
     for buffer in &mut input_buffers {
         writer.unregister_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
     }
@@ -366,16 +387,17 @@ fn verify_batch_put_from_get_into(
     for buffer in &mut output_buffers {
         reader.register_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
     }
-    let get_result = (|| {
+    let get_result = {
         let mut gets = items
             .iter()
             .zip(output_buffers.iter_mut())
             .map(|(item, buffer)| {
-                GetRequest::new(item.key.as_str(), buffer.as_mut_slice()).tenant(item.tenant.as_str())
+                GetRequest::new(item.key.as_str(), buffer.as_mut_slice())
+                    .tenant(item.tenant.as_str())
             })
             .collect::<Vec<_>>();
         reader.batch_get_into(&mut gets)
-    })();
+    };
     for buffer in &mut output_buffers {
         reader.unregister_buffer(buffer.as_mut_ptr().cast(), buffer.len())?;
     }
@@ -437,7 +459,12 @@ fn verify_multi_buffer_batch_ops(
     let sizes = {
         let mut output_refs = output_parts
             .iter_mut()
-            .map(|parts| parts.iter_mut().map(|part| part.as_mut_slice()).collect::<Vec<_>>())
+            .map(|parts| {
+                parts
+                    .iter_mut()
+                    .map(|part| part.as_mut_slice())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let mut gets = items
             .iter()
@@ -491,7 +518,9 @@ fn verify_routed_scale_out(
     let items = build_items("tenant-a", "scale-auto", 32, value_size);
     let puts = items
         .iter()
-        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
+        .map(|item| {
+            PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str())
+        })
         .collect::<Vec<_>>();
     router.batch_put(&puts)?;
 
@@ -531,7 +560,9 @@ fn verify_multi_replica_route_publish(
     let items = build_items("tenant-a", "replicated", 8, value_size);
     let puts = items
         .iter()
-        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
+        .map(|item| {
+            PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str())
+        })
         .collect::<Vec<_>>();
     router.batch_put(&puts)?;
 
@@ -646,7 +677,14 @@ fn run_batch_put_benchmark(
             writer.batch_put(&puts)?;
             total_bytes += batch_size * value_size;
         }
-        print_bench("put", batch_size, iterations, value_size, total_bytes, start.elapsed());
+        print_bench(
+            "put",
+            batch_size,
+            iterations,
+            value_size,
+            total_bytes,
+            start.elapsed(),
+        );
     }
     Ok(())
 }
@@ -660,7 +698,9 @@ fn run_batch_get_benchmark(
     let items = build_items("bench-get", "get", 64, value_size);
     let puts = items
         .iter()
-        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
+        .map(|item| {
+            PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str())
+        })
         .collect::<Vec<_>>();
     writer.batch_put(&puts)?;
 
@@ -743,11 +783,7 @@ fn build_items(tenant: &str, prefix: &str, count: usize, value_size: usize) -> V
         .collect()
 }
 
-fn ensure_batch_payloads(
-    label: &str,
-    items: &[OwnedItem],
-    actual: &[Vec<u8>],
-) -> Result<()> {
+fn ensure_batch_payloads(label: &str, items: &[OwnedItem], actual: &[Vec<u8>]) -> Result<()> {
     if items.len() != actual.len() {
         return Err(StoreError::Transport(format!(
             "{label} length mismatch: items={} actual={}",

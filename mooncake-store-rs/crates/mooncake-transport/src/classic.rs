@@ -37,6 +37,7 @@ impl ClassicTransferEngine {
         Ok(Self { raw })
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn register_local_memory(
         &self,
         addr: *mut c_void,
@@ -57,6 +58,7 @@ impl ClassicTransferEngine {
         check_zero(rc, "registerLocalMemory")
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn unregister_local_memory(&self, addr: *mut c_void) -> Result<()> {
         let rc = unsafe { ffi::unregisterLocalMemory(self.raw, addr) };
         check_zero(rc, "unregisterLocalMemory")
@@ -108,8 +110,14 @@ impl ClassicTransferEngine {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let rc =
-            unsafe { ffi::submitTransfer(self.raw, batch_id, native_requests.as_mut_ptr(), native_requests.len()) };
+        let rc = unsafe {
+            ffi::submitTransfer(
+                self.raw,
+                batch_id,
+                native_requests.as_mut_ptr(),
+                native_requests.len(),
+            )
+        };
         check_zero(rc, "submitTransfer")
     }
 
@@ -149,7 +157,9 @@ fn check_zero(rc: i32, operation: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(StoreError::Transport(format!("{operation} failed with rc={rc}")))
+        Err(StoreError::Transport(format!(
+            "{operation} failed with rc={rc}"
+        )))
     }
 }
 
