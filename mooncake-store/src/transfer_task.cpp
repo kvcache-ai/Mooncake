@@ -448,18 +448,23 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             return std::nullopt;
         }
 
-        TransferStrategy strategy = selectStrategy(handle, slices);
+        if (op_code == TransferRequest::READ) {
+            future = submitMemoryReadOperation(handle, slices, 0);
+        } else {
+            TransferStrategy strategy = selectStrategy(handle, slices);
 
-        switch (strategy) {
-            case TransferStrategy::LOCAL_MEMCPY:
-                future = submitMemcpyOperation(handle, slices, op_code);
-                break;
-            case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
-                break;
-            default:
-                LOG(ERROR) << "Unknown transfer strategy: " << strategy;
-                return std::nullopt;
+            switch (strategy) {
+                case TransferStrategy::LOCAL_MEMCPY:
+                    future = submitMemcpyOperation(handle, slices, op_code);
+                    break;
+                case TransferStrategy::TRANSFER_ENGINE:
+                    future =
+                        submitTransferEngineOperation(handle, slices, op_code);
+                    break;
+                default:
+                    LOG(ERROR) << "Unknown transfer strategy: " << strategy;
+                    return std::nullopt;
+            }
         }
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
@@ -659,6 +664,25 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     return submitTransfer(requests);
 }
 
+std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    TransferStrategy strategy = selectStrategy(handle, slices);
+
+    if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+        return submitMemcpyOperation(handle, slices, TransferRequest::READ,
+                                     src_offset);
+    }
+    if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+        return submitTransferEngineOperation(handle, slices,
+                                             TransferRequest::READ, src_offset);
+    }
+
+    LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
+               << strategy;
+    return std::nullopt;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     uint64_t src_offset) {
@@ -677,20 +701,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
             return std::nullopt;
         }
 
-        TransferStrategy strategy = selectStrategy(handle, slices);
-
-        if (strategy == TransferStrategy::LOCAL_MEMCPY) {
-            future = submitMemcpyOperation(handle, slices,
-                                           TransferRequest::READ, src_offset);
-        } else if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-            future = submitTransferEngineOperation(
-                handle, slices, TransferRequest::READ, src_offset);
-        } else {
-            LOG(ERROR) << "Range read only supports LOCAL_MEMCPY or "
-                          "TRANSFER_ENGINE, got: "
-                       << strategy;
-            return std::nullopt;
-        }
+        future = submitMemoryReadOperation(handle, slices, src_offset);
     } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
         LOG(ERROR)
             << "Range read not supported for disk replicas (use full read)";

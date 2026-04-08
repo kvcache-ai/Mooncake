@@ -2567,6 +2567,26 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     return future->get();
 }
 
+ErrorCode Client::TransferReadInternal(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
+                                                       slices, src_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range read operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+
+    return future->get();
+}
+
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
@@ -2590,25 +2610,13 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferReadInternal(replica_descriptor, slices, 0);
 }
 
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t src_offset) {
-    if (!transfer_submitter_) {
-        LOG(ERROR) << "TransferSubmitter not initialized";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
-    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
-                                                       slices, src_offset);
-    if (!future) {
-        LOG(ERROR) << "Failed to submit range read operation";
-        return ErrorCode::TRANSFER_FAIL;
-    }
-
-    return future->get();
+    return TransferReadInternal(replica_descriptor, slices, src_offset);
 }
 
 void Client::PollAndDispatchTasks() {
