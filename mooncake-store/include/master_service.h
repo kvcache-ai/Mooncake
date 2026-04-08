@@ -1222,6 +1222,7 @@ class MasterService {
     };
 
     struct DrainJob {
+        mutable std::mutex mutex;
         UUID id;
         JobType type{JobType::DRAIN};
         JobStatus status{JobStatus::CREATED};
@@ -1240,7 +1241,12 @@ class MasterService {
         std::unordered_set<std::string> terminal_failed_unit_keys;
     };
 
+    static constexpr uint32_t kMaxDrainUnitRetries = 3;
+
     tl::expected<void, ErrorCode> ValidateDrainRequest(
+        const CreateDrainJobRequest& request);
+    tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
+        ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);
@@ -1256,8 +1262,8 @@ class MasterService {
     std::atomic<bool> job_dispatch_running_{false};
     static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
     std::mutex job_mutex_;
-    std::unordered_map<UUID, DrainJob, boost::hash<UUID>> drain_jobs_
-        GUARDED_BY(job_mutex_);
+    std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
+        drain_jobs_ GUARDED_BY(job_mutex_);
 };
 
 }  // namespace mooncake

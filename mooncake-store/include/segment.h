@@ -318,6 +318,8 @@ class SegmentManager {
         client_segments_;  // client_id -> segment_ids
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
+    std::unordered_map<std::string, UUID>
+        segment_id_by_name_;  // segment name -> segment_id
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment

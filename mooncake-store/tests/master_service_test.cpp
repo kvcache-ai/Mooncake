@@ -107,6 +107,31 @@ class MasterServiceTest : public ::testing::Test {
         return processed;
     }
 
+    bool FailPendingMoveTasks(MasterService& service,
+                              const UUID& client_id) const {
+        auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
+        EXPECT_TRUE(fetched.has_value());
+        if (!fetched.has_value() || fetched->empty()) {
+            return false;
+        }
+
+        bool processed = false;
+        for (const auto& assignment : *fetched) {
+            if (assignment.type != TaskType::REPLICA_MOVE) {
+                continue;
+            }
+
+            TaskCompleteRequest complete_request;
+            complete_request.id = assignment.id;
+            complete_request.status = TaskStatus::FAILED;
+            complete_request.message = "move_failed";
+            EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
+                            .has_value());
+            processed = true;
+        }
+        return processed;
+    }
+
     template <typename Predicate>
     void WaitUntil(
         Predicate&& predicate,
@@ -1423,7 +1448,6 @@ TEST_F(MasterServiceTest, MoveEnd) {
     // segment_2
     move_start_result =
         service_->MoveStart(client_id, key, "segment_2", "segment_1");
-    LOG(INFO) << "drain_test_1 put_start done";
     ASSERT_TRUE(move_start_result.has_value());
 
     // Unmount segment_2 to simulate source gone
@@ -4321,7 +4345,79 @@ TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     EXPECT_EQ(restored_status.value(), SegmentStatus::OK);
 }
 
-// Test force Remove - should bypass lease check
+TEST_F(MasterServiceTest, CancelDrainJobRejectsActiveMoveTasks) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil([&] {
+        auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+        return fetched.has_value() && !fetched->empty();
+    });
+
+    auto cancel_result = service_->CancelDrainJob(job_id.value());
+    ASSERT_FALSE(cancel_result.has_value());
+    EXPECT_EQ(cancel_result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        WaitUntil(
+            [&] { return FailPendingMoveTasks(*service_, ctx0.client_id); });
+    }
+
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::FAILED;
+    });
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->status, JobStatus::FAILED);
+    EXPECT_EQ(query->active_units, 0u);
+    EXPECT_GE(query->failed_units, 3u);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+}
+
 TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
     // Set a long lease TTL so objects will have active leases
     const uint64_t kv_lease_ttl = 10000;  // 10 seconds

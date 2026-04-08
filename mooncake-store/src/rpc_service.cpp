@@ -67,11 +67,14 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
 
 void SetServiceUnavailable(coro_http::coro_http_response& resp,
                            std::string_view message) {
-    resp.add_header("Content-Type", "text/plain; version=0.0.4");
+    const std::string payload =
+        std::string("{\"success\":false,\"error_code\":") +
+        std::to_string(toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE)) +
+        ",\"error_message\":\"" + EscapeJson(message) + "\"}";
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
     resp.set_status_and_content(coro_http::status_type::service_unavailable,
-                                std::string(message));
+                                payload);
 }
-
 struct HttpErrorResponse {
     bool success{false};
     int32_t error_code{0};
