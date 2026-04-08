@@ -16,6 +16,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
 
@@ -727,6 +728,12 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server();
     void stop_http_server();
+
+    // Embedded Client RPC server for offload object reads
+    std::unique_ptr<coro_rpc::coro_rpc_server> client_rpc_server_;
+    std::jthread client_rpc_thread_;
+    int start_client_rpc_server();
+    void stop_client_rpc_server();
 
     void handle_ipc_shm_register(int client_sock);
     void handle_ipc_shm_fd_request(int client_sock);

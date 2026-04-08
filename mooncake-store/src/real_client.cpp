@@ -289,6 +289,7 @@ RealClient::RealClient() {
 
 RealClient::~RealClient() {
     // Ensure resources are cleaned even if not explicitly closed
+    stop_client_rpc_server();
     stop_http_server();
     tearDownAll_internal();
 }
@@ -600,6 +601,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         rpc_port_binder_.reset();
     }
 
+    // Start embedded Client RPC server for offload object reads.
+    // This is needed when using Python binding (no standalone server).
+    if (start_client_rpc_server() != 0) {
+        LOG(WARNING) << "Failed to start client RPC server on "
+                     << this->local_rpc_addr
+                     << ". LOCAL_DISK offload reads may not work.";
+    }
+
     if (FLAGS_enable_http_server) {
         if (start_http_server() != 0) {
             LOG(ERROR) << "Failed to start HTTP server on port "
@@ -747,6 +756,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_client_rpc_server();
     stop_http_server();
 
     if (!client_) {
@@ -890,6 +900,66 @@ void RealClient::stop_http_server() {
         http_server_->stop();
         http_server_.reset();
         LOG(INFO) << "Client HTTP server stopped";
+    }
+}
+
+int RealClient::start_client_rpc_server() {
+    if (this->local_rpc_addr.empty()) {
+        LOG(WARNING) << "local_rpc_addr is empty, skip client RPC server";
+        return -1;
+    }
+
+    // Parse host:port from local_rpc_addr
+    size_t colon = this->local_rpc_addr.find_last_of(':');
+    if (colon == std::string::npos) {
+        LOG(ERROR) << "Invalid local_rpc_addr (no port): "
+                   << this->local_rpc_addr;
+        return -1;
+    }
+    std::string rpc_host = this->local_rpc_addr.substr(0, colon);
+    int rpc_port = std::stoi(this->local_rpc_addr.substr(colon + 1));
+
+    try {
+        client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            1, rpc_port, rpc_host);
+
+        // Register offload-related handlers (essential for LOCAL_DISK reads)
+        client_rpc_server_->register_handler<
+            &RealClient::batch_get_offload_object>(this);
+        client_rpc_server_->register_handler<
+            &RealClient::release_offload_buffer>(this);
+        client_rpc_server_->register_handler<
+            &RealClient::service_ready_internal>(this);
+
+        // Start in background thread (start() blocks)
+        client_rpc_thread_ = std::jthread([this]() {
+            LOG(INFO) << "Client RPC server starting on "
+                      << this->local_rpc_addr;
+            auto ec = client_rpc_server_->start();
+            if (ec) {
+                LOG(ERROR) << "Client RPC server stopped with error";
+            }
+        });
+
+        // Brief wait to confirm binding
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        LOG(INFO) << "Client RPC server started on " << this->local_rpc_addr;
+        return 0;
+    } catch (const std::exception &e) {
+        LOG(ERROR) << "Failed to start client RPC server: " << e.what();
+        client_rpc_server_.reset();
+        return -1;
+    }
+}
+
+void RealClient::stop_client_rpc_server() {
+    if (client_rpc_server_) {
+        client_rpc_server_->stop();
+        if (client_rpc_thread_.joinable()) {
+            client_rpc_thread_.join();
+        }
+        client_rpc_server_.reset();
+        LOG(INFO) << "Client RPC server stopped";
     }
 }
 
