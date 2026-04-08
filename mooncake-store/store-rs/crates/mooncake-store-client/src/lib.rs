@@ -4,8 +4,8 @@ mod placement;
 mod transport;
 
 pub use client::{
-    GetRequest, MooncakeCompatibilityFacade, ObjectRef, PutFromRequest, PutRequest,
-    StoreClient, StoreClientBuilder,
+    GetRequest, MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest,
+    ObjectRef, PutFromRequest, PutRequest, StoreClient, StoreClientBuilder,
 };
 pub use memory::LocalMemoryConfig;
 pub use placement::{PlacementChoice, PlacementPlanner};

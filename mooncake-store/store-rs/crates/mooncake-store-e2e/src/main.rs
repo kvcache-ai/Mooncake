@@ -4,15 +4,16 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, ObjectRef, PlacementPlanner,
-    PutFromRequest, PutRequest, StoreClient, StoreClientBuilder,
+    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
+    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
+    StoreClientBuilder,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result, StoreError,
 };
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
-const LEASE_MS: u64 = 30_000;
+const LEASE_MS: u64 = 600_000;
 const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 
@@ -50,6 +51,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let engine_target_b = build_tent_engine(redis_port, "target-b-segment")?;
     let engine_upgrade = build_tent_engine(redis_port, "target-a-upgrade-segment")?;
     let engine_reclaim = build_tent_engine(redis_port, "target-reclaim-segment")?;
+    let engine_router = build_tent_engine(redis_port, "router-segment")?;
+    let engine_router_replica = build_tent_engine(redis_port, "router-replica-segment")?;
     let engine_reader = build_tent_engine(redis_port, "reader-segment")?;
 
     let mut target_a = build_client(
@@ -97,6 +100,38 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "tenant-a",
         &[("pool", "pool-reclaim"), ("role", "reclaim"), ("storage", "true")],
     )?;
+    let router = build_routed_client(
+        metadata.clone(),
+        "router",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        engine_router,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 8)
+            .scratch_bytes(SCRATCH_BYTES)
+            .location("cpu:0")
+            .tags(vec!["dram".to_string(), "router".to_string()]),
+        "tenant-a",
+        &[("pool", "pool-a"), ("role", "router"), ("storage", "false")],
+        planner.clone(),
+        1,
+    )?;
+    let router_replica = build_routed_client(
+        metadata.clone(),
+        "router-replica",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        engine_router_replica,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 8)
+            .scratch_bytes(SCRATCH_BYTES)
+            .location("cpu:0")
+            .tags(vec!["dram".to_string(), "router".to_string(), "replicated".to_string()]),
+        "tenant-a",
+        &[("pool", "pool-a"), ("role", "router-replica"), ("storage", "false")],
+        planner.clone(),
+        2,
+    )?;
     let reader = build_client(
         metadata,
         "reader",
@@ -112,21 +147,25 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     target_b.register_local_memory()?;
     target_upgrade.register_local_memory()?;
     reclaim_writer.register_local_memory()?;
+    router.register_local_memory()?;
+    router_replica.register_local_memory()?;
     reader.register_local_memory()?;
 
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
     verify_batch_put_get(&target_a, &reader, value_size)?;
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
+    verify_multi_buffer_batch_ops(&target_a, &reader, value_size)?;
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
-    verify_dynamic_scale_out(&planner, &target_a, &target_b, &reader, value_size)?;
+    verify_routed_scale_out(&router, &reader, value_size)?;
+    verify_multi_replica_route_publish(&router_replica, &reader, value_size)?;
     verify_hot_upgrade(&mut target_a, &mut target_upgrade, &reader, value_size)?;
 
-    run_batch_put_benchmark(&target_b, value_size, batch_bench_iters)?;
+    run_batch_put_benchmark(&router, value_size, batch_bench_iters)?;
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
 
     println!(
-        "e2e ok: single put/get, batch put/get, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, hot-upgrade"
+        "e2e ok: single put/get, batch put/get, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, hot-upgrade"
     );
     Ok(())
 }
@@ -165,6 +204,32 @@ fn build_client(
         .compatibility(CompatibilityDescriptor::default())
         .local_memory(memory)
         .with_tent(engine);
+    for (key, value) in labels {
+        builder = builder.label(*key, *value);
+    }
+    builder.build(now_ms() + LEASE_MS)
+}
+
+fn build_routed_client(
+    metadata: Arc<RedisMetadataBackend>,
+    stable_id: &str,
+    epoch: ClientEpoch,
+    state: ClientLifecycleState,
+    engine: Arc<TentEngine>,
+    memory: LocalMemoryConfig,
+    tenant: &str,
+    labels: &[(&str, &str)],
+    planner: PlacementPlanner,
+    replica_count: usize,
+) -> Result<StoreClient> {
+    let mut builder = StoreClientBuilder::new(metadata, stable_id)
+        .epoch(epoch)
+        .state(state)
+        .tenant(tenant)
+        .compatibility(CompatibilityDescriptor::default())
+        .local_memory(memory)
+        .with_tent(engine)
+        .routed_writes(planner, replica_count);
     for (key, value) in labels {
         builder = builder.label(*key, *value);
     }
@@ -323,6 +388,79 @@ fn verify_batch_put_from_get_into(
     Ok(())
 }
 
+fn verify_multi_buffer_batch_ops(
+    writer: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let items = build_items("tenant-a", "multi-buffer", 4, value_size);
+    let split_payloads = items
+        .iter()
+        .map(|item| split_payload(&item.value))
+        .collect::<Vec<_>>();
+    let slice_sets = split_payloads
+        .iter()
+        .map(|parts| parts.iter().map(|part| part.as_slice()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let puts = items
+        .iter()
+        .zip(slice_sets.iter())
+        .map(|(item, slices)| {
+            MultiBufferPutRequest::new(item.key.as_str(), slices.as_slice())
+                .tenant(item.tenant.as_str())
+        })
+        .collect::<Vec<_>>();
+    writer.batch_put_from_multi_buffers(&puts)?;
+
+    let refs = items
+        .iter()
+        .map(|item| ObjectRef::new(item.key.as_str()).tenant(item.tenant.as_str()))
+        .collect::<Vec<_>>();
+    let buffers = reader.batch_get_buffer(&refs)?;
+    ensure_batch_payloads("batch_get_buffer", &items, &buffers)?;
+
+    let mut output_parts = items
+        .iter()
+        .map(|item| {
+            split_lengths(item.value.len())
+                .into_iter()
+                .map(|len| vec![0u8; len])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let sizes = {
+        let mut output_refs = output_parts
+            .iter_mut()
+            .map(|parts| parts.iter_mut().map(|part| part.as_mut_slice()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut gets = items
+            .iter()
+            .zip(output_refs.iter_mut())
+            .map(|(item, refs)| {
+                MultiBufferGetRequest::new(item.key.as_str(), refs.as_mut_slice())
+                    .tenant(item.tenant.as_str())
+            })
+            .collect::<Vec<_>>();
+        reader.batch_get_into_multi_buffers(&mut gets)?
+    };
+    for (size, item) in sizes.iter().zip(items.iter()) {
+        if *size != item.value.len() {
+            return Err(StoreError::Transport(format!(
+                "batch_get_into_multi_buffers size mismatch for {}: got={} expected={}",
+                item.key,
+                size,
+                item.value.len()
+            )));
+        }
+    }
+    let merged = output_parts
+        .into_iter()
+        .map(|parts| parts.into_iter().flatten().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    ensure_batch_payloads("batch_get_into_multi_buffers", &items, &merged)?;
+    Ok(())
+}
+
 fn verify_overwrite_reclaims_capacity(
     writer: &StoreClient,
     reader: &StoreClient,
@@ -339,66 +477,83 @@ fn verify_overwrite_reclaims_capacity(
     Ok(())
 }
 
-fn verify_dynamic_scale_out(
-    planner: &PlacementPlanner,
-    writer_a: &StoreClient,
-    writer_b: &StoreClient,
+fn verify_routed_scale_out(
+    router: &StoreClient,
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
     let items = build_items("tenant-a", "scale-auto", 32, value_size);
+    let puts = items
+        .iter()
+        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
+        .collect::<Vec<_>>();
+    router.batch_put(&puts)?;
+
+    let mut placement_counts = std::collections::BTreeMap::<String, usize>::new();
+    for item in &items {
+        let route = router
+            .query_route_in_tenant(item.tenant.as_str(), item.key.as_str())?
+            .ok_or_else(|| StoreError::NotFound(item.key.clone()))?;
+        let owner = route
+            .replicas
+            .first()
+            .ok_or_else(|| StoreError::InvalidState("scale-out route has no replica".to_string()))?
+            .owner
+            .storage_key();
+        *placement_counts.entry(owner).or_default() += 1;
+    }
+    if placement_counts.len() < 2 {
+        return Err(StoreError::InvalidState(format!(
+            "routed scale-out failed to spread across active storage nodes: {:?}",
+            placement_counts
+        )));
+    }
     let refs = items
         .iter()
         .map(|item| ObjectRef::new(item.key.as_str()).tenant(item.tenant.as_str()))
         .collect::<Vec<_>>();
-    let plans = planner.plan(writer_a, &refs, 1)?;
-    let writers = std::collections::BTreeMap::from([
-        (
-            writer_a.runtime_id().storage_key(),
-            writer_a,
-        ),
-        (
-            writer_b.runtime_id().storage_key(),
-            writer_b,
-        ),
-    ]);
-    let mut grouped = std::collections::BTreeMap::<String, Vec<PutRequest<'_>>>::new();
-    let mut placement_counts = std::collections::BTreeMap::<String, usize>::new();
-    for (item, plan) in items.iter().zip(plans.iter()) {
-        let owner = plan
-            .owners
-            .first()
-            .ok_or_else(|| StoreError::InvalidState("placement returned no owner".to_string()))?;
-        *placement_counts.entry(owner.storage_key()).or_default() += 1;
-        grouped
-            .entry(owner.storage_key())
-            .or_default()
-            .push(PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()));
-    }
-
-    let left_count = placement_counts
-        .get(&writer_a.runtime_id().storage_key())
-        .copied()
-        .unwrap_or_default();
-    let right_count = placement_counts
-        .get(&writer_b.runtime_id().storage_key())
-        .copied()
-        .unwrap_or_default();
-    if left_count == 0 || right_count == 0 {
-        return Err(StoreError::InvalidState(format!(
-            "scale-out planner failed to spread writes: left={left_count} right={right_count}"
-        )));
-    }
-
-    for (runtime, requests) in grouped {
-        let writer = writers.get(&runtime).ok_or_else(|| {
-            StoreError::InvalidState(format!("planned runtime {runtime} is not wired in e2e"))
-        })?;
-        writer.batch_put(&requests)?;
-    }
-
     let results = reader.batch_get(&refs)?;
     ensure_batch_payloads("scale-out batch_get", &items, &results)?;
+    Ok(())
+}
+
+fn verify_multi_replica_route_publish(
+    router: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let items = build_items("tenant-a", "replicated", 8, value_size);
+    let puts = items
+        .iter()
+        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
+        .collect::<Vec<_>>();
+    router.batch_put(&puts)?;
+
+    for item in &items {
+        let route = router
+            .query_route_in_tenant(item.tenant.as_str(), item.key.as_str())?
+            .ok_or_else(|| StoreError::NotFound(item.key.clone()))?;
+        if route.replicas.len() != 2 {
+            return Err(StoreError::InvalidState(format!(
+                "replicated route {} expected 2 replicas, got {}",
+                item.key,
+                route.replicas.len()
+            )));
+        }
+        if route.replicas[0].owner == route.replicas[1].owner {
+            return Err(StoreError::InvalidState(format!(
+                "replicated route {} collapsed to one owner",
+                item.key
+            )));
+        }
+    }
+
+    let refs = items
+        .iter()
+        .map(|item| ObjectRef::new(item.key.as_str()).tenant(item.tenant.as_str()))
+        .collect::<Vec<_>>();
+    let results = reader.batch_get(&refs)?;
+    ensure_batch_payloads("replicated batch_get", &items, &results)?;
     Ok(())
 }
 
@@ -604,6 +759,27 @@ fn payload(seed: &str, size: usize) -> Vec<u8> {
         *byte = ((state >> 24) % 251) as u8;
     }
     bytes
+}
+
+fn split_payload(payload: &[u8]) -> Vec<Vec<u8>> {
+    let lengths = split_lengths(payload.len());
+    let mut cursor = 0usize;
+    let mut parts = Vec::with_capacity(lengths.len());
+    for length in lengths {
+        parts.push(payload[cursor..cursor + length].to_vec());
+        cursor += length;
+    }
+    parts
+}
+
+fn split_lengths(total: usize) -> Vec<usize> {
+    if total <= 3 {
+        return vec![total];
+    }
+    let first = total / 3;
+    let second = total / 3;
+    let third = total - first - second;
+    vec![first, second, third]
 }
 
 fn now_ms() -> u64 {

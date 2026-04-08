@@ -3,13 +3,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
-use mooncake_transport::{TentEngine, TransferProgress, TransferRequest, TransferStatus};
+use mooncake_transport::{SegmentInfo, TentEngine, TransferProgress, TransferRequest, TransferStatus};
 
 pub trait StoreTransport {
     fn segment_name(&self) -> Result<String>;
     fn rpc_server_address(&self) -> Result<(String, u16)>;
     fn open_segment(&self, segment_name: &str) -> Result<u64>;
     fn close_segment(&self, handle: u64) -> Result<()>;
+    fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo>;
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void>;
     fn free_memory(&self, addr: *mut c_void) -> Result<()>;
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
@@ -36,6 +37,10 @@ impl StoreTransport for TentEngine {
 
     fn close_segment(&self, handle: u64) -> Result<()> {
         TentEngine::close_segment(self, handle)
+    }
+
+    fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo> {
+        TentEngine::get_segment_info(self, handle)
     }
 
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {

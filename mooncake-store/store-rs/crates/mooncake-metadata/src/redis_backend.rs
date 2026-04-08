@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
     MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement, SegmentName,
-    StoreError,
+    SegmentReservation, StoreError,
 };
 use redis::{Commands, Script};
 
@@ -35,6 +35,35 @@ end
 
 redis.call('HSET', key, 'version', next_version, 'payload', payload)
 return {1, payload}
+"#;
+
+const RESERVE_SEGMENT_SCRIPT: &str = r#"
+local key = KEYS[1]
+local requested = tonumber(ARGV[1])
+local alignment = tonumber(ARGV[2])
+
+local capacity = tonumber(redis.call('HGET', key, 'capacity_bytes'))
+local used = tonumber(redis.call('HGET', key, 'used_bytes'))
+
+if not capacity or not used then
+    return {0, -1}
+end
+
+local offset = used
+if alignment > 1 then
+    local rem = offset % alignment
+    if rem ~= 0 then
+        offset = offset + (alignment - rem)
+    end
+end
+
+local next_used = offset + requested
+if next_used > capacity then
+    return {0, capacity - offset}
+end
+
+redis.call('HSET', key, 'used_bytes', tostring(next_used))
+return {1, offset}
 "#;
 
 #[derive(Clone, Debug)]
@@ -135,9 +164,18 @@ impl MetadataBackend for RedisMetadataBackend {
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
         let mut connection = self.connection()?;
         let key = self.keyspace.segment(&segment.owner, &segment.segment_name);
-        let payload = serde_json::to_string(segment).map_err(json_error)?;
+        let tags = serde_json::to_string(&segment.tags).map_err(json_error)?;
         connection
-            .set::<_, _, ()>(key, payload)
+            .hset_multiple::<_, _, _, ()>(
+                key,
+                &[
+                    ("owner", segment.owner.storage_key()),
+                    ("segment_name", segment.segment_name.0.clone()),
+                    ("capacity_bytes", segment.capacity_bytes.to_string()),
+                    ("used_bytes", segment.used_bytes.to_string()),
+                    ("tags_json", tags),
+                ],
+            )
             .map_err(|error| metadata_error("redis set segment", error))
     }
 
@@ -147,6 +185,38 @@ impl MetadataBackend for RedisMetadataBackend {
         connection
             .del::<_, ()>(key)
             .map_err(|error| metadata_error("redis del segment", error))
+    }
+
+    fn reserve_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        length_bytes: u64,
+        alignment: u64,
+    ) -> Result<SegmentReservation> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.segment(owner, segment);
+        let result = Script::new(RESERVE_SEGMENT_SCRIPT)
+            .key(&key)
+            .arg(length_bytes)
+            .arg(alignment.max(1))
+            .invoke::<(i32, i64)>(&mut connection)
+            .map_err(|error| metadata_error("redis reserve segment", error))?;
+        if result.0 != 1 {
+            if result.1 < 0 {
+                return Err(StoreError::NotFound(key));
+            }
+            return Err(StoreError::Allocator(format!(
+                "segment capacity exhausted for {}:{} requested={} remaining={}",
+                owner, segment.0, length_bytes, result.1
+            )));
+        }
+        Ok(SegmentReservation {
+            owner: owner.clone(),
+            segment_name: segment.clone(),
+            offset_bytes: result.1 as u64,
+            length_bytes,
+        })
     }
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
