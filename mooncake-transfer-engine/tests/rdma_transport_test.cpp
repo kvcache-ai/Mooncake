@@ -368,9 +368,10 @@ std::string loadNicPriorityMatrix(const std::string &backend) {
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
-    std::string matrix =
-        "{\"cpu:0\": [[" + device_names + "], []], "
-        " \"cpu:1\": [[" + device_names + "], []]";
+    std::string matrix = "{\"cpu:0\": [[" + device_names +
+                         "], []], "
+                         " \"cpu:1\": [[" +
+                         device_names + "], []]";
     if (usesDeviceMemory(backend)) {
         matrix += ", \"" + explicitLocation(backend) + "\": [[" + device_names +
                   "], []]";
