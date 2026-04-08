@@ -4,8 +4,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, ObjectRef, PutFromRequest,
-    PutRequest, StoreClient, StoreClientBuilder,
+    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, ObjectRef, PlacementPlanner,
+    PutFromRequest, PutRequest, StoreClient, StoreClientBuilder,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result, StoreError,
@@ -35,6 +35,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let metadata = Arc::new(RedisMetadataBackend::new(
         RedisMetadataConfig::new(redis_url).keyspace(keyspace),
     )?);
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
     let memory = LocalMemoryConfig::new()
         .storage_bytes(MEMORY_BYTES)
         .scratch_bytes(SCRATCH_BYTES)
@@ -59,7 +60,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         engine_target_a,
         memory.clone(),
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "primary")],
+        &[("pool", "pool-a"), ("role", "primary"), ("storage", "true")],
     )?;
     let target_b = build_client(
         metadata.clone(),
@@ -69,7 +70,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         engine_target_b,
         memory.clone(),
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "scaleout")],
+        &[("pool", "pool-a"), ("role", "scaleout"), ("storage", "true")],
     )?;
     let mut target_upgrade = build_client(
         metadata.clone(),
@@ -79,7 +80,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         engine_upgrade,
         memory.clone(),
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "upgrade")],
+        &[("pool", "pool-a"), ("role", "upgrade"), ("storage", "true")],
     )?;
     let reclaim_writer = build_client(
         metadata.clone(),
@@ -94,7 +95,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .reclaim_grace_ms(0)
             .tags(vec!["dram".to_string(), "overwrite-reclaim".to_string()]),
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "reclaim")],
+        &[("pool", "pool-reclaim"), ("role", "reclaim"), ("storage", "true")],
     )?;
     let reader = build_client(
         metadata,
@@ -104,7 +105,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         engine_reader,
         memory,
         "tenant-a",
-        &[("pool", "pool-a"), ("role", "reader")],
+        &[("pool", "pool-a"), ("role", "reader"), ("storage", "false")],
     )?;
 
     target_a.register_local_memory()?;
@@ -118,7 +119,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_batch_put_get(&target_a, &reader, value_size)?;
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
-    verify_dynamic_scale_out(&target_a, &target_b, &reader, value_size)?;
+    verify_dynamic_scale_out(&planner, &target_a, &target_b, &reader, value_size)?;
     verify_hot_upgrade(&mut target_a, &mut target_upgrade, &reader, value_size)?;
 
     run_batch_put_benchmark(&target_b, value_size, batch_bench_iters)?;
@@ -339,31 +340,65 @@ fn verify_overwrite_reclaims_capacity(
 }
 
 fn verify_dynamic_scale_out(
+    planner: &PlacementPlanner,
     writer_a: &StoreClient,
     writer_b: &StoreClient,
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
-    let mut left = build_items("tenant-a", "scale-left", 4, value_size);
-    let mut right = build_items("tenant-a", "scale-right", 4, value_size);
-    let puts_left = left
-        .iter()
-        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
-        .collect::<Vec<_>>();
-    let puts_right = right
-        .iter()
-        .map(|item| PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()))
-        .collect::<Vec<_>>();
-    writer_a.batch_put(&puts_left)?;
-    writer_b.batch_put(&puts_right)?;
-
-    left.append(&mut right);
-    let refs = left
+    let items = build_items("tenant-a", "scale-auto", 32, value_size);
+    let refs = items
         .iter()
         .map(|item| ObjectRef::new(item.key.as_str()).tenant(item.tenant.as_str()))
         .collect::<Vec<_>>();
+    let plans = planner.plan(writer_a, &refs, 1)?;
+    let writers = std::collections::BTreeMap::from([
+        (
+            writer_a.runtime_id().storage_key(),
+            writer_a,
+        ),
+        (
+            writer_b.runtime_id().storage_key(),
+            writer_b,
+        ),
+    ]);
+    let mut grouped = std::collections::BTreeMap::<String, Vec<PutRequest<'_>>>::new();
+    let mut placement_counts = std::collections::BTreeMap::<String, usize>::new();
+    for (item, plan) in items.iter().zip(plans.iter()) {
+        let owner = plan
+            .owners
+            .first()
+            .ok_or_else(|| StoreError::InvalidState("placement returned no owner".to_string()))?;
+        *placement_counts.entry(owner.storage_key()).or_default() += 1;
+        grouped
+            .entry(owner.storage_key())
+            .or_default()
+            .push(PutRequest::new(item.key.as_str(), item.value.as_slice()).tenant(item.tenant.as_str()));
+    }
+
+    let left_count = placement_counts
+        .get(&writer_a.runtime_id().storage_key())
+        .copied()
+        .unwrap_or_default();
+    let right_count = placement_counts
+        .get(&writer_b.runtime_id().storage_key())
+        .copied()
+        .unwrap_or_default();
+    if left_count == 0 || right_count == 0 {
+        return Err(StoreError::InvalidState(format!(
+            "scale-out planner failed to spread writes: left={left_count} right={right_count}"
+        )));
+    }
+
+    for (runtime, requests) in grouped {
+        let writer = writers.get(&runtime).ok_or_else(|| {
+            StoreError::InvalidState(format!("planned runtime {runtime} is not wired in e2e"))
+        })?;
+        writer.batch_put(&requests)?;
+    }
+
     let results = reader.batch_get(&refs)?;
-    ensure_batch_payloads("scale-out batch_get", &left, &results)?;
+    ensure_batch_payloads("scale-out batch_get", &items, &results)?;
     Ok(())
 }
 
