@@ -115,7 +115,29 @@ pip install mooncake-transfer-engine-non-cuda
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
     ```
 
-4. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_HOME` (default `/opt/maca` if unset). SDK layouts vary; CMake adds both `${MACA_HOME}/lib` and `${MACA_HOME}/lib64` to the link search path, so include both in the environment when linking or running binaries:
+4. If you want to compile Cambricon MLU support, first install the Cambricon Neuware SDK. After that:
+    1) Export `NEUWARE_HOME` or pass `-DNEUWARE_ROOT=/path/to/neuware` to CMake
+    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cnrt`, `cndrv`, and other Neuware libraries during compilation:
+    ```bash
+    export NEUWARE_HOME=/usr/local/neuware
+    export LIBRARY_PATH=$LIBRARY_PATH:${NEUWARE_HOME}/lib64
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${NEUWARE_HOME}/lib64
+    ```
+
+    If your Neuware installation lives outside the default include/library layout, you can also pass:
+    ```bash
+    cmake .. -DUSE_MLU=ON \
+      -DMLU_INCLUDE_DIR=/path/to/neuware/include \
+      -DMLU_LIB_DIR=/path/to/neuware/lib64
+    ```
+
+    For Cambricon MLU builds, enable the MLU backend explicitly:
+    ```bash
+    cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=${NEUWARE_HOME:-/usr/local/neuware}
+    make -j
+    ```
+
+5. If you want to compile MetaX (Muxi) MACA support (e.g. C500), install the MACA SDK so headers and libraries are available under `MACA_HOME` (default `/opt/maca` if unset). SDK layouts vary; CMake adds both `${MACA_HOME}/lib` and `${MACA_HOME}/lib64` to the link search path, so include both in the environment when linking or running binaries:
     ```bash
     export MACA_HOME=/opt/maca
     export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
@@ -123,7 +145,7 @@ pip install mooncake-transfer-engine-non-cuda
     ```
     Build with `-DUSE_MACA=ON`. To override which libraries are linked to `transfer_engine`, pass a CMake list at configure time, e.g. `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated). This variable is read in `mooncake-transfer-engine/src/CMakeLists.txt` under `if(USE_MACA)`, not in `mooncake-common/common.cmake`.
 
-5. Install yalantinglibs
+6. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -133,7 +155,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-6. In the root directory of this project, run the following commands:
+7. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -141,7 +163,7 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-7. Install Mooncake python package and mooncake_master executable
+8. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```

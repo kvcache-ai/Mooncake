@@ -22,6 +22,8 @@
 //   --segment_id=127.0.0.2:12345 --local_server_name=127.0.0.3:12346
 //   --device_name=erdma_1 --mem_backend=mlu --device_id=0
 //   --expect_remote_location=mlu:0
+// MACA builds use mem_backend=gpu (same cuda_alike path); example:
+//   --expect_remote_location=maca:0
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -47,6 +49,7 @@
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU) || \
     defined(USE_MACA)
 
 #include <cassert>
@@ -97,31 +100,98 @@ std::string pickBackend() {
     }
 #if defined(USE_MLU)
     return "mlu";
-#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     return FLAGS_use_vram ? "gpu" : "cpu";
 #else
     return "cpu";
 #endif
 }
 
+int pickDevId(const std::string &backend) {
+    if (FLAGS_device_id >= 0) {
+        return FLAGS_device_id;
+    }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MACA)
-DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
-DEFINE_int32(gpu_id, 0, "GPU ID to use");
+    if (backend == "gpu") {
+        return FLAGS_gpu_id;
+    }
 #endif
     return 0;
 }
 
 bool usesDeviceMemory(const std::string &backend) { return backend != "cpu"; }
 
-static void *allocateMemoryPool(size_t size, int socket_id,
-                                bool from_vram = false) {
+void validateBackend(const std::string &backend) {
+    if (backend == "cpu") {
+        return;
+    }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_MACA)
-    if (from_vram) {
-        int gpu_id = FLAGS_gpu_id;
-        void *d_buf;
-        checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
+    if (backend == "gpu") {
+        return;
+    }
+#endif
+#if defined(USE_MLU)
+    if (backend == "mlu") {
+        return;
+    }
+#endif
+    LOG(ERROR) << "Unsupported mem_backend=" << backend;
+    std::exit(EXIT_FAILURE);
+}
+
+std::string explicitLocation(const std::string &backend) {
+    if (backend == "cpu") {
+        return "cpu:0";
+    }
+    return GPU_PREFIX + std::to_string(pickDevId(backend));
+}
+
+std::string registrationLocation(const std::string &backend) {
+    if (FLAGS_protocol != "rdma") {
+        return "cpu:0";
+    }
+    if (FLAGS_use_wildcard_location) {
+        return kWildcardLocation;
+    }
+    return explicitLocation(backend);
+}
+
+bool validateTransferSizes() {
+    if (FLAGS_data_length == 0) {
+        LOG(ERROR) << "data_length must be greater than 0";
+        return false;
+    }
+    if (FLAGS_buffer_size < FLAGS_data_length * 2) {
+        LOG(ERROR) << "buffer_size must be at least 2 * data_length";
+        return false;
+    }
+    return true;
+}
+
+void setBackendDevice(const std::string &backend) {
+    if (!usesDeviceMemory(backend)) {
+        return;
+    }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU) || \
+    defined(USE_MACA)
+    checkCudaError(cudaSetDevice(pickDevId(backend)), "Failed to set device");
+#else
+    LOG(FATAL) << "Device memory backend is not available in this build";
+#endif
+}
+
+void *allocateMemoryPool(size_t size, int socket_id,
+                         const std::string &backend) {
+    if (usesDeviceMemory(backend)) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU) || \
+    defined(USE_MACA)
+        setBackendDevice(backend);
+        void *d_buf = nullptr;
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
         return d_buf;
@@ -133,15 +203,11 @@ static void *allocateMemoryPool(size_t size, int socket_id,
     return numa_alloc_onnode(size, socket_id);
 }
 
-static void freeMemoryPool(void *addr, size_t size) {
+void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
+    if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU) || \
     defined(USE_MACA)
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                   "Failed to get pointer attributes");
-
-    if (attributes.type == cudaMemoryTypeDevice) {
         cudaFree(addr);
         return;
 #else
@@ -155,7 +221,8 @@ void copyFromHost(void *dst, const void *src, size_t size,
                   const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU)
+    defined(USE_MLU) || \
+    defined(USE_MACA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice),
                        "Failed to copy host data to device");
         return;
@@ -170,7 +237,8 @@ void copyToHost(void *dst, const void *src, size_t size,
                 const std::string &backend) {
     if (usesDeviceMemory(backend)) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU)
+    defined(USE_MLU) || \
+    defined(USE_MACA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost),
                        "Failed to copy device data to host");
         return;
@@ -311,19 +379,34 @@ std::string loadNicPriorityMatrix(const std::string &backend) {
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
-    return "{\"cpu:0\": [[" + device_names +
-           "], []], "
-           " \"cpu:1\": [[" +
-           device_names +
-           "], []], "
-           " \"cuda:0\": [[" +
-           device_names +
-           "], []], "
-           " \"musa:0\": [[" +
-           device_names +
-           "], []], "
-           " \"maca:0\": [[" +
-           device_names + "], []]}";
+    std::string matrix = "{\"cpu:0\": [[" + device_names +
+                         "], []], "
+                         " \"cpu:1\": [[" +
+                         device_names + "], []]";
+    if (usesDeviceMemory(backend)) {
+        matrix += ", \"" + explicitLocation(backend) + "\": [[" + device_names +
+                  "], []]";
+    }
+    matrix += "}";
+    return matrix;
+}
+
+Transport *installTransport(TransferEngine *engine,
+                            const std::string &backend) {
+    if (FLAGS_protocol == "rdma") {
+        auto nic_priority_matrix = loadNicPriorityMatrix(backend);
+        void *args[2] = {const_cast<char *>(nic_priority_matrix.c_str()),
+                         nullptr};
+        return engine->installTransport("rdma", args);
+    }
+    if (FLAGS_protocol == "tcp") {
+        return engine->installTransport("tcp", nullptr);
+    }
+    if (FLAGS_protocol == "nvmeof") {
+        return engine->installTransport("nvmeof", nullptr);
+    }
+    LOG(ERROR) << "Unsupported protocol: must be rdma, tcp, or nvmeof";
+    return nullptr;
 }
 
 int initiator() {
@@ -349,14 +432,9 @@ int initiator() {
     Transport *xport = installTransport(engine.get(), backend);
     LOG_ASSERT(xport);
 
-    void *addr = nullptr;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
-    addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
-    std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
-    int name_suffix = FLAGS_use_vram ? FLAGS_gpu_id : 0;
-    int rc = engine->registerLocalMemory(
-        addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
+    void *addr = allocateMemoryPool(FLAGS_buffer_size, 0, backend);
+    int rc = engine->registerLocalMemory(addr, FLAGS_buffer_size,
+                                         registrationLocation(backend));
     LOG_ASSERT(!rc);
 
     auto segment_id = engine->openSegment(FLAGS_segment_id.c_str());
