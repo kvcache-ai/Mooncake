@@ -3,6 +3,7 @@
   <h2 align="center">
       A KVCache-centric Disaggregated Architecture for LLM Serving
   </h2>
+<!-- CI gate test: doc-only change should not trigger downstream tests -->
   <a href="https://www.usenix.org/system/files/fast25-qin.pdf" target="_blank"><strong>Paper</strong></a>
   | <a href="https://www.usenix.org/system/files/fast25_slides-qin.pdf" target="_blank"><strong>Slides</strong></a>
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
