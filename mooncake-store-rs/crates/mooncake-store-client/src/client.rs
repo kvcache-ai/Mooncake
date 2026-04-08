@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mooncake_store_core::{
-    CasResult, ClientEpoch, ClientEndpointSet, ClientLease, ClientLifecycleState, ClientRuntimeId,
+    CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey,
     ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteState, RouteVersion, SegmentAnnouncement,
     SegmentName, StoreError,
@@ -418,9 +418,11 @@ impl StoreClient {
                 priority: 0,
             }],
         };
-        let cas = self
-            .metadata
-            .compare_and_swap_object_route(&scoped_key, expected_version, Some(&route))?;
+        let cas = self.metadata.compare_and_swap_object_route(
+            &scoped_key,
+            expected_version,
+            Some(&route),
+        )?;
         if !cas.applied {
             return Err(StoreError::Conflict(format!(
                 "route update lost race for tenant={tenant} key={key}"
@@ -433,7 +435,11 @@ impl StoreClient {
             let mut state = self.state.lock();
             state.memory_mut()?.storage_used_bytes() as u64
         };
-        self.mount_segment(self.storage_capacity_bytes()? as u64, used_bytes, self.local_memory.tags.clone())?;
+        self.mount_segment(
+            self.storage_capacity_bytes()? as u64,
+            used_bytes,
+            self.local_memory.tags.clone(),
+        )?;
         Ok(route)
     }
 
@@ -480,9 +486,11 @@ impl StoreClient {
                 })
                 .collect(),
         };
-        let cas = self
-            .metadata
-            .compare_and_swap_object_route(&route.key, expected_version, Some(&route))?;
+        let cas = self.metadata.compare_and_swap_object_route(
+            &route.key,
+            expected_version,
+            Some(&route),
+        )?;
         if !cas.applied {
             return Err(StoreError::Conflict(format!(
                 "route update lost race for tenant={tenant} key={key}"
@@ -496,10 +504,9 @@ impl StoreClient {
         for object in objects {
             let tenant = object.tenant.unwrap_or(self.default_tenant());
             let scoped = self.scoped_key(tenant, object.key);
-            let route = self
-                .metadata
-                .get_object_route(&scoped)?
-                .ok_or_else(|| StoreError::NotFound(format!("tenant={tenant} key={}", object.key)))?;
+            let route = self.metadata.get_object_route(&scoped)?.ok_or_else(|| {
+                StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
+            })?;
             if route.state != RouteState::Active {
                 return Err(StoreError::InvalidState(format!(
                     "tenant={tenant} key={} is not active",
@@ -618,11 +625,7 @@ impl StoreClient {
 
         let mut sizes = Vec::with_capacity(buffers.len());
         let mut scratch_index = 0usize;
-        for ((buffer, direct), length) in buffers
-            .iter_mut()
-            .zip(direct_paths.iter())
-            .zip(lengths)
-        {
+        for ((buffer, direct), length) in buffers.iter_mut().zip(direct_paths.iter()).zip(lengths) {
             if !*direct {
                 unsafe {
                     ptr::copy_nonoverlapping(
@@ -680,11 +683,7 @@ impl StoreClient {
                 "routed target resolution requires routed write mode".to_string(),
             ));
         };
-        let plan = planner.plan(
-            self,
-            &[ObjectRef::new(key).tenant(tenant)],
-            *replica_count,
-        )?;
+        let plan = planner.plan(self, &[ObjectRef::new(key).tenant(tenant)], *replica_count)?;
         let owners = plan
             .into_iter()
             .next()
@@ -761,7 +760,9 @@ impl StoreClient {
             let target_offset = buffer
                 .base
                 .checked_add(reservation.offset_bytes)
-                .ok_or_else(|| StoreError::Transport("remote target offset overflow".to_string()))?;
+                .ok_or_else(|| {
+                    StoreError::Transport("remote target offset overflow".to_string())
+                })?;
             remote_requests.push((index, handle, target_offset));
             absolute_offsets[index] = target_offset;
         }
@@ -788,7 +789,8 @@ impl StoreClient {
                 let _ = transport.free_batch(batch_id);
                 return Err(error);
             }
-            let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let wait_result =
+                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
             let free_result = transport.free_batch(batch_id);
             wait_result?;
             free_result?;
@@ -906,7 +908,8 @@ impl StoreClient {
                 .zip(entry.reservations.iter())
                 .enumerate()
             {
-                let is_local = target.runtime == self.lease.runtime && target.segment_name == local_segment;
+                let is_local =
+                    target.runtime == self.lease.runtime && target.segment_name == local_segment;
                 let offset = if is_local {
                     let addr = {
                         let state = self.state.lock();
@@ -915,7 +918,11 @@ impl StoreClient {
                             .storage_address(reservation.offset_bytes as usize)?
                     };
                     unsafe {
-                        ptr::copy_nonoverlapping(entry.value.as_ptr(), addr.cast::<u8>(), entry.value.len());
+                        ptr::copy_nonoverlapping(
+                            entry.value.as_ptr(),
+                            addr.cast::<u8>(),
+                            entry.value.len(),
+                        );
                     }
                     addr as u64
                 } else {
@@ -930,16 +937,17 @@ impl StoreClient {
                             target.segment_name.0
                         ))
                     })?;
-                    let target_offset = buffer.base.checked_add(reservation.offset_bytes).ok_or_else(|| {
-                        StoreError::Transport("remote target offset overflow".to_string())
-                    })?;
-                    let scratch = scratch_slots[entry
-                        .scratch_index
+                    let target_offset = buffer
+                        .base
+                        .checked_add(reservation.offset_bytes)
                         .ok_or_else(|| {
-                            StoreError::InvalidState(
-                                "remote write is missing a scratch slot".to_string(),
-                            )
-                        })?];
+                            StoreError::Transport("remote target offset overflow".to_string())
+                        })?;
+                    let scratch = scratch_slots[entry.scratch_index.ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "remote write is missing a scratch slot".to_string(),
+                        )
+                    })?];
                     remote_requests.push(TransferRequest {
                         opcode: Opcode::Write,
                         source: scratch.addr,
@@ -986,7 +994,8 @@ impl StoreClient {
                 let _ = transport.free_batch(batch_id);
                 return Err(error);
             }
-            let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let wait_result =
+                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
             let free_result = transport.free_batch(batch_id);
             wait_result?;
             free_result?;
@@ -994,9 +1003,11 @@ impl StoreClient {
 
         let mut published = Vec::with_capacity(routes.len());
         for pending in routes {
-            let cas = self
-                .metadata
-                .compare_and_swap_object_route(&pending.key, pending.expected_version, Some(&pending.route))?;
+            let cas = self.metadata.compare_and_swap_object_route(
+                &pending.key,
+                pending.expected_version,
+                Some(&pending.route),
+            )?;
             if !cas.applied {
                 return Err(StoreError::Conflict(format!(
                     "route update lost race for key {}",
@@ -1087,7 +1098,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_in_tenant(&self, tenant: &str, key: &str) -> Result<Option<ObjectRoute>> {
-        self.metadata.get_object_route(&self.scoped_key(tenant, key))
+        self.metadata
+            .get_object_route(&self.scoped_key(tenant, key))
     }
 
     fn cas_route(
@@ -1186,7 +1198,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
-            routes.push(self.put_from_in_tenant(tenant, request.key, request.buffer, request.size)?);
+            routes.push(self.put_from_in_tenant(
+                tenant,
+                request.key,
+                request.buffer,
+                request.size,
+            )?);
         }
         Ok(routes)
     }
@@ -1282,7 +1299,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let payloads = self.batch_get(&objects)?;
         let mut sizes = Vec::with_capacity(requests.len());
         for (request, payload) in requests.iter_mut().zip(payloads.iter()) {
-            let total = request.buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+            let total = request
+                .buffers
+                .iter()
+                .map(|buffer| buffer.len())
+                .sum::<usize>();
             if total < payload.len() {
                 return Err(StoreError::Allocator(format!(
                     "multi-buffer capacity too small for key {}: have={} need={}",
@@ -1362,16 +1383,13 @@ impl StoreState {
             .ok_or_else(|| StoreError::InvalidState("local memory is not registered".to_string()))
     }
 
-    fn open_segment(
-        &mut self,
-        transport: &dyn StoreTransport,
-        segment_name: &str,
-    ) -> Result<u64> {
+    fn open_segment(&mut self, transport: &dyn StoreTransport, segment_name: &str) -> Result<u64> {
         if let Some(handle) = self.remote_segments.get(segment_name) {
             return Ok(*handle);
         }
         let handle = transport.open_segment(segment_name)?;
-        self.remote_segments.insert(segment_name.to_string(), handle);
+        self.remote_segments
+            .insert(segment_name.to_string(), handle);
         Ok(handle)
     }
 
@@ -1501,12 +1519,361 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::c_void;
+    use std::ptr;
     use std::sync::Arc;
 
     use mooncake_metadata::InMemoryMetadataBackend;
-    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, HandoffKind, MetadataBackend};
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, SegmentAnnouncement,
+        SegmentName, StoreError,
+    };
+    use mooncake_transport::{
+        Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
+        TransferStatus,
+    };
+    use parking_lot::Mutex;
 
-    use crate::{MooncakeCompatibilityFacade, StoreClientBuilder};
+    use crate::{
+        transport::StoreTransport, LocalMemoryConfig, MooncakeCompatibilityFacade,
+        MultiBufferGetRequest, PlacementPlanner, PutRequest, StoreClientBuilder,
+    };
+
+    struct TestTransport {
+        local_segment: String,
+        state: Mutex<TestTransportState>,
+    }
+
+    struct TestTransportState {
+        next_handle: u64,
+        next_batch: u64,
+        allocations: BTreeMap<usize, Box<[u8]>>,
+        segments_by_name: BTreeMap<String, u64>,
+        segments_by_handle: BTreeMap<u64, TestSegment>,
+        live_batches: BTreeSet<u64>,
+        registered_memory: BTreeMap<usize, usize>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestSegment {
+        base: usize,
+        len: usize,
+    }
+
+    impl TestTransport {
+        fn new(local_segment: &str) -> Self {
+            Self {
+                local_segment: local_segment.to_string(),
+                state: Mutex::new(TestTransportState {
+                    next_handle: 1,
+                    next_batch: 1,
+                    allocations: BTreeMap::new(),
+                    segments_by_name: BTreeMap::new(),
+                    segments_by_handle: BTreeMap::new(),
+                    live_batches: BTreeSet::new(),
+                    registered_memory: BTreeMap::new(),
+                }),
+            }
+        }
+
+        fn add_external_segment(&self, segment_name: &str, size: usize) -> u64 {
+            let mut state = self.state.lock();
+            let base = allocate_boxed_region(&mut state, size);
+            register_segment(&mut state, segment_name.to_string(), base, size)
+        }
+
+        fn segment_bounds(&self, segment_name: &str) -> Option<(u64, u64)> {
+            let state = self.state.lock();
+            let handle = state.segments_by_name.get(segment_name)?;
+            let segment = state.segments_by_handle.get(handle)?;
+            Some((segment.base as u64, segment.len as u64))
+        }
+    }
+
+    impl StoreTransport for TestTransport {
+        fn segment_name(&self) -> mooncake_store_core::Result<String> {
+            Ok(self.local_segment.clone())
+        }
+
+        fn rpc_server_address(&self) -> mooncake_store_core::Result<(String, u16)> {
+            Ok(("127.0.0.1".to_string(), 0))
+        }
+
+        fn open_segment(&self, segment_name: &str) -> mooncake_store_core::Result<u64> {
+            let state = self.state.lock();
+            state
+                .segments_by_name
+                .get(segment_name)
+                .copied()
+                .ok_or_else(|| StoreError::NotFound(format!("segment {segment_name} not found")))
+        }
+
+        fn close_segment(&self, handle: u64) -> mooncake_store_core::Result<()> {
+            let state = self.state.lock();
+            if state.segments_by_handle.contains_key(&handle) {
+                return Ok(());
+            }
+            Err(StoreError::NotFound(format!(
+                "segment handle {handle} not found"
+            )))
+        }
+
+        fn get_segment_info(&self, handle: u64) -> mooncake_store_core::Result<SegmentInfo> {
+            let state = self.state.lock();
+            let segment = state
+                .segments_by_handle
+                .get(&handle)
+                .copied()
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("segment handle {handle} not found"))
+                })?;
+            Ok(SegmentInfo {
+                kind: SegmentKind::Memory,
+                buffers: vec![SegmentBuffer {
+                    base: segment.base as u64,
+                    length: segment.len as u64,
+                    location: "cpu:0".to_string(),
+                }],
+            })
+        }
+
+        fn allocate_memory(
+            &self,
+            size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<*mut c_void> {
+            let mut state = self.state.lock();
+            let base = allocate_boxed_region(&mut state, size);
+            if !state.segments_by_name.contains_key(&self.local_segment) {
+                register_segment(&mut state, self.local_segment.clone(), base, size);
+            }
+            Ok(base as *mut c_void)
+        }
+
+        fn free_memory(&self, addr: *mut c_void) -> mooncake_store_core::Result<()> {
+            let mut state = self.state.lock();
+            let key = addr as usize;
+            if state.allocations.remove(&key).is_none() {
+                return Err(StoreError::NotFound(format!(
+                    "allocation {:p} not found",
+                    addr
+                )));
+            }
+            let orphaned = state
+                .segments_by_handle
+                .iter()
+                .filter_map(|(handle, segment)| (segment.base == key).then_some(*handle))
+                .collect::<Vec<_>>();
+            for handle in orphaned {
+                state.segments_by_handle.remove(&handle);
+                state
+                    .segments_by_name
+                    .retain(|_, current_handle| *current_handle != handle);
+            }
+            state.registered_memory.remove(&key);
+            Ok(())
+        }
+
+        fn register_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            self.state
+                .lock()
+                .registered_memory
+                .insert(addr as usize, size);
+            Ok(())
+        }
+
+        fn unregister_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            let mut state = self.state.lock();
+            match state.registered_memory.remove(&(addr as usize)) {
+                Some(registered) if registered == size => Ok(()),
+                Some(registered) => Err(StoreError::Allocator(format!(
+                    "registered size mismatch: expected={registered} got={size}"
+                ))),
+                None => Err(StoreError::NotFound(format!(
+                    "registered allocation {:p} not found",
+                    addr
+                ))),
+            }
+        }
+
+        fn allocate_batch(&self, batch_size: usize) -> mooncake_store_core::Result<u64> {
+            if batch_size == 0 {
+                return Err(StoreError::Transport(
+                    "batch_size must be greater than zero".to_string(),
+                ));
+            }
+            let mut state = self.state.lock();
+            let batch_id = state.next_batch;
+            state.next_batch += 1;
+            state.live_batches.insert(batch_id);
+            Ok(batch_id)
+        }
+
+        fn free_batch(&self, batch_id: u64) -> mooncake_store_core::Result<()> {
+            if self.state.lock().live_batches.remove(&batch_id) {
+                return Ok(());
+            }
+            Err(StoreError::NotFound(format!("batch {batch_id} not found")))
+        }
+
+        fn submit(
+            &self,
+            batch_id: u64,
+            requests: &[TransferRequest],
+        ) -> mooncake_store_core::Result<()> {
+            let state = self.state.lock();
+            if !state.live_batches.contains(&batch_id) {
+                return Err(StoreError::NotFound(format!("batch {batch_id} not found")));
+            }
+            for request in requests {
+                let segment = state
+                    .segments_by_handle
+                    .get(&request.target_id)
+                    .ok_or_else(|| {
+                        StoreError::NotFound(format!(
+                            "segment handle {} not found",
+                            request.target_id
+                        ))
+                    })?;
+                validate_request_bounds(*segment, request)?;
+                unsafe {
+                    match request.opcode {
+                        Opcode::Write => ptr::copy_nonoverlapping(
+                            request.source.cast::<u8>(),
+                            request.target_offset as *mut u8,
+                            request.length as usize,
+                        ),
+                        Opcode::Read => ptr::copy_nonoverlapping(
+                            request.target_offset as *const u8,
+                            request.source.cast::<u8>(),
+                            request.length as usize,
+                        ),
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn task_status(
+            &self,
+            batch_id: u64,
+            _task_id: usize,
+        ) -> mooncake_store_core::Result<TransferProgress> {
+            self.overall_status(batch_id)
+        }
+
+        fn overall_status(&self, batch_id: u64) -> mooncake_store_core::Result<TransferProgress> {
+            if self.state.lock().live_batches.contains(&batch_id) {
+                return Ok(TransferProgress {
+                    status: TransferStatus::Completed,
+                    transferred_bytes: 0,
+                });
+            }
+            Err(StoreError::NotFound(format!("batch {batch_id} not found")))
+        }
+    }
+
+    fn allocate_boxed_region(state: &mut TestTransportState, size: usize) -> usize {
+        let mut memory = vec![0u8; size].into_boxed_slice();
+        let base = memory.as_mut_ptr() as usize;
+        state.allocations.insert(base, memory);
+        base
+    }
+
+    fn register_segment(
+        state: &mut TestTransportState,
+        segment_name: String,
+        base: usize,
+        size: usize,
+    ) -> u64 {
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        state.segments_by_name.insert(segment_name, handle);
+        state
+            .segments_by_handle
+            .insert(handle, TestSegment { base, len: size });
+        handle
+    }
+
+    fn validate_request_bounds(
+        segment: TestSegment,
+        request: &TransferRequest,
+    ) -> mooncake_store_core::Result<()> {
+        let start = usize::try_from(request.target_offset)
+            .map_err(|_| StoreError::Transport("target offset does not fit usize".to_string()))?;
+        let end = start
+            .checked_add(request.length as usize)
+            .ok_or_else(|| StoreError::Transport("request length overflow".to_string()))?;
+        let segment_end = segment
+            .base
+            .checked_add(segment.len)
+            .ok_or_else(|| StoreError::Transport("segment length overflow".to_string()))?;
+        if start < segment.base || end > segment_end {
+            return Err(StoreError::Transport(format!(
+                "request out of segment bounds: start={start} end={end} segment={}..{}",
+                segment.base, segment_end
+            )));
+        }
+        Ok(())
+    }
+
+    fn storage_config() -> LocalMemoryConfig {
+        LocalMemoryConfig::new()
+            .storage_bytes(4096)
+            .scratch_bytes(4096)
+            .reclaim_grace_ms(0)
+    }
+
+    fn publish_storage_node(
+        metadata: &InMemoryMetadataBackend,
+        transport: &TestTransport,
+        stable_id: &str,
+        segment_name: &str,
+        pool: &str,
+    ) -> ClientRuntimeId {
+        transport.add_external_segment(segment_name, 4096);
+        let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(1));
+        let mut endpoints = ClientEndpointSet {
+            rpc_address: "127.0.0.1:0".to_string(),
+            segment_name: Some(SegmentName::new(segment_name)),
+            labels: Default::default(),
+        };
+        endpoints
+            .labels
+            .insert("pool".to_string(), pool.to_string());
+        endpoints
+            .labels
+            .insert("storage".to_string(), "true".to_string());
+        metadata
+            .upsert_client_lease(&ClientLease {
+                runtime: runtime.clone(),
+                state: ClientLifecycleState::Active,
+                compatibility: CompatibilityDescriptor::default(),
+                endpoints,
+                expires_at_ms: 10_000,
+            })
+            .expect("storage lease should upsert");
+        metadata
+            .publish_segment(&SegmentAnnouncement {
+                owner: runtime.clone(),
+                segment_name: SegmentName::new(segment_name),
+                capacity_bytes: 4096,
+                used_bytes: 0,
+                tags: vec!["dram".to_string()],
+            })
+            .expect("storage segment should publish");
+        runtime
+    }
 
     #[test]
     fn hot_upgrade_handoff_is_published_after_draining() {
@@ -1524,7 +1891,9 @@ mod tests {
             .plan_handoff(ClientEpoch(2), HandoffKind::HotUpgrade, 7, 100, Some(1_000))
             .expect("handoff planning should succeed");
 
-        let leases = metadata.list_live_clients().expect("list clients should succeed");
+        let leases = metadata
+            .list_live_clients()
+            .expect("list clients should succeed");
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].state, ClientLifecycleState::Draining);
 
@@ -1555,5 +1924,137 @@ mod tests {
             .query_route_in_tenant("tenant-a", "same-key")
             .expect("tenant query should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn routed_batch_put_rejects_duplicate_scoped_keys() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("router-segment"));
+        let planner = PlacementPlanner::new(metadata.clone());
+        let client = StoreClientBuilder::new(metadata, "router")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config())
+            .routed_writes(planner, 1)
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let error = client
+            .batch_put(&[
+                PutRequest::new("dup-key", b"left").tenant("tenant-a"),
+                PutRequest::new("dup-key", b"right").tenant("tenant-a"),
+            ])
+            .expect_err("duplicate scoped key should fail");
+
+        assert!(matches!(error, StoreError::Conflict(_)));
+        assert!(error
+            .to_string()
+            .contains("duplicate scoped key tenant-a::dup-key"));
+    }
+
+    #[test]
+    fn batch_get_into_multi_buffers_rejects_insufficient_capacity() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("client-segment"));
+        let client = StoreClientBuilder::new(metadata, "client-a")
+            .state(ClientLifecycleState::Active)
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("client build should succeed");
+
+        client.put("blob", b"abcdefgh").expect("put should succeed");
+        let mut part_a = [0u8; 3];
+        let mut part_b = [0u8; 3];
+        let mut buffers: [&mut [u8]; 2] = [&mut part_a, &mut part_b];
+        let mut requests = [MultiBufferGetRequest::new("blob", &mut buffers)];
+
+        let error = client
+            .batch_get_into_multi_buffers(&mut requests)
+            .expect_err("insufficient multi-buffer capacity should fail");
+
+        assert!(matches!(error, StoreError::Allocator(_)));
+        assert!(error
+            .to_string()
+            .contains("multi-buffer capacity too small"));
+    }
+
+    #[test]
+    fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("router-segment"));
+        let owner_a = publish_storage_node(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-a",
+            "seg-a",
+            "pool-a",
+        );
+        let owner_b = publish_storage_node(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-b",
+            "seg-b",
+            "pool-a",
+        );
+        let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+        let client = StoreClientBuilder::new(metadata.clone(), "router")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport.clone())
+            .local_memory(storage_config())
+            .routed_writes(planner, 2)
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let payload = b"routed-payload";
+        let routes = client
+            .batch_put(&[PutRequest::new("key-a", payload).tenant("tenant-a")])
+            .expect("batch routed put should succeed");
+
+        assert_eq!(routes.len(), 1);
+        let route = &routes[0];
+        assert_eq!(route.key, ObjectKey::new("tenant-a::key-a"));
+        assert_eq!(route.version.0, 1);
+        assert_eq!(route.replicas.len(), 2);
+        assert_eq!(
+            route
+                .replicas
+                .iter()
+                .map(|replica| replica.priority)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let owners = route
+            .replicas
+            .iter()
+            .map(|replica| replica.owner.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owners, BTreeSet::from([owner_a.clone(), owner_b.clone()]));
+
+        for replica in &route.replicas {
+            let (base, len) = transport
+                .segment_bounds(&replica.segment_name.0)
+                .expect("segment bounds should exist");
+            assert!(replica.offset >= base);
+            assert!(replica.offset + replica.length <= base + len);
+            assert_eq!(replica.length as usize, payload.len());
+        }
+
+        let stored = metadata
+            .get_object_route(&ObjectKey::new("tenant-a::key-a"))
+            .expect("route query should succeed")
+            .expect("route should exist");
+        assert_eq!(stored, *route);
+        assert_eq!(
+            client
+                .get_in_tenant("tenant-a", "key-a")
+                .expect("get should succeed"),
+            payload
+        );
     }
 }

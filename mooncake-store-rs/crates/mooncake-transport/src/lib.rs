@@ -4,7 +4,7 @@ mod tent;
 use std::ffi::c_void;
 
 pub use classic::ClassicTransferEngine;
-pub use tent::{SegmentInfo, TentEngine, TentEngineConfig};
+pub use tent::{SegmentBuffer, SegmentInfo, SegmentKind, TentEngine, TentEngineConfig};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TransportEngineKind {

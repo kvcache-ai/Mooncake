@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use mooncake_store_core::{ClientLease, ClientLifecycleState, ClientRuntimeId, MetadataBackend, Result, StoreError};
+use mooncake_store_core::{
+    ClientLease, ClientLifecycleState, ClientRuntimeId, MetadataBackend, Result, StoreError,
+};
 
 use crate::{ObjectRef, StoreClient};
 
@@ -47,7 +49,12 @@ impl PlacementPlanner {
         objects: &[ObjectRef<'_>],
         replica_count: usize,
     ) -> Result<Vec<PlacementChoice>> {
-        self.plan_from_lease(observer.lease(), observer.default_tenant(), objects, replica_count)
+        self.plan_from_lease(
+            observer.lease(),
+            observer.default_tenant(),
+            objects,
+            replica_count,
+        )
     }
 
     pub fn plan_from_lease(
@@ -97,7 +104,11 @@ impl PlacementPlanner {
     }
 
     fn candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
-        let pool = observer.endpoints.labels.get(&self.scope_label_key).cloned();
+        let pool = observer
+            .endpoints
+            .labels
+            .get(&self.scope_label_key)
+            .cloned();
         let mut candidates = self
             .metadata
             .list_live_clients()?
@@ -106,7 +117,8 @@ impl PlacementPlanner {
             .filter(|lease| is_compatible(observer, lease))
             .filter(|lease| {
                 pool.as_ref().is_none_or(|pool| {
-                    lease.endpoints
+                    lease
+                        .endpoints
                         .labels
                         .get(&self.scope_label_key)
                         .is_some_and(|value| value == pool)
@@ -114,7 +126,8 @@ impl PlacementPlanner {
             })
             .filter(|lease| {
                 self.required_labels.iter().all(|(key, value)| {
-                    lease.endpoints
+                    lease
+                        .endpoints
                         .labels
                         .get(key)
                         .is_some_and(|candidate| candidate == value)
@@ -247,7 +260,10 @@ mod tests {
             .expect("writer should exist");
         let planner = PlacementPlanner::new(metadata).require_label("storage", "true");
         let refs = (0..64)
-            .map(|index| ObjectRef::new(Box::leak(format!("key-{index}").into_boxed_str())).tenant("tenant-a"))
+            .map(|index| {
+                ObjectRef::new(Box::leak(format!("key-{index}").into_boxed_str()))
+                    .tenant("tenant-a")
+            })
             .collect::<Vec<_>>();
         let plans = planner
             .plan_from_lease(&observer, "tenant-a", &refs, 1)
@@ -255,9 +271,64 @@ mod tests {
 
         let mut owners = std::collections::BTreeMap::<String, usize>::new();
         for plan in plans {
-            *owners.entry(plan.owners[0].stable_id.0.clone()).or_default() += 1;
+            *owners
+                .entry(plan.owners[0].stable_id.0.clone())
+                .or_default() += 1;
         }
         assert_eq!(owners.len(), 2);
+    }
+
+    #[test]
+    fn planner_filters_incompatible_storage_nodes() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        publish_client(
+            metadata.as_ref(),
+            "writer",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "false",
+        );
+        publish_client_with_compat(
+            metadata.as_ref(),
+            "storage-a",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "true",
+            CompatibilityDescriptor::default(),
+        );
+        let mut incompatible = CompatibilityDescriptor::default();
+        incompatible.transport_api_version = 2;
+        publish_client_with_compat(
+            metadata.as_ref(),
+            "storage-b",
+            1,
+            ClientLifecycleState::Active,
+            "pool-a",
+            "true",
+            incompatible,
+        );
+
+        let observer = metadata
+            .list_live_clients()
+            .expect("list should work")
+            .into_iter()
+            .find(|lease| lease.runtime.stable_id.0 == "writer")
+            .expect("writer should exist");
+        let planner = PlacementPlanner::new(metadata).require_label("storage", "true");
+
+        let error = planner
+            .plan_from_lease(
+                &observer,
+                "tenant-a",
+                &[ObjectRef::new("key-1").tenant("tenant-a")],
+                2,
+            )
+            .expect_err("incompatible node should not count as a candidate");
+        assert!(error
+            .to_string()
+            .contains("not enough active placement candidates"));
     }
 
     fn publish_client(
@@ -268,13 +339,35 @@ mod tests {
         pool: &str,
         storage: &str,
     ) {
+        publish_client_with_compat(
+            metadata,
+            stable_id,
+            epoch,
+            state,
+            pool,
+            storage,
+            CompatibilityDescriptor::default(),
+        );
+    }
+
+    fn publish_client_with_compat(
+        metadata: &InMemoryMetadataBackend,
+        stable_id: &str,
+        epoch: u64,
+        state: ClientLifecycleState,
+        pool: &str,
+        storage: &str,
+        compatibility: CompatibilityDescriptor,
+    ) {
         let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
         let mut endpoints = ClientEndpointSet {
             rpc_address: "127.0.0.1:0".to_string(),
             segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
             labels: Default::default(),
         };
-        endpoints.labels.insert("pool".to_string(), pool.to_string());
+        endpoints
+            .labels
+            .insert("pool".to_string(), pool.to_string());
         endpoints
             .labels
             .insert("storage".to_string(), storage.to_string());
@@ -282,7 +375,7 @@ mod tests {
             .upsert_client_lease(&ClientLease {
                 runtime,
                 state,
-                compatibility: CompatibilityDescriptor::default(),
+                compatibility,
                 endpoints,
                 expires_at_ms: 10_000,
             })
