@@ -1,4 +1,4 @@
-#include "oplog_watcher.h"
+#include "ha/oplog/oplog_watcher.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -19,11 +19,11 @@
 #endif
 
 #include "metadata_store.h"
-#include "oplog_applier.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_manager.h"
 #include "standby_state_machine.h"
 #include "types.h"
-#include "etcd_oplog_store.h"
+#include "ha/oplog/oplog_store.h"
 
 namespace mooncake::test {
 
@@ -49,10 +49,31 @@ class MinimalMockMetadataStore : public MetadataStore {
 // we just provide a valid instance to OpLogWatcher.
 class MockOpLogApplier : public OpLogApplier {
    public:
-    MockOpLogApplier() : OpLogApplier(&metadata_store_, "test_cluster") {}
+    MockOpLogApplier() : OpLogApplier(&metadata_store_) {}
 
    private:
     MinimalMockMetadataStore metadata_store_;
+};
+
+class NoopOpLogStore final : public ha::OpLogStore {
+   public:
+    tl::expected<ha::OpLogSequenceId, ErrorCode> Append(
+        const ha::OpLogAppendRequest&) override {
+        return ha::OpLogSequenceId{0};
+    }
+
+    tl::expected<ha::OpLogPollResult, ErrorCode> PollFrom(
+        ha::OpLogSequenceId start_seq, size_t,
+        std::chrono::milliseconds) override {
+        ha::OpLogPollResult result;
+        result.next_seq = start_seq + 1;
+        result.timed_out = true;
+        return result;
+    }
+
+    tl::expected<ha::OpLogSequenceId, ErrorCode> GetLatestSequence() override {
+        return ha::OpLogSequenceId{0};
+    }
 };
 
 // Helper function to create a valid OpLogEntry with checksum
@@ -101,8 +122,9 @@ class OpLogWatcherTest : public ::testing::Test {
         etcd_endpoints_ = "http://localhost:2379";
         cluster_id_ = "test_cluster_001";
         mock_applier_ = std::make_unique<MockOpLogApplier>();
-        watcher_ = std::make_unique<OpLogWatcher>(etcd_endpoints_, cluster_id_,
-                                                  mock_applier_.get());
+        mock_store_ = std::make_shared<NoopOpLogStore>();
+        watcher_ =
+            std::make_unique<OpLogWatcher>(mock_store_, mock_applier_.get());
     }
 
     void TearDown() override {
@@ -114,6 +136,7 @@ class OpLogWatcherTest : public ::testing::Test {
 
     std::string etcd_endpoints_;
     std::string cluster_id_;
+    std::shared_ptr<NoopOpLogStore> mock_store_;
     std::unique_ptr<MockOpLogApplier> mock_applier_;
     std::unique_ptr<OpLogWatcher> watcher_;
 };
@@ -352,14 +375,12 @@ TEST_F(OpLogWatcherTest, TestStateCallback_WatchBroken) {
 // ========== 5.1.7 Cluster ID validation tests ==========
 
 TEST_F(OpLogWatcherTest, TestInvalidClusterId_Rejected) {
-    // Invalid cluster_id should cause LOG(FATAL) in constructor
-    // We can't test this directly as it would terminate the process
-    // But we can verify that valid cluster_id works
-    std::string valid_cluster_id = "test_cluster_001";
+    // The generic watcher is decoupled from cluster-id validation. Backend
+    // factories validate cluster namespace before constructing a store.
     std::unique_ptr<MockOpLogApplier> mock_applier =
         std::make_unique<MockOpLogApplier>();
     std::unique_ptr<OpLogWatcher> watcher = std::make_unique<OpLogWatcher>(
-        etcd_endpoints_, valid_cluster_id, mock_applier.get());
+        std::make_shared<NoopOpLogStore>(), mock_applier.get());
     EXPECT_NE(nullptr, watcher);
     watcher->Stop();
 }

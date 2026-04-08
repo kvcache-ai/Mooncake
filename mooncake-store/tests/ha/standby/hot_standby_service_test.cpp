@@ -231,7 +231,7 @@ TEST_F(HotStandbyServiceTest, TestStart) {
 #else
     ErrorCode err =
         service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
 }
@@ -242,13 +242,13 @@ TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
         << "Requires real etcd connection to verify double start semantics.";
 #else
     // After the first Start fails and state becomes FAILED, the second Start
-    // should still return INTERNAL_ERROR
+    // should still surface that the configured backend is unavailable.
     ErrorCode err1 =
         service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err1);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err1);
     ErrorCode err2 =
         service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err2);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err2);
 #endif
 }
 
@@ -259,7 +259,7 @@ TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
     std::string invalid_endpoints = "invalid_endpoint";
     ErrorCode err =
         service_->Start("primary_unused", invalid_endpoints, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err);
 #endif
 }
 
@@ -288,7 +288,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
     ErrorCode err =
         service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
 }
@@ -324,10 +324,10 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
         << "Connection failure requires real etcd and invalid endpoints.";
 #else
     // In non-etcd mode we cannot distinguish detailed connection errors; only
-    // verify it doesn't crash
+    // verify the missing backend is reported precisely.
     ErrorCode err =
         service_->Start("primary_unused", "bad_endpoint", cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err);
 #endif
 }
 
@@ -340,7 +340,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
     // the call is safe
     ErrorCode err =
         service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
-    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, err);
 #endif
 }
 

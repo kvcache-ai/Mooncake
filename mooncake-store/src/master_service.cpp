@@ -13,10 +13,7 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
-#ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
-#include "etcd_oplog_store.h"
-#endif
+#include "ha/oplog/oplog_store_factory.h"
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -116,12 +113,8 @@ void FilterInvalidReplicaDescriptors(
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
-bool MasterService::ShouldReplicateToEtcdStandby() const {
-#ifdef STORE_USE_ETCD
-    return enable_ha_ && ha_backend_type_ == "etcd";
-#else
-    return false;
-#endif
+bool MasterService::ShouldReplicateToStandby() const {
+    return persistent_oplog_store_ != nullptr;
 }
 
 std::string MasterService::SerializeMetadataForOpLog(
@@ -142,7 +135,7 @@ std::string MasterService::SerializeMetadataForOpLog(
 
 void MasterService::AppendMetadataMutationOpLog(
     const std::string& key, const ObjectMetadata* metadata) {
-    if (!ShouldReplicateToEtcdStandby()) {
+    if (!ShouldReplicateToStandby()) {
         return;
     }
 
@@ -157,7 +150,7 @@ void MasterService::AppendMetadataMutationOpLog(
 
 void MasterService::AppendSegmentUnmountOpLog(
     const std::string& segment_name, const std::string& transport_endpoint) {
-    if (!ShouldReplicateToEtcdStandby() || transport_endpoint.empty()) {
+    if (!ShouldReplicateToStandby() || transport_endpoint.empty()) {
         return;
     }
 
@@ -171,56 +164,54 @@ void MasterService::AppendSegmentUnmountOpLog(
 
 void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
                                          const std::string& payload) {
-#ifdef STORE_USE_ETCD
-    if (enable_ha_ && ha_backend_type_ == "etcd") {
+    if (ShouldReplicateToStandby()) {
         oplog_manager_.Append(type, key, payload);
     }
-#else
-    (void)type;
-    (void)key;
-    (void)payload;
-#endif
 }
 
-void MasterService::InitializeEtcdOpLogManager() {
-#ifdef STORE_USE_ETCD
-    if (!enable_ha_ || ha_backend_type_ != "etcd") {
+void MasterService::InitializePersistentOpLogManager() {
+    if (!enable_ha_) {
         return;
     }
 
     if (cluster_id_.empty()) {
-        LOG(WARNING) << "HA mode enabled with etcd backend but cluster_id is "
-                        "empty, oplog replication is disabled";
+        LOG(WARNING) << "HA mode enabled but cluster_id is empty, "
+                     << "oplog replication is disabled";
         return;
     }
 
-    if (!ha_backend_connstring_.empty()) {
-        auto err = EtcdHelper::ConnectToEtcdStoreClient(
-            ha_backend_connstring_.c_str());
-        if (err != ErrorCode::OK) {
-            LOG(WARNING) << "Failed to connect to etcd for oplog manager, "
-                         << "connstring=" << ha_backend_connstring_
-                         << ", err=" << toString(err);
-            return;
-        }
-    }
-
-    auto etcd_oplog_store = std::make_shared<EtcdOpLogStore>(
-        cluster_id_, /*enable_latest_seq_batch_update=*/true,
-        /*enable_batch_write=*/true);
-    if (etcd_oplog_store->Init() != ErrorCode::OK) {
-        LOG(WARNING) << "Failed to initialize etcd oplog store for cluster_id="
-                     << cluster_id_;
+    auto backend_type = ha::ParseHABackendType(ha_backend_type_);
+    if (!backend_type || !ha::SupportsOpLogFollowing(*backend_type)) {
+        LOG(INFO) << "HA backend does not provide OpLog following, backend="
+                  << ha_backend_type_;
         return;
     }
 
-    oplog_manager_.SetEtcdOpLogStore(etcd_oplog_store);
-
-    uint64_t max_seq = 0;
-    if (etcd_oplog_store->GetMaxSequenceId(max_seq) == ErrorCode::OK) {
-        oplog_manager_.SetInitialSequenceId(max_seq);
+    ha::HABackendSpec spec{
+        .type = *backend_type,
+        .connstring = ha_backend_connstring_,
+        .cluster_namespace = cluster_id_,
+    };
+    ha::OpLogStoreFactoryOptions options{
+        .enable_latest_seq_batch_update =
+            *backend_type == ha::HABackendType::ETCD,
+        .enable_batch_write = *backend_type == ha::HABackendType::ETCD,
+    };
+    auto store = ha::CreateOpLogStore(spec, options);
+    if (!store) {
+        LOG(WARNING) << "Failed to initialize OpLog backend store, backend="
+                     << ha_backend_type_ << ", cluster_id=" << cluster_id_
+                     << ", error=" << toString(store.error());
+        return;
     }
-#endif
+
+    persistent_oplog_store_ = std::move(store.value());
+    oplog_manager_.SetPersistentStore(persistent_oplog_store_);
+
+    auto latest_seq = persistent_oplog_store_->GetLatestSequence();
+    if (latest_seq && latest_seq.value() > 0) {
+        oplog_manager_.SetInitialSequenceId(latest_seq.value());
+    }
 }
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -276,7 +267,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    InitializeEtcdOpLogManager();
+    InitializePersistentOpLogManager();
 
     if (config.preloaded_state.has_value()) {
         LoadPreloadedState(config.preloaded_state.value());
@@ -445,8 +436,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         return tl::make_unexpected(err);
     }
 
-    if (enable_ha_ && ha_backend_type_ == "etcd" &&
-        !segment.te_endpoint.empty()) {
+    if (ShouldReplicateToStandby() && !segment.te_endpoint.empty()) {
         SegmentMountOp payload;
         payload.segment_name = segment.name;
         payload.transport_endpoint = segment.te_endpoint;
@@ -1100,7 +1090,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
 
-    if (enable_ha_ && ha_backend_type_ == "etcd") {
+    if (ShouldReplicateToStandby()) {
         AppendOpLogAndNotify(OpType::PUT_END, key,
                              SerializeMetadataForOpLog(metadata));
     }
@@ -1198,11 +1188,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
-        if (enable_ha_ && ha_backend_type_ == "etcd") {
+        if (ShouldReplicateToStandby()) {
             AppendOpLogAndNotify(OpType::PUT_REVOKE, key);
         }
         accessor.Erase();
-    } else if (enable_ha_ && ha_backend_type_ == "etcd") {
+    } else if (ShouldReplicateToStandby()) {
         AppendOpLogAndNotify(OpType::PUT_END, key,
                              SerializeMetadataForOpLog(metadata));
     }
@@ -1749,7 +1739,7 @@ auto MasterService::Remove(const std::string& key, bool force)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
-    if (enable_ha_ && ha_backend_type_ == "etcd") {
+    if (ShouldReplicateToStandby()) {
         AppendOpLogAndNotify(OpType::REMOVE, key);
     }
     // Remove object metadata
@@ -2507,51 +2497,30 @@ void MasterService::HandleChildExit(pid_t pid, int status,
 
 tl::expected<ha::OpLogSequenceId, SerializationError>
 MasterService::ResolveSnapshotSequenceId() const {
-    if (!enable_ha_ || ha_backend_type_ != "etcd") {
+    if (!enable_ha_) {
         return ha::OpLogSequenceId{0};
     }
 
-#ifndef STORE_USE_ETCD
-    return tl::make_unexpected(SerializationError(
-        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
-        "etcd snapshot sequence resolution is unavailable in this build"));
-#else
-    if (ha_backend_connstring_.empty()) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::INVALID_PARAMS,
-            "etcd snapshot sequence resolution requires a backend connstring"));
-    }
-
-    auto err =
-        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_.c_str());
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to connect to etcd for snapshot boundary: "
-                             "{}",
-                             toString(err))));
-    }
-
-    EtcdOpLogStore oplog_store(cluster_id_);
-    err = oplog_store.Init();
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to initialize etcd oplog store: {}",
-                             toString(err))));
-    }
-
-    uint64_t sequence_id = 0;
-    err = oplog_store.GetLatestSequenceId(sequence_id);
-    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+    auto backend_type = ha::ParseHABackendType(ha_backend_type_);
+    if (!backend_type || !ha::SupportsOpLogFollowing(*backend_type)) {
         return ha::OpLogSequenceId{0};
     }
-    if (err != ErrorCode::OK) {
+
+    if (!persistent_oplog_store_) {
         return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to resolve snapshot sequence boundary: {}",
-                             toString(err))));
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+            "snapshot sequence resolution requires an initialized OpLog "
+            "backend"));
     }
 
-    return static_cast<ha::OpLogSequenceId>(sequence_id);
-#endif
+    auto sequence_id = persistent_oplog_store_->GetLatestSequence();
+    if (!sequence_id) {
+        return tl::make_unexpected(SerializationError(
+            sequence_id.error(),
+            fmt::format("failed to resolve snapshot sequence boundary: {}",
+                        toString(sequence_id.error()))));
+    }
+    return sequence_id.value();
 }
 
 tl::expected<ha::SnapshotDescriptor, SerializationError>
@@ -3281,7 +3250,7 @@ void MasterService::LoadPreloadedState(const ha::PromotedStandbyState& state) {
     imported_replica_allocators_.clear();
     invalid_replica_endpoints_.clear();
 
-    if (enable_ha_ && ha_backend_type_ == "etcd" && state.applied_seq_id > 0 &&
+    if (ShouldReplicateToStandby() && state.applied_seq_id > 0 &&
         oplog_manager_.GetLastSequenceId() == 0) {
         oplog_manager_.SetInitialSequenceId(state.applied_seq_id);
     }

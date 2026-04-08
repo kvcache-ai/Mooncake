@@ -1,4 +1,5 @@
-#include "oplog_applier.h"
+#include "ha/oplog/backends/etcd/etcd_oplog_store.h"
+#include "ha/oplog/oplog_applier.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -12,10 +13,9 @@
 
 #include <xxhash.h>
 
-#include "etcd_oplog_store.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -137,16 +137,13 @@ class OpLogApplierTest : public ::testing::Test {
         google::InitGoogleLogging("OpLogApplierTest");
         FLAGS_logtostderr = 1;
         mock_metadata_store_ = std::make_unique<MockMetadataStore>();
-        cluster_id_ = "test_cluster_001";
-        applier_ = std::make_unique<OpLogApplier>(mock_metadata_store_.get(),
-                                                  cluster_id_);
+        applier_ = std::make_unique<OpLogApplier>(mock_metadata_store_.get());
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
     std::unique_ptr<MockMetadataStore> mock_metadata_store_;
     std::unique_ptr<OpLogApplier> applier_;
-    std::string cluster_id_;
 };
 
 // ========== 4.1.1 Basic apply tests ==========

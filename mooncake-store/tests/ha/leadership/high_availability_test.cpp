@@ -9,7 +9,7 @@
 #include <string>
 
 #ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
+#include "ha/common/etcd/etcd_helper.h"
 #endif
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"

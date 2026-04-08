@@ -13,11 +13,13 @@
 #include <utility>
 #include <vector>
 
+#include "ha/ha_types.h"
+#include "ha/oplog/oplog_applier.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store.h"
+#include "ha/oplog/oplog_watcher.h"
 #include "metadata_store.h"
 #include "ha_metric_manager.h"
-#include "oplog_applier.h"
-#include "oplog_manager.h"
-#include "oplog_watcher.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "standby_state_machine.h"
 #include "types.h"
@@ -51,6 +53,8 @@ struct HotStandbyConfig {
     // Snapshot-only standby polls the catalog for newer published snapshots
     // and refreshes its local metadata baseline when one appears.
     uint32_t snapshot_refresh_interval_ms{1000};
+
+    ha::HABackendType oplog_backend_type{ha::HABackendType::ETCD};
 };
 
 /**
@@ -91,12 +95,12 @@ class HotStandbyService {
      * following
      * @param primary_address Address of the Primary Master (not used with
      * OpLog backend-based sync)
-     * @param etcd_endpoints Comma-separated OpLog backend endpoints
+     * @param oplog_backend_connstring OpLog backend connection string
      * @param cluster_id Cluster identifier for OpLog path
      * @return ErrorCode::OK on success
      */
     ErrorCode Start(const std::string& primary_address,
-                    const std::string& etcd_endpoints,
+                    const std::string& oplog_backend_connstring,
                     const std::string& cluster_id);
 
     /**
@@ -259,9 +263,10 @@ class HotStandbyService {
     std::unique_ptr<OpLogApplier> oplog_applier_;
     std::unique_ptr<OpLogWatcher> oplog_watcher_;
 
-    // Configuration for etcd-based OpLog sync
-    std::string etcd_endpoints_;
+    // Configuration for backend-based OpLog sync
+    std::string oplog_backend_connstring_;
     std::string cluster_id_;
+    std::shared_ptr<ha::OpLogStore> oplog_store_;
 
     // Replication state
     std::shared_ptr<ReplicationStream> replication_stream_;

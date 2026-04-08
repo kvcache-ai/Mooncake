@@ -9,13 +9,11 @@
 #include <string>
 #include <vector>
 
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store.h"
 #include "metadata_store.h"
 
 namespace mooncake {
-
-// Forward declaration
-class EtcdOpLogStore;
 
 /**
  * @brief Apply OpLog entries to Standby metadata store with ordering guarantee
@@ -28,11 +26,12 @@ class OpLogApplier {
     /**
      * @brief Constructor
      * @param metadata_store Metadata store to apply changes to
-     * @param cluster_id Cluster ID for accessing etcd OpLog (optional, for
-     * requesting missing OpLog)
+     * @param oplog_store OpLog backend used for gap resolution and promotion
+     * catch-up (optional)
      */
-    explicit OpLogApplier(MetadataStore* metadata_store,
-                          const std::string& cluster_id = std::string());
+    explicit OpLogApplier(
+        MetadataStore* metadata_store,
+        std::shared_ptr<ha::OpLogStore> oplog_store = nullptr);
 
     /**
      * @brief Apply a single OpLog entry (with ordering checks)
@@ -81,7 +80,7 @@ class OpLogApplier {
 
     // Promotion helper:
     // Try to resolve current gaps ONCE (no waiting) by fetching missing/skipped
-    // sequence_ids from etcd. If an entry arrives late:
+    // sequence_ids from the backend. If an entry arrives late:
     // - REMOVE / PUT_REVOKE: delete the key
     // - PUT_END: discard
     //
@@ -126,8 +125,10 @@ class OpLogApplier {
 
     void ApplySegmentUpdate(const OpLogEntry& entry);
 
+    bool FetchEntry(uint64_t sequence_id, OpLogEntry& entry) const;
+
     /**
-     * @brief Request missing OpLog entry from etcd
+     * @brief Request missing OpLog entry from backend
      * @param missing_seq_id Missing sequence ID
      * @return true if entry was found and applied, false otherwise
      */
@@ -141,17 +142,7 @@ class OpLogApplier {
 
     MetadataStore* metadata_store_;
     StandbySegmentRegistry segment_registry_;
-
-    // EtcdOpLogStore for requesting missing OpLog entries (optional)
-    std::string cluster_id_;
-    mutable std::mutex etcd_oplog_store_mutex_;
-    mutable std::unique_ptr<EtcdOpLogStore> etcd_oplog_store_;
-
-    /**
-     * @brief Get or create EtcdOpLogStore instance (lazy initialization)
-     * @return Pointer to EtcdOpLogStore, or nullptr if cluster_id is not set
-     */
-    EtcdOpLogStore* GetEtcdOpLogStore() const;
+    std::shared_ptr<ha::OpLogStore> oplog_store_;
 
     // Note: key_sequence_map_ has been removed.
     // Global sequence_id is sufficient for ordering guarantee.
@@ -178,7 +169,7 @@ class OpLogApplier {
     // IMPORTANT: request must happen BEFORE skip, otherwise we will never
     // request.
     static constexpr int kMissingEntryRequestSeconds =
-        1;  // request from etcd after 1s
+        1;  // request from backend after 1s
     static constexpr int kMissingEntrySkipSeconds =
         3;  // skip after 3s (avoid global stall)
     static constexpr int kMaxPendingEntries =

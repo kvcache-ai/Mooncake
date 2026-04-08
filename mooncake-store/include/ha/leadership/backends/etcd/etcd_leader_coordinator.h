@@ -5,7 +5,7 @@
 #include <mutex>
 #include <thread>
 
-#include "etcd_helper.h"
+#include "ha/common/etcd/etcd_helper.h"
 #include "ha/leadership/leader_coordinator.h"
 
 namespace mooncake {

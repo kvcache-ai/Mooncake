@@ -1,4 +1,4 @@
-#include "etcd_oplog_store.h"
+#include "ha/oplog/backends/etcd/etcd_oplog_store.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-#include "etcd_helper.h"
+#include "ha/common/etcd/etcd_helper.h"
 
 DEFINE_string(etcd_endpoints, "0.0.0.0:2379",
               "Etcd endpoints for EtcdOpLogStoreTest");

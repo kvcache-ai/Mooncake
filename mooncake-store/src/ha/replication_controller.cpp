@@ -8,6 +8,7 @@
 #include <glog/logging.h>
 
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "hot_standby_service.h"
 
 namespace mooncake {
@@ -22,7 +23,8 @@ struct StandbyRuntimeCapabilities {
 
 std::unique_ptr<HotStandbyService> CreateStandbyService(
     const MasterServiceSupervisorConfig& config,
-    const StandbyRuntimeCapabilities& capabilities) {
+    const StandbyRuntimeCapabilities& capabilities,
+    ha::HABackendType oplog_backend_type) {
     return std::make_unique<HotStandbyService>(HotStandbyConfig{
         .standby_id = config.local_hostname,
         .primary_address = "",
@@ -31,6 +33,7 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_verification = false,
         .enable_snapshot_bootstrap = config.enable_snapshot_restore,
         .enable_oplog_following = capabilities.has_oplog_following,
+        .oplog_backend_type = oplog_backend_type,
     });
 }
 
@@ -38,7 +41,7 @@ StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     StandbyRuntimeCapabilities capabilities;
     capabilities.has_snapshot_bootstrap = config.enable_snapshot_restore;
-    capabilities.has_oplog_following = spec.type == HABackendType::ETCD;
+    capabilities.has_oplog_following = SupportsOpLogFollowing(spec.type);
     return capabilities;
 }
 
@@ -109,7 +112,8 @@ class CapabilityDrivenReplicationController final
         : spec_(spec),
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
-          standby_service_(CreateStandbyService(config, capabilities_)) {
+          standby_service_(
+              CreateStandbyService(config, capabilities_, spec.type)) {
         if (capabilities_.has_snapshot_bootstrap) {
             auto snapshot_provider =
                 CreateCatalogBackedSnapshotProvider(config_);

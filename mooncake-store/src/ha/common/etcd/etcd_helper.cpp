@@ -1,4 +1,4 @@
-#include "etcd_helper.h"
+#include "ha/common/etcd/etcd_helper.h"
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"

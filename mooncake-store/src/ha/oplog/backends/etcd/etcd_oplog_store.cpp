@@ -1,9 +1,10 @@
-#include "etcd_oplog_store.h"
+#include "ha/oplog/backends/etcd/etcd_oplog_store.h"
 
 #include <glog/logging.h>
 #include <sstream>
 #include <iomanip>
 
+#include "ha/oplog/oplog_codec.h"
 #include "ha_metric_manager.h"
 #include "utils/base64.h"
 
@@ -13,7 +14,7 @@
 #include <json/json.h>  // CentOS
 #endif
 
-#include "etcd_helper.h"
+#include "ha/common/etcd/etcd_helper.h"
 
 namespace mooncake {
 
@@ -552,6 +553,79 @@ ErrorCode EtcdOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
                                    end_key.c_str(), end_key.size());
 }
 
+tl::expected<ha::OpLogSequenceId, ErrorCode> EtcdOpLogStore::Append(
+    const ha::OpLogAppendRequest& request) {
+    auto entry = ha::oplog::DeserializeEntryPayload(request.payload);
+    if (!entry) {
+        return tl::make_unexpected(entry.error());
+    }
+    if (entry->sequence_id != request.expected_next_seq) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const bool sync = entry->op_type != OpType::PUT_END;
+    ErrorCode err = WriteOpLog(entry.value(), sync);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return entry->sequence_id;
+}
+
+tl::expected<ha::OpLogPollResult, ErrorCode> EtcdOpLogStore::PollFrom(
+    ha::OpLogSequenceId start_seq, size_t max_records,
+    std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    ha::OpLogPollResult result;
+    result.next_seq = start_seq + 1;
+
+    for (;;) {
+        std::vector<OpLogEntry> entries;
+        ErrorCode err = ReadOpLogSince(start_seq, max_records, entries);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+
+        if (!entries.empty()) {
+            result.records.reserve(entries.size());
+            for (const auto& entry : entries) {
+                result.records.push_back(ha::OpLogRecord{
+                    .seq = entry.sequence_id,
+                    .producer_view_version = 0,
+                    .payload = ha::oplog::SerializeEntryPayload(entry),
+                });
+            }
+            result.next_seq = result.records.back().seq + 1;
+            result.timed_out = false;
+            return result;
+        }
+
+        if (timeout.count() == 0 ||
+            std::chrono::steady_clock::now() >= deadline) {
+            result.timed_out = true;
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+tl::expected<ha::OpLogSequenceId, ErrorCode>
+EtcdOpLogStore::GetLatestSequence() {
+    uint64_t sequence_id = 0;
+    ErrorCode err = GetMaxSequenceId(sequence_id);
+    if (err == ErrorCode::OK) {
+        return static_cast<ha::OpLogSequenceId>(sequence_id);
+    }
+
+    err = GetLatestSequenceId(sequence_id);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ha::OpLogSequenceId{0};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return static_cast<ha::OpLogSequenceId>(sequence_id);
+}
+
 std::string EtcdOpLogStore::BuildOpLogKey(uint64_t sequence_id) const {
     std::ostringstream oss;
     // Fixed-width encoding for correct etcd lexicographical range operations.
@@ -629,60 +703,16 @@ std::string EtcdOpLogStore::BuildSnapshotKey(
 }
 
 std::string EtcdOpLogStore::SerializeOpLogEntry(const OpLogEntry& entry) const {
-    Json::Value root;
-    root["sequence_id"] = static_cast<Json::UInt64>(entry.sequence_id);
-    root["timestamp_ms"] = static_cast<Json::UInt64>(entry.timestamp_ms);
-    root["op_type"] = static_cast<int>(entry.op_type);
-    root["object_key"] = entry.object_key;
-    // CRITICAL: Base64 encode binary payload to prevent UTF-8 corruption in
-    // JSON
-    root["payload"] = base64::Encode(entry.payload);
-    root["checksum"] = static_cast<Json::UInt>(entry.checksum);
-    root["prefix_hash"] = static_cast<Json::UInt>(entry.prefix_hash);
-
-    Json::StreamWriterBuilder builder;
-    builder["indentation"] = "";  // Compact format
-    std::unique_ptr<Json::StreamWriter> writer(builder.newStreamWriter());
-    std::ostringstream oss;
-    writer->write(root, &oss);
-    return oss.str();
+    return ha::oplog::SerializeEntryPayload(entry);
 }
 
 bool EtcdOpLogStore::DeserializeOpLogEntry(const std::string& json_str,
                                            OpLogEntry& entry) const {
-    Json::Value root;
-    Json::CharReaderBuilder builder;
-    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
-    std::string errors;
-
-    if (!reader->parse(json_str.data(), json_str.data() + json_str.size(),
-                       &root, &errors)) {
-        LOG(ERROR) << "Failed to parse JSON: " << errors;
+    auto decoded = ha::oplog::DeserializeEntryPayload(json_str);
+    if (!decoded) {
         return false;
     }
-
-    try {
-        entry.sequence_id = root["sequence_id"].asUInt64();
-        entry.timestamp_ms = root["timestamp_ms"].asUInt64();
-        entry.op_type = static_cast<OpType>(root["op_type"].asInt());
-        entry.object_key = root["object_key"].asString();
-        // CRITICAL: Base64 decode payload to restore binary data
-        entry.payload = base64::Decode(root["payload"].asString());
-        entry.checksum = root["checksum"].asUInt();
-        entry.prefix_hash = root["prefix_hash"].asUInt();
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to deserialize OpLogEntry: " << e.what();
-        return false;
-    }
-
-    std::string size_reason;
-    if (!OpLogManager::ValidateEntrySize(entry, &size_reason)) {
-        LOG(ERROR) << "EtcdOpLogStore: entry size rejected, sequence_id="
-                   << entry.sequence_id << ", key=" << entry.object_key
-                   << ", reason=" << size_reason;
-        return false;
-    }
-
+    entry = std::move(decoded.value());
     return true;
 }
 

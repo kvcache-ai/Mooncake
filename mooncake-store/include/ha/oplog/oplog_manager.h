@@ -10,6 +10,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/oplog/oplog_store.h"
 #include "types.h"
 
 namespace mooncake {
@@ -18,9 +19,6 @@ namespace test {
 class MasterServiceEtcdOpLogTest;
 }  // namespace test
 
-// Forward declaration
-class EtcdOpLogStore;
-
 // Operation types for hot-standby replication.
 // This is a minimal subset that can be extended later.
 enum class OpType : uint8_t {
@@ -28,8 +26,7 @@ enum class OpType : uint8_t {
     PUT_REVOKE = 2,
     REMOVE = 3,
     // Deprecated: LEASE_RENEW is intentionally not recorded in OpLog in the
-    // current etcd-based hot-standby design (Standby relies on Primary DELETE
-    // operations).
+    // current hot-standby design (Standby relies on Primary DELETE operations).
     LEASE_RENEW = 4,
     SEGMENT_MOUNT = 5,
     SEGMENT_UNMOUNT = 6,
@@ -82,8 +79,8 @@ struct SegmentUpdateOp {
  *
  * This class is intentionally simple: it keeps a bounded deque of OpLogEntry
  * and provides append / get-since primitives. It can later be extended to
- * or to spill to disk if needed. In the new etcd-based design, OpLog will be
- * written to etcd.
+ * or to spill to disk if needed. In HA mode, OpLog can also be written to a
+ * pluggable persistent backend.
  */
 class OpLogManager {
     friend class test::MasterServiceEtcdOpLogTest;
@@ -91,13 +88,13 @@ class OpLogManager {
    public:
     OpLogManager();
 
-    // Set the EtcdOpLogStore for writing OpLog to etcd (optional).
-    // If not set, OpLog will only be stored in memory buffer.
-    void SetEtcdOpLogStore(std::shared_ptr<EtcdOpLogStore> etcd_oplog_store);
+    // Set the persistent OpLog backend (optional).
+    // If not set, OpLog will only be stored in the local in-memory buffer.
+    void SetPersistentStore(std::shared_ptr<ha::OpLogStore> persistent_store);
 
     // Append a new entry and return the assigned sequence_id.
     // This is a best-effort (async) path: the entry is buffered in memory
-    // and enqueued to etcd without waiting for persistence.
+    // and enqueued to the backend without waiting for persistence.
     // Only suitable for idempotent, lag-tolerant operations (PUT_END).
     // For operations that MUST be durable before returning (REMOVE, etc.),
     // use AppendAndPersist() instead.
@@ -108,17 +105,16 @@ class OpLogManager {
     // in-memory buffer, and return the full entry.
     //
     // IMPORTANT: This will advance last_seq_id_ even if the caller later fails
-    // to persist it to etcd. This supports "seq pre-allocation" semantics where
-    // retries use the same (smaller) sequence_id.
+    // to persist it to the backend. This supports "seq pre-allocation"
+    // semantics where retries use the same (smaller) sequence_id.
     OpLogEntry AllocateEntry(OpType type, const std::string& key,
                              const std::string& payload = std::string());
 
-    // Persist an already-allocated entry to etcd using its sequence_id.
+    // Persist an already-allocated entry to the backend using its sequence_id.
     // Does NOT modify sequence counters.
-    ErrorCode PersistEntryToEtcd(const OpLogEntry& entry) const;
+    ErrorCode PersistEntry(const OpLogEntry& entry) const;
 
-    // Append a new entry and durably persist it to etcd (if EtcdOpLogStore is
-    // set).
+    // Append a new entry and durably persist it to the backend (if configured).
     //
     // This is intended for operations that may free/reuse memory (e.g. REMOVE),
     // where best-effort replication is unsafe: Standby must observe the DELETE
@@ -127,7 +123,7 @@ class OpLogManager {
     //
     // Design (updated for seq pre-allocation):
     // - sequence_id is allocated first and never reused.
-    // - If etcd write fails, caller may retry PersistEntryToEtcd with the same
+    // - If backend append fails, caller may retry PersistEntry with the same
     //   entry (sequence_id fixed and "smaller" than later entries).
     tl::expected<uint64_t, ErrorCode> AppendAndPersist(
         OpType type, const std::string& key,
@@ -149,9 +145,8 @@ class OpLogManager {
     // This is public so OpLogWatcher and OpLogApplier can validate entries.
     static bool VerifyChecksum(const OpLogEntry& entry);
 
-    // Basic DoS protection for externally sourced OpLog entries (etcd watch /
-    // reads). Enforce conservative bounds on key/payload sizes before
-    // parsing/applying.
+    // Basic DoS protection for externally sourced OpLog entries. Enforce
+    // conservative bounds on key/payload sizes before parsing/applying.
     static constexpr size_t kMaxObjectKeySize = 4096;            // 4 KiB
     static constexpr size_t kMaxPayloadSize = 10 * 1024 * 1024;  // 10 MiB
 
@@ -175,8 +170,8 @@ class OpLogManager {
     // All operations are applied in sequence_id order, which ensures
     // consistency.
 
-    // Optional etcd OpLog store for persistent storage
-    std::shared_ptr<EtcdOpLogStore> etcd_oplog_store_;
+    // Optional persistent OpLog backend.
+    std::shared_ptr<ha::OpLogStore> persistent_store_;
 
     // Simple bounds to avoid unbounded memory growth.
     static constexpr size_t kMaxBufferEntries_ = 100000;

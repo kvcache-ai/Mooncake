@@ -1,62 +1,25 @@
-#include "oplog_applier.h"
+#include "ha/oplog/oplog_applier.h"
 
 #include <glog/logging.h>
 
 #include <algorithm>
 #include <chrono>
 
-#include "etcd_oplog_store.h"
 #include "ha_metric_manager.h"
+#include "ha/oplog/oplog_codec.h"
 #include "metadata_store.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 namespace mooncake {
 
 OpLogApplier::OpLogApplier(MetadataStore* metadata_store,
-                           const std::string& cluster_id)
+                           std::shared_ptr<ha::OpLogStore> oplog_store)
     : metadata_store_(metadata_store),
-      cluster_id_(cluster_id),
+      oplog_store_(std::move(oplog_store)),
       expected_sequence_id_(1) {
     if (metadata_store_ == nullptr) {
         LOG(FATAL) << "OpLogApplier: metadata_store cannot be null";
     }
-
-    // Validate cluster_id if provided (required for etcd operations).
-    // Normalize by stripping trailing slashes for validation.
-    std::string normalized = cluster_id_;
-    while (!normalized.empty() && normalized.back() == '/') {
-        normalized.pop_back();
-    }
-    if (!normalized.empty() && !IsValidClusterIdComponent(normalized)) {
-        LOG(FATAL)
-            << "Invalid cluster_id for OpLogApplier: '" << cluster_id_
-            << "' (normalized: '" << normalized
-            << "'). Allowed chars: [A-Za-z0-9_.-], max_len=128, no slashes.";
-    }
-}
-
-EtcdOpLogStore* OpLogApplier::GetEtcdOpLogStore() const {
-#ifdef STORE_USE_ETCD
-    if (cluster_id_.empty()) {
-        return nullptr;
-    }
-
-    std::lock_guard<std::mutex> lock(etcd_oplog_store_mutex_);
-    if (!etcd_oplog_store_) {
-        // Reader: do not start `/latest` batch update thread.
-        auto new_store = std::make_unique<EtcdOpLogStore>(
-            cluster_id_, /*enable_latest_seq_batch_update=*/false);
-        if (new_store->Init() != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to initialize EtcdOpLogStore for cluster: "
-                       << cluster_id_;
-            return nullptr;
-        }
-        etcd_oplog_store_ = std::move(new_store);
-    }
-    return etcd_oplog_store_.get();
-#else
-    return nullptr;
-#endif
 }
 
 bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
@@ -275,7 +238,7 @@ size_t OpLogApplier::ProcessPendingEntries() {
                 continue;  // may skip multiple consecutive gaps
             }
 
-            // Best-effort request from etcd (before skip triggers).
+            // Best-effort request from backend (before skip triggers).
             if (waited.count() >= kMissingEntryRequestSeconds) {
                 missing_seq_to_request = missing_seq;
                 break;
@@ -413,9 +376,7 @@ size_t OpLogApplier::ProcessPendingEntries() {
 OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
     size_t max_ids) {
     GapResolveResult r;
-#ifdef STORE_USE_ETCD
-    EtcdOpLogStore* store = GetEtcdOpLogStore();
-    if (store == nullptr) {
+    if (!oplog_store_) {
         return r;
     }
 
@@ -444,12 +405,11 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
     std::vector<uint64_t> successfully_processed;
     for (uint64_t seq : gap_ids) {
         OpLogEntry e;
-        ErrorCode err = store->ReadOpLog(seq, e);
-        if (err != ErrorCode::OK) {
+        if (!FetchEntry(seq, e)) {
             // Log failed gap for monitoring, but don't clear it so it can be
             // retried later.
             LOG(WARNING) << "Promotion gap resolve: failed to fetch seq=" << seq
-                         << ", err=" << static_cast<int>(err);
+                         << " from persistent backend";
             continue;
         }
         r.fetched++;
@@ -492,10 +452,6 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
     }
     return r;
-#else
-    (void)max_ids;
-    return r;
-#endif
 }
 
 bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
@@ -657,28 +613,17 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
 }
 
 bool OpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
-#ifdef STORE_USE_ETCD
     HAMetricManager::instance().inc_oplog_gap_resolve_attempts();
-
-    EtcdOpLogStore* oplog_store = GetEtcdOpLogStore();
-    if (oplog_store == nullptr) {
-        LOG(WARNING)
-            << "OpLogApplier: cannot request missing OpLog, cluster_id not set";
+    if (!oplog_store_) {
+        LOG(WARNING) << "OpLogApplier: cannot request missing OpLog without "
+                        "persistent backend";
         return false;
     }
 
     OpLogEntry entry;
-    ErrorCode err = oplog_store->ReadOpLog(missing_seq_id, entry);
-    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
-        LOG(INFO) << "OpLogApplier: missing OpLog entry not found in etcd, "
-                     "sequence_id="
-                  << missing_seq_id;
-        return false;
-    }
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "OpLogApplier: failed to read missing OpLog from etcd, "
-                      "sequence_id="
-                   << missing_seq_id << ", error=" << static_cast<int>(err);
+    if (!FetchEntry(missing_seq_id, entry)) {
+        LOG(INFO) << "OpLogApplier: missing OpLog entry not found, "
+                  << "sequence_id=" << missing_seq_id;
         return false;
     }
 
@@ -717,11 +662,34 @@ bool OpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
     }
 
     return true;
-#else
-    LOG(WARNING) << "OpLogApplier: STORE_USE_ETCD not enabled, cannot request "
-                    "missing OpLog";
-    return false;
-#endif
+}
+
+bool OpLogApplier::FetchEntry(uint64_t sequence_id, OpLogEntry& entry) const {
+    if (!oplog_store_ || sequence_id == 0) {
+        return false;
+    }
+
+    auto poll_result = oplog_store_->PollFrom(
+        sequence_id - 1, /*max_records=*/1, std::chrono::milliseconds(0));
+    if (!poll_result || poll_result->records.empty()) {
+        return false;
+    }
+
+    const auto& record = poll_result->records.front();
+    if (record.seq != sequence_id) {
+        return false;
+    }
+
+    auto decoded = ha::oplog::DeserializeEntryPayload(record.payload);
+    if (!decoded) {
+        LOG(ERROR) << "OpLogApplier: failed to decode fetched OpLog record, "
+                   << "sequence_id=" << sequence_id
+                   << ", error=" << toString(decoded.error());
+        return false;
+    }
+
+    entry = std::move(decoded.value());
+    return true;
 }
 
 void OpLogApplier::ScheduleWaitForMissingEntries(uint64_t missing_seq_id) {

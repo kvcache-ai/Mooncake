@@ -100,6 +100,18 @@ if(STORE_USE_REDIS)
         PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
     add_test(NAME redis_snapshot_catalog_store_test
              COMMAND redis_snapshot_catalog_store_test)
+
+    add_executable(redis_oplog_store_test
+                   ha/oplog/redis_oplog_store_test.cpp)
+    target_include_directories(redis_oplog_store_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+    target_link_libraries(redis_oplog_store_test
+        PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
+               ${ETCD_WRAPPER_LIB} glog gflags ibverbs gtest pthread
+        PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    add_test(NAME redis_oplog_store_test
+             COMMAND redis_oplog_store_test)
 endif()
 target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD OR STORE_USE_REDIS)

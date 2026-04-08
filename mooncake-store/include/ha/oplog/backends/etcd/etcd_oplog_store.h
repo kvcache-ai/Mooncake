@@ -10,7 +10,8 @@
 #include <thread>
 #include <vector>
 
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store.h"
 #include "types.h"
 
 namespace mooncake {
@@ -25,7 +26,7 @@ namespace mooncake {
  * The latest sequence_id is also stored at:
  *   /oplog/{cluster_id}/latest
  */
-class EtcdOpLogStore {
+class EtcdOpLogStore : public ha::OpLogStore {
    public:
     /**
      * @brief Constructor.
@@ -132,6 +133,15 @@ class EtcdOpLogStore {
      * @return: Error code.
      */
     ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id);
+
+    tl::expected<ha::OpLogSequenceId, ErrorCode> Append(
+        const ha::OpLogAppendRequest& request) override;
+
+    tl::expected<ha::OpLogPollResult, ErrorCode> PollFrom(
+        ha::OpLogSequenceId start_seq, size_t max_records,
+        std::chrono::milliseconds timeout) override;
+
+    tl::expected<ha::OpLogSequenceId, ErrorCode> GetLatestSequence() override;
 
    private:
     /**

@@ -12,7 +12,7 @@ set(MOONCAKE_STORE_SOURCES
     master_metric_manager.cpp
     storage_backend.cpp
     thread_pool.cpp
-    etcd_helper.cpp
+    ha/common/etcd/etcd_helper.cpp
     segment.cpp
     transfer_task.cpp
     rpc_service.cpp
@@ -31,6 +31,13 @@ set(MOONCAKE_STORE_SOURCES
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
+    ha/oplog/oplog_applier.cpp
+    ha/oplog/oplog_codec.cpp
+    ha/oplog/oplog_manager.cpp
+    ha/oplog/oplog_store_factory.cpp
+    ha/oplog/oplog_watcher.cpp
+    ha/oplog/backends/etcd/etcd_oplog_store.cpp
+    ha/oplog/backends/redis/redis_oplog_store.cpp
     ha/replication_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/object/snapshot_object_store.cpp
@@ -42,10 +49,6 @@ set(MOONCAKE_STORE_SOURCES
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
-    oplog_manager.cpp
-    etcd_oplog_store.cpp
-    oplog_watcher.cpp
-    oplog_applier.cpp
     hot_standby_service.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp)

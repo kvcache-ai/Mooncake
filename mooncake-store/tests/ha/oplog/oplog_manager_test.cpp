@@ -1,4 +1,4 @@
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -67,22 +67,22 @@ TEST_F(OpLogManagerTest, TestAllocateEntry) {
     EXPECT_NE(0u, e1.prefix_hash);
 }
 
-TEST_F(OpLogManagerTest, TestPersistEntryToEtcd) {
-    // Without an EtcdOpLogStore configured, PersistEntryToEtcd should return an
-    // error
+TEST_F(OpLogManagerTest, TestPersistEntry) {
+    // Without a persistent store configured, PersistEntry should return an
+    // error.
     OpLogEntry entry =
         M().AllocateEntry(OpType::PUT_END, "key", "payload-data");
 
-    ErrorCode err = M().PersistEntryToEtcd(entry);
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, err);
+    ErrorCode err = M().PersistEntry(entry);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
 }
 
 TEST_F(OpLogManagerTest, TestAppendAndPersist) {
-    // Without an EtcdOpLogStore configured, AppendAndPersist should return an
-    // error
+    // Without a persistent store configured, AppendAndPersist should return an
+    // error.
     auto res = M().AppendAndPersist(OpType::REMOVE, "key", "");
     ASSERT_FALSE(res.has_value());
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, res.error());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, res.error());
 }
 
 // ========== Initial Sequence Id Tests ==========
@@ -184,32 +184,31 @@ TEST_F(OpLogManagerTest, TestValidateEntrySize_EmptyKey) {
     EXPECT_TRUE(OpLogManager::ValidateEntrySize(entry, &reason));
 }
 
-// ========== 2.1.4 Etcd integration tests (placeholder) ==========
+// ========== 2.1.4 Persistent backend tests (placeholder) ==========
 
-TEST_F(OpLogManagerTest, TestWriteToEtcd_Success) {
+TEST_F(OpLogManagerTest, TestWriteToPersistentStore_Success) {
 #if defined(STORE_USE_ETCD)
-    GTEST_SKIP()
-        << "TODO: requires real EtcdOpLogStore and running etcd cluster.";
+    GTEST_SKIP() << "TODO: requires real persistent store and running backend.";
 #else
     GTEST_SKIP() << "STORE_USE_ETCD is disabled.";
 #endif
 }
 
-TEST_F(OpLogManagerTest, TestWriteToEtcd_Failure) {
+TEST_F(OpLogManagerTest, TestWriteToPersistentStore_Failure) {
     OpLogEntry entry =
         M().AllocateEntry(OpType::PUT_END, "key", "payload-data");
-    ErrorCode err = M().PersistEntryToEtcd(entry);
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, err);
+    ErrorCode err = M().PersistEntry(entry);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
 }
 
-TEST_F(OpLogManagerTest, TestWriteToEtcd_Retry) {
+TEST_F(OpLogManagerTest, TestWriteToPersistentStore_Retry) {
     GTEST_SKIP() << "TODO: retry / idempotent semantics are tested at "
-                    "EtcdOpLogStore level.";
+                    "backend store level.";
 }
 
 TEST_F(OpLogManagerTest, TestIdempotentWrite) {
     GTEST_SKIP() << "TODO: idempotent write belongs to "
-                    "EtcdOpLogStore::WriteOpLog tests.";
+                    "backend store append tests.";
 }
 
 // ========== 2.1.5 Boundary condition tests ==========

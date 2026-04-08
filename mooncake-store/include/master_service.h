@@ -21,13 +21,14 @@
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
+#include "ha/oplog/oplog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 
@@ -465,8 +466,8 @@ class MasterService {
     bool TryRestoreStateFromSnapshot(const ha::SnapshotDescriptor& snapshot);
     void ResetStateAfterFailedRestoreAttempt();
     void LoadPreloadedState(const ha::PromotedStandbyState& state);
-    void InitializeEtcdOpLogManager();
-    bool ShouldReplicateToEtcdStandby() const;
+    void InitializePersistentOpLogManager();
+    bool ShouldReplicateToStandby() const;
     void AppendOpLogAndNotify(OpType type, const std::string& key,
                               const std::string& payload = std::string());
     void AppendMetadataMutationOpLog(const std::string& key,
@@ -1074,6 +1075,7 @@ class MasterService {
     const std::string cluster_id_;
     std::unordered_set<std::string> invalid_replica_endpoints_;
     OpLogManager oplog_manager_;
+    std::shared_ptr<ha::OpLogStore> persistent_oplog_store_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
