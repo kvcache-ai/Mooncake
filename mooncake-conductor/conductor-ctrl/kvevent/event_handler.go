@@ -75,7 +75,7 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
 	}
 
 	indexer := h.manager.getIndexer()
-	er := indexer.ProcessStoreEvent(conductorEvent, dpRank, h.instanceID)
+	er := indexer.ProcessStoreEvent(conductorEvent, dpRank)
 	// TODO support mooncake_key map
 	if er != nil {
 		slog.Error("process store event failed.", "error", er)
