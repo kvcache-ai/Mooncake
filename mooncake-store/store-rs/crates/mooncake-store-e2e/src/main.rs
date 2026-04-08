@@ -6,10 +6,11 @@ use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataCon
 use mooncake_store_client::{
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
-    StoreClientBuilder,
+    StoreClientBuilder, TentTransportFactory,
 };
 use mooncake_store_core::{
-    ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result, StoreError,
+    ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result,
+    SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
@@ -47,20 +48,22 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "dynamic-membership".to_string(),
         ]);
 
-    let engine_target_a = build_tent_engine(redis_port, "target-a-segment")?;
-    let engine_target_b = build_tent_engine(redis_port, "target-b-segment")?;
-    let engine_upgrade = build_tent_engine(redis_port, "target-a-upgrade-segment")?;
-    let engine_reclaim = build_tent_engine(redis_port, "target-reclaim-segment")?;
-    let engine_router = build_tent_engine(redis_port, "router-segment")?;
-    let engine_router_replica = build_tent_engine(redis_port, "router-replica-segment")?;
-    let engine_reader = build_tent_engine(redis_port, "reader-segment")?;
+    let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment")?;
+    let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment")?;
+    let upgrade_bundle = build_tent_bundle(redis_port, "target-a-upgrade-segment")?;
+    let reclaim_bundle = build_tent_bundle(redis_port, "target-reclaim-segment")?;
+    let router_bundle = build_tent_bundle(redis_port, "router-segment")?;
+    let router_replica_bundle = build_tent_bundle(redis_port, "router-replica-segment")?;
+    let reader_bundle = build_tent_bundle(redis_port, "reader-segment")?;
+    let elastic_target_bundle = build_tent_bundle(redis_port, "elastic-target-segment")?;
+    let elastic_router_bundle = build_tent_bundle(redis_port, "elastic-router-segment")?;
 
     let mut target_a = build_client(
         metadata.clone(),
         "store-a",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        engine_target_a,
+        target_a_bundle,
         memory.clone(),
         "tenant-a",
         &[("pool", "pool-a"), ("role", "primary"), ("storage", "true")],
@@ -70,7 +73,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "store-b",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        engine_target_b,
+        target_b_bundle,
         memory.clone(),
         "tenant-a",
         &[
@@ -84,7 +87,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "store-a",
         ClientEpoch(2),
         ClientLifecycleState::Standby,
-        engine_upgrade,
+        upgrade_bundle,
         memory.clone(),
         "tenant-a",
         &[("pool", "pool-a"), ("role", "upgrade"), ("storage", "true")],
@@ -94,7 +97,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "store-reclaim",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        engine_reclaim,
+        reclaim_bundle,
         LocalMemoryConfig::new()
             .storage_bytes(value_size * 2)
             .scratch_bytes(value_size * 2)
@@ -113,7 +116,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "router",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        engine_router,
+        router_bundle,
         LocalMemoryConfig::new()
             .storage_bytes(value_size * 8)
             .scratch_bytes(SCRATCH_BYTES)
@@ -129,7 +132,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "router-replica",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        engine_router_replica,
+        router_replica_bundle,
         LocalMemoryConfig::new()
             .storage_bytes(value_size * 8)
             .scratch_bytes(SCRATCH_BYTES)
@@ -149,14 +152,48 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         2,
     )?;
     let reader = build_client(
-        metadata,
+        metadata.clone(),
         "reader",
         ClientEpoch(1),
         ClientLifecycleState::Active,
-        engine_reader,
+        reader_bundle,
         memory,
         "tenant-a",
         &[("pool", "pool-a"), ("role", "reader"), ("storage", "false")],
+    )?;
+    let elastic_target = build_client(
+        metadata.clone(),
+        "elastic-target",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        elastic_target_bundle,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 2)
+            .scratch_bytes(SCRATCH_BYTES)
+            .location("cpu:0")
+            .tags(vec![
+                "dram".to_string(),
+                "elastic".to_string(),
+                "storage".to_string(),
+            ]),
+        "tenant-a",
+        &[("pool", "pool-elastic"), ("role", "elastic-target"), ("storage", "true")],
+    )?;
+    let elastic_router = build_routed_client(
+        metadata.clone(),
+        "elastic-router",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        elastic_router_bundle,
+        LocalMemoryConfig::new()
+            .storage_bytes(value_size * 4)
+            .scratch_bytes(SCRATCH_BYTES)
+            .location("cpu:0")
+            .tags(vec!["dram".to_string(), "elastic-router".to_string()]),
+        "tenant-a",
+        &[("pool", "pool-elastic"), ("role", "elastic-router"), ("storage", "false")],
+        PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+        1,
     )?;
 
     target_a.register_local_memory()?;
@@ -166,6 +203,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     router.register_local_memory()?;
     router_replica.register_local_memory()?;
     reader.register_local_memory()?;
+    elastic_target.register_local_memory()?;
+    elastic_router.register_local_memory()?;
 
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
@@ -175,6 +214,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
     verify_routed_scale_out(&router, &reader, value_size)?;
     verify_multi_replica_route_publish(&router_replica, &reader, value_size)?;
+    verify_dynamic_expand_and_soft_shrink(&elastic_target, &elastic_router, &reader, value_size)?;
     verify_hot_upgrade(
         &mut target_a,
         &mut target_upgrade,
@@ -187,27 +227,40 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
 
     println!(
-        "e2e ok: single put/get, batch put/get, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, hot-upgrade"
+        "e2e ok: single put/get, batch put/get, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, hot-upgrade"
     );
     Ok(())
 }
 
+struct TentBundle {
+    engine: Arc<TentEngine>,
+    factory: Arc<TentTransportFactory>,
+}
+
+fn tent_base_config(redis_port: u16) -> TentEngineConfig {
+    TentEngineConfig::new()
+        .set("metadata_type", "redis")
+        .set("metadata_servers", format!("127.0.0.1:{redis_port}"))
+        .set("redis_db_index", "0")
+        .set("rpc_server_hostname", "127.0.0.1")
+        .set("rpc_server_port", "0")
+        .set("log_level", "warning")
+        .set("transports/tcp/enable", "true")
+        .set("transports/shm/enable", "false")
+        .set("transports/rdma/enable", "false")
+        .set("transports/io_uring/enable", "false")
+}
+
 #[allow(clippy::arc_with_non_send_sync)]
-fn build_tent_engine(redis_port: u16, local_segment_name: &str) -> Result<Arc<TentEngine>> {
-    Ok(Arc::new(TentEngine::new(
-        &TentEngineConfig::new()
-            .set("metadata_type", "redis")
-            .set("metadata_servers", format!("127.0.0.1:{redis_port}"))
-            .set("redis_db_index", "0")
-            .set("rpc_server_hostname", "127.0.0.1")
-            .set("rpc_server_port", "0")
-            .set("local_segment_name", local_segment_name)
-            .set("log_level", "warning")
-            .set("transports/tcp/enable", "true")
-            .set("transports/shm/enable", "false")
-            .set("transports/rdma/enable", "false")
-            .set("transports/io_uring/enable", "false"),
-    )?))
+fn build_tent_bundle(redis_port: u16, local_segment_name: &str) -> Result<TentBundle> {
+    let config = tent_base_config(redis_port);
+    let engine = Arc::new(TentEngine::new(
+        &config.clone().set("local_segment_name", local_segment_name),
+    )?);
+    Ok(TentBundle {
+        engine,
+        factory: Arc::new(TentTransportFactory::new(config)),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,7 +269,7 @@ fn build_client(
     stable_id: &str,
     epoch: ClientEpoch,
     state: ClientLifecycleState,
-    engine: Arc<TentEngine>,
+    transport: TentBundle,
     memory: LocalMemoryConfig,
     tenant: &str,
     labels: &[(&str, &str)],
@@ -227,7 +280,8 @@ fn build_client(
         .tenant(tenant)
         .compatibility(CompatibilityDescriptor::default())
         .local_memory(memory)
-        .with_tent(engine);
+        .with_tent(transport.engine)
+        .transport_factory(transport.factory);
     for (key, value) in labels {
         builder = builder.label(*key, *value);
     }
@@ -240,7 +294,7 @@ fn build_routed_client(
     stable_id: &str,
     epoch: ClientEpoch,
     state: ClientLifecycleState,
-    engine: Arc<TentEngine>,
+    transport: TentBundle,
     memory: LocalMemoryConfig,
     tenant: &str,
     labels: &[(&str, &str)],
@@ -253,7 +307,8 @@ fn build_routed_client(
         .tenant(tenant)
         .compatibility(CompatibilityDescriptor::default())
         .local_memory(memory)
-        .with_tent(engine)
+        .with_tent(transport.engine)
+        .transport_factory(transport.factory)
         .routed_writes(planner, replica_count);
     for (key, value) in labels {
         builder = builder.label(*key, *value);
@@ -507,6 +562,73 @@ fn verify_overwrite_reclaims_capacity(
     }
     let actual = reader.get("overwrite-key")?;
     ensure_payload("overwrite reclaim", &expected, &actual)?;
+    Ok(())
+}
+
+fn verify_dynamic_expand_and_soft_shrink(
+    target: &StoreClient,
+    router: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let primary = SegmentName::new("elastic-target-segment");
+    let first = payload("elastic-initial", value_size);
+    router.put("elastic-key", &first)?;
+    let first_route = router
+        .query_route("elastic-key")?
+        .ok_or_else(|| StoreError::NotFound("elastic-key".to_string()))?;
+    if first_route.replicas[0].segment_name != primary {
+        return Err(StoreError::InvalidState(format!(
+            "elastic initial write landed on unexpected segment {}",
+            first_route.replicas[0].segment_name.0
+        )));
+    }
+
+    let expanded = target.expand_local_memory(value_size * 4)?;
+    target.drain_segment(&primary)?;
+
+    let second = payload("elastic-updated", value_size);
+    router.put("elastic-key", &second)?;
+    let second_route = router
+        .query_route("elastic-key")?
+        .ok_or_else(|| StoreError::NotFound("elastic-key".to_string()))?;
+    if second_route.replicas[0].segment_name != expanded.segment_name {
+        return Err(StoreError::InvalidState(format!(
+            "elastic overwrite did not move to expanded segment: {}",
+            second_route.replicas[0].segment_name.0
+        )));
+    }
+
+    let segments = target.list_segments()?;
+    let primary_state = segments
+        .iter()
+        .find(|segment| segment.segment_name == primary)
+        .ok_or_else(|| StoreError::NotFound(primary.0.clone()))?;
+    if primary_state.state != SegmentLifecycleState::Draining {
+        return Err(StoreError::InvalidState(
+            "primary elastic segment is not draining".to_string(),
+        ));
+    }
+    if primary_state.used_bytes != 0 {
+        return Err(StoreError::InvalidState(format!(
+            "primary elastic segment still has live bytes: {}",
+            primary_state.used_bytes
+        )));
+    }
+    if !target.retire_segment(&primary)? {
+        return Err(StoreError::InvalidState(
+            "elastic draining segment did not retire".to_string(),
+        ));
+    }
+
+    let remaining = target.list_segments()?;
+    if remaining.iter().any(|segment| segment.segment_name == primary) {
+        return Err(StoreError::InvalidState(
+            "elastic primary segment still published after retire".to_string(),
+        ));
+    }
+    let actual = reader.get("elastic-key")?;
+    ensure_payload("elastic expand+shrink", &second, &actual)?;
     Ok(())
 }
 

@@ -2,8 +2,8 @@ use crate::error::Result;
 use crate::identity::{ClientRuntimeId, ClientStableId};
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteVersion, SegmentAnnouncement, SegmentName,
-    SegmentReservation,
+    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, SegmentReservation,
 };
 
 pub trait MetadataBackend: Send + Sync {
@@ -21,13 +21,29 @@ pub trait MetadataBackend: Send + Sync {
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()>;
 
+    fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>>;
+
+    fn update_segment_state(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> Result<()>;
+
     fn reserve_segment(
         &self,
         owner: &ClientRuntimeId,
         segment: &SegmentName,
         length_bytes: u64,
-        alignment: u64,
     ) -> Result<SegmentReservation>;
+
+    fn release_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()>;
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>>;
 

@@ -10,7 +10,7 @@ pub use error::{Result, StoreError};
 pub use identity::{ClientEndpointSet, ClientEpoch, ClientRuntimeId, ClientStableId};
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
-    RouteState, RouteVersion, SegmentAnnouncement, SegmentName, SegmentReservation,
+    CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
 };
 pub use traits::{MetadataBackend, PlacementStrategy};

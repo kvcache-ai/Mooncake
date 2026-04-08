@@ -1,9 +1,12 @@
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
-use mooncake_transport::{SegmentInfo, TentEngine, TransferProgress, TransferRequest, TransferStatus};
+use mooncake_transport::{
+    SegmentInfo, TentEngine, TentEngineConfig, TransferProgress, TransferRequest, TransferStatus,
+};
 
 pub trait StoreTransport {
     fn segment_name(&self) -> Result<String>;
@@ -20,6 +23,30 @@ pub trait StoreTransport {
     fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()>;
     fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress>;
     fn overall_status(&self, batch_id: u64) -> Result<TransferProgress>;
+}
+
+pub trait StoreTransportFactory: Send + Sync {
+    fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct TentTransportFactory {
+    config: TentEngineConfig,
+}
+
+impl TentTransportFactory {
+    pub fn new(config: TentEngineConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl StoreTransportFactory for TentTransportFactory {
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
+        Ok(Arc::new(TentEngine::new(
+            &self.config.clone().set("local_segment_name", segment_name),
+        )?))
+    }
 }
 
 impl StoreTransport for TentEngine {
