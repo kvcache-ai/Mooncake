@@ -5,9 +5,10 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_BUILD_DIR");
+    println!("cargo:rerun-if-changed=../../third_party/Mooncake");
 
-    let upstream_dir = env_path("MOONCAKE_UPSTREAM_DIR")
-        .unwrap_or_else(|| PathBuf::from("/root/Mooncake-upstream-main"));
+    let upstream_dir =
+        env_path("MOONCAKE_UPSTREAM_DIR").unwrap_or_else(default_upstream_dir);
     let build_dir = env_path("MOONCAKE_UPSTREAM_BUILD_DIR")
         .unwrap_or_else(|| upstream_dir.join("build-rust"));
 
@@ -29,7 +30,19 @@ fn env_path(key: &str) -> Option<PathBuf> {
     env::var_os(key).map(PathBuf::from)
 }
 
+fn default_upstream_dir() -> PathBuf {
+    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir must exist"))
+        .join("../../third_party/Mooncake")
+}
+
 fn ensure_upstream_native_artifacts(upstream_dir: &Path, build_dir: &Path) {
+    if !upstream_dir.exists() {
+        panic!(
+            "Mooncake upstream source was not found at {}. Run `git submodule update --init --recursive` or set MOONCAKE_UPSTREAM_DIR.",
+            upstream_dir.display()
+        );
+    }
+
     let transfer_engine = build_dir.join("mooncake-transfer-engine/src/libtransfer_engine.so");
     let tent_shared = build_dir.join("mooncake-transfer-engine/tent/src/libtent_shared.so");
     if transfer_engine.exists() && tent_shared.exists() {

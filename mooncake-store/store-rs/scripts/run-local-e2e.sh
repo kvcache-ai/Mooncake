@@ -5,7 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"
 BENCH_ITERS="${MC_STORE_RS_BENCH_ITERS:-512}"
 VALUE_SIZE="${MC_STORE_RS_VALUE_SIZE:-4096}"
-UPSTREAM_DIR="${MOONCAKE_UPSTREAM_DIR:-/root/Mooncake-upstream-main}"
+UPSTREAM_DIR="${MOONCAKE_UPSTREAM_DIR:-${ROOT_DIR}/third_party/Mooncake}"
+UPSTREAM_BUILD_DIR="${MOONCAKE_UPSTREAM_BUILD_DIR:-${UPSTREAM_DIR}/build-rust}"
+
+if [[ ! -d "${UPSTREAM_DIR}" ]]; then
+  echo "Mooncake upstream submodule missing at ${UPSTREAM_DIR}" >&2
+  echo "Run: git submodule update --init --recursive" >&2
+  exit 1
+fi
 
 if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
   redis-server \
@@ -16,7 +23,7 @@ if ! redis-cli -p "${REDIS_PORT}" ping >/dev/null 2>&1; then
     --appendonly no
 fi
 
-export LD_LIBRARY_PATH="${UPSTREAM_DIR}/build-rust/mooncake-transfer-engine/tent/src:${UPSTREAM_DIR}/build-rust/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
 export MC_STORE_RS_REDIS_URL="${MC_STORE_RS_REDIS_URL:-redis://127.0.0.1:${REDIS_PORT}/0}"
 export MC_STORE_RS_REDIS_PORT="${REDIS_PORT}"
 export MC_STORE_RS_BATCH_BENCH_ITERS="${BENCH_ITERS}"

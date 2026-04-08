@@ -1,7 +1,9 @@
 use std::ffi::{c_char, c_int, c_void};
 
-pub const DEFAULT_UPSTREAM_DIR: &str = "/root/Mooncake-upstream-main";
-pub const DEFAULT_UPSTREAM_BUILD_DIR: &str = "/root/Mooncake-upstream-main/build-rust";
+pub const DEFAULT_UPSTREAM_DIR: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/Mooncake");
+pub const DEFAULT_UPSTREAM_BUILD_DIR: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/Mooncake/build-rust");
 
 pub mod classic {
     use super::{c_char, c_int, c_void};
