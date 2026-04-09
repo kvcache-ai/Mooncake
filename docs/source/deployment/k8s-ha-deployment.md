@@ -38,6 +38,9 @@ rules:
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "create", "update", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -88,6 +91,8 @@ A complete deployment consists of: Namespace, RBAC (above), headless Service, St
 
 ### Headless Service
 
+Required for StatefulSet DNS (individual pod addressing):
+
 ```yaml
 apiVersion: v1
 kind: Service
@@ -103,6 +108,27 @@ spec:
     name: rpc
   - port: 8080
     name: http
+```
+
+### Leader Service
+
+Routes traffic to the current leader only. The `mooncake.io/store-role: leader` label is managed automatically by the master process — it is set when a pod becomes the leader and removed when leadership is lost.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-master-leader
+  namespace: <namespace>
+spec:
+  selector:
+    app: mooncake-master
+    mooncake.io/store-role: leader
+  ports:
+  - port: 8080
+    name: http
+  - port: 50051
+    name: rpc
 ```
 
 ### StatefulSet
@@ -142,6 +168,14 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: LD_LIBRARY_PATH
           value: /usr/local/lib
         ports:
@@ -155,22 +189,20 @@ See `k8s-test/manifests.yaml` for a complete working example.
 
 ## Client Discovery
 
-Clients connect to the HA cluster using a `k8s://` connection string:
+Clients connect to the HA cluster using a `k8s://` connection string. The `mooncake-master-leader` Service routes metadata requests to the current leader via label-based routing:
 
 ```python
 import mooncake
 
 client = mooncake.Client()
 client.setup(
-    metadata_server="http://<leader-ip>:8080/metadata",
+    metadata_server="http://mooncake-master-leader.<namespace>.svc:8080/metadata",
     master_server_addr="k8s://<namespace>/<lease-name>",
 )
 ```
 
 The `master_server_addr` parameter accepts the format `k8s://<namespace>/<lease-name>`. The client reads the K8s Lease to discover the current leader's address for RPC operations.
 
-> **Note:** The `metadata_server` parameter currently requires the leader's IP directly. On failover, the client's heartbeat thread automatically discovers the new leader via the Lease and reconnects. See [Known Limitations](#known-limitations) for details.
+The `metadata_server` parameter uses the `mooncake-master-leader` Service, which automatically follows leader changes via the `mooncake.io/store-role: leader` pod label. On failover, the label moves to the new leader, and the Service endpoint updates accordingly.
 
-## Known Limitations
-
-- **Metadata server routing**: The `metadata_server` parameter (`http://<leader-ip>:8080/metadata`) is currently bound to the leader's pod IP and does not automatically follow leader changes. On failover, the client's heartbeat thread discovers the new leader and reconnects, but the initial `metadata_server` URL must point to a reachable leader. A future enhancement will use K8s label-based routing (a Service selecting `mooncake-role: leader`) to provide a stable metadata endpoint that survives failover.
+> **Note:** You can also use the leader's pod IP directly (`http://<leader-ip>:8080/metadata`), but the Service-based URL is recommended for production as it survives failover without client restarts.

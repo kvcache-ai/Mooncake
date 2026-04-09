@@ -45,6 +45,10 @@ struct MasterConfig {
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
 
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
+
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
 
@@ -146,6 +150,10 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+
+    // Pod identity for K8s label-based routing
+    std::string pod_name;
+    std::string pod_namespace;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -214,6 +222,9 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        pod_name = config.pod_name;
+        pod_namespace = config.pod_namespace;
         validate();
     }
 

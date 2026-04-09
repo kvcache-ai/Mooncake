@@ -125,6 +125,11 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
              "How long a client is considered alive after the last ping, only "
              "used in HA mode");
 
+DEFINE_string(pod_name, "",
+              "Pod name for K8s label-based routing (default: $POD_NAME)");
+DEFINE_string(pod_namespace, "",
+              "Pod namespace for K8s label-based routing "
+              "(default: $POD_NAMESPACE)");
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
 DEFINE_int64(global_file_segment_size,
@@ -331,6 +336,10 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetString("pod_name", &master_config.pod_name,
+                             FLAGS_pod_name);
+    default_config.GetString("pod_namespace", &master_config.pod_namespace,
+                             FLAGS_pod_namespace);
     default_config.GetUInt64("put_start_discard_timeout_sec",
                              &master_config.put_start_discard_timeout_sec,
                              FLAGS_put_start_discard_timeout_sec);
@@ -606,6 +615,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
     }
+    if ((google::GetCommandLineFlagInfo("pod_name", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.pod_name = FLAGS_pod_name;
+    }
+    if ((google::GetCommandLineFlagInfo("pod_namespace", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.pod_namespace = FLAGS_pod_namespace;
+    }
     if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
                                         &info) &&
          !info.is_default) ||
@@ -827,6 +846,16 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
     ResolveRpcAddressFromInterfaceOrDie(master_config);
+
+    // Fall back to environment variables for pod identity (K8s Downward API)
+    if (master_config.pod_name.empty()) {
+        const char* env = std::getenv("POD_NAME");
+        if (env) master_config.pod_name = env;
+    }
+    if (master_config.pod_namespace.empty()) {
+        const char* env = std::getenv("POD_NAMESPACE");
+        if (env) master_config.pod_namespace = env;
+    }
 
     const std::string ha_backend_connstring =
         ResolveHABackendConnstring(master_config);

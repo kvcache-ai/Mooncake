@@ -20,6 +20,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -483,6 +485,64 @@ func K8sLeaseCancelWatch(
 	}
 
 	state.cancel()
+	return 0
+}
+
+// patchPodLabel sets or removes a label on a pod using a JSON merge patch.
+// If value is non-nil, the label is set; if nil, the label is removed.
+func patchPodLabel(namespace, podName, labelKey string, value interface{}) error {
+	if globalClient == nil {
+		return fmt.Errorf("k8s client not initialized")
+	}
+
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]interface{}{
+				labelKey: value,
+			},
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal label patch: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = globalClient.CoreV1().Pods(namespace).Patch(
+		ctx, podName, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to patch pod label: %w", err)
+	}
+	return nil
+}
+
+//export K8sPatchPodLabel
+func K8sPatchPodLabel(
+	ns, podName, labelKey, labelValue *C.char,
+	errMsg **C.char,
+) C.int {
+	err := patchPodLabel(C.GoString(ns), C.GoString(podName),
+		C.GoString(labelKey), C.GoString(labelValue))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export K8sRemovePodLabel
+func K8sRemovePodLabel(
+	ns, podName, labelKey *C.char,
+	errMsg **C.char,
+) C.int {
+	err := patchPodLabel(C.GoString(ns), C.GoString(podName),
+		C.GoString(labelKey), nil)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 	return 0
 }
 
