@@ -258,7 +258,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
-#elif defined(USE_HIP) || defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
@@ -273,22 +273,13 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
         } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
-#if defined(USE_HIP)
-            constexpr const char* kCrossNodeTransport = "hip";
-            constexpr const char* kCrossNodeTransportName = "HIP";
-#else
-            constexpr const char* kCrossNodeTransport = "nvlink";
-            constexpr const char* kCrossNodeTransportName = "NVLink";
-#endif
             Transport* t =
-                multi_transports_->installTransport(kCrossNodeTransport, nullptr);
+                multi_transports_->installTransport("nvlink", nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install " << kCrossNodeTransportName
-                           << " transport";
+                LOG(ERROR) << "Failed to install NVLink transport";
                 return -1;
             }
-            LOG(INFO) << "Using cross-node " << kCrossNodeTransportName
-                      << " transport "
+            LOG(INFO) << "Using cross-node NVLink transport "
                       << "(MC_FORCE_MNNVL or no HCA detected)";
         } else {
             Transport* t =
@@ -336,6 +327,21 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
         // TODO: install other transports automatically
+
+#ifdef USE_HIP
+        // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
+        // coexist with the cross-node transport (RDMA/TCP) selected above.
+        {
+            Transport* hip_transport =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!hip_transport) {
+                LOG(WARNING) << "Failed to install HIP transport "
+                                "(intra-node GPU P2P unavailable)";
+            } else {
+                LOG(INFO) << "HIP transport installed for intra-node GPU P2P";
+            }
+        }
+#endif
     }
 #endif
 

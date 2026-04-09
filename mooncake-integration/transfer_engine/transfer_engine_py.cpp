@@ -59,8 +59,6 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
-        allocateMemory = malloc;
-        freeMemory = free;
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
@@ -73,15 +71,8 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected HIP memory allocator";
 #else
-        allocateMemory = malloc;
-        freeMemory = free;
         LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
 #endif
-    } else if (strcmp(protocol, "xgmi") == 0) {
-        allocateMemory = malloc;
-        freeMemory = free;
-        LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
-                   << "Use 'hip' instead.";
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
         allocateMemory = [](size_t s) -> void * {
@@ -93,12 +84,9 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
-        allocateMemory = malloc;
-        freeMemory = free;
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
 #endif
     } else {
-        // default fallback
         allocateMemory = malloc;
         freeMemory = free;
         LOG(WARNING) << "Using default malloc/free for protocol: "
@@ -192,8 +180,11 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         return -1;
     }
 
-    bool manual_transport = strcmp(protocol, "hip") == 0 ||
-                            strcmp(protocol, "nvlink") == 0 ||
+    // NVLink-family transports bypass auto-discover because they replace
+    // the cross-node transport entirely (MNNVL is itself cross-node capable).
+    // HIP (IPC mode) is intra-node only and coexists with the auto-discovered
+    // cross-node transport, so it does NOT need to disable auto-discover.
+    bool manual_transport = strcmp(protocol, "nvlink") == 0 ||
                             strcmp(protocol, "nvlink_intra") == 0;
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
@@ -201,13 +192,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     auto device_filter = buildDeviceFilter(device_name_safe);
 
 #ifdef USE_EFA
-    // When using EFA protocol, we still need topology discovery but won't
-    // auto-install RDMA
     bool use_efa = (strcmp(protocol, "efa") == 0);
-    // Disable auto_discover to prevent RDMA transport installation, we'll
-    // install EFA or advanced transports manually
     engine_ = std::make_unique<TransferEngine>(false, device_filter);
-    // Manually discover topology for EFA to populate device list
     if (use_efa) {
         engine_->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
@@ -225,7 +211,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                           hostname_port.first.c_str(), hostname_port.second);
         if (ret) return -1;
     } else {
-        // the last two params are unused
         int ret = engine_->init(conn_string, local_hostname, "", 0);
         if (ret) return -1;
     }
@@ -234,7 +219,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("efa", nullptr);
+        auto *transport = engine_->installTransport("efa", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install EFA transport";
             return -1;
@@ -247,12 +232,9 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
             return -1;
         }
     } else {
-        // For non-EFA protocols (e.g. TCP), manually install TCP transport
-        // since auto_discover is disabled to prevent RDMA installation
-        // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in EFA build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
+        auto *transport = engine_->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";
             return -1;
