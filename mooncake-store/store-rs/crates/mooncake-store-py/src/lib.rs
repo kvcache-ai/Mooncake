@@ -31,7 +31,10 @@ struct PyMooncakeDistributedStore {
 }
 
 #[pyclass(name = "MooncakeHostMemAllocator", unsendable)]
-struct PyMooncakeHostMemAllocator;
+struct PyMooncakeHostMemAllocator {
+    use_hugepage: Option<bool>,
+    hugepage_size: Option<usize>,
+}
 
 #[pymethods]
 impl PyMooncakeDistributedStore {
@@ -60,7 +63,9 @@ impl PyMooncakeDistributedStore {
         keyspace = None,
         transport_metadata_url = None,
         local_segment_name = None,
-        expires_at_ms = None
+        expires_at_ms = None,
+        use_hugepage = None,
+        hugepage_size = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn setup(
@@ -81,6 +86,8 @@ impl PyMooncakeDistributedStore {
         transport_metadata_url: Option<String>,
         local_segment_name: Option<String>,
         expires_at_ms: Option<u64>,
+        use_hugepage: Option<bool>,
+        hugepage_size: Option<usize>,
     ) -> PyResult<i32> {
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
@@ -98,6 +105,8 @@ impl PyMooncakeDistributedStore {
                 replica_count,
                 keyspace,
                 expires_at_ms,
+                use_hugepage,
+                hugepage_size_bytes: hugepage_size,
             },
             local_segment_name,
             route_control: RouteControlMode::EmbeddedWrh,
@@ -1208,12 +1217,21 @@ impl PyMooncakeDistributedStore {
 #[pymethods]
 impl PyMooncakeHostMemAllocator {
     #[new]
-    fn new() -> Self {
-        Self
+    #[pyo3(signature = (use_hugepage = None, hugepage_size = None))]
+    fn new(use_hugepage: Option<bool>, hugepage_size: Option<usize>) -> Self {
+        Self {
+            use_hugepage,
+            hugepage_size,
+        }
     }
 
     fn alloc(&self, size: usize) -> PyResult<usize> {
-        shm::allocate_shared_region(size).map_err(store_error_to_py)
+        let result = if self.use_hugepage.is_none() && self.hugepage_size.is_none() {
+            shm::allocate_shared_region(size)
+        } else {
+            shm::allocate_shared_region_with_options(size, self.use_hugepage, self.hugepage_size)
+        };
+        result.map_err(store_error_to_py)
     }
 
     fn free(&self, ptr: usize) -> PyResult<i32> {

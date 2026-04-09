@@ -42,17 +42,23 @@ impl CompatRuntimeArgs {
                 .set("local_segment_name", &segment_name),
         )?);
         let factory = Arc::new(TentTransportFactory::new(plan.tent_config));
+        let mut local_memory = LocalMemoryConfig::new()
+            .storage_bytes(plan.storage_bytes)
+            .scratch_bytes(plan.scratch_bytes)
+            .location("cpu:0");
+        if let Some(use_hugepage) = plan.use_hugepage {
+            local_memory = local_memory.use_hugepage(use_hugepage);
+        }
+        if let Some(hugepage_size_bytes) = plan.hugepage_size_bytes {
+            local_memory = local_memory.hugepage_size_bytes(hugepage_size_bytes);
+        }
+
         let mut builder = StoreClientBuilder::new(plan.metadata, stable_id.clone())
             .epoch(ClientEpoch(1))
             .state(ClientLifecycleState::Active)
             .compatibility(CompatibilityDescriptor::default())
             .tenant(plan.tenant)
-            .local_memory(
-                LocalMemoryConfig::new()
-                    .storage_bytes(plan.storage_bytes)
-                    .scratch_bytes(plan.scratch_bytes)
-                    .location("cpu:0"),
-            )
+            .local_memory(local_memory)
             .with_tent(engine)
             .transport_factory(factory)
             .route_control(self.route_control);

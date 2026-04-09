@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use _store_rs::dummy_service::{SharedStoreClient, start_dummy_store_server};
 use _store_rs::runtime::{CompatRuntimeArgs, CompatSetupArgs};
 use clap::{Parser, ValueEnum};
+use mooncake_store_core::parse_hugepage_size;
 use mooncake_store_client::{
     init_tracing, start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
     RouteControlMode,
@@ -68,6 +69,10 @@ struct Args {
     metrics_addr: Option<String>,
     #[arg(long)]
     client_server_address: Option<String>,
+    #[arg(long, default_value_t = false)]
+    use_hugepage: bool,
+    #[arg(long, value_parser = parse_hugepage_size_arg)]
+    hugepage_size: Option<usize>,
     #[arg(long)]
     trace_filter: Option<String>,
     #[arg(long, value_enum, default_value_t = RouteControlArg::EmbeddedWrh)]
@@ -101,6 +106,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             replica_count: args.replica_count,
             keyspace: args.keyspace,
             expires_at_ms: Some(now_ms().saturating_add(args.lease_ttl_ms)),
+            use_hugepage: args.use_hugepage.then_some(true),
+            hugepage_size_bytes: args.hugepage_size,
         },
         local_segment_name: args.local_segment_name,
         route_control: args.route_control.into(),
@@ -190,6 +197,11 @@ fn parse_label(input: &str) -> Result<(String, String), String> {
         return Err("label key must not be empty".to_string());
     }
     Ok((key.to_string(), value.trim().to_string()))
+}
+
+fn parse_hugepage_size_arg(input: &str) -> Result<usize, String> {
+    parse_hugepage_size(input)
+        .map_err(|error| error.to_string())
 }
 
 fn install_signal_handler() -> Result<Arc<AtomicBool>, Box<dyn Error>> {

@@ -1,5 +1,6 @@
 pub mod compat;
 pub mod error;
+pub mod hugepage;
 pub mod identity;
 pub mod lifecycle;
 pub mod route;
@@ -7,6 +8,7 @@ pub mod traits;
 
 pub use compat::CompatibilityDescriptor;
 pub use error::{Result, StoreError};
+pub use hugepage::{HugePageConfig, parse_hugepage_size};
 pub use identity::{ClientEndpointSet, ClientEpoch, ClientRuntimeId, ClientStableId};
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{

@@ -14,6 +14,9 @@ pub trait StoreTransport {
     fn open_segment(&self, segment_name: &str) -> Result<u64>;
     fn close_segment(&self, handle: u64) -> Result<()>;
     fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo>;
+    fn adopt_local_memory(&self, _addr: *mut c_void, _size: usize, _location: &str) -> Result<()> {
+        Ok(())
+    }
     fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void>;
     fn free_memory(&self, addr: *mut c_void) -> Result<()>;
     fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()>;
