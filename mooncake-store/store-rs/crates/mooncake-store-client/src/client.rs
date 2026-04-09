@@ -15,12 +15,19 @@ use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
 use tracing::{debug, info, info_span};
 
+use crate::control_plane::{
+    control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
+    ControlPlaneHandle,
+};
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, StorageExtentInfo, StorageSegmentSpec,
 };
 use crate::observability::OperationTracker;
 use crate::placement::PlacementPlanner;
-use crate::route_directory::{build_route_directory, RouteControlMode};
+use crate::route_directory::{
+    authority_compare_and_swap, authority_get, authority_replace, build_route_directory,
+    RouteControlMode,
+};
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
 const DEFAULT_TENANT: &str = "default";
@@ -351,6 +358,21 @@ impl StoreClientBuilder {
             stable_id: self.stable_id,
             epoch: self.epoch,
         };
+        let state = Mutex::new(StoreState::default());
+        let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
+        let control_client = Arc::new(ControlPlaneClient);
+        let control_plane = ControlPlaneHandle::spawn(
+            &control_bind_host(&endpoints.rpc_address),
+            Arc::new(LocalAuthorityAdapter),
+            Arc::new(LocalAllocatorAdapter {
+                runtime: runtime.clone(),
+                allocator: allocator.clone(),
+            }),
+        )?;
+        endpoints
+            .labels
+            .entry(control_address_label().to_string())
+            .or_insert_with(|| control_plane.address().to_string());
         let lease = ClientLease {
             runtime: runtime.clone(),
             state: self.initial_state,
@@ -359,18 +381,25 @@ impl StoreClientBuilder {
             expires_at_ms,
         };
         self.metadata.upsert_client_lease(&lease)?;
-        let route_directory =
-            build_route_directory(self.route_control, self.metadata.clone(), &lease);
+        let route_directory = build_route_directory(
+            self.route_control,
+            self.metadata.clone(),
+            &lease,
+            control_client.clone(),
+        );
         Ok(StoreClient {
             metadata: self.metadata,
             route_directory,
+            _control_plane: control_plane,
+            control_client,
+            allocator,
             lease,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,
             transport_factory: self.transport_factory,
             write_mode: self.write_mode,
-            state: Mutex::new(StoreState::default()),
+            state,
         })
     }
 }
@@ -480,6 +509,9 @@ pub trait MooncakeCompatibilityFacade {
 pub struct StoreClient {
     metadata: Arc<dyn MetadataBackend>,
     route_directory: Arc<dyn RouteDirectory>,
+    _control_plane: ControlPlaneHandle,
+    control_client: Arc<ControlPlaneClient>,
+    allocator: Arc<Mutex<LocalAllocatorState>>,
     lease: ClientLease,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
@@ -515,6 +547,145 @@ impl StoreClient {
                 PlacementPlanner::new(self.metadata.clone()).require_label("storage", "true")
             }
             WriteMode::Routed { planner, .. } => planner.clone(),
+        }
+    }
+
+    fn lookup_runtime_lease(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
+        self.metadata
+            .list_live_clients()?
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime && compatibility_matches(&self.lease, lease))
+            .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", runtime)))
+    }
+
+    fn reserve_segment_allocation(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: Option<&SegmentName>,
+        length_bytes: u64,
+        require_local_memory: bool,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        if *owner == self.lease.runtime {
+            if require_local_memory {
+                let state = self.state.lock();
+                if let Some(segment_name) = segment_name {
+                    if !state.memory_ref()?.has_storage_segment(segment_name) {
+                        return Err(StoreError::NotFound(format!(
+                            "local segment {} not found",
+                            segment_name.0
+                        )));
+                    }
+                }
+            }
+            return match segment_name {
+                Some(segment_name) => {
+                    self.allocator
+                        .lock()
+                        .reserve_specific(owner, segment_name, length_bytes)
+                }
+                None => self.allocator.lock().reserve_any(owner, length_bytes),
+            };
+        }
+
+        let owner_lease = self.lookup_runtime_lease(owner)?;
+        let rpc_result = match segment_name {
+            Some(segment_name) => self.control_client.reserve_specific(
+                &owner_lease,
+                owner,
+                segment_name,
+                length_bytes,
+            ),
+            None => self
+                .control_client
+                .reserve_any(&owner_lease, owner, length_bytes),
+        };
+        match rpc_result {
+            Ok(reservation) => Ok(reservation),
+            Err(error) => {
+                debug!(
+                    owner = %owner,
+                    segment = segment_name.map(|segment| segment.0.as_str()).unwrap_or("*"),
+                    error = %error,
+                    "allocator rpc failed; falling back to metadata allocator"
+                );
+                match segment_name {
+                    Some(segment_name) => {
+                        self.metadata
+                            .reserve_segment(owner, segment_name, length_bytes)
+                    }
+                    None => {
+                        let mut segments = self.metadata.list_segments(Some(owner))?;
+                        segments.retain(|segment| segment.state == SegmentLifecycleState::Active);
+                        segments.sort_by(|left, right| {
+                            let left_remaining =
+                                left.capacity_bytes.saturating_sub(left.used_bytes);
+                            let right_remaining =
+                                right.capacity_bytes.saturating_sub(right.used_bytes);
+                            right_remaining
+                                .cmp(&left_remaining)
+                                .then_with(|| left.segment_name.cmp(&right.segment_name))
+                        });
+                        let mut last_capacity_error = None;
+                        for segment in segments {
+                            match self.metadata.reserve_segment(
+                                owner,
+                                &segment.segment_name,
+                                length_bytes,
+                            ) {
+                                Ok(reservation) => return Ok(reservation),
+                                Err(StoreError::Allocator(message)) => {
+                                    last_capacity_error = Some(StoreError::Allocator(message));
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(last_capacity_error.unwrap_or_else(|| {
+                            StoreError::Allocator(format!(
+                                "no writable active segment available for {}",
+                                owner
+                            ))
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_segment_allocation(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        if *owner == self.lease.runtime {
+            return self
+                .allocator
+                .lock()
+                .release(owner, segment_name, offset_bytes, length_bytes);
+        }
+
+        let owner_lease = self.lookup_runtime_lease(owner)?;
+        match self.control_client.release(
+            &owner_lease,
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                debug!(
+                    owner = %owner,
+                    segment = %segment_name.0,
+                    offset_bytes,
+                    length_bytes,
+                    error = %error,
+                    "allocator release rpc failed; falling back to metadata allocator"
+                );
+                self.metadata
+                    .release_segment(owner, segment_name, offset_bytes, length_bytes)
+            }
         }
     }
 
@@ -663,36 +834,16 @@ impl StoreClient {
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
-        if require_local_memory {
-            let state = self.state.lock();
-            if !state.memory_ref()?.has_storage_segment(segment_name) {
-                return Err(StoreError::NotFound(format!(
-                    "local segment {} not found",
-                    segment_name.0
-                )));
-            }
-        }
-        let segment = self
-            .metadata
-            .list_segments(Some(owner))?
-            .into_iter()
-            .find(|segment| {
-                segment.segment_name == *segment_name
-                    && segment.state == SegmentLifecycleState::Active
-            })
-            .ok_or_else(|| {
-                StoreError::NotFound(format!(
-                    "active segment {} for owner {} not found",
-                    segment_name.0, owner
-                ))
-            })?;
-        let reservation =
-            self.metadata
-                .reserve_segment(owner, &segment.segment_name, length_bytes as u64)?;
+        let reservation = self.reserve_segment_allocation(
+            owner,
+            Some(segment_name),
+            length_bytes as u64,
+            require_local_memory,
+        )?;
         Ok((
             ReplicaWriteTarget {
                 runtime: owner.clone(),
-                segment_name: segment.segment_name,
+                segment_name: reservation.segment_name.clone(),
             },
             reservation,
         ))
@@ -709,7 +860,7 @@ impl StoreClient {
             ));
         }
         for (target, reservation) in targets.iter().zip(reservations.iter()) {
-            self.metadata.release_segment(
+            self.release_segment_allocation(
                 &target.runtime,
                 &target.segment_name,
                 reservation.offset_bytes,
@@ -725,7 +876,7 @@ impl StoreClient {
             state.take_due_reclaims(now_ms())
         };
         for reclaim in due {
-            self.metadata.release_segment(
+            self.release_segment_allocation(
                 &reclaim.owner,
                 &reclaim.segment_name,
                 reclaim.offset_bytes,
@@ -806,7 +957,7 @@ impl StoreClient {
             state = ?segment.state,
             "publishing local segment"
         );
-        self.metadata.publish_segment(&SegmentAnnouncement {
+        let announcement = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
             segment_name: segment.segment_name.clone(),
             capacity_bytes: segment.capacity_bytes,
@@ -814,29 +965,9 @@ impl StoreClient {
             state: segment.state,
             alignment_bytes: segment.alignment_bytes,
             tags: segment.tags.clone(),
-        })
-    }
-
-    fn sorted_segments(
-        &self,
-        owner: &ClientRuntimeId,
-        require_local_memory: bool,
-    ) -> Result<Vec<SegmentAnnouncement>> {
-        let mut segments = self.metadata.list_segments(Some(owner))?;
-        if require_local_memory {
-            let state = self.state.lock();
-            let memory = state.memory_ref()?;
-            segments.retain(|segment| memory.has_storage_segment(&segment.segment_name));
-        }
-        segments.retain(|segment| segment.state == SegmentLifecycleState::Active);
-        segments.sort_by(|left, right| {
-            let left_remaining = left.capacity_bytes.saturating_sub(left.used_bytes);
-            let right_remaining = right.capacity_bytes.saturating_sub(right.used_bytes);
-            right_remaining
-                .cmp(&left_remaining)
-                .then_with(|| left.segment_name.cmp(&right.segment_name))
-        });
-        Ok(segments)
+        };
+        self.allocator.lock().upsert(&announcement);
+        self.metadata.publish_segment(&announcement)
     }
 
     fn reserve_owner_segment(
@@ -846,40 +977,26 @@ impl StoreClient {
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
         self.flush_due_reclaims()?;
-        let mut last_capacity_error = None;
-        for segment in self.sorted_segments(owner, require_local_memory)? {
-            match self
-                .metadata
-                .reserve_segment(owner, &segment.segment_name, length_bytes as u64)
-            {
-                Ok(reservation) => {
-                    debug!(
-                        owner = %owner,
-                        segment = %segment.segment_name.0,
-                        offset_bytes = reservation.offset_bytes,
-                        length_bytes = reservation.length_bytes,
-                        "reserved segment space"
-                    );
-                    return Ok((
-                        ReplicaWriteTarget {
-                            runtime: owner.clone(),
-                            segment_name: segment.segment_name,
-                        },
-                        reservation,
-                    ));
-                }
-                Err(StoreError::Allocator(error)) => {
-                    last_capacity_error = Some(StoreError::Allocator(error));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_capacity_error.unwrap_or_else(|| {
-            StoreError::Allocator(format!(
-                "no writable active segment available for {}",
-                owner
-            ))
-        }))
+        let reservation = self.reserve_segment_allocation(
+            owner,
+            None,
+            length_bytes as u64,
+            require_local_memory,
+        )?;
+        debug!(
+            owner = %owner,
+            segment = %reservation.segment_name.0,
+            offset_bytes = reservation.offset_bytes,
+            length_bytes = reservation.length_bytes,
+            "reserved segment space"
+        );
+        Ok((
+            ReplicaWriteTarget {
+                runtime: owner.clone(),
+                segment_name: reservation.segment_name.clone(),
+            },
+            reservation,
+        ))
     }
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {
@@ -891,7 +1008,7 @@ impl StoreClient {
                 length_bytes = replica.length,
                 "releasing route allocation"
             );
-            self.metadata.release_segment(
+            self.release_segment_allocation(
                 &replica.owner,
                 &replica.segment_name,
                 replica.segment_offset,
@@ -1617,12 +1734,17 @@ impl MooncakeCompatibilityFacade for StoreClient {
             alignment_bytes: self.local_memory.alignment as u64,
             tags,
         };
+        self.allocator.lock().upsert(&segment);
         let result = self.metadata.publish_segment(&segment);
         tracker.finish(&result, used_bytes);
         result
     }
 
     fn list_segments(&self) -> Result<Vec<SegmentAnnouncement>> {
+        let local = self.allocator.lock().announcements();
+        if !local.is_empty() {
+            return Ok(local);
+        }
         self.metadata.list_segments(Some(&self.lease.runtime))
     }
 
@@ -1675,6 +1797,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             alignment_bytes: self.local_memory.alignment as u64,
             tags: self.local_memory.tags.clone(),
         };
+        self.allocator.lock().upsert(&announcement);
         info!(
             runtime = %self.lease.runtime,
             segment = %announcement.segment_name.0,
@@ -1719,6 +1842,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .memory_mut()?
                 .update_storage_state(segment, SegmentLifecycleState::Draining)?;
         }
+        self.allocator
+            .lock()
+            .update_state(segment, SegmentLifecycleState::Draining)?;
         info!(
             runtime = %self.lease.runtime,
             segment = %segment.0,
@@ -1742,10 +1868,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
         let tracker = OperationTracker::new("retire_segment");
         self.ensure_local_memory()?;
-        let segments = self.metadata.list_segments(Some(&self.lease.runtime))?;
-        let announcement = segments
-            .into_iter()
-            .find(|entry| entry.segment_name == *segment)
+        let announcement = self
+            .allocator
+            .lock()
+            .announcement(segment)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment.0)))?;
         if announcement.state != SegmentLifecycleState::Draining {
             let result = Err(StoreError::InvalidState(format!(
@@ -1777,6 +1903,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             state
                 .memory_mut()?
                 .remove_storage_segment(transport.as_ref(), segment)?;
+            self.allocator.lock().remove(segment);
         }
         info!(
             runtime = %self.lease.runtime,
@@ -2409,6 +2536,293 @@ struct StoreState {
     next_local_segment_id: u64,
 }
 
+#[derive(Default)]
+struct LocalAllocatorState {
+    segments: BTreeMap<SegmentName, SegmentAllocator>,
+}
+
+impl LocalAllocatorState {
+    fn upsert(&mut self, announcement: &SegmentAnnouncement) {
+        match self.segments.get_mut(&announcement.segment_name) {
+            Some(segment) => segment.merge_announcement(announcement),
+            None => {
+                self.segments.insert(
+                    announcement.segment_name.clone(),
+                    SegmentAllocator::new(announcement.clone()),
+                );
+            }
+        }
+    }
+
+    fn announcement(&self, segment_name: &SegmentName) -> Option<SegmentAnnouncement> {
+        self.segments
+            .get(segment_name)
+            .map(|segment| segment.announcement.clone())
+    }
+
+    fn announcements(&self) -> Vec<SegmentAnnouncement> {
+        self.segments
+            .values()
+            .map(|segment| segment.announcement.clone())
+            .collect()
+    }
+
+    fn update_state(
+        &mut self,
+        segment_name: &SegmentName,
+        next: SegmentLifecycleState,
+    ) -> Result<()> {
+        let segment = self
+            .segments
+            .get_mut(segment_name)
+            .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
+        segment.announcement.state = next;
+        Ok(())
+    }
+
+    fn remove(&mut self, segment_name: &SegmentName) {
+        self.segments.remove(segment_name);
+    }
+
+    fn reserve_any(
+        &mut self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let mut candidates = self
+            .segments
+            .values()
+            .filter(|segment| segment.announcement.state == SegmentLifecycleState::Active)
+            .map(|segment| {
+                (
+                    segment.remaining_capacity(),
+                    segment.announcement.segment_name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let mut last_capacity_error = None;
+        for (_, segment_name) in candidates {
+            match self.reserve_specific(owner, &segment_name, length_bytes) {
+                Ok(reservation) => return Ok(reservation),
+                Err(StoreError::Allocator(message)) => {
+                    last_capacity_error = Some(StoreError::Allocator(message));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_capacity_error.unwrap_or_else(|| {
+            StoreError::Allocator(format!(
+                "no writable active segment available for {}",
+                owner
+            ))
+        }))
+    }
+
+    fn reserve_specific(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let segment = self
+            .segments
+            .get_mut(segment_name)
+            .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
+        segment.reserve(owner, segment_name, length_bytes)
+    }
+
+    fn release(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        let segment = self
+            .segments
+            .get_mut(segment_name)
+            .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
+        segment.release(owner, segment_name, offset_bytes, length_bytes)
+    }
+}
+
+struct SegmentAllocator {
+    announcement: SegmentAnnouncement,
+    cursor_bytes: u64,
+    free_spans: Vec<FreeSpan>,
+}
+
+impl SegmentAllocator {
+    fn new(announcement: SegmentAnnouncement) -> Self {
+        Self {
+            cursor_bytes: announcement.used_bytes,
+            announcement,
+            free_spans: Vec::new(),
+        }
+    }
+
+    fn merge_announcement(&mut self, next: &SegmentAnnouncement) {
+        self.announcement.owner = next.owner.clone();
+        self.announcement.segment_name = next.segment_name.clone();
+        self.announcement.capacity_bytes = next.capacity_bytes;
+        self.announcement.tags = next.tags.clone();
+        self.announcement.state = next.state;
+        self.announcement.alignment_bytes = next.alignment_bytes.max(1);
+        self.announcement.used_bytes = self.announcement.used_bytes.max(next.used_bytes);
+        self.cursor_bytes = self.cursor_bytes.max(next.used_bytes);
+    }
+
+    fn remaining_capacity(&self) -> u64 {
+        self.announcement
+            .capacity_bytes
+            .saturating_sub(self.announcement.used_bytes)
+    }
+
+    fn reserve(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        if self.announcement.state != SegmentLifecycleState::Active {
+            return Err(StoreError::InvalidState(format!(
+                "segment {}:{} is not active",
+                owner, segment_name.0
+            )));
+        }
+        if length_bytes == 0 {
+            return Err(StoreError::Allocator(
+                "zero-length segment reservation is not supported".to_string(),
+            ));
+        }
+        let alignment = self.announcement.alignment_bytes.max(1);
+        let reserved_len = align_up_u64(length_bytes, alignment);
+
+        if let Some(index) = self
+            .free_spans
+            .iter()
+            .position(|span| span.length_bytes >= reserved_len)
+        {
+            let span = self.free_spans.remove(index);
+            if span.length_bytes > reserved_len {
+                self.free_spans.push(FreeSpan {
+                    offset_bytes: span.offset_bytes + reserved_len,
+                    length_bytes: span.length_bytes - reserved_len,
+                });
+                self.free_spans.sort_by_key(|entry| entry.offset_bytes);
+            }
+            self.announcement.used_bytes = self
+                .announcement
+                .used_bytes
+                .checked_add(reserved_len)
+                .ok_or_else(|| {
+                StoreError::Allocator("segment reservation overflow".to_string())
+            })?;
+            return Ok(mooncake_store_core::SegmentReservation {
+                owner: owner.clone(),
+                segment_name: segment_name.clone(),
+                offset_bytes: span.offset_bytes,
+                length_bytes,
+            });
+        }
+
+        let offset = align_up_u64(self.cursor_bytes, alignment);
+        let next_cursor = offset
+            .checked_add(reserved_len)
+            .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
+        if next_cursor > self.announcement.capacity_bytes {
+            return Err(StoreError::Allocator(format!(
+                "segment capacity exhausted for {}:{} requested={} remaining={}",
+                owner,
+                segment_name.0,
+                length_bytes,
+                self.announcement.capacity_bytes.saturating_sub(offset)
+            )));
+        }
+        self.cursor_bytes = next_cursor;
+        self.announcement.used_bytes = self
+            .announcement
+            .used_bytes
+            .checked_add(reserved_len)
+            .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
+        Ok(mooncake_store_core::SegmentReservation {
+            owner: owner.clone(),
+            segment_name: segment_name.clone(),
+            offset_bytes: offset,
+            length_bytes,
+        })
+    }
+
+    fn release(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        let alignment = self.announcement.alignment_bytes.max(1);
+        let reserved_len = align_up_u64(length_bytes, alignment);
+        let end = offset_bytes
+            .checked_add(reserved_len)
+            .ok_or_else(|| StoreError::Allocator("segment release overflow".to_string()))?;
+        if end > self.announcement.capacity_bytes {
+            return Err(StoreError::Allocator(format!(
+                "segment release exceeds capacity for {}:{} offset={} len={}",
+                owner, segment_name.0, offset_bytes, length_bytes
+            )));
+        }
+        self.insert_free_span(offset_bytes, reserved_len);
+        self.announcement.used_bytes = self.announcement.used_bytes.saturating_sub(reserved_len);
+        self.trim_tail();
+        if self.announcement.used_bytes == 0 {
+            self.cursor_bytes = 0;
+            self.free_spans.clear();
+        }
+        Ok(())
+    }
+
+    fn trim_tail(&mut self) {
+        loop {
+            let Some(last) = self.free_spans.last().cloned() else {
+                return;
+            };
+            if last.offset_bytes + last.length_bytes != self.cursor_bytes {
+                return;
+            }
+            self.cursor_bytes = last.offset_bytes;
+            self.free_spans.pop();
+        }
+    }
+
+    fn insert_free_span(&mut self, offset_bytes: u64, length_bytes: u64) {
+        self.free_spans.push(FreeSpan {
+            offset_bytes,
+            length_bytes,
+        });
+        self.free_spans.sort_by_key(|entry| entry.offset_bytes);
+        let mut merged: Vec<FreeSpan> = Vec::with_capacity(self.free_spans.len());
+        for span in self.free_spans.drain(..) {
+            if let Some(previous) = merged.last_mut() {
+                let prev_end = previous.offset_bytes + previous.length_bytes;
+                if prev_end >= span.offset_bytes {
+                    let merged_end = prev_end.max(span.offset_bytes + span.length_bytes);
+                    previous.length_bytes = merged_end - previous.offset_bytes;
+                    continue;
+                }
+            }
+            merged.push(span);
+        }
+        self.free_spans = merged;
+    }
+}
+
+#[derive(Clone)]
+struct FreeSpan {
+    offset_bytes: u64,
+    length_bytes: u64,
+}
+
 #[derive(Clone)]
 enum WriteMode {
     LocalOnly,
@@ -2472,6 +2886,96 @@ struct PendingReclaim {
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
+}
+
+struct LocalAuthorityAdapter;
+
+impl AuthorityService for LocalAuthorityAdapter {
+    fn get_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        authority_get(namespace, authority, key)
+    }
+
+    fn compare_and_swap_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> Result<CasResult> {
+        authority_compare_and_swap(namespace, authority, key, expected, next)
+    }
+
+    fn replace_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+        next: Option<&ObjectRoute>,
+    ) -> Result<()> {
+        authority_replace(namespace, authority, key, next)
+    }
+}
+
+struct LocalAllocatorAdapter {
+    runtime: ClientRuntimeId,
+    allocator: Arc<Mutex<LocalAllocatorState>>,
+}
+
+impl AllocatorService for LocalAllocatorAdapter {
+    fn reserve_any(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        if *owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "allocator rpc targeted runtime {} on {}",
+                owner, self.runtime
+            )));
+        }
+        self.allocator.lock().reserve_any(owner, length_bytes)
+    }
+
+    fn reserve_specific(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        if *owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "allocator rpc targeted runtime {} on {}",
+                owner, self.runtime
+            )));
+        }
+        self.allocator
+            .lock()
+            .reserve_specific(owner, segment_name, length_bytes)
+    }
+
+    fn release(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<()> {
+        if *owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "allocator rpc targeted runtime {} on {}",
+                owner, self.runtime
+            )));
+        }
+        self.allocator
+            .lock()
+            .release(owner, segment_name, offset_bytes, length_bytes)
+    }
 }
 
 impl StoreState {
@@ -2649,6 +3153,23 @@ fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
         && left.compatibility.transport_api_version == right.compatibility.transport_api_version
 }
 
+fn control_bind_host(rpc_address: &str) -> String {
+    if rpc_address.is_empty() {
+        return "127.0.0.1".to_string();
+    }
+    rpc_address
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty() && *host != "0.0.0.0" && *host != "::")
+        .unwrap_or("127.0.0.1")
+        .to_string()
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> u64 {
+    let mask = alignment.saturating_sub(1);
+    value.saturating_add(mask) & !mask
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2685,7 +3206,7 @@ mod tests {
 
     struct TestTransport {
         local_segment: String,
-        state: Mutex<TestTransportState>,
+        state: Arc<Mutex<TestTransportState>>,
     }
 
     struct TestTransportState {
@@ -2704,11 +3225,131 @@ mod tests {
         len: usize,
     }
 
+    struct NoHotPathMetadataBackend {
+        inner: Arc<InMemoryMetadataBackend>,
+    }
+
+    impl NoHotPathMetadataBackend {
+        fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl MetadataBackend for NoHotPathMetadataBackend {
+        fn route_namespace(&self) -> String {
+            self.inner.route_namespace()
+        }
+
+        fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+            self.inner.upsert_client_lease(lease)
+        }
+
+        fn update_client_state(
+            &self,
+            runtime: &ClientRuntimeId,
+            next: ClientLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_client_state(runtime, next)
+        }
+
+        fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+            self.inner.list_live_clients()
+        }
+
+        fn publish_segment(
+            &self,
+            segment: &SegmentAnnouncement,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.publish_segment(segment)
+        }
+
+        fn unpublish_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn list_segments(
+            &self,
+            owner: Option<&ClientRuntimeId>,
+        ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+            self.inner.list_segments(owner)
+        }
+
+        fn update_segment_state(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            next: SegmentLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_segment_state(owner, segment, next)
+        }
+
+        fn reserve_segment(
+            &self,
+            _owner: &ClientRuntimeId,
+            _segment: &SegmentName,
+            _length_bytes: u64,
+        ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+            Err(StoreError::Unsupported(
+                "metadata allocator hot path is disabled in this test".to_string(),
+            ))
+        }
+
+        fn release_segment(
+            &self,
+            _owner: &ClientRuntimeId,
+            _segment: &SegmentName,
+            _offset_bytes: u64,
+            _length_bytes: u64,
+        ) -> mooncake_store_core::Result<()> {
+            Err(StoreError::Unsupported(
+                "metadata allocator hot path is disabled in this test".to_string(),
+            ))
+        }
+
+        fn get_object_route(
+            &self,
+            _key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+            Err(StoreError::Unsupported(
+                "metadata route hot path is disabled in this test".to_string(),
+            ))
+        }
+
+        fn compare_and_swap_object_route(
+            &self,
+            _key: &ObjectKey,
+            _expected: Option<mooncake_store_core::RouteVersion>,
+            _next: Option<&mooncake_store_core::ObjectRoute>,
+        ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+            Err(StoreError::Unsupported(
+                "metadata route hot path is disabled in this test".to_string(),
+            ))
+        }
+
+        fn put_handoff(
+            &self,
+            handoff: &mooncake_store_core::HandoffPlan,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.put_handoff(handoff)
+        }
+
+        fn get_handoff(
+            &self,
+            stable_id: &mooncake_store_core::ClientStableId,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+            self.inner.get_handoff(stable_id)
+        }
+    }
+
     impl TestTransport {
         fn new(local_segment: &str) -> Self {
             Self {
                 local_segment: local_segment.to_string(),
-                state: Mutex::new(TestTransportState {
+                state: Arc::new(Mutex::new(TestTransportState {
                     next_handle: 1,
                     next_batch: 1,
                     allocations: BTreeMap::new(),
@@ -2716,7 +3357,14 @@ mod tests {
                     segments_by_handle: BTreeMap::new(),
                     live_batches: BTreeSet::new(),
                     registered_memory: BTreeMap::new(),
-                }),
+                })),
+            }
+        }
+
+        fn peer(&self, local_segment: &str) -> Self {
+            Self {
+                local_segment: local_segment.to_string(),
+                state: self.state.clone(),
             }
         }
 
@@ -3318,6 +3966,72 @@ mod tests {
                 .get_in_tenant("tenant-a", "cross-pool-key")
                 .expect("reader get should succeed"),
             b"cross-pool-payload"
+        );
+    }
+
+    #[test]
+    fn routed_io_works_when_metadata_hot_paths_are_disabled() {
+        let metadata = Arc::new(NoHotPathMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let storage_transport = Arc::new(TestTransport::new("storage-hot-path-segment"));
+        let router_transport = Arc::new(storage_transport.peer("router-hot-path-segment"));
+        let reader_transport = Arc::new(storage_transport.peer("reader-hot-path-segment"));
+
+        let storage = StoreClientBuilder::new(metadata.clone(), "storage-hot-path")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("storage build should succeed");
+        storage
+            .register_local_memory()
+            .expect("storage memory should register");
+
+        let router = StoreClientBuilder::new(metadata.clone(), "router-hot-path")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(router_transport)
+            .local_memory(storage_config())
+            .routed_writes(
+                PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+                1,
+            )
+            .build(10_000)
+            .expect("router build should succeed");
+        router
+            .register_local_memory()
+            .expect("router memory should register");
+
+        let reader = StoreClientBuilder::new(metadata.clone(), "reader-hot-path")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+        reader
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        router
+            .put_in_tenant("tenant-a", "hot-path-key", b"hot-path-payload")
+            .expect("routed put should succeed without metadata hot paths");
+        assert_eq!(
+            storage
+                .get_in_tenant("tenant-a", "hot-path-key")
+                .expect("storage get should succeed"),
+            b"hot-path-payload"
+        );
+        assert_eq!(
+            reader
+                .get_in_tenant("tenant-a", "hot-path-key")
+                .expect("reader get should succeed"),
+            b"hot-path-payload"
         );
     }
 
