@@ -24,6 +24,9 @@ keywords = ["mooncake", "store", "rust", "distributed-cache"]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 
+[project.scripts]
+mooncake-store-client = "mooncake.cli_client:main"
+
 [tool.maturin]
 manifest-path = "crates/mooncake-store-py/Cargo.toml"
 python-source = "python"

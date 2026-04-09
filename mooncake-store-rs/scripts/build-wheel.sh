@@ -56,16 +56,16 @@ fi
 
 git -C "${REPO_ROOT}" submodule update --init --recursive
 
+cargo build \
+  --manifest-path "${REPO_ROOT}/crates/mooncake-store-py/Cargo.toml" \
+  --bin mooncake-store-client \
+  --release
+
 "${VENV_DIR}/bin/maturin" build \
   --release \
   --manifest-path "${REPO_ROOT}/crates/mooncake-store-py/Cargo.toml" \
   --out "${WHEEL_DIR}" \
   "$@"
-
-cargo build \
-  --manifest-path "${REPO_ROOT}/crates/mooncake-store-py/Cargo.toml" \
-  --bin mooncake-store-client \
-  --release
 
 install -m 0755 \
   "${REPO_ROOT}/target/release/mooncake-store-client" \
@@ -76,6 +76,54 @@ if [[ -z "${LATEST_WHEEL}" ]]; then
   echo "wheel build completed but no wheel was found in ${WHEEL_DIR}" >&2
   exit 1
 fi
+
+"${VENV_DIR}/bin/python" - <<'PY' "${LATEST_WHEEL}" "${REPO_ROOT}/target/release/mooncake-store-client"
+import base64
+import csv
+import hashlib
+import pathlib
+import sys
+import tempfile
+import zipfile
+
+wheel_path = pathlib.Path(sys.argv[1])
+client_path = pathlib.Path(sys.argv[2])
+
+with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
+    root = pathlib.Path(temp_dir)
+    with zipfile.ZipFile(wheel_path) as source_wheel:
+        source_wheel.extractall(root)
+
+    packaged_client = root / "mooncake" / "mooncake-store-client"
+    packaged_client.write_bytes(client_path.read_bytes())
+    packaged_client.chmod(0o755)
+
+    dist_info = next(root.glob("*.dist-info"))
+    record_path = dist_info / "RECORD"
+    rows = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if path == record_path:
+            rows.append((relative, "", ""))
+            continue
+        payload = path.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).decode().rstrip("=")
+        rows.append((relative, f"sha256={digest}", str(len(payload))))
+
+    with record_path.open("w", newline="") as record_file:
+        csv.writer(record_file, lineterminator="\n").writerows(rows)
+
+    with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as target_wheel:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            info = zipfile.ZipInfo.from_file(path, arcname=relative)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            target_wheel.writestr(info, path.read_bytes())
+PY
 
 cat <<EOF
 wheel:  ${LATEST_WHEEL}
