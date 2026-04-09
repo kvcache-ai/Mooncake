@@ -12,6 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 ARG PYTHON_VERSION=3.10
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
 ARG EP_TORCH_VERSIONS="2.9.1"
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
@@ -37,7 +38,7 @@ RUN apt-get update && \
         python${PYTHON_VERSION} \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
+    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common && \
@@ -84,8 +85,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Inherit PYTHON_VERSION so the runtime stage installs the matching interpreter
+# Inherit build-args so the runtime stage installs the matching interpreter
 ARG PYTHON_VERSION=3.10
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
 # Install runtime dependencies and the requested Python version
@@ -106,7 +108,7 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
+    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common curl && \
