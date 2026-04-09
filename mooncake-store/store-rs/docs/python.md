@@ -63,8 +63,9 @@ By default the script:
 
 - creates or reuses `.venv-wheel`
 - installs `maturin`
+- embeds the standalone `mooncake-store-client` binary into the wheel package
 - builds the Python wheel into `dist/wheels/`
-- builds the standalone `mooncake-store-client` binary into `dist/bin/`
+- copies the standalone `mooncake-store-client` artifact into `dist/bin/`
 
 Common variants:
 
@@ -79,6 +80,11 @@ Install the wheel into any compatible virtualenv:
 pip install dist/wheels/mooncake_store_rs-*.whl
 ```
 
+After installation, both interfaces are available:
+
+- `python -c "import mooncake"` loads the native extension
+- `mooncake-store-client --help` runs the packaged standalone client command
+
 ## Standalone Client Binary
 
 You can build the standalone compatibility server directly:
@@ -87,7 +93,9 @@ You can build the standalone compatibility server directly:
 cargo build -p mooncake-store-py --bin mooncake-store-client --release
 ```
 
-Or use `./scripts/build-wheel.sh`, which also stages the binary in `dist/bin/`.
+Or use `./scripts/build-wheel.sh`, which also copies the binary to `dist/bin/`.
+
+When the client is installed from a wheel, the same binary is also embedded inside the package and exposed through the `mooncake-store-client` console script, matching the upstream Mooncake packaging style.
 
 Start a storage client:
 

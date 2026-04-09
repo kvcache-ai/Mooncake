@@ -102,7 +102,8 @@ The implementation is easier to understand when grouped by capability instead of
 - `MooncakeHostMemAllocator` for registered buffer ownership
 - dummy and real HiCache-compatible execution paths
 - wheel packaging with bundled native runtime libraries
-- standalone `mooncake-store-client` binary packaging
+- wheel-installed `mooncake-store-client` console command
+- standalone `mooncake-store-client` binary artifact in `dist/bin/`
 - hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
@@ -168,6 +169,16 @@ For deployment details and script knobs, read `docs/deployment.md`.
 
 ```bash
 ./scripts/run-python-compat-e2e.sh
+```
+
+To package the Python module and the standalone client command together:
+
+```bash
+./scripts/build-wheel.sh
+python3 -m venv .venv-wheel-test
+. .venv-wheel-test/bin/activate
+pip install dist/wheels/mooncake_store_rs-*.whl
+mooncake-store-client --help
 ```
 
 ### Run the HiCache compatibility checks
