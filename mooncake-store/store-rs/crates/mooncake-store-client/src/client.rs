@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey,
-    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteDirectory, RouteState, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteDirectory, RouteState,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
@@ -17,7 +17,7 @@ use tracing::{debug, info, info_span};
 
 use crate::control_plane::{
     control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
-    ControlPlaneHandle,
+    ControlPlaneHandle, ReleaseOp, ReserveSpecificOp,
 };
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, StorageExtentInfo, StorageSegmentSpec,
@@ -25,8 +25,8 @@ use crate::memory::{
 use crate::observability::OperationTracker;
 use crate::placement::PlacementPlanner;
 use crate::route_directory::{
-    authority_compare_and_swap, authority_get, authority_replace, build_route_directory,
-    RouteControlMode,
+    authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
+    authority_replace, authority_replace_many, build_route_directory, RouteControlMode,
 };
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
@@ -558,6 +558,81 @@ impl StoreClient {
             .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", runtime)))
     }
 
+    fn lookup_runtime_leases(
+        &self,
+        runtimes: impl IntoIterator<Item = ClientRuntimeId>,
+    ) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
+        let wanted = runtimes
+            .into_iter()
+            .filter(|runtime| *runtime != self.lease.runtime)
+            .collect::<BTreeSet<_>>();
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut leases = BTreeMap::new();
+        for lease in self.metadata.list_live_clients()? {
+            if !wanted.contains(&lease.runtime) {
+                continue;
+            }
+            if !compatibility_matches(&self.lease, &lease) {
+                continue;
+            }
+            leases.insert(lease.runtime.clone(), lease);
+        }
+        for runtime in &wanted {
+            if !leases.contains_key(runtime) {
+                return Err(StoreError::NotFound(format!(
+                    "runtime {} is not available",
+                    runtime
+                )));
+            }
+        }
+        Ok(leases)
+    }
+
+    fn reserve_segment_allocation_via_metadata(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: Option<&SegmentName>,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        match segment_name {
+            Some(segment_name) => self
+                .metadata
+                .reserve_segment(owner, segment_name, length_bytes),
+            None => {
+                let mut segments = self.metadata.list_segments(Some(owner))?;
+                segments.retain(|segment| segment.state == SegmentLifecycleState::Active);
+                segments.sort_by(|left, right| {
+                    let left_remaining = left.capacity_bytes.saturating_sub(left.used_bytes);
+                    let right_remaining = right.capacity_bytes.saturating_sub(right.used_bytes);
+                    right_remaining
+                        .cmp(&left_remaining)
+                        .then_with(|| left.segment_name.cmp(&right.segment_name))
+                });
+                let mut last_capacity_error = None;
+                for segment in segments {
+                    match self
+                        .metadata
+                        .reserve_segment(owner, &segment.segment_name, length_bytes)
+                    {
+                        Ok(reservation) => return Ok(reservation),
+                        Err(StoreError::Allocator(message)) => {
+                            last_capacity_error = Some(StoreError::Allocator(message));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(last_capacity_error.unwrap_or_else(|| {
+                    StoreError::Allocator(format!(
+                        "no writable active segment available for {}",
+                        owner
+                    ))
+                }))
+            }
+        }
+    }
+
     fn reserve_segment_allocation(
         &self,
         owner: &ClientRuntimeId,
@@ -608,83 +683,7 @@ impl StoreClient {
                     error = %error,
                     "allocator rpc failed; falling back to metadata allocator"
                 );
-                match segment_name {
-                    Some(segment_name) => {
-                        self.metadata
-                            .reserve_segment(owner, segment_name, length_bytes)
-                    }
-                    None => {
-                        let mut segments = self.metadata.list_segments(Some(owner))?;
-                        segments.retain(|segment| segment.state == SegmentLifecycleState::Active);
-                        segments.sort_by(|left, right| {
-                            let left_remaining =
-                                left.capacity_bytes.saturating_sub(left.used_bytes);
-                            let right_remaining =
-                                right.capacity_bytes.saturating_sub(right.used_bytes);
-                            right_remaining
-                                .cmp(&left_remaining)
-                                .then_with(|| left.segment_name.cmp(&right.segment_name))
-                        });
-                        let mut last_capacity_error = None;
-                        for segment in segments {
-                            match self.metadata.reserve_segment(
-                                owner,
-                                &segment.segment_name,
-                                length_bytes,
-                            ) {
-                                Ok(reservation) => return Ok(reservation),
-                                Err(StoreError::Allocator(message)) => {
-                                    last_capacity_error = Some(StoreError::Allocator(message));
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        Err(last_capacity_error.unwrap_or_else(|| {
-                            StoreError::Allocator(format!(
-                                "no writable active segment available for {}",
-                                owner
-                            ))
-                        }))
-                    }
-                }
-            }
-        }
-    }
-
-    fn release_segment_allocation(
-        &self,
-        owner: &ClientRuntimeId,
-        segment_name: &SegmentName,
-        offset_bytes: u64,
-        length_bytes: u64,
-    ) -> Result<()> {
-        if *owner == self.lease.runtime {
-            return self
-                .allocator
-                .lock()
-                .release(owner, segment_name, offset_bytes, length_bytes);
-        }
-
-        let owner_lease = self.lookup_runtime_lease(owner)?;
-        match self.control_client.release(
-            &owner_lease,
-            owner,
-            segment_name,
-            offset_bytes,
-            length_bytes,
-        ) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                debug!(
-                    owner = %owner,
-                    segment = %segment_name.0,
-                    offset_bytes,
-                    length_bytes,
-                    error = %error,
-                    "allocator release rpc failed; falling back to metadata allocator"
-                );
-                self.metadata
-                    .release_segment(owner, segment_name, offset_bytes, length_bytes)
+                self.reserve_segment_allocation_via_metadata(owner, segment_name, length_bytes)
             }
         }
     }
@@ -849,6 +848,245 @@ impl StoreClient {
         ))
     }
 
+    fn reserve_owner_segments_batch(
+        &self,
+        requests: &[OwnerReservationRequest],
+    ) -> Result<Vec<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let remote_leases = self.lookup_runtime_leases(
+            requests
+                .iter()
+                .filter(|request| request.owner != self.lease.runtime)
+                .map(|request| request.owner.clone()),
+        )?;
+        let mut resolved = vec![None; requests.len()];
+        let rollback = |resolved: &[Option<(
+            ReplicaWriteTarget,
+            mooncake_store_core::SegmentReservation,
+        )>]| {
+            let releases = resolved
+                .iter()
+                .filter_map(|entry| entry.as_ref())
+                .map(|(target, reservation)| AllocationReleaseRequest {
+                    owner: target.runtime.clone(),
+                    segment_name: target.segment_name.clone(),
+                    offset_bytes: reservation.offset_bytes,
+                    length_bytes: reservation.length_bytes,
+                })
+                .collect::<Vec<_>>();
+            let _ = self.release_segment_allocations_batch(&releases);
+        };
+        let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
+        for (index, request) in requests.iter().enumerate() {
+            if request.owner == self.lease.runtime {
+                let reservation = match self.reserve_segment_allocation(
+                    &request.owner,
+                    None,
+                    request.length_bytes,
+                    request.require_local_memory,
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        rollback(&resolved);
+                        return Err(error);
+                    }
+                };
+                resolved[index] = Some((
+                    ReplicaWriteTarget {
+                        runtime: request.owner.clone(),
+                        segment_name: reservation.segment_name.clone(),
+                    },
+                    reservation,
+                ));
+                continue;
+            }
+            let lease = remote_leases.get(&request.owner).cloned().ok_or_else(|| {
+                StoreError::NotFound(format!("runtime {} is not available", request.owner))
+            })?;
+            remote_groups
+                .entry(request.owner.clone())
+                .or_insert_with(|| (lease, Vec::new()))
+                .1
+                .push(index);
+        }
+
+        for (owner, (lease, indices)) in remote_groups {
+            let lengths = indices
+                .iter()
+                .map(|index| requests[*index].length_bytes)
+                .collect::<Vec<_>>();
+            match self
+                .control_client
+                .batch_reserve_any(&lease, &owner, &lengths)
+            {
+                Ok(results) => {
+                    for ((index, length_bytes), result) in indices
+                        .iter()
+                        .copied()
+                        .zip(lengths.into_iter())
+                        .zip(results.into_iter())
+                    {
+                        let reservation = match result {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                debug!(
+                                    owner = %owner,
+                                    error = %error,
+                                    length_bytes,
+                                    "allocator batch reserve rpc failed; falling back to metadata allocator"
+                                );
+                                match self.reserve_segment_allocation_via_metadata(
+                                    &owner,
+                                    None,
+                                    length_bytes,
+                                ) {
+                                    Ok(reservation) => reservation,
+                                    Err(error) => {
+                                        rollback(&resolved);
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                        };
+                        resolved[index] = Some((
+                            ReplicaWriteTarget {
+                                runtime: owner.clone(),
+                                segment_name: reservation.segment_name.clone(),
+                            },
+                            reservation,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        owner = %owner,
+                        error = %error,
+                        items = indices.len(),
+                        "allocator batch reserve rpc failed; falling back to metadata allocator"
+                    );
+                    for index in indices {
+                        let reservation = match self.reserve_segment_allocation_via_metadata(
+                            &owner,
+                            None,
+                            requests[index].length_bytes,
+                        ) {
+                            Ok(reservation) => reservation,
+                            Err(error) => {
+                                rollback(&resolved);
+                                return Err(error);
+                            }
+                        };
+                        resolved[index] = Some((
+                            ReplicaWriteTarget {
+                                runtime: owner.clone(),
+                                segment_name: reservation.segment_name.clone(),
+                            },
+                            reservation,
+                        ));
+                    }
+                }
+            }
+        }
+
+        resolved
+            .into_iter()
+            .map(|entry| {
+                entry.ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "missing owner reservation result from batch allocator".to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn release_segment_allocations_batch(
+        &self,
+        requests: &[AllocationReleaseRequest],
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let remote_leases = self.lookup_runtime_leases(
+            requests
+                .iter()
+                .filter(|request| request.owner != self.lease.runtime)
+                .map(|request| request.owner.clone()),
+        )?;
+        let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
+        for (index, request) in requests.iter().enumerate() {
+            if request.owner == self.lease.runtime {
+                self.allocator.lock().release(
+                    &request.owner,
+                    &request.segment_name,
+                    request.offset_bytes,
+                    request.length_bytes,
+                )?;
+                continue;
+            }
+            let lease = remote_leases.get(&request.owner).cloned().ok_or_else(|| {
+                StoreError::NotFound(format!("runtime {} is not available", request.owner))
+            })?;
+            remote_groups
+                .entry(request.owner.clone())
+                .or_insert_with(|| (lease, Vec::new()))
+                .1
+                .push(index);
+        }
+
+        for (owner, (lease, indices)) in remote_groups {
+            let ops = indices
+                .iter()
+                .map(|index| ReleaseOp {
+                    segment_name: requests[*index].segment_name.clone(),
+                    offset_bytes: requests[*index].offset_bytes,
+                    length_bytes: requests[*index].length_bytes,
+                })
+                .collect::<Vec<_>>();
+            match self.control_client.batch_release(&lease, &owner, &ops) {
+                Ok(results) => {
+                    for (index, result) in indices.iter().copied().zip(results.into_iter()) {
+                        if let Err(error) = result {
+                            debug!(
+                                owner = %owner,
+                                segment = %requests[index].segment_name.0,
+                                offset_bytes = requests[index].offset_bytes,
+                                length_bytes = requests[index].length_bytes,
+                                error = %error,
+                                "allocator batch release rpc failed; falling back to metadata allocator"
+                            );
+                            self.metadata.release_segment(
+                                &owner,
+                                &requests[index].segment_name,
+                                requests[index].offset_bytes,
+                                requests[index].length_bytes,
+                            )?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        owner = %owner,
+                        error = %error,
+                        items = indices.len(),
+                        "allocator batch release rpc failed; falling back to metadata allocator"
+                    );
+                    for index in indices {
+                        self.metadata.release_segment(
+                            &owner,
+                            &requests[index].segment_name,
+                            requests[index].offset_bytes,
+                            requests[index].length_bytes,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn release_reserved_allocations(
         &self,
         targets: &[ReplicaWriteTarget],
@@ -859,15 +1097,17 @@ impl StoreClient {
                 "targets and reservations length mismatch".to_string(),
             ));
         }
-        for (target, reservation) in targets.iter().zip(reservations.iter()) {
-            self.release_segment_allocation(
-                &target.runtime,
-                &target.segment_name,
-                reservation.offset_bytes,
-                reservation.length_bytes,
-            )?;
-        }
-        Ok(())
+        let releases = targets
+            .iter()
+            .zip(reservations.iter())
+            .map(|(target, reservation)| AllocationReleaseRequest {
+                owner: target.runtime.clone(),
+                segment_name: target.segment_name.clone(),
+                offset_bytes: reservation.offset_bytes,
+                length_bytes: reservation.length_bytes,
+            })
+            .collect::<Vec<_>>();
+        self.release_segment_allocations_batch(&releases)
     }
 
     fn flush_due_reclaims(&self) -> Result<()> {
@@ -875,15 +1115,16 @@ impl StoreClient {
             let mut state = self.state.lock();
             state.take_due_reclaims(now_ms())
         };
-        for reclaim in due {
-            self.release_segment_allocation(
-                &reclaim.owner,
-                &reclaim.segment_name,
-                reclaim.offset_bytes,
-                reclaim.length_bytes,
-            )?;
-        }
-        Ok(())
+        let releases = due
+            .into_iter()
+            .map(|reclaim| AllocationReleaseRequest {
+                owner: reclaim.owner,
+                segment_name: reclaim.segment_name,
+                offset_bytes: reclaim.offset_bytes,
+                length_bytes: reclaim.length_bytes,
+            })
+            .collect::<Vec<_>>();
+        self.release_segment_allocations_batch(&releases)
     }
 
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
@@ -1000,22 +1241,26 @@ impl StoreClient {
     }
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {
-        for replica in &route.replicas {
-            debug!(
-                owner = %replica.owner,
-                segment = %replica.segment_name.0,
-                offset_bytes = replica.segment_offset,
-                length_bytes = replica.length,
-                "releasing route allocation"
-            );
-            self.release_segment_allocation(
-                &replica.owner,
-                &replica.segment_name,
-                replica.segment_offset,
-                replica.length,
-            )?;
-        }
-        Ok(())
+        let releases = route
+            .replicas
+            .iter()
+            .map(|replica| {
+                debug!(
+                    owner = %replica.owner,
+                    segment = %replica.segment_name.0,
+                    offset_bytes = replica.segment_offset,
+                    length_bytes = replica.length,
+                    "releasing route allocation"
+                );
+                AllocationReleaseRequest {
+                    owner: replica.owner.clone(),
+                    segment_name: replica.segment_name.clone(),
+                    offset_bytes: replica.segment_offset,
+                    length_bytes: replica.length,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.release_segment_allocations_batch(&releases)
     }
 
     fn put_scoped_with_policy(
@@ -1102,16 +1347,29 @@ impl StoreClient {
     }
 
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
+        let scoped = objects
+            .iter()
+            .map(|object| {
+                let tenant = object.tenant.unwrap_or(self.default_tenant());
+                (tenant.to_string(), self.scoped_key(tenant, object.key))
+            })
+            .collect::<Vec<_>>();
+        let routes = self.route_directory.get_object_routes(
+            &self.lease,
+            &scoped
+                .iter()
+                .map(|(_, scoped)| scoped.clone())
+                .collect::<Vec<_>>(),
+        )?;
         let mut resolved = Vec::with_capacity(objects.len());
-        for object in objects {
-            let tenant = object.tenant.unwrap_or(self.default_tenant());
-            let scoped = self.scoped_key(tenant, object.key);
-            let route = self
-                .route_directory
-                .get_object_route(&self.lease, &scoped)?
-                .ok_or_else(|| {
-                    StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
-                })?;
+        for (((tenant, _scoped), object), route) in scoped
+            .into_iter()
+            .zip(objects.iter())
+            .zip(routes.into_iter())
+        {
+            let route = route.ok_or_else(|| {
+                StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
+            })?;
             if route.state != RouteState::Active {
                 return Err(StoreError::InvalidState(format!(
                     "tenant={tenant} key={} is not active",
@@ -1415,6 +1673,28 @@ impl StoreClient {
             .collect::<Vec<_>>();
         let plans = planner.plan(self, &object_refs, *replica_count)?;
 
+        let reservation_requests = requests
+            .iter()
+            .zip(plans.iter())
+            .flat_map(|(request, plan)| {
+                plan.owners
+                    .iter()
+                    .map(move |owner| OwnerReservationRequest {
+                        owner: owner.clone(),
+                        length_bytes: request.value.len() as u64,
+                        require_local_memory: false,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let mut reserved_allocations = self
+            .reserve_owner_segments_batch(&reservation_requests)?
+            .into_iter();
+        let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
+            for entry in entries {
+                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+            }
+        };
+
         let mut prepared = Vec::with_capacity(requests.len());
         let mut scratch_lengths = Vec::new();
         for (request, plan) in requests.iter().zip(plans.iter()) {
@@ -1422,9 +1702,13 @@ impl StoreClient {
             let scoped_key = self.scoped_key(tenant, request.key);
             let mut targets = Vec::with_capacity(plan.owners.len());
             let mut reservations = Vec::with_capacity(plan.owners.len());
-            for runtime in &plan.owners {
-                let (target, reservation) =
-                    self.reserve_owner_segment(runtime, request.value.len(), false)?;
+            for _ in &plan.owners {
+                let Some((target, reservation)) = reserved_allocations.next() else {
+                    release_prepared(&prepared);
+                    return Err(StoreError::InvalidState(
+                        "missing owner reservation from batch allocator".to_string(),
+                    ));
+                };
                 targets.push(target);
                 reservations.push(reservation);
             }
@@ -1450,11 +1734,12 @@ impl StoreClient {
                 scratch_index,
             });
         }
-        let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
-            for entry in entries {
-                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
-            }
-        };
+        if reserved_allocations.next().is_some() {
+            release_prepared(&prepared);
+            return Err(StoreError::InvalidState(
+                "extra owner reservations remain after batch prepare".to_string(),
+            ));
+        }
 
         let scratch_slots = if scratch_lengths.is_empty() {
             Vec::new()
@@ -1469,9 +1754,22 @@ impl StoreClient {
         }
 
         let mut remote_requests = Vec::new();
+        let current_routes = match self.route_directory.get_object_routes(
+            &self.lease,
+            &prepared
+                .iter()
+                .map(|entry| entry.scoped_key.clone())
+                .collect::<Vec<_>>(),
+        ) {
+            Ok(routes) => routes,
+            Err(error) => {
+                release_prepared(&prepared);
+                return Err(error);
+            }
+        };
         let mut routes = Vec::with_capacity(prepared.len());
 
-        for entry in &prepared {
+        for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
             let mut replicas = Vec::with_capacity(entry.targets.len());
             for (priority, (target, reservation)) in entry
                 .targets
@@ -1546,9 +1844,6 @@ impl StoreClient {
                 });
             }
 
-            let current = self
-                .route_directory
-                .get_object_route(&self.lease, &entry.scoped_key)?;
             let expected_version = current.as_ref().map(|route| route.version);
             let next_version = current
                 .as_ref()
@@ -1589,31 +1884,60 @@ impl StoreClient {
             }
         }
 
+        let cas_requests = routes
+            .iter()
+            .map(|pending| RouteCasRequest {
+                key: pending.key.clone(),
+                expected: pending.expected_version,
+                next: Some(pending.route.clone()),
+            })
+            .collect::<Vec<_>>();
+        let cas_results = match self
+            .route_directory
+            .compare_and_swap_object_routes(&self.lease, &cas_requests)
+        {
+            Ok(results) => results,
+            Err(error) => {
+                release_prepared(&prepared);
+                return Err(error);
+            }
+        };
+
         let mut published = Vec::with_capacity(routes.len());
-        for (index, pending) in routes.into_iter().enumerate() {
-            let cas = match self.route_directory.compare_and_swap_object_route(
-                &self.lease,
-                &pending.key,
-                pending.expected_version,
-                Some(&pending.route),
-            ) {
-                Ok(cas) => cas,
-                Err(error) => {
-                    release_prepared(&prepared[index..]);
-                    return Err(error);
+        let mut first_error = None;
+        for ((index, pending), cas_result) in
+            routes.into_iter().enumerate().zip(cas_results.into_iter())
+        {
+            match cas_result {
+                Ok(cas) if cas.applied => {
+                    if let Some(previous) = pending.previous.as_ref() {
+                        self.schedule_route_reclaim(previous)?;
+                    }
+                    published.push(pending.route);
                 }
-            };
-            if !cas.applied {
-                release_prepared(&prepared[index..]);
-                return Err(StoreError::Conflict(format!(
-                    "route update lost race for key {}",
-                    pending.key.0
-                )));
+                Ok(_) => {
+                    let _ = self.release_reserved_allocations(
+                        &prepared[index].targets,
+                        &prepared[index].reservations,
+                    );
+                    first_error.get_or_insert_with(|| {
+                        StoreError::Conflict(format!(
+                            "route update lost race for key {}",
+                            pending.key.0
+                        ))
+                    });
+                }
+                Err(error) => {
+                    let _ = self.release_reserved_allocations(
+                        &prepared[index].targets,
+                        &prepared[index].reservations,
+                    );
+                    first_error.get_or_insert(error);
+                }
             }
-            if let Some(previous) = pending.previous.as_ref() {
-                self.schedule_route_reclaim(previous)?;
-            }
-            published.push(pending.route);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(published)
     }
@@ -2848,6 +3172,21 @@ struct PreparedObjectWrite<'a> {
     scratch_index: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct OwnerReservationRequest {
+    owner: ClientRuntimeId,
+    length_bytes: u64,
+    require_local_memory: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AllocationReleaseRequest {
+    owner: ClientRuntimeId,
+    segment_name: SegmentName,
+    offset_bytes: u64,
+    length_bytes: u64,
+}
+
 struct PendingRoutePublish {
     key: ObjectKey,
     expected_version: Option<RouteVersion>,
@@ -2922,6 +3261,51 @@ impl AuthorityService for LocalAuthorityAdapter {
     ) -> Result<()> {
         authority_replace(namespace, authority, key, next)
     }
+
+    fn batch_get_routes(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<Option<ObjectRoute>>> {
+        match authority_get_many(namespace, authority, keys) {
+            Ok(routes) => routes.into_iter().map(Ok).collect(),
+            Err(error) => keys
+                .iter()
+                .map(|_| Err(StoreError::NotFound(error.to_string())))
+                .collect(),
+        }
+    }
+
+    fn batch_compare_and_swap_routes(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        requests: &[RouteCasRequest],
+    ) -> Vec<Result<CasResult>> {
+        match authority_compare_and_swap_many(namespace, authority, requests) {
+            Ok(results) => results.into_iter().map(Ok).collect(),
+            Err(error) => requests
+                .iter()
+                .map(|_| Err(StoreError::NotFound(error.to_string())))
+                .collect(),
+        }
+    }
+
+    fn batch_replace_routes(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        requests: &[RouteCasRequest],
+    ) -> Vec<Result<()>> {
+        match authority_replace_many(namespace, authority, requests) {
+            Ok(()) => requests.iter().map(|_| Ok(())).collect(),
+            Err(error) => requests
+                .iter()
+                .map(|_| Err(StoreError::NotFound(error.to_string())))
+                .collect(),
+        }
+    }
 }
 
 struct LocalAllocatorAdapter {
@@ -2977,6 +3361,80 @@ impl AllocatorService for LocalAllocatorAdapter {
         self.allocator
             .lock()
             .release(owner, segment_name, offset_bytes, length_bytes)
+    }
+
+    fn batch_reserve_any(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Vec<Result<mooncake_store_core::SegmentReservation>> {
+        if *owner != self.runtime {
+            return length_bytes
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "allocator rpc targeted runtime {} on {}",
+                        owner, self.runtime
+                    )))
+                })
+                .collect();
+        }
+        let mut allocator = self.allocator.lock();
+        length_bytes
+            .iter()
+            .map(|length_bytes| allocator.reserve_any(owner, *length_bytes))
+            .collect()
+    }
+
+    fn batch_reserve_specific(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Vec<Result<mooncake_store_core::SegmentReservation>> {
+        if *owner != self.runtime {
+            return requests
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "allocator rpc targeted runtime {} on {}",
+                        owner, self.runtime
+                    )))
+                })
+                .collect();
+        }
+        let mut allocator = self.allocator.lock();
+        requests
+            .iter()
+            .map(|request| {
+                allocator.reserve_specific(owner, &request.segment_name, request.length_bytes)
+            })
+            .collect()
+    }
+
+    fn batch_release(&self, owner: &ClientRuntimeId, requests: &[ReleaseOp]) -> Vec<Result<()>> {
+        if *owner != self.runtime {
+            return requests
+                .iter()
+                .map(|_| {
+                    Err(StoreError::InvalidState(format!(
+                        "allocator rpc targeted runtime {} on {}",
+                        owner, self.runtime
+                    )))
+                })
+                .collect();
+        }
+        let mut allocator = self.allocator.lock();
+        requests
+            .iter()
+            .map(|request| {
+                allocator.release(
+                    owner,
+                    &request.segment_name,
+                    request.offset_bytes,
+                    request.length_bytes,
+                )
+            })
+            .collect()
     }
 }
 
@@ -3201,9 +3659,9 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::{
-        render_prometheus_metrics, reset_metrics, transport::StoreTransport, LocalMemoryConfig,
-        MooncakeCompatibilityFacade, MultiBufferGetRequest, PlacementPlanner, PutRequest,
-        ReplicationPolicy, StoreClientBuilder,
+        render_prometheus_metrics, reset_metrics, transport::StoreTransport, GetRequest,
+        LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest, ObjectRef,
+        PlacementPlanner, PutRequest, ReplicationPolicy, StoreClientBuilder,
     };
 
     struct TestTransport {
@@ -4035,6 +4493,115 @@ mod tests {
                 .expect("reader get should succeed"),
             b"hot-path-payload"
         );
+    }
+
+    #[test]
+    fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
+        let metadata = Arc::new(NoHotPathMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let storage_transport = Arc::new(TestTransport::new("storage-hot-batch-segment"));
+        let router_transport = Arc::new(storage_transport.peer("router-hot-batch-segment"));
+        let reader_transport = Arc::new(storage_transport.peer("reader-hot-batch-segment"));
+
+        let storage = StoreClientBuilder::new(metadata.clone(), "storage-hot-batch")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("storage build should succeed");
+        storage
+            .register_local_memory()
+            .expect("storage memory should register");
+
+        let router = StoreClientBuilder::new(metadata.clone(), "router-hot-batch")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(router_transport)
+            .local_memory(storage_config())
+            .routed_writes(
+                PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+                1,
+            )
+            .build(10_000)
+            .expect("router build should succeed");
+        router
+            .register_local_memory()
+            .expect("router memory should register");
+
+        let reader = StoreClientBuilder::new(metadata.clone(), "reader-hot-batch")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+        reader
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        let first = router
+            .batch_put(&[
+                PutRequest::new("hot-batch-a", b"alpha-0").tenant("tenant-a"),
+                PutRequest::new("hot-batch-b", b"beta-00").tenant("tenant-a"),
+                PutRequest::new("hot-batch-c", b"gamma-0").tenant("tenant-a"),
+            ])
+            .expect("first batch routed put should succeed");
+        assert_eq!(first.len(), 3);
+        for key in ["hot-batch-a", "hot-batch-b", "hot-batch-c"] {
+            assert!(
+                metadata
+                    .inner
+                    .get_object_route(&ObjectKey::new(format!("tenant-a::{key}")))
+                    .expect("metadata query should succeed")
+                    .is_none(),
+                "embedded WRH route directory should keep batch routes off metadata backend"
+            );
+        }
+
+        let first_values = reader
+            .batch_get(&[
+                ObjectRef::new("hot-batch-a").tenant("tenant-a"),
+                ObjectRef::new("hot-batch-b").tenant("tenant-a"),
+                ObjectRef::new("hot-batch-c").tenant("tenant-a"),
+            ])
+            .expect("reader batch_get should succeed");
+        assert_eq!(
+            first_values,
+            vec![
+                b"alpha-0".to_vec(),
+                b"beta-00".to_vec(),
+                b"gamma-0".to_vec()
+            ]
+        );
+
+        let second = router
+            .batch_put(&[
+                PutRequest::new("hot-batch-a", b"alpha-1").tenant("tenant-a"),
+                PutRequest::new("hot-batch-b", b"beta-11").tenant("tenant-a"),
+                PutRequest::new("hot-batch-c", b"gamma-1").tenant("tenant-a"),
+            ])
+            .expect("overwrite batch routed put should succeed");
+        assert_eq!(second.len(), 3);
+
+        let mut buf_a = [0u8; 7];
+        let mut buf_b = [0u8; 7];
+        let mut buf_c = [0u8; 7];
+        let sizes = reader
+            .batch_get_into(&mut [
+                GetRequest::new("hot-batch-a", &mut buf_a).tenant("tenant-a"),
+                GetRequest::new("hot-batch-b", &mut buf_b).tenant("tenant-a"),
+                GetRequest::new("hot-batch-c", &mut buf_c).tenant("tenant-a"),
+            ])
+            .expect("reader batch_get_into should succeed");
+        assert_eq!(sizes, vec![7, 7, 7]);
+        assert_eq!(&buf_a, b"alpha-1");
+        assert_eq!(&buf_b, b"beta-11");
+        assert_eq!(&buf_c, b"gamma-1");
     }
 
     #[test]

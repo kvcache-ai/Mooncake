@@ -2,8 +2,8 @@ use crate::error::Result;
 use crate::identity::{ClientRuntimeId, ClientStableId};
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation,
+    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
 };
 
 pub trait MetadataBackend: Send + Sync {
@@ -68,6 +68,16 @@ pub trait RouteDirectory: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>>;
 
+    fn get_object_routes(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        keys.iter()
+            .map(|key| self.get_object_route(observer, key))
+            .collect()
+    }
+
     fn compare_and_swap_object_route(
         &self,
         observer: &ClientLease,
@@ -75,6 +85,24 @@ pub trait RouteDirectory: Send + Sync {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult>;
+
+    fn compare_and_swap_object_routes(
+        &self,
+        observer: &ClientLease,
+        requests: &[RouteCasRequest],
+    ) -> Result<Vec<Result<CasResult>>> {
+        Ok(requests
+            .iter()
+            .map(|request| {
+                self.compare_and_swap_object_route(
+                    observer,
+                    &request.key,
+                    request.expected,
+                    request.next.as_ref(),
+                )
+            })
+            .collect())
+    }
 }
 
 pub trait PlacementStrategy: Send + Sync {
