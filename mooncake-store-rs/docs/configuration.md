@@ -39,12 +39,21 @@ System-managed behavior:
 | `tags` | `["dram"]` | tags published with the segment |
 | `alignment` | `64` | allocation alignment |
 | `reclaim_grace_ms` | `1000` | delayed reclaim window |
+| `hugepage_enabled` | `None` | override hugepage enablement for local storage and scratch |
+| `hugepage_size_bytes` | `None` | override hugepage size; `2 MiB` and `1 GiB` are supported |
 
 Validation rules:
 
 - `storage_bytes` must be greater than zero
 - `scratch_bytes` must be greater than zero
 - `location` must not be empty
+- hugepage size must be either `2 MiB` or `1 GiB`
+
+Hugepage behavior:
+
+- if `hugepage_enabled` is `Some(true)`, the client allocates native local memory with `MAP_HUGETLB`
+- if `hugepage_size_bytes` is set, hugepage mode is implicitly enabled
+- if both fields are `None`, the runtime falls back to `MC_STORE_USE_HUGEPAGE` and `MC_STORE_HUGEPAGE_SIZE`
 
 ## Route Control
 
@@ -139,6 +148,34 @@ Notes:
 - when store metadata uses etcd, TENT metadata still needs Redis
 - set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint
 
+## Python Compatibility Configuration
+
+`MooncakeDistributedStore.setup(...)` accepts the core store knobs plus Python-specific convenience parameters.
+
+Important Python-only compatibility knobs:
+
+| Parameter | Meaning |
+|-----------|---------|
+| `stable_id` | persistent client identity |
+| `tenant` | default tenant scope |
+| `labels` | lease labels such as `pool` and `storage` |
+| `routed_writes` | enable routed placement from Python |
+| `replica_count` | default replica count when routed writes are enabled |
+| `transport_metadata_url` | Redis endpoint for TENT when store metadata uses etcd |
+| `use_hugepage` | enable hugepage-backed local store memory |
+| `hugepage_size` | hugepage size for local store memory; accepts `2MB` or `1GB` |
+
+The config-dict path accepts the same hugepage knobs through `use_hugepage` and `hugepage_size`.
+
+`MooncakeHostMemAllocator(...)` exposes:
+
+| Parameter | Meaning |
+|-----------|---------|
+| `use_hugepage` | request hugepage-backed shm regions |
+| `hugepage_size` | hugepage size for shm regions; accepts `2MB` or `1GB` |
+
+When the native extension is unavailable, the pure-Python allocator falls back to `mmap` and does not support hugepages.
+
 ## Environment Variables
 
 The current repository uses these environment variables.
@@ -155,6 +192,8 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_BENCH_ITERS` | `scripts/run-local-e2e.sh` | input that the script maps to `MC_STORE_RS_BATCH_BENCH_ITERS` |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
 | `MC_STORE_RS_TENT_REDIS_URL` | Python compatibility layer | Redis URL used by TENT when store metadata is etcd |
+| `MC_STORE_USE_HUGEPAGE` | local memory and Python shm allocator | enable hugepage-backed allocation |
+| `MC_STORE_HUGEPAGE_SIZE` | local memory and Python shm allocator | hugepage size; `2MB` or `1GB` |
 | `MOONCAKE_UPSTREAM_DIR` | local scripts | upstream Mooncake source tree |
 | `MOONCAKE_UPSTREAM_BUILD_DIR` | local scripts | upstream Mooncake build output tree |
 

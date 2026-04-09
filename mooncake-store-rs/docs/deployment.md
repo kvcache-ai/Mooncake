@@ -62,6 +62,33 @@ What the script does:
 - creates two Python clients
 - validates single-object, batch, zero-copy, multi-buffer, route, and metrics paths
 
+### HiCache compatibility validation
+
+Run the compatibility checks for both Python execution modes:
+
+```bash
+./scripts/run-sglang-hicache-dummy-compat.sh
+./scripts/run-sglang-hicache-real-compat.sh
+```
+
+What they validate:
+
+- dummy path through the standalone compatibility server plus shm registration
+- real path through the native distributed store runtime plus registered-buffer I/O
+
+### Wheel packaging
+
+Build the Python wheel and stage the standalone client binary:
+
+```bash
+./scripts/build-wheel.sh
+```
+
+Default outputs:
+
+- `dist/wheels/`
+- `dist/bin/mooncake-store-client`
+
 ## Deployment Roles
 
 The runtime is assembled from regular clients with different configuration.
@@ -76,6 +103,7 @@ Typical settings:
 - `label("storage", "true")`
 - non-zero `LocalMemoryConfig`
 - `register_local_memory()` after `build(...)`
+- optional hugepage-backed local memory through `LocalMemoryConfig`
 
 ### Routed writer
 
@@ -158,6 +186,7 @@ The runtime also manages some labels internally, such as route capability and co
 - increment `epoch` for successor processes during hot-upgrade flows
 - mount local memory before serving data traffic
 - use a dedicated metadata keyspace per environment or test run
+- if hugepage mode is enabled, preallocate matching hugepages on the host before starting clients
 
 ## Validation Coverage
 

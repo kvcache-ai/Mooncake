@@ -36,6 +36,7 @@ Main capabilities:
 - `put_from`
 - `batch_put_from`
 - `batch_get_into`
+- registered subranges inside a larger caller-owned buffer
 
 ### Multi-buffer path
 
@@ -45,6 +46,7 @@ Main capabilities:
 
 - `batch_put_from_multi_buffers`
 - `batch_get_into_multi_buffers`
+- HiCache-compatible dummy and real paths for the Python layer
 
 ## Routing
 
@@ -95,6 +97,12 @@ A request can control placement behavior with:
 ### Local allocation
 
 Local segment reservation and release are handled inside the client process.
+
+The current implementation supports:
+
+- transport-managed local memory
+- hugepage-backed native memory for Rust store segments
+- hugepage-backed shared memory for Python host buffers
 
 ### Remote allocation
 
@@ -188,3 +196,14 @@ What this means in practice:
 - the same transport path is reused
 - the same metrics and tracing capabilities are available
 - the same replication controls are exposed through `ReplicateConfig`
+- the same standalone compatibility server can serve dummy clients
+- the wheel packaging flow ships the native extension with bundled runtime libraries
+
+### Dummy and real compatibility paths
+
+The compatibility layer exposes two integration modes:
+
+- real mode uses the native `StoreClient` directly from Python
+- dummy mode talks to a standalone `mooncake-store-client` process and exchanges shm buffer registrations over a side channel
+
+Both paths are covered by repository validation scripts.

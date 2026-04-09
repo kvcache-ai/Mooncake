@@ -158,6 +158,25 @@ The Rust client supports both object-oriented and buffer-oriented paths.
 
 Use the buffer-oriented forms when the application already owns stable memory and wants to avoid extra copies.
 
+## Hugepage-Backed Local Memory
+
+`LocalMemoryConfig` can request hugepage-backed local storage and scratch memory.
+
+```rust
+let local_memory = LocalMemoryConfig::new()
+    .storage_bytes(128 * 1024 * 1024)
+    .scratch_bytes(16 * 1024 * 1024)
+    .use_hugepage(true)
+    .hugepage_size_bytes(2 * 1024 * 1024);
+```
+
+Supported sizes:
+
+- `2 MiB`
+- `1 GiB`
+
+If these fields are not set explicitly, the runtime can also use `MC_STORE_USE_HUGEPAGE` and `MC_STORE_HUGEPAGE_SIZE`.
+
 ## Multi-Tenant Access
 
 Use tenant-aware request builders when the default tenant is not enough.
