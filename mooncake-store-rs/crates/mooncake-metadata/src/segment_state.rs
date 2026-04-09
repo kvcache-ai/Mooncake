@@ -2,8 +2,8 @@ use mooncake_store_core::{
     ClientRuntimeId, Result, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
     SegmentReservation, StoreError,
 };
-use serde::{Deserialize, Serialize};
 use serde::de::{Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,7 +77,9 @@ impl StoredSegmentState {
                 .announcement
                 .used_bytes
                 .checked_add(reserved_len)
-                .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
+                .ok_or_else(|| {
+                StoreError::Allocator("segment reservation overflow".to_string())
+            })?;
             return Ok(SegmentReservation {
                 owner: owner.clone(),
                 segment_name: segment.clone(),

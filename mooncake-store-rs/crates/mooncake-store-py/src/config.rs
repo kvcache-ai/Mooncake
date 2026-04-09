@@ -43,10 +43,7 @@ pub struct CompatSetupArgs {
 
 impl CompatSetupArgs {
     pub fn build(self) -> Result<CompatBuildPlan> {
-        let keyspace = self
-            .keyspace
-            .map(MetadataKeyspace::new)
-            .unwrap_or_default();
+        let keyspace = self.keyspace.map(MetadataKeyspace::new).unwrap_or_default();
         let stable_id = self
             .stable_id
             .unwrap_or_else(|| format!("py-store-{}", now_ms()));
@@ -104,8 +101,7 @@ fn build_metadata_backend(
             .unwrap_or_else(|| "redis://127.0.0.1:6380/0".to_string());
         if !transport_redis_url.starts_with("redis://") {
             return Err(StoreError::Metadata(
-                "transport metadata url must be redis:// when store metadata uses etcd"
-                    .to_string(),
+                "transport metadata url must be redis:// when store metadata uses etcd".to_string(),
             ));
         }
         return Ok((backend, transport_redis_url));
