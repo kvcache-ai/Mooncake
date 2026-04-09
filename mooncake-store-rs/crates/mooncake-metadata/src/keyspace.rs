@@ -21,7 +21,12 @@ impl MetadataKeyspace {
     }
 
     pub fn segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
-        format!("{}/segments/{}:{}", self.prefix, owner.storage_key(), segment.0)
+        format!(
+            "{}/segments/{}:{}",
+            self.prefix,
+            owner.storage_key(),
+            segment.0
+        )
     }
 
     pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
@@ -41,6 +46,10 @@ impl MetadataKeyspace {
 
     pub fn handoff(&self, stable_id: &ClientStableId) -> String {
         format!("{}/handoffs/{}", self.prefix, stable_id.0)
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 }
 

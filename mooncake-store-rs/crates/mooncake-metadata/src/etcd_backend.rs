@@ -69,6 +69,14 @@ impl EtcdMetadataBackend {
 }
 
 impl MetadataBackend for EtcdMetadataBackend {
+    fn route_namespace(&self) -> String {
+        format!(
+            "etcd://{}#{}",
+            self.config.endpoints.join(","),
+            self.config.keyspace.prefix()
+        )
+    }
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         let key = self.config.keyspace.client(&lease.runtime);
         let payload = serde_json::to_string(lease).map_err(json_error)?;
@@ -150,7 +158,9 @@ impl MetadataBackend for EtcdMetadataBackend {
             let mut state = current
                 .kvs()
                 .first()
-                .map(|kv| serde_json::from_slice::<StoredSegmentState>(kv.value()).map_err(json_error))
+                .map(|kv| {
+                    serde_json::from_slice::<StoredSegmentState>(kv.value()).map_err(json_error)
+                })
                 .transpose()?
                 .unwrap_or_else(|| StoredSegmentState::new(segment.clone()));
             state.merge_announcement(segment);

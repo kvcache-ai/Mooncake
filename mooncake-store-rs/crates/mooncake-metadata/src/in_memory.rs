@@ -33,6 +33,10 @@ impl InMemoryMetadataBackend {
 }
 
 impl MetadataBackend for InMemoryMetadataBackend {
+    fn route_namespace(&self) -> String {
+        format!("inmemory://{:p}", self)
+    }
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         self.state
             .write()
@@ -294,7 +298,9 @@ mod tests {
             .expect("second reserve should work");
 
         assert_eq!(second.offset_bytes, first.offset_bytes);
-        let segments = metadata.list_segments(Some(&owner)).expect("list should work");
+        let segments = metadata
+            .list_segments(Some(&owner))
+            .expect("list should work");
         assert_eq!(segments[0].used_bytes, 64);
     }
 }

@@ -2,6 +2,7 @@ mod client;
 mod memory;
 mod observability;
 mod placement;
+mod route_directory;
 mod transport;
 
 pub use client::{
@@ -15,6 +16,7 @@ pub use observability::{
     stop_metrics_http_server, OperationMetricSnapshot, OperationTracker,
 };
 pub use placement::{PlacementChoice, PlacementPlanner};
+pub use route_directory::RouteControlMode;
 pub use transport::{
     wait_for_batch_completion, StoreTransport, StoreTransportFactory, TentTransportFactory,
 };

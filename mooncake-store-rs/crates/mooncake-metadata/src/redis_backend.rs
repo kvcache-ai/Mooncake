@@ -226,15 +226,18 @@ impl RedisMetadataConfig {
 pub struct RedisMetadataBackend {
     client: redis::Client,
     keyspace: MetadataKeyspace,
+    route_namespace: String,
 }
 
 impl RedisMetadataBackend {
     pub fn new(config: RedisMetadataConfig) -> Result<Self> {
+        let route_namespace = format!("redis://{}#{}", config.url, config.keyspace.prefix());
         let client = redis::Client::open(config.url.as_str())
             .map_err(|error| metadata_error("redis client open", error))?;
         Ok(Self {
             client,
             keyspace: config.keyspace,
+            route_namespace,
         })
     }
 
@@ -295,6 +298,10 @@ impl RedisMetadataBackend {
 }
 
 impl MetadataBackend for RedisMetadataBackend {
+    fn route_namespace(&self) -> String {
+        self.route_namespace.clone()
+    }
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
         let mut connection = self.connection()?;
         let key = self.keyspace.client(&lease.runtime);
@@ -356,7 +363,9 @@ impl MetadataBackend for RedisMetadataBackend {
             .query(&mut connection)
             .map_err(|error| metadata_error("redis hget segment state", error))?;
         let mut state = match current_payload {
-            Some(payload) => serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?,
+            Some(payload) => {
+                serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?
+            }
             None => StoredSegmentState::new(segment.clone()),
         };
         state.merge_announcement(segment);
@@ -385,7 +394,8 @@ impl MetadataBackend for RedisMetadataBackend {
                 .query(&mut connection)
                 .map_err(|error| metadata_error("redis hget segment state", error))?;
             if let Some(payload) = payload {
-                let state = serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?;
+                let state =
+                    serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?;
                 segments.push(state.announcement);
             }
         }
