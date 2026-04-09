@@ -135,6 +135,13 @@ Allocation is split by storage ownership.
 - remote allocations use control-plane RPC to the owning client
 - metadata allocation remains the fallback when allocator RPC is unavailable
 
+Local memory supports two backing strategies:
+
+- transport-managed memory through the TE/TENT transport
+- hugepage-backed native memory allocated directly by store-rs and then registered into the transport
+
+The Python host allocator uses shared `memfd` + `mmap`, and can also request hugepage-backed shm regions when the host kernel is configured for hugepages.
+
 Reclaim is explicit and route-aware.
 
 - overwrites schedule release for the old replicas
@@ -204,6 +211,33 @@ Examples include:
 
 Tracing is built on `tracing` + `tracing-subscriber` and can be enabled from code or by environment variables.
 
+## Python Compatibility Architecture
+
+The Python package exposes two runtime paths over the same Rust implementation.
+
+### Real path
+
+`MooncakeDistributedStore.setup(...)` builds a native `StoreClient`.
+
+That means:
+
+- route lookups use the same `RouteDirectory`
+- allocation uses the same local / remote allocator logic
+- data transfer uses the same TE/TENT transport path
+- lifecycle, reclaim, tracing, and metrics share the same implementation as Rust callers
+
+### Dummy path
+
+`MooncakeDistributedStore.setup_dummy(...)` connects to a standalone `mooncake-store-client` process.
+
+That path is split as follows:
+
+- gRPC carries compatibility operations such as put/get/batch RPCs
+- a Unix-domain side channel passes shm file descriptors for registered buffers
+- the standalone server resolves those shm registrations and forwards operations into the native store runtime
+
+This preserves compatibility for integrations that expect a dummy client / external server split while keeping the real store logic inside the Rust runtime.
+
 ## Code Map
 
 | Path | Role |
@@ -215,7 +249,9 @@ Tracing is built on `tracing` + `tracing-subscriber` and can be enabled from cod
 | `crates/mooncake-store-client/src/control_plane.rs` | protobuf RPC client/server for route and allocator |
 | `crates/mooncake-store-client/src/memory.rs` | local memory and segment tracking |
 | `crates/mooncake-store-client/src/transport.rs` | transfer submission helpers |
-| `crates/mooncake-store-py` | Python bindings and compatibility setup |
+| `crates/mooncake-store-py/src/lib.rs` | Python bindings, real/dummy dispatch, compatibility API |
+| `crates/mooncake-store-py/src/dummy_client.rs` | dummy compatibility client and shm registration RPC |
+| `crates/mooncake-store-py/src/shm.rs` | shm region ownership, fd passing, shared mapping helpers |
 | `crates/mooncake-store-e2e` | runnable system validation |
 
 ## When to Read Which Document

@@ -72,6 +72,8 @@ The implementation is easier to understand when grouped by capability instead of
 ### Memory and Reclaim
 
 - local segment registration
+- native local-memory hugepage allocation
+- Python shm allocator hugepage allocation
 - local and remote allocation paths
 - overwrite reclaim
 - delete reclaim
@@ -97,6 +99,11 @@ The implementation is easier to understand when grouped by capability instead of
 ### Python Compatibility
 
 - Mooncake-style `MooncakeDistributedStore`
+- `MooncakeHostMemAllocator` for registered buffer ownership
+- dummy and real HiCache-compatible execution paths
+- wheel packaging with bundled native runtime libraries
+- standalone `mooncake-store-client` binary packaging
+- hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
 - native module backed by the Rust implementation
@@ -162,6 +169,18 @@ For deployment details and script knobs, read `docs/deployment.md`.
 ```bash
 ./scripts/run-python-compat-e2e.sh
 ```
+
+### Run the HiCache compatibility checks
+
+```bash
+./scripts/run-sglang-hicache-dummy-compat.sh
+./scripts/run-sglang-hicache-real-compat.sh
+```
+
+These scripts validate:
+
+- the dummy path through the standalone compatibility service plus shm buffer registration
+- the real path through the native distributed store runtime plus registered-buffer I/O
 
 For Python build and API details, read `docs/python.md`.
 
@@ -257,6 +276,17 @@ cargo build -p mooncake-store-py
 export PYTHONPATH="$PWD/python"
 ```
 
+Build a distributable wheel and package the standalone client binary:
+
+```bash
+./scripts/build-wheel.sh
+```
+
+The default output layout is:
+
+- `dist/wheels/` for Python wheels
+- `dist/bin/mooncake-store-client` for the standalone client runtime
+
 ```python
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
@@ -279,6 +309,18 @@ assert store.get("hello") == b"world"
 config = ReplicateConfig(replica_num=2, prefer_local=True)
 store.put("replicated", b"payload", config=config)
 ```
+
+Use the host allocator when the application wants stable registered buffers:
+
+```python
+from mooncake.store import MooncakeHostMemAllocator
+
+allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
+ptr = allocator.alloc(2 * 1024 * 1024)
+allocator.free(ptr)
+```
+
+If hugepage mode is requested, the kernel must already have compatible hugepages reserved.
 
 For Python APIs and configuration details, read `docs/python.md`.
 

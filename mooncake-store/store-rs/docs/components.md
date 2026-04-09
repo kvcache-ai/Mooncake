@@ -27,6 +27,7 @@ Main content:
 - client identities and endpoint sets
 - leases and lifecycle states
 - routes, replicas, segments, and versions
+- hugepage configuration parsing shared by Rust and Python entry points
 - store traits such as `MetadataBackend` and `RouteDirectory`
 
 Read this crate first if you want to understand the data model before reading the runtime.
@@ -124,8 +125,11 @@ What it contains:
 
 - `MooncakeDistributedStore`
 - compatibility-style `setup(...)`
+- `setup_dummy(...)` for the standalone compatibility path
+- `MooncakeHostMemAllocator` for shm-backed host buffers
 - Python-facing replication config handling
 - metadata URL parsing for Redis and etcd
+- shm registration helpers and dummy compatibility RPC client
 
 ### `python/mooncake`
 

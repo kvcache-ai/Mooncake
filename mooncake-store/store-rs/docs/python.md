@@ -2,14 +2,46 @@
 
 `mooncake-store-rs` ships a Python compatibility layer in `crates/mooncake-store-py` and a convenience package in `python/mooncake`.
 
+The Python package does not wrap a second store implementation. It reuses the same Rust runtime, control plane, allocator, reclaim logic, tracing, and metrics that the Rust client uses.
+
 ## What the Python Layer Provides
 
-- `MooncakeDistributedStore`: the main client wrapper
-- `ReplicateConfig`: request-level replication policy
-- tracing and metrics helpers
-- batch and zero-copy style operations exposed through Python-friendly APIs
+- `MooncakeDistributedStore` as the main compatibility API
+- `MooncakeHostMemAllocator` for caller-owned registered buffers
+- real and dummy execution modes for Mooncake / HiCache-style integration
+- batch I/O, registered-buffer I/O, and multi-buffer I/O
+- route query, lifecycle, and metrics helpers
+- wheel packaging for the native extension plus the bundled runtime libraries
 
-## Build
+## Execution Modes
+
+The Python compatibility layer supports two execution styles.
+
+### Real mode
+
+Use `setup(...)` when Python should talk to the native distributed store runtime directly.
+
+This mode:
+
+- constructs a Rust `StoreClient`
+- registers local memory and participates in route / allocator control plane RPC
+- supports routed writes, replication policy, segment lifecycle, metrics, and tracing
+- is the normal path for Python clients that should behave like store-rs nodes
+
+### Dummy mode
+
+Use `setup_dummy(...)` when Python should behave like the upstream dummy compatibility client.
+
+This mode:
+
+- connects to a standalone `mooncake-store-client` process over gRPC
+- registers shm regions by passing file descriptors over a Unix socket
+- keeps the Python process out of the distributed control plane
+- is the compatibility path used by the HiCache dummy flow
+
+Dummy mode is intentionally narrower than real mode. It exists to preserve compatibility for callers that expect the old dummy client / standalone server split.
+
+## Build From a Checkout
 
 ```bash
 git submodule update --init --recursive
@@ -17,20 +49,29 @@ cargo build -p mooncake-store-py
 export PYTHONPATH="$PWD/python"
 ```
 
-The Python package loads the native extension from the local `target` directory and preloads the upstream Mooncake TE/TENT shared libraries from `third_party/Mooncake/build-rust`.
+The package loads the native extension from the local `target` directory and preloads the upstream Mooncake TE/TENT shared libraries from `third_party/Mooncake/build-rust`.
 
 ## Build a Wheel
+
+Use the repository packaging script:
 
 ```bash
 ./scripts/build-wheel.sh
 ```
 
-By default the script writes artifacts to `dist/`:
+By default the script:
 
-- the `mooncake` Python package
-- the `mooncake._store_rs` native extension
-- the repaired runtime shared libraries needed by the extension on Linux
-- the standalone `mooncake-store-client` binary in `dist/bin/`
+- creates or reuses `.venv-wheel`
+- installs `maturin`
+- builds the Python wheel into `dist/wheels/`
+- builds the standalone `mooncake-store-client` binary into `dist/bin/`
+
+Common variants:
+
+```bash
+./scripts/build-wheel.sh --interpreter python3.11
+DIST_DIR=artifacts ./scripts/build-wheel.sh
+```
 
 Install the wheel into any compatible virtualenv:
 
@@ -40,16 +81,18 @@ pip install dist/wheels/mooncake_store_rs-*.whl
 
 ## Standalone Client Binary
 
-Build the standalone client runtime:
+You can build the standalone compatibility server directly:
 
 ```bash
 cargo build -p mooncake-store-py --bin mooncake-store-client --release
 ```
 
+Or use `./scripts/build-wheel.sh`, which also stages the binary in `dist/bin/`.
+
 Start a storage client:
 
 ```bash
-./target/release/mooncake-store-client \
+./dist/bin/mooncake-store-client \
   --local-hostname 127.0.0.1 \
   --metadata-url redis://127.0.0.1:6380/0 \
   --storage-bytes $((128 * 1024 * 1024)) \
@@ -57,6 +100,7 @@ Start a storage client:
   --stable-id store-a \
   --tenant default \
   --label pool=pool-a \
+  --label storage=true \
   --metrics-addr 127.0.0.1:9091
 ```
 
@@ -67,8 +111,10 @@ Useful flags:
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
 - `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
+- `--client-server-address host:port` to expose the standalone compatibility server for dummy clients
+- `--use-hugepage` and `--hugepage-size 2MB|1GB` to enable hugepage-backed local memory
 
-## Basic Example
+## Basic Real-Mode Example
 
 ```python
 from mooncake.store import MooncakeDistributedStore
@@ -119,6 +165,72 @@ policy = ReplicateConfig(
 store.put("key", b"payload", config=policy)
 ```
 
+## Basic Dummy-Mode Example
+
+Start the standalone compatibility server first:
+
+```bash
+./dist/bin/mooncake-store-client \
+  --local-hostname 127.0.0.1 \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --storage-bytes $((64 * 1024 * 1024)) \
+  --scratch-bytes $((16 * 1024 * 1024)) \
+  --stable-id dummy-server \
+  --client-server-address 127.0.0.1:16590
+```
+
+Then connect from Python:
+
+```python
+from mooncake.store import MooncakeDistributedStore, MooncakeHostMemAllocator
+
+store = MooncakeDistributedStore()
+store.setup_dummy(64 * 1024 * 1024, 16 * 1024 * 1024, "127.0.0.1:16590")
+
+allocator = MooncakeHostMemAllocator()
+ptr = allocator.alloc(4096)
+store.register_buffer(ptr, 4096)
+```
+
+## Host Allocator and Hugepages
+
+`MooncakeHostMemAllocator` is the Python-side allocator for stable registered buffers.
+
+Default behavior:
+
+- when the native extension is available, it allocates shm regions with `memfd` and shared `mmap`
+- when the native extension is not available, it falls back to Python `mmap`
+- the pure-Python fallback does not support hugepages
+
+Hugepage options:
+
+- `use_hugepage=True`
+- `hugepage_size="2MB"` or `hugepage_size="1GB"`
+
+Example:
+
+```python
+from mooncake.store import MooncakeHostMemAllocator
+
+allocator = MooncakeHostMemAllocator(use_hugepage=True, hugepage_size="2MB")
+ptr = allocator.alloc(2 * 1024 * 1024)
+allocator.free(ptr)
+```
+
+The same hugepage knobs are also accepted by `MooncakeDistributedStore.setup(...)` and the config-dict path. They control the store client's local storage and scratch allocator.
+
+Supported hugepage sizes:
+
+- `2MB`
+- `1GB`
+
+Related environment variables:
+
+- `MC_STORE_USE_HUGEPAGE`
+- `MC_STORE_HUGEPAGE_SIZE`
+
+If hugepage mode is requested, the host kernel must already have compatible hugepages reserved.
+
 ## Supported Operations
 
 ### Basic I/O
@@ -127,7 +239,7 @@ store.put("key", b"payload", config=policy)
 - `batch_put`, `batch_get`, `batch_remove`
 - `query_route`, `is_exist`, `get_size`
 
-### Buffer-oriented I/O
+### Buffer-Oriented I/O
 
 - `register_buffer`, `unregister_buffer`
 - `put_from`
@@ -136,7 +248,7 @@ store.put("key", b"payload", config=policy)
 - `batch_get_into`
 - `batch_get_into_multi_buffers`
 
-### Lifecycle and capacity
+### Lifecycle and Capacity
 
 - `activate`, `enter_standby`, `enter_draining`
 - `expand_local_memory`
@@ -183,19 +295,28 @@ When the store metadata backend is etcd, TENT transport metadata still uses Redi
 
 These values map to the Rust `ReplicationPolicy` used by `StoreClient`.
 
-## Local Development
+## Validation Scripts
 
-Run the compatibility validation script:
+Run the Python compatibility validation:
 
 ```bash
 ./scripts/run-python-compat-e2e.sh
 ```
 
-This validates:
+Run the HiCache compatibility validations:
+
+```bash
+./scripts/run-sglang-hicache-dummy-compat.sh
+./scripts/run-sglang-hicache-real-compat.sh
+```
+
+Current coverage includes:
 
 - setup and native loading
-- single-key operations
-- batch operations
+- single-key and batch operations
+- registered-buffer and multi-buffer paths
+- dummy-path shm registration
+- real-path registered-buffer reads and writes
 - route query behavior
 - replication policy handling
 - metrics exposure
