@@ -622,6 +622,29 @@ TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
     EXPECT_FALSE(mock_metadata_store_->Exists("key4"));
 }
 
+TEST_F(OpLogApplierTest, TestLargeFutureBurstDoesNotDropBufferedEntries) {
+    std::string payload = MakeValidJsonPayload();
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+
+    constexpr uint64_t kBurstCount = 4096;
+    for (uint64_t seq = 3; seq < 3 + kBurstCount; ++seq) {
+        EXPECT_FALSE(applier_->ApplyOpLogEntry(MakeEntry(
+            seq, OpType::PUT_END, "key" + std::to_string(seq), payload)))
+            << "sequence_id=" << seq;
+    }
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::PUT_END, "key2", payload)));
+    EXPECT_EQ(3u + kBurstCount, applier_->GetExpectedSequenceId());
+    EXPECT_EQ(2u + kBurstCount, mock_metadata_store_->GetKeyCount());
+    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
+    EXPECT_TRUE(
+        mock_metadata_store_->Exists("key" + std::to_string(2 + kBurstCount)));
+}
+
 // ========== 4.1.8 JSON parsing tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {

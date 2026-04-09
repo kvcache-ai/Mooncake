@@ -172,8 +172,11 @@ class OpLogApplier {
         1;  // request from backend after 1s
     static constexpr int kMissingEntrySkipSeconds =
         3;  // skip after 3s (avoid global stall)
-    static constexpr int kMaxPendingEntries =
-        1000;  // Max pending entries before giving up
+    // Snapshot bootstrap can leave standby briefly behind while the leader
+    // keeps appending new entries. Keep enough headroom here so catch-up
+    // buffers the burst instead of discarding future entries and stalling
+    // promotion.
+    static constexpr size_t kMaxPendingEntries = 256 * 1024;
 };
 
 }  // namespace mooncake
