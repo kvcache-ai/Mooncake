@@ -360,7 +360,7 @@ impl StoreClientBuilder {
         };
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
-        let control_client = Arc::new(ControlPlaneClient);
+        let control_client = Arc::new(ControlPlaneClient::new()?);
         let control_plane = ControlPlaneHandle::spawn(
             &control_bind_host(&endpoints.rpc_address),
             Arc::new(LocalAuthorityAdapter),
@@ -2497,6 +2497,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
 
 impl Drop for StoreClient {
     fn drop(&mut self) {
+        self.control_client.clear_channels();
+        self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {
             return;
         };
