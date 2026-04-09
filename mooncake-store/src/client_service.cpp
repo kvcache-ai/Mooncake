@@ -2539,9 +2539,14 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
         total_size = mem_desc.buffer_descriptor.size_;
-    } else {
+    } else if (replica_descriptor.is_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;
+    } else if (replica_descriptor.is_local_disk_replica()) {
+        total_size = replica_descriptor.get_local_disk_descriptor().object_size;
+    } else {
+        LOG(ERROR) << "TransferRead: unknown replica type";
+        return ErrorCode::INVALID_REPLICA;
     }
 
     size_t slices_size = CalculateSliceSize(slices);
