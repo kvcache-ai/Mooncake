@@ -58,6 +58,10 @@ struct HotStandbyConfig {
     uint32_t snapshot_refresh_interval_ms{1000};
 
     ha::HABackendType oplog_backend_type{ha::HABackendType::ETCD};
+
+    // Shared backend used to publish standby progress records. This backend
+    // must be readable by the leader-side OpLog GC logic, so local-only
+    // backends such as localfs are not valid here.
     ha::HABackendType progress_backend_type{ha::HABackendType::UNKNOWN};
     std::string progress_backend_connstring;
 };
@@ -200,7 +204,7 @@ class HotStandbyService {
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     std::optional<ha::StandbyProgressRecord> BuildStandbyProgressRecordLocked()
         const;
-    void InitializeStandbyProgressStoreLocked();
+    ErrorCode InitializeStandbyProgressStoreLocked();
     void PublishStandbyProgress();
     void NotifySyncStatus();
     bool WaitForShutdownOrTimeout(std::chrono::milliseconds timeout);

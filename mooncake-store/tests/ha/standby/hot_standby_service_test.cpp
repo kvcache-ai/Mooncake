@@ -774,6 +774,30 @@ TEST_F(HotStandbyServiceTest,
 #endif
 }
 
+TEST_F(HotStandbyServiceTest,
+       OplogFollowingRequiresLeaderReadableSharedProgressBackend) {
+    namespace fs = std::filesystem;
+
+    const auto oplog_dir =
+        fs::temp_directory_path() /
+        ("hot_standby_localfs_oplog_" + UuidToString(generate_uuid()));
+    ASSERT_TRUE(fs::create_directories(oplog_dir));
+
+    config_.standby_id = "standby-" + UuidToString(generate_uuid());
+    config_.enable_snapshot_bootstrap = false;
+    config_.enable_oplog_following = true;
+    config_.oplog_backend_type = ha::HABackendType::LOCALFS;
+    config_.progress_backend_type = ha::HABackendType::UNKNOWN;
+    config_.progress_backend_connstring.clear();
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              service_->Start("", oplog_dir.string(), cluster_id_));
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+
+    fs::remove_all(oplog_dir);
+}
+
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
     config_.enable_snapshot_bootstrap = true;
     config_.enable_oplog_following = false;

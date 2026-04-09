@@ -322,7 +322,20 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         oplog_store_ = std::move(store.value());
     }
 
-    InitializeStandbyProgressStoreLocked();
+    auto progress_err = InitializeStandbyProgressStoreLocked();
+    if (progress_err != ErrorCode::OK) {
+        state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
+        return finish_start(progress_err);
+    }
+
+    if (config_.enable_oplog_following && !standby_progress_store_) {
+        LOG(ERROR) << "OpLog following requires a leader-readable shared "
+                   << "standby progress backend, standby_id="
+                   << config_.standby_id << ", progress_backend="
+                   << ha::HABackendTypeToString(config_.progress_backend_type);
+        state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
+        return finish_start(ErrorCode::INVALID_PARAMS);
+    }
 
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
 
@@ -910,37 +923,45 @@ HotStandbyService::BuildStandbyProgressRecordLocked() const {
     return record;
 }
 
-void HotStandbyService::InitializeStandbyProgressStoreLocked() {
+ErrorCode HotStandbyService::InitializeStandbyProgressStoreLocked() {
     standby_progress_store_.reset();
 
-    const auto backend_type =
-        config_.progress_backend_type != ha::HABackendType::UNKNOWN
-            ? config_.progress_backend_type
-            : config_.oplog_backend_type;
-    const std::string& connstring = !config_.progress_backend_connstring.empty()
-                                        ? config_.progress_backend_connstring
-                                        : oplog_backend_connstring_;
+    if (config_.standby_id.empty() || cluster_id_.empty()) {
+        return ErrorCode::OK;
+    }
 
-    if (config_.standby_id.empty() || cluster_id_.empty() ||
-        connstring.empty()) {
-        return;
+    if (config_.progress_backend_type == ha::HABackendType::UNKNOWN &&
+        config_.progress_backend_connstring.empty()) {
+        return ErrorCode::OK;
+    }
+
+    if (config_.progress_backend_type == ha::HABackendType::UNKNOWN ||
+        config_.progress_backend_connstring.empty()) {
+        LOG(ERROR) << "Standby progress backend config is incomplete, "
+                   << "standby_id=" << config_.standby_id << ", backend="
+                   << ha::HABackendTypeToString(config_.progress_backend_type)
+                   << ", connstring_empty="
+                   << config_.progress_backend_connstring.empty();
+        return ErrorCode::INVALID_PARAMS;
     }
 
     ha::HABackendSpec spec{
-        .type = backend_type,
-        .connstring = connstring,
+        .type = config_.progress_backend_type,
+        .connstring = config_.progress_backend_connstring,
         .cluster_namespace = cluster_id_,
     };
     auto progress_store = ha::CreateStandbyProgressStore(spec);
     if (!progress_store) {
         LOG(WARNING) << "Failed to initialize standby progress store, "
-                     << "backend=" << ha::HABackendTypeToString(backend_type)
+                     << "backend="
+                     << ha::HABackendTypeToString(config_.progress_backend_type)
                      << ", cluster=" << cluster_id_
                      << ", error=" << toString(progress_store.error());
-        return;
+        return progress_store.error();
     }
 
     standby_progress_store_ = std::move(progress_store.value());
+    return ErrorCode::OK;
 }
 
 void HotStandbyService::PublishStandbyProgress() {
