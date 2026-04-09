@@ -2069,7 +2069,8 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("dst_offsets"),
             py::arg("src_offsets"), py::arg("sizes"),
-            "Get multiple byte ranges from an object into a pre-allocated buffer")
+            "Get multiple byte ranges from an object into a pre-allocated "
+            "buffer")
         .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,

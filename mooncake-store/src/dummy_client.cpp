@@ -775,8 +775,7 @@ int64_t DummyClient::get_into_range(const std::string& key, void* buffer,
 std::vector<int64_t> DummyClient::get_into_ranges(
     const std::string& key, void* buffer,
     const std::vector<size_t>& dst_offsets,
-    const std::vector<size_t>& src_offsets,
-    const std::vector<size_t>& sizes) {
+    const std::vector<size_t>& src_offsets, const std::vector<size_t>& sizes) {
     const size_t range_count = dst_offsets.size();
     std::vector<int64_t> results(
         range_count, static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
@@ -787,8 +786,8 @@ std::vector<int64_t> DummyClient::get_into_ranges(
     }
 
     for (size_t i = 0; i < range_count; ++i) {
-        results[i] =
-            get_into_range(key, buffer, dst_offsets[i], src_offsets[i], sizes[i]);
+        results[i] = get_into_range(key, buffer, dst_offsets[i], src_offsets[i],
+                                    sizes[i]);
     }
 
     return results;
