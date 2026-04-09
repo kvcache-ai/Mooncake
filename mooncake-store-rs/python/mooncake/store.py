@@ -114,9 +114,13 @@ class _BatchStatusResult(list):
 
 class MooncakeHostMemAllocator:
     def __init__(self) -> None:
+        native_allocator = getattr(_native, "MooncakeHostMemAllocator", None)
+        self._native_allocator = native_allocator() if native_allocator else None
         self._allocations: dict[int, mmap.mmap] = {}
 
     def alloc(self, size: int) -> int:
+        if self._native_allocator is not None:
+            return int(self._native_allocator.alloc(int(size)))
         requested = int(size)
         if requested <= 0:
             raise ValueError("allocation size must be positive")
@@ -126,6 +130,8 @@ class MooncakeHostMemAllocator:
         return pointer
 
     def free(self, ptr: int) -> int:
+        if self._native_allocator is not None:
+            return int(self._native_allocator.free(int(ptr)))
         pointer = int(ptr)
         region = self._allocations.pop(pointer, None)
         if region is None:
@@ -134,6 +140,8 @@ class MooncakeHostMemAllocator:
         return 0
 
     def close(self) -> None:
+        if self._native_allocator is not None:
+            return
         pointers = list(self._allocations)
         for pointer in pointers:
             self.free(pointer)
@@ -286,16 +294,16 @@ class MooncakeDistributedStore:
     def batch_put_from(self, *args, tenant: str | None = None, config=None):
         if len(args) == 1:
             items = _normalize_pointer_items(args[0])
-            self._native.batch_put_from(
+            result = self._native.batch_put_from(
                 items,
                 tenant=tenant,
                 **_replication_kwargs(config),
             )
             self._track_keys([key for key, _, _ in items], tenant=tenant)
-            return _BatchStatusResult([0] * len(items))
+            return _coerce_batch_status_result(result, len(items))
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
-            self._native.batch_put_from_raw(
+            result = self._native.batch_put_from_raw(
                 keys,
                 buffer_ptrs,
                 sizes,
@@ -303,7 +311,7 @@ class MooncakeDistributedStore:
                 **_replication_kwargs(config),
             )
             self._track_keys(keys, tenant=tenant)
-            return _BatchStatusResult([0] * len(keys))
+            return _coerce_batch_status_result(result, len(keys))
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
         )
@@ -405,10 +413,13 @@ class MooncakeDistributedStore:
 
     def remove_all(self, force: bool = False):
         if hasattr(self._native, "remove_all"):
-            removed = self._native.remove_all(force=force)
-            if int(removed) >= 0:
-                self._tracked_keys.clear()
-            return removed
+            try:
+                removed = self._native.remove_all(force=force)
+                if int(removed) >= 0:
+                    self._tracked_keys.clear()
+                return removed
+            except Exception:
+                pass
         removed = 0
         for tenant, keys in self._group_tracked_keys().items():
             statuses = self._native.batch_remove(keys, force=force, tenant=tenant)
@@ -550,6 +561,14 @@ def _normalize_pointer_items(items: Iterable[tuple]):
         key, buffer_ptr, size = item
         normalized.append((str(key), int(buffer_ptr), int(size)))
     return normalized
+
+
+def _coerce_batch_status_result(result, count: int) -> _BatchStatusResult:
+    if isinstance(result, int):
+        if result != 0:
+            raise RuntimeError(f"batch put-from failed with status {result}")
+        return _BatchStatusResult([0] * count)
+    return _BatchStatusResult([int(status) for status in result])
 
 
 def _coerce_bool(value, default: bool) -> bool:

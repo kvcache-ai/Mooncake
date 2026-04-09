@@ -1,10 +1,14 @@
 mod config;
+mod dummy_client;
+pub mod dummy_service;
 pub mod runtime;
+mod shm;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::slice;
 
+use dummy_client::DummySession;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
     start_metrics_http_server, stop_metrics_http_server, GetRequest, MooncakeCompatibilityFacade,
@@ -22,13 +26,20 @@ use runtime::CompatRuntimeArgs;
 #[pyclass(name = "MooncakeDistributedStore", unsendable)]
 struct PyMooncakeDistributedStore {
     client: Option<StoreClient>,
+    dummy: Option<DummySession>,
 }
+
+#[pyclass(name = "MooncakeHostMemAllocator", unsendable)]
+struct PyMooncakeHostMemAllocator;
 
 #[pymethods]
 impl PyMooncakeDistributedStore {
     #[new]
     fn new() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            dummy: None,
+        }
     }
 
     #[pyo3(signature = (
@@ -95,12 +106,31 @@ impl PyMooncakeDistributedStore {
         let _ = master_server;
         let client = runtime.client;
         client.register_local_memory().map_err(store_error_to_py)?;
+        self.dummy = None;
         self.client = Some(client);
         Ok(0)
     }
 
-    fn close(&mut self) {
+    #[pyo3(signature = (mem_pool_size, local_buffer_size, server_address))]
+    fn setup_dummy(
+        &mut self,
+        mem_pool_size: usize,
+        local_buffer_size: usize,
+        server_address: &str,
+    ) -> PyResult<i32> {
+        let _ = (mem_pool_size, local_buffer_size);
+        let session = DummySession::connect(server_address).map_err(store_error_to_py)?;
         self.client = None;
+        self.dummy = Some(session);
+        Ok(0)
+    }
+
+    fn close(&mut self) {
+        if let Some(dummy) = self.dummy.as_ref() {
+            dummy.close();
+        }
+        self.client = None;
+        self.dummy = None;
     }
 
     #[pyo3(signature = (
@@ -132,6 +162,21 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let policy = replication_policy(
+                replica_count,
+                preferred_segment,
+                preferred_segments,
+                preferred_storage_owner,
+                preferred_storage_owners,
+                prefer_local,
+                prefer_alloc_in_same_node,
+                with_soft_pin,
+            );
+            return dummy
+                .put(key, &value, tenant, policy.as_ref())
+                .map_err(store_error_to_py);
+        }
         let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
@@ -162,6 +207,15 @@ impl PyMooncakeDistributedStore {
         key: &str,
         tenant: Option<&str>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
+            if status != 0 {
+                return Err(PyKeyError::new_err(format!(
+                    "dummy store get failed for key={key}"
+                )));
+            }
+            return Ok(PyBytes::new(py, &value));
+        }
         let client = self.client_ref()?;
         let value = match tenant {
             Some(tenant) => client.get_in_tenant(tenant, key),
@@ -173,6 +227,12 @@ impl PyMooncakeDistributedStore {
 
     #[pyo3(signature = (key, *, tenant = None))]
     fn is_exist(&self, key: &str, tenant: Option<&str>) -> PyResult<bool> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let results = dummy
+                .batch_is_exist(&[key.to_string()], tenant)
+                .map_err(store_error_to_py)?;
+            return Ok(results.first().copied().unwrap_or_default() == 1);
+        }
         let client = self.client_ref()?;
         match tenant {
             Some(tenant) => client.is_exist_in_tenant(tenant, key),
@@ -183,6 +243,9 @@ impl PyMooncakeDistributedStore {
 
     #[pyo3(signature = (keys, *, tenant = None))]
     fn batch_is_exist(&self, keys: Vec<String>, tenant: Option<&str>) -> PyResult<Vec<i32>> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            return dummy.batch_is_exist(&keys, tenant).map_err(store_error_to_py);
+        }
         let client = self.client_ref()?;
         let objects = keys
             .iter()
@@ -201,11 +264,21 @@ impl PyMooncakeDistributedStore {
     }
 
     fn get_hostname(&self) -> PyResult<String> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            return Ok(dummy.server_addr().to_string());
+        }
         self.client_ref()?.get_hostname().map_err(store_error_to_py)
     }
 
     #[pyo3(signature = (key, *, tenant = None))]
     fn get_size(&self, key: &str, tenant: Option<&str>) -> PyResult<usize> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
+            if status != 0 {
+                return Ok(0);
+            }
+            return Ok(value.len());
+        }
         let client = self.client_ref()?;
         match tenant {
             Some(tenant) => client.get_size_in_tenant(tenant, key),
@@ -215,6 +288,11 @@ impl PyMooncakeDistributedStore {
     }
 
     fn register_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            return dummy
+                .register_buffer(buffer_ptr, size)
+                .map_err(store_error_to_py);
+        }
         let client = self.client_ref()?;
         client
             .register_buffer(pointer_from_usize(buffer_ptr)?, size)
@@ -223,6 +301,11 @@ impl PyMooncakeDistributedStore {
     }
 
     fn unregister_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            return dummy
+                .unregister_buffer(buffer_ptr, Some(size))
+                .map_err(store_error_to_py);
+        }
         let client = self.client_ref()?;
         client
             .unregister_buffer(pointer_from_usize(buffer_ptr)?, size)
@@ -261,6 +344,21 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let policy = replication_policy(
+                replica_count,
+                preferred_segment,
+                preferred_segments,
+                preferred_storage_owner,
+                preferred_storage_owners,
+                prefer_local,
+                prefer_alloc_in_same_node,
+                with_soft_pin,
+            );
+            return dummy
+                .put_from(key, buffer_ptr, size, tenant, policy.as_ref())
+                .map_err(store_error_to_py);
+        }
         let client = self.client_ref()?;
         let buffer = pointer_from_usize(buffer_ptr)? as *const c_void;
         let policy = replication_policy(
@@ -293,6 +391,17 @@ impl PyMooncakeDistributedStore {
         size: usize,
         tenant: Option<&str>,
     ) -> PyResult<usize> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let size = dummy
+                .get_into(key, buffer_ptr, size, tenant)
+                .map_err(store_error_to_py)?;
+            if size < 0 {
+                return Err(PyKeyError::new_err(format!(
+                    "dummy store get_into failed for key={key}"
+                )));
+            }
+            return Ok(size as usize);
+        }
         let client = self.client_ref()?;
         let buffer = unsafe {
             slice::from_raw_parts_mut(pointer_from_usize(buffer_ptr)?.cast::<u8>(), size)
@@ -375,6 +484,7 @@ impl PyMooncakeDistributedStore {
     #[allow(clippy::too_many_arguments)]
     fn batch_put_from(
         &self,
+        py: Python<'_>,
         items: Vec<(String, usize, usize)>,
         tenant: Option<&str>,
         replica_count: Option<usize>,
@@ -385,7 +495,23 @@ impl PyMooncakeDistributedStore {
         prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
-    ) -> PyResult<i32> {
+    ) -> PyResult<Py<PyAny>> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let policy = replication_policy(
+                replica_count,
+                preferred_segment,
+                preferred_segments,
+                preferred_storage_owner,
+                preferred_storage_owners,
+                prefer_local,
+                prefer_alloc_in_same_node,
+                with_soft_pin,
+            );
+            let statuses = dummy
+                .batch_put_from(&items, tenant, policy.as_ref())
+                .map_err(store_error_to_py)?;
+            return Ok(PyList::new(py, statuses)?.into_any().unbind());
+        }
         let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
@@ -414,7 +540,7 @@ impl PyMooncakeDistributedStore {
         client
             .batch_put_from(&requests)
             .map_err(store_error_to_py)?;
-        Ok(0)
+        Ok(PyList::new(py, vec![0; requests.len()])?.into_any().unbind())
     }
 
     #[pyo3(signature = (
@@ -435,6 +561,7 @@ impl PyMooncakeDistributedStore {
     #[allow(clippy::too_many_arguments)]
     fn batch_put_from_raw(
         &self,
+        py: Python<'_>,
         keys: Vec<String>,
         buffer_ptrs: Vec<usize>,
         sizes: Vec<usize>,
@@ -447,7 +574,7 @@ impl PyMooncakeDistributedStore {
         prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
-    ) -> PyResult<i32> {
+    ) -> PyResult<Py<PyAny>> {
         if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
             return Err(PyValueError::new_err(
                 "keys, buffer_ptrs, and sizes must have the same length",
@@ -460,6 +587,7 @@ impl PyMooncakeDistributedStore {
             .map(|((key, buffer_ptr), size)| (key, buffer_ptr, size))
             .collect::<Vec<_>>();
         self.batch_put_from(
+            py,
             items,
             tenant,
             replica_count,
@@ -705,7 +833,10 @@ impl PyMooncakeDistributedStore {
         &self,
         items: Vec<(String, usize, usize)>,
         tenant: Option<&str>,
-    ) -> PyResult<Vec<usize>> {
+    ) -> PyResult<Vec<i64>> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            return dummy.batch_get_into(&items, tenant).map_err(store_error_to_py);
+        }
         let client = self.client_ref()?;
         let mut buffers = items
             .iter()
@@ -731,6 +862,7 @@ impl PyMooncakeDistributedStore {
             .collect::<Vec<_>>();
         client
             .batch_get_into(&mut requests)
+            .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
             .map_err(store_error_to_py)
     }
 
@@ -741,7 +873,7 @@ impl PyMooncakeDistributedStore {
         buffer_ptrs: Vec<usize>,
         sizes: Vec<usize>,
         tenant: Option<&str>,
-    ) -> PyResult<Vec<usize>> {
+    ) -> PyResult<Vec<i64>> {
         if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
             return Err(PyValueError::new_err(
                 "keys, buffer_ptrs, and sizes must have the same length",
@@ -894,6 +1026,27 @@ impl PyMooncakeDistributedStore {
         Ok(0)
     }
 
+    #[pyo3(signature = (force = false))]
+    fn remove_all(&self, force: bool) -> PyResult<i64> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let (status, removed) = dummy.remove_all(force).map_err(store_error_to_py)?;
+            if status != 0 {
+                return Err(PyRuntimeError::new_err("dummy remove_all failed"));
+            }
+            return Ok(removed);
+        }
+        Err(PyRuntimeError::new_err(
+            "remove_all is not available for real-mode native store",
+        ))
+    }
+
+    fn health_check(&self) -> PyResult<i32> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            return Ok(dummy.health_check());
+        }
+        Ok(if self.client.is_some() { 0 } else { 1 })
+    }
+
     fn metrics_text(&self) -> String {
         render_prometheus_metrics()
     }
@@ -942,6 +1095,7 @@ fn metrics_server_address() -> Option<String> {
 #[pymodule]
 fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMooncakeDistributedStore>()?;
+    module.add_class::<PyMooncakeHostMemAllocator>()?;
     module.add_function(wrap_pyfunction!(init_tracing, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_text, module)?)?;
     module.add_function(wrap_pyfunction!(start_metrics_server, module)?)?;
@@ -961,6 +1115,23 @@ impl PyMooncakeDistributedStore {
         self.client
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("store is not set up"))
+    }
+}
+
+#[pymethods]
+impl PyMooncakeHostMemAllocator {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn alloc(&self, size: usize) -> PyResult<usize> {
+        shm::allocate_shared_region(size).map_err(store_error_to_py)
+    }
+
+    fn free(&self, ptr: usize) -> PyResult<i32> {
+        shm::free_shared_region(ptr).map_err(store_error_to_py)?;
+        Ok(0)
     }
 }
 
