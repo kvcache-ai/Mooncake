@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientStableId, MetadataBackend, ObjectKey,
@@ -11,6 +12,7 @@ use tracing::warn;
 use crate::control_plane::ControlPlaneClient;
 
 const ROUTE_SCOPE_LABEL: &str = "route_scope";
+const AUTHORITY_CANDIDATE_CACHE_TTL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RouteControlMode {
@@ -65,12 +67,29 @@ struct EmbeddedWrhRouteDirectory {
     namespace: String,
     local_stable_id: ClientStableId,
     control_plane: Arc<ControlPlaneClient>,
+    authority_cache: Mutex<RouteAuthorityCache>,
 }
 
 #[derive(Clone)]
 struct RouteAuthoritySelection {
     primary: Option<ClientLease>,
     secondary: Option<ClientLease>,
+}
+
+#[derive(Default)]
+struct RouteAuthorityCache {
+    refreshed_at: Option<Instant>,
+    leases: Vec<ClientLease>,
+}
+
+impl RouteAuthorityCache {
+    fn snapshot(&self) -> Option<Vec<ClientLease>> {
+        let refreshed_at = self.refreshed_at?;
+        if refreshed_at.elapsed() > AUTHORITY_CANDIDATE_CACHE_TTL {
+            return None;
+        }
+        Some(self.leases.clone())
+    }
 }
 
 impl EmbeddedWrhRouteDirectory {
@@ -88,20 +107,37 @@ impl EmbeddedWrhRouteDirectory {
             namespace,
             local_stable_id: lease.runtime.stable_id.clone(),
             control_plane,
+            authority_cache: Mutex::new(RouteAuthorityCache::default()),
         }
     }
 
-    fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
+    fn active_route_leases(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
+        if !force_refresh {
+            if let Some(snapshot) = self.authority_cache.lock().snapshot() {
+                return Ok(snapshot);
+            }
+        }
+        let leases = self
+            .metadata
+            .list_live_clients()?
+            .into_iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active && route_capable(lease))
+            .collect::<Vec<_>>();
+        let mut cache = self.authority_cache.lock();
+        cache.refreshed_at = Some(Instant::now());
+        cache.leases = leases.clone();
+        Ok(leases)
+    }
+
+    fn authority_candidates_once(
+        &self,
+        observer: &ClientLease,
+        force_refresh: bool,
+    ) -> Result<Vec<ClientLease>> {
         let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
         let mut candidates = BTreeMap::<String, ClientLease>::new();
-        for lease in self.metadata.list_live_clients()? {
-            if lease.state != ClientLifecycleState::Active {
-                continue;
-            }
+        for lease in self.active_route_leases(force_refresh)? {
             if !compatibility_matches(observer, &lease) {
-                continue;
-            }
-            if !route_capable(&lease) {
                 continue;
             }
             if route_scope.as_ref().is_some_and(|scope| {
@@ -122,6 +158,14 @@ impl EmbeddedWrhRouteDirectory {
             }
         }
         Ok(candidates.into_values().collect())
+    }
+
+    fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
+        let candidates = self.authority_candidates_once(observer, false)?;
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+        self.authority_candidates_once(observer, true)
     }
 
     fn select_authorities_from_candidates(
