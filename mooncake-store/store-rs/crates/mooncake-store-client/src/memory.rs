@@ -188,7 +188,9 @@ impl LocalMemoryState {
     ) -> Result<*mut c_void> {
         self.storage
             .get(segment)
-            .ok_or_else(|| StoreError::NotFound(format!("storage segment {} not found", segment.0)))?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("storage segment {} not found", segment.0))
+            })?
             .region
             .address_at(relative_offset)
     }
@@ -198,10 +200,9 @@ impl LocalMemoryState {
         segment: &SegmentName,
         next: SegmentLifecycleState,
     ) -> Result<()> {
-        let extent = self
-            .storage
-            .get_mut(segment)
-            .ok_or_else(|| StoreError::NotFound(format!("storage segment {} not found", segment.0)))?;
+        let extent = self.storage.get_mut(segment).ok_or_else(|| {
+            StoreError::NotFound(format!("storage segment {} not found", segment.0))
+        })?;
         extent.state = next;
         Ok(())
     }
@@ -224,10 +225,9 @@ impl LocalMemoryState {
         transport: &dyn StoreTransport,
         segment: &SegmentName,
     ) -> Result<()> {
-        let extent = self
-            .storage
-            .remove(segment)
-            .ok_or_else(|| StoreError::NotFound(format!("storage segment {} not found", segment.0)))?;
+        let extent = self.storage.remove(segment).ok_or_else(|| {
+            StoreError::NotFound(format!("storage segment {} not found", segment.0))
+        })?;
         extent.region.release(transport)
     }
 

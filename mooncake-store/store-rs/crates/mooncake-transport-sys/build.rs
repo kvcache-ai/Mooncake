@@ -7,10 +7,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_BUILD_DIR");
     println!("cargo:rerun-if-changed=../../third_party/Mooncake");
 
-    let upstream_dir =
-        env_path("MOONCAKE_UPSTREAM_DIR").unwrap_or_else(default_upstream_dir);
-    let build_dir = env_path("MOONCAKE_UPSTREAM_BUILD_DIR")
-        .unwrap_or_else(|| upstream_dir.join("build-rust"));
+    let upstream_dir = env_path("MOONCAKE_UPSTREAM_DIR").unwrap_or_else(default_upstream_dir);
+    let build_dir =
+        env_path("MOONCAKE_UPSTREAM_BUILD_DIR").unwrap_or_else(|| upstream_dir.join("build-rust"));
 
     ensure_upstream_native_artifacts(&upstream_dir, &build_dir);
 
