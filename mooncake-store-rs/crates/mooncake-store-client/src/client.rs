@@ -4562,6 +4562,10 @@ mod tests {
                 "embedded WRH route directory should keep batch routes off metadata backend"
             );
         }
+        assert!(
+            router.control_client.active_stream_sessions() >= 1,
+            "routed batch_put should establish a reusable control stream session"
+        );
 
         let first_values = reader
             .batch_get(&[
