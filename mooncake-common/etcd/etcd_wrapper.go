@@ -1072,4 +1072,40 @@ func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, usePrefix C.int, err
 	return 0
 }
 
+//export SnapshotStoreListKeysWrapper
+func SnapshotStoreListKeysWrapper(prefix *C.char, prefixSize C.int,
+	outKeys ***C.char, outKeySizes **C.int, outCount *C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+
+	resp, err := snapshotClient.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithKeysOnly(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	n := len(resp.Kvs)
+	*outCount = C.int(n)
+	if n == 0 {
+		return 0
+	}
+
+	keysArr := (*[1 << 30]*C.char)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	sizesArr := (*[1 << 30]C.int)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.int(0)))))
+	for i, kv := range resp.Kvs {
+		keysArr[i] = C.CString(string(kv.Key))
+		sizesArr[i] = C.int(len(kv.Key))
+	}
+
+	*outKeys = (**C.char)(unsafe.Pointer(keysArr))
+	*outKeySizes = (*C.int)(unsafe.Pointer(sizesArr))
+	return 0
+}
+
 func main() {}

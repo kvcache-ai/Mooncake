@@ -12,13 +12,14 @@
 #include "ha/standby_controller.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
-#include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 #include "ha/snapshot/snapshot_test_utils.h"
 
 namespace mooncake::test {
 
 DEFINE_string(redis_endpoint, "",
               "Redis endpoint for HotStandby snapshot bootstrap tests");
+DEFINE_string(etcd_endpoints, "",
+              "etcd endpoints for HotStandby snapshot bootstrap tests");
 
 namespace {
 
@@ -34,6 +35,9 @@ class HotStandbySnapshotBootstrapTest
         if (GetParam().requires_redis && FLAGS_redis_endpoint.empty()) {
             GTEST_SKIP() << "Redis endpoint is not configured";
         }
+        if (GetParam().requires_etcd && FLAGS_etcd_endpoints.empty()) {
+            GTEST_SKIP() << "etcd endpoint is not configured";
+        }
 
         cluster_id_ =
             "hot-standby-bootstrap-test-" + UuidToString(generate_uuid());
@@ -41,8 +45,15 @@ class HotStandbySnapshotBootstrapTest
         local_path_env_ =
             std::make_unique<ScopedEnvVar>(kSnapshotLocalPathEnv, temp_dir_);
 
-        object_store_ =
-            std::make_unique<LocalFileSnapshotObjectStore>(temp_dir_);
+        object_store_ = CreateObjectStoreForTest(
+            GetParam(), temp_dir_, FLAGS_etcd_endpoints);
+        ASSERT_NE(object_store_, nullptr);
+
+        if (GetParam().requires_etcd) {
+            (void)object_store_->DeleteObjectsWithPrefix(
+                "mooncake_master_snapshot/");
+        }
+
         catalog_store_ = CreateCatalogStoreForTest(
             GetParam(), object_store_.get(), cluster_id_, FLAGS_redis_endpoint);
         ASSERT_NE(catalog_store_, nullptr);
@@ -53,6 +64,10 @@ class HotStandbySnapshotBootstrapTest
     void TearDown() override {
         if (snapshot_published_ && catalog_store_ != nullptr) {
             (void)catalog_store_->Delete(descriptor_.snapshot_id);
+        }
+        if (GetParam().requires_etcd && object_store_) {
+            (void)object_store_->DeleteObjectsWithPrefix(
+                "mooncake_master_snapshot/");
         }
         catalog_store_.reset();
         object_store_.reset();
@@ -74,7 +89,8 @@ class HotStandbySnapshotBootstrapTest
     tl::expected<std::unique_ptr<SnapshotProvider>, ErrorCode> CreateProvider()
         const {
         return CreateCatalogBackedSnapshotProvider(MakeSnapshotProviderConfig(
-            GetParam(), cluster_id_, FLAGS_redis_endpoint));
+            GetParam(), cluster_id_, FLAGS_redis_endpoint,
+            FLAGS_etcd_endpoints));
     }
 
     void PublishSnapshot() {
@@ -89,7 +105,7 @@ class HotStandbySnapshotBootstrapTest
     bool snapshot_published_{false};
     ha::SnapshotDescriptor descriptor_;
     std::unique_ptr<ScopedEnvVar> local_path_env_;
-    std::unique_ptr<LocalFileSnapshotObjectStore> object_store_;
+    std::unique_ptr<SnapshotObjectStore> object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> catalog_store_;
 };
 

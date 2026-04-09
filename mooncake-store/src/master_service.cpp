@@ -27,6 +27,8 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils.h"
+#include "ha/snapshot/snapshot_socket_util.h"
+#include <sys/socket.h>
 
 namespace mooncake {
 
@@ -103,6 +105,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       snapshot_retention_count_(config.snapshot_retention_count),
+      snapshot_object_store_type_(
+          ParseSnapshotObjectStoreType(config.snapshot_object_store_type)),
+      etcd_endpoints_(config.etcd_endpoints),
       snapshot_catalog_store_type_(config.snapshot_catalog_store_type),
       snapshot_catalog_store_connstring_(
           config.snapshot_catalog_store_connstring),
@@ -114,10 +119,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_cxl_(config.enable_cxl) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
-            auto object_store_type =
-                ParseSnapshotObjectStoreType(config.snapshot_object_store_type);
-            snapshot_object_store_ =
-                SnapshotObjectStore::Create(object_store_type);
+            snapshot_object_store_ = SnapshotObjectStore::Create(
+                snapshot_object_store_type_, etcd_endpoints_);
             snapshot_catalog_store_ = CreateSnapshotCatalogStore();
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot stores: " << e.what();
@@ -2418,6 +2421,24 @@ void MasterService::SnapshotThreadFunc() {
             continue;
         }
 
+        auto snapshot_start_time = std::chrono::steady_clock::now();
+
+        // ETCD backend: create socketpair for child→parent data transfer
+        // (child cannot call cgo after fork, so parent uploads instead)
+        bool use_socketpair =
+            (snapshot_object_store_type_ == SnapshotObjectStoreType::ETCD);
+        int sv[2] = {-1, -1};
+        if (use_socketpair) {
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1) {
+                LOG(ERROR)
+                    << "[Snapshot] Failed to create socketpair: "
+                    << strerror(errno) << ", snapshot_id=" << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
+        }
+
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
@@ -2432,37 +2453,105 @@ void MasterService::SnapshotThreadFunc() {
                        << strerror(errno) << ", snapshot_id=" << snapshot_id;
             close(log_pipe[0]);
             close(log_pipe[1]);
+            if (use_socketpair) {
+                close(sv[0]);
+                close(sv[1]);
+            }
         } else if (pid == 0) {
             // Child process
             // Close read end, set write end for logging
             close(log_pipe[0]);
             g_snapshot_log_pipe_fd = log_pipe[1];
+            if (use_socketpair) close(sv[0]);  // close parent end
 
-            // Save current state using the configured persistence mechanism
-            SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
-                          snapshot_id);
-            auto result = PersistState(descriptor.value());
-            if (!result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] Child process failed to persist state, "
-                    "snapshot_id={},code={},msg={}",
-                    snapshot_id, toString(result.error().code),
-                    result.error().message);
+            if (use_socketpair) {
+                // ETCD: serialize and write to socketpair (no cgo calls)
+                SNAP_LOG_INFO(
+                    "[Snapshot] Child process started (ETCD mode), "
+                    "snapshot_id={}",
+                    snapshot_id);
+                auto result =
+                    PersistStateViaChildSerialize(sv[1], descriptor.value());
+                close(sv[1]);
+                if (!result) {
+                    SNAP_LOG_ERROR(
+                        "[Snapshot] Child serialize failed, "
+                        "snapshot_id={},code={},msg={}",
+                        snapshot_id, toString(result.error().code),
+                        result.error().message);
+                    close(log_pipe[1]);
+                    _exit(1);
+                }
+                SNAP_LOG_INFO(
+                    "[Snapshot] Child serialize completed, snapshot_id={}",
+                    snapshot_id);
                 close(log_pipe[1]);
-                _exit(1);  // Exit child process with error
+                _exit(0);
+            } else {
+                // LOCAL/S3: serialize + upload directly (unchanged)
+                SNAP_LOG_INFO(
+                    "[Snapshot] Child process started, snapshot_id={}",
+                    snapshot_id);
+                auto result = PersistState(descriptor.value());
+                if (!result) {
+                    SNAP_LOG_ERROR(
+                        "[Snapshot] Child process failed to persist state, "
+                        "snapshot_id={},code={},msg={}",
+                        snapshot_id, toString(result.error().code),
+                        result.error().message);
+                    close(log_pipe[1]);
+                    _exit(1);
+                }
+                SNAP_LOG_INFO(
+                    "[Snapshot] Child process successfully persisted state, "
+                    "snapshot_id={}",
+                    snapshot_id);
+                close(log_pipe[1]);
+                _exit(0);
             }
-            SNAP_LOG_INFO(
-                "[Snapshot] Child process successfully persisted state, "
-                "snapshot_id={}",
-                snapshot_id);
-
-            close(log_pipe[1]);
-            _exit(0);  // Exit child process successfully
         } else {
             // Parent process
-            // Close write end, pass read end to wait function
             close(log_pipe[1]);
-            WaitForSnapshotChild(pid, snapshot_id, log_pipe[0]);
+            if (use_socketpair) {
+                close(sv[1]);  // close child end
+                // ETCD: parent reads from socketpair and uploads
+                auto result =
+                    PersistStateViaParentUpload(sv[0], descriptor.value());
+                close(sv[0]);
+
+                // Reap child process
+                int status = 0;
+                waitpid(pid, &status, 0);
+
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - snapshot_start_time)
+                        .count();
+                MasterMetricManager::instance().set_snapshot_duration_ms(
+                    elapsed);
+
+                if (!result) {
+                    LOG(ERROR)
+                        << "[Snapshot] Parent upload failed, snapshot_id="
+                        << snapshot_id
+                        << ", code=" << toString(result.error().code)
+                        << ", msg=" << result.error().message;
+                    MasterMetricManager::instance().inc_snapshot_fail();
+                } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                    LOG(INFO) << "[Snapshot] Snapshot completed successfully, "
+                                 "snapshot_id="
+                              << snapshot_id;
+                    MasterMetricManager::instance().inc_snapshot_success();
+                } else {
+                    LOG(ERROR)
+                        << "[Snapshot] Child process failed, snapshot_id="
+                        << snapshot_id << ", exit_status=" << WEXITSTATUS(status);
+                    MasterMetricManager::instance().inc_snapshot_fail();
+                }
+            } else {
+                // LOCAL/S3: wait for child to finish (unchanged)
+                WaitForSnapshotChild(pid, snapshot_id, log_pipe[0]);
+            }
             close(log_pipe[0]);
         }
     }
@@ -5002,6 +5091,237 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
         service_->discarded_replicas_ = std::move(temp_list);
     }
 
+    return {};
+}
+
+// ============================================================================
+// ETCD snapshot: socketpair-based child serialize + parent upload
+// ============================================================================
+
+tl::expected<void, SerializationError>
+MasterService::PersistStateViaChildSerialize(
+    int socket_fd, const ha::SnapshotDescriptor& descriptor) {
+    using namespace snapshot_socket;
+
+    const std::string& snapshot_id = descriptor.snapshot_id;
+    const std::string& path_prefix = descriptor.object_prefix;
+
+    // Build manifest content
+    std::string manifest_content =
+        fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
+                    SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
+
+    // Define components to serialize one at a time
+    struct Component {
+        std::string key;
+        std::function<tl::expected<std::vector<uint8_t>, SerializationError>()>
+            serialize;
+    };
+
+    std::vector<Component> components = {
+        {path_prefix + SNAPSHOT_METADATA_FILE,
+         [this]() { return MetadataSerializer(this).Serialize(); }},
+        {path_prefix + SNAPSHOT_SEGMENTS_FILE,
+         [this]() { return SegmentSerializer(&segment_manager_).Serialize(); }},
+        {path_prefix + SNAPSHOT_TASK_MANAGER_FILE,
+         [this]() {
+             return TaskManagerSerializer(&task_manager_).Serialize();
+         }},
+        {path_prefix + SNAPSHOT_MANIFEST_FILE,
+         [&]() -> tl::expected<std::vector<uint8_t>, SerializationError> {
+             return std::vector<uint8_t>(manifest_content.begin(),
+                                         manifest_content.end());
+         }},
+    };
+
+    for (auto& comp : components) {
+        // Serialize
+        SNAP_LOG_INFO("[Snapshot] Serializing {}, snapshot_id={}", comp.key,
+                      snapshot_id);
+        auto data = comp.serialize();
+        if (!data) {
+            SNAP_LOG_ERROR(
+                "[Snapshot] Serialization failed for {}, snapshot_id={}, "
+                "code={}, msg={}",
+                comp.key, snapshot_id, toString(data.error().code),
+                data.error().message);
+            // Send end marker so parent knows we're done
+            uint32_t zero = 0;
+            WriteExact(socket_fd, &zero, sizeof(zero));
+            return tl::make_unexpected(data.error());
+        }
+
+        // Write: [key_len:4][key][data_len:8][data]
+        uint32_t key_len = static_cast<uint32_t>(comp.key.size());
+        uint64_t data_len = data->size();
+        if (!WriteExact(socket_fd, &key_len, sizeof(key_len)) ||
+            !WriteExact(socket_fd, comp.key.data(), key_len) ||
+            !WriteExact(socket_fd, &data_len, sizeof(data_len)) ||
+            (data_len > 0 &&
+             !WriteExact(socket_fd, data->data(), data_len))) {
+            SNAP_LOG_ERROR(
+                "[Snapshot] Failed to write to socketpair, key={}, "
+                "snapshot_id={}",
+                comp.key, snapshot_id);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "socketpair write failed"));
+        }
+
+        SNAP_LOG_INFO("[Snapshot] Sent to parent: key={}, size={}", comp.key,
+                      data_len);
+
+        // Free buffer before waiting for ack
+        data->clear();
+        data->shrink_to_fit();
+
+        // Wait for parent ack
+        uint8_t ack = 0;
+        if (!ReadExact(socket_fd, &ack, sizeof(ack))) {
+            SNAP_LOG_ERROR(
+                "[Snapshot] Failed to read ack from parent, key={}, "
+                "snapshot_id={}",
+                comp.key, snapshot_id);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "socketpair ack read failed"));
+        }
+        if (ack != 0) {
+            SNAP_LOG_ERROR(
+                "[Snapshot] Parent upload failed (ack={}), key={}, "
+                "snapshot_id={}",
+                ack, comp.key, snapshot_id);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "parent upload failed"));
+        }
+    }
+
+    // Send end marker: key_len = 0
+    uint32_t zero = 0;
+    WriteExact(socket_fd, &zero, sizeof(zero));
+
+    SNAP_LOG_INFO("[Snapshot] Child serialize completed, snapshot_id={}",
+                  snapshot_id);
+    return {};
+}
+
+tl::expected<void, SerializationError>
+MasterService::PersistStateViaParentUpload(
+    int socket_fd, const ha::SnapshotDescriptor& descriptor) {
+    using namespace snapshot_socket;
+
+    const std::string& snapshot_id = descriptor.snapshot_id;
+    bool all_success = true;
+    std::string error_msg;
+
+    LOG(INFO) << "[Snapshot] Parent upload started (ETCD mode), snapshot_id="
+              << snapshot_id << ", backend="
+              << snapshot_object_store_->GetConnectionInfo();
+
+    while (true) {
+        // Read key_len
+        uint32_t key_len = 0;
+        if (!ReadExact(socket_fd, &key_len, sizeof(key_len))) {
+            // Child closed connection or crashed
+            break;
+        }
+        if (key_len == 0) {
+            // End marker
+            break;
+        }
+
+        // Read key
+        std::string key(key_len, '\0');
+        if (!ReadExact(socket_fd, key.data(), key_len)) {
+            error_msg = "failed to read key from socketpair";
+            all_success = false;
+            break;
+        }
+
+        // Read data_len + data
+        uint64_t data_len = 0;
+        if (!ReadExact(socket_fd, &data_len, sizeof(data_len))) {
+            error_msg = "failed to read data_len from socketpair";
+            all_success = false;
+            break;
+        }
+        std::vector<uint8_t> data(data_len);
+        if (data_len > 0 && !ReadExact(socket_fd, data.data(), data_len)) {
+            error_msg = "failed to read data from socketpair";
+            all_success = false;
+            break;
+        }
+
+        // Upload to etcd via object store (cgo, safe in parent)
+        LOG(INFO) << "[Snapshot] Uploading key=" << key
+                  << ", size=" << data_len << ", snapshot_id=" << snapshot_id;
+        auto upload_result = snapshot_object_store_->UploadBuffer(key, data);
+
+        uint8_t ack = 0;
+        if (!upload_result) {
+            LOG(ERROR) << "[Snapshot] Upload failed: key=" << key
+                       << ", error=" << upload_result.error()
+                       << ", snapshot_id=" << snapshot_id;
+
+            // backup_dir fallback (same behavior as local/S3)
+            if (use_snapshot_backup_dir_) {
+                // Extract local filename from key (last path component)
+                auto slash_pos = key.rfind('/');
+                std::string local_filename =
+                    (slash_pos != std::string::npos)
+                        ? key.substr(slash_pos + 1)
+                        : key;
+                auto save_path = fs::path(snapshot_backup_dir_) /
+                                 SNAPSHOT_BACKUP_SAVE_DIR / local_filename;
+                auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
+                if (!save_result) {
+                    LOG(ERROR) << "[Snapshot] Save to backup_dir failed: "
+                               << save_path;
+                }
+                error_msg.append(upload_result.error() + "\n");
+                all_success = false;
+                ack = 1;
+            } else {
+                // fail-fast: notify child and stop
+                ack = 1;
+                WriteExact(socket_fd, &ack, sizeof(ack));
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL, upload_result.error()));
+            }
+        }
+
+        // Send ack to child
+        if (!WriteExact(socket_fd, &ack, sizeof(ack))) {
+            error_msg = "failed to write ack to socketpair";
+            all_success = false;
+            break;
+        }
+
+        LOG(INFO) << "[Snapshot] Upload completed: key=" << key
+                  << ", snapshot_id=" << snapshot_id;
+    }
+
+    if (!all_success) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::PERSISTENT_FAIL,
+                               error_msg.empty() ? "upload failed" : error_msg));
+    }
+
+    // Publish to catalog store and cleanup (parent process, cgo safe)
+    auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+    if (snapshot_catalog_store) {
+        auto publish_result = snapshot_catalog_store->Publish(descriptor);
+        if (publish_result != ErrorCode::OK) {
+            LOG(ERROR) << "[Snapshot] Catalog publish failed, snapshot_id="
+                       << snapshot_id
+                       << ", code=" << toString(publish_result);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL, "catalog publish failed"));
+        }
+    }
+
+    CleanupOldSnapshot(snapshot_retention_count_, snapshot_id);
+
+    LOG(INFO) << "[Snapshot] Parent upload completed, snapshot_id="
+              << snapshot_id;
     return {};
 }
 

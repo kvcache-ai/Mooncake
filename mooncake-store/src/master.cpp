@@ -173,7 +173,7 @@ DEFINE_uint32(snapshot_retention_count,
               "automatically deleted)");
 DEFINE_string(snapshot_object_store_type, "",
               "Snapshot object store type: 'local' for local filesystem, "
-              "'s3' for S3 storage");
+              "'s3' for S3 storage, 'etcd' for ETCD storage");
 DEFINE_string(snapshot_payload_store_type, "",
               "Deprecated alias of --snapshot_object_store_type");
 DEFINE_string(snapshot_payload_backend_type, "",

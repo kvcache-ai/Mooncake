@@ -16,6 +16,10 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
+#ifdef STORE_USE_ETCD
+#include "ha/snapshot/object/backends/etcd/etcd_snapshot_object_store.h"
+#endif
 #include "master_config.h"
 #include "replica.h"
 #include "segment.h"
@@ -41,7 +45,9 @@ constexpr int64_t kDefaultTestCreatedAtMs = 1700000000000LL;
 struct CatalogBackendParam {
     std::string name;
     std::string catalog_store_type;
+    std::string object_store_type{"local"};
     bool requires_redis{false};
+    bool requires_etcd{false};
 };
 
 class ScopedEnvVar {
@@ -83,6 +89,14 @@ inline std::vector<CatalogBackendParam> BuildCatalogBackendParams() {
         .name = "Redis",
         .catalog_store_type = "redis",
         .requires_redis = true,
+    });
+#endif
+#ifdef STORE_USE_ETCD
+    params.push_back(CatalogBackendParam{
+        .name = "EtcdEmbedded",
+        .catalog_store_type = "embedded",
+        .object_store_type = "etcd",
+        .requires_etcd = true,
     });
 #endif
     return params;
@@ -184,16 +198,37 @@ inline ha::SnapshotDescriptor MakeTestSnapshotDescriptor(
 
 inline MasterServiceSupervisorConfig MakeSnapshotProviderConfig(
     const CatalogBackendParam& param, const std::string& cluster_id,
-    const std::string& redis_endpoint) {
+    const std::string& redis_endpoint,
+    const std::string& etcd_endpoints = "") {
     MasterServiceSupervisorConfig config;
     config.cluster_id = cluster_id;
-    config.snapshot_object_store_type = "local";
+    config.snapshot_object_store_type = param.object_store_type;
     config.snapshot_catalog_store_type = param.catalog_store_type;
     if (param.requires_redis) {
         config.snapshot_catalog_store_connstring = redis_endpoint;
         config.ha_backend_connstring = redis_endpoint;
     }
+    if (param.requires_etcd && !etcd_endpoints.empty()) {
+        config.etcd_endpoints = etcd_endpoints;
+        config.ha_backend_connstring = etcd_endpoints;
+    }
     return config;
+}
+
+/// Create a SnapshotObjectStore matching the param's object_store_type.
+/// For "local", uses @p local_dir as root.  For "etcd", uses @p etcd_endpoints.
+inline std::unique_ptr<SnapshotObjectStore> CreateObjectStoreForTest(
+    const CatalogBackendParam& param, const std::string& local_dir,
+    const std::string& etcd_endpoints = "") {
+    if (param.object_store_type == "etcd") {
+#ifdef STORE_USE_ETCD
+        return std::make_unique<EtcdSnapshotObjectStore>(etcd_endpoints);
+#else
+        (void)etcd_endpoints;
+        return nullptr;
+#endif
+    }
+    return std::make_unique<LocalFileSnapshotObjectStore>(local_dir);
 }
 
 inline std::unique_ptr<ha::SnapshotCatalogStore> CreateCatalogStoreForTest(

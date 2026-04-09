@@ -290,6 +290,7 @@ class WrappedMasterServiceConfig {
     std::string snapshot_object_store_type;
     std::string snapshot_catalog_store_type;
     std::string snapshot_catalog_store_connstring;
+    std::string etcd_endpoints = "0.0.0.0:2379";
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -369,6 +370,7 @@ class WrappedMasterServiceConfig {
         snapshot_catalog_store_type = config.snapshot_catalog_store_type;
         snapshot_catalog_store_connstring =
             config.snapshot_catalog_store_connstring;
+        etcd_endpoints = config.etcd_endpoints;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -424,6 +426,7 @@ class WrappedMasterServiceConfig {
         snapshot_catalog_store_type = config.snapshot_catalog_store_type;
         snapshot_catalog_store_connstring =
             config.snapshot_catalog_store_connstring;
+        etcd_endpoints = config.etcd_endpoints;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -476,6 +479,7 @@ class MasterServiceConfigBuilder {
     std::string snapshot_object_store_type_;
     std::string snapshot_catalog_store_type_;
     std::string snapshot_catalog_store_connstring_;
+    std::string etcd_endpoints_ = "0.0.0.0:2379";
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -661,6 +665,12 @@ class MasterServiceConfigBuilder {
         return set_snapshot_catalog_store_connstring(connstring);
     }
 
+    MasterServiceConfigBuilder& set_etcd_endpoints(
+        const std::string& endpoints) {
+        etcd_endpoints_ = endpoints;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
         uint32_t max_total_finished_tasks) {
         max_total_finished_tasks_ = max_total_finished_tasks;
@@ -759,6 +769,7 @@ class MasterServiceConfig {
     std::string snapshot_object_store_type;
     std::string snapshot_catalog_store_type;
     std::string snapshot_catalog_store_connstring;
+    std::string etcd_endpoints = "0.0.0.0:2379";
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -810,6 +821,7 @@ class MasterServiceConfig {
         snapshot_catalog_store_type = config.snapshot_catalog_store_type;
         snapshot_catalog_store_connstring =
             config.snapshot_catalog_store_connstring;
+        etcd_endpoints = config.etcd_endpoints;
 
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
@@ -864,6 +876,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
     config.snapshot_catalog_store_connstring =
         snapshot_catalog_store_connstring_;
+    config.etcd_endpoints = etcd_endpoints_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =

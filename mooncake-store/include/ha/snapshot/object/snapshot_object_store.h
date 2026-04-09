@@ -12,12 +12,28 @@ namespace mooncake {
 // Snapshot object store type enumeration
 enum class SnapshotObjectStoreType {
     LOCAL_FILE = 0,  // Local file system
-    S3 = 1           // S3 storage
+    S3 = 1,          // S3 storage
+    ETCD = 2         // Etcd storage
 };
 
 // Convert string to SnapshotObjectStoreType
 inline SnapshotObjectStoreType ParseSnapshotObjectStoreType(
     const std::string& type_str) {
+    if (type_str.empty() || type_str == "local" || type_str == "LOCAL") {
+        return SnapshotObjectStoreType::LOCAL_FILE;
+    }
+#ifdef STORE_USE_ETCD
+    if (type_str == "etcd" || type_str == "ETCD") {
+        return SnapshotObjectStoreType::ETCD;
+    }
+#else
+    if (type_str == "etcd" || type_str == "ETCD") {
+        throw std::invalid_argument(
+            "ETCD snapshot object store requested but STORE_USE_ETCD is "
+            "not enabled. Please rebuild with STORE_USE_ETCD or use the "
+            "'local' object store.");
+    }
+#endif
 #ifdef HAVE_AWS_SDK
     if (type_str == "s3" || type_str == "S3") {
         return SnapshotObjectStoreType::S3;
@@ -30,9 +46,6 @@ inline SnapshotObjectStoreType ParseSnapshotObjectStoreType(
             "'local' object store.");
     }
 #endif
-    if (type_str == "local" || type_str == "LOCAL") {
-        return SnapshotObjectStoreType::LOCAL_FILE;
-    }
 
     // Unknown object store type - fail fast.
     throw std::invalid_argument("Unknown snapshot object store type: '" +
@@ -43,6 +56,8 @@ inline SnapshotObjectStoreType ParseSnapshotObjectStoreType(
 inline std::string SnapshotObjectStoreTypeToString(
     SnapshotObjectStoreType type) {
     switch (type) {
+        case SnapshotObjectStoreType::ETCD:
+            return "etcd";
         case SnapshotObjectStoreType::S3:
             return "s3";
         case SnapshotObjectStoreType::LOCAL_FILE:
@@ -137,7 +152,8 @@ class SnapshotObjectStore {
      * @return Smart pointer to object store instance
      */
     static std::unique_ptr<SnapshotObjectStore> Create(
-        SnapshotObjectStoreType type);
+        SnapshotObjectStoreType type,
+        const std::string& etcd_endpoints = "");
 };
 
 }  // namespace mooncake
