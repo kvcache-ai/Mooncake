@@ -63,7 +63,7 @@ class ReplicateConfig:
     replica_num: int = 1
     preferred_segment: str = ""
     preferred_segments: list[str] = field(default_factory=list)
-    with_soft_pin: bool = True
+    with_soft_pin: bool = False
     prefer_alloc_in_same_node: bool = False
 
     def copy(self) -> "ReplicateConfig":
@@ -125,8 +125,7 @@ class MooncakeDistributedStore:
         return result
 
     def put(self, key: str, value, *, tenant: str | None = None, config=None):
-        _ensure_supported_replicate_config(config)
-        return self._native.put(key, value, tenant=tenant)
+        return self._native.put(key, value, tenant=tenant, **_replication_kwargs(config))
 
     def put_from(
         self,
@@ -137,8 +136,13 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
         config=None,
     ):
-        _ensure_supported_replicate_config(config)
-        return self._native.put_from(key, buffer_ptr, size, tenant=tenant)
+        return self._native.put_from(
+            key,
+            buffer_ptr,
+            size,
+            tenant=tenant,
+            **_replication_kwargs(config),
+        )
 
     def batch_put(
         self,
@@ -149,9 +153,12 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
         config=None,
     ):
-        _ensure_supported_replicate_config(config)
         normalized = _normalize_key_value_items(items, keys, values)
-        return self._native.batch_put(normalized, tenant=tenant)
+        return self._native.batch_put(
+            normalized,
+            tenant=tenant,
+            **_replication_kwargs(config),
+        )
 
     def put_batch(
         self,
@@ -164,13 +171,20 @@ class MooncakeDistributedStore:
         return self.batch_put(keys=keys, values=values, tenant=tenant, config=config)
 
     def batch_put_from(self, *args, tenant: str | None = None, config=None):
-        _ensure_supported_replicate_config(config)
         if len(args) == 1:
-            return self._native.batch_put_from(args[0], tenant=tenant)
+            return self._native.batch_put_from(
+                args[0],
+                tenant=tenant,
+                **_replication_kwargs(config),
+            )
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
             return self._native.batch_put_from_raw(
-                keys, buffer_ptrs, sizes, tenant=tenant
+                keys,
+                buffer_ptrs,
+                sizes,
+                tenant=tenant,
+                **_replication_kwargs(config),
             )
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
@@ -182,19 +196,30 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
         config=None,
     ):
-        _ensure_supported_replicate_config(config)
         if len(args) == 1:
             items = list(args[0])
             if _items_use_bytes_payloads(items):
-                return self._native.batch_put_from_multi_buffers(items, tenant=tenant)
+                return self._native.batch_put_from_multi_buffers(
+                    items,
+                    tenant=tenant,
+                    **_replication_kwargs(config),
+                )
             keys, all_buffer_ptrs, all_sizes = _normalize_descriptor_items(items)
             return self._native.batch_put_from_multi_buffers_raw(
-                keys, all_buffer_ptrs, all_sizes, tenant=tenant
+                keys,
+                all_buffer_ptrs,
+                all_sizes,
+                tenant=tenant,
+                **_replication_kwargs(config),
             )
         if len(args) == 3:
             keys, all_buffer_ptrs, all_sizes = _normalize_raw_multi_buffer_args(*args)
             return self._native.batch_put_from_multi_buffers_raw(
-                keys, all_buffer_ptrs, all_sizes, tenant=tenant
+                keys,
+                all_buffer_ptrs,
+                all_sizes,
+                tenant=tenant,
+                **_replication_kwargs(config),
             )
         raise TypeError(
             "batch_put_from_multi_buffers expects items or (keys, all_buffer_ptrs, all_sizes)"
@@ -240,6 +265,18 @@ class MooncakeDistributedStore:
             tenant=tenant,
         )
 
+    def remove(self, key: str, *, force: bool = False, tenant: str | None = None):
+        return self._native.remove(key, force=force, tenant=tenant)
+
+    def batch_remove(
+        self,
+        keys: Sequence[str],
+        *,
+        force: bool = False,
+        tenant: str | None = None,
+    ):
+        return self._native.batch_remove(list(keys), force=force, tenant=tenant)
+
     def start_metrics_server(self, bind_addr: str = "127.0.0.1:0") -> str:
         return self._native.start_metrics_server(bind_addr)
 
@@ -259,23 +296,21 @@ class MooncakeDistributedStore:
         return self._registered_buffers[int(buffer_ptr)]
 
 
-def _ensure_supported_replicate_config(config) -> None:
+def _replication_kwargs(config) -> dict:
     if config is None:
-        return
-    unsupported = []
-    if getattr(config, "replica_num", 1) != 1:
-        unsupported.append("replica_num")
-    if getattr(config, "preferred_segment", "") not in ("", None):
-        unsupported.append("preferred_segment")
-    if getattr(config, "preferred_segments", []) not in ([], None):
-        unsupported.append("preferred_segments")
-    if getattr(config, "with_soft_pin", True) is not True:
-        unsupported.append("with_soft_pin")
-    if unsupported:
-        fields = ", ".join(sorted(unsupported))
-        raise NotImplementedError(
-            f"store-rs compatibility layer does not yet support per-request replicate config fields: {fields}"
-        )
+        return {}
+    preferred_segments = list(getattr(config, "preferred_segments", []) or [])
+    preferred_segment = getattr(config, "preferred_segment", "")
+    if preferred_segment not in ("", None) and preferred_segment not in preferred_segments:
+        preferred_segments.insert(0, preferred_segment)
+    return {
+        "replica_count": int(getattr(config, "replica_num", 1)),
+        "preferred_segments": preferred_segments or None,
+        "prefer_alloc_in_same_node": bool(
+            getattr(config, "prefer_alloc_in_same_node", False)
+        ),
+        "with_soft_pin": bool(getattr(config, "with_soft_pin", False)),
+    }
 
 
 def _normalize_key_value_items(

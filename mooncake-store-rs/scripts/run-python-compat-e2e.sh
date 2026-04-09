@@ -43,6 +43,7 @@ from mooncake.store import (
 )
 
 stamp = int(time.time() * 1000)
+keyspace = f"mc/store-rs/py-compat/{stamp}"
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
@@ -53,7 +54,21 @@ assert store.setup(
     "",
     "",
     stable_id=f"py-compat-{stamp}",
-    keyspace=f"mc/store-rs/py-compat/{stamp}",
+    keyspace=keyspace,
+    labels={"pool": "pool-a", "storage": "true"},
+) == 0
+store_peer = MooncakeDistributedStore()
+assert store_peer.setup(
+    "127.0.0.1",
+    "redis://127.0.0.1:6380/0",
+    4 * 1024 * 1024,
+    1 * 1024 * 1024,
+    "tcp",
+    "",
+    "",
+    stable_id=f"py-compat-peer-{stamp}",
+    keyspace=keyspace,
+    labels={"pool": "pool-a", "storage": "true"},
 ) == 0
 
 assert store.put("py-key", b"hello-python") == 0
@@ -64,12 +79,33 @@ assert store.batch_is_exist(["py-key", "missing-key"]) == [1, 0]
 assert store.get_hostname().startswith("127.0.0.1:")
 
 default_config = ReplicateConfig()
+assert default_config.with_soft_pin is False
 assert store.put_batch(
     ["put-batch-a", "put-batch-b"],
     [b"alpha", b"beta"],
     config=default_config,
 ) == 0
 assert store.batch_get(["put-batch-a", "put-batch-b"]) == [b"alpha", b"beta"]
+
+replicated_config = ReplicateConfig(replica_num=2)
+assert store.put("replicated-key", b"replicated", config=replicated_config) == 0
+replicated_route = store.query_route("replicated-key")
+assert replicated_route is not None
+assert len(replicated_route["replicas"]) == 2
+assert len({replica["owner"] for replica in replicated_route["replicas"]}) == 2
+
+preferred_segment = store_peer.list_segments()[0]["segment_name"]
+preferred_config = ReplicateConfig(
+    replica_num=1,
+    preferred_segment=preferred_segment,
+)
+assert store.batch_put(
+    [("policy-batch-a", b"left"), ("policy-batch-b", b"right")],
+    config=preferred_config,
+) == 0
+preferred_route = store.query_route("policy-batch-a")
+assert preferred_route is not None
+assert preferred_route["replicas"][0]["segment_name"] == preferred_segment
 
 send_buf = ctypes.create_string_buffer(b"zero-copy-payload")
 assert store.register_buffer(ctypes.addressof(send_buf), len(send_buf.raw)) == 0
@@ -175,6 +211,13 @@ assert len(segments) >= 1
 route = store.query_route("py-key")
 assert route is not None and route["key"] == "default::py-key"
 
+assert store.remove("py-key") == 0
+assert store.is_exist("py-key") is False
+assert store.get_size("py-key") == 0
+assert store.query_route("py-key") is None
+assert store.batch_remove(["put-batch-a", "put-batch-b"]) == [0, 0]
+assert store.batch_is_exist(["put-batch-a", "put-batch-b"]) == [0, 0]
+
 metrics = metrics_text()
 assert "mooncake_store_client_operation_total" in metrics
 assert 'operation="put",status="ok"' in metrics
@@ -190,6 +233,7 @@ store.stop_metrics_server()
 assert metrics_server_address() is None
 stop_metrics_server()
 
+store_peer.close()
 store.close()
 print("python compat ok")
 PY

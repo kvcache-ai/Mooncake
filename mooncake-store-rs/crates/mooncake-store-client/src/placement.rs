@@ -57,6 +57,14 @@ impl PlacementPlanner {
         )
     }
 
+    pub fn ranked_candidates(
+        &self,
+        observer: &StoreClient,
+        object: &ObjectRef<'_>,
+    ) -> Result<Vec<ClientRuntimeId>> {
+        self.ranked_candidates_from_lease(observer.lease(), observer.default_tenant(), object)
+    }
+
     pub fn plan_from_lease(
         &self,
         observer: &ClientLease,
@@ -80,27 +88,25 @@ impl PlacementPlanner {
         let mut plans = Vec::with_capacity(objects.len());
         for object in objects {
             let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let mut scored = candidates
-                .iter()
-                .map(|candidate| {
-                    (
-                        rendezvous_score(&tenant, object.key, &candidate.runtime),
-                        candidate.runtime.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+            let scored = self.rank_candidates(&tenant, object.key, &candidates);
             plans.push(PlacementChoice {
                 tenant,
                 key: object.key.to_string(),
-                owners: scored
-                    .into_iter()
-                    .take(replica_count)
-                    .map(|(_, runtime)| runtime)
-                    .collect(),
+                owners: scored.into_iter().take(replica_count).collect(),
             });
         }
         Ok(plans)
+    }
+
+    pub fn ranked_candidates_from_lease(
+        &self,
+        observer: &ClientLease,
+        default_tenant: &str,
+        object: &ObjectRef<'_>,
+    ) -> Result<Vec<ClientRuntimeId>> {
+        let tenant = object.tenant.unwrap_or(default_tenant);
+        let candidates = self.candidates(observer)?;
+        Ok(self.rank_candidates(tenant, object.key, &candidates))
     }
 
     fn candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
@@ -136,6 +142,25 @@ impl PlacementPlanner {
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.runtime.cmp(&right.runtime));
         Ok(candidates)
+    }
+
+    fn rank_candidates(
+        &self,
+        tenant: &str,
+        key: &str,
+        candidates: &[ClientLease],
+    ) -> Vec<ClientRuntimeId> {
+        let mut scored = candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    rendezvous_score(tenant, key, &candidate.runtime),
+                    candidate.runtime.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        scored.into_iter().map(|(_, runtime)| runtime).collect()
     }
 }
 
