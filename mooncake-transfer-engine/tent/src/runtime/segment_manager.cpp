@@ -28,6 +28,8 @@ namespace tent {
 SegmentManager::SegmentManager(std::unique_ptr<SegmentRegistry> agent)
     : next_id_(1), version_(0), registry_(std::move(agent)) {
     local_desc_ = std::make_shared<SegmentDesc>();
+    subscribers_lock_ = std::make_shared<RWSpinlock>();
+    subscribers_ = std::make_shared<std::unordered_set<std::string>>();
 }
 
 SegmentManager::~SegmentManager() {}
@@ -135,8 +137,8 @@ Status SegmentManager::invalidateAllCacheForRemote(
 }
 
 void SegmentManager::addSubscriber(const std::string &subscriber_addr) {
-    RWSpinlock::WriteGuard guard(subscribers_lock_);
-    subscribers_.insert(subscriber_addr);
+    RWSpinlock::WriteGuard guard(*subscribers_lock_);
+    subscribers_->insert(subscriber_addr);
 }
 
 Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
@@ -170,16 +172,29 @@ Status SegmentManager::makeFileRemote(SegmentDescRef &desc,
 Status SegmentManager::synchronizeLocal() {
     CHECK_STATUS(registry_->putSegmentDesc(local_desc_));
 
-    RWSpinlock::ReadGuard guard(subscribers_lock_);
-    if (subscribers_.empty()) return Status::OK();
+    std::vector<std::string> subscribers_snapshot;
+    subscribers_snapshot.reserve(subscribers_->size());
 
-    for (const auto &subscriber : subscribers_) {
+    {
+        RWSpinlock::ReadGuard guard(*subscribers_lock_);
+        for (const auto &subscriber : *subscribers_) {
+            subscribers_snapshot.emplace_back(subscriber);
+        }
+    }
+
+    // Avoid holding the lock while issuing RPCs. Since the async RPC is
+    // based on coroutine, the callback might be executed on the current thread
+    // (e.g., if an error occurs before the first suspension point).
+    // Holding the lock here could lead to a deadlock.
+    for (const auto &subscriber : subscribers_snapshot) {
         // Remove subscribers that have failed (e.g., peer might shutdown)
         // to avoid repeated RPC failures.
         ControlClient::notifySegmentUpdatedAsync(
-            subscriber, local_desc_->name, [this, subscriber] {
-                RWSpinlock::WriteGuard guard(subscribers_lock_);
-                subscribers_.erase(subscriber);
+            subscriber, local_desc_->name,
+            /* on_failure */
+            [subscribers = subscribers_, lock = subscribers_lock_, subscriber] {
+                RWSpinlock::WriteGuard guard(*lock);
+                subscribers->erase(subscriber);
             });
     }
     return Status::OK();

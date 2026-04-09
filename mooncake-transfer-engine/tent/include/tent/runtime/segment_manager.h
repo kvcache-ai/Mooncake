@@ -147,8 +147,9 @@ class SegmentManager {
     std::string file_desc_basepath_;
     uint64_t ttl_ms_ = 10 * 1000;  // N.B. Frequent TTL harms p999
 
-    RWSpinlock subscribers_lock_;
-    std::unordered_set<std::string> subscribers_;
+    // shared_ptr to prevent UAF in async callbacks
+    std::shared_ptr<RWSpinlock> subscribers_lock_;
+    std::shared_ptr<std::unordered_set<std::string>> subscribers_;
 };
 }  // namespace tent
 }  // namespace mooncake
