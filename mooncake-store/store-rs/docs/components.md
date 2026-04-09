@@ -158,7 +158,10 @@ The e2e binary validates:
 ## Suggested Reading Order
 
 1. `README.md`
-2. `crates/mooncake-store-core`
-3. `docs/features.md`
-4. `docs/architecture.md`
-5. `crates/mooncake-store-e2e/src/main.rs`
+2. `docs/deployment.md`
+3. `docs/rust.md`
+4. `docs/configuration.md`
+5. `crates/mooncake-store-core`
+6. `docs/features.md`
+7. `docs/architecture.md`
+8. `crates/mooncake-store-e2e/src/main.rs`

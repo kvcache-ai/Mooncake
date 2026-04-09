@@ -220,5 +220,8 @@ Tracing is built on `tracing` + `tracing-subscriber` and can be enabled from cod
 ## When to Read Which Document
 
 - Start with `README.md` for setup and a first run
+- Read `docs/deployment.md` for local scripts and deployment roles
+- Read `docs/rust.md` for Rust integration
+- Read `docs/configuration.md` for defaults and tuning knobs
 - Read `docs/python.md` for the Python layer
 - Read `crates/mooncake-store-e2e/src/main.rs` for a complete runnable example
