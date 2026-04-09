@@ -6,13 +6,13 @@ mod transport;
 
 pub use client::{
     GetRequest, MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest,
-    ObjectRef, PutFromRequest, PutRequest, StoreClient, StoreClientBuilder,
+    ObjectRef, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 pub use memory::LocalMemoryConfig;
 pub use observability::{
-    OperationMetricSnapshot, OperationTracker, init_tracing, init_tracing_from_env,
-    metrics_http_server_addr, render_prometheus_metrics, snapshot_metrics,
-    start_metrics_http_server, start_metrics_http_server_from_env, stop_metrics_http_server,
+    init_tracing, init_tracing_from_env, metrics_http_server_addr, render_prometheus_metrics,
+    snapshot_metrics, start_metrics_http_server, start_metrics_http_server_from_env,
+    stop_metrics_http_server, OperationMetricSnapshot, OperationTracker,
 };
 pub use placement::{PlacementChoice, PlacementPlanner};
 pub use transport::{

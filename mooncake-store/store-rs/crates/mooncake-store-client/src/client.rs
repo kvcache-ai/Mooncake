@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
@@ -42,11 +42,58 @@ impl<'a> ObjectRef<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReplicationPolicy {
+    pub replica_count: Option<usize>,
+    pub with_soft_pin: bool,
+    pub preferred_segments: Vec<SegmentName>,
+    pub prefer_alloc_in_same_node: bool,
+}
+
+impl ReplicationPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn replica_count(mut self, replica_count: usize) -> Self {
+        self.replica_count = Some(replica_count);
+        self
+    }
+
+    pub fn with_soft_pin(mut self, with_soft_pin: bool) -> Self {
+        self.with_soft_pin = with_soft_pin;
+        self
+    }
+
+    pub fn prefer_alloc_in_same_node(mut self, prefer_alloc_in_same_node: bool) -> Self {
+        self.prefer_alloc_in_same_node = prefer_alloc_in_same_node;
+        self
+    }
+
+    pub fn preferred_segment(mut self, segment: impl Into<String>) -> Self {
+        self.preferred_segments.push(SegmentName::new(segment));
+        self
+    }
+
+    pub fn preferred_segments<I, S>(mut self, segments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.preferred_segments = segments
+            .into_iter()
+            .map(SegmentName::new)
+            .collect::<Vec<_>>();
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct PutRequest<'a> {
     pub tenant: Option<&'a str>,
     pub key: &'a str,
     pub value: &'a [u8],
+    pub policy: Option<ReplicationPolicy>,
 }
 
 impl<'a> PutRequest<'a> {
@@ -55,6 +102,7 @@ impl<'a> PutRequest<'a> {
             tenant: None,
             key,
             value,
+            policy: None,
         }
     }
 
@@ -62,14 +110,20 @@ impl<'a> PutRequest<'a> {
         self.tenant = Some(tenant);
         self
     }
+
+    pub fn replication(mut self, policy: ReplicationPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PutFromRequest<'a> {
     pub tenant: Option<&'a str>,
     pub key: &'a str,
     pub buffer: *const c_void,
     pub size: usize,
+    pub policy: Option<ReplicationPolicy>,
 }
 
 impl<'a> PutFromRequest<'a> {
@@ -79,11 +133,17 @@ impl<'a> PutFromRequest<'a> {
             key,
             buffer,
             size,
+            policy: None,
         }
     }
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn replication(mut self, policy: ReplicationPolicy) -> Self {
+        self.policy = Some(policy);
         self
     }
 }
@@ -99,6 +159,7 @@ pub struct MultiBufferPutRequest<'a> {
     pub tenant: Option<&'a str>,
     pub key: &'a str,
     pub buffers: &'a [&'a [u8]],
+    pub policy: Option<ReplicationPolicy>,
 }
 
 impl<'a> MultiBufferPutRequest<'a> {
@@ -107,11 +168,17 @@ impl<'a> MultiBufferPutRequest<'a> {
             tenant: None,
             key,
             buffers,
+            policy: None,
         }
     }
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn replication(mut self, policy: ReplicationPolicy) -> Self {
+        self.policy = Some(policy);
         self
     }
 }
@@ -329,8 +396,30 @@ pub trait MooncakeCompatibilityFacade {
     fn register_local_memory(&self) -> Result<()>;
     fn register_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
     fn unregister_buffer(&self, buffer: *mut c_void, size: usize) -> Result<()>;
+    fn get_hostname(&self) -> Result<String>;
+    fn get_size(&self, key: &str) -> Result<usize>;
+    fn get_size_in_tenant(&self, tenant: &str, key: &str) -> Result<usize>;
+    fn is_exist(&self, key: &str) -> Result<bool>;
+    fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool>;
+    fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>>;
+    fn remove(&self, key: &str, force: bool) -> Result<()>;
+    fn remove_in_tenant(&self, tenant: &str, key: &str, force: bool) -> Result<()>;
+    fn batch_remove(&self, objects: &[ObjectRef<'_>], force: bool) -> Result<()>;
     fn put(&self, key: &str, value: &[u8]) -> Result<ObjectRoute>;
     fn put_in_tenant(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute>;
+    fn put_with_policy(
+        &self,
+        key: &str,
+        value: &[u8],
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute>;
+    fn put_in_tenant_with_policy(
+        &self,
+        tenant: &str,
+        key: &str,
+        value: &[u8],
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute>;
     fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute>;
     fn put_from_in_tenant(
         &self,
@@ -338,6 +427,21 @@ pub trait MooncakeCompatibilityFacade {
         key: &str,
         buffer: *const c_void,
         size: usize,
+    ) -> Result<ObjectRoute>;
+    fn put_from_with_policy(
+        &self,
+        key: &str,
+        buffer: *const c_void,
+        size: usize,
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute>;
+    fn put_from_in_tenant_with_policy(
+        &self,
+        tenant: &str,
+        key: &str,
+        buffer: *const c_void,
+        size: usize,
+        policy: &ReplicationPolicy,
     ) -> Result<ObjectRoute>;
     fn batch_put(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>>;
     fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>>;
@@ -380,6 +484,258 @@ impl StoreClient {
 
     pub fn default_tenant(&self) -> &str {
         &self.default_tenant
+    }
+
+    fn default_replica_count(&self) -> usize {
+        match &self.write_mode {
+            WriteMode::LocalOnly => 1,
+            WriteMode::Routed { replica_count, .. } => *replica_count,
+        }
+    }
+
+    fn request_placement_planner(&self) -> PlacementPlanner {
+        match &self.write_mode {
+            WriteMode::LocalOnly => {
+                PlacementPlanner::new(self.metadata.clone()).require_label("storage", "true")
+            }
+            WriteMode::Routed { planner, .. } => planner.clone(),
+        }
+    }
+
+    fn resolve_replication_policy(
+        &self,
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<ResolvedReplicationPolicy> {
+        let Some(policy) = policy else {
+            return Ok(ResolvedReplicationPolicy {
+                replica_count: self.default_replica_count(),
+                preferred_segments: Vec::new(),
+                with_soft_pin: false,
+                prefer_alloc_in_same_node: false,
+            });
+        };
+
+        let mut preferred_segments = policy.preferred_segments.clone();
+        if policy.prefer_alloc_in_same_node
+            && preferred_segments.is_empty()
+            && matches!(self.write_mode, WriteMode::LocalOnly)
+        {
+            preferred_segments.push(self.segment_name()?);
+        }
+        let replica_count = policy
+            .replica_count
+            .unwrap_or_else(|| self.default_replica_count());
+        if replica_count == 0 {
+            return Err(StoreError::InvalidState(
+                "replica_count must be greater than zero".to_string(),
+            ));
+        }
+
+        let mut seen = BTreeSet::new();
+        for segment in &preferred_segments {
+            if !seen.insert(segment.clone()) {
+                return Err(StoreError::Conflict(format!(
+                    "duplicate preferred segment {}",
+                    segment.0
+                )));
+            }
+        }
+        if preferred_segments.len() > replica_count {
+            return Err(StoreError::InvalidState(format!(
+                "preferred segments exceed replica_count: have={} limit={replica_count}",
+                preferred_segments.len()
+            )));
+        }
+
+        Ok(ResolvedReplicationPolicy {
+            replica_count,
+            preferred_segments,
+            with_soft_pin: policy.with_soft_pin,
+            prefer_alloc_in_same_node: policy.prefer_alloc_in_same_node,
+        })
+    }
+
+    fn resolve_replica_targets(
+        &self,
+        tenant: &str,
+        key: &str,
+        policy: &ResolvedReplicationPolicy,
+    ) -> Result<Vec<ReplicaPlacementTarget>> {
+        let _ = policy.with_soft_pin;
+        let _ = policy.prefer_alloc_in_same_node;
+        let mut targets = Vec::with_capacity(policy.replica_count);
+        let mut excluded = BTreeSet::new();
+        for segment in &policy.preferred_segments {
+            let preferred = self.lookup_preferred_segment(segment)?;
+            excluded.insert(preferred.owner.clone());
+            targets.push(ReplicaPlacementTarget::Segment {
+                owner: preferred.owner,
+                segment_name: preferred.segment_name,
+            });
+        }
+        if targets.len() == policy.replica_count {
+            return Ok(targets);
+        }
+
+        let needs_routed = !targets.is_empty()
+            || policy.replica_count > 1
+            || matches!(self.write_mode, WriteMode::Routed { .. });
+        if !needs_routed {
+            return Ok(vec![ReplicaPlacementTarget::Owner(
+                self.lease.runtime.clone(),
+            )]);
+        }
+
+        let ranked = self
+            .request_placement_planner()
+            .ranked_candidates(self, &ObjectRef::new(key).tenant(tenant))?;
+        for owner in ranked {
+            if excluded.contains(&owner) {
+                continue;
+            }
+            excluded.insert(owner.clone());
+            targets.push(ReplicaPlacementTarget::Owner(owner));
+            if targets.len() == policy.replica_count {
+                break;
+            }
+        }
+
+        if targets.len() != policy.replica_count {
+            return Err(StoreError::InvalidState(format!(
+                "not enough placement targets: resolved={} need={}",
+                targets.len(),
+                policy.replica_count
+            )));
+        }
+        Ok(targets)
+    }
+
+    fn lookup_preferred_segment(&self, segment_name: &SegmentName) -> Result<SegmentAnnouncement> {
+        let segments = self.metadata.list_segments(None)?;
+        let segment = segments
+            .into_iter()
+            .find(|segment| {
+                segment.segment_name == *segment_name
+                    && segment.state == SegmentLifecycleState::Active
+            })
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
+            })?;
+        let owner = self
+            .metadata
+            .list_live_clients()?
+            .into_iter()
+            .find(|lease| {
+                lease.runtime == segment.owner
+                    && lease.state == ClientLifecycleState::Active
+                    && compatibility_matches(&self.lease, lease)
+            })
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "preferred segment {} belongs to an unavailable client",
+                    segment_name.0
+                ))
+            })?;
+        let _ = owner;
+        Ok(segment)
+    }
+
+    fn reserve_specific_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: usize,
+        require_local_memory: bool,
+    ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        if require_local_memory {
+            let state = self.state.lock();
+            if !state.memory_ref()?.has_storage_segment(segment_name) {
+                return Err(StoreError::NotFound(format!(
+                    "local segment {} not found",
+                    segment_name.0
+                )));
+            }
+        }
+        let segment = self
+            .metadata
+            .list_segments(Some(owner))?
+            .into_iter()
+            .find(|segment| {
+                segment.segment_name == *segment_name
+                    && segment.state == SegmentLifecycleState::Active
+            })
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "active segment {} for owner {} not found",
+                    segment_name.0, owner
+                ))
+            })?;
+        let reservation =
+            self.metadata
+                .reserve_segment(owner, &segment.segment_name, length_bytes as u64)?;
+        Ok((
+            ReplicaWriteTarget {
+                runtime: owner.clone(),
+                segment_name: segment.segment_name,
+            },
+            reservation,
+        ))
+    }
+
+    fn release_reserved_allocations(
+        &self,
+        targets: &[ReplicaWriteTarget],
+        reservations: &[mooncake_store_core::SegmentReservation],
+    ) -> Result<()> {
+        if targets.len() != reservations.len() {
+            return Err(StoreError::InvalidState(
+                "targets and reservations length mismatch".to_string(),
+            ));
+        }
+        for (target, reservation) in targets.iter().zip(reservations.iter()) {
+            self.metadata.release_segment(
+                &target.runtime,
+                &target.segment_name,
+                reservation.offset_bytes,
+                reservation.length_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn flush_due_reclaims(&self) -> Result<()> {
+        let due = {
+            let mut state = self.state.lock();
+            state.take_due_reclaims(now_ms())
+        };
+        for reclaim in due {
+            self.metadata.release_segment(
+                &reclaim.owner,
+                &reclaim.segment_name,
+                reclaim.offset_bytes,
+                reclaim.length_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
+        let grace_ms = self.local_memory.reclaim_grace_ms;
+        if grace_ms == 0 {
+            return self.release_route_allocations(route);
+        }
+        let mut state = self.state.lock();
+        let due_at_ms = now_ms().saturating_add(grace_ms);
+        for replica in &route.replicas {
+            state.pending_reclaims.push_back(PendingReclaim {
+                due_at_ms,
+                owner: replica.owner.clone(),
+                segment_name: replica.segment_name.clone(),
+                offset_bytes: replica.segment_offset,
+                length_bytes: replica.length,
+            });
+        }
+        Ok(())
     }
 
     fn transport(&self) -> Result<&dyn StoreTransport> {
@@ -473,6 +829,7 @@ impl StoreClient {
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        self.flush_due_reclaims()?;
         let mut last_capacity_error = None;
         for segment in self.sorted_segments(owner, require_local_memory)? {
             match self
@@ -502,7 +859,10 @@ impl StoreClient {
             }
         }
         Err(last_capacity_error.unwrap_or_else(|| {
-            StoreError::Allocator(format!("no writable active segment available for {}", owner))
+            StoreError::Allocator(format!(
+                "no writable active segment available for {}",
+                owner
+            ))
         }))
     }
 
@@ -525,72 +885,41 @@ impl StoreClient {
         Ok(())
     }
 
-    fn put_scoped(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
+    fn put_scoped_with_policy(
+        &self,
+        tenant: &str,
+        key: &str,
+        value: &[u8],
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
+        self.flush_due_reclaims()?;
         let scoped_key = self.scoped_key(tenant, key);
-        let (target, reservation) =
-            self.reserve_owner_segment(&self.lease.runtime, value.len(), true)?;
-        let allocation = {
-            let state = self.state.lock();
-            state.memory_ref()?.storage_address(
-                &target.segment_name,
-                reservation.offset_bytes as usize,
-            )?
-        };
-        unsafe {
-            ptr::copy_nonoverlapping(value.as_ptr(), allocation.cast::<u8>(), value.len());
-        }
-
-        let current = self.metadata.get_object_route(&scoped_key)?;
-        let expected_version = current.as_ref().map(|route| route.version);
-        let next_version = current
-            .as_ref()
-            .map(|route| route.version.next())
-            .unwrap_or(RouteVersion(1));
-        let route = ObjectRoute {
-            key: scoped_key.clone(),
-            version: next_version,
-            state: RouteState::Active,
-            compatibility: self.lease.compatibility.clone(),
-            replicas: vec![ReplicaRoute {
-                owner: self.lease.runtime.clone(),
-                segment_name: target.segment_name,
-                offset: allocation as u64,
-                segment_offset: reservation.offset_bytes,
-                length: value.len() as u64,
-                checksum: None,
-                tier: ReplicaTier::Dram,
-                priority: 0,
-            }],
-        };
-        let cas = self.metadata.compare_and_swap_object_route(
-            &scoped_key,
-            expected_version,
-            Some(&route),
-        )?;
-        if !cas.applied {
-            return Err(StoreError::Conflict(format!(
-                "route update lost race for tenant={tenant} key={key}"
-            )));
-        }
-        if let Some(previous) = current.as_ref() {
-            self.release_route_allocations(previous)?;
-        }
-        Ok(route)
-    }
-
-    fn put_scoped_routed(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
-        self.ensure_local_memory()?;
-        let scoped_key = self.scoped_key(tenant, key);
-        let owners = self.resolve_routed_owners(tenant, key)?;
-        let mut targets = Vec::with_capacity(owners.len());
-        let mut reservations = Vec::with_capacity(owners.len());
-        for owner in owners {
-            let (target, reservation) = self.reserve_owner_segment(&owner, value.len(), false)?;
+        let policy = self.resolve_replication_policy(policy)?;
+        let placements = self.resolve_replica_targets(tenant, key, &policy)?;
+        let mut targets = Vec::with_capacity(placements.len());
+        let mut reservations = Vec::with_capacity(placements.len());
+        for placement in placements {
+            let is_local = placement.owner() == &self.lease.runtime;
+            let (target, reservation) = match placement {
+                ReplicaPlacementTarget::Owner(owner) => {
+                    self.reserve_owner_segment(&owner, value.len(), is_local)?
+                }
+                ReplicaPlacementTarget::Segment {
+                    owner,
+                    segment_name,
+                } => self.reserve_specific_segment(&owner, &segment_name, value.len(), is_local)?,
+            };
             targets.push(target);
             reservations.push(reservation);
         }
-        let offsets = self.write_reserved_replicas(&targets, &reservations, value)?;
+        let offsets = match self.write_reserved_replicas(&targets, &reservations, value) {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                let _ = self.release_reserved_allocations(&targets, &reservations);
+                return Err(error);
+            }
+        };
 
         let current = self.metadata.get_object_route(&scoped_key)?;
         let expected_version = current.as_ref().map(|route| route.version);
@@ -625,12 +954,13 @@ impl StoreClient {
             Some(&route),
         )?;
         if !cas.applied {
+            let _ = self.release_reserved_allocations(&targets, &reservations);
             return Err(StoreError::Conflict(format!(
                 "route update lost race for tenant={tenant} key={key}"
             )));
         }
         if let Some(previous) = current.as_ref() {
-            self.release_route_allocations(previous)?;
+            self.schedule_route_reclaim(previous)?;
         }
         Ok(route)
     }
@@ -829,25 +1159,6 @@ impl StoreClient {
             .ok_or_else(|| StoreError::InvalidState("segment_name is not configured".to_string()))
     }
 
-    fn resolve_routed_owners(&self, tenant: &str, key: &str) -> Result<Vec<ClientRuntimeId>> {
-        let WriteMode::Routed {
-            planner,
-            replica_count,
-        } = &self.write_mode
-        else {
-            return Err(StoreError::InvalidState(
-                "routed target resolution requires routed write mode".to_string(),
-            ));
-        };
-        let plan = planner.plan(self, &[ObjectRef::new(key).tenant(tenant)], *replica_count)?;
-        let owners = plan
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::InvalidState("placement returned no plan".to_string()))?
-            .owners;
-        Ok(owners)
-    }
-
     fn write_reserved_replicas(
         &self,
         targets: &[ReplicaWriteTarget],
@@ -874,10 +1185,9 @@ impl StoreClient {
             {
                 let addr = {
                     let state = self.state.lock();
-                    state.memory_ref()?.storage_address(
-                        &target.segment_name,
-                        reservation.offset_bytes as usize,
-                    )?
+                    state
+                        .memory_ref()?
+                        .storage_address(&target.segment_name, reservation.offset_bytes as usize)?
                 };
                 unsafe {
                     ptr::copy_nonoverlapping(value.as_ptr(), addr.cast::<u8>(), value.len());
@@ -941,6 +1251,7 @@ impl StoreClient {
 
     fn batch_put_scoped_routed(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>> {
         self.ensure_local_memory()?;
+        self.flush_due_reclaims()?;
         self.validate_unique_requests(requests)?;
         let transport = self.transport()?;
         let WriteMode::Routed {
@@ -1000,6 +1311,11 @@ impl StoreClient {
                 scratch_index,
             });
         }
+        let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
+            for entry in entries {
+                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+            }
+        };
 
         let scratch_slots = if scratch_lengths.is_empty() {
             Vec::new()
@@ -1034,12 +1350,10 @@ impl StoreClient {
                 let offset = if is_local {
                     let addr = {
                         let state = self.state.lock();
-                        state
-                            .memory_ref()?
-                            .storage_address(
-                                &target.segment_name,
-                                reservation.offset_bytes as usize,
-                            )?
+                        state.memory_ref()?.storage_address(
+                            &target.segment_name,
+                            reservation.offset_bytes as usize,
+                        )?
                     };
                     unsafe {
                         ptr::copy_nonoverlapping(
@@ -1118,30 +1432,44 @@ impl StoreClient {
             let submit_result = transport.submit(batch_id, &remote_requests);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
+                release_prepared(&prepared);
                 return Err(error);
             }
             let wait_result =
                 wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
             let free_result = transport.free_batch(batch_id);
-            wait_result?;
-            free_result?;
+            if let Err(error) = wait_result {
+                release_prepared(&prepared);
+                return Err(error);
+            }
+            if let Err(error) = free_result {
+                release_prepared(&prepared);
+                return Err(error);
+            }
         }
 
         let mut published = Vec::with_capacity(routes.len());
-        for pending in routes {
-            let cas = self.metadata.compare_and_swap_object_route(
+        for (index, pending) in routes.into_iter().enumerate() {
+            let cas = match self.metadata.compare_and_swap_object_route(
                 &pending.key,
                 pending.expected_version,
                 Some(&pending.route),
-            )?;
+            ) {
+                Ok(cas) => cas,
+                Err(error) => {
+                    release_prepared(&prepared[index..]);
+                    return Err(error);
+                }
+            };
             if !cas.applied {
+                release_prepared(&prepared[index..]);
                 return Err(StoreError::Conflict(format!(
                     "route update lost race for key {}",
                     pending.key.0
                 )));
             }
             if let Some(previous) = pending.previous.as_ref() {
-                self.release_route_allocations(previous)?;
+                self.schedule_route_reclaim(previous)?;
             }
             published.push(pending.route);
         }
@@ -1280,7 +1608,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             storage_bytes
         )
         .entered();
-        let tracker = OperationTracker::new("expand_local_memory").input_bytes(storage_bytes as u64);
+        let tracker =
+            OperationTracker::new("expand_local_memory").input_bytes(storage_bytes as u64);
         self.ensure_local_memory()?;
         if storage_bytes == 0 {
             let result = Err(StoreError::Allocator(
@@ -1413,15 +1742,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     StoreError::Unsupported("transport is not configured".to_string())
                 })?
             } else {
-                state
-                    .local_transports
-                    .remove(&segment.0)
-                    .ok_or_else(|| {
-                        StoreError::NotFound(format!(
-                            "local transport for segment {} not found",
-                            segment.0
-                        ))
-                    })?
+                state.local_transports.remove(&segment.0).ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "local transport for segment {} not found",
+                        segment.0
+                    ))
+                })?
             };
             state
                 .memory_mut()?
@@ -1470,7 +1796,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn register_local_memory(&self) -> Result<()> {
-        let _span = info_span!("store.register_local_memory", runtime = %self.lease.runtime).entered();
+        let _span =
+            info_span!("store.register_local_memory", runtime = %self.lease.runtime).entered();
         let tracker = OperationTracker::new("register_local_memory");
         let result = self.ensure_local_memory();
         tracker.finish(&result, 0);
@@ -1514,6 +1841,97 @@ impl MooncakeCompatibilityFacade for StoreClient {
         result
     }
 
+    fn get_hostname(&self) -> Result<String> {
+        Ok(self.lease.endpoints.rpc_address.clone())
+    }
+
+    fn get_size(&self, key: &str) -> Result<usize> {
+        self.get_size_in_tenant(self.default_tenant(), key)
+    }
+
+    fn get_size_in_tenant(&self, tenant: &str, key: &str) -> Result<usize> {
+        Ok(self
+            .query_route_in_tenant(tenant, key)?
+            .and_then(|route| {
+                route
+                    .replicas
+                    .iter()
+                    .min_by_key(|replica| replica.priority)
+                    .map(|replica| replica.length as usize)
+            })
+            .unwrap_or(0))
+    }
+
+    fn is_exist(&self, key: &str) -> Result<bool> {
+        self.is_exist_in_tenant(self.default_tenant(), key)
+    }
+
+    fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
+        Ok(self.query_route_in_tenant(tenant, key)?.is_some())
+    }
+
+    fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
+        let mut results = Vec::with_capacity(objects.len());
+        for object in objects {
+            let tenant = object.tenant.unwrap_or(self.default_tenant());
+            results.push(self.is_exist_in_tenant(tenant, object.key)?);
+        }
+        Ok(results)
+    }
+
+    fn remove(&self, key: &str, force: bool) -> Result<()> {
+        self.remove_in_tenant(self.default_tenant(), key, force)
+    }
+
+    fn remove_in_tenant(&self, tenant: &str, key: &str, force: bool) -> Result<()> {
+        let _span = info_span!(
+            "store.remove",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            force
+        )
+        .entered();
+        let tracker = OperationTracker::new("remove");
+        let _ = force;
+        let scoped_key = self.scoped_key(tenant, key);
+        let Some(route) = self.metadata.get_object_route(&scoped_key)? else {
+            let result = Err(StoreError::NotFound(format!("tenant={tenant} key={key}")));
+            tracker.finish(&result, 0);
+            return result;
+        };
+        let cas =
+            self.metadata
+                .compare_and_swap_object_route(&scoped_key, Some(route.version), None)?;
+        let result = if cas.applied {
+            self.schedule_route_reclaim(&route)
+        } else {
+            Err(StoreError::Conflict(format!(
+                "route delete lost race for tenant={tenant} key={key}"
+            )))
+        };
+        tracker.finish(&result, 0);
+        result
+    }
+
+    fn batch_remove(&self, objects: &[ObjectRef<'_>], force: bool) -> Result<()> {
+        let _span = info_span!(
+            "store.batch_remove",
+            runtime = %self.lease.runtime,
+            items = objects.len(),
+            force
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_remove");
+        for object in objects {
+            let tenant = object.tenant.unwrap_or(self.default_tenant());
+            self.remove_in_tenant(tenant, object.key, force)?;
+        }
+        let result = Ok(());
+        tracker.finish(&result, 0);
+        result
+    }
+
     fn put(&self, key: &str, value: &[u8]) -> Result<ObjectRoute> {
         self.put_in_tenant(self.default_tenant(), key, value)
     }
@@ -1528,10 +1946,37 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
-        let result = match &self.write_mode {
-            WriteMode::LocalOnly => self.put_scoped(tenant, key, value),
-            WriteMode::Routed { .. } => self.put_scoped_routed(tenant, key, value),
-        };
+        let result = self.put_scoped_with_policy(tenant, key, value, None);
+        tracker.finish(&result, value.len() as u64);
+        result
+    }
+
+    fn put_with_policy(
+        &self,
+        key: &str,
+        value: &[u8],
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute> {
+        self.put_in_tenant_with_policy(self.default_tenant(), key, value, policy)
+    }
+
+    fn put_in_tenant_with_policy(
+        &self,
+        tenant: &str,
+        key: &str,
+        value: &[u8],
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute> {
+        let _span = info_span!(
+            "store.put",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            bytes = value.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
+        let result = self.put_scoped_with_policy(tenant, key, value, Some(policy));
         tracker.finish(&result, value.len() as u64);
         result
     }
@@ -1574,7 +2019,57 @@ impl MooncakeCompatibilityFacade for StoreClient {
             }
         }
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
-        let result = self.put_in_tenant(tenant, key, value);
+        let result = self.put_scoped_with_policy(tenant, key, value, None);
+        tracker.finish(&result, size as u64);
+        result
+    }
+
+    fn put_from_with_policy(
+        &self,
+        key: &str,
+        buffer: *const c_void,
+        size: usize,
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute> {
+        self.put_from_in_tenant_with_policy(self.default_tenant(), key, buffer, size, policy)
+    }
+
+    fn put_from_in_tenant_with_policy(
+        &self,
+        tenant: &str,
+        key: &str,
+        buffer: *const c_void,
+        size: usize,
+        policy: &ReplicationPolicy,
+    ) -> Result<ObjectRoute> {
+        let _span = info_span!(
+            "store.put_from",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            size
+        )
+        .entered();
+        let tracker = OperationTracker::new("put_from").input_bytes(size as u64);
+        if buffer.is_null() {
+            let result = Err(StoreError::Allocator(
+                "put_from buffer must not be null".to_string(),
+            ));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        {
+            let state = self.state.lock();
+            if !state.buffer_is_registered(buffer.cast_mut(), size) {
+                let result = Err(StoreError::Allocator(format!(
+                    "put_from buffer is not registered for tenant={tenant} key={key}"
+                )));
+                tracker.finish(&result, 0);
+                return result;
+            }
+        }
+        let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
+        let result = self.put_scoped_with_policy(tenant, key, value, Some(policy));
         tracker.finish(&result, size as u64);
         result
     }
@@ -1592,7 +2087,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("batch_put").input_bytes(bytes_in);
-        if matches!(self.write_mode, WriteMode::Routed { .. }) {
+        let can_use_fast_routed_batch = matches!(self.write_mode, WriteMode::Routed { .. })
+            && requests.iter().all(|request| request.policy.is_none());
+        if can_use_fast_routed_batch {
             let result = self.batch_put_scoped_routed(requests);
             tracker.finish(&result, bytes_in);
             return result;
@@ -1600,7 +2097,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
-            routes.push(self.put_in_tenant(tenant, request.key, request.value)?);
+            routes.push(self.put_scoped_with_policy(
+                tenant,
+                request.key,
+                request.value,
+                request.policy.as_ref(),
+            )?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -1608,7 +2110,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn batch_put_from(&self, requests: &[PutFromRequest<'_>]) -> Result<Vec<ObjectRoute>> {
-        let bytes_in = requests.iter().map(|request| request.size as u64).sum::<u64>();
+        let bytes_in = requests
+            .iter()
+            .map(|request| request.size as u64)
+            .sum::<u64>();
         let _span = info_span!(
             "store.batch_put_from",
             runtime = %self.lease.runtime,
@@ -1620,12 +2125,18 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
-            routes.push(self.put_from_in_tenant(
-                tenant,
-                request.key,
-                request.buffer,
-                request.size,
-            )?);
+            routes.push(
+                self.put_from_in_tenant_with_policy(
+                    tenant,
+                    request.key,
+                    request.buffer,
+                    request.size,
+                    request
+                        .policy
+                        .as_ref()
+                        .unwrap_or(&ReplicationPolicy::default()),
+                )?,
+            );
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -1653,7 +2164,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
         for request in requests {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
             let payload = flatten_slices(request.buffers);
-            routes.push(self.put_in_tenant(tenant, request.key, &payload)?);
+            routes.push(self.put_scoped_with_policy(
+                tenant,
+                request.key,
+                &payload,
+                request.policy.as_ref(),
+            )?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -1725,7 +2241,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .map(|buffer| buffer.as_mut_slice())
             .collect::<Vec<_>>();
         self.execute_batch_get_into(&resolved, &mut slices)?;
-        let bytes_out = buffers.iter().map(|buffer| buffer.len() as u64).sum::<u64>();
+        let bytes_out = buffers
+            .iter()
+            .map(|buffer| buffer.len() as u64)
+            .sum::<u64>();
         let result = Ok(buffers);
         tracker.finish(&result, bytes_out);
         result
@@ -1826,16 +2345,18 @@ impl Drop for StoreClient {
         if let Some(mut memory) = state.memory.take() {
             let segments = memory.storage_segments();
             for segment in segments {
-                let local_transport = if segment.segment_name == self.segment_name().unwrap_or_else(|_| {
-                    SegmentName::new("__missing_primary_segment__")
-                }) {
+                let local_transport = if segment.segment_name
+                    == self
+                        .segment_name()
+                        .unwrap_or_else(|_| SegmentName::new("__missing_primary_segment__"))
+                {
                     self.transport.clone()
                 } else {
                     state.local_transports.remove(&segment.segment_name.0)
                 };
                 if let Some(local_transport) = local_transport {
-                    let _ =
-                        memory.remove_storage_segment(local_transport.as_ref(), &segment.segment_name);
+                    let _ = memory
+                        .remove_storage_segment(local_transport.as_ref(), &segment.segment_name);
                 }
             }
             let _ = memory.release_scratch(transport);
@@ -1849,6 +2370,7 @@ struct StoreState {
     registered_buffers: BTreeMap<usize, usize>,
     local_transports: BTreeMap<String, Arc<dyn StoreTransport>>,
     remote_segments: BTreeMap<String, u64>,
+    pending_reclaims: VecDeque<PendingReclaim>,
     next_local_segment_id: u64,
 }
 
@@ -1882,6 +2404,41 @@ struct PendingRoutePublish {
     route: ObjectRoute,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedReplicationPolicy {
+    replica_count: usize,
+    preferred_segments: Vec<SegmentName>,
+    with_soft_pin: bool,
+    prefer_alloc_in_same_node: bool,
+}
+
+#[derive(Clone, Debug)]
+enum ReplicaPlacementTarget {
+    Owner(ClientRuntimeId),
+    Segment {
+        owner: ClientRuntimeId,
+        segment_name: SegmentName,
+    },
+}
+
+impl ReplicaPlacementTarget {
+    fn owner(&self) -> &ClientRuntimeId {
+        match self {
+            Self::Owner(owner) => owner,
+            Self::Segment { owner, .. } => owner,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingReclaim {
+    due_at_ms: u64,
+    owner: ClientRuntimeId,
+    segment_name: SegmentName,
+    offset_bytes: u64,
+    length_bytes: u64,
+}
+
 impl StoreState {
     fn memory_ref(&self) -> Result<&LocalMemoryState> {
         self.memory
@@ -1897,10 +2454,8 @@ impl StoreState {
 
     fn next_segment_name(&mut self, primary: &SegmentName) -> SegmentName {
         loop {
-            let segment_name = SegmentName::new(format!(
-                "{}-ext-{}",
-                primary.0, self.next_local_segment_id
-            ));
+            let segment_name =
+                SegmentName::new(format!("{}-ext-{}", primary.0, self.next_local_segment_id));
             self.next_local_segment_id = self.next_local_segment_id.saturating_add(1);
             if self
                 .memory
@@ -1998,6 +2553,20 @@ impl StoreState {
         }
         Ok(())
     }
+
+    fn take_due_reclaims(&mut self, now_ms: u64) -> Vec<PendingReclaim> {
+        let mut ready = Vec::new();
+        while self
+            .pending_reclaims
+            .front()
+            .is_some_and(|entry| entry.due_at_ms <= now_ms)
+        {
+            if let Some(entry) = self.pending_reclaims.pop_front() {
+                ready.push(entry);
+            }
+        }
+        ready
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2039,12 +2608,27 @@ fn scatter_into_buffers(payload: &[u8], buffers: &mut [&mut [u8]]) {
     }
 }
 
+fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
+    left.compatibility.store_api_version == right.compatibility.store_api_version
+        && left.compatibility.metadata_schema_version == right.compatibility.metadata_schema_version
+        && left.compatibility.transport_api_version == right.compatibility.transport_api_version
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should advance")
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::ptr;
     use std::sync::Arc;
+    use std::thread::sleep;
+    use std::time::Duration;
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
@@ -2061,7 +2645,7 @@ mod tests {
     use crate::{
         render_prometheus_metrics, reset_metrics, transport::StoreTransport, LocalMemoryConfig,
         MooncakeCompatibilityFacade, MultiBufferGetRequest, PlacementPlanner, PutRequest,
-        StoreClientBuilder,
+        ReplicationPolicy, StoreClientBuilder,
     };
 
     struct TestTransport {
@@ -2518,7 +3102,9 @@ mod tests {
             .build(10_000)
             .expect("client build should succeed");
 
-        client.put("metrics-key", b"abcdefgh").expect("put should succeed");
+        client
+            .put("metrics-key", b"abcdefgh")
+            .expect("put should succeed");
         let value = client.get("metrics-key").expect("get should succeed");
         assert_eq!(value, b"abcdefgh");
 
@@ -2604,5 +3190,149 @@ mod tests {
                 .expect("get should succeed"),
             payload
         );
+    }
+
+    #[test]
+    fn remove_reclaims_segment_space_immediately_when_grace_zero() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("reclaim-segment"));
+        let client = StoreClientBuilder::new(metadata, "reclaim-client")
+            .state(ClientLifecycleState::Active)
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let first = client
+            .put("key-a", b"abcdefgh")
+            .expect("put should succeed");
+        let first_offset = first.replicas[0].segment_offset;
+        client
+            .remove("key-a", true)
+            .expect("remove should reclaim the route");
+        let second = client
+            .put("key-b", b"abcdefgh")
+            .expect("put should succeed");
+
+        assert_eq!(second.replicas[0].segment_offset, first_offset);
+        assert!(!client.is_exist("key-a").expect("is_exist should succeed"));
+    }
+
+    #[test]
+    fn remove_defers_reclaim_until_grace_deadline() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("grace-segment"));
+        let client = StoreClientBuilder::new(metadata, "grace-client")
+            .state(ClientLifecycleState::Active)
+            .transport(transport)
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .storage_bytes(4096)
+                    .scratch_bytes(4096)
+                    .reclaim_grace_ms(30),
+            )
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let first = client
+            .put("key-a", b"abcdefgh")
+            .expect("put should succeed");
+        let first_offset = first.replicas[0].segment_offset;
+        client
+            .remove("key-a", true)
+            .expect("remove should schedule delayed reclaim");
+        let second = client
+            .put("key-b", b"abcdefgh")
+            .expect("put should succeed");
+        assert_ne!(second.replicas[0].segment_offset, first_offset);
+
+        sleep(Duration::from_millis(50));
+        let third = client
+            .put("key-c", b"abcdefgh")
+            .expect("put should succeed");
+        assert_eq!(third.replicas[0].segment_offset, first_offset);
+    }
+
+    #[test]
+    fn request_replication_policy_overrides_default_local_write() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("writer-segment"));
+        let owner_a = publish_storage_node(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-a",
+            "seg-a",
+            "pool-a",
+        );
+        let owner_b = publish_storage_node(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-b",
+            "seg-b",
+            "pool-a",
+        );
+        let client = StoreClientBuilder::new(metadata.clone(), "writer")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let route = client
+            .put_with_policy(
+                "replicated-key",
+                b"replicated-payload",
+                &ReplicationPolicy::new().replica_count(2),
+            )
+            .expect("replicated put should succeed");
+
+        assert_eq!(route.replicas.len(), 2);
+        let owners = route
+            .replicas
+            .iter()
+            .map(|replica| replica.owner.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(owners, BTreeSet::from([owner_a, owner_b]));
+        assert_eq!(
+            client.get("replicated-key").expect("get should succeed"),
+            b"replicated-payload"
+        );
+    }
+
+    #[test]
+    fn request_replication_policy_honors_preferred_segment() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("writer-segment"));
+        let owner_b = publish_storage_node(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-b",
+            "seg-b",
+            "pool-a",
+        );
+        let client = StoreClientBuilder::new(metadata, "writer")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let route = client
+            .put_with_policy(
+                "preferred-key",
+                b"preferred-payload",
+                &ReplicationPolicy::new()
+                    .replica_count(1)
+                    .preferred_segment("seg-b"),
+            )
+            .expect("preferred-segment put should succeed");
+
+        assert_eq!(route.replicas.len(), 1);
+        assert_eq!(route.replicas[0].owner, owner_b);
+        assert_eq!(route.replicas[0].segment_name, SegmentName::new("seg-b"));
     }
 }

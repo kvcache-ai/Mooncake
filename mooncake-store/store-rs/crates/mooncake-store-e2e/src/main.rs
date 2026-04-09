@@ -1,13 +1,14 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
+    init_tracing_from_env, render_prometheus_metrics, start_metrics_http_server_from_env,
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
-    StoreClientBuilder, TentTransportFactory, init_tracing_from_env, render_prometheus_metrics,
-    start_metrics_http_server_from_env,
+    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
+    ReplicationPolicy, StoreClient, StoreClientBuilder, TentTransportFactory,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result,
@@ -176,13 +177,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .storage_bytes(value_size * 2)
             .scratch_bytes(SCRATCH_BYTES)
             .location("cpu:0")
+            .reclaim_grace_ms(0)
             .tags(vec![
                 "dram".to_string(),
                 "elastic".to_string(),
                 "storage".to_string(),
             ]),
         "tenant-a",
-        &[("pool", "pool-elastic"), ("role", "elastic-target"), ("storage", "true")],
+        &[
+            ("pool", "pool-elastic"),
+            ("role", "elastic-target"),
+            ("storage", "true"),
+        ],
     )?;
     let elastic_router = build_routed_client(
         metadata.clone(),
@@ -194,9 +200,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .storage_bytes(value_size * 4)
             .scratch_bytes(SCRATCH_BYTES)
             .location("cpu:0")
+            .reclaim_grace_ms(0)
             .tags(vec!["dram".to_string(), "elastic-router".to_string()]),
         "tenant-a",
-        &[("pool", "pool-elastic"), ("role", "elastic-router"), ("storage", "false")],
+        &[
+            ("pool", "pool-elastic"),
+            ("role", "elastic-router"),
+            ("storage", "false"),
+        ],
         PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
         1,
     )?;
@@ -217,6 +228,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_batch_put_from_get_into(&target_a, &reader, value_size)?;
     verify_multi_buffer_batch_ops(&target_a, &reader, value_size)?;
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
+    verify_request_replication_policy(&target_a, &target_b, &reader, value_size)?;
+    verify_delete_reclaim_parity(&reclaim_writer, value_size)?;
     verify_routed_scale_out(&router, &reader, value_size)?;
     verify_multi_replica_route_publish(&router_replica, &reader, value_size)?;
     verify_dynamic_expand_and_soft_shrink(&elastic_target, &elastic_router, &reader, value_size)?;
@@ -232,7 +245,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
 
     println!(
-        "e2e ok: single put/get, batch put/get, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, hot-upgrade"
+        "e2e ok: single put/get, batch put/get, request-level replication policy, true delete reclaim, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, hot-upgrade"
     );
     if env::var("MC_STORE_RS_PRINT_METRICS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -576,6 +589,118 @@ fn verify_overwrite_reclaims_capacity(
     Ok(())
 }
 
+fn verify_request_replication_policy(
+    writer: &StoreClient,
+    preferred_target: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let single_value = payload("policy-single", value_size);
+    let single_route = writer.put_with_policy(
+        "policy-single-key",
+        &single_value,
+        &ReplicationPolicy::new().replica_count(2),
+    )?;
+    if single_route.replicas.len() != 2 {
+        return Err(StoreError::InvalidState(format!(
+            "request replication policy expected 2 replicas, got {}",
+            single_route.replicas.len()
+        )));
+    }
+    let owners = single_route
+        .replicas
+        .iter()
+        .map(|replica| replica.owner.storage_key())
+        .collect::<BTreeSet<_>>();
+    if owners.len() != 2 {
+        return Err(StoreError::InvalidState(format!(
+            "request replication policy did not spread across 2 owners: {:?}",
+            owners
+        )));
+    }
+
+    let preferred_segment = preferred_target
+        .list_segments()?
+        .into_iter()
+        .find(|segment| segment.state == SegmentLifecycleState::Active)
+        .ok_or_else(|| StoreError::NotFound("preferred target segment".to_string()))?
+        .segment_name;
+    let batch_a = payload("policy-batch-a", value_size);
+    let batch_b = payload("policy-batch-b", value_size);
+    let batch = vec![
+        PutRequest::new("policy-batch-a", &batch_a)
+            .replication(ReplicationPolicy::new().replica_count(2)),
+        PutRequest::new("policy-batch-b", &batch_b).replication(
+            ReplicationPolicy::new()
+                .replica_count(1)
+                .preferred_segment(preferred_segment.0.clone()),
+        ),
+    ];
+    writer.batch_put(&batch)?;
+
+    let preferred_route = writer
+        .query_route("policy-batch-b")?
+        .ok_or_else(|| StoreError::NotFound("policy-batch-b".to_string()))?;
+    if preferred_route.replicas.len() != 1
+        || preferred_route.replicas[0].segment_name != preferred_segment
+    {
+        return Err(StoreError::InvalidState(format!(
+            "preferred segment policy missed target {}: {:?}",
+            preferred_segment.0, preferred_route.replicas
+        )));
+    }
+
+    let refs = [
+        ObjectRef::new("policy-single-key"),
+        ObjectRef::new("policy-batch-a"),
+        ObjectRef::new("policy-batch-b"),
+    ];
+    let values = reader.batch_get(&refs)?;
+    ensure_payload("policy single", &single_value, &values[0])?;
+    ensure_payload("policy batch a", &batch_a, &values[1])?;
+    ensure_payload("policy batch b", &batch_b, &values[2])?;
+    Ok(())
+}
+
+fn verify_delete_reclaim_parity(writer: &StoreClient, value_size: usize) -> Result<()> {
+    let deleted = payload("delete-reclaim-a", value_size);
+    writer.put("delete-key-a", &deleted)?;
+    let first_route = writer
+        .query_route("delete-key-a")?
+        .ok_or_else(|| StoreError::NotFound("delete-key-a".to_string()))?;
+    let first_offset = first_route.replicas[0].segment_offset;
+
+    writer.remove("delete-key-a", true)?;
+    if writer.is_exist("delete-key-a")? {
+        return Err(StoreError::InvalidState(
+            "deleted key still exists after remove".to_string(),
+        ));
+    }
+    if writer.get_size("delete-key-a")? != 0 {
+        return Err(StoreError::InvalidState(
+            "deleted key still reports non-zero size".to_string(),
+        ));
+    }
+    if writer.query_route("delete-key-a")?.is_some() {
+        return Err(StoreError::InvalidState(
+            "deleted key still has a published route".to_string(),
+        ));
+    }
+
+    let replacement = payload("delete-reclaim-b", value_size);
+    writer.put("delete-key-b", &replacement)?;
+    let second_route = writer
+        .query_route("delete-key-b")?
+        .ok_or_else(|| StoreError::NotFound("delete-key-b".to_string()))?;
+    if second_route.replicas[0].segment_offset != first_offset {
+        return Err(StoreError::InvalidState(format!(
+            "delete reclaim did not reuse freed space: old={} new={}",
+            first_offset, second_route.replicas[0].segment_offset
+        )));
+    }
+    Ok(())
+}
+
 fn verify_dynamic_expand_and_soft_shrink(
     target: &StoreClient,
     router: &StoreClient,
@@ -633,7 +758,10 @@ fn verify_dynamic_expand_and_soft_shrink(
     }
 
     let remaining = target.list_segments()?;
-    if remaining.iter().any(|segment| segment.segment_name == primary) {
+    if remaining
+        .iter()
+        .any(|segment| segment.segment_name == primary)
+    {
         return Err(StoreError::InvalidState(
             "elastic primary segment still published after retire".to_string(),
         ));

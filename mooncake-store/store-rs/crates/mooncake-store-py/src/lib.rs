@@ -8,11 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use config::CompatSetupArgs;
 use mooncake_store_client::{
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
-    StoreClientBuilder, TentTransportFactory, init_tracing as init_store_tracing,
-    metrics_http_server_addr, render_prometheus_metrics, start_metrics_http_server,
-    stop_metrics_http_server,
+    init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
+    start_metrics_http_server, stop_metrics_http_server, GetRequest, LocalMemoryConfig,
+    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
+    PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient,
+    StoreClientBuilder, TentTransportFactory,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, ObjectRoute, SegmentAnnouncement,
@@ -96,16 +96,17 @@ impl PyMooncakeDistributedStore {
 
         let metadata = plan.metadata.clone();
         let segment_name = local_segment_name.unwrap_or_else(|| {
-            format!(
-                "{}-segment-{}",
-                plan.stable_id.replace(':', "-"),
-                now_ms()
-            )
+            format!("{}-segment-{}", plan.stable_id.replace(':', "-"), now_ms())
         });
         #[allow(clippy::arc_with_non_send_sync)]
         let engine = Arc::new(
-            TentEngine::new(&plan.tent_config.clone().set("local_segment_name", &segment_name))
-                .map_err(store_error_to_py)?,
+            TentEngine::new(
+                &plan
+                    .tent_config
+                    .clone()
+                    .set("local_segment_name", &segment_name),
+            )
+            .map_err(store_error_to_py)?,
         );
         let factory = Arc::new(TentTransportFactory::new(plan.tent_config));
         let mut builder = StoreClientBuilder::new(plan.metadata, plan.stable_id)
@@ -132,7 +133,9 @@ impl PyMooncakeDistributedStore {
             );
         }
 
-        let client = builder.build(plan.expires_at_ms).map_err(store_error_to_py)?;
+        let client = builder
+            .build(plan.expires_at_ms)
+            .map_err(store_error_to_py)?;
         client.register_local_memory().map_err(store_error_to_py)?;
         self.client = Some(client);
         Ok(0)
@@ -142,12 +145,44 @@ impl PyMooncakeDistributedStore {
         self.client = None;
     }
 
-    #[pyo3(signature = (key, value, *, tenant = None))]
-    fn put(&self, key: &str, value: Vec<u8>, tenant: Option<&str>) -> PyResult<i32> {
+    #[pyo3(signature = (
+        key,
+        value,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn put(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
+    ) -> PyResult<i32> {
         let client = self.client_ref()?;
-        match tenant {
-            Some(tenant) => client.put_in_tenant(tenant, key, &value),
-            None => client.put(key, &value),
+        let policy = replication_policy(
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        );
+        match (tenant, policy.as_ref()) {
+            (Some(tenant), Some(policy)) => {
+                client.put_in_tenant_with_policy(tenant, key, &value, policy)
+            }
+            (None, Some(policy)) => client.put_with_policy(key, &value, policy),
+            (Some(tenant), None) => client.put_in_tenant(tenant, key, &value),
+            (None, None) => client.put(key, &value),
         }
         .map_err(store_error_to_py)?;
         Ok(0)
@@ -172,46 +207,44 @@ impl PyMooncakeDistributedStore {
     #[pyo3(signature = (key, *, tenant = None))]
     fn is_exist(&self, key: &str, tenant: Option<&str>) -> PyResult<bool> {
         let client = self.client_ref()?;
-        let route = match tenant {
-            Some(tenant) => client.query_route_in_tenant(tenant, key),
-            None => client.query_route(key),
+        match tenant {
+            Some(tenant) => client.is_exist_in_tenant(tenant, key),
+            None => client.is_exist(key),
         }
-        .map_err(store_error_to_py)?;
-        Ok(route.is_some())
+        .map_err(store_error_to_py)
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
     fn batch_is_exist(&self, keys: Vec<String>, tenant: Option<&str>) -> PyResult<Vec<i32>> {
         let client = self.client_ref()?;
-        keys.iter()
+        let objects = keys
+            .iter()
             .map(|key| {
-                let route = match tenant {
-                    Some(tenant) => client.query_route_in_tenant(tenant, key),
-                    None => client.query_route(key),
+                let mut object = ObjectRef::new(key.as_str());
+                if let Some(tenant) = tenant {
+                    object = object.tenant(tenant);
                 }
-                .map_err(store_error_to_py)?;
-                Ok(i32::from(route.is_some()))
+                object
             })
-            .collect()
+            .collect::<Vec<_>>();
+        client
+            .batch_is_exist(&objects)
+            .map(|items| items.into_iter().map(i32::from).collect())
+            .map_err(store_error_to_py)
     }
 
     fn get_hostname(&self) -> PyResult<String> {
-        Ok(self.client_ref()?.lease().endpoints.rpc_address.clone())
+        self.client_ref()?.get_hostname().map_err(store_error_to_py)
     }
 
     #[pyo3(signature = (key, *, tenant = None))]
     fn get_size(&self, key: &str, tenant: Option<&str>) -> PyResult<usize> {
         let client = self.client_ref()?;
-        let route = match tenant {
-            Some(tenant) => client.query_route_in_tenant(tenant, key),
-            None => client.query_route(key),
+        match tenant {
+            Some(tenant) => client.get_size_in_tenant(tenant, key),
+            None => client.get_size(key),
         }
-        .map_err(store_error_to_py)?;
-        Ok(route
-            .as_ref()
-            .and_then(|route| route.replicas.iter().min_by_key(|replica| replica.priority))
-            .map(|replica| replica.length as usize)
-            .unwrap_or(0))
+        .map_err(store_error_to_py)
     }
 
     fn register_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
@@ -230,19 +263,47 @@ impl PyMooncakeDistributedStore {
         Ok(0)
     }
 
-    #[pyo3(signature = (key, buffer_ptr, size, *, tenant = None))]
+    #[pyo3(signature = (
+        key,
+        buffer_ptr,
+        size,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn put_from(
         &self,
         key: &str,
         buffer_ptr: usize,
         size: usize,
         tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
     ) -> PyResult<i32> {
         let client = self.client_ref()?;
         let buffer = pointer_from_usize(buffer_ptr)? as *const c_void;
-        match tenant {
-            Some(tenant) => client.put_from_in_tenant(tenant, key, buffer, size),
-            None => client.put_from(key, buffer, size),
+        let policy = replication_policy(
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        );
+        match (tenant, policy.as_ref()) {
+            (Some(tenant), Some(policy)) => {
+                client.put_from_in_tenant_with_policy(tenant, key, buffer, size, policy)
+            }
+            (None, Some(policy)) => client.put_from_with_policy(key, buffer, size, policy),
+            (Some(tenant), None) => client.put_from_in_tenant(tenant, key, buffer, size),
+            (None, None) => client.put_from(key, buffer, size),
         }
         .map_err(store_error_to_py)?;
         Ok(0)
@@ -257,7 +318,9 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
     ) -> PyResult<usize> {
         let client = self.client_ref()?;
-        let buffer = unsafe { slice::from_raw_parts_mut(pointer_from_usize(buffer_ptr)?.cast::<u8>(), size) };
+        let buffer = unsafe {
+            slice::from_raw_parts_mut(pointer_from_usize(buffer_ptr)?.cast::<u8>(), size)
+        };
         match tenant {
             Some(tenant) => client.get_into_in_tenant(tenant, key, buffer),
             None => client.get_into(key, buffer),
@@ -265,15 +328,44 @@ impl PyMooncakeDistributedStore {
         .map_err(store_error_to_py)
     }
 
-    #[pyo3(signature = (items, *, tenant = None))]
-    fn batch_put(&self, items: Vec<(String, Vec<u8>)>, tenant: Option<&str>) -> PyResult<i32> {
+    #[pyo3(signature = (
+        items,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn batch_put(
+        &self,
+        items: Vec<(String, Vec<u8>)>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
+    ) -> PyResult<i32> {
         let client = self.client_ref()?;
+        let policy = replication_policy(
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        );
         let requests = items
             .iter()
             .map(|(key, value)| {
                 let mut request = PutRequest::new(key, value);
                 if let Some(tenant) = tenant {
                     request = request.tenant(tenant);
+                }
+                if let Some(policy) = policy.clone() {
+                    request = request.replication(policy);
                 }
                 request
             })
@@ -282,38 +374,79 @@ impl PyMooncakeDistributedStore {
         Ok(0)
     }
 
-    #[pyo3(signature = (items, *, tenant = None))]
+    #[pyo3(signature = (
+        items,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn batch_put_from(
         &self,
         items: Vec<(String, usize, usize)>,
         tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
     ) -> PyResult<i32> {
         let client = self.client_ref()?;
+        let policy = replication_policy(
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        );
         let requests = items
             .iter()
             .map(|(key, buffer_ptr, size)| {
-                let mut request = PutFromRequest::new(
-                    key,
-                    (*buffer_ptr as *mut c_void).cast_const(),
-                    *size,
-                );
+                let mut request =
+                    PutFromRequest::new(key, (*buffer_ptr as *mut c_void).cast_const(), *size);
                 if let Some(tenant) = tenant {
                     request = request.tenant(tenant);
+                }
+                if let Some(policy) = policy.clone() {
+                    request = request.replication(policy);
                 }
                 request
             })
             .collect::<Vec<_>>();
-        client.batch_put_from(&requests).map_err(store_error_to_py)?;
+        client
+            .batch_put_from(&requests)
+            .map_err(store_error_to_py)?;
         Ok(0)
     }
 
-    #[pyo3(signature = (keys, buffer_ptrs, sizes, *, tenant = None))]
+    #[pyo3(signature = (
+        keys,
+        buffer_ptrs,
+        sizes,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn batch_put_from_raw(
         &self,
         keys: Vec<String>,
         buffer_ptrs: Vec<usize>,
         sizes: Vec<usize>,
         tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
     ) -> PyResult<i32> {
         if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
             return Err(PyValueError::new_err(
@@ -326,19 +459,54 @@ impl PyMooncakeDistributedStore {
             .zip(sizes)
             .map(|((key, buffer_ptr), size)| (key, buffer_ptr, size))
             .collect::<Vec<_>>();
-        self.batch_put_from(items, tenant)
+        self.batch_put_from(
+            items,
+            tenant,
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        )
     }
 
-    #[pyo3(signature = (items, *, tenant = None))]
+    #[pyo3(signature = (
+        items,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn batch_put_from_multi_buffers(
         &self,
         items: Vec<(String, Vec<Vec<u8>>)>,
         tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
     ) -> PyResult<i32> {
         let client = self.client_ref()?;
+        let policy = replication_policy(
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        );
         let borrowed = items
             .iter()
-            .map(|(_, buffers)| buffers.iter().map(|buffer| buffer.as_slice()).collect::<Vec<_>>())
+            .map(|(_, buffers)| {
+                buffers
+                    .iter()
+                    .map(|buffer| buffer.as_slice())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let requests = items
             .iter()
@@ -347,6 +515,9 @@ impl PyMooncakeDistributedStore {
                 let mut request = MultiBufferPutRequest::new(key, slices.as_slice());
                 if let Some(tenant) = tenant {
                     request = request.tenant(tenant);
+                }
+                if let Some(policy) = policy.clone() {
+                    request = request.replication(policy);
                 }
                 request
             })
@@ -357,13 +528,30 @@ impl PyMooncakeDistributedStore {
         Ok(0)
     }
 
-    #[pyo3(signature = (keys, all_buffer_ptrs, all_sizes, *, tenant = None))]
+    #[pyo3(signature = (
+        keys,
+        all_buffer_ptrs,
+        all_sizes,
+        *,
+        tenant = None,
+        replica_count = None,
+        preferred_segment = None,
+        preferred_segments = None,
+        prefer_alloc_in_same_node = false,
+        with_soft_pin = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn batch_put_from_multi_buffers_raw(
         &self,
         keys: Vec<String>,
         all_buffer_ptrs: Vec<Vec<usize>>,
         all_sizes: Vec<Vec<usize>>,
         tenant: Option<&str>,
+        replica_count: Option<usize>,
+        preferred_segment: Option<String>,
+        preferred_segments: Option<Vec<String>>,
+        prefer_alloc_in_same_node: bool,
+        with_soft_pin: bool,
     ) -> PyResult<Vec<i32>> {
         let client = self.client_ref()?;
         if keys.len() != all_buffer_ptrs.len() || keys.len() != all_sizes.len() {
@@ -393,6 +581,13 @@ impl PyMooncakeDistributedStore {
                     .collect::<PyResult<Vec<_>>>()
             })
             .collect::<PyResult<Vec<_>>>()?;
+        let policy = replication_policy(
+            replica_count,
+            preferred_segment,
+            preferred_segments,
+            prefer_alloc_in_same_node,
+            with_soft_pin,
+        );
 
         let requests = keys
             .iter()
@@ -402,11 +597,49 @@ impl PyMooncakeDistributedStore {
                 if let Some(tenant) = tenant {
                     request = request.tenant(tenant);
                 }
+                if let Some(policy) = policy.clone() {
+                    request = request.replication(policy);
+                }
                 request
             })
             .collect::<Vec<_>>();
         client
             .batch_put_from_multi_buffers(&requests)
+            .map_err(store_error_to_py)?;
+        Ok(vec![0; keys.len()])
+    }
+
+    #[pyo3(signature = (key, force = false, *, tenant = None))]
+    fn remove(&self, key: &str, force: bool, tenant: Option<&str>) -> PyResult<i32> {
+        let client = self.client_ref()?;
+        match tenant {
+            Some(tenant) => client.remove_in_tenant(tenant, key, force),
+            None => client.remove(key, force),
+        }
+        .map_err(store_error_to_py)?;
+        Ok(0)
+    }
+
+    #[pyo3(signature = (keys, force = false, *, tenant = None))]
+    fn batch_remove(
+        &self,
+        keys: Vec<String>,
+        force: bool,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<i32>> {
+        let client = self.client_ref()?;
+        let objects = keys
+            .iter()
+            .map(|key| {
+                let mut object = ObjectRef::new(key.as_str());
+                if let Some(tenant) = tenant {
+                    object = object.tenant(tenant);
+                }
+                object
+            })
+            .collect::<Vec<_>>();
+        client
+            .batch_remove(&objects, force)
             .map_err(store_error_to_py)?;
         Ok(vec![0; keys.len()])
     }
@@ -456,7 +689,12 @@ impl PyMooncakeDistributedStore {
         let mut buffers = items
             .iter()
             .map(|(_, buffer_ptr, size)| unsafe {
-                slice::from_raw_parts_mut(pointer_from_usize(*buffer_ptr).expect("pointer must be valid").cast::<u8>(), *size)
+                slice::from_raw_parts_mut(
+                    pointer_from_usize(*buffer_ptr)
+                        .expect("pointer must be valid")
+                        .cast::<u8>(),
+                    *size,
+                )
             })
             .collect::<Vec<_>>();
         let mut requests = items
@@ -731,6 +969,35 @@ fn route_to_py(py: Python<'_>, route: &ObjectRoute) -> PyResult<Py<PyAny>> {
     }
     dict.set_item("replicas", replicas)?;
     Ok(dict.into_any().unbind())
+}
+
+fn replication_policy(
+    replica_count: Option<usize>,
+    preferred_segment: Option<String>,
+    preferred_segments: Option<Vec<String>>,
+    prefer_alloc_in_same_node: bool,
+    with_soft_pin: bool,
+) -> Option<ReplicationPolicy> {
+    let mut policy = ReplicationPolicy::new()
+        .prefer_alloc_in_same_node(prefer_alloc_in_same_node)
+        .with_soft_pin(with_soft_pin);
+    let mut has_policy = prefer_alloc_in_same_node || with_soft_pin;
+    if let Some(replica_count) = replica_count {
+        policy = policy.replica_count(replica_count);
+        has_policy = true;
+    }
+    let mut combined_segments = Vec::new();
+    if let Some(segment) = preferred_segment.filter(|segment| !segment.is_empty()) {
+        combined_segments.push(segment);
+    }
+    if let Some(mut segments) = preferred_segments.filter(|segments| !segments.is_empty()) {
+        combined_segments.append(&mut segments);
+    }
+    if !combined_segments.is_empty() {
+        policy = policy.preferred_segments(combined_segments);
+        has_policy = true;
+    }
+    has_policy.then_some(policy)
 }
 
 fn pointer_from_usize(pointer: usize) -> PyResult<*mut c_void> {
