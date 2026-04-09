@@ -29,6 +29,7 @@ CreateLeaderCoordinator(const HABackendSpec& spec) {
             }
             return std::unique_ptr<LeaderCoordinator>(std::move(coordinator));
         }
+        case HABackendType::LOCALFS:
         case HABackendType::K8S:
             return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }

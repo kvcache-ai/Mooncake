@@ -25,6 +25,7 @@ enum class HABackendType {
     ETCD = 1,
     REDIS = 2,
     K8S = 3,
+    LOCALFS = 4,
 };
 
 inline std::string HABackendTypeToString(HABackendType type) {
@@ -37,6 +38,8 @@ inline std::string HABackendTypeToString(HABackendType type) {
             return "redis";
         case HABackendType::K8S:
             return "k8s";
+        case HABackendType::LOCALFS:
+            return "localfs";
     }
     return "unknown";
 }
@@ -50,6 +53,9 @@ inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
     }
     if (type == "k8s") {
         return HABackendType::K8S;
+    }
+    if (type == "localfs" || type == "local_fs") {
+        return HABackendType::LOCALFS;
     }
     return std::nullopt;
 }

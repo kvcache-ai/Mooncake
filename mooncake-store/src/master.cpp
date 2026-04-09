@@ -11,6 +11,8 @@
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/oplog/oplog_backend_config.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -111,6 +113,13 @@ DEFINE_string(ha_backend_type, "etcd",
 DEFINE_string(ha_backend_connstring, "",
               "HA backend connection string. If unset, fallback to "
               "etcd_endpoints for backward compatibility");
+DEFINE_string(oplog_backend_type, "",
+              "Optional OpLog backend type. If unset, fallback to "
+              "ha_backend_type");
+DEFINE_string(oplog_backend_connstring, "",
+              "Optional OpLog backend connection string. If unset and "
+              "oplog_backend_type is not set, fallback to ha backend "
+              "connection string");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
@@ -203,18 +212,6 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 
-namespace {
-
-std::string ResolveHABackendConnstring(
-    const mooncake::MasterConfig& master_config) {
-    if (!master_config.ha_backend_connstring.empty()) {
-        return master_config.ha_backend_connstring;
-    }
-    return master_config.etcd_endpoints;
-}
-
-}  // namespace
-
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -268,6 +265,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("ha_backend_connstring",
                              &master_config.ha_backend_connstring,
                              FLAGS_ha_backend_connstring);
+    default_config.GetString("oplog_backend_type",
+                             &master_config.oplog_backend_type,
+                             FLAGS_oplog_backend_type);
+    default_config.GetString("oplog_backend_connstring",
+                             &master_config.oplog_backend_connstring,
+                             FLAGS_oplog_backend_connstring);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -508,6 +511,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.ha_backend_connstring = FLAGS_ha_backend_connstring;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_backend_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_backend_type = FLAGS_oplog_backend_type;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_backend_connstring", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_backend_connstring = FLAGS_oplog_backend_connstring;
     }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
@@ -784,17 +797,51 @@ int main(int argc, char* argv[]) {
     LoadConfigFromCmdline(master_config, !conf_path.empty());
 
     const std::string ha_backend_connstring =
-        ResolveHABackendConnstring(master_config);
+        mooncake::ha::ResolveConfiguredHABackendConnstring(
+            master_config.ha_backend_connstring, master_config.etcd_endpoints);
+    const std::string oplog_backend_type =
+        mooncake::ha::ResolveConfiguredOpLogBackendType(
+            master_config.ha_backend_type, master_config.oplog_backend_type);
+    const std::string oplog_backend_connstring =
+        mooncake::ha::ResolveConfiguredOpLogBackendConnstring(
+            master_config.ha_backend_type, ha_backend_connstring,
+            master_config.oplog_backend_type,
+            master_config.oplog_backend_connstring);
     if (master_config.enable_ha && ha_backend_connstring.empty()) {
         LOG(FATAL) << "HA backend connection string must be set when "
                    << "enable_ha is true";
         return 1;
+    }
+    if (master_config.enable_ha) {
+        auto parsed_oplog_backend =
+            mooncake::ha::ParseConfiguredOpLogBackendType(
+                master_config.ha_backend_type,
+                master_config.oplog_backend_type);
+        if (!parsed_oplog_backend.has_value()) {
+            LOG(FATAL) << "Invalid oplog backend type: " << oplog_backend_type;
+            return 1;
+        }
+        if (mooncake::ha::SupportsOpLogFollowing(*parsed_oplog_backend) &&
+            oplog_backend_connstring.empty()) {
+            LOG(FATAL) << "OpLog backend connection string must be set when "
+                       << "oplog backend type is "
+                       << mooncake::ha::HABackendTypeToString(
+                              *parsed_oplog_backend);
+            return 1;
+        }
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
             << "HA backend connection string is set but will not be used in "
             << "non-HA mode";
+    }
+    if (!master_config.enable_ha &&
+        mooncake::ha::HasExplicitOpLogBackendConfig(
+            master_config.oplog_backend_type,
+            master_config.oplog_backend_connstring)) {
+        LOG(WARNING) << "OpLog backend config is set but will not be used in "
+                     << "non-HA mode";
     }
     if (!master_config.ha_backend_connstring.empty() &&
         !master_config.etcd_endpoints.empty() &&
@@ -833,6 +880,8 @@ int main(int argc, char* argv[]) {
         << ", enable_offload=" << master_config.enable_offload
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
+        << ", oplog_backend_type=" << oplog_backend_type
+        << ", oplog_backend_connstring=" << oplog_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num

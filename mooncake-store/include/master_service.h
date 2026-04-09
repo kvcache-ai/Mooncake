@@ -1075,6 +1075,10 @@ class MasterService {
 
     const std::string ha_backend_connstring_;
 
+    const std::string oplog_backend_type_;
+
+    const std::string oplog_backend_connstring_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     std::unordered_set<std::string> invalid_replica_endpoints_;

@@ -41,6 +41,7 @@ CreateStandbyProgressStore(const HABackendSpec& spec) {
                     spec.connstring, spec.cluster_namespace));
 #endif
         }
+        case HABackendType::LOCALFS:
         case HABackendType::K8S:
         case HABackendType::UNKNOWN:
             break;

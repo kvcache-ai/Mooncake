@@ -32,12 +32,14 @@ set(MOONCAKE_STORE_SOURCES
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
     ha/oplog/oplog_applier.cpp
+    ha/oplog/oplog_backend_config.cpp
     ha/oplog/oplog_codec.cpp
     ha/oplog/oplog_gc_controller.cpp
     ha/oplog/oplog_manager.cpp
     ha/oplog/oplog_store_factory.cpp
     ha/oplog/oplog_watcher.cpp
     ha/oplog/backends/etcd/etcd_oplog_store.cpp
+    ha/oplog/backends/localfs/localfs_oplog_store.cpp
     ha/oplog/backends/redis/redis_oplog_store.cpp
     ha/progress/standby_progress_store_factory.cpp
     ha/progress/backends/etcd/etcd_standby_progress_store.cpp

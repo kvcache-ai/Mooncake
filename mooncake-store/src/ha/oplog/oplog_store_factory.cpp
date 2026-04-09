@@ -6,6 +6,7 @@
 
 #include "ha/common/etcd/etcd_helper.h"
 #include "ha/oplog/backends/etcd/etcd_oplog_store.h"
+#include "ha/oplog/backends/localfs/localfs_oplog_store.h"
 #include "ha/oplog/backends/redis/redis_oplog_store.h"
 
 namespace mooncake {
@@ -53,6 +54,19 @@ tl::expected<std::shared_ptr<OpLogStore>, ErrorCode> CreateOpLogStore(
             return std::static_pointer_cast<OpLogStore>(store);
 #endif
         }
+        case HABackendType::LOCALFS: {
+            if (spec.connstring.empty() || spec.cluster_namespace.empty()) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto store = std::make_shared<backends::localfs::LocalFsOpLogStore>(
+                spec.connstring, spec.cluster_namespace,
+                options.enable_batch_write);
+            auto err = store->Init();
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+            return std::static_pointer_cast<OpLogStore>(store);
+        }
         case HABackendType::K8S:
         case HABackendType::UNKNOWN:
             break;
@@ -62,7 +76,8 @@ tl::expected<std::shared_ptr<OpLogStore>, ErrorCode> CreateOpLogStore(
 
 bool SupportsOpLogFollowing(HABackendType backend_type) {
     return backend_type == HABackendType::ETCD ||
-           backend_type == HABackendType::REDIS;
+           backend_type == HABackendType::REDIS ||
+           backend_type == HABackendType::LOCALFS;
 }
 
 }  // namespace ha

@@ -13,6 +13,8 @@
 
 #include "ha/metrics/ha_metric_manager.h"
 #include "ha/leadership/leader_coordinator_factory.h"
+#include "ha/oplog/oplog_backend_config.h"
+#include "ha/oplog/oplog_store_factory.h"
 #include "ha/replication_controller.h"
 #include "rpc_service.h"
 
@@ -24,11 +26,6 @@ namespace {
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
 constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
-
-HARuntimeMode ResolveRuntimeMode(HABackendType type) {
-    return type == HABackendType::ETCD ? HARuntimeMode::kSnapshotWithOplog
-                                       : HARuntimeMode::kSnapshotOnly;
-}
 
 HARuntimePhaseStats BuildPromotedStandbyPhaseStats(
     const std::optional<PromotedStandbyState>& promoted_state) {
@@ -47,12 +44,15 @@ HARuntimePhaseStats BuildPromotedStandbyPhaseStats(
     return stats;
 }
 
-std::string ResolveHABackendConnstring(
-    const MasterServiceSupervisorConfig& config) {
-    if (!config.ha_backend_connstring.empty()) {
-        return config.ha_backend_connstring;
+HARuntimeMode ResolveRuntimeMode(const MasterServiceSupervisorConfig& config) {
+    const auto ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+        config.ha_backend_connstring, config.etcd_endpoints);
+    if (ConfiguredOpLogBackendSupportsFollowing(
+            config.ha_backend_type, ha_backend_connstring,
+            config.oplog_backend_type, config.oplog_backend_connstring)) {
+        return HARuntimeMode::kSnapshotWithOplog;
     }
-    return config.etcd_endpoints;
+    return HARuntimeMode::kSnapshotOnly;
 }
 
 tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
@@ -62,7 +62,8 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto connstring = ResolveHABackendConnstring(config);
+    auto connstring = ResolveConfiguredHABackendConnstring(
+        config.ha_backend_connstring, config.etcd_endpoints);
     if (connstring.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -156,7 +157,7 @@ int MasterServiceSupervisor::Start() {
                    << ", backend_type=" << config_.ha_backend_type;
         return -1;
     }
-    const auto runtime_mode = ResolveRuntimeMode(spec->type);
+    const auto runtime_mode = ResolveRuntimeMode(config_);
 
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),

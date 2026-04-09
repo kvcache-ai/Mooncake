@@ -32,6 +32,8 @@ struct MasterConfig {
     bool enable_offload;
     std::string ha_backend_type;
     std::string ha_backend_connstring;
+    std::string oplog_backend_type;
+    std::string oplog_backend_connstring;
     std::string etcd_endpoints;
 
     std::string cluster_id;
@@ -107,6 +109,8 @@ class MasterServiceSupervisorConfig {
     bool rpc_enable_tcp_no_delay = true;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    std::string oplog_backend_type;
+    std::string oplog_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -165,6 +169,8 @@ class MasterServiceSupervisorConfig {
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        oplog_backend_type = config.oplog_backend_type;
+        oplog_backend_connstring = config.oplog_backend_connstring;
         etcd_endpoints = config.etcd_endpoints;
         if (ha_backend_connstring.empty()) {
             ha_backend_connstring = etcd_endpoints;
@@ -269,6 +275,8 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    std::string oplog_backend_type;
+    std::string oplog_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -325,6 +333,8 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        oplog_backend_type = config.oplog_backend_type;
+        oplog_backend_connstring = config.oplog_backend_connstring;
         if (ha_backend_connstring.empty()) {
             ha_backend_connstring = config.etcd_endpoints;
         }
@@ -403,6 +413,8 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        oplog_backend_type = config.oplog_backend_type;
+        oplog_backend_connstring = config.oplog_backend_connstring;
         if (ha_backend_connstring.empty()) {
             ha_backend_connstring = config.etcd_endpoints;
         }
@@ -457,6 +469,8 @@ class MasterServiceConfigBuilder {
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
+    std::string oplog_backend_type_;
+    std::string oplog_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -547,6 +561,18 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_backend_type(
+        const std::string& backend_type) {
+        oplog_backend_type_ = backend_type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_backend_connstring(
+        const std::string& connstring) {
+        oplog_backend_connstring_ = connstring;
         return *this;
     }
 
@@ -739,6 +765,8 @@ class MasterServiceConfig {
     bool enable_offload = false;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    std::string oplog_backend_type;
+    std::string oplog_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -791,6 +819,8 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        oplog_backend_type = config.oplog_backend_type;
+        oplog_backend_connstring = config.oplog_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -850,6 +880,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
+    config.oplog_backend_type = oplog_backend_type_;
+    config.oplog_backend_connstring = oplog_backend_connstring_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;

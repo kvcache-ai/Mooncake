@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <shared_mutex>
 #include <regex>
+#include <string_view>
 #include <unordered_set>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -11,6 +12,7 @@
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
+#include "ha/oplog/oplog_backend_config.h"
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "ha/oplog/oplog_gc_controller.h"
@@ -186,27 +188,39 @@ void MasterService::InitializePersistentOpLogManager() {
         return;
     }
 
-    auto backend_type = ha::ParseHABackendType(ha_backend_type_);
+    const auto backend_type_text = ha::ResolveConfiguredOpLogBackendType(
+        ha_backend_type_, oplog_backend_type_);
+    auto backend_type = ha::ParseHABackendType(backend_type_text);
     if (!backend_type || !ha::SupportsOpLogFollowing(*backend_type)) {
         LOG(INFO) << "HA backend does not provide OpLog following, backend="
-                  << ha_backend_type_;
+                  << backend_type_text;
+        return;
+    }
+
+    const auto backend_connstring = ha::ResolveConfiguredOpLogBackendConnstring(
+        ha_backend_type_, ha_backend_connstring_, oplog_backend_type_,
+        oplog_backend_connstring_);
+    if (backend_connstring.empty()) {
+        LOG(WARNING) << "OpLog backend connection string is empty, backend="
+                     << backend_type_text << ", cluster_id=" << cluster_id_;
         return;
     }
 
     ha::HABackendSpec spec{
         .type = *backend_type,
-        .connstring = ha_backend_connstring_,
+        .connstring = backend_connstring,
         .cluster_namespace = cluster_id_,
     };
     ha::OpLogStoreFactoryOptions options{
         .enable_latest_seq_batch_update =
             *backend_type == ha::HABackendType::ETCD,
-        .enable_batch_write = *backend_type == ha::HABackendType::ETCD,
+        .enable_batch_write = *backend_type == ha::HABackendType::ETCD ||
+                              *backend_type == ha::HABackendType::LOCALFS,
     };
     auto store = ha::CreateOpLogStore(spec, options);
     if (!store) {
         LOG(WARNING) << "Failed to initialize OpLog backend store, backend="
-                     << ha_backend_type_ << ", cluster_id=" << cluster_id_
+                     << backend_type_text << ", cluster_id=" << cluster_id_
                      << ", error=" << toString(store.error());
         return;
     }
@@ -274,6 +288,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_offload_(config.enable_offload),
       ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
+      oplog_backend_type_(config.oplog_backend_type),
+      oplog_backend_connstring_(config.oplog_backend_connstring),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
@@ -2554,7 +2570,9 @@ MasterService::ResolveSnapshotSequenceId() const {
         return ha::OpLogSequenceId{0};
     }
 
-    auto backend_type = ha::ParseHABackendType(ha_backend_type_);
+    const auto backend_type_text = ha::ResolveConfiguredOpLogBackendType(
+        ha_backend_type_, oplog_backend_type_);
+    auto backend_type = ha::ParseHABackendType(backend_type_text);
     if (!backend_type || !ha::SupportsOpLogFollowing(*backend_type)) {
         return ha::OpLogSequenceId{0};
     }
