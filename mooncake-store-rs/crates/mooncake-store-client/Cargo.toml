@@ -8,9 +8,16 @@ mooncake-store-core = { path = "../mooncake-store-core" }
 mooncake-transport = { path = "../mooncake-transport" }
 parking_lot.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
 
 [dev-dependencies]
 mooncake-metadata = { path = "../mooncake-metadata" }

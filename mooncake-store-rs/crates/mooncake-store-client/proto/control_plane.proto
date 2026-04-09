@@ -1,0 +1,154 @@
+syntax = "proto3";
+
+package mooncake.store.control;
+
+service ControlPlaneService {
+  rpc GetRoute(GetRouteRequest) returns (GetRouteReply);
+  rpc CompareAndSwapRoute(CompareAndSwapRouteRequest) returns (CompareAndSwapRouteReply);
+  rpc ReplaceRoute(ReplaceRouteRequest) returns (ReplaceRouteReply);
+  rpc ReserveAny(ReserveAnyRequest) returns (ReserveAnyReply);
+  rpc ReserveSpecific(ReserveSpecificRequest) returns (ReserveSpecificReply);
+  rpc Release(ReleaseRequest) returns (ReleaseReply);
+}
+
+enum ErrorKind {
+  ERROR_KIND_UNSPECIFIED = 0;
+  ERROR_KIND_NOT_FOUND = 1;
+  ERROR_KIND_CONFLICT = 2;
+  ERROR_KIND_INVALID_STATE = 3;
+  ERROR_KIND_STALE_EPOCH = 4;
+  ERROR_KIND_UNSUPPORTED = 5;
+  ERROR_KIND_ALLOCATOR = 6;
+  ERROR_KIND_METADATA = 7;
+  ERROR_KIND_TRANSPORT = 8;
+}
+
+message ErrorDetail {
+  ErrorKind kind = 1;
+  string message = 2;
+}
+
+message ClientRuntimeId {
+  string stable_id = 1;
+  uint64 epoch = 2;
+}
+
+message CompatibilityDescriptor {
+  uint32 store_api_version = 1;
+  uint32 metadata_schema_version = 2;
+  uint32 transport_api_version = 3;
+  repeated string capabilities = 4;
+}
+
+enum RouteState {
+  ROUTE_STATE_UNSPECIFIED = 0;
+  ROUTE_STATE_ACTIVE = 1;
+  ROUTE_STATE_DELETING = 2;
+  ROUTE_STATE_TOMBSTONE = 3;
+}
+
+enum ReplicaTier {
+  REPLICA_TIER_UNSPECIFIED = 0;
+  REPLICA_TIER_DRAM = 1;
+  REPLICA_TIER_NVME = 2;
+  REPLICA_TIER_FILE = 3;
+  REPLICA_TIER_UNKNOWN = 4;
+}
+
+message ReplicaRoute {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset = 3;
+  uint64 segment_offset = 4;
+  uint64 length = 5;
+  optional uint64 checksum = 6;
+  ReplicaTier tier = 7;
+  uint32 priority = 8;
+}
+
+message ObjectRoute {
+  string key = 1;
+  uint64 version = 2;
+  RouteState state = 3;
+  CompatibilityDescriptor compatibility = 4;
+  repeated ReplicaRoute replicas = 5;
+}
+
+message CasResult {
+  bool applied = 1;
+  ObjectRoute current = 2;
+}
+
+message SegmentReservation {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset_bytes = 3;
+  uint64 length_bytes = 4;
+}
+
+message GetRouteRequest {
+  string namespace = 1;
+  string authority = 2;
+  string key = 3;
+}
+
+message GetRouteReply {
+  ObjectRoute route = 1;
+  ErrorDetail error = 2;
+}
+
+message CompareAndSwapRouteRequest {
+  string namespace = 1;
+  string authority = 2;
+  string key = 3;
+  optional uint64 expected_version = 4;
+  ObjectRoute next = 5;
+}
+
+message CompareAndSwapRouteReply {
+  CasResult result = 1;
+  ErrorDetail error = 2;
+}
+
+message ReplaceRouteRequest {
+  string namespace = 1;
+  string authority = 2;
+  string key = 3;
+  ObjectRoute next = 4;
+}
+
+message ReplaceRouteReply {
+  ErrorDetail error = 1;
+}
+
+message ReserveAnyRequest {
+  ClientRuntimeId owner = 1;
+  uint64 length_bytes = 2;
+}
+
+message ReserveAnyReply {
+  SegmentReservation reservation = 1;
+  ErrorDetail error = 2;
+}
+
+message ReserveSpecificRequest {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 length_bytes = 3;
+}
+
+message ReserveSpecificReply {
+  SegmentReservation reservation = 1;
+  ErrorDetail error = 2;
+}
+
+message ReleaseRequest {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset_bytes = 3;
+  uint64 length_bytes = 4;
+}
+
+message ReleaseReply {
+  ErrorDetail error = 1;
+}
