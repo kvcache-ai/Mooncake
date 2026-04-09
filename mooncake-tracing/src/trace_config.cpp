@@ -39,8 +39,9 @@ std::vector<std::string> SplitCsv(const char* value) {
 }
 
 std::string ToLowerCopy(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(
+        value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
 
@@ -56,8 +57,8 @@ TraceConfig LoadTraceConfig(const std::string& service_name,
                             const std::string& process_role) {
     TraceConfig cfg;
     const char* enabled = std::getenv("MC_TRACING_ENABLED");
-    cfg.enabled =
-        enabled && std::string(enabled) != "0" && std::string(enabled) != "false";
+    cfg.enabled = enabled && std::string(enabled) != "0" &&
+                  std::string(enabled) != "false";
     const char* mode = std::getenv("MC_TRACING_EXPORTER");
     cfg.exporter_mode = mode ? mode : (cfg.enabled ? "jsonl" : "off");
     cfg.service_name = service_name;
@@ -65,9 +66,9 @@ TraceConfig LoadTraceConfig(const std::string& service_name,
     cfg.node_id = node ? node : "unknown-node";
     cfg.process_role = process_role;
     const char* path = std::getenv("MC_TRACING_JSONL_PATH");
-    cfg.jsonl_path = path ? path
-                          : BuildLocalTraceFilePath(service_name, cfg.node_id,
-                                                    ".jsonl");
+    cfg.jsonl_path =
+        path ? path
+             : BuildLocalTraceFilePath(service_name, cfg.node_id, ".jsonl");
 
     const char* otlp_endpoint = std::getenv("OTEL_EXPORTER_OTLP_ENDPOINT");
     const char* otlp_traces_endpoint =
@@ -84,8 +85,8 @@ TraceConfig LoadTraceConfig(const std::string& service_name,
     const char* otlp_headers = std::getenv("OTEL_EXPORTER_OTLP_HEADERS");
     const char* otlp_traces_headers =
         std::getenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS");
-    cfg.otlp_headers =
-        otlp_traces_headers ? otlp_traces_headers : (otlp_headers ? otlp_headers : "");
+    cfg.otlp_headers = otlp_traces_headers ? otlp_traces_headers
+                                           : (otlp_headers ? otlp_headers : "");
     const char* otlp_timeout = std::getenv("OTEL_EXPORTER_OTLP_TIMEOUT");
     const char* otlp_traces_timeout =
         std::getenv("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT");
@@ -101,12 +102,12 @@ TraceConfig LoadTraceConfig(const std::string& service_name,
         cfg.remote_endpoints = std::move(parsed_endpoints);
     }
 
-    cfg.exporter_queue_max_items = ParseSizeTEnv(
-        std::getenv("MC_TRACING_EXPORTER_QUEUE_MAX_ITEMS"),
-        cfg.exporter_queue_max_items);
-    cfg.exporter_queue_max_bytes = ParseSizeTEnv(
-        std::getenv("MC_TRACING_EXPORTER_QUEUE_MAX_BYTES"),
-        cfg.exporter_queue_max_bytes);
+    cfg.exporter_queue_max_items =
+        ParseSizeTEnv(std::getenv("MC_TRACING_EXPORTER_QUEUE_MAX_ITEMS"),
+                      cfg.exporter_queue_max_items);
+    cfg.exporter_queue_max_bytes =
+        ParseSizeTEnv(std::getenv("MC_TRACING_EXPORTER_QUEUE_MAX_BYTES"),
+                      cfg.exporter_queue_max_bytes);
     if (const char* retry_base =
             std::getenv("MC_TRACING_EXPORTER_RETRY_BASE_MS")) {
         cfg.exporter_retry_base_ms = std::max(1, std::atoi(retry_base));
@@ -120,8 +121,7 @@ TraceConfig LoadTraceConfig(const std::string& service_name,
         cfg.exporter_retry_max_attempts =
             std::max(0, std::atoi(retry_attempts));
     }
-    if (const char* spool_dir =
-            std::getenv("MC_TRACING_EXPORTER_SPOOL_DIR")) {
+    if (const char* spool_dir = std::getenv("MC_TRACING_EXPORTER_SPOOL_DIR")) {
         cfg.exporter_spool_dir = spool_dir;
     }
 
@@ -130,7 +130,8 @@ TraceConfig LoadTraceConfig(const std::string& service_name,
     }
     if (const char* sampling_ratio =
             std::getenv("MC_TRACING_SAMPLING_BASE_RATIO")) {
-        cfg.sampling_base_ratio = std::clamp(std::atof(sampling_ratio), 0.0, 1.0);
+        cfg.sampling_base_ratio =
+            std::clamp(std::atof(sampling_ratio), 0.0, 1.0);
     }
     if (const char* slow_threshold =
             std::getenv("MC_TRACING_SLOW_THRESHOLD_MS")) {

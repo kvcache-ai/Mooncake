@@ -31,8 +31,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload,
     const std::string& trace_carrier) {
     auto carrier = tracing::DecodeTraceCarrier(trace_carrier);
-    auto& tracing_facade = tracing::TracingFacade::Instance(
-        "mooncake-store", "task-manager");
+    auto& tracing_facade =
+        tracing::TracingFacade::Instance("mooncake-store", "task-manager");
     auto span = carrier.empty()
                     ? tracing_facade.StartSpan(
                           "task_manager.submit_task", nullptr,
@@ -104,15 +104,14 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
 
         Task& task = it->second;
         auto carrier = tracing::DecodeTraceCarrier(task.trace_carrier);
-        auto& tracing_facade = tracing::TracingFacade::Instance(
-            "mooncake-store", "task-manager");
-        auto span = carrier.empty()
-                        ? tracing_facade.StartSpan(
-                              "task_manager.pop_tasks", nullptr,
-                              {{"task.id", UuidToString(task.id)}})
-                        : tracing_facade.StartSpanFromCarrier(
-                              "task_manager.pop_tasks", carrier,
-                              {{"task.id", UuidToString(task.id)}});
+        auto& tracing_facade =
+            tracing::TracingFacade::Instance("mooncake-store", "task-manager");
+        auto span = carrier.empty() ? tracing_facade.StartSpan(
+                                          "task_manager.pop_tasks", nullptr,
+                                          {{"task.id", UuidToString(task.id)}})
+                                    : tracing_facade.StartSpanFromCarrier(
+                                          "task_manager.pop_tasks", carrier,
+                                          {{"task.id", UuidToString(task.id)}});
         task.mark_processing();
         span.AddEvent("task marked processing",
                       {{"assigned_client", UuidToString(client_id)}});
@@ -136,8 +135,8 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
                                                const UUID& task_id,
                                                TaskStatus status,
                                                const std::string& message) {
-    auto& tracing_facade = tracing::TracingFacade::Instance(
-        "mooncake-store", "task-manager");
+    auto& tracing_facade =
+        tracing::TracingFacade::Instance("mooncake-store", "task-manager");
     if (!is_finished_status(status)) {
         LOG(ERROR) << "complete_task: invalid completion status=" << status
                    << ", task_id=" << task_id;
@@ -152,13 +151,12 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 
     Task& task = it->second;
     auto carrier = tracing::DecodeTraceCarrier(task.trace_carrier);
-    auto span = carrier.empty()
-                    ? tracing_facade.StartSpan(
-                          "task_manager.complete_task", nullptr,
-                          {{"task.id", UuidToString(task_id)}})
-                    : tracing_facade.StartSpanFromCarrier(
-                          "task_manager.complete_task", carrier,
-                          {{"task.id", UuidToString(task_id)}});
+    auto span = carrier.empty() ? tracing_facade.StartSpan(
+                                      "task_manager.complete_task", nullptr,
+                                      {{"task.id", UuidToString(task_id)}})
+                                : tracing_facade.StartSpanFromCarrier(
+                                      "task_manager.complete_task", carrier,
+                                      {{"task.id", UuidToString(task_id)}});
 
     if (task.assigned_client != client_id) {
         LOG(ERROR) << "Client " << client_id << " is not assigned to task "
@@ -174,8 +172,8 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
     }
 
     task.mark_complete(status, message);
-    span.SetAttribute("task.status", status == TaskStatus::SUCCESS ? "SUCCESS"
-                                                                   : "FAILED");
+    span.SetAttribute("task.status",
+                      status == TaskStatus::SUCCESS ? "SUCCESS" : "FAILED");
     if (status == TaskStatus::FAILED) {
         span.SetStatus("ERROR");
     }
@@ -195,8 +193,8 @@ ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id,
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
-    auto& tracing_facade = tracing::TracingFacade::Instance(
-        "mooncake-store", "task-manager");
+    auto& tracing_facade =
+        tracing::TracingFacade::Instance("mooncake-store", "task-manager");
     const auto before = manager_->finished_task_history_.size();
     while (manager_->finished_task_history_.size() >
            manager_->max_total_finished_tasks_) {
@@ -213,8 +211,8 @@ void ScopedTaskWriteAccess::prune_finished_tasks() {
 }
 
 void ScopedTaskWriteAccess::prune_expired_tasks() {
-    auto& tracing_facade = tracing::TracingFacade::Instance(
-        "mooncake-store", "task-manager");
+    auto& tracing_facade =
+        tracing::TracingFacade::Instance("mooncake-store", "task-manager");
     const auto pending_before = manager_->total_pending_tasks_;
     const auto processing_before = manager_->total_processing_tasks_;
     const auto now = std::chrono::system_clock::now();

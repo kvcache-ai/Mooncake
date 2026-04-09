@@ -221,7 +221,8 @@ std::string BuildOtlpPayload(const std::vector<TraceRecord>& records) {
     return Json::writeString(builder, root);
 }
 
-bool IsHighPriorityRecord(const TraceRecord& record, const TraceConfig& config) {
+bool IsHighPriorityRecord(const TraceRecord& record,
+                          const TraceConfig& config) {
     if (IsStructuralRecord(record)) {
         return true;
     }
@@ -269,7 +270,8 @@ void OtlpHttpTraceExporter::Export(const TraceRecord& record) {
     (void)TryExport(record, &ignored_error);
 }
 
-void OtlpHttpTraceExporter::ExportBatch(const std::vector<TraceRecord>& records) {
+void OtlpHttpTraceExporter::ExportBatch(
+    const std::vector<TraceRecord>& records) {
     std::string ignored_error;
     (void)TryExportBatch(records, &ignored_error);
 }
@@ -290,7 +292,8 @@ bool OtlpHttpTraceExporter::EnsureCurlLocked() {
         return false;
     }
 
-    header_list_ = curl_slist_append(header_list_, "Content-Type: application/json");
+    header_list_ =
+        curl_slist_append(header_list_, "Content-Type: application/json");
     if (!headers_.empty()) {
         std::stringstream ss(headers_);
         std::string item;
@@ -314,8 +317,8 @@ bool OtlpHttpTraceExporter::EnsureCurlLocked() {
     return true;
 }
 
-bool OtlpHttpTraceExporter::TryExportBatch(const std::vector<TraceRecord>& records,
-                                           std::string* error_message) {
+bool OtlpHttpTraceExporter::TryExportBatch(
+    const std::vector<TraceRecord>& records, std::string* error_message) {
     if (records.empty()) {
         return true;
     }
@@ -348,9 +351,9 @@ bool OtlpHttpTraceExporter::TryExportBatch(const std::vector<TraceRecord>& recor
             << " errbuf=" << errbuf << " body=" << response;
         LOG_EVERY_N(ERROR, 100)
             << "OTLP exporter POST failed url=" << url
-            << " curl=" << curl_easy_strerror(rc)
-            << " http=" << code << " errbuf=" << errbuf
-            << " body=" << response << " batch_size=" << records.size();
+            << " curl=" << curl_easy_strerror(rc) << " http=" << code
+            << " errbuf=" << errbuf << " body=" << response
+            << " batch_size=" << records.size();
         if (error_message) {
             *error_message = oss.str();
         }
@@ -364,7 +367,8 @@ AsyncRemoteTraceExporter::AsyncRemoteTraceExporter(
     : config_(std::move(config)),
       fallback_exporter_(std::move(fallback_exporter)) {
     if (!fallback_exporter_) {
-        fallback_exporter_ = std::make_shared<JsonlTraceExporter>(config_.jsonl_path);
+        fallback_exporter_ =
+            std::make_shared<JsonlTraceExporter>(config_.jsonl_path);
     }
     if (send_fn) {
         remote_send_fns_.push_back(std::move(send_fn));
@@ -463,9 +467,8 @@ void AsyncRemoteTraceExporter::Export(const TraceRecord& record) {
 
 bool AsyncRemoteTraceExporter::FlushForTest(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    return drained_cv_.wait_for(lock, timeout, [this] {
-        return queue_.empty() && !worker_busy_;
-    });
+    return drained_cv_.wait_for(
+        lock, timeout, [this] { return queue_.empty() && !worker_busy_; });
 }
 
 TraceExporterStats AsyncRemoteTraceExporter::SnapshotStats() const {
@@ -495,8 +498,8 @@ size_t AsyncRemoteTraceExporter::EstimateRecordBytes(
     return total;
 }
 
-bool AsyncRemoteTraceExporter::TrySendRemote(const std::vector<TraceRecord>& records,
-                                             std::string* error_message) {
+bool AsyncRemoteTraceExporter::TrySendRemote(
+    const std::vector<TraceRecord>& records, std::string* error_message) {
     std::ostringstream oss;
     for (size_t i = 0; i < remote_send_fns_.size(); ++i) {
         std::string endpoint_error;
@@ -600,7 +603,8 @@ void AsyncRemoteTraceExporter::WorkerMain() {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
             backoff_ms =
-                std::min(backoff_ms * 2, std::max(backoff_ms, config_.exporter_retry_max_ms));
+                std::min(backoff_ms * 2,
+                         std::max(backoff_ms, config_.exporter_retry_max_ms));
         }
 
         if (!exported) {

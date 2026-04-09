@@ -23,8 +23,7 @@ class Span {
     ~Span();
 
     void SetAttribute(const std::string& key, const std::string& value);
-    void AddEvent(const std::string& name,
-                  const TraceAttrs& attrs = {});
+    void AddEvent(const std::string& name, const TraceAttrs& attrs = {});
     void SetStatus(const std::string& status);
     TraceContext context() const;
     bool valid() const { return facade_ != nullptr; }
@@ -34,7 +33,7 @@ class Span {
     class TracingFacade* facade_{nullptr};
     std::unique_ptr<TraceRecord> record_;
     bool ended_{false};
-  };
+};
 
 class TracingFacade {
    public:
@@ -60,6 +59,6 @@ class TracingFacade {
     TraceConfig config_;
     std::shared_ptr<TraceExporter> exporter_;
     std::unique_ptr<TraceSampler> sampler_;
-  };
+};
 
 }  // namespace mooncake::tracing

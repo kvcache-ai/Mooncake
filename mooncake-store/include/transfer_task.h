@@ -175,8 +175,8 @@ class TransferTraceSession {
 
     static TransferTraceSession Start(
         mooncake::tracing::TracingFacade& tracing,
-        const mooncake::tracing::TraceContext* trace_context,
-        size_t batch_size, size_t total_bytes);
+        const mooncake::tracing::TraceContext* trace_context, size_t batch_size,
+        size_t total_bytes);
 
     const mooncake::tracing::TraceContext* parent_context() const {
         return parent_context_.valid() ? &parent_context_ : nullptr;
@@ -220,7 +220,9 @@ class TransferEngineOperationState : public OperationState {
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size,
                                  TransferTraceSession trace_session = {})
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size),
+        : engine_(engine),
+          batch_id_(batch_id),
+          batch_size_(batch_size),
           trace_session_(std::move(trace_session)) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
@@ -429,11 +431,10 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
-    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
-                                         std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code,
-                                         const tracing::TraceContext* trace_context =
-                                             nullptr);
+    std::optional<TransferFuture> submit(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        TransferRequest::OpCode op_code,
+        const tracing::TraceContext* trace_context = nullptr);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
@@ -476,8 +477,7 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code,
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         const tracing::TraceContext* trace_context);
 
     /**
@@ -485,8 +485,7 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code,
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         const tracing::TraceContext* trace_context);
 
     std::optional<TransferFuture> submitFileReadOperation(

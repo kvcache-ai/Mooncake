@@ -67,7 +67,7 @@
 
 namespace mooncake {
 namespace {
-const char* ToTransferStatusName(Transport::TransferStatusEnum status) {
+const char *ToTransferStatusName(Transport::TransferStatusEnum status) {
     switch (status) {
         case Transport::TransferStatusEnum::WAITING:
             return "WAITING";
@@ -87,7 +87,7 @@ const char* ToTransferStatusName(Transport::TransferStatusEnum status) {
     return "UNKNOWN";
 }
 
-const char* ToSliceStatusName(Transport::Slice::SliceStatus status) {
+const char *ToSliceStatusName(Transport::Slice::SliceStatus status) {
     switch (status) {
         case Transport::Slice::PENDING:
             return "PENDING";
@@ -103,7 +103,7 @@ const char* ToSliceStatusName(Transport::Slice::SliceStatus status) {
     return "UNKNOWN";
 }
 
-const char* ToOpcodeName(Transport::TransferRequest::OpCode opcode) {
+const char *ToOpcodeName(Transport::TransferRequest::OpCode opcode) {
     return opcode == Transport::TransferRequest::READ ? "READ" : "WRITE";
 }
 
@@ -115,9 +115,9 @@ struct ObservedTaskState {
 };
 
 ObservedTaskState ObserveTaskState(
-    const std::vector<Transport::Slice*>& slice_list) {
+    const std::vector<Transport::Slice *> &slice_list) {
     ObservedTaskState observed;
-    for (const auto* slice : slice_list) {
+    for (const auto *slice : slice_list) {
         switch (slice->status) {
             case Transport::Slice::SUCCESS:
                 ++observed.success_slice_count;
@@ -189,7 +189,7 @@ Status MultiTransport::submitTransfer(
     size_t task_id = task_begin;
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *>>
         submit_tasks;
     std::vector<std::string> task_transport_names(batch_desc.task_list.size());
     for (auto &request : entries) {
@@ -211,21 +211,20 @@ Status MultiTransport::submitTransfer(
     }
 
     auto batch_context = trace_registry_.LookupBatchContext(batch_id);
-    auto& tracing = tracing::TracingFacade::Instance("mooncake-transfer-engine",
+    auto &tracing = tracing::TracingFacade::Instance("mooncake-transfer-engine",
                                                      "multi-transport");
-    auto batch_submit_span = batch_context.has_value()
-                                 ? tracing.StartSpan(
-                                       "te.batch.submit", &batch_context.value(),
-                                       {{"te.batch_id", std::to_string(batch_id)},
-                                        {"sampling.priority", "structural"},
-                                        {"task.count",
-                                         std::to_string(entries.size())}})
-                                 : tracing.StartSpan(
-                                       "te.batch.submit", nullptr,
-                                       {{"te.batch_id", std::to_string(batch_id)},
-                                        {"sampling.priority", "structural"},
-                                        {"task.count",
-                                         std::to_string(entries.size())}});
+    auto batch_submit_span =
+        batch_context.has_value()
+            ? tracing.StartSpan(
+                  "te.batch.submit", &batch_context.value(),
+                  {{"te.batch_id", std::to_string(batch_id)},
+                   {"sampling.priority", "structural"},
+                   {"task.count", std::to_string(entries.size())}})
+            : tracing.StartSpan(
+                  "te.batch.submit", nullptr,
+                  {{"te.batch_id", std::to_string(batch_id)},
+                   {"sampling.priority", "structural"},
+                   {"task.count", std::to_string(entries.size())}});
     auto batch_submit_context = batch_submit_span.context();
     Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
@@ -238,7 +237,7 @@ Status MultiTransport::submitTransfer(
     }
 
     for (size_t idx = task_begin; idx < batch_desc.task_list.size(); ++idx) {
-        auto& task = batch_desc.task_list[idx];
+        auto &task = batch_desc.task_list[idx];
         mooncake::tracing::TraceContext task_context;
         auto task_span = tracing.StartSpan(
             "te.task.submit", &batch_submit_context,
@@ -256,7 +255,7 @@ Status MultiTransport::submitTransfer(
                            {{"transport.name", task_transport_names[idx]}});
         for (size_t slice_idx = 0; slice_idx < task.slice_list.size();
              ++slice_idx) {
-            auto* slice = task.slice_list[slice_idx];
+            auto *slice = task.slice_list[slice_idx];
             slice->StartTrace(task_context, batch_id, idx, slice_idx,
                               task_transport_names[idx]);
             if (!trace_registry_.MarkSliceQueued(batch_id, idx, slice_idx)) {
@@ -289,7 +288,7 @@ Status MultiTransport::mp_submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+    std::unordered_map<Transport *, std::vector<Transport::TransferTask *>>
         submit_tasks;
     for (auto &request : entries) {
         Transport *transport = nullptr;
@@ -344,8 +343,9 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         status.s = Transport::TransferStatusEnum::TIMEOUT;
         task.is_finished = true;
     } else if (success_slice_count + failed_slice_count == task.slice_count) {
-        status.s = failed_slice_count ? Transport::TransferStatusEnum::FAILED
-                                      : Transport::TransferStatusEnum::COMPLETED;
+        status.s = failed_slice_count
+                       ? Transport::TransferStatusEnum::FAILED
+                       : Transport::TransferStatusEnum::COMPLETED;
         task.is_finished = true;
     } else {
         if (globalConfig().slice_timeout > 0) {
@@ -371,14 +371,14 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     auto task_trace = trace_registry_.LookupTask(batch_id, task_id);
     if (task_trace.has_value()) {
-        auto& tracing_facade = tracing::TracingFacade::Instance(
+        auto &tracing_facade = tracing::TracingFacade::Instance(
             "mooncake-transfer-engine", "multi-transport");
         std::vector<std::pair<std::string, tracing::TraceAttrs>> pending_events;
         pending_events.reserve(task.slice_list.size() + 1);
 
         for (size_t slice_idx = 0; slice_idx < task.slice_list.size();
              ++slice_idx) {
-            auto* slice = task.slice_list[slice_idx];
+            auto *slice = task.slice_list[slice_idx];
             if (slice->status != Transport::Slice::SUCCESS &&
                 slice->status != Transport::Slice::FAILED &&
                 slice->status != Transport::Slice::TIMEOUT) {
@@ -397,10 +397,10 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                     : (slice->status == Transport::Slice::FAILED
                            ? "slice failed"
                            : "slice timeout detected"),
-                tracing::TraceAttrs{{"slice.id", std::to_string(slice_idx)},
-                                    {"slice.length", std::to_string(slice->length)},
-                                    {"slice.status",
-                                     ToSliceStatusName(slice->status)}});
+                tracing::TraceAttrs{
+                    {"slice.id", std::to_string(slice_idx)},
+                    {"slice.length", std::to_string(slice->length)},
+                    {"slice.status", ToSliceStatusName(slice->status)}});
         }
 
         if ((status.s == Transport::TransferStatusEnum::COMPLETED ||
@@ -409,10 +409,11 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             trace_registry_.MarkTaskTerminal(batch_id, task_id)) {
             pending_events.emplace_back(
                 "task terminal status",
-                tracing::TraceAttrs{{"task.id", std::to_string(task_id)},
-                                    {"status", ToTransferStatusName(status.s)},
-                                    {"transferred.bytes",
-                                     std::to_string(status.transferred_bytes)}});
+                tracing::TraceAttrs{
+                    {"task.id", std::to_string(task_id)},
+                    {"status", ToTransferStatusName(status.s)},
+                    {"transferred.bytes",
+                     std::to_string(status.transferred_bytes)}});
         }
 
         if (!pending_events.empty()) {
@@ -422,7 +423,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                  {"task.id", std::to_string(task_id)},
                  {"transport.name", task_trace->transport_name},
                  {"status", ToTransferStatusName(status.s)}});
-            for (const auto& event : pending_events) {
+            for (const auto &event : pending_events) {
                 span.AddEvent(event.first, event.second);
             }
             if (status.s == Transport::TransferStatusEnum::FAILED ||
@@ -487,7 +488,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
          status.s == Transport::TransferStatusEnum::TIMEOUT) &&
         trace_registry_.MarkBatchTerminal(batch_id)) {
         auto batch_context = trace_registry_.LookupBatchContext(batch_id);
-        auto& tracing = tracing::TracingFacade::Instance(
+        auto &tracing = tracing::TracingFacade::Instance(
             "mooncake-transfer-engine", "multi-transport");
         auto span = batch_context.has_value()
                         ? tracing.StartSpan(

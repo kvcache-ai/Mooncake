@@ -229,7 +229,8 @@ TEST_F(TransferTaskTest, StartSpanFromCarrierUsesCarrierSpanAsParent) {
     EXPECT_TRUE(context.force_sample);
 }
 
-TEST_F(TransferTaskTest, TransferTraceSessionCreatesStandaloneRootWhenMissingParent) {
+TEST_F(TransferTaskTest,
+       TransferTraceSessionCreatesStandaloneRootWhenMissingParent) {
     mooncake::tracing::TraceConfig config;
     config.enabled = true;
     config.exporter_mode = "inmemory";
@@ -338,7 +339,8 @@ TEST_F(TransferTaskTest, AsyncRemoteExporterDropsWhenQueueIsFull) {
     config.exporter_retry_max_ms = 2;
     config.exporter_retry_max_attempts = 1;
 
-    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    auto fallback =
+        std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
     mooncake::tracing::AsyncRemoteTraceExporter exporter(
         config, fallback,
         [](const std::vector<mooncake::tracing::TraceRecord>&, std::string*) {
@@ -362,8 +364,7 @@ TEST_F(TransferTaskTest, AsyncRemoteExporterDropsWhenQueueIsFull) {
     EXPECT_GE(stats.fallback_count, 1u);
 }
 
-TEST_F(TransferTaskTest,
-       AsyncRemoteExporterPrefersErrorSpanWhenQueueIsFull) {
+TEST_F(TransferTaskTest, AsyncRemoteExporterPrefersErrorSpanWhenQueueIsFull) {
     mooncake::tracing::TraceConfig config;
     config.enabled = true;
     config.exporter_mode = "remote";
@@ -375,7 +376,8 @@ TEST_F(TransferTaskTest,
     config.exporter_retry_max_ms = 2;
     config.exporter_retry_max_attempts = 0;
 
-    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    auto fallback =
+        std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
     std::atomic<bool> release_remote{false};
     mooncake::tracing::AsyncRemoteTraceExporter exporter(
         config, fallback,
@@ -449,7 +451,8 @@ TEST_F(TransferTaskTest,
     config.exporter_retry_max_ms = 2;
     config.exporter_retry_max_attempts = 0;
 
-    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    auto fallback =
+        std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
     std::atomic<bool> release_remote{false};
     mooncake::tracing::AsyncRemoteTraceExporter exporter(
         config, fallback,
@@ -568,7 +571,8 @@ TEST_F(TransferTaskTest, TraceSamplerDiagKeepsEventfulSpan) {
     EXPECT_FALSE(sampler.ShouldSample(normal_record));
 }
 
-TEST_F(TransferTaskTest, AsyncRemoteExporterSpoolsWhenConfiguredAndRemoteFails) {
+TEST_F(TransferTaskTest,
+       AsyncRemoteExporterSpoolsWhenConfiguredAndRemoteFails) {
     namespace fs = std::filesystem;
 
     mooncake::tracing::TraceConfig config;
@@ -617,7 +621,8 @@ TEST_F(TransferTaskTest, AsyncRemoteExporterSpoolsWhenConfiguredAndRemoteFails) 
     fs::remove_all(spool_dir);
 }
 
-TEST_F(TransferTaskTest, AsyncRemoteExporterCountsQueueFullAndCollectorFailure) {
+TEST_F(TransferTaskTest,
+       AsyncRemoteExporterCountsQueueFullAndCollectorFailure) {
     mooncake::tracing::TraceConfig config;
     config.enabled = true;
     config.exporter_mode = "remote";
@@ -629,7 +634,8 @@ TEST_F(TransferTaskTest, AsyncRemoteExporterCountsQueueFullAndCollectorFailure) 
     config.exporter_retry_max_ms = 2;
     config.exporter_retry_max_attempts = 1;
 
-    auto fallback = std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
+    auto fallback =
+        std::make_shared<mooncake::tracing::InMemoryTraceExporter>();
     mooncake::tracing::AsyncRemoteTraceExporter exporter(
         config, fallback,
         [](const std::vector<mooncake::tracing::TraceRecord>&, std::string*) {
@@ -670,10 +676,9 @@ TEST_F(TransferTaskTest, AsyncRemoteExporterBatchesMultipleRecordsPerSend) {
     std::atomic<bool> release_remote{false};
     mooncake::tracing::AsyncRemoteTraceExporter exporter(
         config, std::make_shared<mooncake::tracing::InMemoryTraceExporter>(),
-        [&release_remote,
-         &remote_calls,
-         &max_batch_size](const std::vector<mooncake::tracing::TraceRecord>& records,
-                          std::string*) {
+        [&release_remote, &remote_calls, &max_batch_size](
+            const std::vector<mooncake::tracing::TraceRecord>& records,
+            std::string*) {
             while (!release_remote.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }

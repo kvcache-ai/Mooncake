@@ -166,9 +166,9 @@ class Transport {
        public:
         void ResetTraceState();
 
-        void StartTrace(const tracing::TraceContext& parent_context,
+        void StartTrace(const tracing::TraceContext &parent_context,
                         BatchID batch_id, size_t task_id, size_t slice_id,
-                        const std::string& transport_name);
+                        const std::string &transport_name);
 
         void markSuccess();
 
@@ -184,7 +184,7 @@ class Transport {
         volatile int64_t ts;
 
        private:
-        void FinishTrace(const char* status_name, bool error);
+        void FinishTrace(const char *status_name, bool error);
 
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION

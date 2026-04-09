@@ -399,13 +399,12 @@ int TransferEngineImpl::sendNotifyByID(
         mooncake::tracing::DecodeCarrierString(notify_msg.trace_carrier);
     auto& tracing = mooncake::tracing::TracingFacade::Instance(
         "mooncake-transfer-engine", "transfer-engine");
-    auto span = tracing.StartSpanFromCarrier(
-        "sendNotifyByID", carrier,
-        {{"target.id", std::to_string(target_id)},
-         {"notify.name", notify_msg.name}});
-    span.AddEvent("notify sent",
-                  {{"target.id", std::to_string(target_id)},
-                   {"notify.name", notify_msg.name}});
+    auto span =
+        tracing.StartSpanFromCarrier("sendNotifyByID", carrier,
+                                     {{"target.id", std::to_string(target_id)},
+                                      {"notify.name", notify_msg.name}});
+    span.AddEvent("notify sent", {{"target.id", std::to_string(target_id)},
+                                  {"notify.name", notify_msg.name}});
     auto desc = metadata_->getSegmentDescByID(target_id);
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
@@ -423,10 +422,9 @@ int TransferEngineImpl::sendNotifyByName(
         "mooncake-transfer-engine", "transfer-engine");
     auto span = tracing.StartSpanFromCarrier(
         "sendNotifyByName", carrier,
-        {{"target.name", remote_agent},
-         {"notify.name", notify_msg.name}});
+        {{"target.name", remote_agent}, {"notify.name", notify_msg.name}});
     span.AddEvent("notify sent", {{"target.name", remote_agent},
-                                   {"notify.name", notify_msg.name}});
+                                  {"notify.name", notify_msg.name}});
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
     if (ret != 0) {

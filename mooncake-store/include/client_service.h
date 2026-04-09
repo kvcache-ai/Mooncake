@@ -529,19 +529,18 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
-    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code,
-                           const tracing::TraceContext* trace_context =
-                               nullptr);
-    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices,
-                            const tracing::TraceContext* trace_context =
-                                nullptr);
-    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices,
-                           const tracing::TraceContext* trace_context =
-                               nullptr);
+    ErrorCode TransferData(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        const tracing::TraceContext* trace_context = nullptr);
+    ErrorCode TransferWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const tracing::TraceContext* trace_context = nullptr);
+    ErrorCode TransferRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices,
+        const tracing::TraceContext* trace_context = nullptr);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -702,11 +701,10 @@ class Client {
      * @param targets Target segments
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    tl::expected<void, ErrorCode> Copy(const std::string& key,
-                                       const std::string& source,
-                                       const std::vector<std::string>& targets,
-                                       const tracing::TraceContext* trace_context =
-                                           nullptr);
+    tl::expected<void, ErrorCode> Copy(
+        const std::string& key, const std::string& source,
+        const std::vector<std::string>& targets,
+        const tracing::TraceContext* trace_context = nullptr);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -715,11 +713,10 @@ class Client {
      * @param target Target segment
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    tl::expected<void, ErrorCode> Move(const std::string& key,
-                                       const std::string& source,
-                                       const std::string& target,
-                                       const tracing::TraceContext* trace_context =
-                                           nullptr);
+    tl::expected<void, ErrorCode> Move(
+        const std::string& key, const std::string& source,
+        const std::string& target,
+        const tracing::TraceContext* trace_context = nullptr);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

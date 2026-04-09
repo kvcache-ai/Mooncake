@@ -179,16 +179,14 @@ TEST_F(TransportTest, BatchTraceRegistryDeduplicatesSliceAndTaskTerminal) {
     MultiTransportTraceRegistry registry;
     Transport::BatchID batch_id = 42;
 
-    tracing::TraceContext batch_context{
-        .trace_id = "trace-1",
-        .span_id = "batch-span",
-        .parent_span_id = "",
-        .correlation_id = "corr-1"};
-    tracing::TraceContext task_context{
-        .trace_id = "trace-1",
-        .span_id = "task-span",
-        .parent_span_id = "batch-span",
-        .correlation_id = "corr-1"};
+    tracing::TraceContext batch_context{.trace_id = "trace-1",
+                                        .span_id = "batch-span",
+                                        .parent_span_id = "",
+                                        .correlation_id = "corr-1"};
+    tracing::TraceContext task_context{.trace_id = "trace-1",
+                                       .span_id = "task-span",
+                                       .parent_span_id = "batch-span",
+                                       .correlation_id = "corr-1"};
 
     registry.RegisterBatch(batch_id, batch_context);
     registry.RegisterTask(batch_id, 0, task_context, "tcp", 2, 1024);
@@ -201,10 +199,10 @@ TEST_F(TransportTest, BatchTraceRegistryDeduplicatesSliceAndTaskTerminal) {
     EXPECT_TRUE(registry.MarkSliceQueued(batch_id, 0, 0));
     EXPECT_FALSE(registry.MarkSliceQueued(batch_id, 0, 0));
 
-    EXPECT_TRUE(registry.MarkSliceTerminal(
-        batch_id, 0, 0, Transport::Slice::SUCCESS));
-    EXPECT_FALSE(registry.MarkSliceTerminal(
-        batch_id, 0, 0, Transport::Slice::SUCCESS));
+    EXPECT_TRUE(
+        registry.MarkSliceTerminal(batch_id, 0, 0, Transport::Slice::SUCCESS));
+    EXPECT_FALSE(
+        registry.MarkSliceTerminal(batch_id, 0, 0, Transport::Slice::SUCCESS));
 
     EXPECT_TRUE(registry.MarkTaskTerminal(batch_id, 0));
     EXPECT_FALSE(registry.MarkTaskTerminal(batch_id, 0));
@@ -217,24 +215,22 @@ TEST_F(TransportTest, BatchTraceRegistryTracksTimeoutAsDistinctTerminal) {
     MultiTransportTraceRegistry registry;
     Transport::BatchID batch_id = 7;
 
-    tracing::TraceContext batch_context{
-        .trace_id = "trace-2",
-        .span_id = "batch-2",
-        .parent_span_id = "",
-        .correlation_id = "corr-2"};
-    tracing::TraceContext task_context{
-        .trace_id = "trace-2",
-        .span_id = "task-2",
-        .parent_span_id = "batch-2",
-        .correlation_id = "corr-2"};
+    tracing::TraceContext batch_context{.trace_id = "trace-2",
+                                        .span_id = "batch-2",
+                                        .parent_span_id = "",
+                                        .correlation_id = "corr-2"};
+    tracing::TraceContext task_context{.trace_id = "trace-2",
+                                       .span_id = "task-2",
+                                       .parent_span_id = "batch-2",
+                                       .correlation_id = "corr-2"};
 
     registry.RegisterBatch(batch_id, batch_context);
     registry.RegisterTask(batch_id, 1, task_context, "rdma", 1, 4096);
 
-    EXPECT_TRUE(registry.MarkSliceTerminal(
-        batch_id, 1, 0, Transport::Slice::TIMEOUT));
-    EXPECT_FALSE(registry.MarkSliceTerminal(
-        batch_id, 1, 0, Transport::Slice::FAILED));
+    EXPECT_TRUE(
+        registry.MarkSliceTerminal(batch_id, 1, 0, Transport::Slice::TIMEOUT));
+    EXPECT_FALSE(
+        registry.MarkSliceTerminal(batch_id, 1, 0, Transport::Slice::FAILED));
 
     auto task = registry.LookupTask(batch_id, 1);
     ASSERT_TRUE(task.has_value());
@@ -246,16 +242,14 @@ TEST_F(TransportTest, BatchTraceRegistryKeepsFirstBatchContext) {
     MultiTransportTraceRegistry registry;
     Transport::BatchID batch_id = 99;
 
-    tracing::TraceContext root_context{
-        .trace_id = "trace-root",
-        .span_id = "root-span",
-        .parent_span_id = "",
-        .correlation_id = "corr-root"};
-    tracing::TraceContext later_context{
-        .trace_id = "trace-root",
-        .span_id = "later-span",
-        .parent_span_id = "root-span",
-        .correlation_id = "corr-root"};
+    tracing::TraceContext root_context{.trace_id = "trace-root",
+                                       .span_id = "root-span",
+                                       .parent_span_id = "",
+                                       .correlation_id = "corr-root"};
+    tracing::TraceContext later_context{.trace_id = "trace-root",
+                                        .span_id = "later-span",
+                                        .parent_span_id = "root-span",
+                                        .correlation_id = "corr-root"};
 
     registry.RegisterBatch(batch_id, root_context);
     registry.RegisterBatch(batch_id, later_context);
@@ -315,11 +309,10 @@ TEST_F(TransportTest, ActiveBatchTraceRegistryUsesProvidedParentContext) {
     ActiveBatchTraceRegistry registry;
     Transport::BatchID batch_id = 321;
 
-    tracing::TraceContext parent_context{
-        .trace_id = "trace-parent",
-        .span_id = "parent-span",
-        .parent_span_id = "",
-        .correlation_id = "corr-parent"};
+    tracing::TraceContext parent_context{.trace_id = "trace-parent",
+                                         .span_id = "parent-span",
+                                         .parent_span_id = "",
+                                         .correlation_id = "corr-parent"};
 
     auto root = registry.EnsureRoot(tracing, batch_id, &parent_context);
     ASSERT_TRUE(root.context.valid());
@@ -364,11 +357,10 @@ TEST_F(TransportTest, SliceTraceLifecycleTracksSuccessAndTimeout) {
     setenv("MC_TRACING_ENABLED", "1", 1);
     setenv("MC_TRACING_EXPORTER", "jsonl", 1);
 
-    tracing::TraceContext parent_context{
-        .trace_id = "trace-slice",
-        .span_id = "task-span",
-        .parent_span_id = "batch-span",
-        .correlation_id = "corr-slice"};
+    tracing::TraceContext parent_context{.trace_id = "trace-slice",
+                                         .span_id = "task-span",
+                                         .parent_span_id = "batch-span",
+                                         .correlation_id = "corr-slice"};
 
     Transport::BatchDesc success_batch;
     success_batch.batch_size = 1;
@@ -381,7 +373,8 @@ TEST_F(TransportTest, SliceTraceLifecycleTracksSuccessAndTimeout) {
     success_slice.length = 512;
     success_slice.status = Transport::Slice::PENDING;
 
-    success_slice.StartTrace(parent_context, success_task.batch_id, 3, 0, "tcp");
+    success_slice.StartTrace(parent_context, success_task.batch_id, 3, 0,
+                             "tcp");
     EXPECT_TRUE(success_slice.has_active_trace_for_test());
     EXPECT_FALSE(success_slice.trace_terminal_recorded_for_test());
 

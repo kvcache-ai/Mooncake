@@ -404,14 +404,13 @@ TEST_F(ClientTaskManagerTest, SerializerPreservesTraceCarrierAndRetryCount) {
     UUID client_id = generate_uuid();
     const std::string trace_carrier = "trace-9|span-9|corr-9";
 
-    auto task_id = manager.get_write_access()
-                       .submit_task_typed_with_trace<TaskType::REPLICA_COPY>(
-                           client_id,
-                           ReplicaCopyPayload{
-                               .key = "key1",
-                               .source = "seg1",
-                               .targets = {"seg2"}},
-                           trace_carrier);
+    auto task_id =
+        manager.get_write_access()
+            .submit_task_typed_with_trace<TaskType::REPLICA_COPY>(
+                client_id,
+                ReplicaCopyPayload{
+                    .key = "key1", .source = "seg1", .targets = {"seg2"}},
+                trace_carrier);
     ASSERT_TRUE(task_id.has_value());
 
     TaskManagerSerializer serializer(&manager);

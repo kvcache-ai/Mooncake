@@ -102,11 +102,10 @@ class TransferEngine {
                           const std::vector<TransferRequest>& entries,
                           const tracing::TraceContext* trace_context = nullptr);
 
-    Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest>& entries,
-                                    TransferMetadata::NotifyDesc notify_msg,
-                                    const tracing::TraceContext* trace_context =
-                                        nullptr);
+    Status submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg,
+        const tracing::TraceContext* trace_context = nullptr);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     // Multi-protocol API

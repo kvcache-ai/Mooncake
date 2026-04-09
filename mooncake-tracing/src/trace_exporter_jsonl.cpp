@@ -63,7 +63,8 @@ std::vector<TraceRecord> InMemoryTraceExporter::Snapshot() const {
 
 JsonlTraceExporter::JsonlTraceExporter(std::string file_path)
     : file_path_(std::move(file_path)) {
-    std::filesystem::create_directories(std::filesystem::path(file_path_).parent_path());
+    std::filesystem::create_directories(
+        std::filesystem::path(file_path_).parent_path());
 }
 void JsonlTraceExporter::Export(const TraceRecord& record) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -84,8 +85,7 @@ std::shared_ptr<TraceExporter> MakeDefaultExporter(
         return std::make_shared<InMemoryTraceExporter>();
     }
     if (config.exporter_mode == "remote" ||
-        config.exporter_mode == "otlp_http" ||
-        config.exporter_mode == "otlp") {
+        config.exporter_mode == "otlp_http" || config.exporter_mode == "otlp") {
         return std::make_shared<AsyncRemoteTraceExporter>(
             config, std::make_shared<JsonlTraceExporter>(config.jsonl_path));
     }

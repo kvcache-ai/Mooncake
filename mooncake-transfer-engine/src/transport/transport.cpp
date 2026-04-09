@@ -63,14 +63,14 @@ void Transport::Slice::StartTrace(const tracing::TraceContext& parent_context,
 
     auto& tracing = tracing::TracingFacade::Instance("mooncake-transfer-engine",
                                                      "multi-transport");
-    trace_span_ = tracing.StartSpan(
-        "te.slice", &parent_context,
-        {{"te.batch_id", std::to_string(batch_id)},
-         {"task.id", std::to_string(task_id)},
-         {"slice.id", std::to_string(slice_id)},
-         {"transport.name", transport_name},
-         {"slice.length", std::to_string(length)},
-         {"slice.status", ToSliceStatusName(status)}});
+    trace_span_ =
+        tracing.StartSpan("te.slice", &parent_context,
+                          {{"te.batch_id", std::to_string(batch_id)},
+                           {"task.id", std::to_string(task_id)},
+                           {"slice.id", std::to_string(slice_id)},
+                           {"transport.name", transport_name},
+                           {"slice.length", std::to_string(length)},
+                           {"slice.status", ToSliceStatusName(status)}});
     if (!trace_span_.valid()) {
         return;
     }
@@ -113,14 +113,13 @@ void Transport::Slice::FinishTrace(const char* status_name, bool error) {
     }
 
     trace_span_.SetAttribute("status", status_name);
-    trace_span_.AddEvent(
-        "slice terminal status",
-        {{"te.batch_id", std::to_string(trace_batch_id_)},
-         {"task.id", std::to_string(trace_task_id_)},
-         {"slice.id", std::to_string(trace_slice_id_)},
-         {"transport.name", trace_transport_name_},
-         {"slice.length", std::to_string(length)},
-         {"status", status_name}});
+    trace_span_.AddEvent("slice terminal status",
+                         {{"te.batch_id", std::to_string(trace_batch_id_)},
+                          {"task.id", std::to_string(trace_task_id_)},
+                          {"slice.id", std::to_string(trace_slice_id_)},
+                          {"transport.name", trace_transport_name_},
+                          {"slice.length", std::to_string(length)},
+                          {"status", status_name}});
     if (error) {
         trace_span_.SetStatus("ERROR");
     }
@@ -128,7 +127,7 @@ void Transport::Slice::FinishTrace(const char* status_name, bool error) {
     trace_terminal_recorded_ = true;
 }
 
-Transport::ThreadLocalSliceCache &Transport::getSliceCache() {
+Transport::ThreadLocalSliceCache& Transport::getSliceCache() {
     return tl_slice_cache;
 }
 
@@ -148,7 +147,7 @@ Transport::BatchID Transport::allocateBatchID(size_t batch_size) {
 }
 
 Status Transport::freeBatchID(BatchID batch_id) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
@@ -165,7 +164,7 @@ Status Transport::freeBatchID(BatchID batch_id) {
     return Status::OK();
 }
 
-int Transport::install(std::string &local_server_name,
+int Transport::install(std::string& local_server_name,
                        std::shared_ptr<TransferMetadata> meta,
                        std::shared_ptr<Topology> topo) {
     local_server_name_ = local_server_name;

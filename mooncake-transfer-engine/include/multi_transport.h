@@ -52,9 +52,9 @@ class MultiTransportTraceRegistry {
         std::unordered_map<size_t, TaskState> tasks;
     };
 
-    void RegisterBatch(BatchID batch_id, const tracing::TraceContext& context) {
+    void RegisterBatch(BatchID batch_id, const tracing::TraceContext &context) {
         std::lock_guard<std::mutex> guard(mutex_);
-        auto& batch = batches_[batch_id];
+        auto &batch = batches_[batch_id];
         if (!batch.context.valid()) {
             batch.context = context;
         }
@@ -76,11 +76,11 @@ class MultiTransportTraceRegistry {
     }
 
     void RegisterTask(BatchID batch_id, size_t task_id,
-                      const tracing::TraceContext& context,
-                      const std::string& transport_name, size_t slice_count,
+                      const tracing::TraceContext &context,
+                      const std::string &transport_name, size_t slice_count,
                       size_t total_bytes) {
         std::lock_guard<std::mutex> guard(mutex_);
-        auto& task = batches_[batch_id].tasks[task_id];
+        auto &task = batches_[batch_id].tasks[task_id];
         task.context = context;
         task.transport_name = transport_name;
         task.slice_count = slice_count;
@@ -107,7 +107,7 @@ class MultiTransportTraceRegistry {
 
     bool MarkSliceQueued(BatchID batch_id, size_t task_id, size_t slice_id) {
         std::lock_guard<std::mutex> guard(mutex_);
-        auto* task = FindTaskState(batch_id, task_id);
+        auto *task = FindTaskState(batch_id, task_id);
         if (!task || slice_id >= task->slice_queued.size()) {
             return false;
         }
@@ -121,7 +121,7 @@ class MultiTransportTraceRegistry {
     bool MarkSliceTerminal(BatchID batch_id, size_t task_id, size_t slice_id,
                            Transport::Slice::SliceStatus status) {
         std::lock_guard<std::mutex> guard(mutex_);
-        auto* task = FindTaskState(batch_id, task_id);
+        auto *task = FindTaskState(batch_id, task_id);
         if (!task || slice_id >= task->slice_terminal_states.size()) {
             return false;
         }
@@ -135,7 +135,7 @@ class MultiTransportTraceRegistry {
 
     bool MarkTaskTerminal(BatchID batch_id, size_t task_id) {
         std::lock_guard<std::mutex> guard(mutex_);
-        auto* task = FindTaskState(batch_id, task_id);
+        auto *task = FindTaskState(batch_id, task_id);
         if (!task || task->terminal_recorded) {
             return false;
         }
@@ -154,7 +154,8 @@ class MultiTransportTraceRegistry {
     }
 
    private:
-    static SliceTerminalState MapSliceStatus(Transport::Slice::SliceStatus status) {
+    static SliceTerminalState MapSliceStatus(
+        Transport::Slice::SliceStatus status) {
         switch (status) {
             case Transport::Slice::SUCCESS:
                 return SliceTerminalState::kCompleted;
@@ -167,7 +168,7 @@ class MultiTransportTraceRegistry {
         }
     }
 
-    TaskState* FindTaskState(BatchID batch_id, size_t task_id) {
+    TaskState *FindTaskState(BatchID batch_id, size_t task_id) {
         auto batch_it = batches_.find(batch_id);
         if (batch_it == batches_.end()) {
             return nullptr;
@@ -214,7 +215,7 @@ class MultiTransport {
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
 
     void SetBatchTraceContext(BatchID batch_id,
-                              const tracing::TraceContext& context) {
+                              const tracing::TraceContext &context) {
         trace_registry_.RegisterBatch(batch_id, context);
     }
 

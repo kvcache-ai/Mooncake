@@ -26,14 +26,16 @@ bool HasAttrValue(const TraceAttrs& attrs, const std::string& key,
 
 double DeterministicSampleValue(const TraceRecord& record) {
     std::hash<std::string> hasher;
-    const auto seed = !record.trace_id.empty() ? record.trace_id : record.span_id;
+    const auto seed =
+        !record.trace_id.empty() ? record.trace_id : record.span_id;
     const auto value = hasher(seed);
     return static_cast<double>(value % 1000000ULL) / 1000000.0;
 }
 }  // namespace
 
 Span::Span(TracingFacade* facade, TraceRecord record)
-    : facade_(facade), record_(std::make_unique<TraceRecord>(std::move(record))) {}
+    : facade_(facade),
+      record_(std::make_unique<TraceRecord>(std::move(record))) {}
 Span::Span(Span&& other) noexcept { *this = std::move(other); }
 Span& Span::operator=(Span&& other) noexcept {
     if (this != &other) {
@@ -51,16 +53,17 @@ void Span::SetAttribute(const std::string& key, const std::string& value) {
     if (record_) record_->attrs.emplace_back(key, value);
 }
 void Span::AddEvent(const std::string& name, const TraceAttrs& attrs) {
-    if (record_) record_->events.push_back(TraceEvent{name, NowUnixNano(), attrs});
+    if (record_)
+        record_->events.push_back(TraceEvent{name, NowUnixNano(), attrs});
 }
 void Span::SetStatus(const std::string& status) {
     if (record_) record_->status = status;
 }
 TraceContext Span::context() const {
     if (!record_) return {};
-    return TraceContext{record_->trace_id, record_->span_id,
+    return TraceContext{record_->trace_id,       record_->span_id,
                         record_->parent_span_id, record_->correlation_id,
-                        record_->force_sample, false};
+                        record_->force_sample,   false};
 }
 
 TraceSampler::TraceSampler(TraceConfig config) : config_(std::move(config)) {}
@@ -110,13 +113,16 @@ TracingFacade::TracingFacade(TraceConfig config) : config_(std::move(config)) {
             exporter_ = std::make_shared<InMemoryTraceExporter>();
         } else if (config_.exporter_mode == "remote") {
             exporter_ = std::make_shared<AsyncRemoteTraceExporter>(
-                config_, std::make_shared<JsonlTraceExporter>(config_.jsonl_path));
+                config_,
+                std::make_shared<JsonlTraceExporter>(config_.jsonl_path));
         } else if (config_.exporter_mode == "otlp_http" ||
                    config_.exporter_mode == "otlp") {
             exporter_ = std::make_shared<AsyncRemoteTraceExporter>(
-                config_, std::make_shared<JsonlTraceExporter>(config_.jsonl_path));
+                config_,
+                std::make_shared<JsonlTraceExporter>(config_.jsonl_path));
         } else {
-            exporter_ = std::make_shared<JsonlTraceExporter>(config_.jsonl_path);
+            exporter_ =
+                std::make_shared<JsonlTraceExporter>(config_.jsonl_path);
         }
     }
     sampler_ = std::make_unique<TraceSampler>(config_);
@@ -130,16 +136,18 @@ Span TracingFacade::StartSpan(const std::string& span_name,
     if (!parent) {
         ctx = root;
     } else {
-        ctx.trace_id = parent->trace_id.empty() ? root.trace_id : parent->trace_id;
+        ctx.trace_id =
+            parent->trace_id.empty() ? root.trace_id : parent->trace_id;
         ctx.parent_span_id = parent->span_id;
         ctx.span_id = root.span_id;
-        ctx.correlation_id =
-            parent->correlation_id.empty() ? root.correlation_id
-                                           : parent->correlation_id;
+        ctx.correlation_id = parent->correlation_id.empty()
+                                 ? root.correlation_id
+                                 : parent->correlation_id;
         ctx.force_sample = parent->force_sample;
         ctx.context_missing = parent->context_missing;
     }
-    if (HasAttrValue(attrs, kSamplingPriorityAttr, kStructuralSamplingPriority)) {
+    if (HasAttrValue(attrs, kSamplingPriorityAttr,
+                     kStructuralSamplingPriority)) {
         ctx.force_sample = true;
     }
     TraceRecord rec;

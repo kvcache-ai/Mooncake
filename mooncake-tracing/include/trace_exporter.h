@@ -89,8 +89,8 @@ class OtlpHttpTraceExporter : public TraceExporter {
 
 class AsyncRemoteTraceExporter : public TraceExporter {
    public:
-    using RemoteSendFn = std::function<bool(
-        const std::vector<TraceRecord>&, std::string* error_message)>;
+    using RemoteSendFn = std::function<bool(const std::vector<TraceRecord>&,
+                                            std::string* error_message)>;
 
     AsyncRemoteTraceExporter(TraceConfig config,
                              std::shared_ptr<TraceExporter> fallback_exporter,

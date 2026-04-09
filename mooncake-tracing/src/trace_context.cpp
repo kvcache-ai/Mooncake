@@ -31,16 +31,14 @@ std::string EncodeTraceCarrier(const TraceCarrier& carrier) {
 TraceCarrier DecodeTraceCarrier(const std::string& encoded) {
     TraceCarrier carrier;
     const auto first_sep = encoded.find('|');
-    const auto second_sep =
-        encoded.find('|', first_sep == std::string::npos ? first_sep
-                                                         : first_sep + 1);
+    const auto second_sep = encoded.find(
+        '|', first_sep == std::string::npos ? first_sep : first_sep + 1);
     if (first_sep == std::string::npos || second_sep == std::string::npos) {
         return carrier;
     }
     const auto third_sep = encoded.find('|', second_sep + 1);
     carrier.trace_id = encoded.substr(0, first_sep);
-    carrier.span_id =
-        encoded.substr(first_sep + 1, second_sep - first_sep - 1);
+    carrier.span_id = encoded.substr(first_sep + 1, second_sep - first_sep - 1);
     if (third_sep == std::string::npos) {
         carrier.correlation_id = encoded.substr(second_sep + 1);
         return carrier;
@@ -72,7 +70,8 @@ TraceContext RootContext(const std::string& correlation_id) {
     ctx.trace_id = RandomHex(32);
     ctx.span_id = RandomHex(16);
     ctx.parent_span_id.clear();
-    ctx.correlation_id = correlation_id.empty() ? RandomHex(16) : correlation_id;
+    ctx.correlation_id =
+        correlation_id.empty() ? RandomHex(16) : correlation_id;
     return ctx;
 }
 

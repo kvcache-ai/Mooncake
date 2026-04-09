@@ -2369,10 +2369,9 @@ tl::expected<void, ErrorCode> Client::Copy(
     return result;
 }
 
-tl::expected<void, ErrorCode> Client::Move(const std::string& key,
-                                           const std::string& source,
-                                           const std::string& target,
-                                           const tracing::TraceContext* trace_context) {
+tl::expected<void, ErrorCode> Client::Move(
+    const std::string& key, const std::string& source,
+    const std::string& target, const tracing::TraceContext* trace_context) {
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
@@ -2525,18 +2524,17 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     for (const auto& slice : slices) {
         total_bytes += slice.size;
     }
-    auto& tracing = tracing::TracingFacade::Instance("mooncake-store",
-                                                     "client-service");
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "client-service");
     auto operation_span = tracing.StartSpan(
         "mooncake.transfer.operation", trace_context,
-        {{"transfer.op",
-          op_code == TransferRequest::READ ? "READ" : "WRITE"},
+        {{"transfer.op", op_code == TransferRequest::READ ? "READ" : "WRITE"},
          {"slice.count", std::to_string(slices.size())},
          {"bytes.total", std::to_string(total_bytes)}});
 
     auto operation_context = operation_span.context();
-    auto future = transfer_submitter_->submit(replica_descriptor, slices, op_code,
-                                              &operation_context);
+    auto future = transfer_submitter_->submit(replica_descriptor, slices,
+                                              op_code, &operation_context);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         operation_span.SetStatus("ERROR");
@@ -2623,15 +2621,15 @@ void Client::TaskPollThreadMain() {
 
 void Client::SubmitTask(const TaskAssignment& assignment) {
     auto carrier = tracing::DecodeTraceCarrier(assignment.trace_carrier);
-    auto& tracing = tracing::TracingFacade::Instance("mooncake-store",
-                                                     "client-task");
-    auto span = carrier.empty()
-                    ? tracing.StartSpan(
-                          "SubmitTask", nullptr,
-                          {{"task.id", UuidToString(assignment.id)}})
-                    : tracing.StartSpanFromCarrier(
-                          "SubmitTask", carrier,
-                          {{"task.id", UuidToString(assignment.id)}});
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "client-task");
+    auto span =
+        carrier.empty()
+            ? tracing.StartSpan("SubmitTask", nullptr,
+                                {{"task.id", UuidToString(assignment.id)}})
+            : tracing.StartSpanFromCarrier(
+                  "SubmitTask", carrier,
+                  {{"task.id", UuidToString(assignment.id)}});
     if (!task_running_.load()) {
         LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
@@ -2653,16 +2651,17 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
     auto carrier = tracing::DecodeTraceCarrier(assignment.trace_carrier);
-    auto& tracing = tracing::TracingFacade::Instance("mooncake-store",
-                                                     "client-task");
-    auto span = carrier.empty()
-                    ? tracing.StartSpan(
-                          "ExecuteTask", nullptr,
-                          {{"task.id", UuidToString(assignment.id)}})
-                    : tracing.StartSpanFromCarrier(
-                          "ExecuteTask", carrier,
-                          {{"task.id", UuidToString(assignment.id)}});
-    span.SetAttribute("task.retry_count", std::to_string(client_task.retry_count));
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "client-task");
+    auto span =
+        carrier.empty()
+            ? tracing.StartSpan("ExecuteTask", nullptr,
+                                {{"task.id", UuidToString(assignment.id)}})
+            : tracing.StartSpanFromCarrier(
+                  "ExecuteTask", carrier,
+                  {{"task.id", UuidToString(assignment.id)}});
+    span.SetAttribute("task.retry_count",
+                      std::to_string(client_task.retry_count));
 
     try {
         switch (assignment.type) {
