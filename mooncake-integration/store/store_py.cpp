@@ -10,6 +10,7 @@
 #include <cstdlib>  // for atexit
 
 #include "integration_utils.h"
+#include "utils.h"
 
 namespace py = pybind11;
 
@@ -1309,19 +1310,35 @@ PYBIND11_MODULE(store, m) {
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
-               size_t local_buffer_size, const std::string &server_address) {
+               size_t local_buffer_size, const std::string &server_address,
+               const std::string &endpoint_file) {
+                std::string addr = server_address;
+                if (addr.empty()) {
+                    addr = ReadEndpointFromFile(endpoint_file);
+                    if (addr.empty()) {
+                        throw std::runtime_error(
+                            "server_address is empty and no endpoint file "
+                            "found. "
+                            "Please specify server_address or ensure Real "
+                            "Client "
+                            "has written its endpoint file.");
+                    }
+                    LOG(INFO) << "DummyClient: using server_address from "
+                                 "endpoint file: "
+                              << addr;
+                }
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
                 resource_tracker.registerInstance(
                     std::static_pointer_cast<PyClient>(self.store_));
-                auto [ip, port] = parseHostNameWithPort(server_address);
+                auto [ip, port] = parseHostNameWithPort(addr);
                 return self.store_->setup_dummy(
-                    mem_pool_size, local_buffer_size, server_address,
+                    mem_pool_size, local_buffer_size, addr,
                     "@mooncake_client_" + std::to_string(port) + ".sock");
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
-            py::arg("server_address"))
+            py::arg("server_address") = "", py::arg("endpoint_file") = "")
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,

@@ -421,4 +421,10 @@ std::string GetEnvStringOr(const char* name, const std::string& default_value);
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,
                                const std::string& fsdir);
+
+// Read the Real Client endpoint address from a file.
+// If endpoint_file is empty, defaults to ~/.mooncake/real_client.endpoint,
+// then /tmp/mooncake/real_client.endpoint.
+// Returns an empty string if the file does not exist or is unreadable.
+std::string ReadEndpointFromFile(const std::string& endpoint_file = "");
 }  // namespace mooncake

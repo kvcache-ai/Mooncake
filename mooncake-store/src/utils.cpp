@@ -1,4 +1,5 @@
 #include "utils.h"
+#include <fstream>
 
 #include <Slab.h>
 #include <glog/logging.h>
@@ -309,5 +310,28 @@ std::string ResolvePathFromKey(const std::string &key,
         fs::path(root_dir) / fsdir / dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
+}
+
+std::string ReadEndpointFromFile(const std::string &endpoint_file) {
+    std::vector<std::string> candidates;
+    if (!endpoint_file.empty()) {
+        candidates.push_back(endpoint_file);
+    } else {
+        const char *home = getenv("HOME");
+        if (home) {
+            candidates.push_back(std::string(home) +
+                                 "/.mooncake/real_client.endpoint");
+        }
+        candidates.push_back("/tmp/mooncake/real_client.endpoint");
+    }
+    for (const auto &path : candidates) {
+        std::ifstream ifs(path);
+        if (!ifs) continue;
+        std::string addr;
+        if (std::getline(ifs, addr) && !addr.empty()) {
+            return addr;
+        }
+    }
+    return "";
 }
 }  // namespace mooncake
