@@ -7,6 +7,8 @@ use crate::route::{
 };
 
 pub trait MetadataBackend: Send + Sync {
+    fn route_namespace(&self) -> String;
+
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()>;
 
     fn update_client_state(
@@ -57,6 +59,22 @@ pub trait MetadataBackend: Send + Sync {
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()>;
 
     fn get_handoff(&self, stable_id: &ClientStableId) -> Result<Option<HandoffPlan>>;
+}
+
+pub trait RouteDirectory: Send + Sync {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>>;
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> Result<CasResult>;
 }
 
 pub trait PlacementStrategy: Send + Sync {

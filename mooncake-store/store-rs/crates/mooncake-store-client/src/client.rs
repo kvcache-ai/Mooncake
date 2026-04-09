@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey,
-    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteState, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, StoreError,
+    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteDirectory, RouteState, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
@@ -20,6 +20,7 @@ use crate::memory::{
 };
 use crate::observability::OperationTracker;
 use crate::placement::PlacementPlanner;
+use crate::route_directory::{build_route_directory, RouteControlMode};
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
 const DEFAULT_TENANT: &str = "default";
@@ -231,6 +232,7 @@ pub struct StoreClientBuilder {
     transport: Option<Arc<dyn StoreTransport>>,
     transport_factory: Option<Arc<dyn StoreTransportFactory>>,
     write_mode: WriteMode,
+    route_control: RouteControlMode,
 }
 
 impl StoreClientBuilder {
@@ -247,6 +249,7 @@ impl StoreClientBuilder {
             transport: None,
             transport_factory: None,
             write_mode: WriteMode::LocalOnly,
+            route_control: RouteControlMode::EmbeddedWrh,
         }
     }
 
@@ -313,6 +316,11 @@ impl StoreClientBuilder {
         self
     }
 
+    pub fn route_control(mut self, route_control: RouteControlMode) -> Self {
+        self.route_control = route_control;
+        self
+    }
+
     pub fn build(self, expires_at_ms: u64) -> Result<StoreClient> {
         if self.default_tenant.is_empty() {
             return Err(StoreError::InvalidState(
@@ -321,6 +329,10 @@ impl StoreClientBuilder {
         }
 
         let mut endpoints = self.endpoints;
+        endpoints
+            .labels
+            .entry("route".to_string())
+            .or_insert_with(|| "true".to_string());
         if let Some(transport) = self.transport.as_ref() {
             if endpoints.rpc_address.is_empty() {
                 let (host, port) = transport.rpc_server_address()?;
@@ -347,8 +359,11 @@ impl StoreClientBuilder {
             expires_at_ms,
         };
         self.metadata.upsert_client_lease(&lease)?;
+        let route_directory =
+            build_route_directory(self.route_control, self.metadata.clone(), &lease);
         Ok(StoreClient {
             metadata: self.metadata,
+            route_directory,
             lease,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
@@ -464,6 +479,7 @@ pub trait MooncakeCompatibilityFacade {
 
 pub struct StoreClient {
     metadata: Arc<dyn MetadataBackend>,
+    route_directory: Arc<dyn RouteDirectory>,
     lease: ClientLease,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
@@ -921,7 +937,9 @@ impl StoreClient {
             }
         };
 
-        let current = self.metadata.get_object_route(&scoped_key)?;
+        let current = self
+            .route_directory
+            .get_object_route(&self.lease, &scoped_key)?;
         let expected_version = current.as_ref().map(|route| route.version);
         let next_version = current
             .as_ref()
@@ -948,7 +966,8 @@ impl StoreClient {
                 })
                 .collect(),
         };
-        let cas = self.metadata.compare_and_swap_object_route(
+        let cas = self.route_directory.compare_and_swap_object_route(
+            &self.lease,
             &route.key,
             expected_version,
             Some(&route),
@@ -970,9 +989,12 @@ impl StoreClient {
         for object in objects {
             let tenant = object.tenant.unwrap_or(self.default_tenant());
             let scoped = self.scoped_key(tenant, object.key);
-            let route = self.metadata.get_object_route(&scoped)?.ok_or_else(|| {
-                StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
-            })?;
+            let route = self
+                .route_directory
+                .get_object_route(&self.lease, &scoped)?
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
+                })?;
             if route.state != RouteState::Active {
                 return Err(StoreError::InvalidState(format!(
                     "tenant={tenant} key={} is not active",
@@ -1407,7 +1429,9 @@ impl StoreClient {
                 });
             }
 
-            let current = self.metadata.get_object_route(&entry.scoped_key)?;
+            let current = self
+                .route_directory
+                .get_object_route(&self.lease, &entry.scoped_key)?;
             let expected_version = current.as_ref().map(|route| route.version);
             let next_version = current
                 .as_ref()
@@ -1450,7 +1474,8 @@ impl StoreClient {
 
         let mut published = Vec::with_capacity(routes.len());
         for (index, pending) in routes.into_iter().enumerate() {
-            let cas = match self.metadata.compare_and_swap_object_route(
+            let cas = match self.route_directory.compare_and_swap_object_route(
+                &self.lease,
                 &pending.key,
                 pending.expected_version,
                 Some(&pending.route),
@@ -1771,8 +1796,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_in_tenant(&self, tenant: &str, key: &str) -> Result<Option<ObjectRoute>> {
-        self.metadata
-            .get_object_route(&self.scoped_key(tenant, key))
+        self.route_directory
+            .get_object_route(&self.lease, &self.scoped_key(tenant, key))
     }
 
     fn cas_route(
@@ -1791,8 +1816,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
-        self.metadata
-            .compare_and_swap_object_route(&self.scoped_key(tenant, key), expected, next)
+        self.route_directory.compare_and_swap_object_route(
+            &self.lease,
+            &self.scoped_key(tenant, key),
+            expected,
+            next,
+        )
     }
 
     fn register_local_memory(&self) -> Result<()> {
@@ -1895,14 +1924,20 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("remove");
         let _ = force;
         let scoped_key = self.scoped_key(tenant, key);
-        let Some(route) = self.metadata.get_object_route(&scoped_key)? else {
+        let Some(route) = self
+            .route_directory
+            .get_object_route(&self.lease, &scoped_key)?
+        else {
             let result = Err(StoreError::NotFound(format!("tenant={tenant} key={key}")));
             tracker.finish(&result, 0);
             return result;
         };
-        let cas =
-            self.metadata
-                .compare_and_swap_object_route(&scoped_key, Some(route.version), None)?;
+        let cas = self.route_directory.compare_and_swap_object_route(
+            &self.lease,
+            &scoped_key,
+            Some(route.version),
+            None,
+        )?;
         let result = if cas.applied {
             self.schedule_route_reclaim(&route)
         } else {
@@ -3179,16 +3214,72 @@ mod tests {
             assert_eq!(replica.length as usize, payload.len());
         }
 
-        let stored = metadata
-            .get_object_route(&ObjectKey::new("tenant-a::key-a"))
-            .expect("route query should succeed")
-            .expect("route should exist");
-        assert_eq!(stored, *route);
+        assert!(
+            metadata
+                .get_object_route(&ObjectKey::new("tenant-a::key-a"))
+                .expect("metadata query should succeed")
+                .is_none(),
+            "embedded WRH authority should keep routes off metadata backend"
+        );
+        assert_eq!(
+            client
+                .query_route_in_tenant("tenant-a", "key-a")
+                .expect("route query should succeed")
+                .expect("route should exist"),
+            *route
+        );
         assert_eq!(
             client
                 .get_in_tenant("tenant-a", "key-a")
                 .expect("get should succeed"),
             payload
+        );
+    }
+
+    #[test]
+    fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let writer_transport = Arc::new(TestTransport::new("writer-segment"));
+        let reader_transport = writer_transport.clone();
+        let writer = StoreClientBuilder::new(metadata.clone(), "writer")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .transport(writer_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("writer build should succeed");
+        let reader = StoreClientBuilder::new(metadata.clone(), "reader")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+
+        writer
+            .put_in_tenant("tenant-a", "peer-key", b"peer-payload")
+            .expect("writer put should succeed");
+
+        assert!(
+            metadata
+                .get_object_route(&ObjectKey::new("tenant-a::peer-key"))
+                .expect("metadata query should succeed")
+                .is_none(),
+            "WRH route directory should keep peer route state off metadata backend"
+        );
+        assert_eq!(
+            reader
+                .query_route_in_tenant("tenant-a", "peer-key")
+                .expect("reader route query should succeed")
+                .expect("route should exist")
+                .key,
+            ObjectKey::new("tenant-a::peer-key")
+        );
+        assert_eq!(
+            reader
+                .get_in_tenant("tenant-a", "peer-key")
+                .expect("reader get should succeed"),
+            b"peer-payload"
         );
     }
 

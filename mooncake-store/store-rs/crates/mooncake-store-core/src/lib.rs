@@ -13,4 +13,4 @@ pub use route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState,
     RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
 };
-pub use traits::{MetadataBackend, PlacementStrategy};
+pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory};
