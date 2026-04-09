@@ -19,6 +19,57 @@ export PYTHONPATH="$PWD/python"
 
 The Python package loads the native extension from the local `target` directory and preloads the upstream Mooncake TE/TENT shared libraries from `third_party/Mooncake/build-rust`.
 
+## Build a Wheel
+
+```bash
+python3 -m venv .venv-build
+. .venv-build/bin/activate
+python -m pip install -U pip maturin
+maturin build --release
+```
+
+The wheel is written to `target/wheels/`. It contains:
+
+- the `mooncake` Python package
+- the `mooncake._store_rs` native extension
+- the repaired runtime shared libraries needed by the extension on Linux
+
+Install the wheel into any compatible virtualenv:
+
+```bash
+pip install target/wheels/mooncake_store_rs-*.whl
+```
+
+## Standalone Client Binary
+
+Build the standalone client runtime:
+
+```bash
+cargo build -p mooncake-store-py --bin mooncake-store-client --release
+```
+
+Start a storage client:
+
+```bash
+./target/release/mooncake-store-client \
+  --local-hostname 127.0.0.1 \
+  --metadata-url redis://127.0.0.1:6380/0 \
+  --storage-bytes $((128 * 1024 * 1024)) \
+  --scratch-bytes $((16 * 1024 * 1024)) \
+  --stable-id store-a \
+  --tenant default \
+  --label pool=pool-a \
+  --metrics-addr 127.0.0.1:9091
+```
+
+Useful flags:
+
+- `--transport-metadata-url` for TENT Redis when the metadata backend uses etcd
+- `--routed-writes` and `--replica-count` to enable routed writer mode
+- `--route-control metadata-only|embedded-wrh` to select the route authority mode
+- `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh
+- `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
+
 ## Basic Example
 
 ```python

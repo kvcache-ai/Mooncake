@@ -10,7 +10,7 @@ use mooncake_store_core::{
 };
 use mooncake_transport::TentEngine;
 
-use crate::config::CompatSetupArgs;
+pub use crate::config::CompatSetupArgs;
 
 pub struct CompatRuntime {
     pub client: StoreClient,
