@@ -256,7 +256,12 @@ impl StoreClientBuilder {
         let mut endpoints = self.endpoints;
         if let Some(transport) = self.transport.as_ref() {
             if endpoints.rpc_address.is_empty() {
-                endpoints.rpc_address = transport.rpc_server_address()?.0;
+                let (host, port) = transport.rpc_server_address()?;
+                endpoints.rpc_address = if port == 0 {
+                    host
+                } else {
+                    format!("{host}:{port}")
+                };
             }
             if endpoints.segment_name.is_none() {
                 endpoints.segment_name = Some(SegmentName::new(transport.segment_name()?));

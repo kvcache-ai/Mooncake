@@ -7,6 +7,7 @@ use mooncake_store_client::{
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
     StoreClientBuilder, TentTransportFactory, init_tracing_from_env, render_prometheus_metrics,
+    start_metrics_http_server_from_env,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result,
@@ -20,6 +21,9 @@ const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     init_tracing_from_env("MC_STORE_RS_TRACE", "MC_STORE_RS_TRACE_FILTER")?;
+    if let Some(address) = start_metrics_http_server_from_env("MC_STORE_RS_METRICS_ADDR")? {
+        println!("metrics http server: http://{address}/metrics");
+    }
     let redis_url = env::var("MC_STORE_RS_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6380/0".to_string());
     let redis_port = env::var("MC_STORE_RS_REDIS_PORT")

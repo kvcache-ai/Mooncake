@@ -32,8 +32,15 @@ cargo build -p mooncake-store-py
 python3 - <<'PY'
 import ctypes
 import time
+import urllib.request
 
-from mooncake.store import MooncakeDistributedStore, metrics_text
+from mooncake.store import (
+    MooncakeDistributedStore,
+    ReplicateConfig,
+    metrics_server_address,
+    metrics_text,
+    stop_metrics_server,
+)
 
 stamp = int(time.time() * 1000)
 store = MooncakeDistributedStore()
@@ -52,6 +59,17 @@ assert store.setup(
 assert store.put("py-key", b"hello-python") == 0
 assert store.get("py-key") == b"hello-python"
 assert store.is_exist("py-key") is True
+assert store.get_size("py-key") == len(b"hello-python")
+assert store.batch_is_exist(["py-key", "missing-key"]) == [1, 0]
+assert store.get_hostname().startswith("127.0.0.1:")
+
+default_config = ReplicateConfig()
+assert store.put_batch(
+    ["put-batch-a", "put-batch-b"],
+    [b"alpha", b"beta"],
+    config=default_config,
+) == 0
+assert store.batch_get(["put-batch-a", "put-batch-b"]) == [b"alpha", b"beta"]
 
 send_buf = ctypes.create_string_buffer(b"zero-copy-payload")
 assert store.register_buffer(ctypes.addressof(send_buf), len(send_buf.raw)) == 0
@@ -61,8 +79,8 @@ assert store.register_buffer(ctypes.addressof(recv_buf), len(recv_buf.raw)) == 0
 bytes_read = store.get_into("py-zc", ctypes.addressof(recv_buf), len(recv_buf.raw))
 assert bytes_read == len(send_buf.raw)
 assert recv_buf.raw[:bytes_read] == send_buf.raw
-assert store.unregister_buffer(ctypes.addressof(send_buf), len(send_buf.raw)) == 0
-assert store.unregister_buffer(ctypes.addressof(recv_buf), len(recv_buf.raw)) == 0
+assert store.unregister_buffer(ctypes.addressof(send_buf)) == 0
+assert store.unregister_buffer(ctypes.addressof(recv_buf)) == 0
 
 assert store.batch_put([("batch-a", b"aaa"), ("batch-b", b"bbb")]) == 0
 assert store.batch_get(["batch-a", "batch-b"]) == [b"aaa", b"bbb"]
@@ -86,14 +104,71 @@ sizes = store.batch_get_into([
 assert sizes == [len(buf_a.raw), len(buf_b.raw)]
 assert out_a.raw[:sizes[0]] == buf_a.raw
 assert out_b.raw[:sizes[1]] == buf_b.raw
+assert store.batch_put_from(
+    ["raw-from-a", "raw-from-b"],
+    [ctypes.addressof(buf_a), ctypes.addressof(buf_b)],
+    [len(buf_a.raw), len(buf_b.raw)],
+    config=default_config,
+) == 0
+raw_out_a = ctypes.create_string_buffer(len(buf_a.raw))
+raw_out_b = ctypes.create_string_buffer(len(buf_b.raw))
+assert store.register_buffer(ctypes.addressof(raw_out_a), len(raw_out_a.raw)) == 0
+assert store.register_buffer(ctypes.addressof(raw_out_b), len(raw_out_b.raw)) == 0
+raw_sizes = store.batch_get_into(
+    ["raw-from-a", "raw-from-b"],
+    [ctypes.addressof(raw_out_a), ctypes.addressof(raw_out_b)],
+    [len(raw_out_a.raw), len(raw_out_b.raw)],
+)
+assert raw_sizes == [len(buf_a.raw), len(buf_b.raw)]
+assert raw_out_a.raw[:raw_sizes[0]] == buf_a.raw
+assert raw_out_b.raw[:raw_sizes[1]] == buf_b.raw
 for current in (buf_a, buf_b, out_a, out_b):
-    assert store.unregister_buffer(ctypes.addressof(current), len(current.raw)) == 0
+    assert store.unregister_buffer(ctypes.addressof(current)) == 0
+for current in (raw_out_a, raw_out_b):
+    assert store.unregister_buffer(ctypes.addressof(current)) == 0
 
 assert store.batch_put_from_multi_buffers([
     ("mb-a", [b"left-", b"right"]),
     ("mb-b", [b"up", b"stream"]),
 ]) == 0
 assert store.batch_get_buffer(["mb-a", "mb-b"]) == [b"left-right", b"upstream"]
+
+mb_src_a = ctypes.create_string_buffer(b"left-right")
+mb_src_b = ctypes.create_string_buffer(b"upstream")
+mb_dst_a = ctypes.create_string_buffer(len(mb_src_a.raw))
+mb_dst_b = ctypes.create_string_buffer(len(mb_src_b.raw))
+for current in (mb_src_a, mb_src_b, mb_dst_a, mb_dst_b):
+    assert store.register_buffer(ctypes.addressof(current), len(current.raw)) == 0
+raw_multi_put = store.batch_put_from_multi_buffers(
+    ["raw-mb-a", "raw-mb-b"],
+    [
+        [ctypes.addressof(mb_src_a), ctypes.addressof(mb_src_a) + 5],
+        [ctypes.addressof(mb_src_b), ctypes.addressof(mb_src_b) + 2],
+    ],
+    [
+        [5, len(mb_src_a.raw) - 5],
+        [2, len(mb_src_b.raw) - 2],
+    ],
+    config=default_config,
+)
+assert raw_multi_put == [0, 0]
+raw_multi_sizes = store.batch_get_into_multi_buffers(
+    ["raw-mb-a", "raw-mb-b"],
+    [
+        [ctypes.addressof(mb_dst_a), ctypes.addressof(mb_dst_a) + 5],
+        [ctypes.addressof(mb_dst_b), ctypes.addressof(mb_dst_b) + 2],
+    ],
+    [
+        [5, len(mb_dst_a.raw) - 5],
+        [2, len(mb_dst_b.raw) - 2],
+    ],
+    prefer_alloc_in_same_node=True,
+)
+assert raw_multi_sizes == [len(mb_src_a.raw), len(mb_src_b.raw)]
+assert mb_dst_a.raw[:raw_multi_sizes[0]] == mb_src_a.raw
+assert mb_dst_b.raw[:raw_multi_sizes[1]] == mb_src_b.raw
+for current in (mb_src_a, mb_src_b, mb_dst_a, mb_dst_b):
+    assert store.unregister_buffer(ctypes.addressof(current)) == 0
 
 segments = store.list_segments()
 assert len(segments) >= 1
@@ -104,6 +179,16 @@ metrics = metrics_text()
 assert "mooncake_store_client_operation_total" in metrics
 assert 'operation="put",status="ok"' in metrics
 assert 'operation="batch_get",status="ok"' in metrics
+
+metrics_addr = store.start_metrics_server()
+assert metrics_server_address() == metrics_addr
+with urllib.request.urlopen(f"http://{metrics_addr}/metrics") as response:
+    http_metrics = response.read().decode()
+assert "mooncake_store_client_operation_total" in http_metrics
+assert 'operation="batch_get_into_multi_buffers",status="ok"' in http_metrics
+store.stop_metrics_server()
+assert metrics_server_address() is None
+stop_metrics_server()
 
 store.close()
 print("python compat ok")
