@@ -173,10 +173,9 @@ Status SegmentManager::synchronizeLocal() {
     CHECK_STATUS(registry_->putSegmentDesc(local_desc_));
 
     std::vector<std::string> subscribers_snapshot;
-    subscribers_snapshot.reserve(subscribers_->size());
-
     {
         RWSpinlock::ReadGuard guard(*subscribers_lock_);
+        subscribers_snapshot.reserve(subscribers_->size());
         for (const auto &subscriber : *subscribers_) {
             subscribers_snapshot.emplace_back(subscriber);
         }
