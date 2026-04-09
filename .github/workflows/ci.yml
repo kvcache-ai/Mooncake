@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-    types: [opened, synchronize, reopened, labeled]
+    types: [synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -20,7 +20,6 @@ jobs:
     if: >-
       needs.check-paths.outputs.should-run-downstream == 'true' &&
       (github.event_name == 'push' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -224,7 +223,6 @@ jobs:
     if: >-
       needs.check-paths.outputs.should-run-downstream == 'true' &&
       (github.event_name == 'push' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
@@ -260,7 +258,6 @@ jobs:
     if: >-
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
@@ -406,7 +403,6 @@ jobs:
     if: >-
       needs.check-paths.outputs.should-run-downstream == 'true' &&
       (github.event_name == 'push' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -574,7 +570,6 @@ jobs:
     if: >-
       needs.check-paths.outputs.should-run-downstream == 'true' &&
       (github.event_name == 'push' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
@@ -596,7 +591,6 @@ jobs:
     name: Spell Check with Typos
     if: >-
       github.event_name == 'push' ||
-      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -611,7 +605,6 @@ jobs:
     name: Check code format
     if: >-
       github.event_name == 'push' ||
-      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -659,7 +652,6 @@ jobs:
   check-paths:
     if: >-
       github.event_name == 'push' ||
-      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
@@ -686,7 +678,6 @@ jobs:
     if: >-
       needs.check-paths.outputs.should-run-downstream == 'true' &&
       (github.event_name == 'push' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
