@@ -31,6 +31,108 @@
 
 namespace mooncake {
 
+MasterService::SnapshotReadGuard::SnapshotReadGuard(
+    const MasterService& service)
+    : service_(&service) {
+    {
+        std::unique_lock<std::mutex> gate(service_->snapshot_barrier_mutex_);
+        service_->snapshot_barrier_cv_.wait(
+            gate, [this]() { return !service_->snapshot_writer_pending_; });
+        ++service_->snapshot_active_readers_;
+    }
+    lock_ = std::shared_lock<std::shared_mutex>(service_->snapshot_mutex_);
+}
+
+MasterService::SnapshotReadGuard::SnapshotReadGuard(
+    SnapshotReadGuard&& other) noexcept
+    : service_(other.service_), lock_(std::move(other.lock_)) {
+    other.service_ = nullptr;
+}
+
+MasterService::SnapshotReadGuard& MasterService::SnapshotReadGuard::operator=(
+    SnapshotReadGuard&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    Release();
+    service_ = other.service_;
+    lock_ = std::move(other.lock_);
+    other.service_ = nullptr;
+    return *this;
+}
+
+MasterService::SnapshotReadGuard::~SnapshotReadGuard() { Release(); }
+
+void MasterService::SnapshotReadGuard::Release() {
+    if (service_ == nullptr) {
+        return;
+    }
+
+    lock_.unlock();
+    {
+        std::lock_guard<std::mutex> gate(service_->snapshot_barrier_mutex_);
+        --service_->snapshot_active_readers_;
+        if (service_->snapshot_active_readers_ == 0) {
+            service_->snapshot_barrier_cv_.notify_all();
+        }
+    }
+    service_ = nullptr;
+}
+
+MasterService::SnapshotWriteGuard::SnapshotWriteGuard(MasterService& service)
+    : service_(&service) {
+    {
+        std::unique_lock<std::mutex> gate(service_->snapshot_barrier_mutex_);
+        service_->snapshot_writer_pending_ = true;
+        service_->snapshot_barrier_cv_.wait(
+            gate, [this]() { return service_->snapshot_active_readers_ == 0; });
+    }
+    lock_ = std::unique_lock<std::shared_mutex>(service_->snapshot_mutex_);
+}
+
+MasterService::SnapshotWriteGuard::SnapshotWriteGuard(
+    SnapshotWriteGuard&& other) noexcept
+    : service_(other.service_), lock_(std::move(other.lock_)) {
+    other.service_ = nullptr;
+}
+
+MasterService::SnapshotWriteGuard& MasterService::SnapshotWriteGuard::operator=(
+    SnapshotWriteGuard&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    Release();
+    service_ = other.service_;
+    lock_ = std::move(other.lock_);
+    other.service_ = nullptr;
+    return *this;
+}
+
+MasterService::SnapshotWriteGuard::~SnapshotWriteGuard() { Release(); }
+
+void MasterService::SnapshotWriteGuard::Release() {
+    if (service_ == nullptr) {
+        return;
+    }
+
+    lock_.unlock();
+    {
+        std::lock_guard<std::mutex> gate(service_->snapshot_barrier_mutex_);
+        service_->snapshot_writer_pending_ = false;
+    }
+    service_->snapshot_barrier_cv_.notify_all();
+    service_ = nullptr;
+}
+
+MasterService::SnapshotReadGuard MasterService::AcquireSnapshotReadGuard()
+    const {
+    return SnapshotReadGuard(*this);
+}
+
+MasterService::SnapshotWriteGuard MasterService::AcquireSnapshotWriteGuard() {
+    return SnapshotWriteGuard(*this);
+}
+
 // Snapshot file names
 static const std::string SNAPSHOT_METADATA_FILE = "metadata";
 static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
@@ -465,7 +567,7 @@ MasterService::~MasterService() {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     // Tell the client monitor thread to start timing for this client. To
@@ -517,7 +619,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
     if (ok_client_.contains(client_id)) {
         LOG(WARNING) << "client_id=" << client_id
@@ -607,7 +709,7 @@ void MasterService::TaskCleanupThreadFunc() {
             break;
         }
 
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        auto snapshot_guard = AcquireSnapshotReadGuard();
         auto write_access = task_manager_.get_write_access();
         write_access.prune_expired_tasks();
         write_access.prune_finished_tasks();
@@ -622,7 +724,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     std::string segment_name;
     std::string transport_endpoint;
 
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     // 1. Prepare to unmount the segment by deleting its allocator
     {
         ScopedSegmentAccess segment_access =
@@ -662,7 +764,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -785,7 +887,7 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
     const bool clear_all_segments = segment_name.empty();
@@ -919,7 +1021,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
 
@@ -953,7 +1055,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRO accessor(this, key);
 
     MasterMetricManager::instance().inc_total_get_nums();
@@ -1016,7 +1118,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             << ", slice_length=" << slice_length << ", config=" << config
             << ", action=put_start_begin";
 
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
@@ -1105,7 +1207,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1165,7 +1267,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                Replica& replica)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         accessor.Create(
@@ -1212,7 +1314,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
@@ -1337,7 +1439,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
@@ -1414,7 +1516,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1491,7 +1593,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1549,7 +1651,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
                    << " cannot be the same as move_src=" << src_segment;
@@ -1624,7 +1726,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                                                      const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1717,7 +1819,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1774,7 +1876,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
 auto MasterService::Remove(const std::string& key, bool force)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -1825,7 +1927,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
 
@@ -1881,7 +1983,7 @@ long MasterService::RemoveAll(bool force) {
     uint64_t total_freed_size = 0;
     // Store the current time to avoid repeatedly
     // calling std::chrono::steady_clock::now()
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     auto now = std::chrono::system_clock::now();
 
     for (size_t i = 0; i < kNumShards; i++) {
@@ -1989,7 +2091,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     auto err =
@@ -2006,7 +2108,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();
     auto& client_local_disk_segment =
@@ -2333,9 +2435,11 @@ void MasterService::SnapshotThreadFunc() {
                                    "snapshot descriptor was not initialized"));
         pid_t pid;
         {
-            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
-            LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
-                      << snapshot_id;
+            LOG(INFO) << "[Snapshot] Waiting for snapshot barrier, "
+                      << "snapshot_id=" << snapshot_id;
+            auto snapshot_guard = AcquireSnapshotWriteGuard();
+            LOG(INFO) << "[Snapshot] Locked snapshot barrier and mutex, "
+                      << "snapshot_id=" << snapshot_id;
             const std::string path_prefix =
                 SNAPSHOT_ROOT + "/" + snapshot_id + "/";
             const std::string manifest_path =
@@ -3483,7 +3587,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
 
     // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < kNumShards; i++) {
@@ -3747,7 +3851,7 @@ void MasterService::ClientMonitorFunc() {
             std::vector<UUID> client_ids;
             std::vector<std::string> segment_names;
             std::vector<std::string> segment_transport_endpoints;
-            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+            auto snapshot_guard = AcquireSnapshotReadGuard();
             {
                 // Lock client_mutex and segment_mutex
                 std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -4306,7 +4410,7 @@ std::string MasterService::FormatTimestamp(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -4356,7 +4460,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -4414,7 +4518,7 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     const auto& tasks =
         task_manager_.get_write_access().pop_tasks(client_id, batch_size);
     std::vector<TaskAssignment> assignments;
@@ -4426,7 +4530,7 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto snapshot_guard = AcquireSnapshotReadGuard();
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
                                                request.status, request.message);

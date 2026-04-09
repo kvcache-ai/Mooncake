@@ -441,6 +441,41 @@ class MasterService {
    private:
     struct ObjectMetadata;
 
+    class SnapshotReadGuard {
+       public:
+        explicit SnapshotReadGuard(const MasterService& service);
+        SnapshotReadGuard(const SnapshotReadGuard&) = delete;
+        SnapshotReadGuard& operator=(const SnapshotReadGuard&) = delete;
+        SnapshotReadGuard(SnapshotReadGuard&& other) noexcept;
+        SnapshotReadGuard& operator=(SnapshotReadGuard&& other) noexcept;
+        ~SnapshotReadGuard();
+
+       private:
+        void Release();
+
+        const MasterService* service_{nullptr};
+        std::shared_lock<std::shared_mutex> lock_;
+    };
+
+    class SnapshotWriteGuard {
+       public:
+        explicit SnapshotWriteGuard(MasterService& service);
+        SnapshotWriteGuard(const SnapshotWriteGuard&) = delete;
+        SnapshotWriteGuard& operator=(const SnapshotWriteGuard&) = delete;
+        SnapshotWriteGuard(SnapshotWriteGuard&& other) noexcept;
+        SnapshotWriteGuard& operator=(SnapshotWriteGuard&& other) noexcept;
+        ~SnapshotWriteGuard();
+
+       private:
+        void Release();
+
+        MasterService* service_{nullptr};
+        std::unique_lock<std::shared_mutex> lock_;
+    };
+
+    SnapshotReadGuard AcquireSnapshotReadGuard() const;
+    SnapshotWriteGuard AcquireSnapshotWriteGuard();
+
     void SnapshotThreadFunc();
 
     // Persist master state
@@ -1117,6 +1152,10 @@ class MasterService {
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
+    mutable std::mutex snapshot_barrier_mutex_;
+    mutable std::condition_variable snapshot_barrier_cv_;
+    mutable size_t snapshot_active_readers_{0};
+    mutable bool snapshot_writer_pending_{false};
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

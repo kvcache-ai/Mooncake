@@ -323,6 +323,30 @@ int MasterServiceSupervisor::Start() {
         }
 
         accept_standby_runtime_updates.store(false, std::memory_order_release);
+
+        auto promote_renewal =
+            leader_coordinator.RenewLeadership(*leadership_session);
+        if (!promote_renewal) {
+            enter_standby_mode(leadership_session->view);
+            if (HandleLeadershipPhaseError(
+                    "promotion renewal startup failure",
+                    "start leadership renewal before promotion",
+                    leader_coordinator, *leadership_session,
+                    promote_renewal.error(), spec->type)) {
+                return -1;
+            }
+            continue;
+        }
+        if (!promote_renewal.value()) {
+            enter_standby_mode(std::nullopt);
+            LogLeadershipReleaseWarning(
+                "promotion renewal expiration",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            LOG(WARNING) << "Leadership expired before standby promotion";
+            admin_server.SetObservedLeader(std::nullopt);
+            continue;
+        }
+
         auto promote_standby = replication_controller->PromoteStandby();
         if (promote_standby != ErrorCode::OK) {
             enter_standby_mode(leadership_session->view);
