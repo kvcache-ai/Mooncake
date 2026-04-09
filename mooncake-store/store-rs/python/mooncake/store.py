@@ -10,8 +10,8 @@ from typing import Iterable, Sequence
 
 
 def _load_native():
-    repo_root = pathlib.Path(__file__).resolve().parents[2]
-    _preload_upstream_libraries(repo_root)
+    package_dir = pathlib.Path(__file__).resolve().parent
+    _preload_upstream_libraries(package_dir)
     try:
         from . import _store_rs as native  # type: ignore
 
@@ -44,15 +44,48 @@ def _load_native():
         )
 
 
-def _preload_upstream_libraries(repo_root: pathlib.Path) -> None:
-    build_root = repo_root / "third_party" / "Mooncake" / "build-rust" / "mooncake-transfer-engine"
-    libraries = [
-        build_root / "src" / "libtransfer_engine.so",
-        build_root / "tent" / "src" / "libtent_shared.so",
-    ]
-    for library in libraries:
+def _preload_upstream_libraries(package_dir: pathlib.Path) -> None:
+    if (package_dir.parent / "mooncake_store_rs.libs").is_dir():
+        return
+    for library in _native_library_candidates(package_dir):
         if library.exists():
             ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+
+
+def _native_library_candidates(package_dir: pathlib.Path) -> list[pathlib.Path]:
+    roots = [
+        package_dir,
+        package_dir / "lib",
+        package_dir.parent,
+        package_dir.parent.parent,
+    ]
+    relative_paths = [
+        pathlib.Path("libtransfer_engine.so"),
+        pathlib.Path("libtent_shared.so"),
+        pathlib.Path("third_party")
+        / "Mooncake"
+        / "build-rust"
+        / "mooncake-transfer-engine"
+        / "src"
+        / "libtransfer_engine.so",
+        pathlib.Path("third_party")
+        / "Mooncake"
+        / "build-rust"
+        / "mooncake-transfer-engine"
+        / "tent"
+        / "src"
+        / "libtent_shared.so",
+    ]
+    candidates: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    for root in roots:
+        for relative_path in relative_paths:
+            candidate = (root / relative_path).resolve()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+    return candidates
 
 
 _native = _load_native()
