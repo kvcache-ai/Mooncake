@@ -70,6 +70,9 @@ static bool supportFabricMem() {
     }
 
 #ifdef USE_CUDA
+    if (!gpu_driver_available()) {
+        return false;
+    }
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
         cuDeviceGetAttribute(&device_support_fabric_mem,

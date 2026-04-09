@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef CUDA_H
-#define CUDA_H
+#ifndef TENT_PLATFORM_CPU_H_
+#define TENT_PLATFORM_CPU_H_
 
 #include "tent/runtime/platform.h"
 #include "tent/common/config.h"
@@ -50,4 +50,4 @@ class CpuPlatform : public Platform {
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // CUDA_H
+#endif  // TENT_PLATFORM_CPU_H_

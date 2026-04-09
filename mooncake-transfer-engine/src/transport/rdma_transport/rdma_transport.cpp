@@ -29,6 +29,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -375,34 +376,43 @@ int RdmaTransport::allocateLocalSegmentID() {
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
+    // DMABUF path requires sequential registration (no parallelism)
+    // Condition: !WITH_NVIDIA_PEERMEM && USE_CUDA && gpu_driver_available()
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
-    for (auto &buffer : buffer_list) {
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                      true, false);
-        if (ret) {
-            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
-                         << buffer.addr << " length " << buffer.length;
-        }
-    }
+    const bool use_sequential = gpu_driver_available();
 #else
-    std::vector<std::future<int>> results;
-    for (auto &buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer, location]() -> int {
-                // Use force_sequential=true to avoid nested parallelism
-                return registerLocalMemoryInternal(buffer.addr, buffer.length,
-                                                   location, true, false, true);
-            }));
-    }
+    const bool use_sequential = false;
+#endif
 
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
-            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
-                         << buffer_list[i].addr << " length "
-                         << buffer_list[i].length;
+    if (use_sequential) {
+        for (auto &buffer : buffer_list) {
+            int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                          true, false);
+            if (ret) {
+                LOG(WARNING)
+                    << "RdmaTransport: Failed to register memory: addr "
+                    << buffer.addr << " length " << buffer.length;
+            }
+        }
+    } else {
+        std::vector<std::future<int>> results;
+        for (auto &buffer : buffer_list) {
+            results.emplace_back(std::async(
+                std::launch::async, [this, buffer, location]() -> int {
+                    return registerLocalMemoryInternal(buffer.addr,
+                                                       buffer.length, location,
+                                                       true, false, true);
+                }));
+        }
+        for (size_t i = 0; i < buffer_list.size(); ++i) {
+            if (results[i].get()) {
+                LOG(WARNING)
+                    << "RdmaTransport: Failed to register memory: addr "
+                    << buffer_list[i].addr << " length "
+                    << buffer_list[i].length;
+            }
         }
     }
-#endif
 
     return metadata_->updateLocalSegmentDesc();
 }

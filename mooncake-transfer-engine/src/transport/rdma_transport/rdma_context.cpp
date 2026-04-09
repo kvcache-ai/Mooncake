@@ -218,44 +218,49 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         length = (size_t)globalConfig().max_mr_size;
     }
 #if defined(USE_MLU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
-    // Implement register memory in a way that does not assume the presence of
-    // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
-    // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
-    // nvidia-peermem.
-    CUmemorytype memType;
-    CUresult result = cuPointerGetAttribute(
-        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+    if (gpu_driver_available()) {
+        // Implement register memory in a way that does not assume the presence
+        // of nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If
+        // memory is on GPU then use ibv_reg_dmabuf_mr() instead which does not
+        // require nvidia-peermem.
+        CUmemorytype memType;
+        CUresult result = cuPointerGetAttribute(
+            &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
-    // Register memory depending on whether memory is on host or GPU.
-    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+        // Register memory depending on whether memory is on host or GPU.
+        if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+            mrMeta.addr = addr;
+            mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+        } else if (memType == CU_MEMORYTYPE_DEVICE) {
+            size_t allocSize;
+            result = cuPointerGetAttribute(
+                &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+            if (result != CUDA_SUCCESS) {
+                const char *errStr;
+                cuGetErrorString(result, &errStr);
+                LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
+                           << (uintptr_t)addr << " cuda error=" << errStr;
+                return ERR_CONTEXT;
+            }
+
+            int dmabuf_fd;
+            result = cuMemGetHandleForAddressRange(
+                &dmabuf_fd, (CUdeviceptr)addr, allocSize,
+                CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+            if (result != CUDA_SUCCESS) {
+                const char *errStr;
+                cuGetErrorString(result, &errStr);
+                LOG(ERROR) << "Failed to retrieve dmabuf for "
+                           << (uintptr_t)addr << " cuda error=" << errStr;
+                return ERR_CONTEXT;
+            }
+            mrMeta.addr = addr;
+            mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
+                                          (uintptr_t)addr, dmabuf_fd, access);
+        }
+    } else {
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
-    } else if (memType == CU_MEMORYTYPE_DEVICE) {
-        size_t allocSize;
-        result = cuPointerGetAttribute(
-            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
-        if (result != CUDA_SUCCESS) {
-            const char *errStr;
-            cuGetErrorString(result, &errStr);
-            LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
-                       << (uintptr_t)addr << " cuda error=" << errStr;
-            return ERR_CONTEXT;
-        }
-
-        int dmabuf_fd;
-        result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, (CUdeviceptr)addr, allocSize,
-            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
-        if (result != CUDA_SUCCESS) {
-            const char *errStr;
-            cuGetErrorString(result, &errStr);
-            LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
-                       << " cuda error=" << errStr;
-            return ERR_CONTEXT;
-        }
-        mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
-                                      (uintptr_t)addr, dmabuf_fd, access);
     }
 #else
     mrMeta.addr = addr;
@@ -563,23 +568,26 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
         // Verify dmabuf support which is required if not using nvidia-peermem.
         // Assume device index matches.
-        CUdevice cuDevice;
-        CUresult result = cuDeviceGet(&cuDevice, i);
-        if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "Failed to query CUDA device";
-            return ERR_CONTEXT;
-        }
-        int dmaBufSupported;
-        result = cuDeviceGetAttribute(
-            &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, cuDevice);
-        if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "Failed to query CUDA device attributes";
-            return ERR_CONTEXT;
-        }
-        if (!dmaBufSupported) {
-            LOG(ERROR) << "DMA BUF supported required for GPU RDMA without "
-                          "nvidia-peermem";
-            return ERR_CONTEXT;
+        if (gpu_driver_available()) {
+            CUdevice cuDevice;
+            CUresult result = cuDeviceGet(&cuDevice, i);
+            if (result != CUDA_SUCCESS) {
+                LOG(ERROR) << "Failed to query CUDA device";
+                return ERR_CONTEXT;
+            }
+            int dmaBufSupported;
+            result = cuDeviceGetAttribute(&dmaBufSupported,
+                                          CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                                          cuDevice);
+            if (result != CUDA_SUCCESS) {
+                LOG(ERROR) << "Failed to query CUDA device attributes";
+                return ERR_CONTEXT;
+            }
+            if (!dmaBufSupported) {
+                LOG(ERROR) << "DMA BUF supported required for GPU RDMA without "
+                              "nvidia-peermem";
+                return ERR_CONTEXT;
+            }
         }
 #endif
 

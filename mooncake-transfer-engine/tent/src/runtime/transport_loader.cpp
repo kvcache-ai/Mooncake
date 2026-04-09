@@ -23,6 +23,7 @@
 #ifdef USE_CUDA
 #include "tent/transport/nvlink/nvlink_transport.h"
 #include "tent/transport/mnnvl/mnnvl_transport.h"
+#include "cuda_loader/cuda_loader.h"
 #endif
 
 #ifdef USE_GDS
@@ -61,19 +62,22 @@ Status TransferEngineImpl::loadTransports() {
 #endif
 
 #ifdef USE_CUDA
-    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
-    if (enable_mnnvl) {
-        if (conf_->get("transports/mnnvl/enable", true))
-            transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
-    } else {
-        if (conf_->get("transports/nvlink/enable", true))
-            transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
+    if (cuda_loader_is_available()) {
+        bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+        if (enable_mnnvl) {
+            if (conf_->get("transports/mnnvl/enable", true))
+                transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
+        } else {
+            if (conf_->get("transports/nvlink/enable", true))
+                transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
+        }
     }
 #endif
 
 #ifdef USE_GDS
-    if (conf_->get("transports/gds/enable", false))
-        transport_list_[GDS] = std::make_shared<GdsTransport>();
+    if (cuda_loader_cufile_available())
+        if (conf_->get("transports/gds/enable", false))
+            transport_list_[GDS] = std::make_shared<GdsTransport>();
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)

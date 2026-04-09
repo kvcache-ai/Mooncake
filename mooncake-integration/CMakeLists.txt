@@ -72,8 +72,7 @@ if (WITH_TE)
     endif()
 
     if (USE_CUDA)
-        find_package(CUDAToolkit REQUIRED)
-        target_link_libraries(engine PRIVATE CUDA::cudart)
+        target_link_libraries(engine PRIVATE cuda_loader)
     endif()
 endif()
 
@@ -193,6 +192,10 @@ endif()
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
     install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
+if (USE_CUDA)
+    install(TARGETS cuda_loader DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 if (WITH_EP)

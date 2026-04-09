@@ -95,21 +95,23 @@ static void* allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                   "Failed to get pointer attributes");
+    if (gpu_runtime_available()) {
+        // check pointer on GPU
+        cudaPointerAttributes attributes;
+        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
+                       "Failed to get pointer attributes");
 
-    if (attributes.type == cudaMemoryTypeDevice) {
-        cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost) {
-        numa_free(addr, size);
-    } else {
-        LOG(ERROR) << "Unknown memory type";
+        if (attributes.type == cudaMemoryTypeDevice) {
+            cudaFree(addr);
+        } else if (attributes.type == cudaMemoryTypeHost) {
+            numa_free(addr, size);
+        } else {
+            LOG(ERROR) << "Unknown memory type";
+        }
+        return;
     }
-#else
-    numa_free(addr, size);
 #endif
+    numa_free(addr, size);
 }
 
 int initiatorWorker(TransferEngine* engine, SegmentID segment_id, int thread_id,
