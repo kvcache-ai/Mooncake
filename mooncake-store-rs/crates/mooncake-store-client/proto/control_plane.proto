@@ -4,11 +4,17 @@ package mooncake.store.control;
 
 service ControlPlaneService {
   rpc GetRoute(GetRouteRequest) returns (GetRouteReply);
+  rpc BatchGetRoutes(BatchGetRoutesRequest) returns (BatchGetRoutesReply);
   rpc CompareAndSwapRoute(CompareAndSwapRouteRequest) returns (CompareAndSwapRouteReply);
+  rpc BatchCompareAndSwapRoutes(BatchCompareAndSwapRoutesRequest) returns (BatchCompareAndSwapRoutesReply);
   rpc ReplaceRoute(ReplaceRouteRequest) returns (ReplaceRouteReply);
+  rpc BatchReplaceRoutes(BatchReplaceRoutesRequest) returns (BatchReplaceRoutesReply);
   rpc ReserveAny(ReserveAnyRequest) returns (ReserveAnyReply);
+  rpc BatchReserveAny(BatchReserveAnyRequest) returns (BatchReserveAnyReply);
   rpc ReserveSpecific(ReserveSpecificRequest) returns (ReserveSpecificReply);
+  rpc BatchReserveSpecific(BatchReserveSpecificRequest) returns (BatchReserveSpecificReply);
   rpc Release(ReleaseRequest) returns (ReleaseReply);
+  rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
 }
 
 enum ErrorKind {
@@ -97,6 +103,16 @@ message GetRouteReply {
   ErrorDetail error = 2;
 }
 
+message BatchGetRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated string keys = 3;
+}
+
+message BatchGetRoutesReply {
+  repeated GetRouteReply replies = 1;
+}
+
 message CompareAndSwapRouteRequest {
   string namespace = 1;
   string authority = 2;
@@ -110,6 +126,22 @@ message CompareAndSwapRouteReply {
   ErrorDetail error = 2;
 }
 
+message RouteCasEntry {
+  string key = 1;
+  optional uint64 expected_version = 2;
+  ObjectRoute next = 3;
+}
+
+message BatchCompareAndSwapRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated RouteCasEntry entries = 3;
+}
+
+message BatchCompareAndSwapRoutesReply {
+  repeated CompareAndSwapRouteReply replies = 1;
+}
+
 message ReplaceRouteRequest {
   string namespace = 1;
   string authority = 2;
@@ -121,6 +153,21 @@ message ReplaceRouteReply {
   ErrorDetail error = 1;
 }
 
+message RouteReplaceEntry {
+  string key = 1;
+  ObjectRoute next = 2;
+}
+
+message BatchReplaceRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated RouteReplaceEntry entries = 3;
+}
+
+message BatchReplaceRoutesReply {
+  repeated ReplaceRouteReply replies = 1;
+}
+
 message ReserveAnyRequest {
   ClientRuntimeId owner = 1;
   uint64 length_bytes = 2;
@@ -129,6 +176,15 @@ message ReserveAnyRequest {
 message ReserveAnyReply {
   SegmentReservation reservation = 1;
   ErrorDetail error = 2;
+}
+
+message BatchReserveAnyRequest {
+  ClientRuntimeId owner = 1;
+  repeated uint64 length_bytes = 2;
+}
+
+message BatchReserveAnyReply {
+  repeated ReserveAnyReply replies = 1;
 }
 
 message ReserveSpecificRequest {
@@ -142,6 +198,20 @@ message ReserveSpecificReply {
   ErrorDetail error = 2;
 }
 
+message ReserveSpecificEntry {
+  string segment_name = 1;
+  uint64 length_bytes = 2;
+}
+
+message BatchReserveSpecificRequest {
+  ClientRuntimeId owner = 1;
+  repeated ReserveSpecificEntry entries = 2;
+}
+
+message BatchReserveSpecificReply {
+  repeated ReserveSpecificReply replies = 1;
+}
+
 message ReleaseRequest {
   ClientRuntimeId owner = 1;
   string segment_name = 2;
@@ -151,4 +221,19 @@ message ReleaseRequest {
 
 message ReleaseReply {
   ErrorDetail error = 1;
+}
+
+message ReleaseEntry {
+  string segment_name = 1;
+  uint64 offset_bytes = 2;
+  uint64 length_bytes = 3;
+}
+
+message BatchReleaseRequest {
+  ClientRuntimeId owner = 1;
+  repeated ReleaseEntry entries = 2;
+}
+
+message BatchReleaseReply {
+  repeated ReleaseReply replies = 1;
 }

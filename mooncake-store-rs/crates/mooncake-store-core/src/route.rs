@@ -114,6 +114,13 @@ pub struct CasResult {
     pub current: Option<ObjectRoute>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteCasRequest {
+    pub key: ObjectKey,
+    pub expected: Option<RouteVersion>,
+    pub next: Option<ObjectRoute>,
+}
+
 fn default_segment_alignment_bytes() -> u64 {
     1
 }
