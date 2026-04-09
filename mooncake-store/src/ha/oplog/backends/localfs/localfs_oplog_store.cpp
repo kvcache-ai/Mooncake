@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <glog/logging.h>
 #include <unistd.h>
+#include <xxhash.h>
 
 #include "ha/oplog/oplog_codec.h"
 #include "types.h"
@@ -66,13 +67,6 @@ ErrorCode LocalFsOpLogStore::Init() {
         return ErrorCode::OK;
     }
 
-    if (!fs::exists(LatestFilePath())) {
-        auto err = AtomicWriteFile(LatestFilePath(), std::string("0"));
-        if (err != ErrorCode::OK) {
-            return err;
-        }
-    }
-
     auto recover_err = RecoverPersistedState();
     if (recover_err != ErrorCode::OK) {
         return recover_err;
@@ -89,10 +83,6 @@ std::string LocalFsOpLogStore::ClusterDir() const {
 
 std::string LocalFsOpLogStore::SegmentsDir() const {
     return ClusterDir() + "/segments";
-}
-
-std::string LocalFsOpLogStore::LatestFilePath() const {
-    return ClusterDir() + "/latest";
 }
 
 std::string LocalFsOpLogStore::BuildSegmentFilename(
@@ -200,23 +190,8 @@ ErrorCode LocalFsOpLogStore::AtomicWriteFile(const std::string& target_path,
     return ErrorCode::OK;
 }
 
-ErrorCode LocalFsOpLogStore::ReadUint64FromFile(const std::string& filepath,
-                                                OpLogSequenceId& value) const {
-    std::ifstream file(filepath);
-    if (!file) {
-        return ErrorCode::OBJECT_NOT_FOUND;
-    }
-
-    std::string content;
-    file >> content;
-    try {
-        value = static_cast<OpLogSequenceId>(std::stoull(content));
-    } catch (...) {
-        LOG(ERROR) << "Invalid LocalFs OpLog numeric file, path=" << filepath
-                   << ", content=" << content;
-        return ErrorCode::INTERNAL_ERROR;
-    }
-    return ErrorCode::OK;
+uint64_t LocalFsOpLogStore::ComputePayloadHash(std::string_view payload) {
+    return XXH64(payload.data(), payload.size(), 0);
 }
 
 std::vector<LocalFsOpLogStore::SegmentInfo> LocalFsOpLogStore::ListSegments()
@@ -249,6 +224,74 @@ std::vector<LocalFsOpLogStore::SegmentInfo> LocalFsOpLogStore::ListSegments()
                   return lhs.min_seq < rhs.min_seq;
               });
     return segments;
+}
+
+bool LocalFsOpLogStore::ShouldFlushPendingBatchLocked() const {
+    return pending_batch_.size() >= kMaxBatchEntries ||
+           pending_batch_bytes_ >= kMaxBatchBytes;
+}
+
+ErrorCode LocalFsOpLogStore::ResolvePersistedPayloadFastPathLocked(
+    OpLogSequenceId sequence_id, std::string_view payload) const {
+    if (last_persisted_seq_id_.load(std::memory_order_acquire) < sequence_id) {
+        return ErrorCode::OBJECT_NOT_FOUND;
+    }
+
+    auto it = persisted_digest_index_.find(sequence_id);
+    if (it == persisted_digest_index_.end()) {
+        return ErrorCode::OBJECT_NOT_FOUND;
+    }
+
+    const PersistedEntryDigest& digest = it->second;
+    if (digest.payload_size != payload.size() ||
+        digest.payload_hash != ComputePayloadHash(payload)) {
+        LOG(ERROR) << "Detected LocalFs OpLog fencing violation, sequence_id="
+                   << sequence_id;
+        return ErrorCode::PERSISTENT_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode LocalFsOpLogStore::ResolvePersistedPayloadFromDisk(
+    OpLogSequenceId sequence_id, std::string_view payload) const {
+    if (last_persisted_seq_id_.load(std::memory_order_acquire) < sequence_id) {
+        return ErrorCode::OBJECT_NOT_FOUND;
+    }
+
+    std::string persisted_payload;
+    const auto err = ReadPayloadForSequence(sequence_id, persisted_payload);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (persisted_payload != payload) {
+        LOG(ERROR) << "Detected LocalFs OpLog fencing violation, sequence_id="
+                   << sequence_id;
+        return ErrorCode::PERSISTENT_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+void LocalFsOpLogStore::CachePersistedEntriesLocked(
+    const std::vector<PendingEntry>& entries) {
+    for (const auto& entry : entries) {
+        PersistedEntryDigest digest{
+            .sequence_id = entry.sequence_id,
+            .payload_hash = ComputePayloadHash(entry.payload),
+            .payload_size = entry.payload.size(),
+        };
+        persisted_digest_queue_.push_back(digest);
+        persisted_digest_index_[entry.sequence_id] = digest;
+    }
+
+    while (persisted_digest_queue_.size() > kPersistedDigestCacheLimit) {
+        const auto oldest = persisted_digest_queue_.front().sequence_id;
+        persisted_digest_queue_.pop_front();
+        auto it = persisted_digest_index_.find(oldest);
+        if (it != persisted_digest_index_.end() &&
+            it->second.sequence_id == oldest) {
+            persisted_digest_index_.erase(it);
+        }
+    }
 }
 
 ErrorCode LocalFsOpLogStore::NormalizePendingEntries(
@@ -400,57 +443,77 @@ ErrorCode LocalFsOpLogStore::ReadPayloadForSequence(
     return ErrorCode::OBJECT_NOT_FOUND;
 }
 
-ErrorCode LocalFsOpLogStore::VerifyPersistedPayloadMatches(
-    OpLogSequenceId sequence_id, const std::string& payload) const {
-    std::string persisted_payload;
-    const auto err = ReadPayloadForSequence(sequence_id, persisted_payload);
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    if (persisted_payload != payload) {
-        LOG(ERROR) << "Detected LocalFs OpLog fencing violation, sequence_id="
-                   << sequence_id;
-        return ErrorCode::PERSISTENT_FAIL;
-    }
-    return ErrorCode::OK;
-}
-
 ErrorCode LocalFsOpLogStore::RecoverPersistedState() {
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        pending_batch_.clear();
+        pending_batch_bytes_ = 0;
+        persisted_digest_queue_.clear();
+        persisted_digest_index_.clear();
+        last_flush_error_ = ErrorCode::OK;
+    }
+
     const auto segments = ListSegments();
     if (segments.empty()) {
         last_persisted_seq_id_.store(0, std::memory_order_release);
-        return AtomicWriteFile(LatestFilePath(), std::string("0"));
+        return ErrorCode::OK;
     }
 
     const auto max_seq = segments.back().max_seq;
     last_persisted_seq_id_.store(max_seq, std::memory_order_release);
-    return AtomicWriteFile(LatestFilePath(), std::to_string(max_seq));
+    return ErrorCode::OK;
 }
 
 void LocalFsOpLogStore::BatchWriteLoop() {
-    while (batch_write_running_.load(std::memory_order_acquire)) {
-        {
-            std::unique_lock<std::mutex> lock(batch_mutex_);
-            if (pending_batch_.empty()) {
-                cv_batch_updated_.wait_for(lock, kBatchTimeout);
-            }
-            if (!batch_write_running_.load(std::memory_order_acquire) &&
-                pending_batch_.empty()) {
+    for (;;) {
+        std::unique_lock<std::mutex> lock(batch_mutex_);
+        cv_batch_updated_.wait(lock, [&]() {
+            return !batch_write_running_.load(std::memory_order_acquire) ||
+                   !pending_batch_.empty();
+        });
+        if (!batch_write_running_.load(std::memory_order_acquire) &&
+            pending_batch_.empty()) {
+            break;
+        }
+
+        const auto flush_deadline =
+            std::chrono::steady_clock::now() + kBatchLinger;
+        while (batch_write_running_.load(std::memory_order_acquire) &&
+               !pending_batch_.empty() && !ShouldFlushPendingBatchLocked()) {
+            if (cv_batch_updated_.wait_until(lock, flush_deadline) ==
+                std::cv_status::timeout) {
                 break;
             }
         }
-        (void)FlushPendingBatch();
+        lock.unlock();
+
+        const auto flush_err = FlushPendingBatch();
+        if (flush_err == ErrorCode::OK) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> state_lock(batch_mutex_);
+            last_flush_error_ = flush_err;
+        }
+        batch_write_running_.store(false, std::memory_order_release);
+        cv_batch_updated_.notify_all();
+        cv_sync_completed_.notify_all();
+        break;
     }
 }
 
 ErrorCode LocalFsOpLogStore::FlushPendingBatch() {
     std::deque<PendingEntry> pending_entries;
+    size_t pending_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(batch_mutex_);
         if (pending_batch_.empty()) {
             return ErrorCode::OK;
         }
         pending_entries.swap(pending_batch_);
+        pending_bytes = pending_batch_bytes_;
+        pending_batch_bytes_ = 0;
     }
 
     std::vector<PendingEntry> entries(
@@ -478,21 +541,27 @@ ErrorCode LocalFsOpLogStore::FlushPendingBatch() {
                    << entries.front().sequence_id
                    << ", last_seq=" << entries.back().sequence_id
                    << ", error=" << toString(write_err);
+        {
+            std::lock_guard<std::mutex> lock(batch_mutex_);
+            for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+                pending_batch_.push_front(std::move(*it));
+            }
+            pending_batch_bytes_ += pending_bytes;
+        }
         cv_sync_completed_.notify_all();
         return write_err;
     }
 
     const auto max_seq = entries.back().sequence_id;
-    last_persisted_seq_id_.store(max_seq, std::memory_order_release);
-    auto latest_err =
-        AtomicWriteFile(LatestFilePath(), std::to_string(max_seq));
-    if (latest_err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to update LocalFs OpLog latest sequence, seq="
-                   << max_seq;
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        CachePersistedEntriesLocked(entries);
+        last_persisted_seq_id_.store(max_seq, std::memory_order_release);
+        last_flush_error_ = ErrorCode::OK;
     }
 
     cv_sync_completed_.notify_all();
-    return latest_err;
+    return ErrorCode::OK;
 }
 
 tl::expected<OpLogSequenceId, ErrorCode> LocalFsOpLogStore::Append(
@@ -515,43 +584,74 @@ tl::expected<OpLogSequenceId, ErrorCode> LocalFsOpLogStore::Append(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (last_persisted_seq_id_.load(std::memory_order_acquire) >=
-        request.expected_next_seq) {
-        const auto verify_err = VerifyPersistedPayloadMatches(
-            request.expected_next_seq, request.payload);
-        if (verify_err == ErrorCode::OK) {
-            return request.expected_next_seq;
-        }
-        if (verify_err != ErrorCode::OBJECT_NOT_FOUND) {
-            return tl::make_unexpected(verify_err);
-        }
-    }
-
     {
         std::lock_guard<std::mutex> lock(batch_mutex_);
-        pending_batch_.push_back(PendingEntry{
-            .payload = request.payload,
-            .sequence_id = request.expected_next_seq,
-        });
+        const auto fast_path_err = ResolvePersistedPayloadFastPathLocked(
+            request.expected_next_seq, request.payload);
+        if (fast_path_err == ErrorCode::OK) {
+            return request.expected_next_seq;
+        }
+        if (fast_path_err != ErrorCode::OBJECT_NOT_FOUND) {
+            return tl::make_unexpected(fast_path_err);
+        }
     }
-    cv_batch_updated_.notify_one();
+
+    const auto disk_resolve_err = ResolvePersistedPayloadFromDisk(
+        request.expected_next_seq, request.payload);
+    if (disk_resolve_err == ErrorCode::OK) {
+        return request.expected_next_seq;
+    }
+    if (disk_resolve_err != ErrorCode::OBJECT_NOT_FOUND) {
+        return tl::make_unexpected(disk_resolve_err);
+    }
 
     std::unique_lock<std::mutex> lock(batch_mutex_);
-    const bool flushed =
-        cv_sync_completed_.wait_for(lock, kSyncWaitTimeout, [&]() {
-            if (last_persisted_seq_id_.load(std::memory_order_acquire) <
-                request.expected_next_seq) {
-                return false;
-            }
-            return VerifyPersistedPayloadMatches(request.expected_next_seq,
-                                                 request.payload) ==
-                   ErrorCode::OK;
-        });
-    if (!flushed) {
-        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    if (last_flush_error_ != ErrorCode::OK) {
+        return tl::make_unexpected(last_flush_error_);
+    }
+    if (!batch_write_running_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    const auto fast_path_err = ResolvePersistedPayloadFastPathLocked(
+        request.expected_next_seq, request.payload);
+    if (fast_path_err == ErrorCode::OK) {
+        return request.expected_next_seq;
+    }
+    if (fast_path_err != ErrorCode::OBJECT_NOT_FOUND) {
+        return tl::make_unexpected(fast_path_err);
     }
 
-    return request.expected_next_seq;
+    pending_batch_.push_back(PendingEntry{
+        .payload = request.payload,
+        .sequence_id = request.expected_next_seq,
+    });
+    pending_batch_bytes_ += request.payload.size();
+    cv_batch_updated_.notify_one();
+
+    cv_sync_completed_.wait(lock, [&]() {
+        const auto verify_err = ResolvePersistedPayloadFastPathLocked(
+            request.expected_next_seq, request.payload);
+        return verify_err == ErrorCode::OK ||
+               verify_err == ErrorCode::PERSISTENT_FAIL ||
+               last_flush_error_ != ErrorCode::OK ||
+               !batch_write_running_.load(std::memory_order_acquire);
+    });
+
+    const auto verify_err = ResolvePersistedPayloadFastPathLocked(
+        request.expected_next_seq, request.payload);
+    if (verify_err == ErrorCode::OK) {
+        return request.expected_next_seq;
+    }
+    if (verify_err == ErrorCode::PERSISTENT_FAIL) {
+        return tl::make_unexpected(verify_err);
+    }
+    if (last_flush_error_ != ErrorCode::OK) {
+        return tl::make_unexpected(last_flush_error_);
+    }
+    if (!batch_write_running_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
 }
 
 tl::expected<OpLogPollResult, ErrorCode> LocalFsOpLogStore::PollFrom(
@@ -608,21 +708,15 @@ tl::expected<OpLogPollResult, ErrorCode> LocalFsOpLogStore::PollFrom(
 
 tl::expected<OpLogSequenceId, ErrorCode>
 LocalFsOpLogStore::GetLatestSequence() {
-    const auto segments = ListSegments();
-    OpLogSequenceId segment_latest = 0;
-    if (!segments.empty()) {
-        segment_latest = segments.back().max_seq;
+    if (enable_batch_write_) {
+        return last_persisted_seq_id_.load(std::memory_order_acquire);
     }
 
-    OpLogSequenceId latest_seq = 0;
-    const auto latest_err = ReadUint64FromFile(LatestFilePath(), latest_seq);
-    if (latest_err == ErrorCode::OK) {
-        return std::max(latest_seq, segment_latest);
+    const auto segments = ListSegments();
+    if (segments.empty()) {
+        return OpLogSequenceId{0};
     }
-    if (latest_err == ErrorCode::OBJECT_NOT_FOUND) {
-        return segment_latest;
-    }
-    return tl::make_unexpected(latest_err);
+    return segments.back().max_seq;
 }
 
 ErrorCode LocalFsOpLogStore::CleanupBefore(OpLogSequenceId before_sequence_id) {

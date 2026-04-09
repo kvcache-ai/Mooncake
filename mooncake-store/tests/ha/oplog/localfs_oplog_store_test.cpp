@@ -2,10 +2,12 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "ha/oplog/oplog_codec.h"
 #include "ha/oplog/oplog_manager.h"
@@ -23,6 +25,23 @@ std::string MakeTempDir() {
 
 std::string MakeClusterNamespace() {
     return "localfs-oplog-cluster-" + UuidToString(generate_uuid());
+}
+
+size_t CountSegmentFiles(const std::string& root_dir,
+                         const std::string& cluster_namespace) {
+    const auto segments_dir =
+        fs::path(root_dir) / cluster_namespace / "segments";
+    if (!fs::exists(segments_dir)) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (const auto& entry : fs::directory_iterator(segments_dir)) {
+        if (entry.is_regular_file()) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 OpLogEntry MakeEntry(OpLogManager& manager, OpType op_type,
@@ -193,6 +212,74 @@ TEST_F(LocalFsOpLogStoreTest, PollFromWaitsForLaterRecords) {
     ASSERT_EQ(1u, poll->records.size());
     EXPECT_EQ(entry.sequence_id, poll->records.front().seq);
     EXPECT_FALSE(poll->timed_out);
+}
+
+TEST_F(LocalFsOpLogStoreTest, BurstAppendCoalescesSegments) {
+    auto writer = CreateWriter();
+    auto reader = CreateReader();
+    ASSERT_NE(writer, nullptr);
+    ASSERT_NE(reader, nullptr);
+
+    constexpr size_t kThreadCount = 8;
+    constexpr size_t kEntryCount = 128;
+
+    OpLogManager manager;
+    std::vector<OpLogEntry> entries;
+    entries.reserve(kEntryCount);
+    for (size_t index = 0; index < kEntryCount; ++index) {
+        entries.push_back(MakeEntry(manager, OpType::PUT_END,
+                                    "burst-key-" + std::to_string(index),
+                                    "burst-payload-" + std::to_string(index)));
+    }
+
+    std::atomic<size_t> next_index{0};
+    std::atomic<size_t> success_count{0};
+    std::atomic<size_t> failure_count{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreadCount);
+    for (size_t worker_id = 0; worker_id < kThreadCount; ++worker_id) {
+        workers.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            while (true) {
+                const size_t index =
+                    next_index.fetch_add(1, std::memory_order_acq_rel);
+                if (index >= entries.size()) {
+                    return;
+                }
+                auto result = writer->Append(
+                    ha::oplog::BuildAppendRequest(entries[index]));
+                if (!result.has_value()) {
+                    failure_count.fetch_add(1, std::memory_order_acq_rel);
+                    return;
+                }
+                success_count.fetch_add(1, std::memory_order_acq_rel);
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    EXPECT_EQ(kEntryCount, success_count.load(std::memory_order_acquire));
+    EXPECT_EQ(0u, failure_count.load(std::memory_order_acquire));
+
+    auto latest = reader->GetLatestSequence();
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_EQ(entries.back().sequence_id, latest.value());
+
+    auto poll =
+        reader->PollFrom(0, kEntryCount + 1, std::chrono::milliseconds(0));
+    ASSERT_TRUE(poll.has_value());
+    EXPECT_EQ(kEntryCount, poll->records.size());
+
+    const auto segment_file_count =
+        CountSegmentFiles(temp_dir_, cluster_namespace_);
+    EXPECT_LT(segment_file_count, kEntryCount);
 }
 
 }  // namespace mooncake::test
