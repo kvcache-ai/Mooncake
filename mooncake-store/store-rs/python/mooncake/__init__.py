@@ -1,5 +1,6 @@
 from .store import (
     MooncakeDistributedStore,
+    MooncakeHostMemAllocator,
     ReplicateConfig,
     init_tracing,
     metrics_server_address,
@@ -10,6 +11,7 @@ from .store import (
 
 __all__ = [
     "MooncakeDistributedStore",
+    "MooncakeHostMemAllocator",
     "ReplicateConfig",
     "init_tracing",
     "metrics_text",

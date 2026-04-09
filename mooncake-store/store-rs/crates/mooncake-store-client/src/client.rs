@@ -4557,9 +4557,17 @@ impl StoreState {
     }
 
     fn buffer_is_registered(&self, buffer: *mut c_void, size: usize) -> bool {
+        let start = buffer as usize;
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
         self.registered_buffers
-            .get(&(buffer as usize))
-            .is_some_and(|registered| *registered >= size)
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(registered_start, registered_size)| {
+                let registered_end = registered_start.saturating_add(*registered_size);
+                start >= *registered_start && end <= registered_end
+            })
     }
 
     fn ensure_non_overlapping(&self, buffer: *mut c_void, size: usize) -> Result<()> {
@@ -4713,7 +4721,7 @@ mod tests {
     use crate::{
         render_prometheus_metrics, reset_metrics, transport::StoreTransport, GetRequest,
         LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest, ObjectRef,
-        PlacementPlanner, PutRequest, ReplicationPolicy, StoreClientBuilder,
+        PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, StoreClientBuilder,
     };
 
     struct TestTransport {
@@ -6215,6 +6223,74 @@ mod tests {
             .expect("batch_get_into should fall back to direct transfer");
         assert_eq!(sizes, vec![8]);
         assert_eq!(&buffer, b"abcdefgh");
+    }
+
+    #[test]
+    fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("writer-subrange-segment"));
+        let writer = StoreClientBuilder::new(metadata.clone(), "writer-subrange")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .transport(transport.clone())
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("writer build should succeed");
+        let reader = StoreClientBuilder::new(metadata, "reader-subrange")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+
+        let mut source = [0u8; 128];
+        let payload_a = b"page-one";
+        let payload_b = b"page-two!";
+        source[..payload_a.len()].copy_from_slice(payload_a);
+        source[64..64 + payload_b.len()].copy_from_slice(payload_b);
+
+        writer
+            .register_buffer(source.as_mut_ptr().cast(), source.len())
+            .expect("writer register buffer should succeed");
+        let written = writer
+            .batch_put_from(&[
+                PutFromRequest::new("subrange-a", source.as_ptr().cast(), payload_a.len()),
+                PutFromRequest::new(
+                    "subrange-b",
+                    unsafe { source.as_ptr().add(64).cast() },
+                    payload_b.len(),
+                ),
+            ])
+            .expect("batch_put_from should accept registered subranges");
+        assert_eq!(written.len(), 2);
+
+        let mut target = [0u8; 128];
+        reader
+            .register_buffer(target.as_mut_ptr().cast(), target.len())
+            .expect("reader register buffer should succeed");
+        let sizes = reader
+            .batch_get_into(&mut [
+                GetRequest::new(
+                    "subrange-a",
+                    unsafe {
+                        std::slice::from_raw_parts_mut(target.as_mut_ptr(), payload_a.len())
+                    },
+                ),
+                GetRequest::new(
+                    "subrange-b",
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            target.as_mut_ptr().add(64),
+                            payload_b.len(),
+                        )
+                    },
+                ),
+            ])
+            .expect("batch_get_into should accept registered subranges");
+        assert_eq!(sizes, vec![payload_a.len(), payload_b.len()]);
+        assert_eq!(&target[..payload_a.len()], payload_a);
+        assert_eq!(&target[64..64 + payload_b.len()], payload_b);
     }
 
     #[test]
