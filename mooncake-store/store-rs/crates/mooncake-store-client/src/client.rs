@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
@@ -32,6 +32,7 @@ use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransport
 
 const DEFAULT_TENANT: &str = "default";
 const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+const LIVE_CLIENT_CACHE_TTL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectRef<'a> {
@@ -428,6 +429,7 @@ impl StoreClientBuilder {
             control_client,
             allocator,
             lease,
+            live_client_cache: Mutex::new(LiveClientCache::default()),
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,
@@ -547,6 +549,7 @@ pub struct StoreClient {
     control_client: Arc<ControlPlaneClient>,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     lease: ClientLease,
+    live_client_cache: Mutex<LiveClientCache>,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,
@@ -584,12 +587,67 @@ impl StoreClient {
         }
     }
 
-    fn lookup_runtime_lease(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
-        self.metadata
-            .list_live_clients()?
+    fn live_clients_snapshot(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
+        if !force_refresh {
+            if let Some(snapshot) = self.live_client_cache.lock().snapshot() {
+                return Ok(snapshot);
+            }
+        }
+        let leases = self.metadata.list_live_clients()?;
+        let mut cache = self.live_client_cache.lock();
+        cache.refreshed_at = Some(Instant::now());
+        cache.leases = leases.clone();
+        Ok(leases)
+    }
+
+    fn compatible_live_clients(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
+        Ok(self
+            .live_clients_snapshot(force_refresh)?
             .into_iter()
-            .find(|lease| lease.runtime == *runtime && compatibility_matches(&self.lease, lease))
+            .filter(|lease| compatibility_matches(&self.lease, lease))
+            .collect())
+    }
+
+    fn lookup_runtime_lease_once(
+        &self,
+        runtime: &ClientRuntimeId,
+        force_refresh: bool,
+    ) -> Result<ClientLease> {
+        self.compatible_live_clients(force_refresh)?
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime)
             .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", runtime)))
+    }
+
+    fn lookup_runtime_lease(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
+        match self.lookup_runtime_lease_once(runtime, false) {
+            Ok(lease) => Ok(lease),
+            Err(StoreError::NotFound(_)) => self.lookup_runtime_lease_once(runtime, true),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn lookup_runtime_leases_once(
+        &self,
+        wanted: &BTreeSet<ClientRuntimeId>,
+        force_refresh: bool,
+    ) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
+        let mut leases = BTreeMap::new();
+        for lease in self.compatible_live_clients(force_refresh)? {
+            if !wanted.contains(&lease.runtime) {
+                continue;
+            }
+            leases.insert(lease.runtime.clone(), lease);
+        }
+        for runtime in wanted {
+            if !leases.contains_key(runtime) {
+                return Err(StoreError::NotFound(format!(
+                    "runtime {} is not available",
+                    runtime
+                )));
+            }
+        }
+        Ok(leases)
     }
 
     fn lookup_runtime_leases(
@@ -603,25 +661,58 @@ impl StoreClient {
         if wanted.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let mut leases = BTreeMap::new();
-        for lease in self.metadata.list_live_clients()? {
-            if !wanted.contains(&lease.runtime) {
-                continue;
-            }
-            if !compatibility_matches(&self.lease, &lease) {
-                continue;
-            }
-            leases.insert(lease.runtime.clone(), lease);
+        match self.lookup_runtime_leases_once(&wanted, false) {
+            Ok(leases) => Ok(leases),
+            Err(StoreError::NotFound(_)) => self.lookup_runtime_leases_once(&wanted, true),
+            Err(error) => Err(error),
         }
-        for runtime in &wanted {
-            if !leases.contains_key(runtime) {
-                return Err(StoreError::NotFound(format!(
-                    "runtime {} is not available",
-                    runtime
-                )));
+    }
+
+    fn resolve_preferred_storage_owners_once(
+        &self,
+        selectors: &[String],
+        force_refresh: bool,
+    ) -> Result<Vec<ClientRuntimeId>> {
+        let compatible = self.compatible_live_clients(force_refresh)?;
+        let mut resolved = Vec::with_capacity(selectors.len());
+        let mut seen = BTreeSet::new();
+        for selector in selectors {
+            let matched = if selector.contains(':') {
+                compatible
+                    .iter()
+                    .find(|lease| lease.runtime.storage_key() == *selector)
+            } else {
+                compatible
+                    .iter()
+                    .filter(|lease| lease.runtime.stable_id.0 == *selector)
+                    .max_by_key(|lease| lease.runtime.epoch)
+            };
+            let lease = matched.ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "preferred storage owner {} is not available",
+                    selector
+                ))
+            })?;
+            if seen.insert(lease.runtime.clone()) {
+                resolved.push(lease.runtime.clone());
             }
         }
-        Ok(leases)
+        Ok(resolved)
+    }
+
+    fn has_active_compatible_runtime(
+        &self,
+        runtime: &ClientRuntimeId,
+        force_refresh: bool,
+    ) -> Result<bool> {
+        Ok(self
+            .live_clients_snapshot(force_refresh)?
+            .into_iter()
+            .any(|lease| {
+                lease.runtime == *runtime
+                    && lease.state == ClientLifecycleState::Active
+                    && compatibility_matches(&self.lease, &lease)
+            }))
     }
 
     fn reserve_segment_allocation_via_metadata(
@@ -750,7 +841,7 @@ impl StoreClient {
         Ok(ResolvedReplicationPolicy {
             replica_count,
             preferred_segments,
-            preferred_storage_owners: self
+            preferred_storage_runtimes: self
                 .resolve_preferred_storage_owners(&policy.preferred_storage_owners)?,
             with_soft_pin: policy.with_soft_pin,
             prefer_local: policy.prefer_local || policy.prefer_alloc_in_same_node,
@@ -764,36 +855,13 @@ impl StoreClient {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
-        let compatible = self
-            .metadata
-            .list_live_clients()?
-            .into_iter()
-            .filter(|lease| compatibility_matches(&self.lease, lease))
-            .collect::<Vec<_>>();
-        let mut resolved = Vec::with_capacity(selectors.len());
-        let mut seen = BTreeSet::new();
-        for selector in selectors {
-            let matched = if selector.contains(':') {
-                compatible
-                    .iter()
-                    .find(|lease| lease.runtime.storage_key() == *selector)
-            } else {
-                compatible
-                    .iter()
-                    .filter(|lease| lease.runtime.stable_id.0 == *selector)
-                    .max_by_key(|lease| lease.runtime.epoch)
-            };
-            let lease = matched.ok_or_else(|| {
-                StoreError::NotFound(format!(
-                    "preferred storage owner {} is not available",
-                    selector
-                ))
-            })?;
-            if seen.insert(lease.runtime.clone()) {
-                resolved.push(lease.runtime.clone());
+        match self.resolve_preferred_storage_owners_once(selectors, false) {
+            Ok(runtimes) => Ok(runtimes),
+            Err(StoreError::NotFound(_)) => {
+                self.resolve_preferred_storage_owners_once(selectors, true)
             }
+            Err(error) => Err(error),
         }
-        Ok(resolved)
     }
 
     fn has_active_local_storage(&self) -> bool {
@@ -819,16 +887,18 @@ impl StoreClient {
         candidate: &ReplicaPlacementTarget,
         length_bytes: usize,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
-        let owner = candidate.owner();
-        let is_local = owner == &self.lease.runtime;
+        let storage_runtime = candidate.storage_runtime();
+        let is_local = storage_runtime == &self.lease.runtime;
         match candidate {
-            ReplicaPlacementTarget::Owner(owner) => {
-                self.reserve_owner_segment(owner, length_bytes, is_local)
+            ReplicaPlacementTarget::StorageRuntime(storage_runtime) => {
+                self.reserve_storage_runtime_segment(storage_runtime, length_bytes, is_local)
             }
             ReplicaPlacementTarget::Segment {
-                owner,
+                storage_runtime,
                 segment_name,
-            } => self.reserve_specific_segment(owner, segment_name, length_bytes, is_local),
+            } => {
+                self.reserve_specific_segment(storage_runtime, segment_name, length_bytes, is_local)
+            }
         }
     }
 
@@ -857,18 +927,18 @@ impl StoreClient {
                 Ok(preferred) => {
                     let candidate = ReplicaPlacementCandidate {
                         target: ReplicaPlacementTarget::Segment {
-                            owner: preferred.owner,
+                            storage_runtime: preferred.owner,
                             segment_name: preferred.segment_name,
                         },
                         soft: policy.with_soft_pin,
                     };
-                    let owner = candidate.target.owner().clone();
-                    if excluded.contains(&owner) {
+                    let storage_runtime = candidate.target.storage_runtime().clone();
+                    if excluded.contains(&storage_runtime) {
                         continue;
                     }
                     match self.reserve_candidate(&candidate.target, length_bytes) {
                         Ok((target, reservation)) => {
-                            excluded.insert(owner);
+                            excluded.insert(storage_runtime);
                             targets.push(target);
                             reservations.push(reservation);
                             if targets.len() == policy.replica_count {
@@ -900,17 +970,17 @@ impl StoreClient {
             }
         }
 
-        for owner in &policy.preferred_storage_owners {
+        for storage_runtime in &policy.preferred_storage_runtimes {
             let candidate = ReplicaPlacementCandidate {
-                target: ReplicaPlacementTarget::Owner(owner.clone()),
+                target: ReplicaPlacementTarget::StorageRuntime(storage_runtime.clone()),
                 soft: true,
             };
-            if excluded.contains(owner) {
+            if excluded.contains(storage_runtime) {
                 continue;
             }
             match self.reserve_candidate(&candidate.target, length_bytes) {
                 Ok((target, reservation)) => {
-                    excluded.insert(owner.clone());
+                    excluded.insert(storage_runtime.clone());
                     targets.push(target);
                     reservations.push(reservation);
                     if targets.len() == policy.replica_count {
@@ -921,7 +991,7 @@ impl StoreClient {
                     debug!(
                         tenant,
                         key,
-                        owner = %owner,
+                        storage_runtime = %storage_runtime,
                         error = %error,
                         "skipping preferred storage owner after reservation failure"
                     );
@@ -935,7 +1005,7 @@ impl StoreClient {
             && self.has_active_local_storage()
         {
             let candidate = ReplicaPlacementCandidate {
-                target: ReplicaPlacementTarget::Owner(self.lease.runtime.clone()),
+                target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
                 soft: true,
             };
             match self.reserve_candidate(&candidate.target, length_bytes) {
@@ -968,13 +1038,13 @@ impl StoreClient {
                 continue;
             }
             let candidate = ReplicaPlacementCandidate {
-                target: ReplicaPlacementTarget::Owner(owner),
+                target: ReplicaPlacementTarget::StorageRuntime(owner),
                 soft: true,
             };
-            let owner = candidate.target.owner().clone();
+            let storage_runtime = candidate.target.storage_runtime().clone();
             match self.reserve_candidate(&candidate.target, length_bytes) {
                 Ok((target, reservation)) => {
-                    excluded.insert(owner);
+                    excluded.insert(storage_runtime);
                     targets.push(target);
                     reservations.push(reservation);
                     if targets.len() == policy.replica_count {
@@ -985,7 +1055,7 @@ impl StoreClient {
                     debug!(
                         tenant,
                         key,
-                        owner = %candidate.target.owner(),
+                        storage_runtime = %candidate.target.storage_runtime(),
                         error = %error,
                         "skipping fallback storage owner after reservation failure"
                     );
@@ -1013,50 +1083,42 @@ impl StoreClient {
             .ok_or_else(|| {
                 StoreError::NotFound(format!("preferred segment {} not found", segment_name.0))
             })?;
-        let owner = self
-            .metadata
-            .list_live_clients()?
-            .into_iter()
-            .find(|lease| {
-                lease.runtime == segment.owner
-                    && lease.state == ClientLifecycleState::Active
-                    && compatibility_matches(&self.lease, lease)
-            })
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "preferred segment {} belongs to an unavailable client",
-                    segment_name.0
-                ))
-            })?;
-        let _ = owner;
+        if !self.has_active_compatible_runtime(&segment.owner, false)?
+            && !self.has_active_compatible_runtime(&segment.owner, true)?
+        {
+            return Err(StoreError::InvalidState(format!(
+                "preferred segment {} belongs to an unavailable client",
+                segment_name.0
+            )));
+        }
         Ok(segment)
     }
 
     fn reserve_specific_segment(
         &self,
-        owner: &ClientRuntimeId,
+        storage_runtime: &ClientRuntimeId,
         segment_name: &SegmentName,
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
         let reservation = self.reserve_segment_allocation(
-            owner,
+            storage_runtime,
             Some(segment_name),
             length_bytes as u64,
             require_local_memory,
         )?;
         Ok((
             ReplicaWriteTarget {
-                runtime: owner.clone(),
+                storage_runtime: storage_runtime.clone(),
                 segment_name: reservation.segment_name.clone(),
             },
             reservation,
         ))
     }
 
-    fn reserve_owner_segments_batch(
+    fn reserve_storage_runtime_segments_batch(
         &self,
-        requests: &[OwnerReservationRequest],
+        requests: &[StorageRuntimeReservationRequest],
     ) -> Result<Vec<Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)>>> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -1065,8 +1127,8 @@ impl StoreClient {
             .lookup_runtime_leases(
                 requests
                     .iter()
-                    .filter(|request| request.owner != self.lease.runtime)
-                    .map(|request| request.owner.clone()),
+                    .filter(|request| request.storage_runtime != self.lease.runtime)
+                    .map(|request| request.storage_runtime.clone()),
             )
             .unwrap_or_default();
         let mut resolved = std::iter::repeat_with(|| None)
@@ -1074,10 +1136,10 @@ impl StoreClient {
             .collect::<Vec<_>>();
         let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
         for (index, request) in requests.iter().enumerate() {
-            if request.owner == self.lease.runtime {
+            if request.storage_runtime == self.lease.runtime {
                 resolved[index] = Some(
                     self.reserve_segment_allocation(
-                        &request.owner,
+                        &request.storage_runtime,
                         None,
                         request.length_bytes,
                         request.require_local_memory,
@@ -1085,7 +1147,7 @@ impl StoreClient {
                     .map(|reservation| {
                         (
                             ReplicaWriteTarget {
-                                runtime: request.owner.clone(),
+                                storage_runtime: request.storage_runtime.clone(),
                                 segment_name: reservation.segment_name.clone(),
                             },
                             reservation,
@@ -1094,28 +1156,28 @@ impl StoreClient {
                 );
                 continue;
             }
-            let Some(lease) = remote_leases.get(&request.owner).cloned() else {
+            let Some(lease) = remote_leases.get(&request.storage_runtime).cloned() else {
                 resolved[index] = Some(Err(StoreError::NotFound(format!(
                     "runtime {} is not available",
-                    request.owner
+                    request.storage_runtime
                 ))));
                 continue;
             };
             remote_groups
-                .entry(request.owner.clone())
+                .entry(request.storage_runtime.clone())
                 .or_insert_with(|| (lease, Vec::new()))
                 .1
                 .push(index);
         }
 
-        for (owner, (lease, indices)) in remote_groups {
+        for (storage_runtime, (lease, indices)) in remote_groups {
             let lengths = indices
                 .iter()
                 .map(|index| requests[*index].length_bytes)
                 .collect::<Vec<_>>();
             match self
                 .control_client
-                .batch_reserve_any(&lease, &owner, &lengths)
+                .batch_reserve_any(&lease, &storage_runtime, &lengths)
             {
                 Ok(results) => {
                     for ((index, length_bytes), result) in indices
@@ -1128,13 +1190,13 @@ impl StoreClient {
                             Ok(reservation) => reservation,
                             Err(error) => {
                                 debug!(
-                                    owner = %owner,
+                                    storage_runtime = %storage_runtime,
                                     error = %error,
                                     length_bytes,
                                     "allocator batch reserve rpc failed; falling back to metadata allocator"
                                 );
                                 match self.reserve_segment_allocation_via_metadata(
-                                    &owner,
+                                    &storage_runtime,
                                     None,
                                     length_bytes,
                                 ) {
@@ -1148,7 +1210,7 @@ impl StoreClient {
                         };
                         resolved[index] = Some(Ok((
                             ReplicaWriteTarget {
-                                runtime: owner.clone(),
+                                storage_runtime: storage_runtime.clone(),
                                 segment_name: reservation.segment_name.clone(),
                             },
                             reservation,
@@ -1157,14 +1219,14 @@ impl StoreClient {
                 }
                 Err(error) => {
                     debug!(
-                        owner = %owner,
+                        storage_runtime = %storage_runtime,
                         error = %error,
                         items = indices.len(),
                         "allocator batch reserve rpc failed; falling back to metadata allocator"
                     );
                     for index in indices {
                         let reservation = match self.reserve_segment_allocation_via_metadata(
-                            &owner,
+                            &storage_runtime,
                             None,
                             requests[index].length_bytes,
                         ) {
@@ -1176,7 +1238,7 @@ impl StoreClient {
                         };
                         resolved[index] = Some(Ok((
                             ReplicaWriteTarget {
-                                runtime: owner.clone(),
+                                storage_runtime: storage_runtime.clone(),
                                 segment_name: reservation.segment_name.clone(),
                             },
                             reservation,
@@ -1191,7 +1253,8 @@ impl StoreClient {
             .map(|entry| {
                 entry.ok_or_else(|| {
                     StoreError::InvalidState(
-                        "missing owner reservation result from batch allocator".to_string(),
+                        "missing storage runtime reservation result from batch allocator"
+                            .to_string(),
                     )
                 })
             })
@@ -1208,31 +1271,37 @@ impl StoreClient {
         let remote_leases = self.lookup_runtime_leases(
             requests
                 .iter()
-                .filter(|request| request.owner != self.lease.runtime)
-                .map(|request| request.owner.clone()),
+                .filter(|request| request.storage_runtime != self.lease.runtime)
+                .map(|request| request.storage_runtime.clone()),
         )?;
         let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
         for (index, request) in requests.iter().enumerate() {
-            if request.owner == self.lease.runtime {
+            if request.storage_runtime == self.lease.runtime {
                 self.allocator.lock().release(
-                    &request.owner,
+                    &request.storage_runtime,
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
                 )?;
                 continue;
             }
-            let lease = remote_leases.get(&request.owner).cloned().ok_or_else(|| {
-                StoreError::NotFound(format!("runtime {} is not available", request.owner))
-            })?;
+            let lease = remote_leases
+                .get(&request.storage_runtime)
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "runtime {} is not available",
+                        request.storage_runtime
+                    ))
+                })?;
             remote_groups
-                .entry(request.owner.clone())
+                .entry(request.storage_runtime.clone())
                 .or_insert_with(|| (lease, Vec::new()))
                 .1
                 .push(index);
         }
 
-        for (owner, (lease, indices)) in remote_groups {
+        for (storage_runtime, (lease, indices)) in remote_groups {
             let ops = indices
                 .iter()
                 .map(|index| ReleaseOp {
@@ -1241,12 +1310,15 @@ impl StoreClient {
                     length_bytes: requests[*index].length_bytes,
                 })
                 .collect::<Vec<_>>();
-            match self.control_client.batch_release(&lease, &owner, &ops) {
+            match self
+                .control_client
+                .batch_release(&lease, &storage_runtime, &ops)
+            {
                 Ok(results) => {
                     for (index, result) in indices.iter().copied().zip(results.into_iter()) {
                         if let Err(error) = result {
                             debug!(
-                                owner = %owner,
+                                storage_runtime = %storage_runtime,
                                 segment = %requests[index].segment_name.0,
                                 offset_bytes = requests[index].offset_bytes,
                                 length_bytes = requests[index].length_bytes,
@@ -1254,7 +1326,7 @@ impl StoreClient {
                                 "allocator batch release rpc failed; falling back to metadata allocator"
                             );
                             self.metadata.release_segment(
-                                &owner,
+                                &storage_runtime,
                                 &requests[index].segment_name,
                                 requests[index].offset_bytes,
                                 requests[index].length_bytes,
@@ -1264,14 +1336,14 @@ impl StoreClient {
                 }
                 Err(error) => {
                     debug!(
-                        owner = %owner,
+                        storage_runtime = %storage_runtime,
                         error = %error,
                         items = indices.len(),
                         "allocator batch release rpc failed; falling back to metadata allocator"
                     );
                     for index in indices {
                         self.metadata.release_segment(
-                            &owner,
+                            &storage_runtime,
                             &requests[index].segment_name,
                             requests[index].offset_bytes,
                             requests[index].length_bytes,
@@ -1297,7 +1369,7 @@ impl StoreClient {
             .iter()
             .zip(reservations.iter())
             .map(|(target, reservation)| AllocationReleaseRequest {
-                owner: target.runtime.clone(),
+                storage_runtime: target.storage_runtime.clone(),
                 segment_name: target.segment_name.clone(),
                 offset_bytes: reservation.offset_bytes,
                 length_bytes: reservation.length_bytes,
@@ -1314,7 +1386,7 @@ impl StoreClient {
         let releases = due
             .into_iter()
             .map(|reclaim| AllocationReleaseRequest {
-                owner: reclaim.owner,
+                storage_runtime: reclaim.storage_runtime,
                 segment_name: reclaim.segment_name,
                 offset_bytes: reclaim.offset_bytes,
                 length_bytes: reclaim.length_bytes,
@@ -1333,7 +1405,7 @@ impl StoreClient {
         for replica in &route.replicas {
             state.pending_reclaims.push_back(PendingReclaim {
                 due_at_ms,
-                owner: replica.owner.clone(),
+                storage_runtime: replica.owner.clone(),
                 segment_name: replica.segment_name.clone(),
                 offset_bytes: replica.segment_offset,
                 length_bytes: replica.length,
@@ -1407,21 +1479,21 @@ impl StoreClient {
         self.metadata.publish_segment(&announcement)
     }
 
-    fn reserve_owner_segment(
+    fn reserve_storage_runtime_segment(
         &self,
-        owner: &ClientRuntimeId,
+        storage_runtime: &ClientRuntimeId,
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
         self.flush_due_reclaims()?;
         let reservation = self.reserve_segment_allocation(
-            owner,
+            storage_runtime,
             None,
             length_bytes as u64,
             require_local_memory,
         )?;
         debug!(
-            owner = %owner,
+            storage_runtime = %storage_runtime,
             segment = %reservation.segment_name.0,
             offset_bytes = reservation.offset_bytes,
             length_bytes = reservation.length_bytes,
@@ -1429,7 +1501,7 @@ impl StoreClient {
         );
         Ok((
             ReplicaWriteTarget {
-                runtime: owner.clone(),
+                storage_runtime: storage_runtime.clone(),
                 segment_name: reservation.segment_name.clone(),
             },
             reservation,
@@ -1449,7 +1521,7 @@ impl StoreClient {
                     "releasing route allocation"
                 );
                 AllocationReleaseRequest {
-                    owner: replica.owner.clone(),
+                    storage_runtime: replica.owner.clone(),
                     segment_name: replica.segment_name.clone(),
                     offset_bytes: replica.segment_offset,
                     length_bytes: replica.length,
@@ -1498,7 +1570,7 @@ impl StoreClient {
                 .zip(offsets.iter())
                 .enumerate()
                 .map(|(priority, (target, offset))| ReplicaRoute {
-                    owner: target.runtime.clone(),
+                    owner: target.storage_runtime.clone(),
                     segment_name: target.segment_name.clone(),
                     offset: *offset,
                     segment_offset: reservations[priority].offset_bytes,
@@ -1922,7 +1994,7 @@ impl StoreClient {
         let mut local_writes = 0usize;
 
         for (index, (target, reservation)) in targets.iter().zip(reservations.iter()).enumerate() {
-            if target.runtime == self.lease.runtime
+            if target.storage_runtime == self.lease.runtime
                 && self
                     .state
                     .lock()
@@ -2104,9 +2176,9 @@ impl StoreClient {
                 };
                 entry.next_candidate += 1;
                 round_indices.push(index);
-                round_requests.push(OwnerReservationRequest {
+                round_requests.push(StorageRuntimeReservationRequest {
                     require_local_memory: owner == self.lease.runtime,
-                    owner,
+                    storage_runtime: owner,
                     length_bytes: entry.value.len() as u64,
                 });
             }
@@ -2117,7 +2189,7 @@ impl StoreClient {
                 )));
             }
 
-            let round_results = self.reserve_owner_segments_batch(&round_requests)?;
+            let round_results = self.reserve_storage_runtime_segments_batch(&round_requests)?;
             let mut made_progress = false;
             for ((index, request), result) in round_indices
                 .into_iter()
@@ -2133,7 +2205,7 @@ impl StoreClient {
                     Err(error) if self.should_skip_candidate(&error, true) => {
                         debug!(
                             key = %pending[index].scoped_key.0,
-                            owner = %request.owner,
+                            storage_runtime = %request.storage_runtime,
                             error = %error,
                             "batch put is skipping placement candidate"
                         );
@@ -2176,7 +2248,7 @@ impl StoreClient {
             .iter()
             .filter(|entry| {
                 entry.targets.iter().any(|target| {
-                    !(target.runtime == self.lease.runtime
+                    !(target.storage_runtime == self.lease.runtime
                         && self
                             .state
                             .lock()
@@ -2219,7 +2291,7 @@ impl StoreClient {
                 .zip(entry.reservations.iter())
                 .enumerate()
             {
-                let is_local = target.runtime == self.lease.runtime
+                let is_local = target.storage_runtime == self.lease.runtime
                     && self
                         .state
                         .lock()
@@ -2276,7 +2348,7 @@ impl StoreClient {
                     target_offset
                 };
                 replicas.push(ReplicaRoute {
-                    owner: target.runtime.clone(),
+                    owner: target.storage_runtime.clone(),
                     segment_name: target.segment_name.clone(),
                     offset,
                     segment_offset: reservation.offset_bytes,
@@ -3297,6 +3369,22 @@ impl Drop for StoreClient {
 }
 
 #[derive(Default)]
+struct LiveClientCache {
+    refreshed_at: Option<Instant>,
+    leases: Vec<ClientLease>,
+}
+
+impl LiveClientCache {
+    fn snapshot(&self) -> Option<Vec<ClientLease>> {
+        let refreshed_at = self.refreshed_at?;
+        if refreshed_at.elapsed() > LIVE_CLIENT_CACHE_TTL {
+            return None;
+        }
+        Some(self.leases.clone())
+    }
+}
+
+#[derive(Default)]
 struct StoreState {
     memory: Option<LocalMemoryState>,
     registered_buffers: BTreeMap<usize, usize>,
@@ -3604,7 +3692,7 @@ enum WriteMode {
 
 #[derive(Clone, Debug)]
 struct ReplicaWriteTarget {
-    runtime: ClientRuntimeId,
+    storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
 }
 
@@ -3616,15 +3704,15 @@ struct PreparedObjectWrite<'a> {
 }
 
 #[derive(Clone, Debug)]
-struct OwnerReservationRequest {
-    owner: ClientRuntimeId,
+struct StorageRuntimeReservationRequest {
+    storage_runtime: ClientRuntimeId,
     length_bytes: u64,
     require_local_memory: bool,
 }
 
 #[derive(Clone, Debug)]
 struct AllocationReleaseRequest {
-    owner: ClientRuntimeId,
+    storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
@@ -3641,25 +3729,27 @@ struct PendingRoutePublish {
 struct ResolvedReplicationPolicy {
     replica_count: usize,
     preferred_segments: Vec<SegmentName>,
-    preferred_storage_owners: Vec<ClientRuntimeId>,
+    preferred_storage_runtimes: Vec<ClientRuntimeId>,
     with_soft_pin: bool,
     prefer_local: bool,
 }
 
 #[derive(Clone, Debug)]
 enum ReplicaPlacementTarget {
-    Owner(ClientRuntimeId),
+    StorageRuntime(ClientRuntimeId),
     Segment {
-        owner: ClientRuntimeId,
+        storage_runtime: ClientRuntimeId,
         segment_name: SegmentName,
     },
 }
 
 impl ReplicaPlacementTarget {
-    fn owner(&self) -> &ClientRuntimeId {
+    fn storage_runtime(&self) -> &ClientRuntimeId {
         match self {
-            Self::Owner(owner) => owner,
-            Self::Segment { owner, .. } => owner,
+            Self::StorageRuntime(storage_runtime) => storage_runtime,
+            Self::Segment {
+                storage_runtime, ..
+            } => storage_runtime,
         }
     }
 }
@@ -3673,7 +3763,7 @@ struct ReplicaPlacementCandidate {
 #[derive(Clone, Debug)]
 struct PendingReclaim {
     due_at_ms: u64,
-    owner: ClientRuntimeId,
+    storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
@@ -4099,6 +4189,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread::sleep;
     use std::time::Duration;
@@ -4149,6 +4240,24 @@ mod tests {
     impl NoHotPathMetadataBackend {
         fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
             Self { inner }
+        }
+    }
+
+    struct CountingMetadataBackend {
+        inner: Arc<InMemoryMetadataBackend>,
+        list_live_clients_calls: AtomicUsize,
+    }
+
+    impl CountingMetadataBackend {
+        fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
+            Self {
+                inner,
+                list_live_clients_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn list_live_clients_calls(&self) -> usize {
+            self.list_live_clients_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -4245,6 +4354,111 @@ mod tests {
             Err(StoreError::Unsupported(
                 "metadata route hot path is disabled in this test".to_string(),
             ))
+        }
+
+        fn put_handoff(
+            &self,
+            handoff: &mooncake_store_core::HandoffPlan,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.put_handoff(handoff)
+        }
+
+        fn get_handoff(
+            &self,
+            stable_id: &mooncake_store_core::ClientStableId,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::HandoffPlan>> {
+            self.inner.get_handoff(stable_id)
+        }
+    }
+
+    impl MetadataBackend for CountingMetadataBackend {
+        fn route_namespace(&self) -> String {
+            self.inner.route_namespace()
+        }
+
+        fn upsert_client_lease(&self, lease: &ClientLease) -> mooncake_store_core::Result<()> {
+            self.inner.upsert_client_lease(lease)
+        }
+
+        fn update_client_state(
+            &self,
+            runtime: &ClientRuntimeId,
+            next: ClientLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_client_state(runtime, next)
+        }
+
+        fn list_live_clients(&self) -> mooncake_store_core::Result<Vec<ClientLease>> {
+            self.list_live_clients_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.list_live_clients()
+        }
+
+        fn publish_segment(
+            &self,
+            segment: &SegmentAnnouncement,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.publish_segment(segment)
+        }
+
+        fn unpublish_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.unpublish_segment(owner, segment)
+        }
+
+        fn list_segments(
+            &self,
+            owner: Option<&ClientRuntimeId>,
+        ) -> mooncake_store_core::Result<Vec<SegmentAnnouncement>> {
+            self.inner.list_segments(owner)
+        }
+
+        fn update_segment_state(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            next: SegmentLifecycleState,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.update_segment_state(owner, segment, next)
+        }
+
+        fn reserve_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<mooncake_store_core::SegmentReservation> {
+            self.inner.reserve_segment(owner, segment, length_bytes)
+        }
+
+        fn release_segment(
+            &self,
+            owner: &ClientRuntimeId,
+            segment: &SegmentName,
+            offset_bytes: u64,
+            length_bytes: u64,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner
+                .release_segment(owner, segment, offset_bytes, length_bytes)
+        }
+
+        fn get_object_route(
+            &self,
+            key: &ObjectKey,
+        ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
+            self.inner.get_object_route(key)
+        }
+
+        fn compare_and_swap_object_route(
+            &self,
+            key: &ObjectKey,
+            expected: Option<mooncake_store_core::RouteVersion>,
+            next: Option<&mooncake_store_core::ObjectRoute>,
+        ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+            self.inner
+                .compare_and_swap_object_route(key, expected, next)
         }
 
         fn put_handoff(
@@ -4830,6 +5044,201 @@ mod tests {
         assert!(metrics.contains("operation=\"put_remote_batch_write\",status=\"ok\""));
         assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
         assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
+    }
+
+    #[test]
+    fn lookup_runtime_lease_reuses_live_client_snapshot() {
+        let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let storage_transport = Arc::new(TestTransport::new("storage-cache-segment"));
+        let client_transport = Arc::new(storage_transport.peer("client-cache-segment"));
+
+        let storage = StoreClientBuilder::new(metadata.clone(), "storage-cache")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("storage build should succeed");
+        let client = StoreClientBuilder::new(metadata.clone(), "client-cache")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .transport(client_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let runtime = storage.runtime_id().clone();
+        let before = metadata.list_live_clients_calls();
+        let lease = client
+            .lookup_runtime_lease(&runtime)
+            .expect("first runtime lookup should succeed");
+        assert_eq!(lease.runtime, runtime);
+        let after_first = metadata.list_live_clients_calls();
+
+        let lease = client
+            .lookup_runtime_lease(&runtime)
+            .expect("second runtime lookup should succeed");
+        assert_eq!(lease.runtime, runtime);
+        let after_second = metadata.list_live_clients_calls();
+
+        assert!(after_first > before);
+        assert_eq!(after_second, after_first);
+    }
+
+    #[test]
+    fn embedded_wrh_route_directory_reuses_authority_snapshot() {
+        let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let storage_transport = Arc::new(TestTransport::new("storage-route-cache-segment"));
+        let writer_transport = Arc::new(storage_transport.peer("writer-route-cache-segment"));
+        let reader_transport = Arc::new(storage_transport.peer("reader-route-cache-segment"));
+
+        let storage = StoreClientBuilder::new(metadata.clone(), "storage-route-cache")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("storage build should succeed");
+        storage
+            .register_local_memory()
+            .expect("storage memory should register");
+
+        let writer = StoreClientBuilder::new(metadata.clone(), "writer-route-cache")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(writer_transport)
+            .local_memory(storage_config())
+            .routed_writes(
+                PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+                1,
+            )
+            .build(10_000)
+            .expect("writer build should succeed");
+        writer
+            .register_local_memory()
+            .expect("writer memory should register");
+
+        let reader = StoreClientBuilder::new(metadata.clone(), "reader-route-cache")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .label("route", "false")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+        reader
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        writer
+            .put_in_tenant("tenant-a", "route-cache-key", b"route-cache-payload")
+            .expect("writer put should succeed");
+        assert!(
+            metadata
+                .inner
+                .get_object_route(&ObjectKey::new("tenant-a::route-cache-key"))
+                .expect("metadata query should succeed")
+                .is_none(),
+            "embedded WRH should keep route state off metadata"
+        );
+
+        let before = metadata.list_live_clients_calls();
+        let route = reader
+            .query_route_in_tenant("tenant-a", "route-cache-key")
+            .expect("first route query should succeed")
+            .expect("route should exist");
+        assert_eq!(route.key, ObjectKey::new("tenant-a::route-cache-key"));
+        let after_first = metadata.list_live_clients_calls();
+
+        let route = reader
+            .query_route_in_tenant("tenant-a", "route-cache-key")
+            .expect("second route query should succeed")
+            .expect("route should exist");
+        assert_eq!(route.key, ObjectKey::new("tenant-a::route-cache-key"));
+        let after_second = metadata.list_live_clients_calls();
+
+        assert!(after_first > before);
+        assert_eq!(after_second, after_first);
+    }
+
+    #[test]
+    fn singleton_control_plane_paths_use_stream_sessions() {
+        let metadata = Arc::new(NoHotPathMetadataBackend::new(Arc::new(
+            InMemoryMetadataBackend::new(),
+        )));
+        let storage_transport = Arc::new(TestTransport::new("storage-single-stream-segment"));
+        let router_transport = Arc::new(storage_transport.peer("router-single-stream-segment"));
+        let reader_transport = Arc::new(storage_transport.peer("reader-single-stream-segment"));
+
+        let storage = StoreClientBuilder::new(metadata.clone(), "storage-single-stream")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("storage build should succeed");
+        storage
+            .register_local_memory()
+            .expect("storage memory should register");
+
+        let router = StoreClientBuilder::new(metadata.clone(), "router-single-stream")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(router_transport)
+            .local_memory(storage_config())
+            .routed_writes(
+                PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+                1,
+            )
+            .build(10_000)
+            .expect("router build should succeed");
+        router
+            .register_local_memory()
+            .expect("router memory should register");
+
+        let reader = StoreClientBuilder::new(metadata.clone(), "reader-single-stream")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .label("route", "false")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+        reader
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        assert_eq!(router.control_client.active_stream_sessions(), 0);
+        router
+            .put_in_tenant("tenant-a", "single-stream-key", b"single-stream-payload")
+            .expect("routed put should succeed");
+        assert!(
+            router.control_client.active_stream_sessions() >= 1,
+            "single-item allocator path should open a reusable control stream"
+        );
+
+        assert_eq!(reader.control_client.active_stream_sessions(), 0);
+        assert_eq!(
+            reader
+                .get_in_tenant("tenant-a", "single-stream-key")
+                .expect("reader get should succeed"),
+            b"single-stream-payload"
+        );
+        assert!(
+            reader.control_client.active_stream_sessions() >= 1,
+            "single-item route lookup should open a reusable control stream"
+        );
     }
 
     #[test]
