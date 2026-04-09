@@ -1,0 +1,59 @@
+name: E2E CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number that triggered this'
+        required: false
+        type: string
+      pr_sha:
+        description: 'PR head SHA to checkout'
+        required: false
+        type: string
+      triggered_by:
+        description: 'User who triggered this'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-ci-${{ inputs.pr_number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  ascend-test:
+    uses: ./.github/workflows/ci_ascend.yml
+    secrets: inherit
+
+  integration-test:
+    uses: ./.github/workflows/integration-test.yml
+    secrets: inherit
+
+  e2e-gate:
+    name: E2E Gate
+    if: always()
+    needs:
+      - ascend-test
+      - integration-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check E2E results
+        run: |
+          echo "PR: #${{ inputs.pr_number }}"
+          echo "SHA: ${{ inputs.pr_sha }}"
+          echo "Triggered by: ${{ inputs.triggered_by }}"
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[] |
+            select(.value.result != "success" and .value.result != "skipped") |
+            "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "::error::The following E2E jobs failed:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All E2E checks passed."
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

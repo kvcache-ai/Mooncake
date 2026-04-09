@@ -1,0 +1,88 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+
+jobs:
+  dispatch:
+    if: >
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/run-ci') ||
+       contains(github.event.comment.body, '/run-e2e-ci'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add reaction to acknowledge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='eyes'
+
+      - name: Check commenter permissions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission')
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::User ${{ github.event.comment.user.login }} lacks write permission (has: $PERM)"
+            exit 1
+          fi
+
+      - name: Get PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_DATA=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json headRefName,headRefOid)
+          echo "sha=$(echo "$PR_DATA" | jq -r '.headRefOid')" >> $GITHUB_OUTPUT
+          echo "ref=$(echo "$PR_DATA" | jq -r '.headRefName')" >> $GITHUB_OUTPUT
+
+      - name: Parse commands
+        id: cmd
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          # /run-e2e-ci implies /run-ci as well (E2E needs build artifacts)
+          if echo "$COMMENT" | grep -q '/run-e2e-ci'; then
+            echo "run_ci=true" >> $GITHUB_OUTPUT
+            echo "run_e2e=true" >> $GITHUB_OUTPUT
+          elif echo "$COMMENT" | grep -q '/run-ci'; then
+            echo "run_ci=true" >> $GITHUB_OUTPUT
+            echo "run_e2e=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Dispatch CI workflow
+        if: steps.cmd.outputs.run_ci == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ci.yml \
+            --repo ${{ github.repository }} \
+            --ref ${{ steps.pr.outputs.ref }}
+
+      - name: Dispatch E2E CI workflow
+        if: steps.cmd.outputs.run_e2e == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run e2e-ci.yml \
+            --repo ${{ github.repository }} \
+            --ref ${{ steps.pr.outputs.ref }} \
+            -f pr_number=${{ github.event.issue.number }} \
+            -f pr_sha=${{ steps.pr.outputs.sha }} \
+            -f triggered_by=${{ github.event.comment.user.login }}
+
+      - name: React with rocket on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='rocket'

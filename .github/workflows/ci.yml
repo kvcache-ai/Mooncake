@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [ "main" ]
     types: [synchronize, reopened, labeled]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -18,8 +19,10 @@ jobs:
   build:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -221,8 +224,10 @@ jobs:
   build-musa:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
@@ -258,6 +263,7 @@ jobs:
     if: >-
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
@@ -401,8 +407,10 @@ jobs:
   build-flags:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -568,8 +576,10 @@ jobs:
     name: Build Docker Image
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
@@ -591,6 +601,7 @@ jobs:
     name: Spell Check with Typos
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -605,6 +616,7 @@ jobs:
     name: Check code format
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -652,6 +664,7 @@ jobs:
   check-paths:
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
@@ -676,22 +689,12 @@ jobs:
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
     if: >-
-      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_cu13.yml
-    secrets: inherit
-
-  ascend-test:
-    needs: [build, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/ci_ascend.yml
-    secrets: inherit
-
-  integration-test:
-    needs: [build, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/integration-test.yml
     secrets: inherit
 
   ci-gate:
@@ -706,8 +709,6 @@ jobs:
       - build-docker
       - test-wheel-ubuntu
       - build-wheel-cu13
-      - ascend-test
-      - integration-test
     runs-on: ubuntu-latest
     steps:
       - name: Check required job results
