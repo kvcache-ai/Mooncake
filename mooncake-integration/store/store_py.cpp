@@ -240,6 +240,7 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
     return all_buffers;
 }
 
+
 // Helper function to convert ErrorCode to Python return value
 // ErrorCode values are already negative, so just cast to int
 inline int to_py_ret(ErrorCode error_code) {
@@ -2043,34 +2044,28 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
             "Get object data directly into a pre-allocated buffer")
         .def(
-            "get_into_range",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               uintptr_t buffer_ptr, size_t dst_offset, size_t src_offset,
-               size_t size) {
-                // Get a byte range directly into user-provided buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
-                py::gil_scoped_release release;
-                return self.store_->get_into_range(key, buffer, dst_offset,
-                                                   src_offset, size);
-            },
-            py::arg("key"), py::arg("buffer_ptr"), py::arg("dst_offset"),
-            py::arg("src_offset"), py::arg("size"),
-            "Get a byte range from an object into a pre-allocated buffer")
-        .def(
             "get_into_ranges",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               uintptr_t buffer_ptr, const std::vector<size_t> &dst_offsets,
-               const std::vector<size_t> &src_offsets,
-               const std::vector<size_t> &sizes) {
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<std::vector<std::string>> &all_keys,
+               const std::vector<std::vector<size_t>> &all_dst_offsets,
+               const std::vector<std::vector<size_t>> &all_src_offsets,
+               const std::vector<std::vector<size_t>> &all_sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
                 py::gil_scoped_release release;
-                return self.store_->get_into_ranges(key, buffer, dst_offsets,
-                                                    src_offsets, sizes);
+                return self.store_->get_into_ranges(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes);
             },
-            py::arg("key"), py::arg("buffer_ptr"), py::arg("dst_offsets"),
-            py::arg("src_offsets"), py::arg("sizes"),
-            "Get multiple byte ranges from an object into a pre-allocated "
-            "buffer")
+            py::arg("buffer_ptrs"), py::arg("all_keys"),
+            py::arg("all_dst_offsets"), py::arg("all_src_offsets"),
+            py::arg("all_sizes"),
+            "Get multiple byte ranges from multiple objects into multiple "
+            "pre-allocated buffers")
         .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,

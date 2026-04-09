@@ -50,15 +50,12 @@ class DummyClient : public PyClient {
 
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
-    int64_t get_into_range(const std::string &key, void *buffer,
-                           size_t dst_offset, size_t src_offset,
-                           size_t size) override;
-
-    std::vector<int64_t> get_into_ranges(
-        const std::string &key, void *buffer,
-        const std::vector<size_t> &dst_offsets,
-        const std::vector<size_t> &src_offsets,
-        const std::vector<size_t> &sizes) override;
+    std::vector<std::vector<int64_t>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<size_t>> &all_dst_offsets,
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        const std::vector<std::vector<size_t>> &all_sizes) override;
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,

@@ -2012,9 +2012,8 @@ int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
-    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size, bool size_is_buffer_capacity) {
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::resolve_ranged_read_metadata(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2024,9 +2023,6 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            if (src_offset == 0) {
-                VLOG(1) << "Object not found for key: " << key;
-            }
             return tl::unexpected(query_result.error());
         }
         LOG(ERROR) << "Query failed for key: " << key
@@ -2046,8 +2042,20 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const auto &replica = res.value();
-    uint64_t total_size = calculate_total_size(replica);
+    auto query_value = std::move(query_result.value());
+    auto replica = res.value();
+    return RangedReadMetadata{.query_result = std::move(query_value),
+                              .replica = std::move(replica),
+                              .total_size = calculate_total_size(replica)};
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
+    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
+    size_t size, const RangedReadMetadata &metadata,
+    bool size_is_buffer_capacity) {
+    const auto &query_result = metadata.query_result;
+    const auto &replica = metadata.replica;
+    const uint64_t total_size = metadata.total_size;
 
     if (size_is_buffer_capacity) {
         if (size < total_size) {
@@ -2067,7 +2075,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         allocateSlices(slices, replica,
                        static_cast<char *>(buffer) + dst_offset);
 
-        auto get_result = client_->Get(key, query_result.value(), slices);
+        auto get_result = client_->Get(key, query_result, slices);
         if (!get_result) {
             LOG(ERROR) << "Get failed for key: " << key
                        << " with error: " << toString(get_result.error());
@@ -2084,12 +2092,29 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     std::vector<Slice> slices;
     slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
 
-    auto get_result =
-        client_->Get(key, query_result.value(), slices, src_offset);
+    auto get_result = client_->Get(key, query_result, slices, src_offset);
     if (!get_result) {
         return tl::unexpected(get_result.error());
     }
     return static_cast<int64_t>(size);
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
+    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
+    size_t size, bool size_is_buffer_capacity) {
+    auto metadata_result = resolve_ranged_read_metadata(key);
+    if (!metadata_result) {
+        if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+             metadata_result.error() == ErrorCode::REPLICA_IS_NOT_READY) &&
+            src_offset == 0) {
+            VLOG(1) << "Object not found for key: " << key;
+        }
+        return tl::unexpected(metadata_result.error());
+    }
+
+    return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
+                               metadata_result.value(),
+                               size_is_buffer_capacity);
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
@@ -2097,48 +2122,131 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
     return to_py_ret(get_into_range_internal(key, buffer, 0, 0, size, true));
 }
 
-int64_t RealClient::get_into_range(const std::string &key, void *buffer,
-                                   size_t dst_offset, size_t src_offset,
-                                   size_t size) {
-    return to_py_ret(
-        get_into_range_internal(key, buffer, dst_offset, src_offset, size));
-}
+std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>
+RealClient::get_into_ranges_internal(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<size_t>> &all_dst_offsets,
+    const std::vector<std::vector<size_t>> &all_src_offsets,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<size_t> *buffer_capacities) {
+    const size_t buffer_count = buffers.size();
+    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>> results(
+        buffer_count);
 
-std::vector<int64_t> RealClient::get_into_ranges(
-    const std::string &key, void *buffer,
-    const std::vector<size_t> &dst_offsets,
-    const std::vector<size_t> &src_offsets, const std::vector<size_t> &sizes) {
-    const size_t range_count = dst_offsets.size();
-    std::vector<int64_t> results(
-        range_count, static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
-
-    if (range_count != src_offsets.size() || range_count != sizes.size()) {
-        LOG(ERROR) << "get_into_ranges: size mismatch";
+    if (buffer_count != all_keys.size() || buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() || buffer_count != all_sizes.size()) {
+        LOG(ERROR) << "get_into_ranges: top-level size mismatch";
+        for (size_t i = 0; i < buffer_count; ++i) {
+            const size_t item_count = i < all_keys.size() ? all_keys[i].size() : 1;
+            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
         return results;
     }
 
-    size_t buffer_size = 0;
-    {
-        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        auto it = registered_buffer_sizes_.find(buffer);
-        if (it == registered_buffer_sizes_.end()) {
-            LOG(ERROR) << "get_into_ranges: buffer is not registered";
+    std::vector<size_t> resolved_buffer_capacities;
+    if (buffer_capacities != nullptr) {
+        if (buffer_capacities->size() != buffer_count) {
+            LOG(ERROR) << "get_into_ranges: buffer capacities size mismatch";
+            for (size_t i = 0; i < buffer_count; ++i) {
+                results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                    all_keys[i].size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
             return results;
         }
-        buffer_size = it->second;
+        resolved_buffer_capacities = *buffer_capacities;
+    } else {
+        resolved_buffer_capacities.resize(buffer_count, 0);
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        for (size_t i = 0; i < buffer_count; ++i) {
+            auto it = registered_buffer_sizes_.find(buffers[i]);
+            if (it == registered_buffer_sizes_.end()) {
+                LOG(ERROR) << "get_into_ranges: buffer is not registered at index "
+                           << i;
+                continue;
+            }
+            resolved_buffer_capacities[i] = it->second;
+        }
     }
 
-    for (size_t i = 0; i < range_count; ++i) {
-        if (sizes[i] > 0 && (dst_offsets[i] > buffer_size ||
-                             sizes[i] > buffer_size - dst_offsets[i])) {
-            LOG(ERROR) << "get_into_ranges: destination overflow, dst_offset="
-                       << dst_offsets[i] << " size=" << sizes[i]
-                       << " buffer_size=" << buffer_size;
+    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
+        metadata_cache;
+
+    for (size_t i = 0; i < buffer_count; ++i) {
+        const size_t item_count = all_keys[i].size();
+        results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+            item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+
+        if (item_count != all_dst_offsets[i].size() ||
+            item_count != all_src_offsets[i].size() ||
+            item_count != all_sizes[i].size()) {
+            LOG(ERROR) << "get_into_ranges: size mismatch for buffer index " << i;
             continue;
         }
 
-        results[i] = to_py_ret(get_into_range_internal(
-            key, buffer, dst_offsets[i], src_offsets[i], sizes[i]));
+        const size_t buffer_size = resolved_buffer_capacities[i];
+        if (buffer_size == 0 && item_count > 0) {
+            if (buffer_capacities == nullptr) {
+                continue;
+            }
+        }
+
+        for (size_t j = 0; j < item_count; ++j) {
+            if (all_sizes[i][j] > 0 &&
+                (all_dst_offsets[i][j] > buffer_size ||
+                 all_sizes[i][j] > buffer_size - all_dst_offsets[i][j])) {
+                LOG(ERROR) << "get_into_ranges: destination overflow, buffer_index="
+                           << i << " item_index=" << j
+                           << " dst_offset=" << all_dst_offsets[i][j]
+                           << " size=" << all_sizes[i][j]
+                           << " buffer_size=" << buffer_size;
+                continue;
+            }
+
+            auto [metadata_it, inserted] = metadata_cache.try_emplace(
+                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
+            (void)inserted;
+            auto &metadata_result = metadata_it->second;
+            if (!metadata_result) {
+                if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+                     metadata_result.error() ==
+                         ErrorCode::REPLICA_IS_NOT_READY) &&
+                    all_src_offsets[i][j] == 0) {
+                    VLOG(1) << "Object not found for key: " << all_keys[i][j];
+                }
+                results[i][j] = tl::unexpected(metadata_result.error());
+                continue;
+            }
+
+            results[i][j] = execute_ranged_read(
+                all_keys[i][j], buffers[i], all_dst_offsets[i][j],
+                all_src_offsets[i][j], all_sizes[i][j],
+                metadata_result.value());
+        }
+    }
+
+    return results;
+}
+
+std::vector<std::vector<int64_t>> RealClient::get_into_ranges(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<size_t>> &all_dst_offsets,
+    const std::vector<std::vector<size_t>> &all_src_offsets,
+    const std::vector<std::vector<size_t>> &all_sizes) {
+    auto internal_results = get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes);
+    std::vector<std::vector<int64_t>> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &row : internal_results) {
+        std::vector<int64_t> converted;
+        converted.reserve(row.size());
+        for (const auto &result : row) {
+            converted.push_back(to_py_ret(result));
+        }
+        results.emplace_back(std::move(converted));
     }
 
     return results;
@@ -2840,6 +2948,87 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     }
 
     return get_into_range_internal(key, real_buffer, 0, src_offset, size);
+}
+
+std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>
+RealClient::get_into_ranges_shm_helper(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<size_t>> &all_dst_offsets,
+    const std::vector<std::vector<size_t>> &all_src_offsets,
+    const std::vector<std::vector<size_t>> &all_sizes, int32_t device_id,
+    const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>(
+            dummy_buffers.size(),
+            std::vector<tl::expected<int64_t, ErrorCode>>(
+                1, tl::unexpected(ErrorCode::INVALID_PARAMS)));
+    }
+#endif
+
+    const size_t buffer_count = dummy_buffers.size();
+    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>> results(
+        buffer_count);
+
+    if (buffer_count != all_keys.size() || buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() || buffer_count != all_sizes.size()) {
+        LOG(ERROR) << "get_into_ranges_shm_helper: top-level size mismatch";
+        for (size_t i = 0; i < buffer_count; ++i) {
+            const size_t item_count = i < all_keys.size() ? all_keys[i].size() : 1;
+            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        for (size_t i = 0; i < buffer_count; ++i) {
+            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                all_keys[i].size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return results;
+    }
+    std::vector<size_t> buffer_sizes(buffer_count, 0);
+    for (size_t i = 0; i < buffer_count; ++i) {
+        const size_t item_count = all_keys[i].size();
+        results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+            item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+
+        if (item_count != all_dst_offsets[i].size() ||
+            item_count != all_src_offsets[i].size() ||
+            item_count != all_sizes[i].size()) {
+            LOG(ERROR) << "get_into_ranges_shm_helper: size mismatch for buffer index "
+                       << i;
+            continue;
+        }
+
+        size_t max_required = 0;
+        for (size_t j = 0; j < item_count; ++j) {
+            max_required = std::max(max_required,
+                                    all_dst_offsets[i][j] + all_sizes[i][j]);
+        }
+        buffer_sizes[i] = max_required;
+    }
+
+    auto real_buffers_result =
+        map_dummy_addrs_to_real_ptrs(it->second, dummy_buffers, buffer_sizes, client_id);
+    if (!real_buffers_result) {
+        for (size_t i = 0; i < buffer_count; ++i) {
+            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                all_keys[i].size(), tl::unexpected(real_buffers_result.error()));
+        }
+        return results;
+    }
+
+    return get_into_ranges_internal(real_buffers_result.value(), all_keys,
+                                    all_dst_offsets, all_src_offsets,
+                                    all_sizes, &buffer_sizes);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>

@@ -756,38 +756,50 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
-    return get_into_range(key, buffer, 0, 0, size);
-}
-
-int64_t DummyClient::get_into_range(const std::string& key, void* buffer,
-                                    size_t dst_offset, size_t src_offset,
-                                    size_t size) {
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
     auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
                              tl::expected<int64_t, ErrorCode>>(
-        key, buf_addr, dst_offset, src_offset, size, client_id_);
+        key, buf_addr, 0, 0, size, client_id_);
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }
     return to_py_ret(*result);
 }
 
-std::vector<int64_t> DummyClient::get_into_ranges(
-    const std::string& key, void* buffer,
-    const std::vector<size_t>& dst_offsets,
-    const std::vector<size_t>& src_offsets, const std::vector<size_t>& sizes) {
-    const size_t range_count = dst_offsets.size();
-    std::vector<int64_t> results(
-        range_count, static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
+std::vector<std::vector<int64_t>> DummyClient::get_into_ranges(
+    const std::vector<void*>& buffers,
+    const std::vector<std::vector<std::string>>& all_keys,
+    const std::vector<std::vector<size_t>>& all_dst_offsets,
+    const std::vector<std::vector<size_t>>& all_src_offsets,
+    const std::vector<std::vector<size_t>>& all_sizes) {
+    std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    auto internal_results =
+        invoke_rpc<&RealClient::get_into_ranges_shm_helper,
+                   std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>(
+            dummy_buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+            device_id_, client_id_);
 
-    if (range_count != src_offsets.size() || range_count != sizes.size()) {
-        LOG(ERROR) << "get_into_ranges: size mismatch";
+    const size_t buffer_count = buffers.size();
+    std::vector<std::vector<int64_t>> results;
+    results.reserve(buffer_count);
+    if (!internal_results) {
+        LOG(ERROR) << "get_into_ranges RPC failed";
+        for (size_t i = 0; i < buffer_count; ++i) {
+            const size_t item_count = i < all_keys.size() ? all_keys[i].size() : 1;
+            results.emplace_back(
+                item_count, static_cast<int64_t>(toInt(internal_results.error())));
+        }
         return results;
     }
 
-    for (size_t i = 0; i < range_count; ++i) {
-        results[i] = get_into_range(key, buffer, dst_offsets[i], src_offsets[i],
-                                    sizes[i]);
+    const auto& nested_results = internal_results.value();
+    for (const auto& row : nested_results) {
+        std::vector<int64_t> converted;
+        converted.reserve(row.size());
+        for (const auto& result : row) {
+            converted.push_back(to_py_ret(result));
+        }
+        results.emplace_back(std::move(converted));
     }
 
     return results;

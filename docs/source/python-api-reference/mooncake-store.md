@@ -264,41 +264,25 @@ def get_into(self, key: str, buffer_ptr: int, size: int) -> int
 
 **Returns:** Number of bytes read, or negative on error
 
-#### get_into_range()
-Retrieve a byte range directly into a registered buffer (zero-copy).
-
-```python
-def get_into_range(self, key: str, buffer_ptr: int, dst_offset: int, src_offset: int, size: int) -> int
-```
-
-**Parameters:**
-- `key`: Object identifier to retrieve
-- `buffer_ptr`: Memory address of a pre-allocated buffer
-- `dst_offset`: Offset in the destination buffer where data is written
-- `src_offset`: Offset in the stored object where reading starts
-- `size`: Number of bytes to read
-
-**Returns:** Number of bytes read, or negative on error
-
-Use this API for single-key partial reads into a registered buffer. The read covers `[src_offset, src_offset + size)`, writes into `(buffer_ptr + dst_offset)`, and returns an error if the requested range exceeds the stored object size.
-
 #### get_into_ranges()
-Retrieve multiple byte ranges directly into a registered buffer (zero-copy).
+Retrieve multiple byte ranges from multiple objects into registered buffers (zero-copy).
 
 ```python
-def get_into_ranges(self, key: str, buffer_ptr: int, dst_offsets: List[int], src_offsets: List[int], sizes: List[int]) -> List[int]
+def get_into_ranges(self, buffer_ptrs: List[int], all_keys: List[List[str]], all_dst_offsets: List[List[int]], all_src_offsets: List[List[int]], all_sizes: List[List[int]]) -> List[List[int]]
 ```
 
 **Parameters:**
-- `key`: Object identifier to retrieve
-- `buffer_ptr`: Memory address of a pre-allocated buffer
-- `dst_offsets`: Destination offsets in the buffer for each range
-- `src_offsets`: Source offsets in the stored object for each range
-- `sizes`: Number of bytes to read for each range
+- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers
+- `all_keys`: For each buffer, the list of source object keys to read from
+- `all_dst_offsets`: For each buffer, destination offsets for each read item
+- `all_src_offsets`: For each buffer, source offsets in the corresponding object
+- `all_sizes`: For each buffer, byte sizes for each read item
 
-**Returns:** A list of per-range results. Each element is the number of bytes read for that range, or a negative value on error.
+**Returns:** A nested list of per-buffer, per-item results. Each element is the number of bytes read for that item, or a negative value on error.
 
-Use this API for single-key multi-range reads into a registered buffer. Each range reads `[src_offsets[i], src_offsets[i] + sizes[i])` and writes into `(buffer_ptr + dst_offsets[i])`. The three offset/size lists must have the same length.
+Use this API for buffer-major sparse reads. For buffer `i` and item `j`, Mooncake reads `[all_src_offsets[i][j], all_src_offsets[i][j] + all_sizes[i][j])` from `all_keys[i][j]` and writes it into `(buffer_ptrs[i] + all_dst_offsets[i][j])`. Within each buffer, the `keys`, `dst_offsets`, `src_offsets`, and `sizes` lists must have the same length.
+
+**Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
 
 ---
 
