@@ -3894,6 +3894,10 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
 
 std::vector<std::string> RealClient::batch_replica_clear(
     const std::vector<std::string> &keys, const std::string &segment_name) {
+    if (!client_) {
+        LOG(ERROR) << "batch_replica_clear: client not initialized";
+        return {};
+    }
     auto result =
         client_->BatchReplicaClear(keys, client_->getClientId(), segment_name);
     if (result) {

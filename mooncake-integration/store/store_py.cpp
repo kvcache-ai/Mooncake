@@ -2272,6 +2272,10 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::string &segment_name) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<std::string>{};
+                }
                 py::gil_scoped_release release;
                 return self.store_->batch_replica_clear(keys, segment_name);
             },
