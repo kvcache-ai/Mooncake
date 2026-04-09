@@ -10,6 +10,20 @@ It keeps the familiar Mooncake-style store API, but organizes the system around 
 
 The result is a store that is easier to embed into Rust systems, easier to test locally, and easier to expose to Python without adding another store implementation.
 
+## Documentation
+
+Use the document that matches what you are doing.
+
+| If You Want To | Read |
+|----------------|------|
+| run the project locally | `README.md`, `docs/deployment.md` |
+| integrate the client into a Rust service | `docs/rust.md` |
+| configure routing, memory, placement, or observability | `docs/configuration.md` |
+| use the Python compatibility layer | `docs/python.md` |
+| understand repository structure | `docs/components.md` |
+| understand implemented capabilities | `docs/features.md` |
+| understand runtime flow and control plane behavior | `docs/architecture.md` |
+
 ## Project Map
 
 The repository is organized by clear runtime responsibilities.
@@ -140,11 +154,15 @@ This script will:
 - run the Rust end-to-end suite
 - print batch put/get benchmark results
 
+For deployment details and script knobs, read `docs/deployment.md`.
+
 ### Run the Python compatibility e2e
 
 ```bash
 ./scripts/run-python-compat-e2e.sh
 ```
+
+For Python build and API details, read `docs/python.md`.
 
 ## Rust Usage
 
@@ -227,6 +245,8 @@ let routed = StoreClientBuilder::new(metadata, "router-a")
     .build(now_ms() + 600_000)?;
 ```
 
+For a fuller Rust guide, including lifecycle and buffer-oriented APIs, read `docs/rust.md`.
+
 ## Python Usage
 
 Build the native module and expose the Python package from the repository checkout:
@@ -263,6 +283,8 @@ For Python APIs and configuration details, read `docs/python.md`.
 
 ## Configuration Notes
 
+For the complete configuration reference, read `docs/configuration.md`.
+
 ### Metadata backends
 
 | Backend | Purpose | Status |
@@ -296,7 +318,10 @@ If store metadata uses etcd in the Python compatibility layer, transport metadat
 ## Documentation Index
 
 - `README.md` — project entry and first run
-- `docs/components.md` — board-by-board module guide
+- `docs/deployment.md` — environment setup, local scripts, and deployment roles
+- `docs/rust.md` — Rust integration and API usage
+- `docs/configuration.md` — builder defaults, request policies, labels, and environment variables
+- `docs/components.md` — component guide
 - `docs/features.md` — feature-by-feature capability guide
 - `docs/architecture.md` — runtime architecture and request paths
 - `docs/python.md` — Python usage and compatibility notes
