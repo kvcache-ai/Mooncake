@@ -1,5 +1,6 @@
 #include "ha/standby/hot_standby_service.h"
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -15,9 +17,13 @@
 #include <thread>
 #include <vector>
 
+#include "ha/progress/standby_progress_store_factory.h"
 #include "master_service.h"
 
 namespace mooncake::test {
+
+DEFINE_string(redis_endpoint, "",
+              "Redis endpoint for HotStandbyService Redis progress tests");
 
 namespace {
 
@@ -690,6 +696,84 @@ TEST_F(HotStandbyServiceTest, TestSnapshotOnlyRefreshUpdatesMetrics) {
                       HARuntimePhase::kSnapshotRefresh));
 }
 
+TEST_F(HotStandbyServiceTest,
+       SnapshotOnlyStartPublishesProgressToConfiguredRedisBackend) {
+#ifndef STORE_USE_REDIS
+    GTEST_SKIP() << "Redis support is not enabled in this build.";
+#else
+    if (FLAGS_redis_endpoint.empty()) {
+        GTEST_SKIP() << "Redis endpoint is not configured";
+    }
+
+    namespace fs = std::filesystem;
+
+    const auto cluster_id =
+        "hot-standby-progress-" + UuidToString(generate_uuid());
+    const auto standby_id = "standby-" + UuidToString(generate_uuid());
+    const auto oplog_dir =
+        fs::temp_directory_path() /
+        ("hot_standby_progress_" + UuidToString(generate_uuid()));
+    ASSERT_TRUE(fs::create_directories(oplog_dir));
+
+    config_.standby_id = standby_id;
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    config_.oplog_backend_type = ha::HABackendType::LOCALFS;
+    config_.progress_backend_type = ha::HABackendType::REDIS;
+    config_.progress_backend_connstring = FLAGS_redis_endpoint;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto progress_store = ha::CreateStandbyProgressStore(ha::HABackendSpec{
+        .type = ha::HABackendType::REDIS,
+        .connstring = FLAGS_redis_endpoint,
+        .cluster_namespace = cluster_id,
+    });
+    ASSERT_TRUE(progress_store.has_value()) << toString(progress_store.error());
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-1", 4096))));
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_dir.string(), cluster_id));
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            auto records = progress_store.value()->List();
+            if (!records) {
+                return false;
+            }
+            return std::any_of(
+                records->begin(), records->end(),
+                [&](const ha::StandbyProgressRecord& record) {
+                    return record.standby_id == standby_id &&
+                           record.mode ==
+                               ha::StandbyProgressMode::kSnapshotOnly &&
+                           record.applied_seq_id == 42 &&
+                           record.required_seq_id == 0;
+                });
+        },
+        std::chrono::seconds(3)));
+
+    service_->Stop();
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            auto records = progress_store.value()->List();
+            if (!records) {
+                return false;
+            }
+            return std::none_of(records->begin(), records->end(),
+                                [&](const ha::StandbyProgressRecord& record) {
+                                    return record.standby_id == standby_id;
+                                });
+        },
+        std::chrono::seconds(3)));
+
+    fs::remove_all(oplog_dir);
+#endif
+}
+
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
     config_.enable_snapshot_bootstrap = true;
     config_.enable_oplog_following = false;
@@ -830,6 +914,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
+    gflags::ParseCommandLineFlags(&argc, &argv, true);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

@@ -58,6 +58,8 @@ struct HotStandbyConfig {
     uint32_t snapshot_refresh_interval_ms{1000};
 
     ha::HABackendType oplog_backend_type{ha::HABackendType::ETCD};
+    ha::HABackendType progress_backend_type{ha::HABackendType::UNKNOWN};
+    std::string progress_backend_connstring;
 };
 
 /**

@@ -913,21 +913,28 @@ HotStandbyService::BuildStandbyProgressRecordLocked() const {
 void HotStandbyService::InitializeStandbyProgressStoreLocked() {
     standby_progress_store_.reset();
 
+    const auto backend_type =
+        config_.progress_backend_type != ha::HABackendType::UNKNOWN
+            ? config_.progress_backend_type
+            : config_.oplog_backend_type;
+    const std::string& connstring = !config_.progress_backend_connstring.empty()
+                                        ? config_.progress_backend_connstring
+                                        : oplog_backend_connstring_;
+
     if (config_.standby_id.empty() || cluster_id_.empty() ||
-        oplog_backend_connstring_.empty()) {
+        connstring.empty()) {
         return;
     }
 
     ha::HABackendSpec spec{
-        .type = config_.oplog_backend_type,
-        .connstring = oplog_backend_connstring_,
+        .type = backend_type,
+        .connstring = connstring,
         .cluster_namespace = cluster_id_,
     };
     auto progress_store = ha::CreateStandbyProgressStore(spec);
     if (!progress_store) {
         LOG(WARNING) << "Failed to initialize standby progress store, "
-                     << "backend="
-                     << ha::HABackendTypeToString(config_.oplog_backend_type)
+                     << "backend=" << ha::HABackendTypeToString(backend_type)
                      << ", cluster=" << cluster_id_
                      << ", error=" << toString(progress_store.error());
         return;

@@ -25,7 +25,7 @@ struct StandbyRuntimeCapabilities {
 std::unique_ptr<HotStandbyService> CreateStandbyService(
     const MasterServiceSupervisorConfig& config,
     const StandbyRuntimeCapabilities& capabilities,
-    ha::HABackendType oplog_backend_type) {
+    ha::HABackendType oplog_backend_type, const HABackendSpec& ha_spec) {
     return std::make_unique<HotStandbyService>(HotStandbyConfig{
         .standby_id = config.local_hostname,
         .primary_address = "",
@@ -35,6 +35,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .enable_snapshot_bootstrap = config.enable_snapshot_restore,
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_backend_type = oplog_backend_type,
+        .progress_backend_type = ha_spec.type,
+        .progress_backend_connstring = ha_spec.connstring,
     });
 }
 
@@ -122,14 +124,14 @@ class CapabilityDrivenReplicationController final
             dependency_init_error_ = oplog_spec.error();
             LOG(ERROR) << "Failed to resolve standby OpLog backend spec, "
                        << "error=" << toString(dependency_init_error_);
-            standby_service_ = CreateStandbyService(config_, capabilities_,
-                                                    HABackendType::UNKNOWN);
+            standby_service_ = CreateStandbyService(
+                config_, capabilities_, HABackendType::UNKNOWN, spec_);
         } else {
             oplog_spec_ = std::move(oplog_spec.value());
             capabilities_ =
                 BuildStandbyRuntimeCapabilities(oplog_spec_.value(), config_);
-            standby_service_ =
-                CreateStandbyService(config_, capabilities_, oplog_spec_->type);
+            standby_service_ = CreateStandbyService(config_, capabilities_,
+                                                    oplog_spec_->type, spec_);
 
             if (SupportsOpLogFollowing(oplog_spec_->type) &&
                 oplog_spec_->connstring.empty() &&
