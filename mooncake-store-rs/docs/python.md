@@ -22,22 +22,20 @@ The Python package loads the native extension from the local `target` directory 
 ## Build a Wheel
 
 ```bash
-python3 -m venv .venv-build
-. .venv-build/bin/activate
-python -m pip install -U pip maturin
-maturin build --release
+./scripts/build-wheel.sh
 ```
 
-The wheel is written to `target/wheels/`. It contains:
+By default the script writes artifacts to `dist/`:
 
 - the `mooncake` Python package
 - the `mooncake._store_rs` native extension
 - the repaired runtime shared libraries needed by the extension on Linux
+- the standalone `mooncake-store-client` binary in `dist/bin/`
 
 Install the wheel into any compatible virtualenv:
 
 ```bash
-pip install target/wheels/mooncake_store_rs-*.whl
+pip install dist/wheels/mooncake_store_rs-*.whl
 ```
 
 ## Standalone Client Binary
