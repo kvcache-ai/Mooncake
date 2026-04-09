@@ -668,13 +668,20 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
-      should-run-downstream: ${{ steps.filter.outputs.src }}
+      should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
     steps:
+      # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
+      - name: Default to true for workflow_dispatch
+        id: dispatch-override
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "src=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
+        if: github.event_name != 'workflow_dispatch'
         with:
           fetch-depth: 2
           persist-credentials: false
       - uses: dorny/paths-filter@v3
+        if: github.event_name != 'workflow_dispatch'
         id: filter
         with:
           filters: |

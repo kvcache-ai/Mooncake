@@ -30,6 +30,9 @@ jobs:
 
   integration-test:
     uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ inputs.pr_sha }}
+      pr_number: ${{ inputs.pr_number }}
     secrets: inherit
 
   e2e-gate:
