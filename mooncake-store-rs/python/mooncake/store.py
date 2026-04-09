@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import Future
 import ctypes
+import gc
 import importlib.machinery
 import importlib.util
 import mmap
 import pathlib
+import queue
 import sys
+import threading
 from dataclasses import dataclass, field
 
 
@@ -188,6 +192,54 @@ class MooncakeHostMemAllocator:
     def __del__(self) -> None:
         self.close()
 
+class _NativeStoreWorker:
+    def __init__(self) -> None:
+        self._queue: queue.Queue[tuple[str, tuple, dict, Future] | None] = queue.Queue()
+        self._closed = False
+        self._startup = Future()
+        self._thread = threading.Thread(target=self._run, name="mooncake-store-native", daemon=True)
+        self._thread.start()
+        self._startup.result()
+
+    def call(self, name: str, *args, **kwargs):
+        if self._closed:
+            raise RuntimeError("store is closed")
+        future = Future()
+        self._queue.put((name, args, kwargs, future))
+        return future.result()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._queue.put(None)
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        try:
+            native = _native.MooncakeDistributedStore()
+        except BaseException as exc:
+            self._startup.set_exception(exc)
+            return
+        self._startup.set_result(None)
+        while True:
+            request = self._queue.get()
+            if request is None:
+                try:
+                    native.close()
+                except Exception:
+                    pass
+                native = None
+                gc.collect()
+                return
+            name, args, kwargs, future = request
+            try:
+                result = getattr(native, name)(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
 
 @dataclass
 class ReplicateConfig:
@@ -216,32 +268,32 @@ class ReplicateConfig:
 def init_tracing(filter: str | None = None):
     return _native.init_tracing(filter)
 
-
 def metrics_text() -> str:
     return _native.metrics_text()
-
 
 def start_metrics_server(bind_addr: str = "127.0.0.1:0") -> str:
     return _native.start_metrics_server(bind_addr)
 
-
 def stop_metrics_server() -> None:
     _native.stop_metrics_server()
-
 
 def metrics_server_address() -> str | None:
     return _native.metrics_server_address()
 
-
 class MooncakeDistributedStore:
     def __init__(self) -> None:
-        self._native = _native.MooncakeDistributedStore()
+        self._worker = _NativeStoreWorker()
+        self._lock = threading.RLock()
         self._registered_buffers: dict[int, int] = {}
         self._tracked_keys: set[tuple[str | None, str]] = set()
 
     def __getattr__(self, name: str):
-        return getattr(self._native, name)
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: self._invoke(name, *args, **kwargs)
 
+    def _invoke(self, name: str, *args, **kwargs):
+        return self._worker.call(name, *args, **kwargs)
     def setup(self, *args, **kwargs):
         if len(args) == 1 and isinstance(args[0], Mapping) and not kwargs:
             return self._setup_from_config_dict(dict(args[0]))
@@ -252,28 +304,35 @@ class MooncakeDistributedStore:
         kwargs.pop("engine", None)
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
-        return self._native.setup(*args, **kwargs)
+        return self._invoke("setup", *args, **kwargs)
+    def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str):
+        return self._invoke("setup_dummy", mem_pool_size, local_buffer_size, server_address)
 
     def close(self) -> None:
-        self._registered_buffers.clear()
-        self._tracked_keys.clear()
-        self._native.close()
+        with self._lock:
+            self._registered_buffers.clear()
+            self._tracked_keys.clear()
+        try:
+            self._invoke("close")
+        finally:
+            self._worker.close()
 
     def register_buffer(self, buffer_ptr: int, size: int):
-        result = self._native.register_buffer(buffer_ptr, size)
+        result = self._invoke("register_buffer", buffer_ptr, size)
         if result == 0:
-            self._registered_buffers[int(buffer_ptr)] = int(size)
+            with self._lock:
+                self._registered_buffers[int(buffer_ptr)] = int(size)
         return result
-
     def unregister_buffer(self, buffer_ptr: int, size: int | None = None):
         resolved_size = self._resolve_registered_size(buffer_ptr, size)
-        result = self._native.unregister_buffer(buffer_ptr, resolved_size)
+        result = self._invoke("unregister_buffer", buffer_ptr, resolved_size)
         if result == 0:
-            self._registered_buffers.pop(int(buffer_ptr), None)
+            with self._lock:
+                self._registered_buffers.pop(int(buffer_ptr), None)
         return result
-
     def put(self, key: str, value, *, tenant: str | None = None, config=None):
-        result = self._native.put(
+        result = self._invoke(
+            "put",
             key,
             value,
             tenant=tenant,
@@ -282,7 +341,6 @@ class MooncakeDistributedStore:
         if result == 0:
             self._track_keys([key], tenant=tenant)
         return result
-
     def put_from(
         self,
         key: str,
@@ -292,7 +350,8 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
         config=None,
     ):
-        result = self._native.put_from(
+        result = self._invoke(
+            "put_from",
             key,
             buffer_ptr,
             size,
@@ -302,7 +361,6 @@ class MooncakeDistributedStore:
         if result == 0:
             self._track_keys([key], tenant=tenant)
         return result
-
     def batch_put(
         self,
         items=None,
@@ -313,7 +371,8 @@ class MooncakeDistributedStore:
         config=None,
     ):
         normalized = _normalize_key_value_items(items, keys, values)
-        result = self._native.batch_put(
+        result = self._invoke(
+            "batch_put",
             normalized,
             tenant=tenant,
             **_replication_kwargs(config),
@@ -321,7 +380,6 @@ class MooncakeDistributedStore:
         if result == 0:
             self._track_keys([key for key, _ in normalized], tenant=tenant)
         return result
-
     def put_batch(
         self,
         keys: Sequence[str],
@@ -331,11 +389,11 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
     ):
         return self.batch_put(keys=keys, values=values, tenant=tenant, config=config)
-
     def batch_put_from(self, *args, tenant: str | None = None, config=None):
         if len(args) == 1:
             items = _normalize_pointer_items(args[0])
-            result = self._native.batch_put_from(
+            result = self._invoke(
+                "batch_put_from",
                 items,
                 tenant=tenant,
                 **_replication_kwargs(config),
@@ -344,7 +402,8 @@ class MooncakeDistributedStore:
             return _coerce_batch_status_result(result, len(items))
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
-            result = self._native.batch_put_from_raw(
+            result = self._invoke(
+                "batch_put_from_raw",
                 keys,
                 buffer_ptrs,
                 sizes,
@@ -356,7 +415,6 @@ class MooncakeDistributedStore:
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
         )
-
     def batch_put_from_multi_buffers(
         self,
         *args,
@@ -366,13 +424,15 @@ class MooncakeDistributedStore:
         if len(args) == 1:
             items = list(args[0])
             if _items_use_bytes_payloads(items):
-                return self._native.batch_put_from_multi_buffers(
+                return self._invoke(
+                    "batch_put_from_multi_buffers",
                     items,
                     tenant=tenant,
                     **_replication_kwargs(config),
                 )
             keys, all_buffer_ptrs, all_sizes = _normalize_descriptor_items(items)
-            return self._native.batch_put_from_multi_buffers_raw(
+            return self._invoke(
+                "batch_put_from_multi_buffers_raw",
                 keys,
                 all_buffer_ptrs,
                 all_sizes,
@@ -381,7 +441,8 @@ class MooncakeDistributedStore:
             )
         if len(args) == 3:
             keys, all_buffer_ptrs, all_sizes = _normalize_raw_multi_buffer_args(*args)
-            return self._native.batch_put_from_multi_buffers_raw(
+            return self._invoke(
+                "batch_put_from_multi_buffers_raw",
                 keys,
                 all_buffer_ptrs,
                 all_sizes,
@@ -391,25 +452,22 @@ class MooncakeDistributedStore:
         raise TypeError(
             "batch_put_from_multi_buffers expects items or (keys, all_buffer_ptrs, all_sizes)"
         )
-
     def batch_get(self, keys: Sequence[str], *, tenant: str | None = None):
-        return self._native.batch_get(list(keys), tenant=tenant)
-
+        return self._invoke("batch_get", list(keys), tenant=tenant)
     def batch_get_buffer(self, keys: Sequence[str], *, tenant: str | None = None):
-        return self._native.batch_get_buffer(list(keys), tenant=tenant)
-
+        return self._invoke("batch_get_buffer", list(keys), tenant=tenant)
     def batch_get_into(self, *args, tenant: str | None = None):
         if len(args) == 1:
-            return self._native.batch_get_into(args[0], tenant=tenant)
+            return self._invoke("batch_get_into", args[0], tenant=tenant)
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
-            return self._native.batch_get_into_raw(
+            return self._invoke(
+                "batch_get_into_raw",
                 keys, buffer_ptrs, sizes, tenant=tenant
             )
         raise TypeError(
             "batch_get_into expects either items or (keys, buffer_ptrs, sizes)"
         )
-
     def batch_get_into_multi_buffers(
         self,
         *args,
@@ -424,20 +482,29 @@ class MooncakeDistributedStore:
             raise TypeError(
                 "batch_get_into_multi_buffers expects items or (keys, all_buffer_ptrs, all_sizes)"
             )
-        return self._native.batch_get_into_multi_buffers(
+        return self._invoke(
+            "batch_get_into_multi_buffers",
             keys,
             all_buffer_ptrs,
             all_sizes,
             prefer_alloc_in_same_node=prefer_alloc_in_same_node,
             tenant=tenant,
         )
-
+    def get(self, key: str, *, tenant: str | None = None):
+        return self._invoke("get", key, tenant=tenant)
+    def is_exist(self, key: str, *, tenant: str | None = None) -> bool:
+        return self._invoke("is_exist", key, tenant=tenant)
+    def batch_is_exist(self, keys: Sequence[str], *, tenant: str | None = None):
+        return self._invoke("batch_is_exist", list(keys), tenant=tenant)
+    def get_hostname(self) -> str:
+        return self._invoke("get_hostname")
+    def get_size(self, key: str, *, tenant: str | None = None) -> int:
+        return self._invoke("get_size", key, tenant=tenant)
     def remove(self, key: str, *, force: bool = False, tenant: str | None = None):
-        result = self._native.remove(key, force=force, tenant=tenant)
+        result = self._invoke("remove", key, force=force, tenant=tenant)
         if result == 0:
             self._forget_keys([key], tenant=tenant)
         return result
-
     def batch_remove(
         self,
         keys: Sequence[str],
@@ -446,79 +513,64 @@ class MooncakeDistributedStore:
         tenant: str | None = None,
     ):
         key_list = list(keys)
-        result = self._native.batch_remove(key_list, force=force, tenant=tenant)
+        result = self._invoke("batch_remove", key_list, force=force, tenant=tenant)
         for key, status in zip(key_list, result):
             if int(status) == 0:
                 self._forget_keys([key], tenant=tenant)
         return result
-
     def remove_all(self, force: bool = False):
-        if hasattr(self._native, "remove_all"):
-            try:
-                removed = self._native.remove_all(force=force)
-                if int(removed) >= 0:
-                    self._tracked_keys.clear()
-                return removed
-            except Exception:
-                pass
+        try:
+            removed = self._invoke("remove_all", force=force)
+            if int(removed) >= 0:
+                self._tracked_keys.clear()
+            return removed
+        except Exception:
+            pass
         removed = 0
         for tenant, keys in self._group_tracked_keys().items():
-            statuses = self._native.batch_remove(keys, force=force, tenant=tenant)
+            statuses = self._invoke("batch_remove", keys, force=force, tenant=tenant)
             for key, status in zip(keys, statuses):
                 if int(status) == 0:
                     self._forget_keys([key], tenant=tenant)
                     removed += 1
         return removed
-
     def start_metrics_server(self, bind_addr: str = "127.0.0.1:0") -> str:
-        return self._native.start_metrics_server(bind_addr)
-
+        return self._invoke("start_metrics_server", bind_addr)
     def stop_metrics_server(self) -> None:
-        self._native.stop_metrics_server()
-
+        self._invoke("stop_metrics_server")
     def metrics_server_address(self) -> str | None:
-        return self._native.metrics_server_address()
-
+        return self._invoke("metrics_server_address")
     def _resolve_registered_size(self, buffer_ptr: int, size: int | None) -> int:
         if size is not None:
             return int(size)
-        if int(buffer_ptr) not in self._registered_buffers:
-            raise ValueError(
-                "buffer size is required for unknown pointers; call register_buffer first or pass size explicitly"
-            )
-        return self._registered_buffers[int(buffer_ptr)]
-
-    def _track_keys(
-        self,
-        keys: Iterable[str],
-        *,
-        tenant: str | None = None,
-    ) -> None:
-        for key in keys:
-            self._tracked_keys.add((tenant, str(key)))
-
-    def _forget_keys(
-        self,
-        keys: Iterable[str],
-        *,
-        tenant: str | None = None,
-    ) -> None:
-        for key in keys:
-            self._tracked_keys.discard((tenant, str(key)))
-
+        with self._lock:
+            if int(buffer_ptr) not in self._registered_buffers:
+                raise ValueError(
+                    "buffer size is required for unknown pointers; call register_buffer first or pass size explicitly"
+                )
+            return self._registered_buffers[int(buffer_ptr)]
+    def _track_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
+        with self._lock:
+            for key in keys:
+                self._tracked_keys.add((tenant, str(key)))
+    def _forget_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
+        with self._lock:
+            for key in keys:
+                self._tracked_keys.discard((tenant, str(key)))
     def _group_tracked_keys(self) -> dict[str | None, list[str]]:
         grouped: dict[str | None, list[str]] = {}
-        for tenant, key in self._tracked_keys:
-            grouped.setdefault(tenant, []).append(key)
+        with self._lock:
+            for tenant, key in self._tracked_keys:
+                grouped.setdefault(tenant, []).append(key)
         return grouped
-
     def _setup_from_config_dict(self, config: Mapping[str, object]):
         if "local_hostname" not in config:
             raise TypeError("setup config requires `local_hostname`")
         metadata_url = config.get("metadata_server", config.get("metadata_url"))
         if metadata_url is None:
             raise TypeError("setup config requires `metadata_server`")
-        return self._native.setup(
+        return self._invoke(
+            "setup",
             str(config["local_hostname"]),
             str(metadata_url),
             _coerce_int(config.get("global_segment_size"), 16 * 1024 * 1024),
@@ -540,7 +592,6 @@ class MooncakeDistributedStore:
             use_hugepage=_coerce_optional_bool(config.get("use_hugepage")),
             hugepage_size=_normalize_hugepage_size(config.get("hugepage_size")),
         )
-
 
 def _replication_kwargs(config) -> dict:
     if config is None:
@@ -569,7 +620,6 @@ def _replication_kwargs(config) -> dict:
         "with_soft_pin": bool(getattr(config, "with_soft_pin", False)),
     }
 
-
 def _normalize_key_value_items(
     items,
     keys: Sequence[str] | None,
@@ -585,7 +635,6 @@ def _normalize_key_value_items(
         raise ValueError("keys and values must have the same length")
     return list(zip(keys, values))
 
-
 def _normalize_raw_batch_args(
     keys: Sequence[str],
     buffer_ptrs: Sequence[int],
@@ -594,7 +643,6 @@ def _normalize_raw_batch_args(
     if len(keys) != len(buffer_ptrs) or len(keys) != len(sizes):
         raise ValueError("keys, buffer_ptrs, and sizes must have the same length")
     return list(keys), [int(ptr) for ptr in buffer_ptrs], [int(size) for size in sizes]
-
 
 def _normalize_pointer_items(items: Iterable[tuple]):
     normalized = []
@@ -605,14 +653,12 @@ def _normalize_pointer_items(items: Iterable[tuple]):
         normalized.append((str(key), int(buffer_ptr), int(size)))
     return normalized
 
-
 def _coerce_batch_status_result(result, count: int) -> _BatchStatusResult:
     if isinstance(result, int):
         if result != 0:
             raise RuntimeError(f"batch put-from failed with status {result}")
         return _BatchStatusResult([0] * count)
     return _BatchStatusResult([int(status) for status in result])
-
 
 def _coerce_bool(value, default: bool) -> bool:
     if value is None:
@@ -621,30 +667,25 @@ def _coerce_bool(value, default: bool) -> bool:
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
 
-
 def _coerce_optional_bool(value) -> bool | None:
     if value is None:
         return None
     return _coerce_bool(value, False)
-
 
 def _coerce_int(value, default: int) -> int:
     if value is None:
         return default
     return int(value)
 
-
 def _coerce_optional_int(value) -> int | None:
     if value is None:
         return None
     return int(value)
 
-
 def _coerce_optional_str(value) -> str | None:
     if value in ("", None):
         return None
     return str(value)
-
 
 def _coerce_mapping(value) -> dict[str, str] | None:
     if value is None:
@@ -652,7 +693,6 @@ def _coerce_mapping(value) -> dict[str, str] | None:
     if not isinstance(value, Mapping):
         raise TypeError("labels must be a mapping")
     return {str(key): str(item) for key, item in value.items()}
-
 
 def _normalize_raw_multi_buffer_args(
     keys: Sequence[str],
@@ -668,7 +708,6 @@ def _normalize_raw_multi_buffer_args(
         [[int(ptr) for ptr in group] for group in all_buffer_ptrs],
         [[int(size) for size in group] for group in all_sizes],
     )
-
 
 def _normalize_descriptor_items(items: Iterable[tuple]):
     keys = []
@@ -700,7 +739,6 @@ def _normalize_descriptor_items(items: Iterable[tuple]):
         all_sizes.append(sizes)
     return keys, all_buffer_ptrs, all_sizes
 
-
 def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
     if not items:
         return True
@@ -712,7 +750,6 @@ def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
         return True
     sample = buffers[0]
     return isinstance(sample, (bytes, bytearray, memoryview))
-
 
 __all__ = [
     "MooncakeDistributedStore",
