@@ -2,30 +2,93 @@
 
 A Rust-native Mooncake Store implementation that keeps the Mooncake store programming model, reuses Mooncake TE/TENT for data transfer, and defaults to masterless route control.
 
-## Overview
+## What This Project Is
 
-`mooncake-store-rs` is a workspace that splits the store into four clear layers:
+`mooncake-store-rs` is a complete store implementation built in Rust.
 
-- `mooncake-store-core`: shared types and traits
-- `mooncake-metadata`: metadata backends for leases, segments, and route persistence
-- `mooncake-store-client`: the main client, allocator, route control, transport bridge, and observability
-- `mooncake-store-py`: a Python compatibility layer built on top of the Rust client
+It keeps the familiar Mooncake-style store API, but organizes the system around client-owned routing and peer-to-peer control-plane communication. Object data is transferred through Mooncake TE/TENT, while leases, segment state, and durable metadata stay in Redis or etcd.
 
-By default, object route ownership is selected client-side with embedded weighted rendezvous hashing. Metadata remains the source of truth for leases and segment state, while TE/TENT stays on the data path for read and write transfer.
+The result is a store that is easier to embed into Rust systems, easier to test locally, and easier to expose to Python without adding another store implementation.
 
-## Highlights
+## Project Map
 
-- Masterless route control with embedded weighted rendezvous hashing
-- Optional `MetadataOnly` route mode for simpler deployments and debugging
-- Local-first placement with spillover to remote storage nodes
-- Request-level replication policy with preferred segment and preferred storage owner hints
-- Batch put/get, registered-buffer put/get, and multi-buffer I/O
-- Multi-tenant key namespace support
-- Lifecycle support for standby, activation, draining, handoff, elastic segment changes, and reclaim
-- Built-in tracing and Prometheus-style metrics
-- Python compatibility layer with a Mooncake-style API surface
+The repository is organized by clear runtime responsibilities.
 
-## Architecture
+| Module | Role | Why It Exists |
+|--------|------|---------------|
+| `mooncake-store-core` | Shared store model | Defines identities, leases, routes, segments, lifecycle, and traits |
+| `mooncake-metadata` | Metadata backends | Stores leases, segments, and route state in Redis, etcd, or memory |
+| `mooncake-store-client` | Main runtime | Implements store APIs, routing, allocation, reclaim, control-plane RPC, and observability |
+| `mooncake-transport-sys` | Native FFI | Links Rust to upstream Mooncake native libraries |
+| `mooncake-transport` | Safe transport wrapper | Exposes TE/TENT as Rust-friendly transport abstractions |
+| `mooncake-store-py` | Python bindings | Exposes the Rust client as a native Python module |
+| `mooncake-store-e2e` | Validation binary | Runs end-to-end checks and benchmark loops |
+
+If you want a deeper module-by-module explanation, read `docs/components.md`.
+
+## Feature Map
+
+The implementation is easier to understand when grouped by capability instead of by crate.
+
+### Data I/O
+
+- single `put` / `get`
+- `batch_put` / `batch_get`
+- buffer-based and registered-buffer I/O
+- multi-buffer put and get for fragmented payloads
+- local copy and remote transfer paths through TE/TENT
+
+### Routing
+
+- default client-side route ownership with embedded weighted rendezvous hashing
+- optional `MetadataOnly` route mode
+- route read, replace, and compare-and-swap through the control plane
+- metadata fallback when route authorities are unavailable
+
+### Placement and Replication
+
+- local-only writes
+- routed writes to remote storage nodes
+- local-first placement with remote spillover
+- request-level replication policy
+- preferred segment hints
+- preferred storage owner hints
+- multi-replica publication
+
+### Memory and Reclaim
+
+- local segment registration
+- local and remote allocation paths
+- overwrite reclaim
+- delete reclaim
+- configurable reclaim grace window
+- elastic segment expansion and retirement
+
+### Lifecycle and Membership
+
+- standby, activate, and draining states
+- handoff planning for upgrades
+- dynamic live-client membership
+- soft shrink through drain and retire flows
+- hot-upgrade and elastic-capacity scenarios validated in e2e
+
+### Observability
+
+- tracing through `tracing` / `tracing-subscriber`
+- in-process Prometheus-style metrics
+- optional metrics HTTP server
+- control-plane and data-path metrics coverage
+
+### Python Compatibility
+
+- Mooncake-style `MooncakeDistributedStore`
+- `ReplicateConfig` request policy mapping
+- batch APIs, route query, metrics helpers, lifecycle helpers
+- native module backed by the Rust implementation
+
+If you want a feature-by-feature view, read `docs/features.md`.
+
+## Architecture at a Glance
 
 ```mermaid
 graph TB
@@ -46,6 +109,8 @@ graph TB
     style TE fill:#ede7f6
 ```
 
+For the runtime view, read `docs/architecture.md`.
+
 ## Quick Start
 
 ### Prerequisites
@@ -54,7 +119,7 @@ graph TB
 - `cmake` and a C++ toolchain
 - `redis-server` and `redis-cli`
 - Git submodule support
-- Python 3, if you want the compatibility layer
+- Python 3, if you want the Python layer
 
 ### Fetch the upstream Mooncake submodule
 
@@ -148,8 +213,6 @@ fn main() -> Result<()> {
 
 ### Routed writes
 
-Use a placement planner and enable routed mode when you want router nodes to place data on remote storage nodes.
-
 ```rust
 use mooncake_store_client::PlacementPlanner;
 
@@ -196,7 +259,7 @@ config = ReplicateConfig(replica_num=2, prefer_local=True)
 store.put("replicated", b"payload", config=config)
 ```
 
-For more Python details, see `docs/python.md`.
+For Python APIs and configuration details, read `docs/python.md`.
 
 ## Configuration Notes
 
@@ -230,6 +293,14 @@ If store metadata uses etcd in the Python compatibility layer, transport metadat
 - `render_prometheus_metrics()` returns a text snapshot
 - `start_metrics_http_server()` exposes `/metrics` and `/healthz`
 
+## Documentation Index
+
+- `README.md` — project entry and first run
+- `docs/components.md` — board-by-board module guide
+- `docs/features.md` — feature-by-feature capability guide
+- `docs/architecture.md` — runtime architecture and request paths
+- `docs/python.md` — Python usage and compatibility notes
+
 ## Workspace Layout
 
 ```text
@@ -249,11 +320,6 @@ scripts/
 third_party/
   Mooncake/                 Upstream Mooncake submodule
 ```
-
-## More Documentation
-
-- `docs/architecture.md`
-- `docs/python.md`
 
 ## Status
 
