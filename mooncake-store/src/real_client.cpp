@@ -357,19 +357,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
         if (local_rpc_port > 0) {
-            this->local_rpc_addr =
-                hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+            this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
+                                   std::to_string(local_rpc_port);
         } else {
             auto rpc_binder = std::make_unique<AutoPortBinder>();
             int rpc_auto = rpc_binder->getPort();
             int specified_port = std::stoi(hostname.substr(colon_pos + 1));
             if (rpc_auto > 0 && rpc_auto != specified_port) {
-                this->local_rpc_addr =
-                    hostname.substr(0, colon_pos + 1) + std::to_string(rpc_auto);
+                this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
+                                       std::to_string(rpc_auto);
                 rpc_port_binder_ = std::move(rpc_binder);
             } else {
-                this->local_rpc_addr =
-                    hostname.substr(0, colon_pos + 1) + std::to_string(specified_port);
+                this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
+                                       std::to_string(specified_port);
             }
         }
         auto client_opt = mooncake::Client::Create(
@@ -403,7 +403,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 this->local_rpc_addr =
                     hostname + ":" + std::to_string(local_rpc_port);
             } else {
-                // Auto-assign a separate port for client RPC (must differ from TE port)
+                // Auto-assign a separate port for client RPC (must differ from
+                // TE port)
                 auto rpc_binder = std::make_unique<AutoPortBinder>();
                 int rpc_auto = rpc_binder->getPort();
                 if (rpc_auto > 0 && rpc_auto != port) {
@@ -625,13 +626,11 @@ int RealClient::setup_real(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path,
-    bool enable_offload) {
-    return to_py_ret(setup_internal(local_hostname, metadata_server,
-                                    global_segment_size, local_buffer_size,
-                                    protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path,
-                                    0, enable_offload));
+    const std::string &ipc_socket_path, bool enable_offload) {
+    return to_py_ret(setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, 0, enable_offload));
 }
 
 namespace {
@@ -920,16 +919,16 @@ int RealClient::start_client_rpc_server() {
     int rpc_port = std::stoi(this->local_rpc_addr.substr(colon + 1));
 
     try {
-        client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-            1, rpc_port, rpc_host);
+        client_rpc_server_ =
+            std::make_unique<coro_rpc::coro_rpc_server>(1, rpc_port, rpc_host);
 
         // Register offload-related handlers (essential for LOCAL_DISK reads)
-        client_rpc_server_->register_handler<
-            &RealClient::batch_get_offload_object>(this);
-        client_rpc_server_->register_handler<
-            &RealClient::release_offload_buffer>(this);
-        client_rpc_server_->register_handler<
-            &RealClient::service_ready_internal>(this);
+        client_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object>(this);
+        client_rpc_server_
+            ->register_handler<&RealClient::release_offload_buffer>(this);
+        client_rpc_server_
+            ->register_handler<&RealClient::service_ready_internal>(this);
 
         // Start in background thread (start() blocks)
         client_rpc_thread_ = std::jthread([this]() {
