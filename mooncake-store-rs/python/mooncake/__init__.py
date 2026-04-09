@@ -1,3 +1,19 @@
-from .store import MooncakeDistributedStore, init_tracing, metrics_text
+from .store import (
+    MooncakeDistributedStore,
+    ReplicateConfig,
+    init_tracing,
+    metrics_server_address,
+    metrics_text,
+    start_metrics_server,
+    stop_metrics_server,
+)
 
-__all__ = ["MooncakeDistributedStore", "init_tracing", "metrics_text"]
+__all__ = [
+    "MooncakeDistributedStore",
+    "ReplicateConfig",
+    "init_tracing",
+    "metrics_text",
+    "start_metrics_server",
+    "stop_metrics_server",
+    "metrics_server_address",
+]

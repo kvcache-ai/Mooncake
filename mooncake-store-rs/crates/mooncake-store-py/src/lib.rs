@@ -8,9 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use config::CompatSetupArgs;
 use mooncake_store_client::{
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferPutRequest, ObjectRef,
-    PlacementPlanner, PutFromRequest, PutRequest, StoreClient, StoreClientBuilder,
-    TentTransportFactory, init_tracing as init_store_tracing, render_prometheus_metrics,
+    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
+    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, StoreClient,
+    StoreClientBuilder, TentTransportFactory, init_tracing as init_store_tracing,
+    metrics_http_server_addr, render_prometheus_metrics, start_metrics_http_server,
+    stop_metrics_http_server,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, ObjectRoute, SegmentAnnouncement,
@@ -178,6 +180,40 @@ impl PyMooncakeDistributedStore {
         Ok(route.is_some())
     }
 
+    #[pyo3(signature = (keys, *, tenant = None))]
+    fn batch_is_exist(&self, keys: Vec<String>, tenant: Option<&str>) -> PyResult<Vec<i32>> {
+        let client = self.client_ref()?;
+        keys.iter()
+            .map(|key| {
+                let route = match tenant {
+                    Some(tenant) => client.query_route_in_tenant(tenant, key),
+                    None => client.query_route(key),
+                }
+                .map_err(store_error_to_py)?;
+                Ok(i32::from(route.is_some()))
+            })
+            .collect()
+    }
+
+    fn get_hostname(&self) -> PyResult<String> {
+        Ok(self.client_ref()?.lease().endpoints.rpc_address.clone())
+    }
+
+    #[pyo3(signature = (key, *, tenant = None))]
+    fn get_size(&self, key: &str, tenant: Option<&str>) -> PyResult<usize> {
+        let client = self.client_ref()?;
+        let route = match tenant {
+            Some(tenant) => client.query_route_in_tenant(tenant, key),
+            None => client.query_route(key),
+        }
+        .map_err(store_error_to_py)?;
+        Ok(route
+            .as_ref()
+            .and_then(|route| route.replicas.iter().min_by_key(|replica| replica.priority))
+            .map(|replica| replica.length as usize)
+            .unwrap_or(0))
+    }
+
     fn register_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
         let client = self.client_ref()?;
         client
@@ -271,6 +307,28 @@ impl PyMooncakeDistributedStore {
         Ok(0)
     }
 
+    #[pyo3(signature = (keys, buffer_ptrs, sizes, *, tenant = None))]
+    fn batch_put_from_raw(
+        &self,
+        keys: Vec<String>,
+        buffer_ptrs: Vec<usize>,
+        sizes: Vec<usize>,
+        tenant: Option<&str>,
+    ) -> PyResult<i32> {
+        if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
+            return Err(PyValueError::new_err(
+                "keys, buffer_ptrs, and sizes must have the same length",
+            ));
+        }
+        let items = keys
+            .into_iter()
+            .zip(buffer_ptrs)
+            .zip(sizes)
+            .map(|((key, buffer_ptr), size)| (key, buffer_ptr, size))
+            .collect::<Vec<_>>();
+        self.batch_put_from(items, tenant)
+    }
+
     #[pyo3(signature = (items, *, tenant = None))]
     fn batch_put_from_multi_buffers(
         &self,
@@ -297,6 +355,60 @@ impl PyMooncakeDistributedStore {
             .batch_put_from_multi_buffers(&requests)
             .map_err(store_error_to_py)?;
         Ok(0)
+    }
+
+    #[pyo3(signature = (keys, all_buffer_ptrs, all_sizes, *, tenant = None))]
+    fn batch_put_from_multi_buffers_raw(
+        &self,
+        keys: Vec<String>,
+        all_buffer_ptrs: Vec<Vec<usize>>,
+        all_sizes: Vec<Vec<usize>>,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<i32>> {
+        let client = self.client_ref()?;
+        if keys.len() != all_buffer_ptrs.len() || keys.len() != all_sizes.len() {
+            return Err(PyValueError::new_err(
+                "keys, all_buffer_ptrs, and all_sizes must have the same length",
+            ));
+        }
+
+        let borrowed = all_buffer_ptrs
+            .iter()
+            .zip(all_sizes.iter())
+            .map(|(buffer_ptrs, sizes)| {
+                if buffer_ptrs.len() != sizes.len() {
+                    return Err(PyValueError::new_err(
+                        "each multi-buffer pointer group must match its sizes group",
+                    ));
+                }
+                buffer_ptrs
+                    .iter()
+                    .zip(sizes.iter())
+                    .map(|(buffer_ptr, size)| unsafe {
+                        Ok(slice::from_raw_parts(
+                            pointer_from_usize(*buffer_ptr)?.cast::<u8>(),
+                            *size,
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let requests = keys
+            .iter()
+            .zip(borrowed.iter())
+            .map(|(key, buffers)| {
+                let mut request = MultiBufferPutRequest::new(key, buffers.as_slice());
+                if let Some(tenant) = tenant {
+                    request = request.tenant(tenant);
+                }
+                request
+            })
+            .collect::<Vec<_>>();
+        client
+            .batch_put_from_multi_buffers(&requests)
+            .map_err(store_error_to_py)?;
+        Ok(vec![0; keys.len()])
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
@@ -360,6 +472,83 @@ impl PyMooncakeDistributedStore {
             .collect::<Vec<_>>();
         client
             .batch_get_into(&mut requests)
+            .map_err(store_error_to_py)
+    }
+
+    #[pyo3(signature = (keys, buffer_ptrs, sizes, *, tenant = None))]
+    fn batch_get_into_raw(
+        &self,
+        keys: Vec<String>,
+        buffer_ptrs: Vec<usize>,
+        sizes: Vec<usize>,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<usize>> {
+        if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
+            return Err(PyValueError::new_err(
+                "keys, buffer_ptrs, and sizes must have the same length",
+            ));
+        }
+        let items = keys
+            .into_iter()
+            .zip(buffer_ptrs)
+            .zip(sizes)
+            .map(|((key, buffer_ptr), size)| (key, buffer_ptr, size))
+            .collect::<Vec<_>>();
+        self.batch_get_into(items, tenant)
+    }
+
+    #[pyo3(signature = (keys, all_buffer_ptrs, all_sizes, prefer_alloc_in_same_node = false, *, tenant = None))]
+    fn batch_get_into_multi_buffers(
+        &self,
+        keys: Vec<String>,
+        all_buffer_ptrs: Vec<Vec<usize>>,
+        all_sizes: Vec<Vec<usize>>,
+        prefer_alloc_in_same_node: bool,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<usize>> {
+        let _ = prefer_alloc_in_same_node;
+        let client = self.client_ref()?;
+        if keys.len() != all_buffer_ptrs.len() || keys.len() != all_sizes.len() {
+            return Err(PyValueError::new_err(
+                "keys, all_buffer_ptrs, and all_sizes must have the same length",
+            ));
+        }
+
+        let mut borrowed = all_buffer_ptrs
+            .iter()
+            .zip(all_sizes.iter())
+            .map(|(buffer_ptrs, sizes)| {
+                if buffer_ptrs.len() != sizes.len() {
+                    return Err(PyValueError::new_err(
+                        "each multi-buffer pointer group must match its sizes group",
+                    ));
+                }
+                buffer_ptrs
+                    .iter()
+                    .zip(sizes.iter())
+                    .map(|(buffer_ptr, size)| unsafe {
+                        Ok(slice::from_raw_parts_mut(
+                            pointer_from_usize(*buffer_ptr)?.cast::<u8>(),
+                            *size,
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let mut requests = keys
+            .iter()
+            .zip(borrowed.iter_mut())
+            .map(|(key, buffers)| {
+                let mut request = MultiBufferGetRequest::new(key, buffers.as_mut_slice());
+                if let Some(tenant) = tenant {
+                    request = request.tenant(tenant);
+                }
+                request
+            })
+            .collect::<Vec<_>>();
+        client
+            .batch_get_into_multi_buffers(&mut requests)
             .map_err(store_error_to_py)
     }
 
@@ -444,6 +633,19 @@ impl PyMooncakeDistributedStore {
     fn metrics_text(&self) -> String {
         render_prometheus_metrics()
     }
+
+    #[pyo3(signature = (bind_addr = "127.0.0.1:0"))]
+    fn start_metrics_server(&self, bind_addr: &str) -> PyResult<String> {
+        start_metrics_http_server(bind_addr).map_err(store_error_to_py)
+    }
+
+    fn stop_metrics_server(&self) -> PyResult<()> {
+        stop_metrics_http_server().map_err(store_error_to_py)
+    }
+
+    fn metrics_server_address(&self) -> Option<String> {
+        metrics_http_server_addr()
+    }
 }
 
 #[pyfunction]
@@ -457,11 +659,30 @@ fn metrics_text() -> String {
     render_prometheus_metrics()
 }
 
+#[pyfunction]
+#[pyo3(signature = (bind_addr = "127.0.0.1:0"))]
+fn start_metrics_server(bind_addr: &str) -> PyResult<String> {
+    start_metrics_http_server(bind_addr).map_err(store_error_to_py)
+}
+
+#[pyfunction]
+fn stop_metrics_server() -> PyResult<()> {
+    stop_metrics_http_server().map_err(store_error_to_py)
+}
+
+#[pyfunction]
+fn metrics_server_address() -> Option<String> {
+    metrics_http_server_addr()
+}
+
 #[pymodule]
 fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMooncakeDistributedStore>()?;
     module.add_function(wrap_pyfunction!(init_tracing, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_text, module)?)?;
+    module.add_function(wrap_pyfunction!(start_metrics_server, module)?)?;
+    module.add_function(wrap_pyfunction!(stop_metrics_server, module)?)?;
+    module.add_function(wrap_pyfunction!(metrics_server_address, module)?)?;
     Ok(())
 }
 

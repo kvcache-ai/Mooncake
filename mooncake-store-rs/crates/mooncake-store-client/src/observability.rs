@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use std::time::Instant;
 
 use mooncake_store_core::{Result, StoreError};
@@ -68,6 +73,26 @@ impl MetricsRegistry {
 
 static METRICS: OnceLock<Mutex<MetricsRegistry>> = OnceLock::new();
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
+static METRICS_HTTP_SERVER: OnceLock<Mutex<Option<MetricsHttpServer>>> = OnceLock::new();
+
+const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
+struct MetricsHttpServer {
+    address: String,
+    shutdown: Sender<()>,
+    thread: JoinHandle<()>,
+}
+
+impl MetricsHttpServer {
+    fn shutdown(self) -> Result<()> {
+        let _ = self.shutdown.send(());
+        self.thread
+            .join()
+            .map_err(|_| StoreError::InvalidState("metrics http server panicked".to_string()))?;
+        Ok(())
+    }
+}
 
 pub struct OperationTracker {
     operation: &'static str,
@@ -150,6 +175,78 @@ pub fn init_tracing_from_env(toggle_env: &str, filter_env: &str) -> Result<bool>
     Ok(true)
 }
 
+pub fn start_metrics_http_server(bind_addr: &str) -> Result<String> {
+    let mut server = metrics_http_server()
+        .lock()
+        .expect("metrics http server lock poisoned");
+    if let Some(server) = server.as_ref() {
+        return Ok(server.address.clone());
+    }
+
+    let listener = TcpListener::bind(bind_addr).map_err(|error| {
+        StoreError::InvalidState(format!(
+            "metrics http server failed to bind {bind_addr}: {error}"
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        StoreError::InvalidState(format!(
+            "metrics http server failed to enable nonblocking mode: {error}"
+        ))
+    })?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| {
+            StoreError::InvalidState(format!(
+                "metrics http server failed to read local address: {error}"
+            ))
+        })?
+        .to_string();
+    let (shutdown, shutdown_rx) = mpsc::channel();
+    let thread = thread::Builder::new()
+        .name("mooncake-store-metrics".to_string())
+        .spawn(move || run_metrics_http_server(listener, shutdown_rx))
+        .map_err(|error| {
+            StoreError::InvalidState(format!(
+                "metrics http server failed to spawn worker thread: {error}"
+            ))
+        })?;
+    *server = Some(MetricsHttpServer {
+        address: address.clone(),
+        shutdown,
+        thread,
+    });
+    Ok(address)
+}
+
+pub fn start_metrics_http_server_from_env(addr_env: &str) -> Result<Option<String>> {
+    let Ok(address) = std::env::var(addr_env) else {
+        return Ok(None);
+    };
+    if address.trim().is_empty() {
+        return Ok(None);
+    }
+    start_metrics_http_server(&address).map(Some)
+}
+
+pub fn metrics_http_server_addr() -> Option<String> {
+    metrics_http_server()
+        .lock()
+        .expect("metrics http server lock poisoned")
+        .as_ref()
+        .map(|server| server.address.clone())
+}
+
+pub fn stop_metrics_http_server() -> Result<()> {
+    let server = metrics_http_server()
+        .lock()
+        .expect("metrics http server lock poisoned")
+        .take();
+    if let Some(server) = server {
+        server.shutdown()?;
+    }
+    Ok(())
+}
+
 pub fn render_prometheus_metrics() -> String {
     let snapshots = snapshot_metrics();
     let mut output = String::new();
@@ -215,4 +312,140 @@ pub fn reset_metrics() {
 
 fn metrics_registry() -> &'static Mutex<MetricsRegistry> {
     METRICS.get_or_init(|| Mutex::new(MetricsRegistry::default()))
+}
+
+fn metrics_http_server() -> &'static Mutex<Option<MetricsHttpServer>> {
+    METRICS_HTTP_SERVER.get_or_init(|| Mutex::new(None))
+}
+
+fn run_metrics_http_server(listener: TcpListener, shutdown_rx: Receiver<()>) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => handle_metrics_http_connection(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if shutdown_rx.recv_timeout(HTTP_POLL_INTERVAL).is_ok() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn handle_metrics_http_connection(mut stream: TcpStream) {
+    if stream.set_read_timeout(Some(HTTP_READ_TIMEOUT)).is_err() {
+        return;
+    }
+    let path = match read_http_path(&mut stream) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let (status, content_type, body) = match path.as_str() {
+        "/metrics" => (
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            render_prometheus_metrics(),
+        ),
+        "/healthz" | "/livez" => ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string()),
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n".to_string(),
+        ),
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn read_http_path(stream: &mut TcpStream) -> std::io::Result<String> {
+    let mut request = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 512];
+    loop {
+        let read = stream.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() >= 8192 {
+            break;
+        }
+    }
+    let request = String::from_utf8_lossy(&request);
+    let first_line = request.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or("/");
+    if method != "GET" {
+        return Ok("/".to_string());
+    }
+    Ok(path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn metrics_http_server_serves_prometheus_text() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        reset_metrics();
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+
+        let result = Ok(());
+        OperationTracker::new("put")
+            .input_bytes(16)
+            .finish(&result, 16);
+
+        let Ok(address) = start_metrics_http_server("127.0.0.1:0") else {
+            return;
+        };
+        let response = http_get(&address, "/metrics");
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("mooncake_store_client_operation_total"));
+        assert!(response.contains("operation=\"put\",status=\"ok\""));
+
+        stop_metrics_http_server().expect("metrics server should stop");
+    }
+
+    #[test]
+    fn metrics_http_server_serves_health_probe() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+        let Ok(address) = start_metrics_http_server("127.0.0.1:0") else {
+            return;
+        };
+        let response = http_get(&address, "/healthz");
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("ok\n"));
+        stop_metrics_http_server().expect("metrics server should stop");
+    }
+
+    fn http_get(address: &str, path: &str) -> String {
+        let mut stream = TcpStream::connect(address).expect("http client should connect");
+        let request = format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .expect("http client should write request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("http client should read response");
+        response
+    }
+
+    fn test_lock() -> &'static Mutex<()> {
+        TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
 }
