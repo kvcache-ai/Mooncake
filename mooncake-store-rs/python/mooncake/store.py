@@ -93,6 +93,28 @@ def _native_library_candidates(package_dir: pathlib.Path) -> list[pathlib.Path]:
 _native = _load_native()
 
 
+def _normalize_hugepage_size(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        mapping = {
+            "2m": 2 * 1024 * 1024,
+            "2mb": 2 * 1024 * 1024,
+            "2097152": 2 * 1024 * 1024,
+            "1g": 1024 * 1024 * 1024,
+            "1gb": 1024 * 1024 * 1024,
+            "1073741824": 1024 * 1024 * 1024,
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+    raise ValueError(
+        f"unsupported hugepage size {value!r}; supported values are 2MB and 1GB"
+    )
+
+
 class _BatchStatusResult(list):
     def status_code(self) -> int:
         for status in self:
@@ -113,14 +135,31 @@ class _BatchStatusResult(list):
 
 
 class MooncakeHostMemAllocator:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        use_hugepage: bool | None = None,
+        hugepage_size: int | str | None = None,
+    ) -> None:
+        self._use_hugepage = use_hugepage
+        self._hugepage_size = _normalize_hugepage_size(hugepage_size)
         native_allocator = getattr(_native, "MooncakeHostMemAllocator", None)
-        self._native_allocator = native_allocator() if native_allocator else None
+        self._native_allocator = (
+            native_allocator(
+                use_hugepage=self._use_hugepage,
+                hugepage_size=self._hugepage_size,
+            )
+            if native_allocator
+            else None
+        )
         self._allocations: dict[int, mmap.mmap] = {}
 
     def alloc(self, size: int) -> int:
         if self._native_allocator is not None:
             return int(self._native_allocator.alloc(int(size)))
+        if self._use_hugepage or self._hugepage_size is not None:
+            raise RuntimeError(
+                "hugepage allocation requires the native mooncake store extension"
+            )
         requested = int(size)
         if requested <= 0:
             raise ValueError("allocation size must be positive")
@@ -211,6 +250,8 @@ class MooncakeDistributedStore:
         if len(args) == 8:
             args = args[:7]
         kwargs.pop("engine", None)
+        if "hugepage_size" in kwargs:
+            kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
         return self._native.setup(*args, **kwargs)
 
     def close(self) -> None:
@@ -496,6 +537,8 @@ class MooncakeDistributedStore:
             ),
             local_segment_name=_coerce_optional_str(config.get("local_segment_name")),
             expires_at_ms=_coerce_optional_int(config.get("expires_at_ms")),
+            use_hugepage=_coerce_optional_bool(config.get("use_hugepage")),
+            hugepage_size=_normalize_hugepage_size(config.get("hugepage_size")),
         )
 
 
@@ -577,6 +620,12 @@ def _coerce_bool(value, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _coerce_optional_bool(value) -> bool | None:
+    if value is None:
+        return None
+    return _coerce_bool(value, False)
 
 
 def _coerce_int(value, default: int) -> int:

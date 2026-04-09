@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::ptr;
 
-use mooncake_store_core::{Result, SegmentLifecycleState, SegmentName, StoreError};
+use mooncake_store_core::{
+    HugePageConfig, Result, SegmentLifecycleState, SegmentName, StoreError,
+};
 
 use crate::transport::StoreTransport;
 
@@ -17,6 +20,8 @@ pub struct LocalMemoryConfig {
     pub tags: Vec<String>,
     pub alignment: usize,
     pub reclaim_grace_ms: u64,
+    pub hugepage_enabled: Option<bool>,
+    pub hugepage_size_bytes: Option<usize>,
 }
 
 impl LocalMemoryConfig {
@@ -54,6 +59,21 @@ impl LocalMemoryConfig {
         self
     }
 
+    pub fn use_hugepage(mut self, enabled: bool) -> Self {
+        self.hugepage_enabled = Some(enabled);
+        self
+    }
+
+    pub fn hugepage_size_bytes(mut self, hugepage_size_bytes: usize) -> Self {
+        self.hugepage_enabled = Some(true);
+        self.hugepage_size_bytes = Some(hugepage_size_bytes);
+        self
+    }
+
+    pub fn hugepage(&self) -> Result<Option<HugePageConfig>> {
+        HugePageConfig::resolve(self.hugepage_enabled, self.hugepage_size_bytes)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.storage_bytes == 0 {
             return Err(StoreError::Allocator(
@@ -70,6 +90,7 @@ impl LocalMemoryConfig {
                 "location must not be empty".to_string(),
             ));
         }
+        let _ = self.hugepage()?;
         Ok(())
     }
 }
@@ -83,6 +104,8 @@ impl Default for LocalMemoryConfig {
             tags: vec!["dram".to_string()],
             alignment: DEFAULT_ALIGNMENT,
             reclaim_grace_ms: 1_000,
+            hugepage_enabled: None,
+            hugepage_size_bytes: None,
         }
     }
 }
@@ -101,6 +124,8 @@ pub struct StorageSegmentSpec {
     pub tags: Vec<String>,
     pub location: String,
     pub alignment: usize,
+    pub hugepage_enabled: Option<bool>,
+    pub hugepage_size_bytes: Option<usize>,
 }
 
 impl LocalMemoryState {
@@ -110,17 +135,20 @@ impl LocalMemoryState {
         config: &LocalMemoryConfig,
     ) -> Result<Self> {
         config.validate()?;
+        let hugepage = config.hugepage()?;
         let storage = RegisteredRegion::register(
             transport,
             config.storage_bytes,
             &config.location,
             config.alignment,
+            hugepage,
         )?;
         let scratch = RegisteredRegion::register(
             transport,
             config.scratch_bytes,
             &config.location,
             config.alignment,
+            hugepage,
         )?;
         let mut segments = BTreeMap::new();
         segments.insert(
@@ -153,6 +181,7 @@ impl LocalMemoryState {
             spec.capacity_bytes,
             &spec.location,
             spec.alignment,
+            HugePageConfig::resolve(spec.hugepage_enabled, spec.hugepage_size_bytes)?,
         )?;
         self.storage.insert(
             spec.segment_name,
@@ -262,6 +291,7 @@ struct RegisteredRegion {
     base: *mut c_void,
     capacity: usize,
     alignment: usize,
+    owner: RegionOwner,
 }
 
 impl RegisteredRegion {
@@ -270,16 +300,30 @@ impl RegisteredRegion {
         capacity: usize,
         location: &str,
         alignment: usize,
+        hugepage: Option<HugePageConfig>,
     ) -> Result<Self> {
-        let base = transport.allocate_memory(capacity, location)?;
+        let alignment = alignment.max(1);
+        let (base, capacity, owner) = match hugepage {
+            Some(hugepage) => allocate_hugepage_region(capacity, alignment, location, hugepage)?,
+            None => (
+                transport.allocate_memory(capacity, location)?,
+                capacity,
+                RegionOwner::Transport,
+            ),
+        };
+        if let Err(error) = transport.adopt_local_memory(base, capacity, location) {
+            let _ = owner.release(transport, base);
+            return Err(error);
+        }
         if let Err(error) = transport.register_memory(base, capacity) {
-            let _ = transport.free_memory(base);
+            let _ = owner.release(transport, base);
             return Err(error);
         }
         Ok(Self {
             base,
             capacity,
-            alignment: alignment.max(1),
+            alignment,
+            owner,
         })
     }
 
@@ -320,7 +364,90 @@ impl RegisteredRegion {
 
     fn release(self, transport: &dyn StoreTransport) -> Result<()> {
         transport.unregister_memory(self.base, self.capacity)?;
-        transport.free_memory(self.base)
+        self.owner.release(transport, self.base)
+    }
+}
+
+#[derive(Debug)]
+enum RegionOwner {
+    Transport,
+    HugePageMmap { mapped_len: usize },
+}
+
+impl RegionOwner {
+    fn release(self, transport: &dyn StoreTransport, base: *mut c_void) -> Result<()> {
+        match self {
+            Self::Transport => transport.free_memory(base),
+            Self::HugePageMmap { mapped_len } => free_hugepage_region(base, mapped_len),
+        }
+    }
+}
+
+fn allocate_hugepage_region(
+    capacity: usize,
+    alignment: usize,
+    location: &str,
+    hugepage: HugePageConfig,
+) -> Result<(*mut c_void, usize, RegionOwner)> {
+    if capacity == 0 {
+        return Err(StoreError::Allocator(
+            "hugepage allocation size must be greater than zero".to_string(),
+        ));
+    }
+    if !(location == "*" || location.starts_with("cpu")) {
+        return Err(StoreError::Unsupported(format!(
+            "hugepage local memory only supports cpu locations, got {location}"
+        )));
+    }
+
+    let effective_alignment = alignment.max(hugepage.bytes());
+    let mapped_len = align_up(capacity, effective_alignment);
+    let flags = libc::MAP_PRIVATE
+        | libc::MAP_ANONYMOUS
+        | libc::MAP_POPULATE
+        | libc::MAP_HUGETLB
+        | hugepage_map_flag(hugepage);
+    let base = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            mapped_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            -1,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(StoreError::Allocator(format!(
+            "hugepage mmap failed for {} (size={}): {} (check /proc/sys/vm/nr_hugepages)",
+            hugepage.label(),
+            mapped_len,
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok((
+        base,
+        mapped_len,
+        RegionOwner::HugePageMmap { mapped_len },
+    ))
+}
+
+fn free_hugepage_region(base: *mut c_void, mapped_len: usize) -> Result<()> {
+    let rc = unsafe { libc::munmap(base, mapped_len) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(StoreError::Allocator(format!(
+        "munmap hugepage region failed: {}",
+        std::io::Error::last_os_error()
+    )))
+}
+
+fn hugepage_map_flag(hugepage: HugePageConfig) -> i32 {
+    match hugepage.bytes() {
+        size if size == 2 * 1024 * 1024 => libc::MAP_HUGE_2MB,
+        size if size == 1024 * 1024 * 1024 => libc::MAP_HUGE_1GB,
+        _ => 0,
     }
 }
 
@@ -331,12 +458,162 @@ fn align_up(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::align_up;
+    use std::ffi::c_void;
+
+    use mooncake_store_core::HugePageConfig;
+    use mooncake_transport::{
+        SegmentInfo, TransferProgress, TransferRequest, TransferStatus,
+    };
+
+    use super::{
+        LocalMemoryConfig, RegionOwner, StoreTransport, align_up, allocate_hugepage_region,
+    };
+
+    struct NoopTransport;
+
+    impl StoreTransport for NoopTransport {
+        fn segment_name(&self) -> mooncake_store_core::Result<String> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn rpc_server_address(&self) -> mooncake_store_core::Result<(String, u16)> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn open_segment(&self, _segment_name: &str) -> mooncake_store_core::Result<u64> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn close_segment(&self, _handle: u64) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn get_segment_info(&self, _handle: u64) -> mooncake_store_core::Result<SegmentInfo> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn allocate_memory(
+            &self,
+            _size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<*mut c_void> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn free_memory(&self, _addr: *mut c_void) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn register_memory(
+            &self,
+            _addr: *mut c_void,
+            _size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn unregister_memory(
+            &self,
+            _addr: *mut c_void,
+            _size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn allocate_batch(&self, _batch_size: usize) -> mooncake_store_core::Result<u64> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn free_batch(&self, _batch_id: u64) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn submit(
+            &self,
+            _batch_id: u64,
+            _requests: &[TransferRequest],
+        ) -> mooncake_store_core::Result<()> {
+            Err(mooncake_store_core::StoreError::Unsupported(
+                "unused in hugepage test".to_string(),
+            ))
+        }
+
+        fn task_status(
+            &self,
+            _batch_id: u64,
+            _task_id: usize,
+        ) -> mooncake_store_core::Result<TransferProgress> {
+            Ok(TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            })
+        }
+
+        fn overall_status(&self, _batch_id: u64) -> mooncake_store_core::Result<TransferProgress> {
+            Ok(TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            })
+        }
+    }
+
+    fn hugepages_available(bytes: usize) -> bool {
+        let path = if bytes == 2 * 1024 * 1024 {
+            "/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
+        } else if bytes == 1024 * 1024 * 1024 {
+            "/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages"
+        } else {
+            return false;
+        };
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .is_some_and(|count| count > 0)
+    }
 
     #[test]
     fn alignment_rounds_up_without_branch_explosion() {
         assert_eq!(align_up(1, 64), 64);
         assert_eq!(align_up(64, 64), 64);
         assert_eq!(align_up(65, 64), 128);
+    }
+
+    #[test]
+    fn local_memory_config_resolves_explicit_hugepage() {
+        let config = LocalMemoryConfig::new()
+            .use_hugepage(true)
+            .hugepage_size_bytes(2 * 1024 * 1024);
+        let hugepage = config
+            .hugepage()
+            .expect("hugepage config should resolve")
+            .expect("hugepage config should be enabled");
+        assert_eq!(hugepage, HugePageConfig::new(2 * 1024 * 1024).expect("2MB is supported"));
+    }
+
+    #[test]
+    fn native_hugepage_allocator_uses_real_hugetlb_when_available() {
+        let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB is supported");
+        if !hugepages_available(hugepage.bytes()) {
+            return;
+        }
+        let (base, mapped_len, owner) =
+            allocate_hugepage_region(4096, 64, "cpu:0", hugepage).expect("hugetlb mmap should succeed");
+        assert_eq!(mapped_len, hugepage.bytes());
+        assert!(matches!(owner, RegionOwner::HugePageMmap { .. }));
+        owner
+            .release(&NoopTransport, base)
+            .expect("hugetlb region should unmap cleanly");
     }
 }

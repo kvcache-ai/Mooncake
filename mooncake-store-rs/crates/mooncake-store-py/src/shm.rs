@@ -10,7 +10,7 @@ use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
-use mooncake_store_core::{Result, StoreError};
+use mooncake_store_core::{HugePageConfig, Result, StoreError};
 use parking_lot::Mutex;
 
 const SHM_ALLOCATOR_NAME: &str = "mooncake_store_rs_shm";
@@ -66,8 +66,17 @@ impl ShmRegisterRequest {
 struct SharedRegion {
     region_id: u64,
     base: usize,
-    len: usize,
+    requested_len: usize,
+    mapped_len: usize,
     fd: OwnedFd,
+}
+
+#[derive(Debug)]
+pub struct SharedRegionRegistration {
+    pub region_id: u64,
+    pub requested_len: usize,
+    pub registered_len: usize,
+    pub fd: OwnedFd,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,19 +145,30 @@ static SHARED_REGISTRY: LazyLock<Mutex<BTreeMap<usize, SharedRegion>>> =
 static NEXT_REGION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn allocate_shared_region(size: usize) -> Result<usize> {
+    allocate_shared_region_with_options(size, None, None)
+}
+
+pub fn allocate_shared_region_with_options(
+    size: usize,
+    hugepage_enabled: Option<bool>,
+    hugepage_size_bytes: Option<usize>,
+) -> Result<usize> {
     if size == 0 {
         return Err(StoreError::Allocator(
             "shared region size must be greater than zero".to_string(),
         ));
     }
-    let fd = memfd_create(SHM_ALLOCATOR_NAME)?;
-    ftruncate(fd.as_raw_fd(), size)?;
-    let mapping = mmap_shared(fd.as_raw_fd(), size)?;
+    let hugepage = HugePageConfig::resolve(hugepage_enabled, hugepage_size_bytes)?;
+    let mapped_len = hugepage.map(|hp| hp.align_up(size)).unwrap_or(size);
+    let fd = memfd_create(SHM_ALLOCATOR_NAME, hugepage)?;
+    ftruncate(fd.as_raw_fd(), mapped_len)?;
+    let mapping = mmap_shared(fd.as_raw_fd(), mapped_len)?;
     let base = mapping as usize;
     let region = SharedRegion {
         region_id: NEXT_REGION_ID.fetch_add(1, Ordering::Relaxed),
         base,
-        len: size,
+        requested_len: size,
+        mapped_len,
         fd,
     };
     SHARED_REGISTRY.lock().insert(base, region);
@@ -162,25 +182,30 @@ pub fn free_shared_region(ptr: usize) -> Result<()> {
         )));
     };
     unsafe {
-        libc::munmap(region.base as *mut libc::c_void, region.len);
+        libc::munmap(region.base as *mut libc::c_void, region.mapped_len);
     }
     Ok(())
 }
 
-pub fn shared_region_for_registration(ptr: usize, size: usize) -> Result<(u64, usize, OwnedFd)> {
+pub fn shared_region_for_registration(ptr: usize, size: usize) -> Result<SharedRegionRegistration> {
     let registry = SHARED_REGISTRY.lock();
     let Some(region) = registry.get(&ptr) else {
         return Err(StoreError::NotFound(format!(
             "shared region base {ptr:#x} not found"
         )));
     };
-    if region.len != size {
+    if region.requested_len != size {
         return Err(StoreError::Allocator(format!(
             "shared region size mismatch: requested={size} actual={}",
-            region.len
+            region.requested_len
         )));
     }
-    Ok((region.region_id, region.len, dup_fd(region.fd.as_raw_fd())?))
+    Ok(SharedRegionRegistration {
+        region_id: region.region_id,
+        requested_len: region.requested_len,
+        registered_len: region.mapped_len,
+        fd: dup_fd(region.fd.as_raw_fd())?,
+    })
 }
 
 pub fn resolve_shared_region(ptr: usize, size: usize) -> Result<ResolvedSharedRegion> {
@@ -193,7 +218,7 @@ pub fn resolve_shared_region(ptr: usize, size: usize) -> Result<ResolvedSharedRe
             "shared region containing {ptr:#x} not found"
         )));
     };
-    let region_end = region.base.saturating_add(region.len);
+    let region_end = region.base.saturating_add(region.mapped_len);
     if end > region_end {
         return Err(StoreError::Allocator(format!(
             "buffer range {ptr:#x}..{end:#x} exceeds shared region {:x}..{:x}",
@@ -292,13 +317,17 @@ pub fn map_registered_region(fd: OwnedFd, size: usize) -> Result<OwnedMappedRegi
     })
 }
 
-fn memfd_create(name: &str) -> Result<OwnedFd> {
+fn memfd_create(name: &str, hugepage: Option<HugePageConfig>) -> Result<OwnedFd> {
     let name = CString::new(name)
         .map_err(|_| StoreError::Allocator("invalid memfd name".to_string()))?;
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let flags = libc::MFD_CLOEXEC | hugepage.map(hugepage_memfd_flags).unwrap_or(0);
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
     if fd < 0 {
         return Err(StoreError::Allocator(format!(
-            "memfd_create failed: {}",
+            "memfd_create failed{}: {}",
+            hugepage
+                .map(|cfg| format!(" for hugepage {}", cfg.label()))
+                .unwrap_or_default(),
             std::io::Error::last_os_error()
         )));
     }
@@ -322,7 +351,7 @@ fn mmap_shared(fd: RawFd, size: usize) -> Result<*mut u8> {
             ptr::null_mut(),
             size,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
+            libc::MAP_SHARED | libc::MAP_POPULATE,
             fd,
             0,
         )
@@ -334,6 +363,15 @@ fn mmap_shared(fd: RawFd, size: usize) -> Result<*mut u8> {
         )));
     }
     Ok(ptr.cast::<u8>())
+}
+
+fn hugepage_memfd_flags(hugepage: HugePageConfig) -> u32 {
+    libc::MFD_HUGETLB
+        | match hugepage.bytes() {
+            size if size == 2 * 1024 * 1024 => libc::MFD_HUGE_2MB,
+            size if size == 1024 * 1024 * 1024 => libc::MFD_HUGE_1GB,
+            _ => 0,
+        }
 }
 
 fn dup_fd(fd: RawFd) -> Result<OwnedFd> {
@@ -423,6 +461,20 @@ fn recv_fd<T>(sock: RawFd) -> Result<(T, OwnedFd)> {
 mod tests {
     use super::*;
 
+    fn hugepages_available(bytes: usize) -> bool {
+        let path = if bytes == 2 * 1024 * 1024 {
+            "/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
+        } else if bytes == 1024 * 1024 * 1024 {
+            "/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages"
+        } else {
+            return false;
+        };
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .is_some_and(|count| count > 0)
+    }
+
     #[test]
     fn shared_regions_resolve_subranges() {
         let ptr = allocate_shared_region(4096).expect("shared alloc should succeed");
@@ -430,5 +482,20 @@ mod tests {
         assert_eq!(resolved.offset, 128);
         assert_eq!(resolved.len, 512);
         free_shared_region(ptr).expect("shared free should succeed");
+    }
+
+    #[test]
+    fn shared_regions_can_use_hugepage_backing_when_available() {
+        let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
+        if !hugepages_available(hugepage.bytes()) {
+            return;
+        }
+        let ptr = allocate_shared_region_with_options(4096, Some(true), Some(hugepage.bytes()))
+            .expect("hugepage shm alloc should succeed");
+        let registration =
+            shared_region_for_registration(ptr, 4096).expect("registration should resolve");
+        assert_eq!(registration.requested_len, 4096);
+        assert_eq!(registration.registered_len, hugepage.bytes());
+        free_shared_region(ptr).expect("hugepage shm free should succeed");
     }
 }

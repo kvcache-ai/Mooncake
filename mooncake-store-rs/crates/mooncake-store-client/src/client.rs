@@ -3041,20 +3041,35 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     tags: self.local_memory.tags.clone(),
                     location: self.local_memory.location.clone(),
                     alignment: self.local_memory.alignment,
+                    hugepage_enabled: self.local_memory.hugepage_enabled,
+                    hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
                 },
             )?;
             state
                 .local_transports
                 .insert(segment_name.0.clone(), transport);
         };
+        let segment_info = self
+            .state
+            .lock()
+            .memory_ref()?
+            .storage_segments()
+            .into_iter()
+            .find(|entry| entry.segment_name == segment_name)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "expanded storage segment {} is missing",
+                    segment_name.0
+                ))
+            })?;
         let announcement = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
             segment_name,
-            capacity_bytes: storage_bytes as u64,
+            capacity_bytes: segment_info.capacity_bytes,
             used_bytes: 0,
             state: SegmentLifecycleState::Active,
-            alignment_bytes: self.local_memory.alignment as u64,
-            tags: self.local_memory.tags.clone(),
+            alignment_bytes: segment_info.alignment_bytes,
+            tags: segment_info.tags,
         };
         self.allocator.lock().upsert(&announcement);
         info!(
@@ -5084,6 +5099,21 @@ mod tests {
             })
         }
 
+        fn adopt_local_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<()> {
+            let mut state = self.state.lock();
+            let segment_name = self.local_segment.clone();
+            if state.segments_by_name.contains_key(&segment_name) {
+                return Ok(());
+            }
+            register_segment(&mut state, segment_name, addr as usize, size);
+            Ok(())
+        }
+
         fn allocate_memory(
             &self,
             size: usize,
@@ -5140,7 +5170,22 @@ mod tests {
         ) -> mooncake_store_core::Result<()> {
             let mut state = self.state.lock();
             match state.registered_memory.remove(&(addr as usize)) {
-                Some(registered) if registered == size => Ok(()),
+                Some(registered) if registered == size => {
+                    let orphaned = state
+                        .segments_by_handle
+                        .iter()
+                        .filter_map(|(handle, segment)| {
+                            (segment.base == addr as usize).then_some(*handle)
+                        })
+                        .collect::<Vec<_>>();
+                    for handle in orphaned {
+                        state.segments_by_handle.remove(&handle);
+                        state
+                            .segments_by_name
+                            .retain(|_, current_handle| *current_handle != handle);
+                    }
+                    Ok(())
+                }
                 Some(registered) => Err(StoreError::Allocator(format!(
                     "registered size mismatch: expected={registered} got={size}"
                 ))),

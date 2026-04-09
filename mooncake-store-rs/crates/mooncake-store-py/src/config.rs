@@ -21,6 +21,8 @@ pub struct CompatBuildPlan {
     pub storage_bytes: usize,
     pub scratch_bytes: usize,
     pub expires_at_ms: u64,
+    pub use_hugepage: Option<bool>,
+    pub hugepage_size_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +41,8 @@ pub struct CompatSetupArgs {
     pub replica_count: usize,
     pub keyspace: Option<String>,
     pub expires_at_ms: Option<u64>,
+    pub use_hugepage: Option<bool>,
+    pub hugepage_size_bytes: Option<usize>,
 }
 
 impl CompatSetupArgs {
@@ -66,6 +70,8 @@ impl CompatSetupArgs {
             storage_bytes: self.global_segment_size,
             scratch_bytes: self.local_buffer_size,
             expires_at_ms: self.expires_at_ms.unwrap_or_else(|| now_ms() + 600_000),
+            use_hugepage: self.use_hugepage,
+            hugepage_size_bytes: self.hugepage_size_bytes,
         })
     }
 }

@@ -28,7 +28,7 @@ pub struct DummySession {
 #[derive(Clone, Copy)]
 struct RegisteredRegion {
     region_id: u64,
-    len: usize,
+    requested_len: usize,
 }
 
 impl DummySession {
@@ -118,14 +118,18 @@ impl DummySession {
     }
 
     pub fn register_buffer(&self, buffer_ptr: usize, size: usize) -> Result<i32> {
-        let (region_id, region_len, fd) = shared_region_for_registration(buffer_ptr, size)?;
-        let request = ShmRegisterRequest::new(self.client_id, region_id, region_len);
-        send_shm_register_request(&self.socket_path, &request, &fd)?;
+        let registration = shared_region_for_registration(buffer_ptr, size)?;
+        let request = ShmRegisterRequest::new(
+            self.client_id,
+            registration.region_id,
+            registration.registered_len,
+        );
+        send_shm_register_request(&self.socket_path, &request, &registration.fd)?;
         self.registered_regions.lock().insert(
             buffer_ptr,
             RegisteredRegion {
-                region_id,
-                len: region_len,
+                region_id: registration.region_id,
+                requested_len: registration.requested_len,
             },
         );
         Ok(0)
@@ -138,10 +142,10 @@ impl DummySession {
             .remove(&buffer_ptr)
             .ok_or_else(|| StoreError::NotFound(format!("buffer {buffer_ptr:#x} is not registered")))?;
         if let Some(size) = size {
-            if size != region.len {
+            if size != region.requested_len {
                 return Err(StoreError::Allocator(format!(
                     "registered buffer size mismatch: requested={size} actual={}",
-                    region.len
+                    region.requested_len
                 )));
             }
         }
