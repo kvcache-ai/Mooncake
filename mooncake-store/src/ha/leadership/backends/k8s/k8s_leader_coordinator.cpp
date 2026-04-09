@@ -69,8 +69,8 @@ K8sLeaderCoordinator::ReadCurrentView() {
 
     std::string holder;
     int64_t transitions = 0;
-    err = K8sLeaseHelper::GetHolder(namespace_, lease_name_, holder,
-                                    transitions);
+    err =
+        K8sLeaseHelper::GetHolder(namespace_, lease_name_, holder, transitions);
     if (err == ErrorCode::K8S_LEASE_NOT_FOUND) {
         return std::optional<MasterView>{std::nullopt};
     }
@@ -88,18 +88,16 @@ K8sLeaderCoordinator::ReadCurrentView() {
 }
 
 tl::expected<AcquireLeadershipResult, ErrorCode>
-K8sLeaderCoordinator::TryAcquireLeadership(
-    const std::string& leader_address) {
+K8sLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     auto err = EnsureConnected();
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
 
     // Start election goroutine
-    err = K8sLeaseHelper::RunElection(namespace_, lease_name_, leader_address,
-                                      kDefaultLeaseDurationSec,
-                                      kDefaultRenewDeadlineSec,
-                                      kDefaultRetryPeriodSec);
+    err = K8sLeaseHelper::RunElection(
+        namespace_, lease_name_, leader_address, kDefaultLeaseDurationSec,
+        kDefaultRenewDeadlineSec, kDefaultRetryPeriodSec);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -126,9 +124,9 @@ K8sLeaderCoordinator::TryAcquireLeadership(
     // We are the leader
     OwnerToken token = namespace_ + "/" + lease_name_;
     LeadershipSession session{
-        .view = MasterView{.leader_address = leader_address,
-                           .view_version =
-                               static_cast<ViewVersionId>(transitions)},
+        .view =
+            MasterView{.leader_address = leader_address,
+                       .view_version = static_cast<ViewVersionId>(transitions)},
         .owner_token = token,
         .lease_ttl = std::chrono::seconds(kDefaultLeaseDurationSec),
     };
@@ -167,15 +165,15 @@ tl::expected<bool, ErrorCode> K8sLeaderCoordinator::RenewLeadership(
     // client-go handles renewal internally. If election is still active,
     // leadership is being renewed. Start the monitor thread if not running.
     if (!election_monitor_thread_.joinable()) {
-        election_monitor_thread_ = std::thread([this, token = session.owner_token]() {
+        election_monitor_thread_ = std::thread([this,
+                                                token = session.owner_token]() {
             auto rc = K8sLeaseHelper::WaitLost(namespace_, lease_name_);
 
             std::shared_ptr<std::atomic<bool>> monitor_armed;
             LeadershipLostCallback on_leadership_lost;
             LeadershipLossReason loss_reason =
-                (rc == ErrorCode::OK)
-                    ? LeadershipLossReason::kLostLeadership
-                    : LeadershipLossReason::kRenewError;
+                (rc == ErrorCode::OK) ? LeadershipLossReason::kLostLeadership
+                                      : LeadershipLossReason::kRenewError;
             {
                 std::lock_guard<std::mutex> lock(election_mutex_);
                 election_active_ = false;
@@ -189,8 +187,7 @@ tl::expected<bool, ErrorCode> K8sLeaderCoordinator::RenewLeadership(
                 }
             }
 
-            if (monitor_armed != nullptr &&
-                monitor_armed->exchange(false) &&
+            if (monitor_armed != nullptr && monitor_armed->exchange(false) &&
                 on_leadership_lost != nullptr) {
                 on_leadership_lost(loss_reason);
             }

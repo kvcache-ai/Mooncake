@@ -36,8 +36,7 @@ std::optional<std::string> GetK8sSkipReason() {
     int64_t transitions = 0;
     err = K8sLeaseHelper::GetHolder(FLAGS_k8s_namespace, FLAGS_k8s_lease_name,
                                     holder, transitions);
-    if (err != ErrorCode::OK &&
-        err != ErrorCode::K8S_LEASE_NOT_FOUND) {
+    if (err != ErrorCode::OK && err != ErrorCode::K8S_LEASE_NOT_FOUND) {
         return "K8s API not reachable (GetHolder probe failed)";
     }
     return std::nullopt;
