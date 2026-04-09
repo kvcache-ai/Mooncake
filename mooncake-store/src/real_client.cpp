@@ -2134,11 +2134,14 @@ RealClient::get_into_ranges_internal(
     std::vector<std::vector<tl::expected<int64_t, ErrorCode>>> results(
         buffer_count);
 
-    if (buffer_count != all_keys.size() || buffer_count != all_dst_offsets.size() ||
-        buffer_count != all_src_offsets.size() || buffer_count != all_sizes.size()) {
+    if (buffer_count != all_keys.size() ||
+        buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() ||
+        buffer_count != all_sizes.size()) {
         LOG(ERROR) << "get_into_ranges: top-level size mismatch";
         for (size_t i = 0; i < buffer_count; ++i) {
-            const size_t item_count = i < all_keys.size() ? all_keys[i].size() : 1;
+            const size_t item_count =
+                i < all_keys.size() ? all_keys[i].size() : 1;
             results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
                 item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
@@ -2151,7 +2154,8 @@ RealClient::get_into_ranges_internal(
             LOG(ERROR) << "get_into_ranges: buffer capacities size mismatch";
             for (size_t i = 0; i < buffer_count; ++i) {
                 results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                    all_keys[i].size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                    all_keys[i].size(),
+                    tl::unexpected(ErrorCode::INVALID_PARAMS));
             }
             return results;
         }
@@ -2162,8 +2166,9 @@ RealClient::get_into_ranges_internal(
         for (size_t i = 0; i < buffer_count; ++i) {
             auto it = registered_buffer_sizes_.find(buffers[i]);
             if (it == registered_buffer_sizes_.end()) {
-                LOG(ERROR) << "get_into_ranges: buffer is not registered at index "
-                           << i;
+                LOG(ERROR)
+                    << "get_into_ranges: buffer is not registered at index "
+                    << i;
                 continue;
             }
             resolved_buffer_capacities[i] = it->second;
@@ -2181,7 +2186,8 @@ RealClient::get_into_ranges_internal(
         if (item_count != all_dst_offsets[i].size() ||
             item_count != all_src_offsets[i].size() ||
             item_count != all_sizes[i].size()) {
-            LOG(ERROR) << "get_into_ranges: size mismatch for buffer index " << i;
+            LOG(ERROR) << "get_into_ranges: size mismatch for buffer index "
+                       << i;
             continue;
         }
 
@@ -2196,11 +2202,12 @@ RealClient::get_into_ranges_internal(
             if (all_sizes[i][j] > 0 &&
                 (all_dst_offsets[i][j] > buffer_size ||
                  all_sizes[i][j] > buffer_size - all_dst_offsets[i][j])) {
-                LOG(ERROR) << "get_into_ranges: destination overflow, buffer_index="
-                           << i << " item_index=" << j
-                           << " dst_offset=" << all_dst_offsets[i][j]
-                           << " size=" << all_sizes[i][j]
-                           << " buffer_size=" << buffer_size;
+                LOG(ERROR)
+                    << "get_into_ranges: destination overflow, buffer_index="
+                    << i << " item_index=" << j
+                    << " dst_offset=" << all_dst_offsets[i][j]
+                    << " size=" << all_sizes[i][j]
+                    << " buffer_size=" << buffer_size;
                 continue;
             }
 
@@ -2973,11 +2980,14 @@ RealClient::get_into_ranges_shm_helper(
     std::vector<std::vector<tl::expected<int64_t, ErrorCode>>> results(
         buffer_count);
 
-    if (buffer_count != all_keys.size() || buffer_count != all_dst_offsets.size() ||
-        buffer_count != all_src_offsets.size() || buffer_count != all_sizes.size()) {
+    if (buffer_count != all_keys.size() ||
+        buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() ||
+        buffer_count != all_sizes.size()) {
         LOG(ERROR) << "get_into_ranges_shm_helper: top-level size mismatch";
         for (size_t i = 0; i < buffer_count; ++i) {
-            const size_t item_count = i < all_keys.size() ? all_keys[i].size() : 1;
+            const size_t item_count =
+                i < all_keys.size() ? all_keys[i].size() : 1;
             results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
                 item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
@@ -3003,32 +3013,34 @@ RealClient::get_into_ranges_shm_helper(
         if (item_count != all_dst_offsets[i].size() ||
             item_count != all_src_offsets[i].size() ||
             item_count != all_sizes[i].size()) {
-            LOG(ERROR) << "get_into_ranges_shm_helper: size mismatch for buffer index "
-                       << i;
+            LOG(ERROR)
+                << "get_into_ranges_shm_helper: size mismatch for buffer index "
+                << i;
             continue;
         }
 
         size_t max_required = 0;
         for (size_t j = 0; j < item_count; ++j) {
-            max_required = std::max(max_required,
-                                    all_dst_offsets[i][j] + all_sizes[i][j]);
+            max_required =
+                std::max(max_required, all_dst_offsets[i][j] + all_sizes[i][j]);
         }
         buffer_sizes[i] = max_required;
     }
 
-    auto real_buffers_result =
-        map_dummy_addrs_to_real_ptrs(it->second, dummy_buffers, buffer_sizes, client_id);
+    auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
+        it->second, dummy_buffers, buffer_sizes, client_id);
     if (!real_buffers_result) {
         for (size_t i = 0; i < buffer_count; ++i) {
             results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                all_keys[i].size(), tl::unexpected(real_buffers_result.error()));
+                all_keys[i].size(),
+                tl::unexpected(real_buffers_result.error()));
         }
         return results;
     }
 
     return get_into_ranges_internal(real_buffers_result.value(), all_keys,
-                                    all_dst_offsets, all_src_offsets,
-                                    all_sizes, &buffer_sizes);
+                                    all_dst_offsets, all_src_offsets, all_sizes,
+                                    &buffer_sizes);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>

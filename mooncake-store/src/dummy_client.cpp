@@ -776,8 +776,8 @@ std::vector<std::vector<int64_t>> DummyClient::get_into_ranges(
     auto internal_results =
         invoke_rpc<&RealClient::get_into_ranges_shm_helper,
                    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>(
-            dummy_buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-            device_id_, client_id_);
+            dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
+            all_sizes, device_id_, client_id_);
 
     const size_t buffer_count = buffers.size();
     std::vector<std::vector<int64_t>> results;
@@ -785,9 +785,11 @@ std::vector<std::vector<int64_t>> DummyClient::get_into_ranges(
     if (!internal_results) {
         LOG(ERROR) << "get_into_ranges RPC failed";
         for (size_t i = 0; i < buffer_count; ++i) {
-            const size_t item_count = i < all_keys.size() ? all_keys[i].size() : 1;
+            const size_t item_count =
+                i < all_keys.size() ? all_keys[i].size() : 1;
             results.emplace_back(
-                item_count, static_cast<int64_t>(toInt(internal_results.error())));
+                item_count,
+                static_cast<int64_t>(toInt(internal_results.error())));
         }
         return results;
     }

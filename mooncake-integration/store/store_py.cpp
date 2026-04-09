@@ -240,7 +240,6 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
     return all_buffers;
 }
 
-
 // Helper function to convert ErrorCode to Python return value
 // ErrorCode values are already negative, so just cast to int
 inline int to_py_ret(ErrorCode error_code) {
@@ -2057,9 +2056,9 @@ PYBIND11_MODULE(store, m) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->get_into_ranges(
-                    buffers, all_keys, all_dst_offsets, all_src_offsets,
-                    all_sizes);
+                return self.store_->get_into_ranges(buffers, all_keys,
+                                                    all_dst_offsets,
+                                                    all_src_offsets, all_sizes);
             },
             py::arg("buffer_ptrs"), py::arg("all_keys"),
             py::arg("all_dst_offsets"), py::arg("all_src_offsets"),
