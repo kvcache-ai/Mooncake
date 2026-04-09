@@ -133,6 +133,7 @@ troubleshooting/troubleshooting
 :maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
+deployment/k8s-ha-deployment
 :::
 
 % Community
