@@ -189,6 +189,38 @@ impl DummySession {
             .statuses)
     }
 
+    pub fn batch_put_from_multi_buffers(
+        &self,
+        items: &[(String, Vec<(usize, usize)>)],
+        tenant: Option<&str>,
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<Vec<i32>> {
+        let request = pb::BatchPutFromMultiBuffersRequest {
+            client_id_hi: self.client_id.high,
+            client_id_lo: self.client_id.low,
+            tenant: tenant.unwrap_or_default().to_string(),
+            replication: policy.map(replication_to_proto),
+            items: items
+                .iter()
+                .map(|(key, buffers)| {
+                    Ok(pb::SharedMultiPutItem {
+                        key: key.clone(),
+                        buffers: Some(pb::SharedBufferGroup {
+                            buffers: buffers
+                                .iter()
+                                .map(|(ptr, size)| self.shared_buffer_ref(*ptr, *size))
+                                .collect::<Result<Vec<_>>>()?,
+                        }),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        Ok(self
+            .rpc(|mut client| async move { client.batch_put_from_multi_buffers(request).await })?
+            .into_inner()
+            .statuses)
+    }
+
     pub fn put_from(
         &self,
         key: &str,
@@ -235,6 +267,47 @@ impl DummySession {
             .lengths)
     }
 
+    pub fn batch_get_into_multi_buffers(
+        &self,
+        items: &[(String, Vec<(usize, usize)>)],
+        tenant: Option<&str>,
+    ) -> Result<Vec<usize>> {
+        let request = pb::BatchGetIntoMultiBuffersRequest {
+            client_id_hi: self.client_id.high,
+            client_id_lo: self.client_id.low,
+            tenant: tenant.unwrap_or_default().to_string(),
+            items: items
+                .iter()
+                .map(|(key, buffers)| {
+                    Ok(pb::SharedMultiGetItem {
+                        key: key.clone(),
+                        buffers: Some(pb::SharedBufferGroup {
+                            buffers: buffers
+                                .iter()
+                                .map(|(ptr, size)| self.shared_buffer_ref(*ptr, *size))
+                                .collect::<Result<Vec<_>>>()?,
+                        }),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        let lengths = self
+            .rpc(|mut client| async move { client.batch_get_into_multi_buffers(request).await })?
+            .into_inner()
+            .lengths;
+        lengths
+            .into_iter()
+            .zip(items.iter())
+            .map(|(length, (key, _))| {
+                usize::try_from(length).map_err(|_| {
+                    StoreError::NotFound(format!(
+                        "dummy batch_get_into_multi_buffers failed for key={key}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub fn get_into(
         &self,
         key: &str,
@@ -263,6 +336,16 @@ impl DummySession {
         Err(StoreError::Allocator(format!(
             "shared region {base_ptr:#x} is not registered with dummy server"
         )))
+    }
+
+    fn shared_buffer_ref(&self, ptr: usize, size: usize) -> Result<pb::SharedBufferRef> {
+        let region = resolve_shared_region(ptr, size)?;
+        self.ensure_region_registered(region.base)?;
+        Ok(pb::SharedBufferRef {
+            region_id: region.region_id,
+            offset: region.offset as u64,
+            length: region.len as u64,
+        })
     }
 
     fn rpc<F, Fut, T>(&self, f: F) -> Result<T>

@@ -1,5 +1,6 @@
 mod config;
 mod dummy_client;
+mod dummy_loop;
 pub mod dummy_service;
 pub mod runtime;
 mod shm;
@@ -628,6 +629,32 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
+        if let Some(dummy) = self.dummy.as_ref() {
+            let policy = replication_policy(
+                replica_count,
+                preferred_segment,
+                preferred_segments,
+                preferred_storage_owner,
+                preferred_storage_owners,
+                prefer_local,
+                prefer_alloc_in_same_node,
+                with_soft_pin,
+            );
+            for (key, buffers) in &items {
+                let total = buffers.iter().map(Vec::len).sum();
+                let mut payload = Vec::with_capacity(total);
+                for buffer in buffers {
+                    payload.extend_from_slice(buffer);
+                }
+                let status = dummy
+                    .put(key, &payload, tenant, policy.as_ref())
+                    .map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Ok(status);
+                }
+            }
+            return Ok(0);
+        }
         let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
@@ -699,12 +726,47 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<Vec<i32>> {
-        let client = self.client_ref()?;
         if keys.len() != all_buffer_ptrs.len() || keys.len() != all_sizes.len() {
             return Err(PyValueError::new_err(
                 "keys, all_buffer_ptrs, and all_sizes must have the same length",
             ));
         }
+        if let Some(dummy) = self.dummy.as_ref() {
+            let items = keys
+                .iter()
+                .zip(all_buffer_ptrs.iter())
+                .zip(all_sizes.iter())
+                .map(|((key, buffer_ptrs), sizes)| {
+                    if buffer_ptrs.len() != sizes.len() {
+                        return Err(PyValueError::new_err(
+                            "each multi-buffer pointer group must match its sizes group",
+                        ));
+                    }
+                    Ok((
+                        key.clone(),
+                        buffer_ptrs
+                            .iter()
+                            .copied()
+                            .zip(sizes.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let policy = replication_policy(
+                replica_count,
+                preferred_segment,
+                preferred_segments,
+                preferred_storage_owner,
+                preferred_storage_owners,
+                prefer_local,
+                prefer_alloc_in_same_node,
+                with_soft_pin,
+            );
+            return dummy
+                .batch_put_from_multi_buffers(&items, tenant, policy.as_ref())
+                .map_err(store_error_to_py);
+        }
+        let client = self.client_ref()?;
 
         let borrowed = all_buffer_ptrs
             .iter()
@@ -898,12 +960,37 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
     ) -> PyResult<Vec<usize>> {
         let _ = prefer_alloc_in_same_node;
-        let client = self.client_ref()?;
         if keys.len() != all_buffer_ptrs.len() || keys.len() != all_sizes.len() {
             return Err(PyValueError::new_err(
                 "keys, all_buffer_ptrs, and all_sizes must have the same length",
             ));
         }
+        if let Some(dummy) = self.dummy.as_ref() {
+            let items = keys
+                .iter()
+                .zip(all_buffer_ptrs.iter())
+                .zip(all_sizes.iter())
+                .map(|((key, buffer_ptrs), sizes)| {
+                    if buffer_ptrs.len() != sizes.len() {
+                        return Err(PyValueError::new_err(
+                            "each multi-buffer pointer group must match its sizes group",
+                        ));
+                    }
+                    Ok((
+                        key.clone(),
+                        buffer_ptrs
+                            .iter()
+                            .copied()
+                            .zip(sizes.iter().copied())
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            return dummy
+                .batch_get_into_multi_buffers(&items, tenant)
+                .map_err(store_error_to_py);
+        }
+        let client = self.client_ref()?;
 
         let mut borrowed = all_buffer_ptrs
             .iter()

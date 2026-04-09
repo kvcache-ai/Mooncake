@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -7,19 +6,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use mooncake_store_client::{
-    MooncakeCompatibilityFacade, ObjectRef, ReplicationPolicy, StoreClient,
-};
 use mooncake_store_core::StoreError;
-use parking_lot::{Mutex, MutexGuard};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
-use tonic::{Request, Response, Status};
 use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 
+pub use crate::dummy_loop::{SharedStoreClient, SharedStoreClientLoop};
 use crate::shm::{
-    DummyClientId, OwnedMappedRegion, ShmRegisterRequest, bind_shm_listener,
-    dummy_ipc_socket_path, map_registered_region, recv_shm_register_request,
+    DummyClientId, ShmRegisterRequest, bind_shm_listener, dummy_ipc_socket_path,
+    map_registered_region, recv_shm_register_request,
 };
 
 pub mod pb {
@@ -88,13 +84,7 @@ pub fn start_dummy_store_server(
 ) -> Result<DummyStoreServerHandle, StoreError> {
     let socket_path = dummy_ipc_socket_path(bind_addr);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let tracked_keys = Arc::new(Mutex::new(BTreeSet::new()));
-    let regions = Arc::new(Mutex::new(BTreeMap::new()));
-    let context = Arc::new(DummyStoreContext {
-        client,
-        regions,
-        tracked_keys,
-    });
+    let context = Arc::new(DummyStoreContext { client });
 
     let shm_listener = bind_shm_listener(&socket_path)?;
     let shm_shutdown = shutdown_flag.clone();
@@ -157,8 +147,6 @@ pub fn start_dummy_store_server(
 
 struct DummyStoreContext {
     client: Arc<SharedStoreClient>,
-    regions: Arc<Mutex<BTreeMap<(u64, u64, u64), ServerRegion>>>,
-    tracked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
 }
 
 impl DummyStoreContext {
@@ -168,96 +156,19 @@ impl DummyStoreContext {
         fd: OwnedFd,
     ) -> Result<(), StoreError> {
         let mapped = map_registered_region(fd, request.size as usize)?;
-        let key = (request.client_id_hi, request.client_id_lo, request.region_id);
-        let client = self.client.lock();
-        client.register_buffer(mapped.ptr.cast(), mapped.len)?;
-        if let Some(previous) = self.regions.lock().insert(key, ServerRegion { mapped }) {
-            let _ = client.unregister_buffer(previous.mapped.ptr.cast(), previous.mapped.len);
+        self.client.register_buffer(mapped.base(), mapped.len())?;
+        let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
+        if let Some(previous) = self.client.install_region(client_id, request.region_id, mapped) {
+            if let Err(error) = self
+                .client
+                .unregister_buffer(previous.base(), previous.len())
+            {
+                tracing::warn!(error = %error, "dummy shm stale region unregister failed");
+            }
         }
         Ok(())
     }
-
-    fn unregister_region(&self, client_id: DummyClientId, region_id: u64) -> i32 {
-        let key = (client_id.high, client_id.low, region_id);
-        let Some(region) = self.regions.lock().remove(&key) else {
-            return -1;
-        };
-        match self
-            .client
-            .lock()
-            .unregister_buffer(region.mapped.ptr.cast(), region.mapped.len)
-        {
-            Ok(()) => 0,
-            Err(error) => {
-                tracing::warn!(error = %error, "dummy unregister region failed");
-                -1
-            }
-        }
-    }
-
-    fn region_slice(&self, client_id: DummyClientId, buffer: &pb::SharedBufferRef) -> Option<(*mut u8, usize)> {
-        let regions = self.regions.lock();
-        let region = regions.get(&(client_id.high, client_id.low, buffer.region_id))?;
-        let offset = usize::try_from(buffer.offset).ok()?;
-        let length = usize::try_from(buffer.length).ok()?;
-        let end = offset.checked_add(length)?;
-        if end > region.mapped.len {
-            return None;
-        }
-        Some((unsafe { region.mapped.ptr.add(offset) }, length))
-    }
-
-    fn track_put_key(&self, tenant: &str, key: &str) {
-        self.tracked_keys
-            .lock()
-            .insert((tenant.to_string(), key.to_string()));
-    }
-
-    fn forget_key(&self, tenant: &str, key: &str) {
-        self.tracked_keys
-            .lock()
-            .remove(&(tenant.to_string(), key.to_string()));
-    }
-
-    fn remove_all(&self, force: bool) -> (i32, i64) {
-        let keys = self.tracked_keys.lock().iter().cloned().collect::<Vec<_>>();
-        let mut removed = 0i64;
-        for (tenant, key) in keys {
-            let result = self
-                .client
-                .lock()
-                .remove_in_tenant(&tenant, &key, force);
-            if result.is_ok() {
-                self.forget_key(&tenant, &key);
-                removed += 1;
-            }
-        }
-        (0, removed)
-    }
 }
-
-struct ServerRegion {
-    mapped: OwnedMappedRegion,
-}
-
-pub struct SharedStoreClient {
-    inner: Mutex<StoreClient>,
-}
-
-impl SharedStoreClient {
-    pub fn new(client: StoreClient) -> Self {
-        Self {
-            inner: Mutex::new(client),
-        }
-    }
-
-    pub fn lock(&self) -> MutexGuard<'_, StoreClient> {
-        self.inner.lock()
-    }
-}
-
-unsafe impl Send for SharedStoreClient {}
-unsafe impl Sync for SharedStoreClient {}
 
 #[derive(Clone)]
 struct GrpcDummyStoreService {
@@ -277,20 +188,12 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         &self,
         request: Request<pb::PutRequest>,
     ) -> Result<Response<pb::StatusReply>, Status> {
-        let request = request.into_inner();
-        let tenant = normalized_tenant(&self.context.client.lock(), &request.tenant);
-        let policy = proto_policy(&request.replication);
-        let result = {
-            let client = self.context.client.lock();
-            match policy.as_ref() {
-                Some(policy) => client.put_in_tenant_with_policy(&tenant, &request.key, &request.value, policy),
-                None => client.put_in_tenant(&tenant, &request.key, &request.value),
-            }
-        };
-        let status = if result.is_ok() { 0 } else { -1 };
-        if status == 0 {
-            self.context.track_put_key(&tenant, &request.key);
-        }
+        let status = self
+            .context
+            .client
+            .put(request.into_inner())
+            .await
+            .map_err(executor_status)?;
         Ok(Response::new(pb::StatusReply { status }))
     }
 
@@ -298,16 +201,12 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         &self,
         request: Request<pb::GetRequest>,
     ) -> Result<Response<pb::GetReply>, Status> {
-        let request = request.into_inner();
-        let tenant = normalized_tenant(&self.context.client.lock(), &request.tenant);
-        let result = self.context.client.lock().get_in_tenant(&tenant, &request.key);
-        let reply = match result {
-            Ok(value) => pb::GetReply { status: 0, value },
-            Err(_) => pb::GetReply {
-                status: -1,
-                value: Vec::new(),
-            },
-        };
+        let reply = self
+            .context
+            .client
+            .get(request.into_inner())
+            .await
+            .map_err(executor_status)?;
         Ok(Response::new(reply))
     }
 
@@ -315,23 +214,12 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         &self,
         request: Request<pb::BatchIsExistRequest>,
     ) -> Result<Response<pb::BatchIsExistReply>, Status> {
-        let request = request.into_inner();
-        let client = self.context.client.lock();
-        let tenants = request
-            .objects
-            .iter()
-            .map(|object| normalized_tenant(&client, &object.tenant))
-            .collect::<Vec<_>>();
-        let refs = request
-            .objects
-            .iter()
-            .zip(tenants.iter())
-            .map(|(object, tenant)| ObjectRef::new(object.key.as_str()).tenant(tenant.as_str()))
-            .collect::<Vec<_>>();
-        let statuses = client
-            .batch_is_exist(&refs)
-            .map(|items| items.into_iter().map(i32::from).collect())
-            .unwrap_or_else(|_| vec![-1; refs.len()]);
+        let statuses = self
+            .context
+            .client
+            .batch_is_exist(request.into_inner())
+            .await
+            .map_err(executor_status)?;
         Ok(Response::new(pb::BatchIsExistReply { statuses }))
     }
 
@@ -339,43 +227,25 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         &self,
         request: Request<pb::BatchPutFromRequest>,
     ) -> Result<Response<pb::BatchStatusReply>, Status> {
-        let request = request.into_inner();
-        let client_id = DummyClientId {
-            high: request.client_id_hi,
-            low: request.client_id_lo,
-        };
-        let tenant = normalized_tenant(&self.context.client.lock(), &request.tenant);
-        let policy = proto_policy(&request.replication);
-        let mut statuses = Vec::with_capacity(request.items.len());
-        for item in &request.items {
-            let Some(buffer) = item.buffer.as_ref() else {
-                statuses.push(-1);
-                continue;
-            };
-            let Some((ptr, len)) = self.context.region_slice(client_id, buffer) else {
-                statuses.push(-1);
-                continue;
-            };
-            let result = {
-                let client = self.context.client.lock();
-                match policy.as_ref() {
-                    Some(policy) => client.put_from_in_tenant_with_policy(
-                        &tenant,
-                        &item.key,
-                        ptr.cast(),
-                        len,
-                        policy,
-                    ),
-                    None => client.put_from_in_tenant(&tenant, &item.key, ptr.cast(), len),
-                }
-            };
-            if result.is_ok() {
-                self.context.track_put_key(&tenant, &item.key);
-                statuses.push(0);
-            } else {
-                statuses.push(-1);
-            }
-        }
+        let statuses = self
+            .context
+            .client
+            .batch_put_from(request.into_inner())
+            .await
+            .map_err(executor_status)?;
+        Ok(Response::new(pb::BatchStatusReply { statuses }))
+    }
+
+    async fn batch_put_from_multi_buffers(
+        &self,
+        request: Request<pb::BatchPutFromMultiBuffersRequest>,
+    ) -> Result<Response<pb::BatchStatusReply>, Status> {
+        let statuses = self
+            .context
+            .client
+            .batch_put_from_multi_buffers(request.into_inner())
+            .await
+            .map_err(executor_status)?;
         Ok(Response::new(pb::BatchStatusReply { statuses }))
     }
 
@@ -383,33 +253,25 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         &self,
         request: Request<pb::BatchGetIntoRequest>,
     ) -> Result<Response<pb::BatchGetIntoReply>, Status> {
-        let request = request.into_inner();
-        let client_id = DummyClientId {
-            high: request.client_id_hi,
-            low: request.client_id_lo,
-        };
-        let tenant = normalized_tenant(&self.context.client.lock(), &request.tenant);
-        let mut lengths = Vec::with_capacity(request.items.len());
-        for item in &request.items {
-            let Some(buffer) = item.buffer.as_ref() else {
-                lengths.push(-1);
-                continue;
-            };
-            let Some((ptr, len)) = self.context.region_slice(client_id, buffer) else {
-                lengths.push(-1);
-                continue;
-            };
-            let buffer = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            let result = self
-                .context
-                .client
-                .lock()
-                .get_into_in_tenant(&tenant, &item.key, buffer);
-            match result {
-                Ok(size) => lengths.push(size as i64),
-                Err(_) => lengths.push(-1),
-            }
-        }
+        let lengths = self
+            .context
+            .client
+            .batch_get_into(request.into_inner())
+            .await
+            .map_err(executor_status)?;
+        Ok(Response::new(pb::BatchGetIntoReply { lengths }))
+    }
+
+    async fn batch_get_into_multi_buffers(
+        &self,
+        request: Request<pb::BatchGetIntoMultiBuffersRequest>,
+    ) -> Result<Response<pb::BatchGetIntoReply>, Status> {
+        let lengths = self
+            .context
+            .client
+            .batch_get_into_multi_buffers(request.into_inner())
+            .await
+            .map_err(executor_status)?;
         Ok(Response::new(pb::BatchGetIntoReply { lengths }))
     }
 
@@ -418,7 +280,12 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         request: Request<pb::RemoveAllRequest>,
     ) -> Result<Response<pb::RemoveAllReply>, Status> {
         let request = request.into_inner();
-        let (status, removed) = self.context.remove_all(request.force);
+        let (status, removed) = self
+            .context
+            .client
+            .remove_all(request.force)
+            .await
+            .map_err(executor_status)?;
         Ok(Response::new(pb::RemoveAllReply { status, removed }))
     }
 
@@ -427,37 +294,30 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         request: Request<pb::UnregisterRegionRequest>,
     ) -> Result<Response<pb::StatusReply>, Status> {
         let request = request.into_inner();
-        let status = self.context.unregister_region(
-            DummyClientId {
-                high: request.client_id_hi,
-                low: request.client_id_lo,
+        let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
+        let status = match self.context.client.take_region(client_id, request.region_id) {
+            Some(region) => match self
+                .context
+                .client
+                .unregister_buffer_async(region.base(), region.len())
+                .await
+            {
+                Ok(()) => 0,
+                Err(error) => {
+                    tracing::warn!(error = %error, "dummy unregister region failed");
+                    -1
+                }
             },
-            request.region_id,
-        );
+            None => -1,
+        };
         Ok(Response::new(pb::StatusReply { status }))
     }
 }
 
-fn normalized_tenant(client: &StoreClient, tenant: &str) -> String {
-    if tenant.is_empty() {
-        client.default_tenant().to_string()
-    } else {
-        tenant.to_string()
-    }
+fn request_client_id(high: u64, low: u64) -> DummyClientId {
+    DummyClientId { high, low }
 }
 
-fn proto_policy(policy: &Option<pb::ReplicationPolicy>) -> Option<ReplicationPolicy> {
-    let policy = policy.as_ref()?;
-    let mut resolved = ReplicationPolicy::new()
-        .prefer_local(policy.prefer_local)
-        .prefer_alloc_in_same_node(policy.prefer_alloc_in_same_node)
-        .with_soft_pin(policy.with_soft_pin)
-        .replica_count(policy.replica_count.max(1) as usize);
-    if !policy.preferred_segments.is_empty() {
-        resolved = resolved.preferred_segments(policy.preferred_segments.clone());
-    }
-    if !policy.preferred_storage_owners.is_empty() {
-        resolved = resolved.preferred_storage_owners(policy.preferred_storage_owners.clone());
-    }
-    Some(resolved)
+fn executor_status(error: StoreError) -> Status {
+    Status::internal(format!("dummy executor failed: {error}"))
 }
