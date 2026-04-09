@@ -1528,53 +1528,65 @@ impl StoreClient {
     }
 
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
-        let scoped = objects
-            .iter()
-            .map(|object| {
-                let tenant = object.tenant.unwrap_or(self.default_tenant());
-                (tenant.to_string(), self.scoped_key(tenant, object.key))
-            })
-            .collect::<Vec<_>>();
-        let routes = self.route_directory.get_object_routes(
-            &self.lease,
-            &scoped
+        let tracker = OperationTracker::new("route_lookup_many");
+        let result = (|| {
+            let scoped = objects
                 .iter()
-                .map(|(_, scoped)| scoped.clone())
-                .collect::<Vec<_>>(),
-        )?;
-        let mut resolved = Vec::with_capacity(objects.len());
-        for (((tenant, _scoped), object), route) in scoped
-            .into_iter()
-            .zip(objects.iter())
-            .zip(routes.into_iter())
-        {
-            let route = route.ok_or_else(|| {
-                StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
-            })?;
-            if route.state != RouteState::Active {
-                return Err(StoreError::InvalidState(format!(
-                    "tenant={tenant} key={} is not active",
-                    object.key
-                )));
-            }
-            let replica = route
-                .replicas
-                .iter()
-                .min_by_key(|replica| replica.priority)
-                .cloned()
-                .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "tenant={tenant} key={} has no replica",
-                        object.key
-                    ))
+                .map(|object| {
+                    let tenant = object.tenant.unwrap_or(self.default_tenant());
+                    (tenant.to_string(), self.scoped_key(tenant, object.key))
+                })
+                .collect::<Vec<_>>();
+            let routes = self.route_directory.get_object_routes(
+                &self.lease,
+                &scoped
+                    .iter()
+                    .map(|(_, scoped)| scoped.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut resolved = Vec::with_capacity(objects.len());
+            for (((tenant, _scoped), object), route) in scoped
+                .into_iter()
+                .zip(objects.iter())
+                .zip(routes.into_iter())
+            {
+                let route = route.ok_or_else(|| {
+                    StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
                 })?;
-            resolved.push(ResolvedObject {
-                tenant: tenant.to_string(),
-                key: object.key.to_string(),
-                replica,
-            });
+                if route.state != RouteState::Active {
+                    return Err(StoreError::InvalidState(format!(
+                        "tenant={tenant} key={} is not active",
+                        object.key
+                    )));
+                }
+                let replica = route
+                    .replicas
+                    .iter()
+                    .min_by_key(|replica| replica.priority)
+                    .cloned()
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "tenant={tenant} key={} has no replica",
+                            object.key
+                        ))
+                    })?;
+                resolved.push(ResolvedObject {
+                    tenant: tenant.to_string(),
+                    key: object.key.to_string(),
+                    replica,
+                });
+            }
+            Ok(resolved)
+        })();
+        if let Ok(resolved) = &result {
+            debug!(
+                runtime = %self.lease.runtime,
+                items = resolved.len(),
+                "resolved object routes"
+            );
         }
-        Ok(resolved)
+        tracker.finish(&result, 0);
+        result
     }
 
     fn execute_batch_get_into(
@@ -1617,6 +1629,12 @@ impl StoreClient {
                 })
                 .collect::<Vec<_>>()
         };
+        let local_items = local_paths.iter().filter(|local| **local).count();
+        let local_bytes = local_paths
+            .iter()
+            .zip(lengths.iter())
+            .filter_map(|(local, length)| (*local).then_some(*length as u64))
+            .sum::<u64>();
 
         {
             let state = self.state.lock();
@@ -1642,17 +1660,33 @@ impl StoreClient {
                 }
             }
         }
+        if local_bytes != 0 {
+            record_success_metric("get_local_copy", 0, local_bytes);
+        }
 
         let remote_indices = local_paths
             .iter()
             .enumerate()
             .filter_map(|(index, local)| (!*local).then_some(index))
             .collect::<Vec<_>>();
+        let remote_bytes = remote_indices
+            .iter()
+            .map(|index| lengths[*index] as u64)
+            .sum::<u64>();
         if remote_indices.is_empty() {
+            debug!(
+                runtime = %self.lease.runtime,
+                total_items = resolved.len(),
+                local_items,
+                local_bytes,
+                "batch get completed via local copies only"
+            );
             return Ok(lengths);
         }
 
         let mut cursor = 0usize;
+        let mut remote_batch_chunks = 0usize;
+        let mut remote_direct_fallbacks = 0usize;
         while cursor < remote_indices.len() {
             match self.plan_remote_get_chunk(&remote_indices, &lengths, cursor)? {
                 Some((next, scratch)) => {
@@ -1663,6 +1697,7 @@ impl StoreClient {
                         &remote_indices[cursor..next],
                         &scratch,
                     )?;
+                    remote_batch_chunks += 1;
                     cursor = next;
                 }
                 None => {
@@ -1673,11 +1708,23 @@ impl StoreClient {
                         buffers[index],
                         lengths[index],
                     )?;
+                    remote_direct_fallbacks += 1;
                     cursor += 1;
                 }
             }
         }
 
+        debug!(
+            runtime = %self.lease.runtime,
+            total_items = resolved.len(),
+            local_items,
+            local_bytes,
+            remote_items = remote_indices.len(),
+            remote_bytes,
+            remote_batch_chunks,
+            remote_direct_fallbacks,
+            "batch get completed across local and remote paths"
+        );
         Ok(lengths)
     }
 
@@ -1698,9 +1745,26 @@ impl StoreClient {
             match planned {
                 Ok(scratch) => best = Some((end + 1, scratch)),
                 Err(StoreError::Allocator(_)) if best.is_some() => break,
-                Err(StoreError::Allocator(_)) => return Ok(None),
+                Err(StoreError::Allocator(_)) => {
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        remote_index = remote_indices[start],
+                        requested_bytes = lengths[remote_indices[start]],
+                        "remote get request exceeds scratch window; falling back to direct path"
+                    );
+                    return Ok(None);
+                }
                 Err(error) => return Err(error),
             }
+        }
+        if let Some((end, _)) = best.as_ref() {
+            debug!(
+                runtime = %self.lease.runtime,
+                start,
+                end = *end,
+                items = end.saturating_sub(start),
+                "planned remote batch get scratch window"
+            );
         }
         Ok(best)
     }
@@ -1713,43 +1777,59 @@ impl StoreClient {
         remote_indices: &[usize],
         scratch: &[RegionAllocation],
     ) -> Result<()> {
-        let requests = {
-            let mut state = self.state.lock();
-            let mut batch = Vec::with_capacity(remote_indices.len());
-            for (position, index) in remote_indices.iter().enumerate() {
-                let entry = &resolved[*index];
-                let segment = state.open_segment(transport, &entry.replica.segment_name.0)?;
-                batch.push(TransferRequest {
-                    opcode: Opcode::Read,
-                    source: scratch[position].addr,
-                    target_id: segment,
-                    target_offset: entry.replica.offset,
-                    length: entry.replica.length,
-                });
+        let bytes_out = remote_indices
+            .iter()
+            .map(|index| resolved[*index].replica.length)
+            .sum::<u64>();
+        let tracker = OperationTracker::new("get_remote_batch_chunk");
+        let result = (|| {
+            let requests = {
+                let mut state = self.state.lock();
+                let mut batch = Vec::with_capacity(remote_indices.len());
+                for (position, index) in remote_indices.iter().enumerate() {
+                    let entry = &resolved[*index];
+                    let segment = state.open_segment(transport, &entry.replica.segment_name.0)?;
+                    batch.push(TransferRequest {
+                        opcode: Opcode::Read,
+                        source: scratch[position].addr,
+                        target_id: segment,
+                        target_offset: entry.replica.offset,
+                        length: entry.replica.length,
+                    });
+                }
+                batch
+            };
+            let batch_id = transport.allocate_batch(requests.len())?;
+            let submit_result = transport.submit(batch_id, &requests);
+            if let Err(error) = submit_result {
+                let _ = transport.free_batch(batch_id);
+                return Err(error);
             }
-            batch
-        };
-        let batch_id = transport.allocate_batch(requests.len())?;
-        let submit_result = transport.submit(batch_id, &requests);
-        if let Err(error) = submit_result {
-            let _ = transport.free_batch(batch_id);
-            return Err(error);
-        }
-        let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
-        let free_result = transport.free_batch(batch_id);
-        wait_result?;
-        free_result?;
+            let wait_result =
+                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let free_result = transport.free_batch(batch_id);
+            wait_result?;
+            free_result?;
 
-        for (position, index) in remote_indices.iter().enumerate() {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    scratch[position].addr.cast::<u8>(),
-                    buffers[*index].as_mut_ptr(),
-                    resolved[*index].replica.length as usize,
-                );
+            for (position, index) in remote_indices.iter().enumerate() {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        scratch[position].addr.cast::<u8>(),
+                        buffers[*index].as_mut_ptr(),
+                        resolved[*index].replica.length as usize,
+                    );
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        debug!(
+            runtime = %self.lease.runtime,
+            items = remote_indices.len(),
+            bytes_out,
+            "executed remote batch get chunk"
+        );
+        tracker.finish(&result, bytes_out);
+        result
     }
 
     fn execute_remote_get_direct(
@@ -1759,49 +1839,62 @@ impl StoreClient {
         buffer: &mut [u8],
         length: usize,
     ) -> Result<()> {
-        let buffer_ptr = buffer.as_mut_ptr().cast::<c_void>();
-        let buffer_len = buffer.len();
-        let mut registered_here = false;
-        {
-            let mut state = self.state.lock();
-            if !state.buffer_is_registered(buffer_ptr, length) {
-                state.register_external_buffer(transport, buffer_ptr, buffer_len)?;
-                registered_here = true;
+        let tracker = OperationTracker::new("get_remote_direct");
+        let result = (|| {
+            let buffer_ptr = buffer.as_mut_ptr().cast::<c_void>();
+            let buffer_len = buffer.len();
+            let mut registered_here = false;
+            {
+                let mut state = self.state.lock();
+                if !state.buffer_is_registered(buffer_ptr, length) {
+                    state.register_external_buffer(transport, buffer_ptr, buffer_len)?;
+                    registered_here = true;
+                }
             }
-        }
-        let request = {
-            let mut state = self.state.lock();
-            let segment = state.open_segment(transport, &resolved.replica.segment_name.0)?;
-            TransferRequest {
-                opcode: Opcode::Read,
-                source: buffer_ptr,
-                target_id: segment,
-                target_offset: resolved.replica.offset,
-                length: resolved.replica.length,
+            let request = {
+                let mut state = self.state.lock();
+                let segment = state.open_segment(transport, &resolved.replica.segment_name.0)?;
+                TransferRequest {
+                    opcode: Opcode::Read,
+                    source: buffer_ptr,
+                    target_id: segment,
+                    target_offset: resolved.replica.offset,
+                    length: resolved.replica.length,
+                }
+            };
+            let batch_id = transport.allocate_batch(1)?;
+            let submit_result = transport.submit(batch_id, &[request]);
+            if let Err(error) = submit_result {
+                let _ = transport.free_batch(batch_id);
+                if registered_here {
+                    let _ = self
+                        .state
+                        .lock()
+                        .unregister_external_buffer(transport, buffer_ptr, buffer_len);
+                }
+                return Err(error);
             }
-        };
-        let batch_id = transport.allocate_batch(1)?;
-        let submit_result = transport.submit(batch_id, &[request]);
-        if let Err(error) = submit_result {
-            let _ = transport.free_batch(batch_id);
+            let wait_result =
+                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let free_result = transport.free_batch(batch_id);
             if registered_here {
                 let _ = self
                     .state
                     .lock()
                     .unregister_external_buffer(transport, buffer_ptr, buffer_len);
             }
-            return Err(error);
-        }
-        let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
-        let free_result = transport.free_batch(batch_id);
-        if registered_here {
-            let _ = self
-                .state
-                .lock()
-                .unregister_external_buffer(transport, buffer_ptr, buffer_len);
-        }
-        wait_result?;
-        free_result
+            wait_result?;
+            free_result
+        })();
+        debug!(
+            runtime = %self.lease.runtime,
+            tenant = %resolved.tenant,
+            key = %resolved.key,
+            bytes_out = length,
+            "executed remote direct get fallback"
+        );
+        tracker.finish(&result, length as u64);
+        result
     }
 
     fn segment_name(&self) -> Result<SegmentName> {
@@ -1826,6 +1919,7 @@ impl StoreClient {
         let transport = self.transport()?;
         let mut absolute_offsets = vec![0u64; targets.len()];
         let mut remote_requests = Vec::new();
+        let mut local_writes = 0usize;
 
         for (index, (target, reservation)) in targets.iter().zip(reservations.iter()).enumerate() {
             if target.runtime == self.lease.runtime
@@ -1846,6 +1940,7 @@ impl StoreClient {
                     ptr::copy_nonoverlapping(value.as_ptr(), addr.cast::<u8>(), value.len());
                 }
                 absolute_offsets[index] = addr as u64;
+                local_writes += 1;
                 continue;
             }
 
@@ -1869,34 +1964,51 @@ impl StoreClient {
             remote_requests.push((index, handle, target_offset));
             absolute_offsets[index] = target_offset;
         }
+        if local_writes != 0 {
+            record_success_metric("put_local_copy", (local_writes * value.len()) as u64, 0);
+        }
+        debug!(
+            runtime = %self.lease.runtime,
+            replicas = targets.len(),
+            local_writes,
+            remote_writes = remote_requests.len(),
+            value_bytes = value.len(),
+            "writing reserved replicas"
+        );
 
         if !remote_requests.is_empty() {
-            let scratch = {
-                let state = self.state.lock();
-                state.memory_ref()?.plan_scratch(&[value.len()])?
-            };
-            copy_into_region(scratch[0], value);
-            let batch_id = transport.allocate_batch(remote_requests.len())?;
-            let requests = remote_requests
-                .iter()
-                .map(|(_, handle, target_offset)| TransferRequest {
-                    opcode: Opcode::Write,
-                    source: scratch[0].addr,
-                    target_id: *handle,
-                    target_offset: *target_offset,
-                    length: value.len() as u64,
-                })
-                .collect::<Vec<_>>();
-            let submit_result = transport.submit(batch_id, &requests);
-            if let Err(error) = submit_result {
-                let _ = transport.free_batch(batch_id);
-                return Err(error);
-            }
-            let wait_result =
-                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
-            let free_result = transport.free_batch(batch_id);
-            wait_result?;
-            free_result?;
+            let tracker = OperationTracker::new("put_remote_batch_write")
+                .input_bytes((remote_requests.len() * value.len()) as u64);
+            let result = (|| {
+                let scratch = {
+                    let state = self.state.lock();
+                    state.memory_ref()?.plan_scratch(&[value.len()])?
+                };
+                copy_into_region(scratch[0], value);
+                let batch_id = transport.allocate_batch(remote_requests.len())?;
+                let requests = remote_requests
+                    .iter()
+                    .map(|(_, handle, target_offset)| TransferRequest {
+                        opcode: Opcode::Write,
+                        source: scratch[0].addr,
+                        target_id: *handle,
+                        target_offset: *target_offset,
+                        length: value.len() as u64,
+                    })
+                    .collect::<Vec<_>>();
+                let submit_result = transport.submit(batch_id, &requests);
+                if let Err(error) = submit_result {
+                    let _ = transport.free_batch(batch_id);
+                    return Err(error);
+                }
+                let wait_result =
+                    wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                let free_result = transport.free_batch(batch_id);
+                wait_result?;
+                free_result
+            })();
+            tracker.finish(&result, 0);
+            result?;
         }
 
         Ok(absolute_offsets)
@@ -3919,6 +4031,13 @@ fn copy_into_region(allocation: RegionAllocation, value: &[u8]) {
     }
 }
 
+fn record_success_metric(operation: &'static str, bytes_in: u64, bytes_out: u64) {
+    let result: Result<()> = Ok(());
+    OperationTracker::new(operation)
+        .input_bytes(bytes_in)
+        .finish(&result, bytes_out);
+}
+
 fn flatten_slices(buffers: &[&[u8]]) -> Vec<u8> {
     let total = buffers.iter().map(|buffer| buffer.len()).sum();
     let mut payload = Vec::with_capacity(total);
@@ -4633,7 +4752,84 @@ mod tests {
         assert!(metrics.contains("mooncake_store_client_operation_total"));
         assert!(metrics.contains("operation=\"put\",status=\"ok\""));
         assert!(metrics.contains("operation=\"get\",status=\"ok\""));
+        assert!(metrics.contains("operation=\"put_local_copy\",status=\"ok\""));
+        assert!(metrics.contains("operation=\"get_local_copy\",status=\"ok\""));
         assert!(metrics.contains("mooncake_store_client_operation_bytes_out_total"));
+    }
+
+    #[test]
+    fn observability_metrics_render_remote_datapaths() {
+        reset_metrics();
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("metrics-remote-segment"));
+        let remote_owner = publish_storage_node_with_capacity(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "metrics-storage-remote",
+            "metrics-seg-remote",
+            "pool-a",
+            1024,
+            1,
+        );
+        let writer = StoreClientBuilder::new(metadata.clone(), "client-metrics-writer")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport.clone())
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("writer build should succeed");
+        let reader = StoreClientBuilder::new(metadata, "client-metrics-reader")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config_with_layout(4096, 8, 1))
+            .build(10_000)
+            .expect("reader build should succeed");
+
+        writer
+            .batch_put(&[
+                PutRequest::new("metrics-remote-a", b"aaaa").replication(
+                    ReplicationPolicy::new()
+                        .prefer_local(false)
+                        .preferred_storage_owner(remote_owner.storage_key()),
+                ),
+                PutRequest::new("metrics-remote-b", b"bbbb").replication(
+                    ReplicationPolicy::new()
+                        .prefer_local(false)
+                        .preferred_storage_owner(remote_owner.storage_key()),
+                ),
+            ])
+            .expect("remote batch put should succeed");
+        let mut direct = [0u8; 8];
+        writer
+            .put_with_policy(
+                "metrics-remote-c",
+                b"abcdefgh",
+                &ReplicationPolicy::new()
+                    .prefer_local(false)
+                    .preferred_storage_owner(remote_owner.storage_key()),
+            )
+            .expect("remote put should succeed");
+        let batch = reader
+            .batch_get(&[
+                ObjectRef::new("metrics-remote-a"),
+                ObjectRef::new("metrics-remote-b"),
+            ])
+            .expect("remote batch get should succeed");
+        assert_eq!(batch, vec![b"aaaa".to_vec(), b"bbbb".to_vec()]);
+        let direct_sizes = reader
+            .batch_get_into(&mut [GetRequest::new("metrics-remote-c", &mut direct)])
+            .expect("remote direct get should succeed");
+        assert_eq!(direct_sizes, vec![8]);
+        assert_eq!(&direct, b"abcdefgh");
+
+        let metrics = render_prometheus_metrics();
+        assert!(metrics.contains("operation=\"route_lookup_many\",status=\"ok\""));
+        assert!(metrics.contains("operation=\"put_remote_batch_write\",status=\"ok\""));
+        assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
+        assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
     }
 
     #[test]
