@@ -1,32 +1,10 @@
 name: 'Build Wheel (CUDA 13)'
 
 on:
-  push:
-    branches: [ "main" ]
-    paths:
-      - 'mooncake-*/**'
-      - 'extern/**'
-      - 'CMakeLists.txt'
-      - 'dependencies.sh'
-      - 'scripts/**'
-      - '.github/workflows/ci_cu13.yml'
-  pull_request:
-    branches: [ "main" ]
-    types: [opened, synchronize, reopened, labeled]
-    paths:
-      - 'mooncake-*/**'
-      - 'extern/**'
-      - 'CMakeLists.txt'
-      - 'dependencies.sh'
-      - 'scripts/**'
-      - '.github/workflows/ci_cu13.yml'
+  workflow_call: {}
 
 jobs:
   build-wheel-cu13:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:

@@ -16,11 +16,12 @@ concurrency:
 
 jobs:
   build:
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (github.event_name == 'push' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -219,11 +220,12 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   build-musa:
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (github.event_name == 'push' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
     steps:
@@ -400,11 +402,12 @@ jobs:
       shell: bash
 
   build-flags:
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (github.event_name == 'push' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -567,11 +570,12 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (github.event_name == 'push' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -673,8 +677,19 @@ jobs:
               - 'mooncake-*/**'
               - 'extern/**'
               - 'CMakeLists.txt'
+              - 'dependencies.sh'
               - 'scripts/**'
               - '.github/workflows/**'
+
+  build-wheel-cu13:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      needs.check-paths.outputs.should-run-downstream == 'true' &&
+      (github.event_name == 'push' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/ci_cu13.yml
+    secrets: inherit
 
   ascend-test:
     needs: [build, check-paths]
@@ -699,6 +714,7 @@ jobs:
       - build-flags
       - build-docker
       - test-wheel-ubuntu
+      - build-wheel-cu13
       - ascend-test
       - integration-test
     runs-on: ubuntu-latest
