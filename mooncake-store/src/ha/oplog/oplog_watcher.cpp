@@ -46,7 +46,9 @@ bool OpLogWatcher::StartFromSequenceId(uint64_t start_seq_id) {
             return false;
         }
 
-        if (!ApplyPollResult(*poll_result) || poll_result->records.empty()) {
+        const bool applied_any = ApplyPollResult(*poll_result);
+        (void)applier_->ProcessPendingEntries();
+        if (!applied_any || poll_result->records.empty()) {
             break;
         }
         cursor = last_processed_sequence_id_.load(std::memory_order_acquire);
@@ -125,6 +127,7 @@ void OpLogWatcher::WatchLoop() {
         }
 
         (void)ApplyPollResult(*poll_result);
+        (void)applier_->ProcessPendingEntries();
     }
 }
 
