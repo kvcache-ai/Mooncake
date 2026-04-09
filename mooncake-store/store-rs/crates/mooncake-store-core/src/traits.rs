@@ -49,6 +49,8 @@ pub trait MetadataBackend: Send + Sync {
 
     fn get_object_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>>;
 
+    fn list_object_routes(&self) -> Result<Vec<ObjectRoute>>;
+
     fn compare_and_swap_object_route(
         &self,
         key: &ObjectKey,

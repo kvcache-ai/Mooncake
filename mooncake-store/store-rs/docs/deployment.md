@@ -169,7 +169,7 @@ The current end-to-end binary covers:
 - overwrite reclaim and delete reclaim
 - routed writes and multi-replica publication
 - multi-tenant access
-- dynamic expansion, soft shrink, and hot-upgrade handoff
+- dynamic expansion, true client shrink, and hot-upgrade handoff
 
 The entry point is `crates/mooncake-store-e2e/src/main.rs`.
 

@@ -342,6 +342,22 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
+        let prefix = self.config.keyspace.object_prefix();
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(prefix, Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(etcd_error("etcd list object routes"))?;
+            let mut routes = Vec::with_capacity(response.kvs().len());
+            for kv in response.kvs() {
+                routes.push(serde_json::from_slice(kv.value()).map_err(json_error)?);
+            }
+            Ok(routes)
+        })
+    }
+
     fn compare_and_swap_object_route(
         &self,
         key: &ObjectKey,

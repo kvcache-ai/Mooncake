@@ -83,7 +83,8 @@ The implementation is easier to understand when grouped by capability instead of
 - standby, activate, and draining states
 - handoff planning for upgrades
 - dynamic live-client membership
-- soft shrink through drain and retire flows
+- segment-level drain / retire flows
+- true client shrink through replica evacuation
 - hot-upgrade and elastic-capacity scenarios validated in e2e
 
 ### Observability

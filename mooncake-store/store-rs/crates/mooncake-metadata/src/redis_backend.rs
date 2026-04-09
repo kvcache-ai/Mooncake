@@ -484,6 +484,26 @@ impl MetadataBackend for RedisMetadataBackend {
             .transpose()
     }
 
+    fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
+        let mut connection = self.connection()?;
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(self.keyspace.object_pattern())
+            .query(&mut connection)
+            .map_err(|error| metadata_error("redis keys objects", error))?;
+        let mut routes = Vec::with_capacity(keys.len());
+        for key in keys {
+            let payload: Option<String> = redis::cmd("HGET")
+                .arg(key)
+                .arg("payload")
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis hget route payload", error))?;
+            if let Some(payload) = payload {
+                routes.push(serde_json::from_str(&payload).map_err(json_error)?);
+            }
+        }
+        Ok(routes)
+    }
+
     fn compare_and_swap_object_route(
         &self,
         key: &ObjectKey,

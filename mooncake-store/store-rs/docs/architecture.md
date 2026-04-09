@@ -178,10 +178,11 @@ Metadata backends store three persistent categories of data:
 | `activate` / `enter_standby` / `enter_draining` | Drive client lifecycle state |
 | `plan_handoff` | Prepare successor handoff metadata |
 | `expand_local_memory` | Add new local storage capacity |
-| `drain_segment` / `retire_segment` | Soft shrink and cleanup segment ownership |
+| `drain_segment` / `retire_segment` | Drain and retire individual local segments |
+| `evacuate_owned_replicas` / `evacuate_owned_replicas_via` | Rewrite live routes away from a draining client and retire emptied segments |
 | remove + reclaim | Delete route state and release segment space |
 
-These APIs are what the e2e suite uses to validate dynamic membership, elastic expansion and shrink, and hot-upgrade handoff.
+These APIs are what the e2e suite uses to validate dynamic membership, elastic expansion, true client shrink, and hot-upgrade handoff.
 
 ## Observability
 

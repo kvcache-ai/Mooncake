@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
@@ -74,7 +75,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "tenant-a",
         &[("pool", "pool-a"), ("role", "primary"), ("storage", "true")],
     )?;
-    let target_b = build_client(
+    let mut target_b = build_client(
         metadata.clone(),
         "store-b",
         ClientEpoch(1),
@@ -211,7 +212,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
         1,
     )?;
-
     target_a.register_local_memory()?;
     target_b.register_local_memory()?;
     target_upgrade.register_local_memory()?;
@@ -249,9 +249,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     run_batch_put_benchmark(&router, value_size, batch_bench_iters)?;
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
+    target_a.activate()?;
+    verify_true_client_shrink(&mut target_b, &router, &reader, value_size)?;
 
     println!(
-        "e2e ok: single put/get, batch put/get, request-level replication policy, true delete reclaim, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, hot-upgrade"
+        "e2e ok: single put/get, batch put/get, request-level replication policy, true delete reclaim, routed remote write, multi-replica publish, registered-buffer path, overwrite reclaim, multi-tenant, scale-out, elastic expand-shrink, true client shrink, hot-upgrade"
     );
     if env::var("MC_STORE_RS_PRINT_METRICS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -782,6 +784,86 @@ fn verify_dynamic_expand_and_soft_shrink(
     }
     let actual = reader.get("elastic-key")?;
     ensure_payload("elastic expand+shrink", &second, &actual)?;
+    Ok(())
+}
+
+fn verify_true_client_shrink(
+    target: &mut StoreClient,
+    router: &StoreClient,
+    _reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let mut owned = Vec::new();
+    for index in 0..32 {
+        let key = format!("shrink-key-{index}");
+        let value = payload(&format!("shrink-value-{index}"), value_size);
+        router.put_with_policy(&key, &value, &ReplicationPolicy::new().prefer_local(false))?;
+        let route = router
+            .query_route(&key)?
+            .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+        if route.replicas[0].owner == *target.runtime_id() {
+            owned.push((key, value));
+        }
+    }
+    if owned.is_empty() {
+        return Err(StoreError::InvalidState(
+            "true client shrink did not place any key on the shrink target".to_string(),
+        ));
+    }
+    for (key, value) in &owned {
+        let actual = router.get(key)?;
+        ensure_payload(&format!("true shrink preflight {key}"), value, &actual)?;
+    }
+
+    let migrated = target.evacuate_owned_replicas_via(router)?;
+    if migrated < owned.len() {
+        return Err(StoreError::InvalidState(format!(
+            "true client shrink migrated {migrated} objects but expected at least {}",
+            owned.len()
+        )));
+    }
+    sleep(Duration::from_secs(2));
+
+    if target.lease().state != ClientLifecycleState::Draining {
+        return Err(StoreError::InvalidState(
+            "true client shrink did not leave the target in draining state".to_string(),
+        ));
+    }
+    if !target.list_segments()?.is_empty() {
+        return Err(StoreError::InvalidState(
+            "true client shrink left published local segments behind".to_string(),
+        ));
+    }
+
+    for (key, value) in owned {
+        let route = router
+            .query_route(&key)?
+            .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+        if route
+            .replicas
+            .iter()
+            .any(|replica| replica.owner == *target.runtime_id())
+        {
+            return Err(StoreError::InvalidState(format!(
+                "true client shrink route still references evacuated runtime for key {key}"
+            )));
+        }
+        let mut actual = router.get(&key)?;
+        for _ in 0..20 {
+            if actual == value {
+                break;
+            }
+            sleep(Duration::from_millis(100));
+            actual = router.get(&key)?;
+        }
+        if actual != value {
+            let reader_route = router.query_route(&key)?;
+            return Err(StoreError::Transport(format!(
+                "true shrink payload mismatch for key {key}: router_route={route:?} reader_route={reader_route:?}"
+            )));
+        }
+        ensure_payload(&format!("true shrink {key}"), &value, &actual)?;
+    }
     Ok(())
 }
 

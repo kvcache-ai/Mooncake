@@ -92,6 +92,7 @@ store.put("key", b"payload", config=policy)
 - `activate`, `enter_standby`, `enter_draining`
 - `expand_local_memory`
 - `drain_segment`, `retire_segment`
+- `evacuate_owned_replicas`
 - `plan_handoff`
 
 ### Observability

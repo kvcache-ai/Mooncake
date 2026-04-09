@@ -140,9 +140,9 @@ The client can publish handoff plans and participate in successor upgrade flows.
 
 ### Elastic capacity
 
-The client can expand local storage, drain segments, and retire segments.
+The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client.
 
-This allows soft shrink and dynamic storage growth without changing the public API.
+This allows segment-level shrink, full client shrink, and dynamic storage growth without changing the public API.
 
 ## Control Plane
 

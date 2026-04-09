@@ -881,6 +881,11 @@ impl PyMooncakeDistributedStore {
             .map_err(store_error_to_py)
     }
 
+    fn evacuate_owned_replicas(&mut self) -> PyResult<usize> {
+        let client = self.client_mut()?;
+        client.evacuate_owned_replicas().map_err(store_error_to_py)
+    }
+
     fn list_segments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyAny>>> {
         let client = self.client_ref()?;
         client

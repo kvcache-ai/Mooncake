@@ -3,8 +3,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientStableId, MetadataBackend, ObjectKey,
-    ObjectRoute, Result, RouteCasRequest, RouteDirectory, RouteVersion, StoreError,
+    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend,
+    ObjectKey, ObjectRoute, Result, RouteCasRequest, RouteDirectory, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
 use tracing::warn;
@@ -627,6 +627,29 @@ pub(crate) fn authority_get_many(
         .collect())
 }
 
+pub(crate) fn authority_list_routes_by_replica_owner(
+    namespace: &str,
+    authority: &ClientStableId,
+    owner: &ClientRuntimeId,
+) -> Result<Vec<ObjectRoute>> {
+    let mesh = route_mesh(namespace);
+    let guard = mesh.lock();
+    if !guard.is_local(authority) {
+        return Err(StoreError::NotFound(format!(
+            "route authority {} is not attached locally",
+            authority
+        )));
+    }
+    Ok(guard
+        .routes_by_authority
+        .get(&authority.0)
+        .into_iter()
+        .flat_map(|routes| routes.values())
+        .filter(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
+        .cloned()
+        .collect())
+}
+
 pub(crate) fn authority_compare_and_swap(
     namespace: &str,
     authority: &ClientStableId,
@@ -867,4 +890,68 @@ fn stable_hash(parts: &[&str]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, ClientStableId, CompatibilityDescriptor, ObjectKey,
+        ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
+    };
+
+    use super::{authority_list_routes_by_replica_owner, authority_replace, route_mesh};
+
+    #[test]
+    fn authority_list_routes_filters_by_replica_owner() {
+        let namespace = "route-directory-test";
+        let authority = ClientStableId::new("authority-a");
+        let owner_a = ClientRuntimeId::new("owner-a", ClientEpoch(1));
+        let owner_b = ClientRuntimeId::new("owner-b", ClientEpoch(1));
+        route_mesh(namespace).lock().register_local(&authority);
+
+        let route_a = ObjectRoute {
+            key: ObjectKey::new("tenant-a::key-a"),
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: owner_a.clone(),
+                segment_name: SegmentName::new("seg-a"),
+                offset: 64,
+                segment_offset: 64,
+                length: 32,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        };
+        let route_b = ObjectRoute {
+            key: ObjectKey::new("tenant-a::key-b"),
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: owner_b.clone(),
+                segment_name: SegmentName::new("seg-b"),
+                offset: 128,
+                segment_offset: 128,
+                length: 32,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        };
+
+        authority_replace(namespace, &authority, &route_a.key, Some(&route_a))
+            .expect("route-a replace should succeed");
+        authority_replace(namespace, &authority, &route_b.key, Some(&route_b))
+            .expect("route-b replace should succeed");
+
+        let found = authority_list_routes_by_replica_owner(namespace, &authority, &owner_a)
+            .expect("owner filter should succeed");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, route_a.key);
+
+        route_mesh(namespace).lock().unregister_local(&authority);
+    }
 }
