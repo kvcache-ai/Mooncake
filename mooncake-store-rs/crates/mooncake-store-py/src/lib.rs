@@ -1,27 +1,23 @@
 mod config;
+pub mod runtime;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::slice;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use config::CompatSetupArgs;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
-    start_metrics_http_server, stop_metrics_http_server, GetRequest, LocalMemoryConfig,
-    MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
-    PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, StoreClient,
-    StoreClientBuilder, TentTransportFactory,
+    start_metrics_http_server, stop_metrics_http_server, GetRequest, MooncakeCompatibilityFacade,
+    MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
+    ReplicationPolicy, RouteControlMode, StoreClient,
 };
 use mooncake_store_core::{
-    ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, ObjectRoute, SegmentAnnouncement,
-    SegmentName, StoreError,
+    ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
 };
-use mooncake_transport::TentEngine;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use runtime::CompatRuntimeArgs;
 
 #[pyclass(name = "MooncakeDistributedStore", unsendable)]
 struct PyMooncakeDistributedStore {
@@ -74,68 +70,30 @@ impl PyMooncakeDistributedStore {
         local_segment_name: Option<String>,
         expires_at_ms: Option<u64>,
     ) -> PyResult<i32> {
-        let plan = CompatSetupArgs {
-            local_hostname: local_hostname.to_string(),
-            metadata_url: metadata_url.to_string(),
-            transport_metadata_url,
-            global_segment_size,
-            local_buffer_size,
-            protocol: protocol.to_string(),
-            _rdma_devices: rdma_devices.to_string(),
-            stable_id,
-            tenant: tenant.to_string(),
-            labels: labels.unwrap_or_default(),
-            routed_writes,
-            replica_count,
-            keyspace,
-            expires_at_ms,
+        let runtime = CompatRuntimeArgs {
+            setup: config::CompatSetupArgs {
+                local_hostname: local_hostname.to_string(),
+                metadata_url: metadata_url.to_string(),
+                transport_metadata_url,
+                global_segment_size,
+                local_buffer_size,
+                protocol: protocol.to_string(),
+                _rdma_devices: rdma_devices.to_string(),
+                stable_id,
+                tenant: tenant.to_string(),
+                labels: labels.unwrap_or_default(),
+                routed_writes,
+                replica_count,
+                keyspace,
+                expires_at_ms,
+            },
+            local_segment_name,
+            route_control: RouteControlMode::EmbeddedWrh,
         }
         .build()
         .map_err(store_error_to_py)?;
         let _ = master_server;
-
-        let metadata = plan.metadata.clone();
-        let segment_name = local_segment_name.unwrap_or_else(|| {
-            format!("{}-segment-{}", plan.stable_id.replace(':', "-"), now_ms())
-        });
-        #[allow(clippy::arc_with_non_send_sync)]
-        let engine = Arc::new(
-            TentEngine::new(
-                &plan
-                    .tent_config
-                    .clone()
-                    .set("local_segment_name", &segment_name),
-            )
-            .map_err(store_error_to_py)?,
-        );
-        let factory = Arc::new(TentTransportFactory::new(plan.tent_config));
-        let mut builder = StoreClientBuilder::new(plan.metadata, plan.stable_id)
-            .epoch(ClientEpoch(1))
-            .state(ClientLifecycleState::Active)
-            .compatibility(CompatibilityDescriptor::default())
-            .tenant(plan.tenant)
-            .local_memory(
-                LocalMemoryConfig::new()
-                    .storage_bytes(plan.storage_bytes)
-                    .scratch_bytes(plan.scratch_bytes)
-                    .location("cpu:0"),
-            )
-            .with_tent(engine)
-            .transport_factory(factory);
-
-        for (key, value) in plan.labels {
-            builder = builder.label(key, value);
-        }
-        if plan.routed_writes {
-            builder = builder.routed_writes(
-                PlacementPlanner::new(metadata).require_label("storage", "true"),
-                plan.replica_count,
-            );
-        }
-
-        let client = builder
-            .build(plan.expires_at_ms)
-            .map_err(store_error_to_py)?;
+        let client = runtime.client;
         client.register_local_memory().map_err(store_error_to_py)?;
         self.client = Some(client);
         Ok(0)
@@ -1102,11 +1060,4 @@ fn store_error_to_py(error: StoreError) -> PyErr {
         | StoreError::Metadata(message)
         | StoreError::Transport(message) => PyRuntimeError::new_err(message),
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_millis() as u64
 }

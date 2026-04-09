@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mooncake-store-rs"
+version = "0.1.0"
+description = "Rust Mooncake store compatibility layer with Python bindings"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Xingrui Yi", email = "yixingrui@linux.alibaba.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "License :: OSI Approved :: Apache Software License",
+]
+keywords = ["mooncake", "store", "rust", "distributed-cache"]
+
+[project.urls]
+Homepage = "https://github.com/kvcache-ai/Mooncake"
+Source = "https://github.com/kvcache-ai/Mooncake"
+
+[tool.maturin]
+manifest-path = "crates/mooncake-store-py/Cargo.toml"
+python-source = "python"
+module-name = "mooncake._store_rs"
+bindings = "pyo3"
