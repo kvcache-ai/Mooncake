@@ -188,8 +188,7 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_REDIS_URL` | Rust e2e | metadata Redis URL |
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
-| `MC_STORE_RS_BATCH_BENCH_ITERS` | Rust e2e | benchmark iteration count |
-| `MC_STORE_RS_BENCH_ITERS` | `scripts/run-local-e2e.sh` | input that the script maps to `MC_STORE_RS_BATCH_BENCH_ITERS` |
+| `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
 | `MC_STORE_RS_TENT_REDIS_URL` | Python compatibility layer | Redis URL used by TENT when store metadata is etcd |
 | `MC_STORE_USE_HUGEPAGE` | local memory and Python shm allocator | enable hugepage-backed allocation |

@@ -36,7 +36,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(4096);
-    let batch_bench_iters = env::var("MC_STORE_RS_BATCH_BENCH_ITERS")
+    let batch_bench_iters = env::var("MC_STORE_RS_BENCH_ITERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(128);
