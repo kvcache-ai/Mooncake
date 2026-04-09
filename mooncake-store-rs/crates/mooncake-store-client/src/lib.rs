@@ -1,4 +1,5 @@
 mod client;
+mod control_plane;
 mod memory;
 mod observability;
 mod placement;

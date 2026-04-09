@@ -7,6 +7,8 @@ edition = "2021"
 mooncake-store-core = { path = "../mooncake-store-core" }
 mooncake-transport = { path = "../mooncake-transport" }
 parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
