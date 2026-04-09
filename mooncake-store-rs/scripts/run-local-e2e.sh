@@ -29,6 +29,16 @@ export MC_STORE_RS_REDIS_PORT="${REDIS_PORT}"
 export MC_STORE_RS_BATCH_BENCH_ITERS="${BENCH_ITERS}"
 export MC_STORE_RS_VALUE_SIZE="${VALUE_SIZE}"
 
-source /root/.cargo/env
+if ! command -v cargo >/dev/null 2>&1; then
+  CARGO_ENV="${CARGO_HOME:-${HOME}/.cargo}/env"
+  if [[ -f "${CARGO_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CARGO_ENV}"
+  else
+    echo "cargo not found in PATH and ${CARGO_ENV} is missing" >&2
+    exit 1
+  fi
+fi
+
 cd "${ROOT_DIR}"
 cargo run --release -p mooncake-store-e2e

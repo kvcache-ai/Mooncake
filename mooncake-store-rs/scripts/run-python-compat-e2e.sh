@@ -25,7 +25,17 @@ export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${ROOT_DIR}/python"
 
-source /root/.cargo/env
+if ! command -v cargo >/dev/null 2>&1; then
+  CARGO_ENV="${CARGO_HOME:-${HOME}/.cargo}/env"
+  if [[ -f "${CARGO_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CARGO_ENV}"
+  else
+    echo "cargo not found in PATH and ${CARGO_ENV} is missing" >&2
+    exit 1
+  fi
+fi
+
 cd "${ROOT_DIR}"
 cargo build -p mooncake-store-py
 
