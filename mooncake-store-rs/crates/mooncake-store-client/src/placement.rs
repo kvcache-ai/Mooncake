@@ -65,6 +65,14 @@ impl PlacementPlanner {
         self.ranked_candidates_from_lease(observer.lease(), observer.default_tenant(), object)
     }
 
+    pub fn rank_many(
+        &self,
+        observer: &StoreClient,
+        objects: &[ObjectRef<'_>],
+    ) -> Result<Vec<PlacementChoice>> {
+        self.rank_many_from_lease(observer.lease(), observer.default_tenant(), objects)
+    }
+
     pub fn plan_from_lease(
         &self,
         observer: &ClientLease,
@@ -107,6 +115,26 @@ impl PlacementPlanner {
         let tenant = object.tenant.unwrap_or(default_tenant);
         let candidates = self.candidates(observer)?;
         Ok(self.rank_candidates(tenant, object.key, &candidates))
+    }
+
+    pub fn rank_many_from_lease(
+        &self,
+        observer: &ClientLease,
+        default_tenant: &str,
+        objects: &[ObjectRef<'_>],
+    ) -> Result<Vec<PlacementChoice>> {
+        let candidates = self.candidates(observer)?;
+        let mut plans = Vec::with_capacity(objects.len());
+        for object in objects {
+            let tenant = object.tenant.unwrap_or(default_tenant).to_string();
+            let owners = self.rank_candidates(&tenant, object.key, &candidates);
+            plans.push(PlacementChoice {
+                tenant,
+                key: object.key.to_string(),
+                owners,
+            });
+        }
+        Ok(plans)
     }
 
     fn candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {

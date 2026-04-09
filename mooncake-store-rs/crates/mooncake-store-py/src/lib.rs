@@ -153,6 +153,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -165,6 +168,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
@@ -173,6 +179,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
@@ -272,6 +281,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -285,6 +297,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
@@ -294,6 +309,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
@@ -335,6 +353,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -346,6 +367,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
@@ -354,6 +378,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
@@ -381,6 +408,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -392,6 +422,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
@@ -400,6 +433,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
@@ -432,6 +468,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -445,6 +484,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
@@ -465,6 +507,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         )
@@ -477,6 +522,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -488,6 +536,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
@@ -496,6 +547,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
@@ -537,6 +591,9 @@ impl PyMooncakeDistributedStore {
         replica_count = None,
         preferred_segment = None,
         preferred_segments = None,
+        preferred_storage_owner = None,
+        preferred_storage_owners = None,
+        prefer_local = true,
         prefer_alloc_in_same_node = false,
         with_soft_pin = false
     ))]
@@ -550,6 +607,9 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
         preferred_segment: Option<String>,
         preferred_segments: Option<Vec<String>>,
+        preferred_storage_owner: Option<String>,
+        preferred_storage_owners: Option<Vec<String>>,
+        prefer_local: bool,
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<Vec<i32>> {
@@ -585,6 +645,9 @@ impl PyMooncakeDistributedStore {
             replica_count,
             preferred_segment,
             preferred_segments,
+            preferred_storage_owner,
+            preferred_storage_owners,
+            prefer_local,
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
@@ -971,17 +1034,22 @@ fn route_to_py(py: Python<'_>, route: &ObjectRoute) -> PyResult<Py<PyAny>> {
     Ok(dict.into_any().unbind())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replication_policy(
     replica_count: Option<usize>,
     preferred_segment: Option<String>,
     preferred_segments: Option<Vec<String>>,
+    preferred_storage_owner: Option<String>,
+    preferred_storage_owners: Option<Vec<String>>,
+    prefer_local: bool,
     prefer_alloc_in_same_node: bool,
     with_soft_pin: bool,
 ) -> Option<ReplicationPolicy> {
     let mut policy = ReplicationPolicy::new()
+        .prefer_local(prefer_local)
         .prefer_alloc_in_same_node(prefer_alloc_in_same_node)
         .with_soft_pin(with_soft_pin);
-    let mut has_policy = prefer_alloc_in_same_node || with_soft_pin;
+    let mut has_policy = prefer_alloc_in_same_node || with_soft_pin || !prefer_local;
     if let Some(replica_count) = replica_count {
         policy = policy.replica_count(replica_count);
         has_policy = true;
@@ -995,6 +1063,17 @@ fn replication_policy(
     }
     if !combined_segments.is_empty() {
         policy = policy.preferred_segments(combined_segments);
+        has_policy = true;
+    }
+    let mut combined_owners = Vec::new();
+    if let Some(owner) = preferred_storage_owner.filter(|owner| !owner.is_empty()) {
+        combined_owners.push(owner);
+    }
+    if let Some(mut owners) = preferred_storage_owners.filter(|owners| !owners.is_empty()) {
+        combined_owners.append(&mut owners);
+    }
+    if !combined_owners.is_empty() {
+        policy = policy.preferred_storage_owners(combined_owners);
         has_policy = true;
     }
     has_policy.then_some(policy)
