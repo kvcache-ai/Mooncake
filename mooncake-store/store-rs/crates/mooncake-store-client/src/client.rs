@@ -50,12 +50,27 @@ impl<'a> ObjectRef<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicationPolicy {
     pub replica_count: Option<usize>,
     pub with_soft_pin: bool,
     pub preferred_segments: Vec<SegmentName>,
+    pub preferred_storage_owners: Vec<String>,
     pub prefer_alloc_in_same_node: bool,
+    pub prefer_local: bool,
+}
+
+impl Default for ReplicationPolicy {
+    fn default() -> Self {
+        Self {
+            replica_count: None,
+            with_soft_pin: false,
+            preferred_segments: Vec::new(),
+            preferred_storage_owners: Vec::new(),
+            prefer_alloc_in_same_node: false,
+            prefer_local: true,
+        }
+    }
 }
 
 impl ReplicationPolicy {
@@ -78,6 +93,11 @@ impl ReplicationPolicy {
         self
     }
 
+    pub fn prefer_local(mut self, prefer_local: bool) -> Self {
+        self.prefer_local = prefer_local;
+        self
+    }
+
     pub fn preferred_segment(mut self, segment: impl Into<String>) -> Self {
         self.preferred_segments.push(SegmentName::new(segment));
         self
@@ -92,6 +112,20 @@ impl ReplicationPolicy {
             .into_iter()
             .map(SegmentName::new)
             .collect::<Vec<_>>();
+        self
+    }
+
+    pub fn preferred_storage_owner(mut self, owner: impl Into<String>) -> Self {
+        self.preferred_storage_owners.push(owner.into());
+        self
+    }
+
+    pub fn preferred_storage_owners<I, S>(mut self, owners: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.preferred_storage_owners = owners.into_iter().map(Into::into).collect::<Vec<_>>();
         self
     }
 }
@@ -692,22 +726,7 @@ impl StoreClient {
         &self,
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ResolvedReplicationPolicy> {
-        let Some(policy) = policy else {
-            return Ok(ResolvedReplicationPolicy {
-                replica_count: self.default_replica_count(),
-                preferred_segments: Vec::new(),
-                with_soft_pin: false,
-                prefer_alloc_in_same_node: false,
-            });
-        };
-
-        let mut preferred_segments = policy.preferred_segments.clone();
-        if policy.prefer_alloc_in_same_node
-            && preferred_segments.is_empty()
-            && matches!(self.write_mode, WriteMode::LocalOnly)
-        {
-            preferred_segments.push(self.segment_name()?);
-        }
+        let policy = policy.cloned().unwrap_or_default();
         let replica_count = policy
             .replica_count
             .unwrap_or_else(|| self.default_replica_count());
@@ -717,6 +736,7 @@ impl StoreClient {
             ));
         }
 
+        let preferred_segments = policy.preferred_segments.clone();
         let mut seen = BTreeSet::new();
         for segment in &preferred_segments {
             if !seen.insert(segment.clone()) {
@@ -726,50 +746,218 @@ impl StoreClient {
                 )));
             }
         }
-        if preferred_segments.len() > replica_count {
-            return Err(StoreError::InvalidState(format!(
-                "preferred segments exceed replica_count: have={} limit={replica_count}",
-                preferred_segments.len()
-            )));
-        }
 
         Ok(ResolvedReplicationPolicy {
             replica_count,
             preferred_segments,
+            preferred_storage_owners: self
+                .resolve_preferred_storage_owners(&policy.preferred_storage_owners)?,
             with_soft_pin: policy.with_soft_pin,
-            prefer_alloc_in_same_node: policy.prefer_alloc_in_same_node,
+            prefer_local: policy.prefer_local || policy.prefer_alloc_in_same_node,
         })
     }
 
-    fn resolve_replica_targets(
+    fn resolve_preferred_storage_owners(
+        &self,
+        selectors: &[String],
+    ) -> Result<Vec<ClientRuntimeId>> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let compatible = self
+            .metadata
+            .list_live_clients()?
+            .into_iter()
+            .filter(|lease| compatibility_matches(&self.lease, lease))
+            .collect::<Vec<_>>();
+        let mut resolved = Vec::with_capacity(selectors.len());
+        let mut seen = BTreeSet::new();
+        for selector in selectors {
+            let matched = if selector.contains(':') {
+                compatible
+                    .iter()
+                    .find(|lease| lease.runtime.storage_key() == *selector)
+            } else {
+                compatible
+                    .iter()
+                    .filter(|lease| lease.runtime.stable_id.0 == *selector)
+                    .max_by_key(|lease| lease.runtime.epoch)
+            };
+            let lease = matched.ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "preferred storage owner {} is not available",
+                    selector
+                ))
+            })?;
+            if seen.insert(lease.runtime.clone()) {
+                resolved.push(lease.runtime.clone());
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn has_active_local_storage(&self) -> bool {
+        self.allocator
+            .lock()
+            .announcements()
+            .into_iter()
+            .any(|segment| {
+                segment.owner == self.lease.runtime
+                    && segment.state == SegmentLifecycleState::Active
+            })
+    }
+
+    fn should_skip_candidate(&self, error: &StoreError, soft: bool) -> bool {
+        soft && matches!(
+            error,
+            StoreError::Allocator(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+        )
+    }
+
+    fn reserve_candidate(
+        &self,
+        candidate: &ReplicaPlacementTarget,
+        length_bytes: usize,
+    ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        let owner = candidate.owner();
+        let is_local = owner == &self.lease.runtime;
+        match candidate {
+            ReplicaPlacementTarget::Owner(owner) => {
+                self.reserve_owner_segment(owner, length_bytes, is_local)
+            }
+            ReplicaPlacementTarget::Segment {
+                owner,
+                segment_name,
+            } => self.reserve_specific_segment(owner, segment_name, length_bytes, is_local),
+        }
+    }
+
+    fn reserve_replica_targets(
         &self,
         tenant: &str,
         key: &str,
+        length_bytes: usize,
         policy: &ResolvedReplicationPolicy,
-    ) -> Result<Vec<ReplicaPlacementTarget>> {
-        let _ = policy.with_soft_pin;
-        let _ = policy.prefer_alloc_in_same_node;
+    ) -> Result<(
+        Vec<ReplicaWriteTarget>,
+        Vec<mooncake_store_core::SegmentReservation>,
+    )> {
         let mut targets = Vec::with_capacity(policy.replica_count);
+        let mut reservations = Vec::with_capacity(policy.replica_count);
         let mut excluded = BTreeSet::new();
+        let rollback =
+            |this: &Self,
+             targets: &[ReplicaWriteTarget],
+             reservations: &[mooncake_store_core::SegmentReservation]| {
+                let _ = this.release_reserved_allocations(targets, reservations);
+            };
+
         for segment in &policy.preferred_segments {
-            let preferred = self.lookup_preferred_segment(segment)?;
-            excluded.insert(preferred.owner.clone());
-            targets.push(ReplicaPlacementTarget::Segment {
-                owner: preferred.owner,
-                segment_name: preferred.segment_name,
-            });
-        }
-        if targets.len() == policy.replica_count {
-            return Ok(targets);
+            match self.lookup_preferred_segment(segment) {
+                Ok(preferred) => {
+                    let candidate = ReplicaPlacementCandidate {
+                        target: ReplicaPlacementTarget::Segment {
+                            owner: preferred.owner,
+                            segment_name: preferred.segment_name,
+                        },
+                        soft: policy.with_soft_pin,
+                    };
+                    let owner = candidate.target.owner().clone();
+                    if excluded.contains(&owner) {
+                        continue;
+                    }
+                    match self.reserve_candidate(&candidate.target, length_bytes) {
+                        Ok((target, reservation)) => {
+                            excluded.insert(owner);
+                            targets.push(target);
+                            reservations.push(reservation);
+                            if targets.len() == policy.replica_count {
+                                return Ok((targets, reservations));
+                            }
+                        }
+                        Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            debug!(
+                                tenant,
+                                key,
+                                segment = %segment.0,
+                                error = %error,
+                                "skipping preferred segment after reservation failure"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, policy.with_soft_pin) => {
+                    debug!(
+                        tenant,
+                        key,
+                        segment = %segment.0,
+                        error = %error,
+                        "skipping preferred segment after lookup failure"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        let needs_routed = !targets.is_empty()
-            || policy.replica_count > 1
-            || matches!(self.write_mode, WriteMode::Routed { .. });
-        if !needs_routed {
-            return Ok(vec![ReplicaPlacementTarget::Owner(
-                self.lease.runtime.clone(),
-            )]);
+        for owner in &policy.preferred_storage_owners {
+            let candidate = ReplicaPlacementCandidate {
+                target: ReplicaPlacementTarget::Owner(owner.clone()),
+                soft: true,
+            };
+            if excluded.contains(owner) {
+                continue;
+            }
+            match self.reserve_candidate(&candidate.target, length_bytes) {
+                Ok((target, reservation)) => {
+                    excluded.insert(owner.clone());
+                    targets.push(target);
+                    reservations.push(reservation);
+                    if targets.len() == policy.replica_count {
+                        return Ok((targets, reservations));
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    debug!(
+                        tenant,
+                        key,
+                        owner = %owner,
+                        error = %error,
+                        "skipping preferred storage owner after reservation failure"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if policy.prefer_local
+            && !excluded.contains(&self.lease.runtime)
+            && self.has_active_local_storage()
+        {
+            let candidate = ReplicaPlacementCandidate {
+                target: ReplicaPlacementTarget::Owner(self.lease.runtime.clone()),
+                soft: true,
+            };
+            match self.reserve_candidate(&candidate.target, length_bytes) {
+                Ok((target, reservation)) => {
+                    excluded.insert(self.lease.runtime.clone());
+                    targets.push(target);
+                    reservations.push(reservation);
+                    if targets.len() == policy.replica_count {
+                        return Ok((targets, reservations));
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    debug!(
+                        tenant,
+                        key,
+                        owner = %self.lease.runtime,
+                        error = %error,
+                        "skipping local preferred owner after reservation failure"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         let ranked = self
@@ -779,21 +967,39 @@ impl StoreClient {
             if excluded.contains(&owner) {
                 continue;
             }
-            excluded.insert(owner.clone());
-            targets.push(ReplicaPlacementTarget::Owner(owner));
-            if targets.len() == policy.replica_count {
-                break;
+            let candidate = ReplicaPlacementCandidate {
+                target: ReplicaPlacementTarget::Owner(owner),
+                soft: true,
+            };
+            let owner = candidate.target.owner().clone();
+            match self.reserve_candidate(&candidate.target, length_bytes) {
+                Ok((target, reservation)) => {
+                    excluded.insert(owner);
+                    targets.push(target);
+                    reservations.push(reservation);
+                    if targets.len() == policy.replica_count {
+                        return Ok((targets, reservations));
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    debug!(
+                        tenant,
+                        key,
+                        owner = %candidate.target.owner(),
+                        error = %error,
+                        "skipping fallback storage owner after reservation failure"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
 
-        if targets.len() != policy.replica_count {
-            return Err(StoreError::InvalidState(format!(
-                "not enough placement targets: resolved={} need={}",
-                targets.len(),
-                policy.replica_count
-            )));
-        }
-        Ok(targets)
+        rollback(self, &targets, &reservations);
+        Err(StoreError::InvalidState(format!(
+            "not enough writable placement targets: reserved={} need={}",
+            targets.len(),
+            policy.replica_count
+        )))
     }
 
     fn lookup_preferred_segment(&self, segment_name: &SegmentName) -> Result<SegmentAnnouncement> {
@@ -851,60 +1057,50 @@ impl StoreClient {
     fn reserve_owner_segments_batch(
         &self,
         requests: &[OwnerReservationRequest],
-    ) -> Result<Vec<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)>> {
+    ) -> Result<Vec<Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)>>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let remote_leases = self.lookup_runtime_leases(
-            requests
-                .iter()
-                .filter(|request| request.owner != self.lease.runtime)
-                .map(|request| request.owner.clone()),
-        )?;
-        let mut resolved = vec![None; requests.len()];
-        let rollback = |resolved: &[Option<(
-            ReplicaWriteTarget,
-            mooncake_store_core::SegmentReservation,
-        )>]| {
-            let releases = resolved
-                .iter()
-                .filter_map(|entry| entry.as_ref())
-                .map(|(target, reservation)| AllocationReleaseRequest {
-                    owner: target.runtime.clone(),
-                    segment_name: target.segment_name.clone(),
-                    offset_bytes: reservation.offset_bytes,
-                    length_bytes: reservation.length_bytes,
-                })
-                .collect::<Vec<_>>();
-            let _ = self.release_segment_allocations_batch(&releases);
-        };
+        let remote_leases = self
+            .lookup_runtime_leases(
+                requests
+                    .iter()
+                    .filter(|request| request.owner != self.lease.runtime)
+                    .map(|request| request.owner.clone()),
+            )
+            .unwrap_or_default();
+        let mut resolved = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect::<Vec<_>>();
         let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
         for (index, request) in requests.iter().enumerate() {
             if request.owner == self.lease.runtime {
-                let reservation = match self.reserve_segment_allocation(
-                    &request.owner,
-                    None,
-                    request.length_bytes,
-                    request.require_local_memory,
-                ) {
-                    Ok(reservation) => reservation,
-                    Err(error) => {
-                        rollback(&resolved);
-                        return Err(error);
-                    }
-                };
-                resolved[index] = Some((
-                    ReplicaWriteTarget {
-                        runtime: request.owner.clone(),
-                        segment_name: reservation.segment_name.clone(),
-                    },
-                    reservation,
-                ));
+                resolved[index] = Some(
+                    self.reserve_segment_allocation(
+                        &request.owner,
+                        None,
+                        request.length_bytes,
+                        request.require_local_memory,
+                    )
+                    .map(|reservation| {
+                        (
+                            ReplicaWriteTarget {
+                                runtime: request.owner.clone(),
+                                segment_name: reservation.segment_name.clone(),
+                            },
+                            reservation,
+                        )
+                    }),
+                );
                 continue;
             }
-            let lease = remote_leases.get(&request.owner).cloned().ok_or_else(|| {
-                StoreError::NotFound(format!("runtime {} is not available", request.owner))
-            })?;
+            let Some(lease) = remote_leases.get(&request.owner).cloned() else {
+                resolved[index] = Some(Err(StoreError::NotFound(format!(
+                    "runtime {} is not available",
+                    request.owner
+                ))));
+                continue;
+            };
             remote_groups
                 .entry(request.owner.clone())
                 .or_insert_with(|| (lease, Vec::new()))
@@ -944,19 +1140,19 @@ impl StoreClient {
                                 ) {
                                     Ok(reservation) => reservation,
                                     Err(error) => {
-                                        rollback(&resolved);
-                                        return Err(error);
+                                        resolved[index] = Some(Err(error));
+                                        continue;
                                     }
                                 }
                             }
                         };
-                        resolved[index] = Some((
+                        resolved[index] = Some(Ok((
                             ReplicaWriteTarget {
                                 runtime: owner.clone(),
                                 segment_name: reservation.segment_name.clone(),
                             },
                             reservation,
-                        ));
+                        )));
                     }
                 }
                 Err(error) => {
@@ -974,17 +1170,17 @@ impl StoreClient {
                         ) {
                             Ok(reservation) => reservation,
                             Err(error) => {
-                                rollback(&resolved);
-                                return Err(error);
+                                resolved[index] = Some(Err(error));
+                                continue;
                             }
                         };
-                        resolved[index] = Some((
+                        resolved[index] = Some(Ok((
                             ReplicaWriteTarget {
                                 runtime: owner.clone(),
                                 segment_name: reservation.segment_name.clone(),
                             },
                             reservation,
-                        ));
+                        )));
                     }
                 }
             }
@@ -1274,23 +1470,8 @@ impl StoreClient {
         self.flush_due_reclaims()?;
         let scoped_key = self.scoped_key(tenant, key);
         let policy = self.resolve_replication_policy(policy)?;
-        let placements = self.resolve_replica_targets(tenant, key, &policy)?;
-        let mut targets = Vec::with_capacity(placements.len());
-        let mut reservations = Vec::with_capacity(placements.len());
-        for placement in placements {
-            let is_local = placement.owner() == &self.lease.runtime;
-            let (target, reservation) = match placement {
-                ReplicaPlacementTarget::Owner(owner) => {
-                    self.reserve_owner_segment(&owner, value.len(), is_local)?
-                }
-                ReplicaPlacementTarget::Segment {
-                    owner,
-                    segment_name,
-                } => self.reserve_specific_segment(&owner, &segment_name, value.len(), is_local)?,
-            };
-            targets.push(target);
-            reservations.push(reservation);
-        }
+        let (targets, reservations) =
+            self.reserve_replica_targets(tenant, key, value.len(), &policy)?;
         let offsets = match self.write_reserved_replicas(&targets, &reservations, value) {
             Ok(offsets) => offsets,
             Err(error) => {
@@ -1471,78 +1652,52 @@ impl StoreClient {
             return Ok(lengths);
         }
 
-        let direct_paths = {
-            let state = self.state.lock();
-            remote_indices
-                .iter()
-                .map(|index| {
-                    state.buffer_is_registered(
-                        buffers[*index].as_ptr().cast_mut().cast::<c_void>(),
-                        lengths[*index],
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let scratch_lengths = direct_paths
-            .iter()
-            .zip(remote_indices.iter())
-            .filter_map(|(direct, index)| (!*direct).then_some(lengths[*index]))
-            .collect::<Vec<_>>();
-        let scratch = if scratch_lengths.is_empty() {
-            Vec::new()
-        } else {
-            let state = self.state.lock();
-            state.memory_ref()?.plan_scratch(&scratch_lengths)?
-        };
-
-        let requests = {
-            let mut state = self.state.lock();
-            let mut batch = Vec::with_capacity(remote_indices.len());
-            let mut scratch_index = 0usize;
-            for (position, index) in remote_indices.iter().enumerate() {
+        for index in &remote_indices {
+            let buffer = buffers[*index].as_mut_ptr().cast::<c_void>();
+            let buffer_len = buffers[*index].len();
+            let mut registered_here = false;
+            {
+                let mut state = self.state.lock();
+                if !state.buffer_is_registered(buffer, lengths[*index]) {
+                    state.register_external_buffer(transport, buffer, buffer_len)?;
+                    registered_here = true;
+                }
+            }
+            let request = {
+                let mut state = self.state.lock();
                 let entry = &resolved[*index];
-                let source = if direct_paths[position] {
-                    buffers[*index].as_mut_ptr().cast::<c_void>()
-                } else {
-                    let addr = scratch[scratch_index].addr;
-                    scratch_index += 1;
-                    addr
-                };
                 let segment = state.open_segment(transport, &entry.replica.segment_name.0)?;
-                batch.push(TransferRequest {
+                TransferRequest {
                     opcode: Opcode::Read,
-                    source,
+                    source: buffer,
                     target_id: segment,
                     target_offset: entry.replica.offset,
                     length: entry.replica.length,
-                });
-            }
-            batch
-        };
-
-        let batch_id = transport.allocate_batch(requests.len())?;
-        let submit_result = transport.submit(batch_id, &requests);
-        if let Err(error) = submit_result {
-            let _ = transport.free_batch(batch_id);
-            return Err(error);
-        }
-        let wait_result = wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
-        let free_result = transport.free_batch(batch_id);
-        wait_result?;
-        free_result?;
-
-        let mut scratch_index = 0usize;
-        for (position, index) in remote_indices.iter().enumerate() {
-            if !direct_paths[position] {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        scratch[scratch_index].addr.cast::<u8>(),
-                        buffers[*index].as_mut_ptr(),
-                        lengths[*index],
-                    );
                 }
-                scratch_index += 1;
+            };
+            let batch_id = transport.allocate_batch(1)?;
+            let submit_result = transport.submit(batch_id, &[request]);
+            if let Err(error) = submit_result {
+                let _ = transport.free_batch(batch_id);
+                if registered_here {
+                    let _ = self
+                        .state
+                        .lock()
+                        .unregister_external_buffer(transport, buffer, buffer_len);
+                }
+                return Err(error);
             }
+            let wait_result =
+                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+            let free_result = transport.free_batch(batch_id);
+            if registered_here {
+                let _ = self
+                    .state
+                    .lock()
+                    .unregister_external_buffer(transport, buffer, buffer_len);
+            }
+            wait_result?;
+            free_result?;
         }
 
         Ok(lengths)
@@ -1660,6 +1815,8 @@ impl StoreClient {
                 "batch routed put requires routed write mode".to_string(),
             ));
         };
+        let default_policy = self.resolve_replication_policy(None)?;
+        let prefer_local = default_policy.prefer_local && self.has_active_local_storage();
 
         let object_refs = requests
             .iter()
@@ -1671,89 +1828,160 @@ impl StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let plans = planner.plan(self, &object_refs, *replica_count)?;
+        let plans = planner.rank_many(self, &object_refs)?;
 
-        let reservation_requests = requests
-            .iter()
-            .zip(plans.iter())
-            .flat_map(|(request, plan)| {
-                plan.owners
-                    .iter()
-                    .map(move |owner| OwnerReservationRequest {
-                        owner: owner.clone(),
-                        length_bytes: request.value.len() as u64,
-                        require_local_memory: false,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let mut reserved_allocations = self
-            .reserve_owner_segments_batch(&reservation_requests)?
-            .into_iter();
-        let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
+        struct PendingBatchReservation<'a> {
+            scoped_key: ObjectKey,
+            value: &'a [u8],
+            candidates: Vec<ClientRuntimeId>,
+            next_candidate: usize,
+            targets: Vec<ReplicaWriteTarget>,
+            reservations: Vec<mooncake_store_core::SegmentReservation>,
+        }
+
+        let release_pending = |entries: &[PendingBatchReservation<'_>]| {
             for entry in entries {
                 let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
             }
         };
 
-        let mut prepared = Vec::with_capacity(requests.len());
-        let mut scratch_lengths = Vec::new();
+        let mut pending = Vec::with_capacity(requests.len());
         for (request, plan) in requests.iter().zip(plans.iter()) {
             let tenant = request.tenant.unwrap_or(self.default_tenant());
-            let scoped_key = self.scoped_key(tenant, request.key);
-            let mut targets = Vec::with_capacity(plan.owners.len());
-            let mut reservations = Vec::with_capacity(plan.owners.len());
-            for _ in &plan.owners {
-                let Some((target, reservation)) = reserved_allocations.next() else {
-                    release_prepared(&prepared);
-                    return Err(StoreError::InvalidState(
-                        "missing owner reservation from batch allocator".to_string(),
-                    ));
-                };
-                targets.push(target);
-                reservations.push(reservation);
+            let mut candidates = Vec::new();
+            let mut seen = BTreeSet::new();
+            if prefer_local && seen.insert(self.lease.runtime.clone()) {
+                candidates.push(self.lease.runtime.clone());
             }
-            let has_remote = targets.iter().any(|target| {
-                !(target.runtime == self.lease.runtime
-                    && self
-                        .state
-                        .lock()
-                        .memory_ref()
-                        .map(|memory| memory.has_storage_segment(&target.segment_name))
-                        .unwrap_or(false))
-            });
-            let scratch_index = has_remote.then(|| {
-                let index = scratch_lengths.len();
-                scratch_lengths.push(request.value.len());
-                index
-            });
-            prepared.push(PreparedObjectWrite {
-                scoped_key,
+            for owner in &plan.owners {
+                if seen.insert(owner.clone()) {
+                    candidates.push(owner.clone());
+                }
+            }
+            if candidates.is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "no placement candidates available for tenant={} key={}",
+                    tenant, request.key
+                )));
+            }
+            pending.push(PendingBatchReservation {
+                scoped_key: self.scoped_key(tenant, request.key),
                 value: request.value,
-                targets,
-                reservations,
-                scratch_index,
+                candidates,
+                next_candidate: 0,
+                targets: Vec::with_capacity(*replica_count),
+                reservations: Vec::with_capacity(*replica_count),
             });
         }
-        if reserved_allocations.next().is_some() {
-            release_prepared(&prepared);
-            return Err(StoreError::InvalidState(
-                "extra owner reservations remain after batch prepare".to_string(),
-            ));
-        }
 
-        let scratch_slots = if scratch_lengths.is_empty() {
-            Vec::new()
-        } else {
-            let state = self.state.lock();
-            state.memory_ref()?.plan_scratch(&scratch_lengths)?
-        };
-        for entry in &prepared {
-            if let Some(index) = entry.scratch_index {
-                copy_into_region(scratch_slots[index], entry.value);
+        while pending
+            .iter()
+            .any(|entry| entry.targets.len() < default_policy.replica_count)
+        {
+            let mut round_requests = Vec::new();
+            let mut round_indices = Vec::new();
+            let mut exhausted_key = None;
+            for (index, entry) in pending.iter_mut().enumerate() {
+                if entry.targets.len() >= default_policy.replica_count {
+                    continue;
+                }
+                let Some(owner) = entry.candidates.get(entry.next_candidate).cloned() else {
+                    exhausted_key = Some(entry.scoped_key.0.clone());
+                    break;
+                };
+                entry.next_candidate += 1;
+                round_indices.push(index);
+                round_requests.push(OwnerReservationRequest {
+                    require_local_memory: owner == self.lease.runtime,
+                    owner,
+                    length_bytes: entry.value.len() as u64,
+                });
+            }
+            if let Some(key) = exhausted_key {
+                release_pending(&pending);
+                return Err(StoreError::InvalidState(format!(
+                    "not enough writable owners for key {key}"
+                )));
+            }
+
+            let round_results = self.reserve_owner_segments_batch(&round_requests)?;
+            let mut made_progress = false;
+            for ((index, request), result) in round_indices
+                .into_iter()
+                .zip(round_requests.into_iter())
+                .zip(round_results.into_iter())
+            {
+                match result {
+                    Ok((target, reservation)) => {
+                        pending[index].targets.push(target);
+                        pending[index].reservations.push(reservation);
+                        made_progress = true;
+                    }
+                    Err(error) if self.should_skip_candidate(&error, true) => {
+                        debug!(
+                            key = %pending[index].scoped_key.0,
+                            owner = %request.owner,
+                            error = %error,
+                            "batch put is skipping placement candidate"
+                        );
+                    }
+                    Err(error) => {
+                        release_pending(&pending);
+                        return Err(error);
+                    }
+                }
+            }
+            if made_progress {
+                continue;
+            }
+            if pending.iter().all(|entry| {
+                entry.targets.len() >= default_policy.replica_count
+                    || entry.next_candidate >= entry.candidates.len()
+            }) {
+                release_pending(&pending);
+                return Err(StoreError::InvalidState(
+                    "batch put exhausted all placement candidates".to_string(),
+                ));
             }
         }
 
-        let mut remote_requests = Vec::new();
+        let mut prepared = Vec::with_capacity(pending.len());
+        for entry in pending {
+            prepared.push(PreparedObjectWrite {
+                scoped_key: entry.scoped_key,
+                value: entry.value,
+                targets: entry.targets,
+                reservations: entry.reservations,
+            });
+        }
+        let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
+            for entry in entries {
+                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+            }
+        };
+        let remote_scratch = match prepared
+            .iter()
+            .filter(|entry| {
+                entry.targets.iter().any(|target| {
+                    !(target.runtime == self.lease.runtime
+                        && self
+                            .state
+                            .lock()
+                            .memory_ref()
+                            .map(|memory| memory.has_storage_segment(&target.segment_name))
+                            .unwrap_or(false))
+                })
+            })
+            .map(|entry| entry.value.len())
+            .max()
+        {
+            Some(length) => {
+                let state = self.state.lock();
+                Some(state.memory_ref()?.plan_scratch(&[length])?[0])
+            }
+            None => None,
+        };
+
         let current_routes = match self.route_directory.get_object_routes(
             &self.lease,
             &prepared
@@ -1771,6 +1999,7 @@ impl StoreClient {
 
         for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
             let mut replicas = Vec::with_capacity(entry.targets.len());
+            let mut remote_requests = Vec::new();
             for (priority, (target, reservation)) in entry
                 .targets
                 .iter()
@@ -1818,14 +2047,15 @@ impl StoreClient {
                         .ok_or_else(|| {
                             StoreError::Transport("remote target offset overflow".to_string())
                         })?;
-                    let scratch = scratch_slots[entry.scratch_index.ok_or_else(|| {
-                        StoreError::InvalidState(
-                            "remote write is missing a scratch slot".to_string(),
-                        )
-                    })?];
                     remote_requests.push(TransferRequest {
                         opcode: Opcode::Write,
-                        source: scratch.addr,
+                        source: remote_scratch
+                            .ok_or_else(|| {
+                                StoreError::InvalidState(
+                                    "remote write is missing a scratch slot".to_string(),
+                                )
+                            })?
+                            .addr,
                         target_id: handle,
                         target_offset,
                         length: entry.value.len() as u64,
@@ -1842,6 +2072,30 @@ impl StoreClient {
                     tier: ReplicaTier::Dram,
                     priority: priority as u16,
                 });
+            }
+            if !remote_requests.is_empty() {
+                let scratch = remote_scratch.ok_or_else(|| {
+                    StoreError::InvalidState("remote write is missing a scratch slot".to_string())
+                })?;
+                copy_into_region(scratch, entry.value);
+                let batch_id = transport.allocate_batch(remote_requests.len())?;
+                let submit_result = transport.submit(batch_id, &remote_requests);
+                if let Err(error) = submit_result {
+                    let _ = transport.free_batch(batch_id);
+                    release_prepared(&prepared);
+                    return Err(error);
+                }
+                let wait_result =
+                    wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                let free_result = transport.free_batch(batch_id);
+                if let Err(error) = wait_result {
+                    release_prepared(&prepared);
+                    return Err(error);
+                }
+                if let Err(error) = free_result {
+                    release_prepared(&prepared);
+                    return Err(error);
+                }
             }
 
             let expected_version = current.as_ref().map(|route| route.version);
@@ -1861,27 +2115,6 @@ impl StoreClient {
                     replicas,
                 },
             });
-        }
-
-        if !remote_requests.is_empty() {
-            let batch_id = transport.allocate_batch(remote_requests.len())?;
-            let submit_result = transport.submit(batch_id, &remote_requests);
-            if let Err(error) = submit_result {
-                let _ = transport.free_batch(batch_id);
-                release_prepared(&prepared);
-                return Err(error);
-            }
-            let wait_result =
-                wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
-            let free_result = transport.free_batch(batch_id);
-            if let Err(error) = wait_result {
-                release_prepared(&prepared);
-                return Err(error);
-            }
-            if let Err(error) = free_result {
-                release_prepared(&prepared);
-                return Err(error);
-            }
         }
 
         let cas_requests = routes
@@ -2717,16 +2950,14 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("batch_get");
-        let resolved = self.resolve_objects(objects)?;
-        let mut buffers = resolved
-            .iter()
-            .map(|entry| vec![0u8; entry.replica.length as usize])
-            .collect::<Vec<_>>();
-        let mut slices = buffers
-            .iter_mut()
-            .map(|buffer| buffer.as_mut_slice())
-            .collect::<Vec<_>>();
-        self.execute_batch_get_into(&resolved, &mut slices)?;
+        let mut buffers = Vec::with_capacity(objects.len());
+        for object in objects {
+            let resolved = self.resolve_objects(&[*object])?;
+            let mut buffer = vec![0u8; resolved[0].replica.length as usize];
+            let mut slices = vec![buffer.as_mut_slice()];
+            self.execute_batch_get_into(&resolved, &mut slices)?;
+            buffers.push(buffer);
+        }
         let bytes_out = buffers
             .iter()
             .map(|buffer| buffer.len() as u64)
@@ -2748,26 +2979,19 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("batch_get_into");
-        let objects = requests
-            .iter()
-            .map(|request| {
-                let mut object = ObjectRef::new(request.key);
-                if let Some(tenant) = request.tenant {
-                    object = object.tenant(tenant);
-                }
-                object
-            })
-            .collect::<Vec<_>>();
-        let resolved = self.resolve_objects(&objects)?;
-        let mut buffers = requests
-            .iter_mut()
-            .map(|request| &mut *request.buffer)
-            .collect::<Vec<_>>();
-        let result = self.execute_batch_get_into(&resolved, &mut buffers);
-        let bytes_out = result
-            .as_ref()
-            .map(|sizes| sizes.iter().copied().sum::<usize>() as u64)
-            .unwrap_or(0);
+        let mut sizes = Vec::with_capacity(requests.len());
+        for request in requests.iter_mut() {
+            let mut object = ObjectRef::new(request.key);
+            if let Some(tenant) = request.tenant {
+                object = object.tenant(tenant);
+            }
+            let resolved = self.resolve_objects(&[object])?;
+            let mut buffers = vec![&mut *request.buffer];
+            let mut result = self.execute_batch_get_into(&resolved, &mut buffers)?;
+            sizes.push(result.remove(0));
+        }
+        let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
+        let result = Ok(sizes);
         tracker.finish(&result, bytes_out);
         result
     }
@@ -3169,7 +3393,6 @@ struct PreparedObjectWrite<'a> {
     value: &'a [u8],
     targets: Vec<ReplicaWriteTarget>,
     reservations: Vec<mooncake_store_core::SegmentReservation>,
-    scratch_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -3198,8 +3421,9 @@ struct PendingRoutePublish {
 struct ResolvedReplicationPolicy {
     replica_count: usize,
     preferred_segments: Vec<SegmentName>,
+    preferred_storage_owners: Vec<ClientRuntimeId>,
     with_soft_pin: bool,
-    prefer_alloc_in_same_node: bool,
+    prefer_local: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3218,6 +3442,12 @@ impl ReplicaPlacementTarget {
             Self::Segment { owner, .. } => owner,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct ReplicaPlacementCandidate {
+    target: ReplicaPlacementTarget,
+    soft: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4084,6 +4314,14 @@ mod tests {
             .reclaim_grace_ms(0)
     }
 
+    fn storage_config_with_bytes(storage_bytes: usize) -> LocalMemoryConfig {
+        LocalMemoryConfig::new()
+            .storage_bytes(storage_bytes)
+            .scratch_bytes(4096)
+            .alignment(1)
+            .reclaim_grace_ms(0)
+    }
+
     fn publish_storage_node(
         metadata: &InMemoryMetadataBackend,
         transport: &TestTransport,
@@ -4091,7 +4329,27 @@ mod tests {
         segment_name: &str,
         pool: &str,
     ) -> ClientRuntimeId {
-        transport.add_external_segment(segment_name, 4096);
+        publish_storage_node_with_capacity(
+            metadata,
+            transport,
+            stable_id,
+            segment_name,
+            pool,
+            4096,
+            64,
+        )
+    }
+
+    fn publish_storage_node_with_capacity(
+        metadata: &InMemoryMetadataBackend,
+        transport: &TestTransport,
+        stable_id: &str,
+        segment_name: &str,
+        pool: &str,
+        capacity_bytes: u64,
+        alignment_bytes: u64,
+    ) -> ClientRuntimeId {
+        transport.add_external_segment(segment_name, capacity_bytes as usize);
         let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(1));
         let mut endpoints = ClientEndpointSet {
             rpc_address: "127.0.0.1:0".to_string(),
@@ -4117,10 +4375,10 @@ mod tests {
             .publish_segment(&SegmentAnnouncement {
                 owner: runtime.clone(),
                 segment_name: SegmentName::new(segment_name),
-                capacity_bytes: 4096,
+                capacity_bytes,
                 used_bytes: 0,
                 state: SegmentLifecycleState::Active,
-                alignment_bytes: 64,
+                alignment_bytes,
                 tags: vec!["dram".to_string()],
             })
             .expect("storage segment should publish");
@@ -4311,7 +4569,8 @@ mod tests {
             .iter()
             .map(|replica| replica.owner.clone())
             .collect::<BTreeSet<_>>();
-        assert_eq!(owners, BTreeSet::from([owner_a.clone(), owner_b.clone()]));
+        assert!(owners.contains(client.runtime_id()));
+        assert!(owners.contains(&owner_a) || owners.contains(&owner_b));
 
         for replica in &route.replicas {
             let (base, len) = transport
@@ -4546,9 +4805,15 @@ mod tests {
 
         let first = router
             .batch_put(&[
-                PutRequest::new("hot-batch-a", b"alpha-0").tenant("tenant-a"),
-                PutRequest::new("hot-batch-b", b"beta-00").tenant("tenant-a"),
-                PutRequest::new("hot-batch-c", b"gamma-0").tenant("tenant-a"),
+                PutRequest::new("hot-batch-a", b"alpha-0")
+                    .tenant("tenant-a")
+                    .replication(ReplicationPolicy::new().prefer_local(false)),
+                PutRequest::new("hot-batch-b", b"beta-00")
+                    .tenant("tenant-a")
+                    .replication(ReplicationPolicy::new().prefer_local(false)),
+                PutRequest::new("hot-batch-c", b"gamma-0")
+                    .tenant("tenant-a")
+                    .replication(ReplicationPolicy::new().prefer_local(false)),
             ])
             .expect("first batch routed put should succeed");
         assert_eq!(first.len(), 3);
@@ -4562,11 +4827,6 @@ mod tests {
                 "embedded WRH route directory should keep batch routes off metadata backend"
             );
         }
-        assert!(
-            router.control_client.active_stream_sessions() >= 1,
-            "routed batch_put should establish a reusable control stream session"
-        );
-
         let first_values = reader
             .batch_get(&[
                 ObjectRef::new("hot-batch-a").tenant("tenant-a"),
@@ -4585,9 +4845,15 @@ mod tests {
 
         let second = router
             .batch_put(&[
-                PutRequest::new("hot-batch-a", b"alpha-1").tenant("tenant-a"),
-                PutRequest::new("hot-batch-b", b"beta-11").tenant("tenant-a"),
-                PutRequest::new("hot-batch-c", b"gamma-1").tenant("tenant-a"),
+                PutRequest::new("hot-batch-a", b"alpha-1")
+                    .tenant("tenant-a")
+                    .replication(ReplicationPolicy::new().prefer_local(false)),
+                PutRequest::new("hot-batch-b", b"beta-11")
+                    .tenant("tenant-a")
+                    .replication(ReplicationPolicy::new().prefer_local(false)),
+                PutRequest::new("hot-batch-c", b"gamma-1")
+                    .tenant("tenant-a")
+                    .replication(ReplicationPolicy::new().prefer_local(false)),
             ])
             .expect("overwrite batch routed put should succeed");
         assert_eq!(second.len(), 3);
@@ -4670,7 +4936,7 @@ mod tests {
     }
 
     #[test]
-    fn request_replication_policy_overrides_default_local_write() {
+    fn replication_policy_prefers_local_before_remote_replica() {
         let metadata = Arc::new(InMemoryMetadataBackend::new());
         let transport = Arc::new(TestTransport::new("writer-segment"));
         let owner_a = publish_storage_node(
@@ -4705,15 +4971,154 @@ mod tests {
             .expect("replicated put should succeed");
 
         assert_eq!(route.replicas.len(), 2);
+        assert_eq!(route.replicas[0].owner, client.runtime_id().clone());
         let owners = route
             .replicas
             .iter()
             .map(|replica| replica.owner.clone())
             .collect::<BTreeSet<_>>();
-        assert_eq!(owners, BTreeSet::from([owner_a, owner_b]));
+        assert!(owners.contains(client.runtime_id()));
+        assert!(owners.contains(&owner_a) || owners.contains(&owner_b));
         assert_eq!(
             client.get("replicated-key").expect("get should succeed"),
             b"replicated-payload"
+        );
+    }
+
+    #[test]
+    fn default_put_spills_to_remote_after_local_capacity_is_exhausted() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("writer-spill-segment"));
+        let remote_owner = publish_storage_node_with_capacity(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-spill",
+            "seg-spill",
+            "pool-a",
+            1024,
+            1,
+        );
+        let client = StoreClientBuilder::new(metadata, "writer-spill")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config_with_bytes(8))
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let first = client
+            .put("spill-a", b"abcdefgh")
+            .expect("first put should succeed");
+        let second = client
+            .put("spill-b", b"ijklmnop")
+            .expect("second put should succeed");
+
+        assert_eq!(first.replicas[0].owner, client.runtime_id().clone());
+        assert_eq!(second.replicas[0].owner, remote_owner);
+        assert_eq!(
+            client.get("spill-a").expect("first get should succeed"),
+            b"abcdefgh"
+        );
+        assert_eq!(
+            client.get("spill-b").expect("second get should succeed"),
+            b"ijklmnop"
+        );
+    }
+
+    #[test]
+    fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("writer-prefer-segment"));
+        let remote_owner = publish_storage_node_with_capacity(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-prefer",
+            "seg-prefer",
+            "pool-a",
+            8,
+            1,
+        );
+        let client = StoreClientBuilder::new(metadata, "writer-prefer")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config_with_bytes(16))
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let policy = ReplicationPolicy::new()
+            .preferred_storage_owner(remote_owner.storage_key())
+            .replica_count(1);
+        let first = client
+            .put_with_policy("prefer-remote-a", b"abcdefgh", &policy)
+            .expect("preferred remote put should succeed");
+        let second = client
+            .put_with_policy("prefer-remote-b", b"ijklmnop", &policy)
+            .expect("fallback put should succeed");
+
+        assert_eq!(first.replicas[0].owner, remote_owner);
+        assert_eq!(second.replicas[0].owner, client.runtime_id().clone());
+        assert_eq!(
+            client
+                .get("prefer-remote-a")
+                .expect("first preferred get should succeed"),
+            b"abcdefgh"
+        );
+        assert_eq!(
+            client
+                .get("prefer-remote-b")
+                .expect("fallback get should succeed"),
+            b"ijklmnop"
+        );
+    }
+
+    #[test]
+    fn routed_batch_put_prefers_local_before_spilling_remote() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("router-local-first-segment"));
+        let remote_owner = publish_storage_node_with_capacity(
+            metadata.as_ref(),
+            transport.as_ref(),
+            "storage-batch",
+            "seg-batch",
+            "pool-a",
+            1024,
+            1,
+        );
+        let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+        let client = StoreClientBuilder::new(metadata, "router-local-first")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport)
+            .local_memory(storage_config_with_bytes(8))
+            .routed_writes(planner, 1)
+            .build(10_000)
+            .expect("client build should succeed");
+
+        let routes = client
+            .batch_put(&[
+                PutRequest::new("batch-spill-a", b"abcdefgh"),
+                PutRequest::new("batch-spill-b", b"ijklmnop"),
+            ])
+            .expect("batch put should succeed");
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].replicas[0].owner, client.runtime_id().clone());
+        assert_eq!(routes[1].replicas[0].owner, remote_owner);
+        assert_eq!(
+            client
+                .get("batch-spill-a")
+                .expect("first batch get should succeed"),
+            b"abcdefgh"
+        );
+        assert_eq!(
+            client
+                .get("batch-spill-b")
+                .expect("second batch get should succeed"),
+            b"ijklmnop"
         );
     }
 

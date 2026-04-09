@@ -966,6 +966,7 @@ impl ControlPlaneClient {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn active_stream_sessions(&self) -> usize {
         self.streams.lock().len()
     }

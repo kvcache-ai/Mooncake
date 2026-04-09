@@ -715,7 +715,11 @@ fn verify_dynamic_expand_and_soft_shrink(
 ) -> Result<()> {
     let primary = SegmentName::new("elastic-target-segment");
     let first = payload("elastic-initial", value_size);
-    router.put("elastic-key", &first)?;
+    router.put_with_policy(
+        "elastic-key",
+        &first,
+        &ReplicationPolicy::new().prefer_local(false),
+    )?;
     let first_route = router
         .query_route("elastic-key")?
         .ok_or_else(|| StoreError::NotFound("elastic-key".to_string()))?;
@@ -730,7 +734,11 @@ fn verify_dynamic_expand_and_soft_shrink(
     target.drain_segment(&primary)?;
 
     let second = payload("elastic-updated", value_size);
-    router.put("elastic-key", &second)?;
+    router.put_with_policy(
+        "elastic-key",
+        &second,
+        &ReplicationPolicy::new().prefer_local(false),
+    )?;
     let second_route = router
         .query_route("elastic-key")?
         .ok_or_else(|| StoreError::NotFound("elastic-key".to_string()))?;
@@ -929,7 +937,11 @@ fn verify_hot_upgrade(
     ensure_payload("upgrade new", &promoted, &results[1])?;
 
     let routed = payload("upgrade-routed", value_size);
-    routed_writer.put("upgrade-routed-key", &routed)?;
+    routed_writer.put_with_policy(
+        "upgrade-routed-key",
+        &routed,
+        &ReplicationPolicy::new().prefer_local(false),
+    )?;
     let routed_route = routed_writer
         .query_route("upgrade-routed-key")?
         .ok_or_else(|| StoreError::NotFound("upgrade-routed-key".to_string()))?;

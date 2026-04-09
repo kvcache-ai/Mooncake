@@ -63,6 +63,9 @@ class ReplicateConfig:
     replica_num: int = 1
     preferred_segment: str = ""
     preferred_segments: list[str] = field(default_factory=list)
+    preferred_storage_owner: str = ""
+    preferred_storage_owners: list[str] = field(default_factory=list)
+    prefer_local: bool = True
     with_soft_pin: bool = False
     prefer_alloc_in_same_node: bool = False
 
@@ -71,6 +74,9 @@ class ReplicateConfig:
             replica_num=self.replica_num,
             preferred_segment=self.preferred_segment,
             preferred_segments=list(self.preferred_segments),
+            preferred_storage_owner=self.preferred_storage_owner,
+            preferred_storage_owners=list(self.preferred_storage_owners),
+            prefer_local=self.prefer_local,
             with_soft_pin=self.with_soft_pin,
             prefer_alloc_in_same_node=self.prefer_alloc_in_same_node,
         )
@@ -303,9 +309,20 @@ def _replication_kwargs(config) -> dict:
     preferred_segment = getattr(config, "preferred_segment", "")
     if preferred_segment not in ("", None) and preferred_segment not in preferred_segments:
         preferred_segments.insert(0, preferred_segment)
+    preferred_storage_owners = list(
+        getattr(config, "preferred_storage_owners", []) or []
+    )
+    preferred_storage_owner = getattr(config, "preferred_storage_owner", "")
+    if (
+        preferred_storage_owner not in ("", None)
+        and preferred_storage_owner not in preferred_storage_owners
+    ):
+        preferred_storage_owners.insert(0, preferred_storage_owner)
     return {
         "replica_count": int(getattr(config, "replica_num", 1)),
         "preferred_segments": preferred_segments or None,
+        "preferred_storage_owners": preferred_storage_owners or None,
+        "prefer_local": bool(getattr(config, "prefer_local", True)),
         "prefer_alloc_in_same_node": bool(
             getattr(config, "prefer_alloc_in_same_node", False)
         ),
