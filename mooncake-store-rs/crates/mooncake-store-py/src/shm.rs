@@ -80,18 +80,53 @@ pub struct ResolvedSharedRegion {
 
 #[derive(Debug)]
 pub struct OwnedMappedRegion {
-    pub ptr: *mut u8,
-    pub len: usize,
-    pub _fd: OwnedFd,
+    base_addr: usize,
+    len: usize,
+    _fd: OwnedFd,
 }
 
-unsafe impl Send for OwnedMappedRegion {}
-unsafe impl Sync for OwnedMappedRegion {}
+impl OwnedMappedRegion {
+    pub fn base(&self) -> usize {
+        self.base_addr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> Result<&[u8]> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| StoreError::Allocator("mapped region range overflow".to_string()))?;
+        if end > self.len {
+            return Err(StoreError::Allocator(format!(
+                "mapped region slice exceeds range: offset={offset} len={len} region_len={}",
+                self.len
+            )));
+        }
+        let ptr = (self.base_addr + offset) as *const u8;
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    pub fn slice_mut(&self, offset: usize, len: usize) -> Result<&mut [u8]> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| StoreError::Allocator("mapped region range overflow".to_string()))?;
+        if end > self.len {
+            return Err(StoreError::Allocator(format!(
+                "mapped region slice exceeds range: offset={offset} len={len} region_len={}",
+                self.len
+            )));
+        }
+        let ptr = (self.base_addr + offset) as *mut u8;
+        Ok(unsafe { slice::from_raw_parts_mut(ptr, len) })
+    }
+}
 
 impl Drop for OwnedMappedRegion {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.ptr.cast(), self.len);
+            libc::munmap(self.base_addr as *mut libc::c_void, self.len);
         }
     }
 }
@@ -251,7 +286,7 @@ pub fn bind_shm_listener(socket_path: &Path) -> Result<UnixListener> {
 pub fn map_registered_region(fd: OwnedFd, size: usize) -> Result<OwnedMappedRegion> {
     let ptr = mmap_shared(fd.as_raw_fd(), size)?;
     Ok(OwnedMappedRegion {
-        ptr,
+        base_addr: ptr as usize,
         len: size,
         _fd: fd,
     })

@@ -8,7 +8,9 @@ service DummyStoreService {
   rpc Get(GetRequest) returns (GetReply);
   rpc BatchIsExist(BatchIsExistRequest) returns (BatchIsExistReply);
   rpc BatchPutFrom(BatchPutFromRequest) returns (BatchStatusReply);
+  rpc BatchPutFromMultiBuffers(BatchPutFromMultiBuffersRequest) returns (BatchStatusReply);
   rpc BatchGetInto(BatchGetIntoRequest) returns (BatchGetIntoReply);
+  rpc BatchGetIntoMultiBuffers(BatchGetIntoMultiBuffersRequest) returns (BatchGetIntoReply);
   rpc RemoveAll(RemoveAllRequest) returns (RemoveAllReply);
   rpc UnregisterRegion(UnregisterRegionRequest) returns (StatusReply);
 }
@@ -94,6 +96,23 @@ message BatchStatusReply {
   repeated int32 statuses = 1;
 }
 
+message SharedBufferGroup {
+  repeated SharedBufferRef buffers = 1;
+}
+
+message SharedMultiPutItem {
+  string key = 1;
+  SharedBufferGroup buffers = 2;
+}
+
+message BatchPutFromMultiBuffersRequest {
+  uint64 client_id_hi = 1;
+  uint64 client_id_lo = 2;
+  string tenant = 3;
+  ReplicationPolicy replication = 4;
+  repeated SharedMultiPutItem items = 5;
+}
+
 message SharedGetItem {
   string key = 1;
   SharedBufferRef buffer = 2;
@@ -108,6 +127,18 @@ message BatchGetIntoRequest {
 
 message BatchGetIntoReply {
   repeated int64 lengths = 1;
+}
+
+message SharedMultiGetItem {
+  string key = 1;
+  SharedBufferGroup buffers = 2;
+}
+
+message BatchGetIntoMultiBuffersRequest {
+  uint64 client_id_hi = 1;
+  uint64 client_id_lo = 2;
+  string tenant = 3;
+  repeated SharedMultiGetItem items = 4;
 }
 
 message UnregisterRegionRequest {

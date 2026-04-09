@@ -4,7 +4,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use _store_rs::dummy_service::{SharedStoreClient, start_dummy_store_server};
@@ -110,8 +109,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stable_id = runtime.stable_id.clone();
     let segment_name = runtime.segment_name.clone();
-    let client = Arc::new(SharedStoreClient::new(runtime.client));
-    client.lock().register_local_memory()?;
+    let mut store_client = runtime.client;
+    store_client.register_local_memory()?;
+    let (shared_client, mut shared_client_loop) = SharedStoreClient::new();
+    let client = Arc::new(shared_client);
     let dummy_server = match args.client_server_address.as_deref() {
         Some(address) => Some(start_dummy_store_server(client.clone(), address)?),
         None => None,
@@ -130,25 +131,36 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or("disabled"),
     );
 
+    let mut next_heartbeat = now_ms().saturating_add(heartbeat_interval);
     while !shutdown.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(heartbeat_interval));
+        let now = now_ms();
+        let wait_ms = next_heartbeat.saturating_sub(now).max(1);
+        shared_client_loop.pump(
+            &mut store_client,
+            Duration::from_millis(wait_ms.min(heartbeat_interval.max(1))),
+        );
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        client
-            .lock()
-            .heartbeat(now_ms().saturating_add(args.lease_ttl_ms))?;
+        let now = now_ms();
+        if now >= next_heartbeat {
+            store_client.heartbeat(now.saturating_add(args.lease_ttl_ms))?;
+            next_heartbeat = now.saturating_add(heartbeat_interval);
+        }
     }
 
+    drop(dummy_server);
+    drop(client);
+    shared_client_loop.drain(&mut store_client);
+
     if args.drain_on_exit {
-        client.lock().enter_draining()?;
-        let evacuated = client.lock().evacuate_owned_replicas()?;
+        store_client.enter_draining()?;
+        let evacuated = store_client.evacuate_owned_replicas()?;
         eprintln!(
             "mooncake-store-client drained stable_id={} evacuated_routes={}",
             stable_id, evacuated
         );
     }
-    drop(dummy_server);
     if metrics_addr.is_some() {
         stop_metrics_http_server()?;
     }
