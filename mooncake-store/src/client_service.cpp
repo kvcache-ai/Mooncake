@@ -2610,7 +2610,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferReadInternal(replica_descriptor, slices, 0);
+    return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
 ErrorCode Client::TransferReadRange(
