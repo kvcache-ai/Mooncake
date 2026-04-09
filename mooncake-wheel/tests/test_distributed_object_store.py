@@ -265,6 +265,60 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
 
+    def test_get_into_ranges_operations(self):
+        """Test single-key multi-range reads into one registered buffer."""
+        import ctypes
+
+        key = "test_get_into_ranges_key"
+        test_data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        buffer_size = 32
+
+        self.assertEqual(self.store.put(key, test_data), 0)
+
+        buffer = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
+
+        ctypes.memset(buffer, ord("_"), buffer_size)
+
+        dst_offsets = [0, 10, 20]
+        src_offsets = [1, 12, 30]
+        sizes = [4, 5, 3]
+        results = self.store.get_into_ranges(
+            key, buffer_ptr, dst_offsets, src_offsets, sizes
+        )
+
+        self.assertEqual(results, sizes)
+        self.assertEqual(bytes(buffer[0:4]), test_data[1:5])
+        self.assertEqual(bytes(buffer[10:15]), test_data[12:17])
+        self.assertEqual(bytes(buffer[20:23]), test_data[30:33])
+        self.assertEqual(bytes(buffer[4:10]), b"_" * 6)
+        self.assertEqual(bytes(buffer[15:20]), b"_" * 5)
+        self.assertEqual(bytes(buffer[23:]), b"_" * (buffer_size - 23))
+
+        mismatch_results = self.store.get_into_ranges(
+            key, buffer_ptr, [0, 4], [0], [4, 4]
+        )
+        self.assertEqual(len(mismatch_results), 2)
+        for result in mismatch_results:
+            self.assertLess(result, 0, "mismatched ranges should fail")
+
+        source_overflow_results = self.store.get_into_ranges(
+            key, buffer_ptr, [0], [len(test_data) - 1], [4]
+        )
+        self.assertEqual(len(source_overflow_results), 1)
+        self.assertLess(source_overflow_results[0], 0)
+
+        destination_overflow_results = self.store.get_into_ranges(
+            key, buffer_ptr, [buffer_size - 1], [0], [4]
+        )
+        self.assertEqual(len(destination_overflow_results), 1)
+        self.assertLess(destination_overflow_results[0], 0)
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+        self.assertEqual(self.store.remove(key), 0)
+
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
         import ctypes

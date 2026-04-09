@@ -4,8 +4,10 @@
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -111,6 +113,12 @@ class RealClient : public PyClient {
     int64_t get_into_range(const std::string &key, void *buffer,
                            size_t dst_offset, size_t src_offset,
                            size_t size) override;
+
+    std::vector<int64_t> get_into_ranges(
+        const std::string &key, void *buffer,
+        const std::vector<size_t> &dst_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) override;
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -682,6 +690,9 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+
+    mutable std::shared_mutex registered_buffer_mutex_;
+    std::unordered_map<void *, size_t> registered_buffer_sizes_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,

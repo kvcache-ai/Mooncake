@@ -168,6 +168,12 @@ class PyClient {
                                    size_t dst_offset, size_t src_offset,
                                    size_t size) = 0;
 
+    virtual std::vector<int64_t> get_into_ranges(
+        const std::string &key, void *buffer,
+        const std::vector<size_t> &dst_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) = 0;
+
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,

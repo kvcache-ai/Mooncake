@@ -1973,8 +1973,16 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false,
-                                        true);
+    auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
+                                               false, true);
+    if (!result) {
+        return result;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        registered_buffer_sizes_[buffer] = size;
+    }
+    return result;
 }
 
 int RealClient::register_buffer(void *buffer, size_t size) {
@@ -1992,6 +2000,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Unregister buffer failed with error: "
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        registered_buffer_sizes_.erase(buffer);
     }
     return {};
 }
@@ -2090,6 +2102,48 @@ int64_t RealClient::get_into_range(const std::string &key, void *buffer,
                                    size_t size) {
     return to_py_ret(
         get_into_range_internal(key, buffer, dst_offset, src_offset, size));
+}
+
+std::vector<int64_t> RealClient::get_into_ranges(
+    const std::string &key, void *buffer,
+    const std::vector<size_t> &dst_offsets,
+    const std::vector<size_t> &src_offsets,
+    const std::vector<size_t> &sizes) {
+    const size_t range_count = dst_offsets.size();
+    std::vector<int64_t> results(
+        range_count, static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
+
+    if (range_count != src_offsets.size() || range_count != sizes.size()) {
+        LOG(ERROR) << "get_into_ranges: size mismatch";
+        return results;
+    }
+
+    size_t buffer_size = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        auto it = registered_buffer_sizes_.find(buffer);
+        if (it == registered_buffer_sizes_.end()) {
+            LOG(ERROR) << "get_into_ranges: buffer is not registered";
+            return results;
+        }
+        buffer_size = it->second;
+    }
+
+    for (size_t i = 0; i < range_count; ++i) {
+        if (sizes[i] > 0 &&
+            (dst_offsets[i] > buffer_size ||
+             sizes[i] > buffer_size - dst_offsets[i])) {
+            LOG(ERROR) << "get_into_ranges: destination overflow, dst_offset="
+                       << dst_offsets[i] << " size=" << sizes[i]
+                       << " buffer_size=" << buffer_size;
+            continue;
+        }
+
+        results[i] = to_py_ret(get_into_range_internal(
+            key, buffer, dst_offsets[i], src_offsets[i], sizes[i]));
+    }
+
+    return results;
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }

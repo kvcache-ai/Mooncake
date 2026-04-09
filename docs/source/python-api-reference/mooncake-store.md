@@ -282,6 +282,24 @@ def get_into_range(self, key: str, buffer_ptr: int, dst_offset: int, src_offset:
 
 Use this API for single-key partial reads into a registered buffer. The read covers `[src_offset, src_offset + size)`, writes into `(buffer_ptr + dst_offset)`, and returns an error if the requested range exceeds the stored object size.
 
+#### get_into_ranges()
+Retrieve multiple byte ranges directly into a registered buffer (zero-copy).
+
+```python
+def get_into_ranges(self, key: str, buffer_ptr: int, dst_offsets: List[int], src_offsets: List[int], sizes: List[int]) -> List[int]
+```
+
+**Parameters:**
+- `key`: Object identifier to retrieve
+- `buffer_ptr`: Memory address of a pre-allocated buffer
+- `dst_offsets`: Destination offsets in the buffer for each range
+- `src_offsets`: Source offsets in the stored object for each range
+- `sizes`: Number of bytes to read for each range
+
+**Returns:** A list of per-range results. Each element is the number of bytes read for that range, or a negative value on error.
+
+Use this API for single-key multi-range reads into a registered buffer. Each range reads `[src_offsets[i], src_offsets[i] + sizes[i])` and writes into `(buffer_ptr + dst_offsets[i])`. The three offset/size lists must have the same length.
+
 ---
 
 ## ReplicateConfig Configuration

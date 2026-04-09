@@ -2057,6 +2057,20 @@ PYBIND11_MODULE(store, m) {
             py::arg("src_offset"), py::arg("size"),
             "Get a byte range from an object into a pre-allocated buffer")
         .def(
+            "get_into_ranges",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, const std::vector<size_t> &dst_offsets,
+               const std::vector<size_t> &src_offsets,
+               const std::vector<size_t> &sizes) {
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                py::gil_scoped_release release;
+                return self.store_->get_into_ranges(key, buffer, dst_offsets,
+                                                    src_offsets, sizes);
+            },
+            py::arg("key"), py::arg("buffer_ptr"), py::arg("dst_offsets"),
+            py::arg("src_offsets"), py::arg("sizes"),
+            "Get multiple byte ranges from an object into a pre-allocated buffer")
+        .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
