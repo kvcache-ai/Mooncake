@@ -7,13 +7,13 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use _store_rs::dummy_service::{SharedStoreClient, start_dummy_store_server};
 use _store_rs::runtime::{CompatRuntimeArgs, CompatSetupArgs};
 use clap::{Parser, ValueEnum};
 use mooncake_store_client::{
     init_tracing, start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
     RouteControlMode,
 };
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RouteControlArg {
     EmbeddedWrh,
@@ -68,6 +68,8 @@ struct Args {
     #[arg(long)]
     metrics_addr: Option<String>,
     #[arg(long)]
+    client_server_address: Option<String>,
+    #[arg(long)]
     trace_filter: Option<String>,
     #[arg(long, value_enum, default_value_t = RouteControlArg::EmbeddedWrh)]
     route_control: RouteControlArg,
@@ -108,16 +110,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stable_id = runtime.stable_id.clone();
     let segment_name = runtime.segment_name.clone();
-    let mut client = runtime.client;
-    client.register_local_memory()?;
+    let client = Arc::new(SharedStoreClient::new(runtime.client));
+    client.lock().register_local_memory()?;
+    let dummy_server = match args.client_server_address.as_deref() {
+        Some(address) => Some(start_dummy_store_server(client.clone(), address)?),
+        None => None,
+    };
 
     eprintln!(
-        "mooncake-store-client started stable_id={} segment={} lease_ttl_ms={} heartbeat_interval_ms={} metrics_addr={}",
+        "mooncake-store-client started stable_id={} segment={} lease_ttl_ms={} heartbeat_interval_ms={} metrics_addr={} client_server_address={} ",
         stable_id,
         segment_name,
         args.lease_ttl_ms,
         heartbeat_interval,
-        metrics_addr.as_deref().unwrap_or("disabled")
+        metrics_addr.as_deref().unwrap_or("disabled"),
+        dummy_server
+            .as_ref()
+            .map(|server| server.address())
+            .unwrap_or("disabled"),
     );
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -125,17 +135,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        client.heartbeat(now_ms().saturating_add(args.lease_ttl_ms))?;
+        client
+            .lock()
+            .heartbeat(now_ms().saturating_add(args.lease_ttl_ms))?;
     }
 
     if args.drain_on_exit {
-        client.enter_draining()?;
-        let evacuated = client.evacuate_owned_replicas()?;
+        client.lock().enter_draining()?;
+        let evacuated = client.lock().evacuate_owned_replicas()?;
         eprintln!(
             "mooncake-store-client drained stable_id={} evacuated_routes={}",
             stable_id, evacuated
         );
     }
+    drop(dummy_server);
     if metrics_addr.is_some() {
         stop_metrics_http_server()?;
     }

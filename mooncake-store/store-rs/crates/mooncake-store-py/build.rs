@@ -1,7 +1,14 @@
 use std::env;
 use std::path::PathBuf;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let protoc = protoc_bin_vendored::protoc_bin_path()?;
+    std::env::set_var("PROTOC", protoc);
+    tonic_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_protos(&["proto/dummy_store.proto"], &["proto"])?;
+    println!("cargo:rerun-if-changed=proto/dummy_store.proto");
     println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_UPSTREAM_BUILD_DIR");
 
@@ -22,6 +29,7 @@ fn main() {
         "cargo:rustc-link-arg-bin=mooncake-store-client=-Wl,-rpath,{}",
         tent_dir.display()
     );
+    Ok(())
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
