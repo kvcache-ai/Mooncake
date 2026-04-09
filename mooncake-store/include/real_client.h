@@ -728,9 +728,12 @@ class RealClient : public PyClient {
     int start_http_server();
     void stop_http_server();
 
+    // Auto-assign RPC port for client RPC server
+    void auto_assign_rpc_address(const std::string &host_prefix,
+                                 int local_rpc_port, int fallback_port);
+
     // Embedded Client RPC server for offload object reads
     std::unique_ptr<coro_rpc::coro_rpc_server> client_rpc_server_;
-    std::jthread client_rpc_thread_;
     int start_client_rpc_server();
     void stop_client_rpc_server();
 

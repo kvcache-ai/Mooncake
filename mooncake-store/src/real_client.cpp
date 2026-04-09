@@ -314,6 +314,25 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+void RealClient::auto_assign_rpc_address(const std::string &host_prefix,
+                                         int local_rpc_port,
+                                         int fallback_port) {
+    if (local_rpc_port > 0) {
+        this->local_rpc_addr = host_prefix + std::to_string(local_rpc_port);
+    } else {
+        auto rpc_binder = std::make_unique<AutoPortBinder>();
+        int rpc_auto = rpc_binder->getPort();
+        if (rpc_auto > 0 && rpc_auto != fallback_port) {
+            this->local_rpc_addr = host_prefix + std::to_string(rpc_auto);
+            rpc_port_binder_ = std::move(rpc_binder);
+        } else {
+            LOG(WARNING) << "Could not auto-assign separate RPC port, "
+                         << "falling back to port " << fallback_port;
+            this->local_rpc_addr = host_prefix + std::to_string(fallback_port);
+        }
+    }
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -356,22 +375,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (user_specified_port) {
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
-        if (local_rpc_port > 0) {
-            this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
-                                   std::to_string(local_rpc_port);
-        } else {
-            auto rpc_binder = std::make_unique<AutoPortBinder>();
-            int rpc_auto = rpc_binder->getPort();
-            int specified_port = std::stoi(hostname.substr(colon_pos + 1));
-            if (rpc_auto > 0 && rpc_auto != specified_port) {
-                this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
-                                       std::to_string(rpc_auto);
-                rpc_port_binder_ = std::move(rpc_binder);
-            } else {
-                this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
-                                       std::to_string(specified_port);
-            }
-        }
+        int specified_port = std::stoi(hostname.substr(colon_pos + 1));
+        auto_assign_rpc_address(hostname.substr(0, colon_pos + 1),
+                                local_rpc_port, specified_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine);
@@ -399,25 +405,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
 
             this->local_hostname = hostname + ":" + std::to_string(port);
-            if (local_rpc_port > 0) {
-                this->local_rpc_addr =
-                    hostname + ":" + std::to_string(local_rpc_port);
-            } else {
-                // Auto-assign a separate port for client RPC (must differ from
-                // TE port)
-                auto rpc_binder = std::make_unique<AutoPortBinder>();
-                int rpc_auto = rpc_binder->getPort();
-                if (rpc_auto > 0 && rpc_auto != port) {
-                    this->local_rpc_addr =
-                        hostname + ":" + std::to_string(rpc_auto);
-                    rpc_port_binder_ = std::move(rpc_binder);
-                } else {
-                    LOG(WARNING) << "Could not auto-assign separate RPC port, "
-                                 << "falling back to TE port " << port;
-                    this->local_rpc_addr =
-                        hostname + ":" + std::to_string(port);
-                }
-            }
+            auto_assign_rpc_address(hostname + ":", local_rpc_port, port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine);
@@ -930,18 +918,13 @@ int RealClient::start_client_rpc_server() {
         client_rpc_server_
             ->register_handler<&RealClient::service_ready_internal>(this);
 
-        // Start in background thread (start() blocks)
-        client_rpc_thread_ = std::jthread([this]() {
-            LOG(INFO) << "Client RPC server starting on "
-                      << this->local_rpc_addr;
-            auto ec = client_rpc_server_->start();
-            if (ec) {
-                LOG(ERROR) << "Client RPC server stopped with error";
-            }
-        });
-
-        // Brief wait to confirm binding
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto ec = client_rpc_server_->async_start();
+        if (ec.hasResult()) {
+            LOG(ERROR) << "Failed to start client RPC server on "
+                       << this->local_rpc_addr;
+            client_rpc_server_.reset();
+            return -1;
+        }
         LOG(INFO) << "Client RPC server started on " << this->local_rpc_addr;
         return 0;
     } catch (const std::exception &e) {
@@ -954,9 +937,6 @@ int RealClient::start_client_rpc_server() {
 void RealClient::stop_client_rpc_server() {
     if (client_rpc_server_) {
         client_rpc_server_->stop();
-        if (client_rpc_thread_.joinable()) {
-            client_rpc_thread_.join();
-        }
         client_rpc_server_.reset();
         LOG(INFO) << "Client RPC server stopped";
     }
