@@ -7,7 +7,7 @@ use mooncake_store_core::{
 };
 use parking_lot::Mutex;
 
-const DEFAULT_SCOPE_LABEL: &str = "pool";
+const ROUTE_SCOPE_LABEL: &str = "route_scope";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RouteControlMode {
@@ -76,7 +76,7 @@ impl EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         key: &ObjectKey,
     ) -> Result<Vec<ClientStableId>> {
-        let pool = observer.endpoints.labels.get(DEFAULT_SCOPE_LABEL).cloned();
+        let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
         let mut candidates = BTreeMap::<String, ClientLease>::new();
         for lease in self.metadata.list_live_clients()? {
             if lease.state != ClientLifecycleState::Active {
@@ -88,12 +88,12 @@ impl EmbeddedWrhRouteDirectory {
             if !route_capable(&lease) {
                 continue;
             }
-            if pool.as_ref().is_some_and(|pool| {
+            if route_scope.as_ref().is_some_and(|scope| {
                 lease
                     .endpoints
                     .labels
-                    .get(DEFAULT_SCOPE_LABEL)
-                    .is_none_or(|candidate| candidate != pool)
+                    .get(ROUTE_SCOPE_LABEL)
+                    .is_none_or(|candidate| candidate != scope)
             }) {
                 continue;
             }

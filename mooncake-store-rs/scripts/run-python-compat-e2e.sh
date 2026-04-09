@@ -31,6 +31,7 @@ cargo build -p mooncake-store-py
 
 python3 - <<'PY'
 import ctypes
+import subprocess
 import time
 import urllib.request
 
@@ -73,6 +74,15 @@ assert store_peer.setup(
 
 assert store.put("py-key", b"hello-python") == 0
 assert store.get("py-key") == b"hello-python"
+assert store_peer.get("py-key") == b"hello-python"
+route = store.query_route("py-key")
+assert route is not None and route["key"] == "default::py-key"
+route_key = f"{keyspace}/objects/default::py-key"
+route_exists = subprocess.check_output(
+    ["redis-cli", "-u", "redis://127.0.0.1:6380/0", "EXISTS", route_key],
+    text=True,
+).strip()
+assert route_exists == "0"
 assert store.is_exist("py-key") is True
 assert store.get_size("py-key") == len(b"hello-python")
 assert store.batch_is_exist(["py-key", "missing-key"]) == [1, 0]
@@ -208,8 +218,6 @@ for current in (mb_src_a, mb_src_b, mb_dst_a, mb_dst_b):
 
 segments = store.list_segments()
 assert len(segments) >= 1
-route = store.query_route("py-key")
-assert route is not None and route["key"] == "default::py-key"
 
 assert store.remove("py-key") == 0
 assert store.is_exist("py-key") is False

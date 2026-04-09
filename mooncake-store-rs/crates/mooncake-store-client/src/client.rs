@@ -3284,6 +3284,44 @@ mod tests {
     }
 
     #[test]
+    fn embedded_wrh_route_directory_ignores_pool_boundaries_by_default() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new("cross-pool-segment"));
+        let writer = StoreClientBuilder::new(metadata.clone(), "writer-cross-pool")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-reclaim")
+            .transport(transport.clone())
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("writer build should succeed");
+        let reader = StoreClientBuilder::new(metadata.clone(), "reader-cross-pool")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .transport(transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+
+        writer
+            .put_in_tenant("tenant-a", "cross-pool-key", b"cross-pool-payload")
+            .expect("writer put should succeed");
+
+        assert!(
+            metadata
+                .get_object_route(&ObjectKey::new("tenant-a::cross-pool-key"))
+                .expect("metadata query should succeed")
+                .is_none(),
+            "WRH route directory should stay off metadata across pools"
+        );
+        assert_eq!(
+            reader
+                .get_in_tenant("tenant-a", "cross-pool-key")
+                .expect("reader get should succeed"),
+            b"cross-pool-payload"
+        );
+    }
+
+    #[test]
     fn remove_reclaims_segment_space_immediately_when_grace_zero() {
         let metadata = Arc::new(InMemoryMetadataBackend::new());
         let transport = Arc::new(TestTransport::new("reclaim-segment"));

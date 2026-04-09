@@ -11,8 +11,8 @@ use mooncake_store_client::{
     ReplicationPolicy, StoreClient, StoreClientBuilder, TentTransportFactory,
 };
 use mooncake_store_core::{
-    ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, Result,
-    SegmentLifecycleState, SegmentName, StoreError,
+    ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, MetadataBackend,
+    ObjectKey, Result, SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
@@ -230,6 +230,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     verify_overwrite_reclaims_capacity(&reclaim_writer, &reader, value_size)?;
     verify_request_replication_policy(&target_a, &target_b, &reader, value_size)?;
     verify_delete_reclaim_parity(&reclaim_writer, value_size)?;
+    verify_embedded_route_directory_offloads_metadata(
+        metadata.as_ref(),
+        &router,
+        &reader,
+        value_size,
+    )?;
     verify_routed_scale_out(&router, &reader, value_size)?;
     verify_multi_replica_route_publish(&router_replica, &reader, value_size)?;
     verify_dynamic_expand_and_soft_shrink(&elastic_target, &elastic_router, &reader, value_size)?;
@@ -768,6 +774,43 @@ fn verify_dynamic_expand_and_soft_shrink(
     }
     let actual = reader.get("elastic-key")?;
     ensure_payload("elastic expand+shrink", &second, &actual)?;
+    Ok(())
+}
+
+fn verify_embedded_route_directory_offloads_metadata(
+    metadata: &dyn MetadataBackend,
+    writer: &StoreClient,
+    reader: &StoreClient,
+    value_size: usize,
+) -> Result<()> {
+    let key = "wrh-offload-key";
+    let value = payload("wrh-offload", value_size);
+    writer.put(key, &value)?;
+
+    let actual = reader.get(key)?;
+    ensure_payload("embedded route offload", &value, &actual)?;
+
+    let scoped_key = ObjectKey::new(format!("tenant-a::{key}"));
+    if metadata.get_object_route(&scoped_key)?.is_some() {
+        return Err(StoreError::InvalidState(
+            "embedded WRH route unexpectedly persisted to metadata backend".to_string(),
+        ));
+    }
+
+    let route = reader
+        .query_route(key)?
+        .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
+    if route.key != scoped_key {
+        return Err(StoreError::InvalidState(format!(
+            "embedded WRH route key mismatch: got={} expected={}",
+            route.key.0, scoped_key.0
+        )));
+    }
+    if route.replicas.is_empty() {
+        return Err(StoreError::InvalidState(
+            "embedded WRH route has no replicas".to_string(),
+        ));
+    }
     Ok(())
 }
 
