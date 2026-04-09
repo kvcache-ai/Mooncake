@@ -26,7 +26,7 @@ fi
 export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${LD_LIBRARY_PATH:-}"
 export MC_STORE_RS_REDIS_URL="${MC_STORE_RS_REDIS_URL:-redis://127.0.0.1:${REDIS_PORT}/0}"
 export MC_STORE_RS_REDIS_PORT="${REDIS_PORT}"
-export MC_STORE_RS_BATCH_BENCH_ITERS="${BENCH_ITERS}"
+export MC_STORE_RS_BENCH_ITERS="${BENCH_ITERS}"
 export MC_STORE_RS_VALUE_SIZE="${VALUE_SIZE}"
 
 if ! command -v cargo >/dev/null 2>&1; then
