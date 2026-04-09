@@ -3,7 +3,7 @@
 
 ## Overview
 This is the latest version of the Mooncake Conductor integration doc with the vLLM project to support KVCache-Aware scheduling algorithm.
-The conductor can be integrated as a plugin into any proxy to uniformly manage KV events from G1 to G3. We also provide a toy_proxy for those who want to try it out ([proxy](./cacheaware_disaggregated_proxy.py)).
+The conductor can be integrated as a plugin into any proxy to uniformly manage KV events from G1 to G3. We also provide a toy_proxy for those who want to try it out ([proxy](./cache_aware_disagg_proxy.py)).
 
 - only vLLM and vLLM-Ascend are supported.
 
@@ -96,7 +96,8 @@ pip install -e .
 ```sh
 # start mooncake_master without kv-event publish
 mooncake_master --rpc_port 50051
-# start moocake_master with kv-event
+
+# start moocake_master with kv-event (future release)
 mooncake_master -enable_kv_event_publish -kv_event_publisher_endpoint tcp://*:19997 -rpc_port 50051
 ```
 ### 2. Run multiple vllm instances
@@ -154,7 +155,7 @@ mooncake_conductor
 ### 4. Run the proxy in the example
 
 ```sh
-python cacheaware_disaggregated_proxy.py --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 --decoder-host 127.0.0.1 --decoder-ports 8200 --conductor-address 127.0.0.1:13333
+python cache_aware_disagg_proxy.py --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 --decoder-host 127.0.0.1 --decoder-ports 8200 --conductor-address 127.0.0.1:13333
 ```
 
 ## Test with openai compatible request
@@ -163,7 +164,6 @@ python cacheaware_disaggregated_proxy.py --prefiller-hosts 127.0.0.1 --prefiller
 curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
   "model": "qwen2.5_7B",
   "prompt": "What are the key architectural differences between vLLM and Mooncake when it comes to handling key-value (KV) cache events, and how can a centralized conductor component be designed in Go to normalize disparate event schemas from these systems, apply consistent metrics collection, and make dynamic scheduling decisions based on real-time KV cache hit rates without relying on Kubernetes-based autoscaling mechanisms?",
-  "max_tokens": 1000
+  "max_tokens": 10
 }'
-
 ```

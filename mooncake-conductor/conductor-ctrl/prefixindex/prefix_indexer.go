@@ -108,10 +108,12 @@ func NewPrefixCacheTable() *PrefixCacheTable {
 
 func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext) *ContextData {
 	ctx_value := *modelcontext
-	value, exists := p.contextMap.Load(ctx_value)
-	if exists {
+
+	// already exists
+	if value, exists := p.contextMap.Load(ctx_value); exists {
 		return value.(*ContextData)
 	}
+
 	seedValue := xxhash.Sum64String(modelcontext.AdditionalSalt)
 	newContextData := &ContextData{
 		prefixStore: &HashMapStore{
@@ -124,9 +126,15 @@ func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext) *ContextDa
 		DpSize:           make(map[int64]struct{}),
 	}
 	newContextData.prefixStore.lastAccess.Store(time.Now().Unix())
-	p.contextMap.Store(ctx_value, newContextData)
-	slog.Debug("in getContextData", "modelcontext", modelcontext)
+
+	actual, created := p.contextMap.LoadOrStore(ctx_value, newContextData)
+	if !created {
+		// Another goroutine beat us — discard newContextData, use the existing one
+		return actual.(*ContextData)
+	}
+
 	p.contextCount.Add(1)
+	slog.Debug("in getContextData", "modelcontext", modelcontext)
 	return newContextData
 }
 
@@ -137,7 +145,7 @@ func (p *PrefixCacheTable) AddDpSize(modelcontext *ModelContext, dpRank int64) {
 }
 
 func (p *PrefixCacheTable) ComputePrefixHash(modelcontext *ModelContext, tokenIds []int32, cacheSalt uint64) []uint64 {
-	// cacheSalt is used to seperate hash from different customers
+	// cacheSalt is used to separate hash from different customers
 	numBlocks := len(tokenIds) / int(modelcontext.BlockSize)
 	prefixHashes := make([]uint64, 0, numBlocks)
 
