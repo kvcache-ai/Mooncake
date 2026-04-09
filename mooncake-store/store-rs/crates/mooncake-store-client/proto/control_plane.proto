@@ -15,6 +15,7 @@ service ControlPlaneService {
   rpc BatchReserveSpecific(BatchReserveSpecificRequest) returns (BatchReserveSpecificReply);
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
+  rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
 
 enum ErrorKind {
@@ -236,4 +237,29 @@ message BatchReleaseRequest {
 
 message BatchReleaseReply {
   repeated ReleaseReply replies = 1;
+}
+
+message ControlStreamRequest {
+  uint64 request_id = 1;
+  oneof body {
+    BatchGetRoutesRequest route_get = 2;
+    BatchCompareAndSwapRoutesRequest route_cas = 3;
+    BatchReplaceRoutesRequest route_replace = 4;
+    BatchReserveAnyRequest allocator_reserve_any = 5;
+    BatchReserveSpecificRequest allocator_reserve_specific = 6;
+    BatchReleaseRequest allocator_release = 7;
+  }
+}
+
+message ControlStreamReply {
+  uint64 request_id = 1;
+  oneof body {
+    BatchGetRoutesReply route_get = 2;
+    BatchCompareAndSwapRoutesReply route_cas = 3;
+    BatchReplaceRoutesReply route_replace = 4;
+    BatchReserveAnyReply allocator_reserve_any = 5;
+    BatchReserveSpecificReply allocator_reserve_specific = 6;
+    BatchReleaseReply allocator_release = 7;
+  }
+  ErrorDetail error = 8;
 }
