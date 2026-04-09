@@ -180,20 +180,20 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         return -1;
     }
 
-    // NVLink-family transports bypass auto-discover because they replace
-    // the cross-node transport entirely (MNNVL is itself cross-node capable).
-    // HIP (IPC mode) is intra-node only and coexists with the auto-discovered
-    // cross-node transport, so it does NOT need to disable auto-discover.
-    bool manual_transport = strcmp(protocol, "nvlink") == 0 ||
-                            strcmp(protocol, "nvlink_intra") == 0;
+    std::string proto = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
 
 #ifdef USE_EFA
-    bool use_efa = (strcmp(protocol, "efa") == 0);
+    // When using EFA protocol, we still need topology discovery but won't
+    // auto-install RDMA
+    bool use_efa = (proto == "efa");
+    // Disable auto_discover to prevent RDMA transport installation, we'll
+    // install EFA manually
     engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    // Manually discover topology for EFA to populate device list
     if (use_efa) {
         engine_->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
@@ -201,7 +201,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!manual_transport, device_filter);
+    engine_ = std::make_unique<TransferEngine>(true, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -211,43 +211,34 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                           hostname_port.first.c_str(), hostname_port.second);
         if (ret) return -1;
     } else {
+        // the last two params are unused
         int ret = engine_->init(conn_string, local_hostname, "", 0);
         if (ret) return -1;
     }
 
 #ifdef USE_EFA
+    // Install EFA transport when protocol is "efa"
     if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
-        auto *transport = engine_->installTransport("efa", nullptr);
+        auto transport = engine_->installTransport("efa", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install EFA transport";
             return -1;
         }
         LOG(INFO) << "EFA transport installed successfully";
-    } else if (manual_transport) {
-        auto *transport = engine_->installTransport(protocol, nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install transport: " << protocol;
-            return -1;
-        }
     } else {
+        // For non-EFA protocols (e.g. TCP), manually install TCP transport
+        // since auto_discover is disabled to prevent RDMA installation
+        // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in EFA build)";
-        auto *transport = engine_->installTransport("tcp", nullptr);
+        auto transport = engine_->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";
             return -1;
         }
         LOG(INFO) << "TCP transport installed successfully";
-    }
-#else
-    if (manual_transport) {
-        auto *transport = engine_->installTransport(protocol, nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install transport: " << protocol;
-            return -1;
-        }
     }
 #endif
 
