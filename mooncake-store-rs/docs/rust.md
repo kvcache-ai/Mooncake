@@ -186,8 +186,14 @@ Common calls:
 - `expand_local_memory(storage_bytes)`
 - `drain_segment(segment)`
 - `retire_segment(segment)`
+- `evacuate_owned_replicas()`
+- `evacuate_owned_replicas_via(writer)`
 
-These operations are the current control surface for hot-upgrade, elastic growth, and soft shrink flows.
+`evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
+
+Use `evacuate_owned_replicas_via(writer)` when you want a separate routed client to publish replacement routes during shrink.
+
+These operations are the current control surface for hot-upgrade, elastic growth, segment drain/retire, and full client shrink flows.
 
 ## Route Inspection
 
@@ -235,7 +241,7 @@ It covers:
 - batch put/get
 - registered-buffer and multi-buffer paths
 - delete reclaim and overwrite reclaim
-- dynamic expansion, soft shrink, and hot-upgrade
+- dynamic expansion, true client shrink, and hot-upgrade
 
 ## Next Reading
 

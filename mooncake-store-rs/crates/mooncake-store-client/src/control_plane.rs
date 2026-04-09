@@ -32,6 +32,13 @@ pub(crate) trait AuthorityService: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>>;
 
+    fn list_routes_by_replica_owner(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>>;
+
     fn compare_and_swap_route(
         &self,
         namespace: &str,
@@ -364,6 +371,69 @@ impl ControlPlaneClient {
                     try_cas_result(result)
                 })
                 .collect())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn list_routes_by_replica_owner(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        let tracker = OperationTracker::new("control_route_list_by_replica_owner");
+        let result = (|| {
+            let request = pb::ListRoutesByReplicaOwnerRequest {
+                namespace: namespace.to_string(),
+                authority: authority.0.clone(),
+                owner: Some(pb_runtime_id(owner)),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::RouteListByReplicaOwner(
+                    request.clone(),
+                )),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::RouteListByReplicaOwner(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream list_routes_by_replica_owner reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream list_routes_by_replica_owner reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return reply.routes.into_iter().map(try_object_route).collect();
+                }
+                Err(error) => {
+                    warn!(
+                        authority = %authority,
+                        owner = %owner,
+                        error = %error,
+                        "control stream list_routes_by_replica_owner failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                |mut client| async move {
+                    client
+                        .list_routes_by_replica_owner(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            decode_error(reply.error)?;
+            reply.routes.into_iter().map(try_object_route).collect()
         })();
         tracker.finish(&result, 0);
         result
@@ -1108,6 +1178,39 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         Ok(Response::new(reply))
     }
 
+    async fn list_routes_by_replica_owner(
+        &self,
+        request: Request<pb::ListRoutesByReplicaOwnerRequest>,
+    ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
+        let request = request.into_inner();
+        let owner = request
+            .owner
+            .as_ref()
+            .map(try_runtime_id)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let owner = owner.ok_or_else(|| {
+            Status::invalid_argument(
+                "control plane list_routes_by_replica_owner request is missing owner",
+            )
+        })?;
+        let reply = match self.authority.list_routes_by_replica_owner(
+            &request.namespace,
+            &ClientStableId::new(request.authority),
+            &owner,
+        ) {
+            Ok(routes) => pb::ListRoutesByReplicaOwnerReply {
+                routes: routes.iter().map(pb_object_route).collect(),
+                error: None,
+            },
+            Err(error) => pb::ListRoutesByReplicaOwnerReply {
+                routes: Vec::new(),
+                error: Some(pb_error(error)),
+            },
+        };
+        Ok(Response::new(reply))
+    }
+
     async fn batch_compare_and_swap_routes(
         &self,
         request: Request<pb::BatchCompareAndSwapRoutesRequest>,
@@ -1486,6 +1589,11 @@ async fn handle_control_stream_request(
             .await
             .map(Response::into_inner)
             .map(pb::control_stream_reply::Body::RouteCas),
+        Some(pb::control_stream_request::Body::RouteListByReplicaOwner(batch)) => service
+            .list_routes_by_replica_owner(Request::new(batch))
+            .await
+            .map(Response::into_inner)
+            .map(pb::control_stream_reply::Body::RouteListByReplicaOwner),
         Some(pb::control_stream_request::Body::RouteReplace(batch)) => service
             .batch_replace_routes(Request::new(batch))
             .await

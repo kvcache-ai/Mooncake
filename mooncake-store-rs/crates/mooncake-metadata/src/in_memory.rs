@@ -146,6 +146,10 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(self.state.read().objects.get(&key.0).cloned())
     }
 
+    fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
+        Ok(self.state.read().objects.values().cloned().collect())
+    }
+
     fn compare_and_swap_object_route(
         &self,
         key: &ObjectKey,

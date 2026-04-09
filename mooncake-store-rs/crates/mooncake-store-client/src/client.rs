@@ -26,7 +26,8 @@ use crate::observability::OperationTracker;
 use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
-    authority_replace, authority_replace_many, build_route_directory, RouteControlMode,
+    authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
+    build_route_directory, RouteControlMode,
 };
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
@@ -458,6 +459,11 @@ pub trait MooncakeCompatibilityFacade {
     fn expand_local_memory(&self, storage_bytes: usize) -> Result<SegmentAnnouncement>;
     fn drain_segment(&self, segment: &SegmentName) -> Result<()>;
     fn retire_segment(&self, segment: &SegmentName) -> Result<bool>;
+    fn evacuate_owned_replicas(&mut self) -> Result<usize> {
+        Err(StoreError::Unsupported(
+            "client evacuation is not supported".to_string(),
+        ))
+    }
     fn query_route(&self, key: &str) -> Result<Option<ObjectRoute>>;
     fn query_route_in_tenant(&self, tenant: &str, key: &str) -> Result<Option<ObjectRoute>>;
     fn cas_route(
@@ -561,6 +567,66 @@ pub struct StoreClient {
 impl StoreClient {
     pub fn runtime_id(&self) -> &ClientRuntimeId {
         &self.lease.runtime
+    }
+
+    pub fn evacuate_owned_replicas_via(&mut self, writer: &StoreClient) -> Result<usize> {
+        let _span = info_span!(
+            "store.evacuate_owned_replicas_via",
+            runtime = %self.lease.runtime,
+            writer = %writer.lease.runtime
+        )
+        .entered();
+        let tracker = OperationTracker::new("evacuate_owned_replicas_via");
+        let result = (|| {
+            self.ensure_local_memory()?;
+            if self.lease.state != ClientLifecycleState::Draining {
+                self.enter_draining()?;
+            }
+            let segments = {
+                let state = self.state.lock();
+                state.memory_ref()?.storage_segments()
+            };
+            for segment in segments
+                .iter()
+                .filter(|segment| segment.state == SegmentLifecycleState::Active)
+            {
+                self.drain_segment_internal(&segment.segment_name, true)?;
+            }
+            self.flush_all_reclaims()?;
+
+            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
+            let mut migrated = 0usize;
+            for route in routes {
+                if self.migrate_owned_route_via_writer(writer, &route)? {
+                    migrated = migrated.saturating_add(1);
+                }
+            }
+
+            self.flush_all_reclaims()?;
+            let live_allocations = self.current_owned_allocations()?;
+            let _ = self.release_stale_local_allocations(&live_allocations)?;
+            self.flush_all_reclaims()?;
+            self.retire_empty_draining_segments()?;
+
+            let remaining = self
+                .list_segments()?
+                .into_iter()
+                .filter(|segment| segment.used_bytes != 0)
+                .collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "client shrink still has live bytes on local segments: {}",
+                    remaining
+                        .iter()
+                        .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Ok(migrated)
+        })();
+        tracker.finish(&result, 0);
+        result
     }
 
     pub fn lease(&self) -> &ClientLease {
@@ -1395,6 +1461,23 @@ impl StoreClient {
         self.release_segment_allocations_batch(&releases)
     }
 
+    fn flush_all_reclaims(&self) -> Result<()> {
+        let pending = {
+            let mut state = self.state.lock();
+            std::mem::take(&mut state.pending_reclaims)
+        };
+        let releases = pending
+            .into_iter()
+            .map(|reclaim| AllocationReleaseRequest {
+                storage_runtime: reclaim.storage_runtime,
+                segment_name: reclaim.segment_name,
+                offset_bytes: reclaim.offset_bytes,
+                length_bytes: reclaim.length_bytes,
+            })
+            .collect::<Vec<_>>();
+        self.release_segment_allocations_batch(&releases)
+    }
+
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
         let grace_ms = self.local_memory.reclaim_grace_ms;
         if grace_ms == 0 {
@@ -1412,6 +1495,13 @@ impl StoreClient {
             });
         }
         Ok(())
+    }
+
+    fn reclaim_route(&self, route: &ObjectRoute, mode: ReclaimMode) -> Result<()> {
+        match mode {
+            ReclaimMode::Scheduled => self.schedule_route_reclaim(route),
+            ReclaimMode::Immediate => self.release_route_allocations(route),
+        }
     }
 
     fn transport(&self) -> Result<&dyn StoreTransport> {
@@ -1531,12 +1621,14 @@ impl StoreClient {
         self.release_segment_allocations_batch(&releases)
     }
 
-    fn put_scoped_with_policy(
+    fn put_scoped_with_policy_current(
         &self,
         tenant: &str,
         key: &str,
         value: &[u8],
         policy: Option<&ReplicationPolicy>,
+        current: Option<&ObjectRoute>,
+        reclaim_mode: ReclaimMode,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
@@ -1551,13 +1643,8 @@ impl StoreClient {
                 return Err(error);
             }
         };
-
-        let current = self
-            .route_directory
-            .get_object_route(&self.lease, &scoped_key)?;
-        let expected_version = current.as_ref().map(|route| route.version);
+        let expected_version = current.map(|route| route.version);
         let next_version = current
-            .as_ref()
             .map(|route| route.version.next())
             .unwrap_or(RouteVersion(1));
         let route = ObjectRoute {
@@ -1593,10 +1680,340 @@ impl StoreClient {
                 "route update lost race for tenant={tenant} key={key}"
             )));
         }
-        if let Some(previous) = current.as_ref() {
-            self.schedule_route_reclaim(previous)?;
+        if let Some(previous) = current {
+            self.reclaim_route(previous, reclaim_mode)?;
         }
         Ok(route)
+    }
+
+    fn put_scoped_with_policy(
+        &self,
+        tenant: &str,
+        key: &str,
+        value: &[u8],
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<ObjectRoute> {
+        let current = self
+            .route_directory
+            .get_object_route(&self.lease, &self.scoped_key(tenant, key))?;
+        self.put_scoped_with_policy_current(
+            tenant,
+            key,
+            value,
+            policy,
+            current.as_ref(),
+            ReclaimMode::Scheduled,
+        )
+    }
+
+    fn drain_segment_internal(
+        &self,
+        segment: &SegmentName,
+        allow_last_active_primary: bool,
+    ) -> Result<()> {
+        self.ensure_local_memory()?;
+        let primary = self.segment_name()?;
+        let (active_count, current_state) = {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            let active_count = memory
+                .storage_segments()
+                .into_iter()
+                .filter(|entry| entry.state == SegmentLifecycleState::Active)
+                .count();
+            let current_state = memory
+                .storage_segments()
+                .into_iter()
+                .find(|entry| entry.segment_name == *segment)
+                .map(|entry| entry.state)
+                .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment.0)))?;
+            (active_count, current_state)
+        };
+        if current_state == SegmentLifecycleState::Draining {
+            return Ok(());
+        }
+        if current_state != SegmentLifecycleState::Active {
+            return Err(StoreError::InvalidState(format!(
+                "segment {} is not active",
+                segment.0
+            )));
+        }
+        if !allow_last_active_primary && active_count <= 1 && *segment == primary {
+            return Err(StoreError::InvalidState(
+                "cannot drain the last active local segment".to_string(),
+            ));
+        }
+        {
+            let mut state = self.state.lock();
+            state
+                .memory_mut()?
+                .update_storage_state(segment, SegmentLifecycleState::Draining)?;
+        }
+        self.allocator
+            .lock()
+            .update_state(segment, SegmentLifecycleState::Draining)?;
+        self.metadata.update_segment_state(
+            &self.lease.runtime,
+            segment,
+            SegmentLifecycleState::Draining,
+        )
+    }
+
+    fn route_scan_authorities(&self) -> Result<Vec<ClientLease>> {
+        Ok(self
+            .compatible_live_clients(true)?
+            .into_iter()
+            .filter(|lease| {
+                lease
+                    .endpoints
+                    .labels
+                    .get("route")
+                    .is_some_and(|value| value == "true")
+            })
+            .filter(|lease| lease.state != ClientLifecycleState::Standby)
+            .collect())
+    }
+
+    fn insert_latest_route(routes: &mut BTreeMap<String, ObjectRoute>, route: ObjectRoute) {
+        match routes.get(&route.key.0) {
+            Some(current) if current.version >= route.version => {}
+            _ => {
+                routes.insert(route.key.0.clone(), route);
+            }
+        }
+    }
+
+    fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
+        let namespace = self.metadata.route_namespace();
+        let mut routes = BTreeMap::new();
+        for route in self.metadata.list_object_routes()? {
+            Self::insert_latest_route(&mut routes, route);
+        }
+        for authority in self.route_scan_authorities()? {
+            let scanned = if authority.runtime.stable_id == self.lease.runtime.stable_id {
+                authority_list_routes_by_replica_owner(
+                    &namespace,
+                    &authority.runtime.stable_id,
+                    owner,
+                )
+            } else {
+                self.control_client.list_routes_by_replica_owner(
+                    &authority,
+                    &namespace,
+                    &authority.runtime.stable_id,
+                    owner,
+                )
+            };
+            match scanned {
+                Ok(found) => {
+                    for route in found {
+                        Self::insert_latest_route(&mut routes, route);
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        authority = %authority.runtime,
+                        owner = %owner,
+                        error = %error,
+                        "route-owner scan failed during shrink"
+                    );
+                }
+            }
+        }
+        Ok(routes.into_values().collect())
+    }
+
+    fn split_scoped_route_key<'a>(&self, route: &'a ObjectRoute) -> Result<(&'a str, &'a str)> {
+        route.key.0.split_once("::").ok_or_else(|| {
+            StoreError::InvalidState(format!("route key {} is missing tenant scope", route.key.0))
+        })
+    }
+
+    fn migration_policy_for_route(&self, route: &ObjectRoute) -> Result<ReplicationPolicy> {
+        let active = self
+            .compatible_live_clients(true)?
+            .into_iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
+            .map(|lease| lease.runtime)
+            .collect::<BTreeSet<_>>();
+        let preferred = route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner != self.lease.runtime)
+            .filter(|replica| active.contains(&replica.owner))
+            .map(|replica| replica.owner.storage_key())
+            .collect::<BTreeSet<_>>();
+        Ok(ReplicationPolicy::new()
+            .replica_count(route.replicas.len().max(1))
+            .prefer_local(false)
+            .with_soft_pin(true)
+            .preferred_storage_owners(preferred))
+    }
+
+    fn migrate_owned_route_via_writer(
+        &self,
+        writer: &StoreClient,
+        route: &ObjectRoute,
+    ) -> Result<bool> {
+        let (tenant, key) = self.split_scoped_route_key(route)?;
+        for _ in 0..4 {
+            let Some(observed) = self.query_route_in_tenant(tenant, key)? else {
+                return Ok(false);
+            };
+            if observed.state != RouteState::Active {
+                return Ok(false);
+            }
+            if !observed
+                .replicas
+                .iter()
+                .any(|replica| replica.owner == self.lease.runtime)
+            {
+                return Ok(false);
+            }
+
+            let payload = self.get_in_tenant(tenant, key)?;
+            let Some(confirmed) = self.query_route_in_tenant(tenant, key)? else {
+                return Ok(false);
+            };
+            if confirmed.version != observed.version {
+                continue;
+            }
+            if !confirmed
+                .replicas
+                .iter()
+                .any(|replica| replica.owner == self.lease.runtime)
+            {
+                return Ok(false);
+            }
+
+            let policy = writer.migration_policy_for_route(&confirmed)?;
+            match writer.put_scoped_with_policy_current(
+                tenant,
+                key,
+                &payload,
+                Some(&policy),
+                Some(&confirmed),
+                ReclaimMode::Immediate,
+            ) {
+                Ok(next) => {
+                    writer.sync_route_to_live_authorities(&next)?;
+                    return Ok(true);
+                }
+                Err(StoreError::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "client shrink lost route update race for {}",
+            route.key.0
+        )))
+    }
+
+    fn migrate_owned_route(&self, route: &ObjectRoute) -> Result<bool> {
+        self.migrate_owned_route_via_writer(self, route)
+    }
+
+    fn current_owned_allocations(&self) -> Result<BTreeSet<AllocationSpan>> {
+        let mut allocations = BTreeSet::new();
+        for route in self.collect_routes_by_replica_owner(&self.lease.runtime)? {
+            let (tenant, key) = self.split_scoped_route_key(&route)?;
+            let Some(current) = self.query_route_in_tenant(tenant, key)? else {
+                continue;
+            };
+            if current.state != RouteState::Active {
+                continue;
+            }
+            for replica in current
+                .replicas
+                .iter()
+                .filter(|replica| replica.owner == self.lease.runtime)
+            {
+                allocations.insert(AllocationSpan {
+                    segment_name: replica.segment_name.clone(),
+                    offset_bytes: replica.segment_offset,
+                    length_bytes: replica.length,
+                });
+            }
+        }
+        Ok(allocations)
+    }
+
+    fn replace_route_on_authority(
+        &self,
+        authority: &ClientLease,
+        route: &ObjectRoute,
+    ) -> Result<()> {
+        let namespace = self.metadata.route_namespace();
+        if authority.runtime.stable_id == self.lease.runtime.stable_id {
+            return authority_replace(
+                &namespace,
+                &authority.runtime.stable_id,
+                &route.key,
+                Some(route),
+            );
+        }
+        let request = RouteCasRequest {
+            key: route.key.clone(),
+            expected: None,
+            next: Some(route.clone()),
+        };
+        let mut results = self.control_client.batch_replace_routes(
+            authority,
+            &namespace,
+            &authority.runtime.stable_id,
+            &[request],
+        )?;
+        results.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane replace route reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
+    fn sync_route_to_live_authorities(&self, route: &ObjectRoute) -> Result<()> {
+        for authority in self.route_scan_authorities()? {
+            self.replace_route_on_authority(&authority, route)?;
+        }
+        Ok(())
+    }
+
+    fn release_stale_local_allocations(
+        &self,
+        live_allocations: &BTreeSet<AllocationSpan>,
+    ) -> Result<usize> {
+        let stale = self
+            .allocator
+            .lock()
+            .allocations()
+            .into_iter()
+            .filter(|allocation| !live_allocations.contains(allocation))
+            .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let releases = stale
+            .iter()
+            .map(|allocation| AllocationReleaseRequest {
+                storage_runtime: self.lease.runtime.clone(),
+                segment_name: allocation.segment_name.clone(),
+                offset_bytes: allocation.offset_bytes,
+                length_bytes: allocation.length_bytes,
+            })
+            .collect::<Vec<_>>();
+        self.release_segment_allocations_batch(&releases)?;
+        Ok(stale.len())
+    }
+
+    fn retire_empty_draining_segments(&self) -> Result<()> {
+        let segments = self.list_segments()?;
+        for segment in segments
+            .into_iter()
+            .filter(|segment| segment.state == SegmentLifecycleState::Draining)
+            .filter(|segment| segment.used_bytes == 0)
+        {
+            let _ = self.retire_segment(&segment.segment_name)?;
+        }
+        Ok(())
     }
 
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
@@ -2660,43 +3077,14 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("drain_segment");
-        self.ensure_local_memory()?;
-        let primary = self.segment_name()?;
-        let active_count = {
-            let state = self.state.lock();
-            state
-                .memory_ref()?
-                .storage_segments()
-                .into_iter()
-                .filter(|entry| entry.state == SegmentLifecycleState::Active)
-                .count()
-        };
-        if active_count <= 1 && *segment == primary {
-            let result = Err(StoreError::InvalidState(
-                "cannot drain the last active local segment".to_string(),
-            ));
-            tracker.finish(&result, 0);
-            return result;
+        let result = self.drain_segment_internal(segment, false);
+        if result.is_ok() {
+            info!(
+                runtime = %self.lease.runtime,
+                segment = %segment.0,
+                "segment entered draining state"
+            );
         }
-        {
-            let mut state = self.state.lock();
-            state
-                .memory_mut()?
-                .update_storage_state(segment, SegmentLifecycleState::Draining)?;
-        }
-        self.allocator
-            .lock()
-            .update_state(segment, SegmentLifecycleState::Draining)?;
-        info!(
-            runtime = %self.lease.runtime,
-            segment = %segment.0,
-            "segment entered draining state"
-        );
-        let result = self.metadata.update_segment_state(
-            &self.lease.runtime,
-            segment,
-            SegmentLifecycleState::Draining,
-        );
         tracker.finish(&result, 0);
         result
     }
@@ -2756,6 +3144,65 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .metadata
             .unpublish_segment(&self.lease.runtime, segment)
             .map(|_| true);
+        tracker.finish(&result, 0);
+        result
+    }
+
+    fn evacuate_owned_replicas(&mut self) -> Result<usize> {
+        let _span = info_span!(
+            "store.evacuate_owned_replicas",
+            runtime = %self.lease.runtime
+        )
+        .entered();
+        let tracker = OperationTracker::new("evacuate_owned_replicas");
+        let result = (|| {
+            self.ensure_local_memory()?;
+            if self.lease.state != ClientLifecycleState::Draining {
+                self.enter_draining()?;
+            }
+            let segments = {
+                let state = self.state.lock();
+                state.memory_ref()?.storage_segments()
+            };
+            for segment in segments
+                .iter()
+                .filter(|segment| segment.state == SegmentLifecycleState::Active)
+            {
+                self.drain_segment_internal(&segment.segment_name, true)?;
+            }
+            self.flush_all_reclaims()?;
+
+            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
+            let mut migrated = 0usize;
+            for route in routes {
+                if self.migrate_owned_route(&route)? {
+                    migrated = migrated.saturating_add(1);
+                }
+            }
+
+            self.flush_all_reclaims()?;
+            let live_allocations = self.current_owned_allocations()?;
+            let _ = self.release_stale_local_allocations(&live_allocations)?;
+            self.flush_all_reclaims()?;
+            self.retire_empty_draining_segments()?;
+
+            let remaining = self
+                .list_segments()?
+                .into_iter()
+                .filter(|segment| segment.used_bytes != 0)
+                .collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "client shrink still has live bytes on local segments: {}",
+                    remaining
+                        .iter()
+                        .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Ok(migrated)
+        })();
         tracker.finish(&result, 0);
         result
     }
@@ -3425,6 +3872,13 @@ impl LocalAllocatorState {
             .collect()
     }
 
+    fn allocations(&self) -> Vec<AllocationSpan> {
+        self.segments
+            .values()
+            .flat_map(|segment| segment.allocations())
+            .collect()
+    }
+
     fn update_state(
         &mut self,
         segment_name: &SegmentName,
@@ -3509,6 +3963,7 @@ struct SegmentAllocator {
     announcement: SegmentAnnouncement,
     cursor_bytes: u64,
     free_spans: Vec<FreeSpan>,
+    allocations: BTreeMap<u64, u64>,
 }
 
 impl SegmentAllocator {
@@ -3517,6 +3972,7 @@ impl SegmentAllocator {
             cursor_bytes: announcement.used_bytes,
             announcement,
             free_spans: Vec::new(),
+            allocations: BTreeMap::new(),
         }
     }
 
@@ -3535,6 +3991,17 @@ impl SegmentAllocator {
         self.announcement
             .capacity_bytes
             .saturating_sub(self.announcement.used_bytes)
+    }
+
+    fn allocations(&self) -> Vec<AllocationSpan> {
+        self.allocations
+            .iter()
+            .map(|(offset_bytes, length_bytes)| AllocationSpan {
+                segment_name: self.announcement.segment_name.clone(),
+                offset_bytes: *offset_bytes,
+                length_bytes: *length_bytes,
+            })
+            .collect()
     }
 
     fn reserve(
@@ -3577,6 +4044,7 @@ impl SegmentAllocator {
                 .ok_or_else(|| {
                 StoreError::Allocator("segment reservation overflow".to_string())
             })?;
+            self.allocations.insert(span.offset_bytes, length_bytes);
             return Ok(mooncake_store_core::SegmentReservation {
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
@@ -3604,6 +4072,7 @@ impl SegmentAllocator {
             .used_bytes
             .checked_add(reserved_len)
             .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
+        self.allocations.insert(offset, length_bytes);
         Ok(mooncake_store_core::SegmentReservation {
             owner: owner.clone(),
             segment_name: segment_name.clone(),
@@ -3630,12 +4099,25 @@ impl SegmentAllocator {
                 owner, segment_name.0, offset_bytes, length_bytes
             )));
         }
+        let reserved = self.allocations.remove(&offset_bytes).ok_or_else(|| {
+            StoreError::Allocator(format!(
+                "segment release missing live allocation for {}:{} offset={} len={}",
+                owner, segment_name.0, offset_bytes, length_bytes
+            ))
+        })?;
+        if reserved != length_bytes {
+            return Err(StoreError::Allocator(format!(
+                "segment release length mismatch for {}:{} offset={} expected={} actual={}",
+                owner, segment_name.0, offset_bytes, reserved, length_bytes
+            )));
+        }
         self.insert_free_span(offset_bytes, reserved_len);
         self.announcement.used_bytes = self.announcement.used_bytes.saturating_sub(reserved_len);
         self.trim_tail();
         if self.announcement.used_bytes == 0 {
             self.cursor_bytes = 0;
             self.free_spans.clear();
+            self.allocations.clear();
         }
         Ok(())
     }
@@ -3769,6 +4251,19 @@ struct PendingReclaim {
     length_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AllocationSpan {
+    segment_name: SegmentName,
+    offset_bytes: u64,
+    length_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReclaimMode {
+    Scheduled,
+    Immediate,
+}
+
 struct LocalAuthorityAdapter;
 
 impl AuthorityService for LocalAuthorityAdapter {
@@ -3779,6 +4274,15 @@ impl AuthorityService for LocalAuthorityAdapter {
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>> {
         authority_get(namespace, authority, key)
+    }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        authority_list_routes_by_replica_owner(namespace, authority, owner)
     }
 
     fn compare_and_swap_route(
@@ -4345,6 +4849,12 @@ mod tests {
             ))
         }
 
+        fn list_object_routes(
+            &self,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
+            self.inner.list_object_routes()
+        }
+
         fn compare_and_swap_object_route(
             &self,
             _key: &ObjectKey,
@@ -4449,6 +4959,12 @@ mod tests {
             key: &ObjectKey,
         ) -> mooncake_store_core::Result<Option<mooncake_store_core::ObjectRoute>> {
             self.inner.get_object_route(key)
+        }
+
+        fn list_object_routes(
+            &self,
+        ) -> mooncake_store_core::Result<Vec<mooncake_store_core::ObjectRoute>> {
+            self.inner.list_object_routes()
         }
 
         fn compare_and_swap_object_route(
@@ -5982,5 +6498,115 @@ mod tests {
         assert_eq!(route.replicas.len(), 1);
         assert_eq!(route.replicas[0].owner, owner_b);
         assert_eq!(route.replicas[0].segment_name, SegmentName::new("seg-b"));
+    }
+
+    #[test]
+    fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let store_a_transport = Arc::new(TestTransport::new("shrink-a-segment"));
+        let store_b_transport = Arc::new(store_a_transport.peer("shrink-b-segment"));
+        let router_transport = Arc::new(store_a_transport.peer("shrink-router-segment"));
+        let reader_transport = Arc::new(store_a_transport.peer("shrink-reader-segment"));
+        let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+        let mut store_a = StoreClientBuilder::new(metadata.clone(), "shrink-store-a")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(store_a_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("store-a build should succeed");
+        let store_b = StoreClientBuilder::new(metadata.clone(), "shrink-store-b")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(store_b_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("store-b build should succeed");
+        let router = StoreClientBuilder::new(metadata.clone(), "shrink-router")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(router_transport)
+            .local_memory(storage_config())
+            .routed_writes(planner, 1)
+            .build(10_000)
+            .expect("router build should succeed");
+        let reader = StoreClientBuilder::new(metadata, "shrink-reader")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+
+        store_a
+            .register_local_memory()
+            .expect("store-a memory should register");
+        store_b
+            .register_local_memory()
+            .expect("store-b memory should register");
+        router
+            .register_local_memory()
+            .expect("router memory should register");
+        reader
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        let mut expected = BTreeMap::new();
+        let mut owned_keys = Vec::new();
+        for index in 0..32 {
+            let key = format!("shrink-key-{index}");
+            let value = format!("value-{index:02}").into_bytes();
+            router
+                .put_with_policy(&key, &value, &ReplicationPolicy::new().prefer_local(false))
+                .expect("seed routed put should succeed");
+            let route = router
+                .query_route(&key)
+                .expect("route query should succeed")
+                .expect("seed route should exist");
+            if route.replicas[0].owner == *store_a.runtime_id() {
+                expected.insert(key.clone(), value);
+                owned_keys.push(key);
+            }
+        }
+        assert!(
+            !owned_keys.is_empty(),
+            "expected at least one object to land on store-a"
+        );
+
+        let migrated = store_a
+            .evacuate_owned_replicas()
+            .expect("true client shrink should succeed");
+        assert_eq!(migrated, owned_keys.len());
+        assert_eq!(store_a.lease().state, ClientLifecycleState::Draining);
+        assert!(
+            store_a
+                .list_segments()
+                .expect("segment listing should succeed")
+                .is_empty(),
+            "all drained local segments should retire after shrink"
+        );
+
+        for key in owned_keys {
+            let route = router
+                .query_route(&key)
+                .expect("post-shrink route query should succeed")
+                .expect("post-shrink route should exist");
+            assert!(
+                route
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.owner != *store_a.runtime_id()),
+                "post-shrink route still references evacuated runtime"
+            );
+            assert_eq!(
+                reader.get(&key).expect("reader get should succeed"),
+                expected[&key]
+            );
+        }
     }
 }

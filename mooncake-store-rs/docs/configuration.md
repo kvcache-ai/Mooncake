@@ -191,4 +191,4 @@ For upgrade and elasticity flows:
 
 - preserve `stable_id`
 - increment `epoch`
-- use `expand_local_memory`, `drain_segment`, and `retire_segment`
+- use `expand_local_memory`, `drain_segment`, `retire_segment`, and `evacuate_owned_replicas`

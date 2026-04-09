@@ -44,6 +44,14 @@ impl MetadataKeyspace {
         format!("{}/objects/{}", self.prefix, key.0)
     }
 
+    pub fn object_prefix(&self) -> String {
+        format!("{}/objects/", self.prefix)
+    }
+
+    pub fn object_pattern(&self) -> String {
+        format!("{}*", self.object_prefix())
+    }
+
     pub fn handoff(&self, stable_id: &ClientStableId) -> String {
         format!("{}/handoffs/{}", self.prefix, stable_id.0)
     }

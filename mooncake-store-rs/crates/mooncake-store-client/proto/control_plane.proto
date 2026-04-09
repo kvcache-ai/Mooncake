@@ -15,6 +15,7 @@ service ControlPlaneService {
   rpc BatchReserveSpecific(BatchReserveSpecificRequest) returns (BatchReserveSpecificReply);
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
+  rpc ListRoutesByReplicaOwner(ListRoutesByReplicaOwnerRequest) returns (ListRoutesByReplicaOwnerReply);
   rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
 
@@ -239,6 +240,17 @@ message BatchReleaseReply {
   repeated ReleaseReply replies = 1;
 }
 
+message ListRoutesByReplicaOwnerRequest {
+  string namespace = 1;
+  string authority = 2;
+  ClientRuntimeId owner = 3;
+}
+
+message ListRoutesByReplicaOwnerReply {
+  repeated ObjectRoute routes = 1;
+  ErrorDetail error = 2;
+}
+
 message ControlStreamRequest {
   uint64 request_id = 1;
   oneof body {
@@ -248,6 +260,7 @@ message ControlStreamRequest {
     BatchReserveAnyRequest allocator_reserve_any = 5;
     BatchReserveSpecificRequest allocator_reserve_specific = 6;
     BatchReleaseRequest allocator_release = 7;
+    ListRoutesByReplicaOwnerRequest route_list_by_replica_owner = 8;
   }
 }
 
@@ -260,6 +273,7 @@ message ControlStreamReply {
     BatchReserveAnyReply allocator_reserve_any = 5;
     BatchReserveSpecificReply allocator_reserve_specific = 6;
     BatchReleaseReply allocator_release = 7;
+    ListRoutesByReplicaOwnerReply route_list_by_replica_owner = 8;
   }
-  ErrorDetail error = 8;
+  ErrorDetail error = 9;
 }
