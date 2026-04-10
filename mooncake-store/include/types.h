@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <string>
 #include <limits>
 #include <unordered_map>
@@ -19,6 +20,28 @@
 #include "libetcd_wrapper.h"
 #endif
 namespace mooncake {
+
+enum class StorageLevel {
+    RAM = 0,
+    CXL,
+    SSD,
+
+    NUM_STORAGE_LEVELS
+};
+
+/**
+ * @brief Stream operator for StorageLevel
+ */
+inline std::ostream& operator<<(std::ostream& os,
+                                const StorageLevel& type) noexcept {
+    static const std::unordered_map<StorageLevel, std::string_view>
+        type_strings{{StorageLevel::RAM, "RAM"},
+                     {StorageLevel::CXL, "CXL"},
+                     {StorageLevel::SSD, "SSD"}};
+
+    os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
+    return os;
+}
 
 // Constants
 static constexpr uint64_t WRONG_VERSION = 0;

@@ -499,6 +499,20 @@ class RealClient : public PyClient {
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol setup implementation
+    tl::expected<void, ErrorCode> mp_setup_internal(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size = 1024 * 1024 * 16,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "", const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
+        const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
+        bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
+        const std::string &ssd_offload_path = "");
+#endif
+
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
         size_t mount_segment_size = 1024 * 1024 * 16);

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <vector>
+#include "replica.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -485,8 +486,18 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+#ifdef ENABLE_MULTI_PROTOCOL
+                    if (level_protocols_.size() > 1) {
+                        std::string proto =
+                            level_protocols_[replica.get_storage_level()];
+                        future = mp_submitTransferEngineOperation(
+                            handle, slices, op_code, proto);
+                    } else
+#endif
+                    {
+                        future = submitTransferEngineOperation(handle, slices,
+                                                               op_code);
+                    }
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -537,7 +548,15 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             offset += slice.size;
         }
     }
-    future = submitTransfer(requests);
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        std::string proto = level_protocols_[replicas[0].get_storage_level()];
+        future = mp_submitTransfer(requests, proto);
+    } else
+#endif
+    {
+        future = submitTransfer(requests);
+    }
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -571,7 +590,15 @@ TransferSubmitter::submit_batch_get_offload_object(
         request.length = slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        std::string proto = level_protocols_[StorageLevel::RAM];
+        return mp_submitTransfer(requests, proto);
+    } else
+#endif
+    {
+        return submitTransfer(requests);
+    }
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
@@ -633,8 +660,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
         // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
+        // destructor if we create the state object, otherwise we need to
+        // free it here
         engine_.freeBatchID(batch_id);
         return std::nullopt;
     }
@@ -651,6 +678,83 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
     return TransferFuture(state);
 }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+std::optional<TransferFuture> TransferSubmitter::mp_submitTransfer(
+    std::vector<TransferRequest>& requests, std::string& proto) {
+    // Allocate batch ID
+    const size_t batch_size = requests.size();
+    BatchID batch_id = engine_.allocateBatchID(batch_size);
+    if (batch_id == INVALID_BATCH_ID) {
+        LOG(ERROR) << "Failed to allocate batch ID";
+        return std::nullopt;
+    }
+
+    // Submit transfer
+    Status s = engine_.mp_submitTransfer(batch_id, requests, proto);
+    if (!s.ok()) {
+        LOG(ERROR) << "Failed to submit all transfers, error code is "
+                   << s.code();
+        // Note: batch_id will be freed by TransferEngineOperationState
+        // destructor if we create the state object, otherwise we need to
+        // free it here
+        engine_.freeBatchID(batch_id);
+        return std::nullopt;
+    }
+
+    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
+        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
+        return std::nullopt;
+    }
+
+    // Create state with transfer engine context - no polling thread
+    // needed
+    auto state = std::make_shared<TransferEngineOperationState>(
+        engine_, batch_id, batch_size);
+
+    return TransferFuture(state);
+}
+
+std::optional<TransferFuture>
+TransferSubmitter::mp_submitTransferEngineOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code, std::string& proto) {
+    if (handle.transport_endpoint_.empty()) {
+        LOG(ERROR) << "Transport endpoint is empty for handle with address "
+                   << handle.buffer_address_;
+        return std::nullopt;
+    }
+    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open segment for endpoint='"
+                   << handle.transport_endpoint_ << "'";
+        return std::nullopt;
+    }
+
+    // Create transfer requests
+    std::vector<TransferRequest> requests;
+    requests.reserve(slices.size());
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = 0;
+
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& slice = slices[i];
+        if (slice.ptr == nullptr) continue;
+
+        TransferRequest request;
+        request.opcode = op_code;
+        request.source = static_cast<char*>(slice.ptr);
+        request.target_id = seg;
+        request.target_offset = base_address + offset;
+        request.length = slice.size;
+
+        offset += slice.size;
+        requests.emplace_back(request);
+    }
+    return mp_submitTransfer(requests, proto);
+}
+#endif
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
@@ -778,8 +882,8 @@ TransferStrategy TransferSubmitter::selectStrategy(
 }
 
 namespace {
-// Helper function to extract IP address from endpoint string (ip:port format)
-// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats
+// Helper function to extract IP address from endpoint string (ip:port
+// format) Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats
 std::string extractIpAddress(const std::string& endpoint) {
     if (endpoint.empty()) {
         return "";
@@ -803,7 +907,8 @@ std::string extractIpAddress(const std::string& endpoint) {
         return endpoint.substr(0, colon_pos);
     }
 
-    // No colon found, return the whole string (might be just IP or hostname)
+    // No colon found, return the whole string (might be just IP or
+    // hostname)
     return endpoint;
 }
 }  // namespace

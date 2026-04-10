@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "master_metric_manager.h"
+#include "replica.h"
 
 namespace mooncake {
 
@@ -60,25 +61,25 @@ void* AllocatedBuffer::get_vaddr_from_cxl() {
 
 // Define operator<< using public accessors or get_descriptor if appropriate
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
-    return os << "AllocatedBuffer: { "
-              << "segment_name: "
+    return os << "AllocatedBuffer: { " << "segment_name: "
               << (buffer.allocator_.lock()
                       ? buffer.allocator_.lock()->getSegmentName()
                       : std::string("<expired>"))
-              << ", "
-              << "size: " << buffer.size() << ", "
+              << ", " << "size: " << buffer.size() << ", "
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
-                                                 std::string transport_endpoint)
+                                                 std::string transport_endpoint,
+                                                 StorageLevel level)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)) {
+      transport_endpoint_(std::move(transport_endpoint)),
+      storage_level_(level) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -112,6 +113,13 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 CachelibBufferAllocator::~CachelibBufferAllocator() {
     MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
                                                            cur_size_);
+    if (storage_level_ == StorageLevel::CXL) {
+        MasterMetricManager::instance().dec_allocated_cxl_size(segment_name_,
+                                                               cur_size_);
+    } else {
+        MasterMetricManager::instance().dec_allocated_dram_size(segment_name_,
+                                                                cur_size_);
+    }
 };
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
@@ -138,6 +146,13 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
             << " segment=" << segment_name_ << " address=" << buffer;
     cur_size_.fetch_add(size);
     MasterMetricManager::instance().inc_allocated_mem_size(segment_name_, size);
+    if (storage_level_ == StorageLevel::CXL) {
+        MasterMetricManager::instance().inc_allocated_cxl_size(segment_name_,
+                                                               size);
+    } else {
+        MasterMetricManager::instance().inc_allocated_dram_size(segment_name_,
+                                                                size);
+    }
     return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
 }
 
@@ -153,6 +168,13 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
         cur_size_.fetch_sub(freed_size);
         MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
                                                                freed_size);
+        if (storage_level_ == StorageLevel::CXL) {
+            MasterMetricManager::instance().dec_allocated_cxl_size(
+                segment_name_, freed_size);
+        } else {
+            MasterMetricManager::instance().dec_allocated_dram_size(
+                segment_name_, freed_size);
+        }
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
@@ -165,12 +187,14 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
-                                             std::string transport_endpoint)
+                                             std::string transport_endpoint,
+                                             StorageLevel level)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)) {
+      transport_endpoint_(std::move(transport_endpoint)),
+      storage_level_(level) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
             << " size=" << size;
@@ -207,6 +231,13 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
 OffsetBufferAllocator::~OffsetBufferAllocator() {
     MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
                                                            cur_size_);
+    if (storage_level_ == StorageLevel::CXL) {
+        MasterMetricManager::instance().dec_allocated_cxl_size(segment_name_,
+                                                               cur_size_);
+    } else {
+        MasterMetricManager::instance().dec_allocated_dram_size(segment_name_,
+                                                                cur_size_);
+    }
 };
 
 std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
@@ -245,6 +276,13 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
 
     cur_size_.fetch_add(size);
     MasterMetricManager::instance().inc_allocated_mem_size(segment_name_, size);
+    if (storage_level_ == StorageLevel::CXL) {
+        MasterMetricManager::instance().inc_allocated_cxl_size(segment_name_,
+                                                               size);
+    } else {
+        MasterMetricManager::instance().inc_allocated_dram_size(segment_name_,
+                                                                size);
+    }
     return allocated_buffer;
 }
 
@@ -257,6 +295,13 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         cur_size_.fetch_sub(freed_size);
         MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
                                                                freed_size);
+        if (storage_level_ == StorageLevel::CXL) {
+            MasterMetricManager::instance().dec_allocated_cxl_size(
+                segment_name_, freed_size);
+        } else {
+            MasterMetricManager::instance().dec_allocated_dram_size(
+                segment_name_, freed_size);
+        }
         VLOG(1) << "deallocation_succeeded address=" << handle->data()
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
