@@ -17,7 +17,9 @@ use mooncake_store_client::{
     MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
     ReplicationPolicy, RouteControlMode,
 };
-use mooncake_store_core::{ObjectRoute, SegmentAnnouncement, SegmentName, StoreError};
+use mooncake_store_core::{
+    ClientEpoch, ClientLifecycleState, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
+};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -65,6 +67,8 @@ impl PyMooncakeDistributedStore {
         master_server = "",
         *,
         stable_id = None,
+        epoch = 1,
+        initial_state = "active",
         tenant = "default",
         labels = None,
         routed_writes = false,
@@ -74,7 +78,8 @@ impl PyMooncakeDistributedStore {
         local_segment_name = None,
         expires_at_ms = None,
         use_hugepage = None,
-        hugepage_size = None
+        hugepage_size = None,
+        route_control = "embedded_wrh"
     ))]
     #[allow(clippy::too_many_arguments)]
     fn setup(
@@ -87,6 +92,8 @@ impl PyMooncakeDistributedStore {
         rdma_devices: &str,
         master_server: &str,
         stable_id: Option<String>,
+        epoch: u64,
+        initial_state: &str,
         tenant: &str,
         labels: Option<BTreeMap<String, String>>,
         routed_writes: bool,
@@ -97,7 +104,11 @@ impl PyMooncakeDistributedStore {
         expires_at_ms: Option<u64>,
         use_hugepage: Option<bool>,
         hugepage_size: Option<usize>,
+        route_control: &str,
     ) -> PyResult<i32> {
+        let epoch = parse_client_epoch_arg(epoch)?;
+        let initial_state = parse_initial_state_arg(initial_state)?;
+        let route_control = parse_route_control_arg(route_control)?;
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
                 local_hostname: local_hostname.to_string(),
@@ -118,7 +129,9 @@ impl PyMooncakeDistributedStore {
                 hugepage_size_bytes: hugepage_size,
             },
             local_segment_name,
-            route_control: RouteControlMode::EmbeddedWrh,
+            epoch,
+            initial_state,
+            route_control,
         }
         .build()
         .map_err(store_error_to_py)?;
@@ -1447,6 +1460,36 @@ fn store_error_to_py(error: StoreError) -> PyErr {
     }
 }
 
+fn parse_route_control_arg(value: &str) -> PyResult<RouteControlMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "embedded_wrh" | "embedded-wrh" | "wrh" => Ok(RouteControlMode::EmbeddedWrh),
+        "metadata_only" | "metadata-only" | "metadata" => Ok(RouteControlMode::MetadataOnly),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported route_control {value:?}; expected embedded_wrh or metadata_only"
+        ))),
+    }
+}
+
+fn parse_client_epoch_arg(value: u64) -> PyResult<ClientEpoch> {
+    if value == 0 {
+        return Err(PyValueError::new_err("epoch must be greater than zero"));
+    }
+    Ok(ClientEpoch(value))
+}
+
+fn parse_initial_state_arg(value: &str) -> PyResult<ClientLifecycleState> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "standby" => Ok(ClientLifecycleState::Standby),
+        "active" => Ok(ClientLifecycleState::Active),
+        "draining" => Ok(ClientLifecycleState::Draining),
+        "sealed" => Ok(ClientLifecycleState::Sealed),
+        "offline" => Ok(ClientLifecycleState::Offline),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported initial_state {value:?}; expected standby, active, draining, sealed, or offline"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1472,14 +1515,15 @@ mod tests {
         TransferStatus,
     };
     use parking_lot::Mutex;
-    use pyo3::exceptions::{PyKeyError, PyRuntimeError};
+    use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
     use pyo3::types::{PyAnyMethods, PyBytesMethods, PyModule};
     use pyo3::{prepare_freethreaded_python, Python};
 
     use super::{
-        _store_rs, init_tracing, metrics_server_address, metrics_text, pointer_from_usize,
-        replication_policy, route_to_py, segment_to_py, start_metrics_server, stop_metrics_server,
-        store_error_to_py, PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
+        _store_rs, init_tracing, metrics_server_address, metrics_text, parse_client_epoch_arg,
+        parse_initial_state_arg, pointer_from_usize, replication_policy, route_to_py,
+        segment_to_py, start_metrics_server, stop_metrics_server, store_error_to_py,
+        PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
     };
     use crate::dispatcher::StoreDispatcher;
     use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
@@ -1900,6 +1944,35 @@ mod tests {
             assert!(not_found.is_instance_of::<PyKeyError>(py));
             let runtime = store_error_to_py(StoreError::Metadata("oops".to_string()));
             assert!(runtime.is_instance_of::<PyRuntimeError>(py));
+        });
+    }
+
+    #[test]
+    fn python_setup_parsers_accept_hot_upgrade_identity_flags() {
+        assert_eq!(
+            parse_client_epoch_arg(7).expect("epoch parser should accept positive values"),
+            ClientEpoch(7)
+        );
+        assert_eq!(
+            parse_initial_state_arg("standby").expect("state parser should accept standby"),
+            ClientLifecycleState::Standby
+        );
+        assert_eq!(
+            parse_initial_state_arg(" Draining ").expect("state parser should trim input"),
+            ClientLifecycleState::Draining
+        );
+    }
+
+    #[test]
+    fn python_setup_parsers_reject_invalid_hot_upgrade_identity_flags() {
+        init_python();
+        Python::with_gil(|py| {
+            assert!(parse_client_epoch_arg(0)
+                .expect_err("epoch zero must be rejected")
+                .is_instance_of::<PyValueError>(py));
+            assert!(parse_initial_state_arg("promoting")
+                .expect_err("unknown lifecycle state must be rejected")
+                .is_instance_of::<PyValueError>(py));
         });
     }
 
