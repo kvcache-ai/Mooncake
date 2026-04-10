@@ -8,6 +8,69 @@
 
 using namespace mooncake;
 
+TEST(UtilsTest, BuildLogicalObjectIdFallsBackToRawKey) {
+    ReplicateConfig config;
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+
+    auto object_id = BuildLogicalObjectId("raw-key", config);
+
+    EXPECT_EQ(object_id.tenant_id, "tenant-a");
+    EXPECT_EQ(object_id.domain_id, "domain-a");
+    EXPECT_EQ(object_id.object_set, "set-a");
+    EXPECT_EQ(object_id.logical_key, "raw-key");
+}
+
+TEST(UtilsTest, BuildLogicalObjectIdPrefersExplicitLogicalKey) {
+    ReplicateConfig config;
+    config.tenant_id = "tenant-b";
+    config.domain_id = "domain-b";
+    config.object_set = "set-b";
+    config.logical_key = "logical-b";
+
+    auto object_id = BuildLogicalObjectId("raw-key", config);
+
+    EXPECT_EQ(object_id.tenant_id, "tenant-b");
+    EXPECT_EQ(object_id.domain_id, "domain-b");
+    EXPECT_EQ(object_id.object_set, "set-b");
+    EXPECT_EQ(object_id.logical_key, "logical-b");
+}
+
+TEST(UtilsTest, MaybeBuildReuseIdentityRejectsNonSharedScope) {
+    EXPECT_FALSE(MaybeBuildReuseIdentity("tenant", "domain", "private",
+                                         "tenant/domain/set/key")
+                     .has_value());
+    EXPECT_FALSE(MaybeBuildReuseIdentity("tenant", "domain",
+                                         "tenant_shared", "")
+                     .has_value());
+}
+
+TEST(UtilsTest, MaybeBuildReuseIdentityAcceptsTenantSharedCanonicalKey) {
+    auto reuse_identity = MaybeBuildReuseIdentity(
+        "tenant", "domain", "tenant_shared", "tenant/domain/set/key");
+
+    ASSERT_TRUE(reuse_identity.has_value());
+    EXPECT_EQ(reuse_identity->tenant_id, "tenant");
+    EXPECT_EQ(reuse_identity->domain_id, "domain");
+    EXPECT_EQ(reuse_identity->sharing_scope, "tenant_shared");
+    EXPECT_EQ(reuse_identity->canonical_key, "tenant/domain/set/key");
+}
+
+TEST(UtilsTest, BuildCanonicalObjectKeyMatchesLogicalIdentity) {
+    ReplicateConfig config;
+    config.tenant_id = "tenant-c";
+    config.domain_id = "domain-c";
+    config.object_set = "set-c";
+    config.logical_key = "logical-c";
+
+    auto object_id = BuildLogicalObjectId("raw-key", config);
+    EXPECT_EQ(BuildCanonicalObjectKey(object_id.tenant_id, object_id.domain_id,
+                                      object_id.object_set,
+                                      object_id.logical_key),
+              "tenant-c/domain-c/set-c/logical-c");
+}
+
 TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(999), "999 B");
     EXPECT_EQ(byte_size_to_string(2048), "2.00 KB");

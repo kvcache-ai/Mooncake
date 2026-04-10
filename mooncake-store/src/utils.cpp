@@ -381,6 +381,39 @@ static std::string SanitizeKey(const std::string &key) {
     return sanitized_key;
 }
 
+std::string BuildCanonicalObjectKey(const std::string &tenant_id,
+                                    const std::string &domain_id,
+                                    const std::string &object_set,
+                                    const std::string &logical_key) {
+    return tenant_id + "/" + domain_id + "/" + object_set + "/" +
+           logical_key;
+}
+
+LogicalObjectId BuildLogicalObjectId(const std::string &raw_key,
+                                     const ReplicateConfig &config) {
+    return LogicalObjectId{config.tenant_id, config.domain_id,
+                           config.object_set,
+                           config.logical_key.empty() ? raw_key
+                                                      : config.logical_key};
+}
+
+ReuseIdentity BuildReuseIdentity(const std::string &tenant_id,
+                                 const std::string &domain_id,
+                                 const std::string &sharing_scope,
+                                 const std::string &canonical_key) {
+    return ReuseIdentity{tenant_id, domain_id, sharing_scope, canonical_key};
+}
+
+std::optional<ReuseIdentity> MaybeBuildReuseIdentity(
+    const std::string &tenant_id, const std::string &domain_id,
+    const std::string &sharing_scope, const std::string &canonical_key) {
+    if (sharing_scope != "tenant_shared" || canonical_key.empty()) {
+        return std::nullopt;
+    }
+    return BuildReuseIdentity(tenant_id, domain_id, sharing_scope,
+                              canonical_key);
+}
+
 std::string ResolvePathFromKey(const std::string &key,
                                const std::string &root_dir,
                                const std::string &fsdir) {

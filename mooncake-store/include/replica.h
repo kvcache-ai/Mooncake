@@ -112,6 +112,52 @@ struct ReplicateConfig {
     }
 };
 
+struct LogicalObjectId {
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string object_set{"default"};
+    std::string logical_key{};
+
+    bool operator==(const LogicalObjectId& other) const {
+        return tenant_id == other.tenant_id &&
+               domain_id == other.domain_id &&
+               object_set == other.object_set &&
+               logical_key == other.logical_key;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const LogicalObjectId& id) noexcept {
+        return os << "LogicalObjectId: { tenant_id: " << id.tenant_id
+                  << ", domain_id: " << id.domain_id
+                  << ", object_set: " << id.object_set
+                  << ", logical_key: " << id.logical_key << " }";
+    }
+};
+YLT_REFL(LogicalObjectId, tenant_id, domain_id, object_set, logical_key);
+
+struct ReuseIdentity {
+    std::string tenant_id{"default"};
+    std::string domain_id{"default"};
+    std::string sharing_scope{};
+    std::string canonical_key{};
+
+    bool operator==(const ReuseIdentity& other) const {
+        return tenant_id == other.tenant_id &&
+               domain_id == other.domain_id &&
+               sharing_scope == other.sharing_scope &&
+               canonical_key == other.canonical_key;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const ReuseIdentity& identity) noexcept {
+        return os << "ReuseIdentity: { tenant_id: " << identity.tenant_id
+                  << ", domain_id: " << identity.domain_id
+                  << ", sharing_scope: " << identity.sharing_scope
+                  << ", canonical_key: " << identity.canonical_key << " }";
+    }
+};
+YLT_REFL(ReuseIdentity, tenant_id, domain_id, sharing_scope, canonical_key);
+
 struct MemoryReplicaData {
     std::unique_ptr<AllocatedBuffer> buffer;
 };
