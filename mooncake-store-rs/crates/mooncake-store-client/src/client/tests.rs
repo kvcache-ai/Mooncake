@@ -9,8 +9,9 @@ use std::time::Duration;
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, StoreError,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey,
+    RouteCasRequest, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+    StoreError,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -19,17 +20,27 @@ use mooncake_transport::{
 use parking_lot::Mutex;
 
 use super::{
-    LocalAllocatorAdapter, LocalAllocatorState, PendingReclaim, SegmentAllocator, StoreState,
+    align_up_u64, compatibility_matches, control_bind_host, copy_into_region, flatten_slices,
+    now_ms, record_success_metric, scatter_into_buffers, LocalAllocatorAdapter,
+    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget,
+    SegmentAllocator, StoreState,
 };
 use crate::{
-    control_plane::AllocatorService, render_prometheus_metrics, reset_metrics,
-    transport::StoreTransport, GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade,
-    MultiBufferGetRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
-    ReplicationPolicy, StoreClientBuilder,
+    control_plane::{AllocatorService, AuthorityService, ReleaseOp},
+    render_prometheus_metrics, reset_metrics,
+    memory::RegionAllocation,
+    transport::{StoreTransport, StoreTransportFactory},
+    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
+    MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
+    ReplicationPolicy, RouteControlMode, StoreClientBuilder,
 };
 
 struct TestTransport {
     local_segment: String,
+    state: Arc<Mutex<TestTransportState>>,
+}
+
+struct TestTransportFactory {
     state: Arc<Mutex<TestTransportState>>,
 }
 
@@ -321,6 +332,12 @@ impl TestTransport {
         }
     }
 
+    fn factory(&self) -> Arc<dyn StoreTransportFactory> {
+        Arc::new(TestTransportFactory {
+            state: self.state.clone(),
+        })
+    }
+
     fn add_external_segment(&self, segment_name: &str, size: usize) -> u64 {
         let mut state = self.state.lock();
         let base = allocate_boxed_region(&mut state, size);
@@ -332,6 +349,15 @@ impl TestTransport {
         let handle = state.segments_by_name.get(segment_name)?;
         let segment = state.segments_by_handle.get(handle)?;
         Some((segment.base as u64, segment.len as u64))
+    }
+}
+
+impl StoreTransportFactory for TestTransportFactory {
+    fn create(&self, segment_name: &str) -> mooncake_store_core::Result<Arc<dyn StoreTransport>> {
+        Ok(Arc::new(TestTransport {
+            local_segment: segment_name.to_string(),
+            state: self.state.clone(),
+        }))
     }
 }
 
@@ -1872,6 +1898,821 @@ fn request_replication_policy_honors_preferred_segment() {
     assert_eq!(route.replicas.len(), 1);
     assert_eq!(route.replicas[0].owner, owner_b);
     assert_eq!(route.replicas[0].segment_name, SegmentName::new("seg-b"));
+}
+
+#[test]
+fn helper_primitives_and_request_builders_cover_contracts() {
+    reset_metrics();
+
+    let object = ObjectRef::new("alpha").tenant("tenant-a");
+    assert_eq!(object.tenant, Some("tenant-a"));
+    assert_eq!(object.key, "alpha");
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(2)
+        .with_soft_pin(true)
+        .prefer_alloc_in_same_node(true)
+        .prefer_local(false)
+        .preferred_segment("seg-a")
+        .preferred_segments(["seg-b", "seg-c"])
+        .preferred_storage_owner("owner-a")
+        .preferred_storage_owners(["owner-b", "owner-c"]);
+    assert_eq!(policy.replica_count, Some(2));
+    assert!(policy.with_soft_pin);
+    assert!(policy.prefer_alloc_in_same_node);
+    assert!(!policy.prefer_local);
+    assert_eq!(
+        policy.preferred_segments,
+        vec![SegmentName::new("seg-b"), SegmentName::new("seg-c")]
+    );
+    assert_eq!(
+        policy.preferred_storage_owners,
+        vec!["owner-b".to_string(), "owner-c".to_string()]
+    );
+
+    let put = PutRequest::new("put-key", b"put-value")
+        .tenant("tenant-a")
+        .replication(policy.clone());
+    assert_eq!(put.tenant, Some("tenant-a"));
+    assert_eq!(put.key, "put-key");
+    assert_eq!(put.value, b"put-value");
+    assert_eq!(put.policy, Some(policy.clone()));
+
+    let source = [1u8, 2, 3, 4];
+    let put_from = PutFromRequest::new("from-key", source.as_ptr().cast(), source.len())
+        .tenant("tenant-a")
+        .replication(policy.clone());
+    assert_eq!(put_from.tenant, Some("tenant-a"));
+    assert_eq!(put_from.key, "from-key");
+    assert_eq!(put_from.size, source.len());
+    assert_eq!(put_from.policy, Some(policy.clone()));
+
+    let slices = [b"left".as_slice(), b"-right".as_slice()];
+    let multi_put = MultiBufferPutRequest::new("multi-put", &slices)
+        .tenant("tenant-a")
+        .replication(policy);
+    assert_eq!(multi_put.tenant, Some("tenant-a"));
+    assert_eq!(multi_put.key, "multi-put");
+    assert_eq!(multi_put.buffers.len(), 2);
+    assert!(multi_put.policy.is_some());
+
+    let mut get_buffer = [0u8; 8];
+    let get = GetRequest::new("get-key", &mut get_buffer).tenant("tenant-a");
+    assert_eq!(get.tenant, Some("tenant-a"));
+    assert_eq!(get.key, "get-key");
+    assert_eq!(get.buffer.len(), 8);
+
+    let mut shard_a = [0u8; 2];
+    let mut shard_b = [0u8; 4];
+    let mut shard_refs: [&mut [u8]; 2] = [&mut shard_a, &mut shard_b];
+    let multi_get = MultiBufferGetRequest::new("multi-get", &mut shard_refs).tenant("tenant-a");
+    assert_eq!(multi_get.tenant, Some("tenant-a"));
+    assert_eq!(multi_get.key, "multi-get");
+    assert_eq!(multi_get.buffers.len(), 2);
+
+    let payload = flatten_slices(&[b"hello".as_slice(), b"-world".as_slice()]);
+    assert_eq!(payload, b"hello-world");
+
+    let mut scatter_a = [0u8; 3];
+    let mut scatter_b = [0u8; 4];
+    let mut scatter_c = [0u8; 2];
+    let mut scatter_refs: [&mut [u8]; 3] = [&mut scatter_a, &mut scatter_b, &mut scatter_c];
+    scatter_into_buffers(b"hello", &mut scatter_refs);
+    assert_eq!(&scatter_a, b"hel");
+    assert_eq!(&scatter_b, b"lo\0\0");
+    assert_eq!(&scatter_c, b"\0\0");
+
+    let mut region = [0u8; 8];
+    copy_into_region(
+        RegionAllocation {
+            addr: region.as_mut_ptr().cast(),
+        },
+        b"rust",
+    );
+    assert_eq!(&region[..4], b"rust");
+
+    let lease_a = ClientLease {
+        runtime: ClientRuntimeId::new("compat-a", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: 1,
+    };
+    let mut lease_b = lease_a.clone();
+    assert!(compatibility_matches(&lease_a, &lease_b));
+    lease_b.compatibility.transport_api_version += 1;
+    assert!(!compatibility_matches(&lease_a, &lease_b));
+
+    assert_eq!(control_bind_host(""), "127.0.0.1");
+    assert_eq!(control_bind_host("0.0.0.0:7001"), "127.0.0.1");
+    assert_eq!(control_bind_host("10.0.0.9:7001"), "10.0.0.9");
+    assert_eq!(align_up_u64(17, 8), 24);
+    assert_eq!(align_up_u64(64, 64), 64);
+    assert!(now_ms() > 0);
+
+    record_success_metric("helper_metric", 12, 34);
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"helper_metric\",status=\"ok\""));
+    assert!(metrics.contains("mooncake_store_client_operation_bytes_in_total"));
+
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    assert!(matches!(
+        StoreClientBuilder::new(metadata, "builder-tenant-empty")
+            .tenant("")
+            .build(10_000),
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let custom_compat = CompatibilityDescriptor {
+        store_api_version: 7,
+        ..CompatibilityDescriptor::default()
+    };
+    let builder_transport = Arc::new(TestTransport::new("builder-compat-segment"));
+    let built = StoreClientBuilder::new(
+        Arc::new(InMemoryMetadataBackend::new()),
+        "builder-compat",
+    )
+    .compatibility(custom_compat.clone())
+    .route_control(RouteControlMode::MetadataOnly)
+    .state(ClientLifecycleState::Active)
+    .transport(builder_transport)
+    .build(10_000)
+    .expect("builder with compatibility and route_control should succeed");
+    assert_eq!(built.lease().compatibility, custom_compat);
+}
+
+#[test]
+fn compatibility_facade_surface_covers_aliases_and_buffers() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("facade-segment"));
+    let mut client = StoreClientBuilder::new(metadata.clone(), "facade-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7011")
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(512))
+        .build(10_000)
+        .expect("client build should succeed");
+
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    client
+        .mount_segment(512, 0, vec!["dram".to_string()])
+        .expect("mount_segment should refresh the primary announcement");
+    assert_eq!(
+        client.get_hostname().expect("hostname should exist"),
+        "127.0.0.1:7011"
+    );
+    assert!(matches!(
+        client.expand_local_memory(0),
+        Err(StoreError::Allocator(_))
+    ));
+
+    client
+        .heartbeat(20_000)
+        .expect("heartbeat should succeed");
+    client.enter_standby().expect("standby should succeed");
+    client.activate().expect("activate should succeed");
+    let handoff = client
+        .plan_handoff(ClientEpoch(2), HandoffKind::HotUpgrade, 9, 100, Some(200))
+        .expect("handoff should be planned");
+    assert_eq!(handoff.to.epoch, ClientEpoch(2));
+
+    let primary = client.segment_name().expect("primary segment should exist");
+    assert!(matches!(
+        client.retire_segment(&primary),
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let expanded = client
+        .expand_local_memory(128)
+        .expect("local memory expansion should succeed");
+    let listed = client.list_segments().expect("segment list should succeed");
+    assert!(listed.iter().any(|segment| segment.segment_name == primary));
+    assert!(
+        listed
+            .iter()
+            .any(|segment| segment.segment_name == expanded.segment_name)
+    );
+    client
+        .drain_segment(&expanded.segment_name)
+        .expect("drain should succeed");
+    assert!(
+        client
+            .retire_segment(&expanded.segment_name)
+            .expect("retire should succeed")
+    );
+
+    let plain = client.put("plain", b"hello").expect("put should succeed");
+    assert_eq!(client.get("plain").expect("get should succeed"), b"hello");
+    let tenant_plain = client
+        .put_in_tenant("tenant-b", "plain", b"world")
+        .expect("tenant put should succeed");
+    assert_eq!(
+        client
+            .get_in_tenant("tenant-b", "plain")
+            .expect("tenant get should succeed"),
+        b"world"
+    );
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .with_soft_pin(true)
+        .prefer_local(true);
+    client
+        .put_with_policy("policy", b"policy!", &policy)
+        .expect("policy put should succeed");
+    client
+        .put_in_tenant_with_policy("tenant-b", "policy", b"tenant-policy", &policy)
+        .expect("tenant policy put should succeed");
+
+    let mut source = [0u8; 128];
+    source[..5].copy_from_slice(b"from!");
+    source[16..22].copy_from_slice(b"tenant");
+    source[32..39].copy_from_slice(b"policy!");
+    source[48..56].copy_from_slice(b"tpolicy!");
+    source[64..69].copy_from_slice(b"batch");
+    source[80..86].copy_from_slice(b"buffer");
+    assert!(matches!(
+        client.put_from("null", ptr::null(), 4),
+        Err(StoreError::Allocator(_))
+    ));
+    let outside = [7u8; 4];
+    assert!(matches!(
+        client.put_from("outside", outside.as_ptr().cast(), outside.len()),
+        Err(StoreError::Allocator(_))
+    ));
+    assert!(matches!(
+        client.register_buffer(source.as_mut_ptr().cast(), 0),
+        Err(StoreError::Allocator(_))
+    ));
+    client
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("buffer register should succeed");
+    client
+        .put_from("from", source.as_ptr().cast(), 5)
+        .expect("put_from should succeed");
+    client
+        .put_from_in_tenant("tenant-b", "from", unsafe { source.as_ptr().add(16).cast() }, 6)
+        .expect("tenant put_from should succeed");
+    client
+        .put_from_with_policy(
+            "from-policy",
+            unsafe { source.as_ptr().add(32).cast() },
+            7,
+            &policy,
+        )
+        .expect("policy put_from should succeed");
+    client
+        .put_from_in_tenant_with_policy(
+            "tenant-b",
+            "from-policy",
+            unsafe { source.as_ptr().add(48).cast() },
+            8,
+            &policy,
+        )
+        .expect("tenant policy put_from should succeed");
+
+    let batch_routes = client
+        .batch_put(&[
+            PutRequest::new("batch-a", b"alpha"),
+            PutRequest::new("batch-b", b"bravo")
+                .tenant("tenant-b")
+                .replication(ReplicationPolicy::new().replica_count(1)),
+        ])
+        .expect("batch_put should succeed");
+    assert_eq!(batch_routes.len(), 2);
+
+    let batch_from_routes = client
+        .batch_put_from(&[
+            PutFromRequest::new("batch-from-a", unsafe { source.as_ptr().add(64).cast() }, 5),
+            PutFromRequest::new("batch-from-b", unsafe { source.as_ptr().add(80).cast() }, 6)
+                .tenant("tenant-b"),
+        ])
+        .expect("batch_put_from should succeed");
+    assert_eq!(batch_from_routes.len(), 2);
+
+    let slices_a = [b"multi".as_slice(), b"-a".as_slice()];
+    let slices_b = [b"multi".as_slice(), b"-tenant".as_slice()];
+    let multi_routes = client
+        .batch_put_from_multi_buffers(&[
+            MultiBufferPutRequest::new("multi-a", &slices_a),
+            MultiBufferPutRequest::new("multi-b", &slices_b)
+                .tenant("tenant-b")
+                .replication(ReplicationPolicy::new().replica_count(1)),
+        ])
+        .expect("multi-buffer put should succeed");
+    assert_eq!(multi_routes.len(), 2);
+
+    assert_eq!(
+        client.get_size("plain").expect("plain size should exist"),
+        plain.replicas[0].length as usize
+    );
+    assert_eq!(
+        client
+            .get_size_in_tenant("tenant-b", "plain")
+            .expect("tenant size should exist"),
+        tenant_plain.replicas[0].length as usize
+    );
+    assert!(client.is_exist("plain").expect("plain should exist"));
+    assert!(
+        client
+            .is_exist_in_tenant("tenant-b", "plain")
+            .expect("tenant plain should exist")
+    );
+    assert_eq!(
+        client
+            .batch_is_exist(&[
+                ObjectRef::new("plain"),
+                ObjectRef::new("plain").tenant("tenant-b"),
+                ObjectRef::new("missing"),
+            ])
+            .expect("batch exist should succeed"),
+        vec![true, true, false]
+    );
+
+    let queried = client
+        .query_route("plain")
+        .expect("query should succeed")
+        .expect("plain route should exist");
+    assert_eq!(queried.key, client.scoped_key("tenant-a", "plain"));
+    let queried_tenant = client
+        .query_route_in_tenant("tenant-b", "plain")
+        .expect("tenant query should succeed")
+        .expect("tenant route should exist");
+    assert_eq!(queried_tenant.key, client.scoped_key("tenant-b", "plain"));
+
+    let mut direct_insert = queried.clone();
+    direct_insert.key = client.scoped_key("tenant-a", "cas-direct");
+    direct_insert.version = queried.version.next();
+    assert!(
+        client
+            .cas_route("cas-direct", None, Some(&direct_insert))
+            .expect("cas insert should succeed")
+            .applied
+    );
+    assert!(
+        client
+            .cas_route("cas-direct", Some(direct_insert.version), None)
+            .expect("cas delete should succeed")
+            .applied
+    );
+
+    let mut tenant_insert = queried_tenant.clone();
+    tenant_insert.key = client.scoped_key("tenant-b", "cas-tenant");
+    tenant_insert.version = queried_tenant.version.next();
+    assert!(
+        client
+            .cas_route_in_tenant("tenant-b", "cas-tenant", None, Some(&tenant_insert))
+            .expect("tenant cas insert should succeed")
+            .applied
+    );
+
+    let batch_get = client
+        .batch_get(&[
+            ObjectRef::new("plain"),
+            ObjectRef::new("from"),
+            ObjectRef::new("plain").tenant("tenant-b"),
+        ])
+        .expect("batch_get should succeed");
+    assert_eq!(batch_get[0], b"hello");
+    assert_eq!(batch_get[1], b"from!");
+    assert_eq!(batch_get[2], b"world");
+
+    let batch_get_buffer = client
+        .batch_get_buffer(&[ObjectRef::new("policy"), ObjectRef::new("from-policy")])
+        .expect("batch_get_buffer should succeed");
+    assert_eq!(batch_get_buffer[0], b"policy!");
+    assert_eq!(batch_get_buffer[1], b"policy!");
+
+    let mut get_plain = [0u8; 8];
+    let plain_size = client
+        .get_into("plain", &mut get_plain)
+        .expect("get_into should succeed");
+    assert_eq!(plain_size, 5);
+    assert_eq!(&get_plain[..plain_size], b"hello");
+
+    let mut get_tenant = [0u8; 8];
+    let tenant_size = client
+        .get_into_in_tenant("tenant-b", "plain", &mut get_tenant)
+        .expect("tenant get_into should succeed");
+    assert_eq!(tenant_size, 5);
+    assert_eq!(&get_tenant[..tenant_size], b"world");
+
+    let mut batch_into_a = [0u8; 8];
+    let mut batch_into_b = [0u8; 8];
+    let batch_sizes = client
+        .batch_get_into(&mut [
+            GetRequest::new("from", &mut batch_into_a),
+            GetRequest::new("from", &mut batch_into_b).tenant("tenant-b"),
+        ])
+        .expect("batch_get_into should succeed");
+    assert_eq!(batch_sizes, vec![5, 6]);
+    assert_eq!(&batch_into_a[..5], b"from!");
+    assert_eq!(&batch_into_b[..6], b"tenant");
+
+    let mut shard_left = [0u8; 3];
+    let mut shard_right = [0u8; 4];
+    let mut shard_refs: [&mut [u8]; 2] = [&mut shard_left, &mut shard_right];
+    let multi_sizes = client
+        .batch_get_into_multi_buffers(&mut [MultiBufferGetRequest::new("policy", &mut shard_refs)])
+        .expect("multi-buffer get should succeed");
+    assert_eq!(multi_sizes, vec![7]);
+    assert_eq!(&shard_left, b"pol");
+    assert_eq!(&shard_right, b"icy!");
+
+    client.remove("plain", false).expect("remove should succeed");
+    client
+        .remove_in_tenant("tenant-b", "plain", false)
+        .expect("tenant remove should succeed");
+    client
+        .batch_remove(
+            &[
+                ObjectRef::new("batch-a"),
+                ObjectRef::new("batch-b").tenant("tenant-b"),
+                ObjectRef::new("batch-from-b").tenant("tenant-b"),
+            ],
+            false,
+        )
+        .expect("batch_remove should succeed");
+    assert!(!client.is_exist("plain").expect("plain should be gone"));
+    assert!(
+        !client
+            .is_exist_in_tenant("tenant-b", "plain")
+            .expect("tenant plain should be gone")
+    );
+
+    client
+        .unregister_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("buffer unregister should succeed");
+}
+
+#[test]
+fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("adapter-segment"));
+    let client = StoreClientBuilder::new(metadata.clone(), "adapter-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(256))
+        .build(10_000)
+        .expect("client build should succeed");
+
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    let route = client
+        .put_in_tenant("tenant-z", "alpha", b"payload")
+        .expect("seed put should succeed");
+
+    let namespace = metadata.route_namespace();
+    let authority = client.runtime_id().stable_id.clone();
+    let scoped_key = client.scoped_key("tenant-z", "alpha");
+
+    let local_authority = LocalAuthorityAdapter;
+    assert_eq!(
+        local_authority
+            .get_route(&namespace, &authority, &scoped_key)
+            .expect("single authority get should succeed"),
+        Some(route.clone())
+    );
+    assert_eq!(
+        local_authority
+            .batch_get_routes(
+                &namespace,
+                &authority,
+                &[scoped_key.clone(), ObjectKey::new("tenant-z::missing")]
+            )
+            .len(),
+        2
+    );
+    assert_eq!(
+        local_authority
+            .list_routes_by_replica_owner(&namespace, &authority, client.runtime_id())
+            .expect("list by owner should succeed")
+            .len(),
+        1
+    );
+
+    let mut updated = route.clone();
+    updated.version = route.version.next();
+    assert!(
+        local_authority
+            .compare_and_swap_route(
+                &namespace,
+                &authority,
+                &scoped_key,
+                Some(route.version),
+                Some(&updated),
+            )
+            .expect("single authority cas should succeed")
+            .applied
+    );
+    let cas_many = local_authority.batch_compare_and_swap_routes(
+        &namespace,
+        &authority,
+        &[
+            RouteCasRequest {
+                key: scoped_key.clone(),
+                expected: Some(updated.version),
+                next: Some(route.clone()),
+            },
+            RouteCasRequest {
+                key: ObjectKey::new("tenant-z::ghost"),
+                expected: Some(RouteVersion(999)),
+                next: None,
+            },
+        ],
+    );
+    assert!(cas_many[0].as_ref().expect("first batch cas should decode").applied);
+    assert!(!cas_many[1]
+        .as_ref()
+        .expect("second batch cas should decode")
+        .applied);
+
+    let replace_key = ObjectKey::new("tenant-z::replaced");
+    let mut replaced_route = route.clone();
+    replaced_route.key = replace_key.clone();
+    replaced_route.version = route.version.next();
+    local_authority
+        .replace_route(&namespace, &authority, &replace_key, Some(&replaced_route))
+        .expect("single replace should succeed");
+    let replaced = local_authority.batch_get_routes(
+        &namespace,
+        &authority,
+        std::slice::from_ref(&replace_key),
+    );
+    assert!(replaced[0]
+        .as_ref()
+        .expect("replaced route should decode")
+        .is_some());
+    let replace_many = local_authority.batch_replace_routes(
+        &namespace,
+        &authority,
+        &[RouteCasRequest {
+            key: replace_key.clone(),
+            expected: None,
+            next: None,
+        }],
+    );
+    assert!(replace_many[0].is_ok());
+
+    let missing_authority = ClientStableId::new("missing-authority");
+    let missing_get = local_authority.batch_get_routes(
+        &namespace,
+        &missing_authority,
+        std::slice::from_ref(&scoped_key),
+    );
+    assert!(matches!(missing_get[0], Err(StoreError::NotFound(_))));
+    let missing_cas = local_authority.batch_compare_and_swap_routes(
+        &namespace,
+        &missing_authority,
+        &[RouteCasRequest {
+            key: scoped_key.clone(),
+            expected: None,
+            next: Some(route.clone()),
+        }],
+    );
+    assert!(matches!(missing_cas[0], Err(StoreError::NotFound(_))));
+    let missing_replace = local_authority.batch_replace_routes(
+        &namespace,
+        &missing_authority,
+        &[RouteCasRequest {
+            key: scoped_key.clone(),
+            expected: None,
+            next: None,
+        }],
+    );
+    assert!(matches!(missing_replace[0], Err(StoreError::NotFound(_))));
+
+    let local_allocator = LocalAllocatorAdapter {
+        runtime: client.runtime_id().clone(),
+        allocator: client.allocator.clone(),
+    };
+    let primary = client.segment_name().expect("primary segment should exist");
+    let single_reservation = local_allocator
+        .reserve_specific(client.runtime_id(), &primary, 8)
+        .expect("single reserve_specific should succeed");
+    local_allocator
+        .release(
+            client.runtime_id(),
+            &primary,
+            single_reservation.offset_bytes,
+            single_reservation.length_bytes,
+        )
+        .expect("single allocator release should succeed");
+    let wrong_owner = ClientRuntimeId::new("wrong-owner", ClientEpoch(9));
+    assert!(matches!(
+        local_allocator.reserve_any(&wrong_owner, 8),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        local_allocator.reserve_specific(&wrong_owner, &primary, 8),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(matches!(
+        local_allocator.release(&wrong_owner, &primary, 0, 8),
+        Err(StoreError::InvalidState(_))
+    ));
+
+    let lease = client.lease().clone();
+    let control = client.control_client.clone();
+    let rpc_get = control
+        .batch_get_routes(&lease, &namespace, &authority, std::slice::from_ref(&scoped_key))
+        .expect("rpc batch get should succeed");
+    assert!(rpc_get[0]
+        .as_ref()
+        .expect("rpc route should decode")
+        .is_some());
+
+    let mut rpc_updated = route.clone();
+    rpc_updated.version = route.version.next();
+    let rpc_cas = control
+        .batch_compare_and_swap_routes(
+            &lease,
+            &namespace,
+            &authority,
+            &[RouteCasRequest {
+                key: scoped_key.clone(),
+                expected: Some(route.version),
+                next: Some(rpc_updated.clone()),
+            }],
+        )
+        .expect("rpc batch cas should succeed");
+    assert!(rpc_cas[0].as_ref().expect("rpc cas should decode").applied);
+    let rpc_list = control
+        .list_routes_by_replica_owner(&lease, &namespace, &authority, client.runtime_id())
+        .expect("rpc list should succeed");
+    assert_eq!(rpc_list.len(), 1);
+    let rpc_replace = control
+        .batch_replace_routes(
+            &lease,
+            &namespace,
+            &authority,
+            &[RouteCasRequest {
+                key: scoped_key.clone(),
+                expected: None,
+                next: Some(route.clone()),
+            }],
+        )
+        .expect("rpc batch replace should succeed");
+    assert!(rpc_replace[0].is_ok());
+
+    let rpc_reservations = control
+        .batch_reserve_any(&lease, client.runtime_id(), &[8, 16])
+        .expect("rpc reserve_any should succeed");
+    let rpc_reservations = rpc_reservations
+        .into_iter()
+        .map(|result| result.expect("reserve_any item should succeed"))
+        .collect::<Vec<_>>();
+    let rpc_specific = control
+        .batch_reserve_specific(
+            &lease,
+            client.runtime_id(),
+            &[crate::control_plane::ReserveSpecificOp {
+                segment_name: primary.clone(),
+                length_bytes: 8,
+            }],
+        )
+        .expect("rpc reserve_specific should succeed");
+    let rpc_specific = rpc_specific[0]
+        .as_ref()
+        .expect("reserve_specific item should succeed")
+        .clone();
+    let release_results = control
+        .batch_release(
+            &lease,
+            client.runtime_id(),
+            &[
+                ReleaseOp {
+                    segment_name: rpc_reservations[0].segment_name.clone(),
+                    offset_bytes: rpc_reservations[0].offset_bytes,
+                    length_bytes: rpc_reservations[0].length_bytes,
+                },
+                ReleaseOp {
+                    segment_name: rpc_reservations[1].segment_name.clone(),
+                    offset_bytes: rpc_reservations[1].offset_bytes,
+                    length_bytes: rpc_reservations[1].length_bytes,
+                },
+                ReleaseOp {
+                    segment_name: rpc_specific.segment_name.clone(),
+                    offset_bytes: rpc_specific.offset_bytes,
+                    length_bytes: rpc_specific.length_bytes,
+                },
+            ],
+        )
+        .expect("rpc release should succeed");
+    assert!(release_results.iter().all(|result| result.is_ok()));
+
+    let wrong_reserve = control
+        .batch_reserve_any(&lease, &wrong_owner, &[8])
+        .expect("wrong-owner reserve should still reply");
+    assert!(matches!(wrong_reserve[0], Err(StoreError::InvalidState(_))));
+    let wrong_release = control
+        .batch_release(
+            &lease,
+            &wrong_owner,
+            &[ReleaseOp {
+                segment_name: primary.clone(),
+                offset_bytes: 0,
+                length_bytes: 8,
+            }],
+        )
+        .expect("wrong-owner release should still reply");
+    assert!(matches!(wrong_release[0], Err(StoreError::InvalidState(_))));
+    let missing_rpc_get = control
+        .batch_get_routes(
+            &lease,
+            &namespace,
+            &missing_authority,
+            std::slice::from_ref(&scoped_key),
+        )
+        .expect("missing authority get should still reply");
+    assert!(matches!(missing_rpc_get[0], Err(StoreError::NotFound(_))));
+}
+
+#[test]
+fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("alloc-helper-segment"));
+    let client = StoreClientBuilder::new(metadata, "alloc-helper-client")
+        .tenant("tenant-a")
+        .state(ClientLifecycleState::Active)
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(storage_config_with_bytes(256))
+        .build(10_000)
+        .expect("client build should succeed");
+
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    assert_eq!(client.default_replica_count(), 1);
+    let _planner = client.request_placement_planner();
+    assert_eq!(
+        client.scoped_key("tenant-a", "alpha"),
+        ObjectKey::new("tenant-a::alpha")
+    );
+    assert_eq!(
+        client
+            .transport()
+            .expect("transport should exist")
+            .segment_name()
+            .expect("transport segment should exist"),
+        "alloc-helper-segment"
+    );
+    assert_eq!(
+        client
+            .transport_factory()
+            .expect("transport factory should exist")
+            .create("alloc-helper-factory")
+            .expect("factory transport should build")
+            .segment_name()
+            .expect("factory segment should exist"),
+        "alloc-helper-factory"
+    );
+
+    let empty_reservations = client
+        .reserve_storage_runtime_segments_batch(&[])
+        .expect("empty reserve batch should succeed");
+    assert!(empty_reservations.is_empty());
+    client
+        .release_segment_allocations_batch(&[])
+        .expect("empty release batch should succeed");
+    client
+        .flush_due_reclaims()
+        .expect("flush_due_reclaims should accept empty queue");
+    client
+        .flush_all_reclaims()
+        .expect("flush_all_reclaims should accept empty queue");
+
+    let primary = client.segment_name().expect("primary segment should exist");
+    let (_target, reservation) = client
+        .reserve_specific_segment(client.runtime_id(), &primary, 8, true)
+        .expect("reserve_specific_segment should succeed");
+    client
+        .release_reserved_allocations(
+            &[ReplicaWriteTarget {
+                storage_runtime: client.runtime_id().clone(),
+                segment_name: primary.clone(),
+            }],
+            std::slice::from_ref(&reservation),
+        )
+        .expect("release_reserved_allocations should succeed");
+    assert!(matches!(
+        client.release_reserved_allocations(
+            &[ReplicaWriteTarget {
+                storage_runtime: client.runtime_id().clone(),
+                segment_name: primary,
+            }],
+            &[],
+        ),
+        Err(StoreError::InvalidState(_))
+    ));
 }
 
 #[test]

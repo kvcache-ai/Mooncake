@@ -1,26 +1,32 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 use parking_lot::Mutex;
+use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
 use super::{
     control_address, control_address_label, decode_error, ensure_batch_len, fail_stream_session,
-    normalize_control_uri, pb_cas_result, pb_compatibility, pb_error, pb_object_route,
-    pb_replica_route, pb_replica_tier, pb_route_state, pb_runtime_id, pb_segment_reservation,
-    status_to_store_error, store_error_from_pb, try_cas_result, try_compatibility,
-    try_object_route, try_replica_route, try_replica_tier, try_route_state, try_runtime_id,
-    try_segment_reservation, AllocatorService, AuthorityService, ControlPlaneClient,
-    ControlPlaneHandle, ControlStreamSession, ReleaseOp, ReserveSpecificOp,
+    handle_control_stream_request, normalize_control_uri, pb_cas_result, pb_compatibility,
+    pb_error, pb_object_route, pb_replica_route, pb_replica_tier, pb_route_state, pb_runtime_id,
+    pb_segment_reservation, status_to_store_error, store_error_from_pb, try_cas_result,
+    try_compatibility, try_object_route, try_replica_route, try_replica_tier, try_route_state,
+    try_runtime_id, try_segment_reservation, AllocatorService, AuthorityService,
+    ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, GrpcControlPlaneService,
+    ReleaseOp, ReserveSpecificOp,
 };
+use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use crate::control_plane::pb;
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
     RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
 };
-use tonic::Status;
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 
 #[derive(Default)]
 struct TestAuthority {
@@ -153,6 +159,194 @@ impl AllocatorService for TestAllocator {
             length_bytes,
         });
         Ok(())
+    }
+}
+
+struct ClosingStreamService {
+    inner: GrpcControlPlaneService,
+}
+
+#[tonic::async_trait]
+impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamService {
+    type ControlStreamStream = ReceiverStream<std::result::Result<pb::ControlStreamReply, Status>>;
+
+    async fn get_route(
+        &self,
+        request: Request<pb::GetRouteRequest>,
+    ) -> std::result::Result<Response<pb::GetRouteReply>, Status> {
+        self.inner.get_route(request).await
+    }
+
+    async fn batch_get_routes(
+        &self,
+        request: Request<pb::BatchGetRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchGetRoutesReply>, Status> {
+        self.inner.batch_get_routes(request).await
+    }
+
+    async fn compare_and_swap_route(
+        &self,
+        request: Request<pb::CompareAndSwapRouteRequest>,
+    ) -> std::result::Result<Response<pb::CompareAndSwapRouteReply>, Status> {
+        self.inner.compare_and_swap_route(request).await
+    }
+
+    async fn list_routes_by_replica_owner(
+        &self,
+        request: Request<pb::ListRoutesByReplicaOwnerRequest>,
+    ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
+        self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn batch_compare_and_swap_routes(
+        &self,
+        request: Request<pb::BatchCompareAndSwapRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchCompareAndSwapRoutesReply>, Status> {
+        self.inner.batch_compare_and_swap_routes(request).await
+    }
+
+    async fn replace_route(
+        &self,
+        request: Request<pb::ReplaceRouteRequest>,
+    ) -> std::result::Result<Response<pb::ReplaceRouteReply>, Status> {
+        self.inner.replace_route(request).await
+    }
+
+    async fn batch_replace_routes(
+        &self,
+        request: Request<pb::BatchReplaceRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchReplaceRoutesReply>, Status> {
+        self.inner.batch_replace_routes(request).await
+    }
+
+    async fn reserve_any(
+        &self,
+        request: Request<pb::ReserveAnyRequest>,
+    ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
+        self.inner.reserve_any(request).await
+    }
+
+    async fn batch_reserve_any(
+        &self,
+        request: Request<pb::BatchReserveAnyRequest>,
+    ) -> std::result::Result<Response<pb::BatchReserveAnyReply>, Status> {
+        self.inner.batch_reserve_any(request).await
+    }
+
+    async fn reserve_specific(
+        &self,
+        request: Request<pb::ReserveSpecificRequest>,
+    ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
+        self.inner.reserve_specific(request).await
+    }
+
+    async fn batch_reserve_specific(
+        &self,
+        request: Request<pb::BatchReserveSpecificRequest>,
+    ) -> std::result::Result<Response<pb::BatchReserveSpecificReply>, Status> {
+        self.inner.batch_reserve_specific(request).await
+    }
+
+    async fn release(
+        &self,
+        request: Request<pb::ReleaseRequest>,
+    ) -> std::result::Result<Response<pb::ReleaseReply>, Status> {
+        self.inner.release(request).await
+    }
+
+    async fn batch_release(
+        &self,
+        request: Request<pb::BatchReleaseRequest>,
+    ) -> std::result::Result<Response<pb::BatchReleaseReply>, Status> {
+        self.inner.batch_release(request).await
+    }
+
+    async fn control_stream(
+        &self,
+        _request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
+    ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
+        Err(Status::unavailable("stream disabled"))
+    }
+}
+
+struct ClosingStreamHandle {
+    address: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ClosingStreamHandle {
+    fn spawn(
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+    ) -> mooncake_store_core::Result<Self> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+            StoreError::Transport(format!("closing stream bind failed: {error}"))
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            StoreError::Transport(format!("closing stream listener setup failed: {error}"))
+        })?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| {
+                StoreError::Transport(format!("closing stream local addr failed: {error}"))
+            })?
+            .to_string();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name(format!("closing-stream-{address}"))
+            .spawn(move || {
+                let runtime = RuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should start");
+                let service = ClosingStreamService {
+                    inner: GrpcControlPlaneService::new(authority, allocator),
+                };
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("listener conversion should succeed");
+                    Server::builder()
+                        .tcp_nodelay(true)
+                        .add_service(
+                            pb::control_plane_service_server::ControlPlaneServiceServer::new(
+                                service,
+                            ),
+                        )
+                        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .expect("closing stream server should run");
+                });
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!("closing stream spawn failed: {error}"))
+            })?;
+        Ok(Self {
+            address,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ClosingStreamHandle {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -350,6 +544,7 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);
+    drop(client);
     handle.shutdown();
 }
 
@@ -477,4 +672,315 @@ fn fail_stream_session_marks_session_closed_and_drains_waiters() {
     assert!(matches!(error, StoreError::Transport(_)));
     assert!(session.closed.load(Ordering::Relaxed));
     assert!(session.pending.lock().is_empty());
+}
+
+#[test]
+fn control_plane_client_short_circuits_empty_batches_and_rejects_bad_uris() {
+    let client = ControlPlaneClient::new().expect("control plane client should build");
+    let lease = sample_lease("not a valid uri");
+    let authority = ClientStableId::new("authority");
+    let owner = sample_owner();
+
+    assert!(client
+        .batch_get_routes(&lease, "ns", &authority, &[])
+        .expect("empty route get should short-circuit")
+        .is_empty());
+    assert!(client
+        .batch_compare_and_swap_routes(&lease, "ns", &authority, &[])
+        .expect("empty cas should short-circuit")
+        .is_empty());
+    assert!(client
+        .batch_replace_routes(&lease, "ns", &authority, &[])
+        .expect("empty replace should short-circuit")
+        .is_empty());
+    assert!(client
+        .batch_reserve_any(&lease, &owner, &[])
+        .expect("empty reserve_any should short-circuit")
+        .is_empty());
+    assert!(client
+        .batch_reserve_specific(&lease, &owner, &[])
+        .expect("empty reserve_specific should short-circuit")
+        .is_empty());
+    assert!(client
+        .batch_release(&lease, &owner, &[])
+        .expect("empty release should short-circuit")
+        .is_empty());
+
+    let error = client
+        .batch_get_routes(&lease, "ns", &authority, &[ObjectKey::new("bad-key")])
+        .expect_err("invalid control uri should fail");
+    assert!(matches!(error, StoreError::Transport(_)));
+}
+
+#[test]
+fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+    let service = GrpcControlPlaneService::new(authority, allocator);
+    let runtime = RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should start");
+
+    runtime.block_on(async {
+        let get_reply = service
+            .get_route(Request::new(pb::GetRouteRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                key: "alpha".to_string(),
+            }))
+            .await
+            .expect("unary get_route should succeed")
+            .into_inner();
+        assert!(get_reply.route.is_some());
+
+        let invalid_route = pb::ObjectRoute {
+            key: "broken".to_string(),
+            version: 9,
+            state: pb_route_state(RouteState::Active),
+            compatibility: None,
+            replicas: vec![],
+        };
+
+        let cas_reply = service
+            .compare_and_swap_route(Request::new(pb::CompareAndSwapRouteRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                key: "broken".to_string(),
+                expected_version: None,
+                next: Some(invalid_route.clone()),
+            }))
+            .await
+            .expect("compare_and_swap_route should reply")
+            .into_inner();
+        assert!(cas_reply.error.is_some());
+
+        let list_error = service
+            .list_routes_by_replica_owner(Request::new(pb::ListRoutesByReplicaOwnerRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                owner: None,
+            }))
+            .await
+            .expect_err("missing owner should be rejected");
+        assert_eq!(list_error.code(), tonic::Code::InvalidArgument);
+
+        let batch_cas = service
+            .batch_compare_and_swap_routes(Request::new(pb::BatchCompareAndSwapRoutesRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                entries: vec![pb::RouteCasEntry {
+                    key: "broken".to_string(),
+                    expected_version: None,
+                    next: Some(invalid_route.clone()),
+                }],
+            }))
+            .await
+            .expect("batch cas should reply")
+            .into_inner();
+        assert_eq!(batch_cas.replies.len(), 1);
+        assert!(batch_cas.replies[0].error.is_some());
+
+        let replace = service
+            .replace_route(Request::new(pb::ReplaceRouteRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                key: "broken".to_string(),
+                next: Some(invalid_route.clone()),
+            }))
+            .await
+            .expect("replace should reply")
+            .into_inner();
+        assert!(replace.error.is_some());
+
+        let batch_replace = service
+            .batch_replace_routes(Request::new(pb::BatchReplaceRoutesRequest {
+                namespace: "ns-a".to_string(),
+                authority: "authority".to_string(),
+                entries: vec![pb::RouteReplaceEntry {
+                    key: "broken".to_string(),
+                    next: Some(invalid_route),
+                }],
+            }))
+            .await
+            .expect("batch replace should reply")
+            .into_inner();
+        assert_eq!(batch_replace.replies.len(), 1);
+        assert!(batch_replace.replies[0].error.is_some());
+
+        let reserve_any = service
+            .reserve_any(Request::new(pb::ReserveAnyRequest {
+                owner: None,
+                length_bytes: 64,
+            }))
+            .await
+            .expect("reserve_any should reply")
+            .into_inner();
+        assert!(reserve_any.error.is_some());
+
+        let reserve_any_error = service
+            .batch_reserve_any(Request::new(pb::BatchReserveAnyRequest {
+                owner: None,
+                length_bytes: vec![8, 16],
+            }))
+            .await
+            .expect_err("batch reserve_any requires owner");
+        assert_eq!(reserve_any_error.code(), tonic::Code::InvalidArgument);
+
+        let reserve_specific = service
+            .reserve_specific(Request::new(pb::ReserveSpecificRequest {
+                owner: None,
+                segment_name: "segment-a".to_string(),
+                length_bytes: 32,
+            }))
+            .await
+            .expect("reserve_specific should reply")
+            .into_inner();
+        assert!(reserve_specific.error.is_some());
+
+        let reserve_specific_error = service
+            .batch_reserve_specific(Request::new(pb::BatchReserveSpecificRequest {
+                owner: None,
+                entries: vec![pb::ReserveSpecificEntry {
+                    segment_name: "segment-a".to_string(),
+                    length_bytes: 32,
+                }],
+            }))
+            .await
+            .expect_err("batch reserve_specific requires owner");
+        assert_eq!(reserve_specific_error.code(), tonic::Code::InvalidArgument);
+
+        let release = service
+            .release(Request::new(pb::ReleaseRequest {
+                owner: None,
+                segment_name: "segment-a".to_string(),
+                offset_bytes: 0,
+                length_bytes: 8,
+            }))
+            .await
+            .expect("release should reply")
+            .into_inner();
+        assert!(release.error.is_some());
+
+        let release_error = service
+            .batch_release(Request::new(pb::BatchReleaseRequest {
+                owner: None,
+                entries: vec![pb::ReleaseEntry {
+                    segment_name: "segment-a".to_string(),
+                    offset_bytes: 0,
+                    length_bytes: 8,
+                }],
+            }))
+            .await
+            .expect_err("batch release requires owner");
+        assert_eq!(release_error.code(), tonic::Code::InvalidArgument);
+
+        let stream_reply = handle_control_stream_request(
+            &service,
+            pb::ControlStreamRequest {
+                request_id: 99,
+                body: None,
+            },
+        )
+        .await;
+        assert_eq!(stream_reply.request_id, 99);
+        assert!(stream_reply.error.is_some());
+        assert!(stream_reply.body.is_none());
+    });
+}
+
+#[test]
+fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("alpha", 1, &owner));
+
+    let mut handle = ClosingStreamHandle::spawn(authority.clone(), allocator.clone())
+        .expect("closing stream server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should build");
+    let authority_id = ClientStableId::new("authority");
+
+    let get_results = client
+        .batch_get_routes(&lease, "ns-a", &authority_id, &[ObjectKey::new("alpha")])
+        .expect("fallback batch get should succeed");
+    assert_eq!(get_results.len(), 1);
+    assert!(get_results[0]
+        .as_ref()
+        .expect("route decode should succeed")
+        .is_some());
+
+    let cas_results = client
+        .batch_compare_and_swap_routes(
+            &lease,
+            "ns-a",
+            &authority_id,
+            &[RouteCasRequest {
+                key: ObjectKey::new("alpha"),
+                expected: Some(RouteVersion(1)),
+                next: Some(sample_route("alpha", 2, &owner)),
+            }],
+        )
+        .expect("fallback cas should succeed");
+    assert!(cas_results[0].as_ref().expect("cas should decode").applied);
+
+    let listed = client
+        .list_routes_by_replica_owner(&lease, "ns-a", &authority_id, &owner)
+        .expect("fallback list should succeed");
+    assert_eq!(listed.len(), 1);
+
+    let replace_results = client
+        .batch_replace_routes(
+            &lease,
+            "ns-a",
+            &authority_id,
+            &[RouteCasRequest {
+                key: ObjectKey::new("alpha"),
+                expected: None,
+                next: Some(sample_route("alpha", 3, &owner)),
+            }],
+        )
+        .expect("fallback replace should succeed");
+    assert!(replace_results[0].is_ok());
+
+    let reserve_any = client
+        .batch_reserve_any(&lease, &owner, &[8, 16])
+        .expect("fallback reserve_any should succeed");
+    assert_eq!(reserve_any.len(), 2);
+    assert!(reserve_any.iter().all(|item| item.is_ok()));
+
+    let reserve_specific = client
+        .batch_reserve_specific(
+            &lease,
+            &owner,
+            &[ReserveSpecificOp {
+                segment_name: SegmentName::new("segment-z"),
+                length_bytes: 24,
+            }],
+        )
+        .expect("fallback reserve_specific should succeed");
+    assert_eq!(reserve_specific.len(), 1);
+    assert!(reserve_specific[0].is_ok());
+
+    let release = client
+        .batch_release(
+            &lease,
+            &owner,
+            &[ReleaseOp {
+                segment_name: SegmentName::new("segment-z"),
+                offset_bytes: 4_096,
+                length_bytes: 24,
+            }],
+        )
+        .expect("fallback release should succeed");
+    assert!(release[0].is_ok());
+    assert_eq!(allocator.released.lock().len(), 1);
+
+    client.clear_channels();
+    assert_eq!(client.active_stream_sessions(), 0);
+    drop(client);
+    handle.shutdown();
 }
