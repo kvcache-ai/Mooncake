@@ -49,7 +49,7 @@ pub struct StoreClient {
     control_client: Arc<ControlPlaneClient>,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     lease: ClientLease,
-    live_client_cache: Mutex<LiveClientCache>,
+    live_client_cache: SharedLiveClientCache,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,

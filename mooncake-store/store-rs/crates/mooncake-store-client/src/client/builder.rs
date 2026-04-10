@@ -131,6 +131,7 @@ impl StoreClientBuilder {
         };
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
+        let live_client_cache = Arc::new(Mutex::new(LiveClientCache::default()));
         let control_client = Arc::new(ControlPlaneClient::new()?);
         let control_plane = ControlPlaneHandle::spawn(
             &control_bind_host(&endpoints.rpc_address),
@@ -157,6 +158,7 @@ impl StoreClientBuilder {
             self.metadata.clone(),
             &lease,
             control_client.clone(),
+            live_client_cache.clone(),
         );
         Ok(StoreClient {
             metadata: self.metadata,
@@ -165,7 +167,7 @@ impl StoreClientBuilder {
             control_client,
             allocator,
             lease,
-            live_client_cache: Mutex::new(LiveClientCache::default()),
+            live_client_cache,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,
