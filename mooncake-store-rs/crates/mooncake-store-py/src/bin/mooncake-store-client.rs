@@ -259,11 +259,16 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     if args.epoch == 0 {
         return Err("--epoch must be greater than zero".into());
     }
-    if args.storage_bytes == 0 {
-        return Err("--storage-bytes must be greater than zero".into());
-    }
     if args.scratch_bytes == 0 {
         return Err("--scratch-bytes must be greater than zero".into());
+    }
+    if args.storage_bytes == 0
+        && args
+            .labels
+            .iter()
+            .any(|(key, value)| key == "storage" && value == "true")
+    {
+        return Err("--label storage=true requires --storage-bytes > 0".into());
     }
     Ok(())
 }
@@ -632,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_args_rejects_zero_capacities_ttl_and_epoch() {
+    fn validate_args_rejects_invalid_ttl_epoch_and_storage_role() {
         validate_args(&sample_args()).expect("baseline args should validate");
 
         let mut args = sample_args();
@@ -645,10 +650,15 @@ mod tests {
 
         let mut args = sample_args();
         args.storage_bytes = 0;
-        assert!(validate_args(&args).is_err());
+        validate_args(&args).expect("scratch-only args should validate");
 
         let mut args = sample_args();
         args.scratch_bytes = 0;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = sample_args();
+        args.storage_bytes = 0;
+        args.labels = vec![("storage".to_string(), "true".to_string())];
         assert!(validate_args(&args).is_err());
     }
 

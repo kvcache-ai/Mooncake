@@ -227,6 +227,26 @@ The important invariants are:
 
 Remote allocator RPC follows the same pattern on the storage owner side. A live remote storage owner returns a real allocator error when it still cannot free capacity. The caller does not silently downgrade that case to metadata allocation.
 
+### Background watermarks plus synchronous fallback
+
+The local storage owner now has two reclaim modes:
+
+- background mode: poll local allocator usage and reclaim from the high watermark down to the low watermark
+- synchronous mode: when a reserve still fails, evict immediately and retry the allocation
+
+This keeps steady-state pressure off the front path while still preserving a deterministic fallback under bursty writes.
+
+Default local-memory thresholds are:
+
+- high watermark: `90%`
+- low watermark: `80%`
+- poll interval: `100ms`
+
+Startup also normalizes the storage role:
+
+- `storage=true` is rejected when `storage_bytes=0`
+- `storage_bytes=0` without an explicit storage label is normalized to `storage=false`
+
 ## Control Plane
 
 The control plane is implemented with protobuf and tonic.

@@ -179,6 +179,42 @@ impl StorageOwnerState {
         self.clock.lock().sync_route(route, &self.runtime);
     }
 
+    fn evict_until_low_watermark(&self, high_percent: u8, low_percent: u8) -> Result<usize> {
+        let (used_bytes, capacity_bytes) = self.allocator.lock().usage_bytes();
+        if capacity_bytes == 0 {
+            return Ok(0);
+        }
+        let high_watermark = watermark_bytes(capacity_bytes, high_percent);
+        if used_bytes < high_watermark {
+            return Ok(0);
+        }
+        let low_watermark = watermark_bytes(capacity_bytes, low_percent);
+        let mut evicted = 0usize;
+        loop {
+            let (used_bytes, _) = self.allocator.lock().usage_bytes();
+            if used_bytes <= low_watermark {
+                break;
+            }
+            if !self.evict_one_blocking(None)? {
+                break;
+            }
+            evicted = evicted.saturating_add(1);
+        }
+        if evicted != 0 {
+            let (used_bytes, _) = self.allocator.lock().usage_bytes();
+            debug!(
+                runtime = %self.runtime,
+                evicted,
+                high_percent,
+                low_percent,
+                used_bytes,
+                capacity_bytes,
+                "background storage-owner eviction completed"
+            );
+        }
+        Ok(evicted)
+    }
+
     fn evict_one(self: &Arc<Self>, preferred_segment: Option<&SegmentName>) -> Result<bool> {
         let preferred_segment = preferred_segment.cloned();
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -461,4 +497,13 @@ impl StorageClockState {
             }
         }
     }
+}
+
+fn watermark_bytes(capacity_bytes: u64, percent: u8) -> u64 {
+    if percent == 0 || capacity_bytes == 0 {
+        return 0;
+    }
+    capacity_bytes
+        .saturating_mul(percent as u64)
+        .div_ceil(100)
 }

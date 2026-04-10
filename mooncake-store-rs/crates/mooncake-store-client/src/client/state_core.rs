@@ -102,6 +102,15 @@ impl LocalAllocatorState {
             .collect()
     }
 
+    fn usage_bytes(&self) -> (u64, u64) {
+        self.segments.values().fold((0u64, 0u64), |(used, capacity), segment| {
+            (
+                used.saturating_add(segment.announcement.used_bytes),
+                capacity.saturating_add(segment.announcement.capacity_bytes),
+            )
+        })
+    }
+
     fn allocations(&self) -> Vec<AllocationSpan> {
         self.segments
             .values()

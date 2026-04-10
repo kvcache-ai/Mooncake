@@ -76,6 +76,7 @@ The implementation is easier to understand when grouped by capability instead of
 - native local-memory hugepage allocation
 - Python shm allocator hugepage allocation
 - local and remote allocation paths
+- background async eviction with configurable watermarks
 - storage-owner CLOCK eviction with route-owner CAS
 - best-effort read-hit reporting to storage owners
 - best-effort remote replica route tracking after publish
@@ -90,6 +91,7 @@ The implementation is easier to understand when grouped by capability instead of
 - standby, activate, and draining states
 - handoff planning for upgrades
 - build-time membership snapshot prewarm and background live-client sync
+- storage-role validation during startup
 - segment-level drain / retire flows
 - true client shrink through replica evacuation
 - hot-upgrade handoff with payload preservation validated by dedicated CLI and Python regression tests
@@ -146,6 +148,7 @@ The runtime separates two owner roles:
 
 - route owner decides object-route versions and CAS
 - storage owner tracks locally stored replicas and runs eviction under capacity pressure
+- storage owners reclaim in the background above the high watermark and stop at the low watermark
 - readers report replica hits to storage owners in batch
 - writers push published remote routes to storage owners in batch
 - metadata remains a durable fallback, not the default hot path

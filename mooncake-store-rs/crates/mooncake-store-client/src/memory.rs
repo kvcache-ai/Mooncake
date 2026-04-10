@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::ptr;
+use std::time::Duration;
 
 use mooncake_store_core::{HugePageConfig, Result, SegmentLifecycleState, SegmentName, StoreError};
 
@@ -9,6 +10,9 @@ use crate::transport::StoreTransport;
 const DEFAULT_STORAGE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_ALIGNMENT: usize = 64;
+const DEFAULT_EVICTION_HIGH_WATERMARK_PERCENT: u8 = 90;
+const DEFAULT_EVICTION_LOW_WATERMARK_PERCENT: u8 = 80;
+const DEFAULT_EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
 pub struct LocalMemoryConfig {
@@ -18,6 +22,9 @@ pub struct LocalMemoryConfig {
     pub tags: Vec<String>,
     pub alignment: usize,
     pub reclaim_grace_ms: u64,
+    pub eviction_high_watermark_percent: u8,
+    pub eviction_low_watermark_percent: u8,
+    pub eviction_poll_interval: Duration,
     pub hugepage_enabled: Option<bool>,
     pub hugepage_size_bytes: Option<usize>,
 }
@@ -57,6 +64,17 @@ impl LocalMemoryConfig {
         self
     }
 
+    pub fn eviction_watermarks(mut self, high_percent: u8, low_percent: u8) -> Self {
+        self.eviction_high_watermark_percent = high_percent;
+        self.eviction_low_watermark_percent = low_percent;
+        self
+    }
+
+    pub fn eviction_poll_interval(mut self, interval: Duration) -> Self {
+        self.eviction_poll_interval = interval;
+        self
+    }
+
     pub fn use_hugepage(mut self, enabled: bool) -> Self {
         self.hugepage_enabled = Some(enabled);
         self
@@ -91,6 +109,17 @@ impl LocalMemoryConfig {
                 "location must not be empty".to_string(),
             ));
         }
+        if self.eviction_high_watermark_percent == 0 || self.eviction_high_watermark_percent > 100 {
+            return Err(StoreError::Allocator(
+                "eviction_high_watermark_percent must be in 1..=100".to_string(),
+            ));
+        }
+        if self.eviction_low_watermark_percent >= self.eviction_high_watermark_percent {
+            return Err(StoreError::Allocator(
+                "eviction_low_watermark_percent must be lower than eviction_high_watermark_percent"
+                    .to_string(),
+            ));
+        }
         let _ = self.hugepage()?;
         Ok(())
     }
@@ -105,6 +134,9 @@ impl Default for LocalMemoryConfig {
             tags: vec!["dram".to_string()],
             alignment: DEFAULT_ALIGNMENT,
             reclaim_grace_ms: 1_000,
+            eviction_high_watermark_percent: DEFAULT_EVICTION_HIGH_WATERMARK_PERCENT,
+            eviction_low_watermark_percent: DEFAULT_EVICTION_LOW_WATERMARK_PERCENT,
+            eviction_poll_interval: DEFAULT_EVICTION_POLL_INTERVAL,
             hugepage_enabled: None,
             hugepage_size_bytes: None,
         }

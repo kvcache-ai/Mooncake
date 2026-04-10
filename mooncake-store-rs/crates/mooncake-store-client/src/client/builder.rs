@@ -1,3 +1,19 @@
+fn normalize_storage_label(
+    local_memory: &LocalMemoryConfig,
+    labels: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    match labels.get("storage").map(String::as_str) {
+        Some("true") if !local_memory.has_storage() => Err(StoreError::InvalidState(
+            "label storage=true requires storage_bytes > 0".to_string(),
+        )),
+        None if !local_memory.has_storage() => {
+            labels.insert("storage".to_string(), "false".to_string());
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub struct StoreClientBuilder {
     metadata: Arc<dyn MetadataBackend>,
     stable_id: ClientStableId,
@@ -118,6 +134,7 @@ impl StoreClientBuilder {
             .labels
             .entry("route".to_string())
             .or_insert_with(|| "true".to_string());
+        normalize_storage_label(&self.local_memory, &mut endpoints.labels)?;
         if let Some(transport) = self.transport.as_ref() {
             if endpoints.rpc_address.is_empty() {
                 let (host, port) = transport.rpc_server_address()?;
@@ -195,6 +212,8 @@ impl StoreClientBuilder {
             live_client_cache.clone(),
             self.live_client_sync_interval,
         )?;
+        let async_eviction =
+            AsyncEvictionHandle::spawn(&runtime, &lease, &self.local_memory, storage_owner.clone())?;
         Ok(StoreClient {
             metadata: self.metadata,
             route_directory,
@@ -205,6 +224,7 @@ impl StoreClientBuilder {
             lease,
             live_client_cache,
             membership_sync,
+            _async_eviction: async_eviction,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,

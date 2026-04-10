@@ -53,6 +53,7 @@ pub struct StoreClient {
     lease: ClientLease,
     live_client_cache: SharedLiveClientCache,
     membership_sync: MembershipSyncHandle,
+    _async_eviction: AsyncEvictionHandle,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,
