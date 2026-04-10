@@ -31,7 +31,7 @@ def _load_native():
         for suffix in suffixes:
             patterns.extend([f"_store_rs{suffix}", f"lib_store_rs{suffix}"])
 
-        for profile in ("debug", "release"):
+        for profile in ("release", "debug"):
             for profile_dir in (target_root / profile, target_root / profile / "deps"):
                 for pattern in patterns:
                     candidate = profile_dir / pattern
@@ -547,6 +547,7 @@ class MooncakeDistributedStore:
             expires_at_ms=_coerce_optional_int(config.get("expires_at_ms")),
             use_hugepage=_coerce_optional_bool(config.get("use_hugepage")),
             hugepage_size=_normalize_hugepage_size(config.get("hugepage_size")),
+            route_control=str(config.get("route_control", "embedded_wrh")),
         )
 
 def _replication_kwargs(config) -> dict:

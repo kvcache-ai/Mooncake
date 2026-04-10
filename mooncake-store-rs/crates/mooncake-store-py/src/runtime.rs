@@ -13,6 +13,8 @@ pub use crate::config::CompatSetupArgs;
 pub struct CompatRuntime {
     pub client: StoreClient,
     pub stable_id: String,
+    pub epoch: ClientEpoch,
+    pub initial_state: ClientLifecycleState,
     pub segment_name: String,
     pub expires_at_ms: u64,
 }
@@ -21,6 +23,8 @@ pub struct CompatRuntime {
 pub struct CompatRuntimeArgs {
     pub setup: CompatSetupArgs,
     pub local_segment_name: Option<String>,
+    pub epoch: ClientEpoch,
+    pub initial_state: ClientLifecycleState,
     pub route_control: RouteControlMode,
 }
 
@@ -52,8 +56,8 @@ impl CompatRuntimeArgs {
         }
 
         let mut builder = StoreClientBuilder::new(plan.metadata, stable_id.clone())
-            .epoch(ClientEpoch(1))
-            .state(ClientLifecycleState::Active)
+            .epoch(self.epoch)
+            .state(self.initial_state)
             .compatibility(CompatibilityDescriptor::default())
             .tenant(plan.tenant)
             .local_memory(local_memory)
@@ -74,6 +78,8 @@ impl CompatRuntimeArgs {
         Ok(CompatRuntime {
             client: builder.build(expires_at_ms)?,
             stable_id,
+            epoch: self.epoch,
+            initial_state: self.initial_state,
             segment_name,
             expires_at_ms,
         })
@@ -183,6 +189,8 @@ mod tests {
                 hugepage_size_bytes: None,
             },
             local_segment_name: None,
+            epoch: ClientEpoch(1),
+            initial_state: ClientLifecycleState::Active,
             route_control: RouteControlMode::EmbeddedWrh,
         }
     }
