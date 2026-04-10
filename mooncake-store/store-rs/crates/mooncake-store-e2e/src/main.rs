@@ -237,6 +237,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     reader.register_local_memory()?;
     elastic_target.register_local_memory()?;
     elastic_router.register_local_memory()?;
+    wait_for_membership_convergence(&[
+        &target_a,
+        &target_b,
+        &target_c,
+        &target_upgrade,
+        &reclaim_writer,
+        &router,
+        &router_replica,
+        &reader,
+        &elastic_target,
+        &elastic_router,
+    ])?;
 
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
@@ -361,6 +373,42 @@ fn build_routed_client(
         builder = builder.label(*key, *value);
     }
     builder.build(now_ms() + LEASE_MS)
+}
+
+fn wait_for_runtime_visibility(
+    client: &StoreClient,
+    runtime: &mooncake_store_core::ClientRuntimeId,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match client.runtime_state(runtime) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(StoreError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        sleep(Duration::from_millis(20));
+    }
+    Err(StoreError::InvalidState(format!(
+        "runtime {} did not become visible to {} before deadline",
+        runtime,
+        client.runtime_id()
+    )))
+}
+
+fn wait_for_membership_convergence(clients: &[&StoreClient]) -> Result<()> {
+    let runtimes = clients
+        .iter()
+        .map(|client| client.runtime_id().clone())
+        .collect::<Vec<_>>();
+    for client in clients {
+        for runtime in &runtimes {
+            if runtime == client.runtime_id() {
+                continue;
+            }
+            wait_for_runtime_visibility(client, runtime)?;
+        }
+    }
+    Ok(())
 }
 
 fn verify_single_put_get(
@@ -1132,22 +1180,22 @@ fn run_batch_put_benchmark(
     iterations: usize,
 ) -> Result<()> {
     for batch_size in [1usize, 8, 64] {
+        let items = build_items(
+            "bench-put",
+            &format!("put-{batch_size}"),
+            batch_size,
+            value_size,
+        );
+        let puts = items
+            .iter()
+            .map(|item| {
+                PutRequest::new(item.key.as_str(), item.value.as_slice())
+                    .tenant(item.tenant.as_str())
+            })
+            .collect::<Vec<_>>();
         let start = Instant::now();
         let mut total_bytes = 0usize;
-        for iteration in 0..iterations {
-            let items = build_items(
-                "bench-put",
-                &format!("put-{batch_size}-{iteration}"),
-                batch_size,
-                value_size,
-            );
-            let puts = items
-                .iter()
-                .map(|item| {
-                    PutRequest::new(item.key.as_str(), item.value.as_slice())
-                        .tenant(item.tenant.as_str())
-                })
-                .collect::<Vec<_>>();
+        for _ in 0..iterations {
             writer.batch_put(&puts)?;
             total_bytes += batch_size * value_size;
         }
