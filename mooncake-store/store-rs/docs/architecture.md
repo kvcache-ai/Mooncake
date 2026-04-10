@@ -63,6 +63,20 @@ This keeps object route lookups off the metadata hot path while preserving a dur
 | `EmbeddedWrh` | Authority RPC first, metadata fallback | Authority CAS with secondary mirror | Normal deployments |
 | `MetadataOnly` | Metadata backend | Metadata backend | Simpler debugging and bring-up |
 
+## Membership Snapshot Model
+
+`StoreClientBuilder::build(...)` publishes the client lease, prewarms a live-client snapshot, and then starts a background membership sync worker.
+
+The shared snapshot is the membership truth used by the hot request path.
+
+- route-authority selection reads the cached snapshot
+- routed placement reads the same cached snapshot
+- runtime lease lookup and preferred-storage resolution read the same cached snapshot
+- successful background refresh replaces the whole snapshot
+- failed refresh keeps the last successful snapshot available
+
+This keeps `list_live_clients()` off the normal request path. Metadata still owns the durable lease set, but request-path consumers read a locally cached view that is refreshed asynchronously.
+
 ## Write Path
 
 A write is split into route resolution, allocation, transfer, and route publication.
@@ -168,6 +182,8 @@ Metadata backends store three persistent categories of data:
 - segment announcements and segment lifecycle state
 - object routes, when metadata persistence is needed
 
+For membership specifically, metadata is the authoritative lease store, while the client runtime keeps a prewarmed and background-refreshed snapshot for request-path reads.
+
 ### Backend support
 
 | Backend | Use Case |
@@ -244,13 +260,24 @@ This preserves compatibility for integrations that expect a dummy client / exter
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
 | `crates/mooncake-metadata` | Backend implementations for metadata |
-| `crates/mooncake-store-client/src/client.rs` | Public API, lifecycle, batching, local state |
+| `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
+| `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |
+| `crates/mooncake-store-client/src/client/runtime_core.rs` | runtime lookup, placement, lifecycle, allocator helpers |
+| `crates/mooncake-store-client/src/client/runtime_io.rs` | get/batch-get, route scans, migration reads |
+| `crates/mooncake-store-client/src/client/runtime_write.rs` | put/batch-put and route publication |
+| `crates/mooncake-store-client/src/client/runtime_alloc.rs` | local and remote allocation helpers |
+| `crates/mooncake-store-client/src/client/membership_sync.rs` | background live-client snapshot refresh |
+| `crates/mooncake-store-client/src/client/facade.rs` | Mooncake-compatible surface methods |
 | `crates/mooncake-store-client/src/route_directory.rs` | Embedded WRH route control |
-| `crates/mooncake-store-client/src/control_plane.rs` | protobuf RPC client/server for route and allocator |
+| `crates/mooncake-store-client/src/control_plane/mod.rs` | control-plane module entry and exports |
+| `crates/mooncake-store-client/src/control_plane/client.rs` | protobuf RPC client and stream-session reuse |
+| `crates/mooncake-store-client/src/control_plane/server.rs` | protobuf RPC server and dispatch |
 | `crates/mooncake-store-client/src/memory.rs` | local memory and segment tracking |
 | `crates/mooncake-store-client/src/transport.rs` | transfer submission helpers |
-| `crates/mooncake-store-py/src/lib.rs` | Python bindings, real/dummy dispatch, compatibility API |
+| `crates/mooncake-store-py/src/lib.rs` | Python bindings and top-level compatibility API |
+| `crates/mooncake-store-py/src/runtime.rs` | real runtime construction from Python setup args |
 | `crates/mooncake-store-py/src/dummy_client.rs` | dummy compatibility client and shm registration RPC |
+| `crates/mooncake-store-py/src/dummy_service.rs` | standalone dummy compatibility service |
 | `crates/mooncake-store-py/src/shm.rs` | shm region ownership, fd passing, shared mapping helpers |
 | `crates/mooncake-store-e2e` | runnable system validation |
 

@@ -17,6 +17,7 @@ Use the document that matches what you are doing.
 | If You Want To | Read |
 |----------------|------|
 | run the project locally | `README.md`, `docs/deployment.md` |
+| run the multi-client stress benchmark | `README.md`, `docs/deployment.md` |
 | integrate the client into a Rust service | `docs/rust.md` |
 | configure routing, memory, placement, or observability | `docs/configuration.md` |
 | use the Python compatibility layer | `docs/python.md` |
@@ -84,7 +85,7 @@ The implementation is easier to understand when grouped by capability instead of
 
 - standby, activate, and draining states
 - handoff planning for upgrades
-- dynamic live-client membership
+- build-time membership snapshot prewarm and background live-client sync
 - segment-level drain / retire flows
 - true client shrink through replica evacuation
 - hot-upgrade and elastic-capacity scenarios validated in e2e
@@ -164,6 +165,30 @@ This script will:
 - print batch put/get benchmark results
 
 For deployment details and script knobs, read `docs/deployment.md`.
+
+### Run the multi-client stress benchmark
+
+```bash
+./scripts/run-multi-client-stress.sh
+```
+
+This script runs the Python compatibility layer in a process-per-client layout:
+
+- storage instances run as dedicated processes with local storage memory
+- rw instances run as separate processes with `rw_storage_bytes=0` by default
+- routed traffic uses the same Rust store runtime and the same embedded WRH route mode
+
+At the end of the run, the script prints a concise steady-state bandwidth summary:
+
+```text
+steady-state bandwidth:
+- put: 24.82 MiB/s
+- get: 27.22 MiB/s
+- batch-put: 45.31 MiB/s
+- batch-get: 109.52 MiB/s
+```
+
+Treat this summary as the primary throughput signal. The per-phase `stress phase=...` lines remain in the log for latency breakdowns and setup debugging.
 
 ### Run the Python compatibility e2e
 
@@ -314,7 +339,7 @@ python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
 pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
-mooncake_master --version
+mooncake-store-client --version
 ```
 
 For local wheelhouse installs, `scripts/install-pro-wheel.sh` wraps the same flow.
@@ -384,6 +409,8 @@ If store metadata uses etcd in the Python compatibility layer, transport metadat
 | `EmbeddedWrh` | Client-side weighted rendezvous chooses route owners and keeps route lookups off the metadata hot path | Yes |
 | `MetadataOnly` | Object routes are read and written directly from the metadata backend | No |
 
+In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `build(...)` and refreshes it in the background. Normal request paths reuse that shared snapshot instead of performing on-demand metadata refreshes.
+
 ## Observability
 
 ### Tracing
@@ -423,6 +450,8 @@ python/
   mooncake/                 Python convenience package
 scripts/
   run-local-e2e.sh          Local Rust e2e + benchmark entrypoint
+  run-multi-client-stress.sh Python compatibility stress benchmark entrypoint
+  python_multi_client_stress.py Worker orchestration and throughput summary
   run-python-compat-e2e.sh  Python compatibility validation
 third_party/
   Mooncake/                 Upstream Mooncake submodule

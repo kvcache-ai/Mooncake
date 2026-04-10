@@ -76,8 +76,10 @@ It contains the public builder, the request API, the allocator logic, the route 
 
 | Area | Files | Responsibility |
 |------|-------|----------------|
-| API and lifecycle | `src/client.rs` | public API, batching, reclaim, lifecycle, registration |
-| Control plane | `src/control_plane.rs` | route RPC and allocator RPC between clients |
+| Client assembly | `src/client/mod.rs`, `src/client/builder.rs` | public builder, client composition, startup defaults |
+| Client runtime | `src/client/runtime_core.rs`, `src/client/runtime_io.rs`, `src/client/runtime_write.rs`, `src/client/runtime_alloc.rs`, `src/client/facade.rs` | request-path logic, lifecycle, batching, reclaim, compatibility surface |
+| Membership sync | `src/client/membership_sync.rs`, `src/client/state_core.rs` | prewarmed live-client snapshot and background refresh |
+| Control plane | `src/control_plane/mod.rs`, `src/control_plane/client.rs`, `src/control_plane/server.rs` | route RPC and allocator RPC between clients |
 | Route control | `src/route_directory.rs` | embedded weighted rendezvous and metadata route mode |
 | Memory tracking | `src/memory.rs` | local storage segments, scratch, registered buffers |
 | Placement planning | `src/placement.rs` | storage-node filtering and selection helpers |
