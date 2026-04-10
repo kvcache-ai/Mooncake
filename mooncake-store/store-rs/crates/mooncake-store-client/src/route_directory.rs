@@ -76,6 +76,26 @@ struct RouteAuthoritySelection {
     secondary: Option<ClientLease>,
 }
 
+#[derive(Clone, Default)]
+struct RouteReadRepairState {
+    primary: RouteAuthorityObservation,
+    secondary: RouteAuthorityObservation,
+}
+
+#[derive(Clone, Default)]
+enum RouteAuthorityObservation {
+    #[default]
+    Unobserved,
+    Missing,
+    Present(ObjectRoute),
+}
+
+#[derive(Clone, Copy)]
+enum RouteRepairTarget {
+    Primary,
+    Secondary,
+}
+
 #[derive(Default)]
 struct RouteAuthorityCache {
     refreshed_at: Option<Instant>,
@@ -173,28 +193,38 @@ impl EmbeddedWrhRouteDirectory {
         candidates: &[ClientLease],
         key: &ObjectKey,
     ) -> RouteAuthoritySelection {
-        let mut primary = None::<(f64, ClientLease)>;
-        let mut secondary = None::<(f64, ClientLease)>;
-        for lease in candidates {
-            let score = weighted_rendezvous_score(
-                &self.namespace,
-                &key.0,
-                &lease.runtime.stable_id.0,
-                route_weight(lease),
-            );
-            if ranked_before(score, lease, primary.as_ref()) {
-                secondary = primary.take();
-                primary = Some((score, lease.clone()));
-                continue;
-            }
-            if ranked_before(score, lease, secondary.as_ref()) {
-                secondary = Some((score, lease.clone()));
-            }
-        }
+        let ranked = self.ranked_authorities_from_candidates(candidates, key);
         RouteAuthoritySelection {
-            primary: primary.map(|(_, lease)| lease),
-            secondary: secondary.map(|(_, lease)| lease),
+            primary: ranked.first().cloned(),
+            secondary: ranked.get(1).cloned(),
         }
+    }
+
+    fn ranked_authorities_from_candidates(
+        &self,
+        candidates: &[ClientLease],
+        key: &ObjectKey,
+    ) -> Vec<ClientLease> {
+        let mut ranked = candidates
+            .iter()
+            .map(|lease| {
+                (
+                    weighted_rendezvous_score(
+                        &self.namespace,
+                        &key.0,
+                        &lease.runtime.stable_id.0,
+                        route_weight(lease),
+                    ),
+                    lease.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.runtime.stable_id.cmp(&right.1.runtime.stable_id))
+        });
+        ranked.into_iter().map(|(_, lease)| lease).collect()
     }
 
     fn read_local_batch(
@@ -205,12 +235,48 @@ impl EmbeddedWrhRouteDirectory {
         authority_get_many(&self.namespace, authority, keys)
     }
 
+    fn read_authority_batch(
+        &self,
+        authority: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+        if authority.runtime.stable_id == self.local_stable_id {
+            return self
+                .read_local_batch(&authority.runtime.stable_id, keys)
+                .map(|routes| routes.into_iter().map(Ok).collect());
+        }
+        self.control_plane.batch_get_routes(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            keys,
+        )
+    }
+
     fn cas_local_batch(
         &self,
         authority: &ClientStableId,
         requests: &[RouteCasRequest],
     ) -> Result<Vec<CasResult>> {
         authority_compare_and_swap_many(&self.namespace, authority, requests)
+    }
+
+    fn cas_authority_batch(
+        &self,
+        authority: &ClientLease,
+        requests: &[RouteCasRequest],
+    ) -> Result<Vec<Result<CasResult>>> {
+        if authority.runtime.stable_id == self.local_stable_id {
+            return self
+                .cas_local_batch(&authority.runtime.stable_id, requests)
+                .map(|results| results.into_iter().map(Ok).collect());
+        }
+        self.control_plane.batch_compare_and_swap_routes(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            requests,
+        )
     }
 
     fn replace_local_batch(
@@ -256,6 +322,219 @@ impl EmbeddedWrhRouteDirectory {
             }
         }
     }
+
+    fn read_ranked_authorities(
+        &self,
+        keys: &[ObjectKey],
+        ranked_authorities: &[Vec<ClientLease>],
+        rank: usize,
+        resolved: &mut [Option<ObjectRoute>],
+        repairs: Option<(&mut [RouteReadRepairState], RouteRepairTarget)>,
+        failure_message: &'static str,
+    ) -> Result<bool> {
+        let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
+        for (index, authorities) in ranked_authorities.iter().enumerate() {
+            let Some(authority) = authorities.get(rank).cloned() else {
+                continue;
+            };
+            groups
+                .entry(authority.runtime.stable_id.0.clone())
+                .or_insert_with(|| (authority, Vec::new()))
+                .1
+                .push(index);
+        }
+        if groups.is_empty() {
+            return Ok(false);
+        }
+
+        let mut repairs = repairs;
+        for (_, (authority, indices)) in groups {
+            let batch_keys = indices
+                .iter()
+                .map(|index| keys[*index].clone())
+                .collect::<Vec<_>>();
+            match self.read_authority_batch(&authority, &batch_keys) {
+                Ok(results) => {
+                    for ((index, key), result) in indices
+                        .into_iter()
+                        .zip(batch_keys.into_iter())
+                        .zip(results.into_iter())
+                    {
+                        match result {
+                            Ok(Some(route)) => {
+                                if let Some((states, target)) = repairs.as_mut() {
+                                    Self::set_repair_observation(
+                                        &mut states[index],
+                                        *target,
+                                        RouteAuthorityObservation::Present(route.clone()),
+                                    );
+                                }
+                                Self::merge_fresher_route(
+                                    &mut resolved[index],
+                                    route,
+                                    &authority.runtime.to_string(),
+                                    &key,
+                                );
+                            }
+                            Ok(None) => {
+                                if let Some((states, target)) = repairs.as_mut() {
+                                    Self::set_repair_observation(
+                                        &mut states[index],
+                                        *target,
+                                        RouteAuthorityObservation::Missing,
+                                    );
+                                }
+                            }
+                            Err(error) => warn!(
+                                runtime = %authority.runtime,
+                                key = %key.0,
+                                error = %error,
+                                "{failure_message}"
+                            ),
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        runtime = %authority.runtime,
+                        error = %error,
+                        items = batch_keys.len(),
+                        "{failure_message}"
+                    );
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn merge_fresher_route(
+        current: &mut Option<ObjectRoute>,
+        candidate: ObjectRoute,
+        authority: &str,
+        key: &ObjectKey,
+    ) {
+        match current {
+            None => *current = Some(candidate),
+            Some(existing) if candidate.version > existing.version => *current = Some(candidate),
+            Some(existing) if candidate.version == existing.version && *existing != candidate => {
+                warn!(
+                    key = %key.0,
+                    authority = %authority,
+                    version = candidate.version.0,
+                    "route authorities disagree on the same route version; keeping the first route"
+                );
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn merge_metadata_routes(
+        &self,
+        keys: &[ObjectKey],
+        resolved: &mut [Option<ObjectRoute>],
+    ) -> Result<()> {
+        for (index, key) in keys.iter().enumerate() {
+            if let Some(route) = self.metadata.get_object_route(key)? {
+                Self::merge_fresher_route(&mut resolved[index], route, "metadata", key);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_repair_observation(
+        state: &mut RouteReadRepairState,
+        target: RouteRepairTarget,
+        observation: RouteAuthorityObservation,
+    ) {
+        match target {
+            RouteRepairTarget::Primary => state.primary = observation,
+            RouteRepairTarget::Secondary => state.secondary = observation,
+        }
+    }
+
+    fn repair_request(
+        key: &ObjectKey,
+        best: &ObjectRoute,
+        observed: &RouteAuthorityObservation,
+    ) -> Option<RouteCasRequest> {
+        match observed {
+            RouteAuthorityObservation::Missing => Some(RouteCasRequest {
+                key: key.clone(),
+                expected: None,
+                next: Some(best.clone()),
+            }),
+            RouteAuthorityObservation::Present(current) if current.version < best.version => {
+                Some(RouteCasRequest {
+                    key: key.clone(),
+                    expected: Some(current.version),
+                    next: Some(best.clone()),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn backfill_missing_authorities(
+        &self,
+        keys: &[ObjectKey],
+        selections: &[RouteAuthoritySelection],
+        resolved: &[Option<ObjectRoute>],
+        repairs: &[RouteReadRepairState],
+    ) {
+        let mut backfills = BTreeMap::<String, (ClientLease, Vec<RouteCasRequest>)>::new();
+        for (index, route) in resolved.iter().enumerate() {
+            let Some(route) = route.as_ref() else {
+                continue;
+            };
+            if let Some(primary) = selections[index].primary.clone() {
+                if let Some(request) =
+                    Self::repair_request(&keys[index], route, &repairs[index].primary)
+                {
+                    backfills
+                        .entry(primary.runtime.stable_id.0.clone())
+                        .or_insert_with(|| (primary, Vec::new()))
+                        .1
+                        .push(request);
+                }
+            }
+            if let Some(secondary) = selections[index].secondary.clone() {
+                if let Some(request) =
+                    Self::repair_request(&keys[index], route, &repairs[index].secondary)
+                {
+                    backfills
+                        .entry(secondary.runtime.stable_id.0.clone())
+                        .or_insert_with(|| (secondary, Vec::new()))
+                        .1
+                        .push(request);
+                }
+            }
+        }
+
+        for (_, (authority, requests)) in backfills {
+            match self.cas_authority_batch(&authority, &requests) {
+                Ok(results) => {
+                    for (request, result) in requests.iter().zip(results.into_iter()) {
+                        if let Err(error) = result {
+                            warn!(
+                                authority = %authority.runtime,
+                                key = %request.key.0,
+                                error = %error,
+                                "route backfill failed"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        authority = %authority.runtime,
+                        error = %error,
+                        items = requests.len(),
+                        "route backfill batch failed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl Drop for EmbeddedWrhRouteDirectory {
@@ -285,162 +564,53 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             return Ok(Vec::new());
         }
         let candidates = self.authority_candidates(observer)?;
-        let selections = keys
+        let ranked_authorities = keys
             .iter()
-            .map(|key| self.select_authorities_from_candidates(&candidates, key))
+            .map(|key| self.ranked_authorities_from_candidates(&candidates, key))
+            .collect::<Vec<_>>();
+        let selections = ranked_authorities
+            .iter()
+            .map(|authorities| RouteAuthoritySelection {
+                primary: authorities.first().cloned(),
+                secondary: authorities.get(1).cloned(),
+            })
             .collect::<Vec<_>>();
         let mut resolved = vec![None; keys.len()];
-        let mut primary_groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
-        for (index, selection) in selections.iter().enumerate() {
-            let Some(primary) = selection.primary.clone() else {
-                continue;
-            };
-            primary_groups
-                .entry(primary.runtime.stable_id.0.clone())
-                .or_insert_with(|| (primary, Vec::new()))
-                .1
-                .push(index);
+        let mut repairs = vec![RouteReadRepairState::default(); keys.len()];
+
+        self.read_ranked_authorities(
+            keys,
+            &ranked_authorities,
+            0,
+            &mut resolved,
+            Some((repairs.as_mut_slice(), RouteRepairTarget::Primary)),
+            "authority route batch read failed; trying secondary or metadata",
+        )?;
+        self.read_ranked_authorities(
+            keys,
+            &ranked_authorities,
+            1,
+            &mut resolved,
+            Some((repairs.as_mut_slice(), RouteRepairTarget::Secondary)),
+            "secondary authority route batch read failed; trying other authorities or metadata",
+        )?;
+
+        let mut rank = 2usize;
+        while self.read_ranked_authorities(
+            keys,
+            &ranked_authorities,
+            rank,
+            &mut resolved,
+            None,
+            "fallback authority route batch read failed; trying other authorities or metadata",
+        )? {
+            rank = rank.saturating_add(1);
         }
 
-        for (_, (authority, indices)) in primary_groups {
-            let batch_keys = indices
-                .iter()
-                .map(|index| keys[*index].clone())
-                .collect::<Vec<_>>();
-            if authority.runtime.stable_id == self.local_stable_id {
-                match self.read_local_batch(&authority.runtime.stable_id, &batch_keys) {
-                    Ok(routes) => {
-                        for (index, route) in indices.into_iter().zip(routes.into_iter()) {
-                            resolved[index] = Some(route);
-                        }
-                    }
-                    Err(error) => {
-                        warn!(
-                            runtime = %authority.runtime,
-                            error = %error,
-                            items = batch_keys.len(),
-                            "authority route batch read failed; trying secondary or metadata"
-                        );
-                    }
-                }
-                continue;
-            }
+        self.merge_metadata_routes(keys, &mut resolved)?;
 
-            match self.control_plane.batch_get_routes(
-                &authority,
-                &self.namespace,
-                &authority.runtime.stable_id,
-                &batch_keys,
-            ) {
-                Ok(results) => {
-                    for ((index, key), result) in indices
-                        .into_iter()
-                        .zip(batch_keys.into_iter())
-                        .zip(results.into_iter())
-                    {
-                        match result {
-                            Ok(route) => resolved[index] = Some(route),
-                            Err(error) => warn!(
-                                runtime = %authority.runtime,
-                                key = %key.0,
-                                error = %error,
-                                "authority route read failed; trying secondary or metadata"
-                            ),
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        runtime = %authority.runtime,
-                        error = %error,
-                        items = batch_keys.len(),
-                        "authority route batch read failed; trying secondary or metadata"
-                    );
-                }
-            }
-        }
-
-        let mut secondary_groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
-        for (index, selection) in selections.iter().enumerate() {
-            if resolved[index].is_some() {
-                continue;
-            }
-            let Some(secondary) = selection.secondary.clone() else {
-                continue;
-            };
-            secondary_groups
-                .entry(secondary.runtime.stable_id.0.clone())
-                .or_insert_with(|| (secondary, Vec::new()))
-                .1
-                .push(index);
-        }
-
-        for (_, (authority, indices)) in secondary_groups {
-            let batch_keys = indices
-                .iter()
-                .map(|index| keys[*index].clone())
-                .collect::<Vec<_>>();
-            if authority.runtime.stable_id == self.local_stable_id {
-                match self.read_local_batch(&authority.runtime.stable_id, &batch_keys) {
-                    Ok(routes) => {
-                        for (index, route) in indices.into_iter().zip(routes.into_iter()) {
-                            resolved[index] = Some(route);
-                        }
-                    }
-                    Err(error) => {
-                        warn!(
-                            runtime = %authority.runtime,
-                            error = %error,
-                            items = batch_keys.len(),
-                            "secondary authority route batch read failed; falling back to metadata"
-                        );
-                    }
-                }
-                continue;
-            }
-
-            match self.control_plane.batch_get_routes(
-                &authority,
-                &self.namespace,
-                &authority.runtime.stable_id,
-                &batch_keys,
-            ) {
-                Ok(results) => {
-                    for ((index, key), result) in indices
-                        .into_iter()
-                        .zip(batch_keys.into_iter())
-                        .zip(results.into_iter())
-                    {
-                        match result {
-                            Ok(route) => resolved[index] = Some(route),
-                            Err(error) => warn!(
-                                runtime = %authority.runtime,
-                                key = %key.0,
-                                error = %error,
-                                "secondary authority route read failed; falling back to metadata"
-                            ),
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        runtime = %authority.runtime,
-                        error = %error,
-                        items = batch_keys.len(),
-                        "secondary authority route batch read failed; falling back to metadata"
-                    );
-                }
-            }
-        }
-
-        let mut routes = Vec::with_capacity(keys.len());
-        for (key, result) in keys.iter().zip(resolved.into_iter()) {
-            match result {
-                Some(route) => routes.push(route),
-                None => routes.push(self.metadata.get_object_route(key)?),
-            }
-        }
-        Ok(routes)
+        self.backfill_missing_authorities(keys, &selections, &resolved, &repairs);
+        Ok(resolved)
     }
 
     fn compare_and_swap_object_route(

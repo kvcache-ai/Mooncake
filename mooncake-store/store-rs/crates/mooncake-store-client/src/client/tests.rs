@@ -1311,6 +1311,638 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
 }
 
 #[test]
+fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-old-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-old-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-old-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-old-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-old-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-old-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "0.01")
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-old-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner.clone(), 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-old-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-old-authority",
+            b"route-repair-payload",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("seed routed put should succeed");
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-old-authority");
+    let seed_route = reader
+        .query_route("route-repair-old-authority")
+        .expect("seed route query should succeed")
+        .expect("seed route should exist");
+    assert_eq!(seed_route.replicas[0].owner, *store_a.runtime_id());
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_a.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("old authority route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert!(
+        metadata
+            .get_object_route(&scoped_key)
+            .expect("metadata query should succeed")
+            .is_none(),
+        "seed route should stay off metadata in embedded WRH mode"
+    );
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-old-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-old-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    sleep(Duration::from_millis(150));
+
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-b route query should succeed")
+    .is_none());
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-c route query should succeed")
+    .is_none());
+
+    let repaired_route = reader
+        .query_route("route-repair-old-authority")
+        .expect("repair route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired_route, seed_route);
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-old-authority")
+            .expect("reader get should succeed after repair"),
+        b"route-repair-payload"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-meta-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-meta-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-meta-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-meta-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-meta-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "0.01")
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-meta-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-meta-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-metadata",
+            b"route-repair-metadata-payload",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("seed routed put should succeed");
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-metadata");
+    let seed_route = reader
+        .query_route("route-repair-metadata")
+        .expect("seed route query should succeed")
+        .expect("seed route should exist");
+    assert_eq!(seed_route.replicas[0].owner, *store_a.runtime_id());
+    metadata
+        .compare_and_swap_object_route(&scoped_key, None, Some(&seed_route))
+        .expect("metadata route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_a.runtime_id().stable_id,
+        &scoped_key,
+        None,
+    )
+    .expect("old authority route removal should succeed");
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_a.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("old authority route query should succeed")
+    .is_none());
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    sleep(Duration::from_millis(150));
+
+    let repaired_route = reader
+        .query_route("route-repair-metadata")
+        .expect("metadata repair route query should succeed")
+        .expect("metadata repair route should exist");
+    assert_eq!(repaired_route, seed_route);
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-metadata")
+            .expect("reader get should succeed after metadata repair"),
+        b"route-repair-metadata-payload"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_stale_authorities_from_old_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-stale-old-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-stale-old-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-stale-old-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-stale-old-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-stale-old-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "0.000001")
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner.clone(), 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-old",
+            b"route-repair-stale-old-v1",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("first routed put should succeed");
+    let stale_route = reader
+        .query_route("route-repair-stale-old")
+        .expect("stale route query should succeed")
+        .expect("stale route should exist");
+    assert_eq!(stale_route.version, RouteVersion(1));
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-old",
+            b"route-repair-stale-old-v2",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("second routed put should succeed");
+    let fresh_route = reader
+        .query_route("route-repair-stale-old")
+        .expect("fresh route query should succeed")
+        .expect("fresh route should exist");
+    assert!(fresh_route.version > stale_route.version);
+    assert_eq!(
+        reader
+            .get("route-repair-stale-old")
+            .expect("reader should see fresh payload"),
+        b"route-repair-stale-old-v2"
+    );
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-stale-old");
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    sleep(Duration::from_millis(150));
+
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+        Some(&stale_route),
+    )
+    .expect("store-b stale route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+        Some(&stale_route),
+    )
+    .expect("store-c stale route insert should succeed");
+
+    let repaired_route = reader
+        .query_route("route-repair-stale-old")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired_route, fresh_route);
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-stale-old")
+            .expect("reader get should succeed after stale-authority repair"),
+        b"route-repair-stale-old-v2"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_stale_authorities_from_metadata() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-stale-meta-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-stale-meta-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-stale-meta-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-stale-meta-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-stale-meta-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "0.000001")
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-metadata",
+            b"route-repair-stale-metadata-v1",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("first routed put should succeed");
+    let stale_route = reader
+        .query_route("route-repair-stale-metadata")
+        .expect("stale route query should succeed")
+        .expect("stale route should exist");
+    assert_eq!(stale_route.version, RouteVersion(1));
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-metadata",
+            b"route-repair-stale-metadata-v2",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("second routed put should succeed");
+    let fresh_route = reader
+        .query_route("route-repair-stale-metadata")
+        .expect("fresh route query should succeed")
+        .expect("fresh route should exist");
+    assert!(fresh_route.version > stale_route.version);
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-stale-metadata");
+    metadata
+        .compare_and_swap_object_route(&scoped_key, None, Some(&fresh_route))
+        .expect("metadata fresh route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_a.runtime_id().stable_id,
+        &scoped_key,
+        None,
+    )
+    .expect("old authority route removal should succeed");
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    sleep(Duration::from_millis(150));
+
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+        Some(&stale_route),
+    )
+    .expect("store-b stale route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+        Some(&stale_route),
+    )
+    .expect("store-c stale route insert should succeed");
+
+    let repaired_route = reader
+        .query_route("route-repair-stale-metadata")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired_route, fresh_route);
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-stale-metadata")
+            .expect("reader get should succeed after metadata stale repair"),
+        b"route-repair-stale-metadata-v2"
+    );
+}
+
+#[test]
 fn embedded_wrh_route_directory_ignores_pool_boundaries_by_default() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("cross-pool-segment"));
