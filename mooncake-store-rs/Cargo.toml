@@ -17,7 +17,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 parking_lot = "0.12"
 pyo3 = { version = "0.24", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }
