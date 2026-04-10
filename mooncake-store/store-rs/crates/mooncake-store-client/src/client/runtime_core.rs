@@ -88,14 +88,14 @@ impl StoreClient {
     }
 
     fn live_clients_snapshot(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
-        if !force_refresh {
-            if let Some(snapshot) = self.live_client_cache.lock().snapshot() {
-                return Ok(snapshot);
-            }
+        if force_refresh {
+            return refresh_live_client_cache(
+                self.metadata.as_ref(),
+                &self.live_client_cache,
+                "live_client_snapshot_force_refresh",
+            );
         }
-        let leases = self.metadata.list_live_clients()?;
-        self.live_client_cache.lock().store(leases.clone());
-        Ok(leases)
+        cached_live_client_snapshot(&self.live_client_cache)
     }
 
     fn compatible_live_clients(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
@@ -152,11 +152,7 @@ impl StoreClient {
     }
 
     fn lookup_runtime_lease(&self, runtime: &ClientRuntimeId) -> Result<ClientLease> {
-        match self.lookup_runtime_lease_once(runtime, false) {
-            Ok(lease) => Ok(lease),
-            Err(StoreError::NotFound(_)) => self.lookup_runtime_lease_once(runtime, true),
-            Err(error) => Err(error),
-        }
+        self.lookup_runtime_lease_once(runtime, false)
     }
 
     fn lookup_runtime_leases_once(
@@ -193,11 +189,7 @@ impl StoreClient {
         if wanted.is_empty() {
             return Ok(BTreeMap::new());
         }
-        match self.lookup_runtime_leases_once(&wanted, false) {
-            Ok(leases) => Ok(leases),
-            Err(StoreError::NotFound(_)) => self.lookup_runtime_leases_once(&wanted, true),
-            Err(error) => Err(error),
-        }
+        self.lookup_runtime_leases_once(&wanted, false)
     }
 
     fn resolve_preferred_storage_owners_once(
@@ -387,13 +379,7 @@ impl StoreClient {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
-        match self.resolve_preferred_storage_owners_once(selectors, false) {
-            Ok(runtimes) => Ok(runtimes),
-            Err(StoreError::NotFound(_)) => {
-                self.resolve_preferred_storage_owners_once(selectors, true)
-            }
-            Err(error) => Err(error),
-        }
+        self.resolve_preferred_storage_owners_once(selectors, false)
     }
 
     fn has_active_local_storage(&self) -> bool {

@@ -33,11 +33,12 @@ use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransport
 
 const DEFAULT_TENANT: &str = "default";
 const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
-const LIVE_CLIENT_CACHE_TTL: Duration = Duration::from_millis(100);
+const DEFAULT_LIVE_CLIENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 include!("types.rs");
 include!("builder.rs");
 include!("state_core.rs");
+include!("membership_sync.rs");
 include!("state_adapters.rs");
 include!("state_store.rs");
 include!("helpers.rs");
@@ -50,6 +51,7 @@ pub struct StoreClient {
     allocator: Arc<Mutex<LocalAllocatorState>>,
     lease: ClientLease,
     live_client_cache: SharedLiveClientCache,
+    membership_sync: MembershipSyncHandle,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,

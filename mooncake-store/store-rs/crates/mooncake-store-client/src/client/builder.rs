@@ -11,6 +11,7 @@ pub struct StoreClientBuilder {
     transport_factory: Option<Arc<dyn StoreTransportFactory>>,
     write_mode: WriteMode,
     route_control: RouteControlMode,
+    live_client_sync_interval: Duration,
 }
 
 impl StoreClientBuilder {
@@ -28,6 +29,7 @@ impl StoreClientBuilder {
             transport_factory: None,
             write_mode: WriteMode::LocalOnly,
             route_control: RouteControlMode::EmbeddedWrh,
+            live_client_sync_interval: DEFAULT_LIVE_CLIENT_SYNC_INTERVAL,
         }
     }
 
@@ -99,6 +101,11 @@ impl StoreClientBuilder {
         self
     }
 
+    pub fn live_client_sync_interval(mut self, interval: Duration) -> Self {
+        self.live_client_sync_interval = interval;
+        self
+    }
+
     pub fn build(self, expires_at_ms: u64) -> Result<StoreClient> {
         if self.default_tenant.is_empty() {
             return Err(StoreError::InvalidState(
@@ -153,6 +160,11 @@ impl StoreClientBuilder {
             expires_at_ms,
         };
         self.metadata.upsert_client_lease(&lease)?;
+        refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &live_client_cache,
+            "live_client_snapshot_prewarm",
+        )?;
         let route_directory = build_route_directory(
             self.route_control,
             self.metadata.clone(),
@@ -160,6 +172,12 @@ impl StoreClientBuilder {
             control_client.clone(),
             live_client_cache.clone(),
         );
+        let membership_sync = MembershipSyncHandle::spawn(
+            &runtime,
+            self.metadata.clone(),
+            live_client_cache.clone(),
+            self.live_client_sync_interval,
+        )?;
         Ok(StoreClient {
             metadata: self.metadata,
             route_directory,
@@ -168,6 +186,7 @@ impl StoreClientBuilder {
             allocator,
             lease,
             live_client_cache,
+            membership_sync,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,

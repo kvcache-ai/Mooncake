@@ -97,18 +97,15 @@ impl EmbeddedWrhRouteDirectory {
     }
 
     fn active_route_leases(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
-        if !force_refresh {
-            if let Some(snapshot) = self.live_client_cache.lock().snapshot() {
-                return Ok(snapshot
-                    .into_iter()
-                    .filter(|lease| {
-                        lease.state == ClientLifecycleState::Active && route_capable(lease)
-                    })
-                    .collect::<Vec<_>>());
-            }
-        }
-        let leases = self.metadata.list_live_clients()?;
-        self.live_client_cache.lock().store(leases.clone());
+        let leases = if force_refresh {
+            crate::client::refresh_live_client_cache(
+                self.metadata.as_ref(),
+                &self.live_client_cache,
+                "live_client_snapshot_force_refresh",
+            )?
+        } else {
+            crate::client::cached_live_client_snapshot(&self.live_client_cache)?
+        };
         Ok(leases
             .into_iter()
             .filter(|lease| lease.state == ClientLifecycleState::Active && route_capable(lease))
@@ -147,11 +144,7 @@ impl EmbeddedWrhRouteDirectory {
     }
 
     fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
-        let candidates = self.authority_candidates_once(observer, false)?;
-        if !candidates.is_empty() {
-            return Ok(candidates);
-        }
-        self.authority_candidates_once(observer, true)
+        self.authority_candidates_once(observer, false)
     }
 
     fn select_authorities_from_candidates(
@@ -882,8 +875,6 @@ fn stable_hash(parts: &[&str]) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::thread::sleep;
-    use std::time::Duration;
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
@@ -1175,14 +1166,17 @@ mod tests {
         }
 
         let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
-        let directory = EmbeddedWrhRouteDirectory::new(
-            metadata.clone(),
-            &observer,
-            control,
-            Arc::new(parking_lot::Mutex::new(
-                crate::client::LiveClientCache::default(),
-            )),
-        );
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory =
+            EmbeddedWrhRouteDirectory::new(metadata.clone(), &observer, control, live_client_cache);
         let namespace = metadata.route_namespace();
         route_mesh(&namespace)
             .lock()
@@ -1236,13 +1230,12 @@ mod tests {
             .expect("empty batch cas should succeed")
             .is_empty());
 
-        sleep(Duration::from_millis(150));
         let authority_new = lease("authority-new", 5, true, Some("scope-a"));
         metadata
             .upsert_client_lease(&authority_new)
             .expect("new lease should upsert");
         let refreshed = directory
-            .authority_candidates(&observer)
+            .authority_candidates_once(&observer, true)
             .expect("refreshed candidate set should succeed");
         assert!(refreshed
             .iter()

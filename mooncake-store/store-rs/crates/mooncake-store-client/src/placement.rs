@@ -128,18 +128,9 @@ impl PlacementPlanner {
     fn candidates_for_client(
         &self,
         observer: &StoreClient,
-        minimum: usize,
+        _minimum: usize,
     ) -> Result<Vec<ClientLease>> {
-        let minimum = minimum.max(1);
-        let candidates = observer.placement_candidates_snapshot(
-            &self.scope_label_key,
-            &self.required_labels,
-            false,
-        )?;
-        if candidates.len() >= minimum {
-            return Ok(candidates);
-        }
-        observer.placement_candidates_snapshot(&self.scope_label_key, &self.required_labels, true)
+        observer.placement_candidates_snapshot(&self.scope_label_key, &self.required_labels, false)
     }
 
     fn candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {

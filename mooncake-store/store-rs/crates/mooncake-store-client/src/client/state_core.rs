@@ -8,10 +8,7 @@ pub(crate) struct LiveClientCache {
 
 impl LiveClientCache {
     pub(crate) fn snapshot(&self) -> Option<Vec<ClientLease>> {
-        let refreshed_at = self.refreshed_at?;
-        if refreshed_at.elapsed() > LIVE_CLIENT_CACHE_TTL {
-            return None;
-        }
+        self.refreshed_at?;
         Some(self.leases.clone())
     }
 
@@ -19,6 +16,17 @@ impl LiveClientCache {
         self.refreshed_at = Some(Instant::now());
         self.leases = leases;
     }
+}
+
+pub(crate) fn cached_live_client_snapshot(
+    live_client_cache: &SharedLiveClientCache,
+) -> Result<Vec<ClientLease>> {
+    live_client_cache.lock().snapshot().ok_or_else(|| {
+        StoreError::InvalidState(
+            "live client snapshot is not initialized; build() must prewarm membership before serving requests"
+                .to_string(),
+        )
+    })
 }
 
 #[derive(Default)]
