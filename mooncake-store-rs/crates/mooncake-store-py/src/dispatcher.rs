@@ -8,7 +8,10 @@ use mooncake_store_client::{
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
     ReplicationPolicy, StoreClient,
 };
-use mooncake_store_core::StoreError;
+use mooncake_store_core::{
+    ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
+    StoreError,
+};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
@@ -72,8 +75,49 @@ impl StoreDispatcher {
         self.run(|client| client.enter_draining())
     }
 
+    pub fn plan_handoff(
+        &self,
+        successor_epoch: ClientEpoch,
+        kind: HandoffKind,
+        barrier_version: u64,
+        created_at_ms: u64,
+        deadline_ms: Option<u64>,
+    ) -> Result<HandoffPlan, StoreError> {
+        self.run(move |client| {
+            client.plan_handoff(
+                successor_epoch,
+                kind,
+                barrier_version,
+                created_at_ms,
+                deadline_ms,
+            )
+        })
+    }
+
+    pub fn activate_if_targeted_handoff(&self) -> Result<Option<HandoffPlan>, StoreError> {
+        self.run(|client| client.activate_if_targeted_handoff())
+    }
+
+    pub fn find_hot_upgrade_successor(&self) -> Result<Option<ClientLease>, StoreError> {
+        self.run(|client| client.find_hot_upgrade_successor())
+    }
+
+    pub fn runtime_state(
+        &self,
+        runtime: ClientRuntimeId,
+    ) -> Result<Option<ClientLifecycleState>, StoreError> {
+        self.run(move |client| client.runtime_state(&runtime))
+    }
+
     pub fn evacuate_owned_replicas(&self) -> Result<usize, StoreError> {
         self.run(|client| client.evacuate_owned_replicas())
+    }
+
+    pub fn evacuate_owned_replicas_to_runtime(
+        &self,
+        runtime: ClientRuntimeId,
+    ) -> Result<usize, StoreError> {
+        self.run(move |client| client.evacuate_owned_replicas_to_runtime(&runtime))
     }
 
     pub fn register_buffer(&self, base_ptr: usize, len: usize) -> Result<(), StoreError> {

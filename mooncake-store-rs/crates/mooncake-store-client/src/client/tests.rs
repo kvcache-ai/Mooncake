@@ -27,8 +27,8 @@ use super::{
 };
 use crate::{
     control_plane::{AllocatorService, AuthorityService, ReleaseOp},
-    render_prometheus_metrics, reset_metrics,
     memory::RegionAllocation,
+    render_prometheus_metrics, reset_metrics,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
@@ -724,6 +724,84 @@ fn hot_upgrade_handoff_is_published_after_draining() {
     assert_eq!(stored.from.epoch, ClientEpoch(1));
     assert_eq!(stored.to.epoch, ClientEpoch(2));
     assert_eq!(stored.kind, HandoffKind::HotUpgrade);
+}
+
+#[test]
+fn hot_upgrade_successor_discovery_uses_same_stable_higher_epoch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let predecessor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7101")
+        .segment_name("upgrade-find-old")
+        .build(10_000)
+        .expect("predecessor build should succeed");
+    let successor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .rpc_address("127.0.0.1:7102")
+        .segment_name("upgrade-find-new")
+        .build(10_000)
+        .expect("successor build should succeed");
+    let _other_stable = StoreClientBuilder::new(metadata, "upgrade-other")
+        .epoch(ClientEpoch(9))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7103")
+        .segment_name("upgrade-other")
+        .build(10_000)
+        .expect("other stable build should succeed");
+
+    let found = predecessor
+        .find_hot_upgrade_successor()
+        .expect("successor lookup should succeed")
+        .expect("successor should exist");
+    assert_eq!(found.runtime, successor.runtime_id().clone());
+}
+
+#[test]
+fn targeted_hot_upgrade_handoff_promotes_standby_successor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut predecessor = StoreClientBuilder::new(metadata.clone(), "upgrade-promote")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7111")
+        .segment_name("upgrade-promote-old")
+        .build(10_000)
+        .expect("predecessor build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata, "upgrade-promote")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .rpc_address("127.0.0.1:7112")
+        .segment_name("upgrade-promote-new")
+        .build(10_000)
+        .expect("successor build should succeed");
+
+    predecessor
+        .enter_draining()
+        .expect("predecessor should drain");
+    predecessor
+        .plan_handoff(
+            ClientEpoch(2),
+            HandoffKind::HotUpgrade,
+            8,
+            100,
+            Some(u64::MAX),
+        )
+        .expect("handoff planning should succeed");
+
+    let plan = successor
+        .activate_if_targeted_handoff()
+        .expect("successor activation should succeed")
+        .expect("targeted handoff should be consumed");
+    assert_eq!(plan.from, predecessor.runtime_id().clone());
+    assert_eq!(plan.to, successor.runtime_id().clone());
+    assert_eq!(successor.lease().state, ClientLifecycleState::Active);
+    assert_eq!(
+        predecessor
+            .runtime_state(successor.runtime_id())
+            .expect("runtime state lookup should succeed"),
+        Some(ClientLifecycleState::Active)
+    );
 }
 
 #[test]
@@ -2028,16 +2106,13 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         ..CompatibilityDescriptor::default()
     };
     let builder_transport = Arc::new(TestTransport::new("builder-compat-segment"));
-    let built = StoreClientBuilder::new(
-        Arc::new(InMemoryMetadataBackend::new()),
-        "builder-compat",
-    )
-    .compatibility(custom_compat.clone())
-    .route_control(RouteControlMode::MetadataOnly)
-    .state(ClientLifecycleState::Active)
-    .transport(builder_transport)
-    .build(10_000)
-    .expect("builder with compatibility and route_control should succeed");
+    let built = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), "builder-compat")
+        .compatibility(custom_compat.clone())
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(builder_transport)
+        .build(10_000)
+        .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
 }
 
@@ -2070,9 +2145,7 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         Err(StoreError::Allocator(_))
     ));
 
-    client
-        .heartbeat(20_000)
-        .expect("heartbeat should succeed");
+    client.heartbeat(20_000).expect("heartbeat should succeed");
     client.enter_standby().expect("standby should succeed");
     client.activate().expect("activate should succeed");
     let handoff = client
@@ -2091,19 +2164,15 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .expect("local memory expansion should succeed");
     let listed = client.list_segments().expect("segment list should succeed");
     assert!(listed.iter().any(|segment| segment.segment_name == primary));
-    assert!(
-        listed
-            .iter()
-            .any(|segment| segment.segment_name == expanded.segment_name)
-    );
+    assert!(listed
+        .iter()
+        .any(|segment| segment.segment_name == expanded.segment_name));
     client
         .drain_segment(&expanded.segment_name)
         .expect("drain should succeed");
-    assert!(
-        client
-            .retire_segment(&expanded.segment_name)
-            .expect("retire should succeed")
-    );
+    assert!(client
+        .retire_segment(&expanded.segment_name)
+        .expect("retire should succeed"));
 
     let plain = client.put("plain", b"hello").expect("put should succeed");
     assert_eq!(client.get("plain").expect("get should succeed"), b"hello");
@@ -2155,7 +2224,12 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .put_from("from", source.as_ptr().cast(), 5)
         .expect("put_from should succeed");
     client
-        .put_from_in_tenant("tenant-b", "from", unsafe { source.as_ptr().add(16).cast() }, 6)
+        .put_from_in_tenant(
+            "tenant-b",
+            "from",
+            unsafe { source.as_ptr().add(16).cast() },
+            6,
+        )
         .expect("tenant put_from should succeed");
     client
         .put_from_with_policy(
@@ -2217,11 +2291,9 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         tenant_plain.replicas[0].length as usize
     );
     assert!(client.is_exist("plain").expect("plain should exist"));
-    assert!(
-        client
-            .is_exist_in_tenant("tenant-b", "plain")
-            .expect("tenant plain should exist")
-    );
+    assert!(client
+        .is_exist_in_tenant("tenant-b", "plain")
+        .expect("tenant plain should exist"));
     assert_eq!(
         client
             .batch_is_exist(&[
@@ -2323,7 +2395,9 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
     assert_eq!(&shard_left, b"pol");
     assert_eq!(&shard_right, b"icy!");
 
-    client.remove("plain", false).expect("remove should succeed");
+    client
+        .remove("plain", false)
+        .expect("remove should succeed");
     client
         .remove_in_tenant("tenant-b", "plain", false)
         .expect("tenant remove should succeed");
@@ -2338,11 +2412,9 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         )
         .expect("batch_remove should succeed");
     assert!(!client.is_exist("plain").expect("plain should be gone"));
-    assert!(
-        !client
-            .is_exist_in_tenant("tenant-b", "plain")
-            .expect("tenant plain should be gone")
-    );
+    assert!(!client
+        .is_exist_in_tenant("tenant-b", "plain")
+        .expect("tenant plain should be gone"));
 
     client
         .unregister_buffer(source.as_mut_ptr().cast(), source.len())
@@ -2427,11 +2499,18 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
             },
         ],
     );
-    assert!(cas_many[0].as_ref().expect("first batch cas should decode").applied);
-    assert!(!cas_many[1]
-        .as_ref()
-        .expect("second batch cas should decode")
-        .applied);
+    assert!(
+        cas_many[0]
+            .as_ref()
+            .expect("first batch cas should decode")
+            .applied
+    );
+    assert!(
+        !cas_many[1]
+            .as_ref()
+            .expect("second batch cas should decode")
+            .applied
+    );
 
     let replace_key = ObjectKey::new("tenant-z::replaced");
     let mut replaced_route = route.clone();
@@ -2521,7 +2600,12 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     let lease = client.lease().clone();
     let control = client.control_client.clone();
     let rpc_get = control
-        .batch_get_routes(&lease, &namespace, &authority, std::slice::from_ref(&scoped_key))
+        .batch_get_routes(
+            &lease,
+            &namespace,
+            &authority,
+            std::slice::from_ref(&scoped_key),
+        )
         .expect("rpc batch get should succeed");
     assert!(rpc_get[0]
         .as_ref()
@@ -2933,6 +3017,126 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
             expected[&key]
         );
     }
+}
+
+#[test]
+fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let predecessor_transport = Arc::new(TestTransport::new("pin-upgrade-old-segment"));
+    let successor_transport = Arc::new(predecessor_transport.peer("pin-upgrade-new-segment"));
+    let spare_transport = Arc::new(predecessor_transport.peer("pin-upgrade-spare-segment"));
+    let reader_transport = Arc::new(predecessor_transport.peer("pin-upgrade-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut predecessor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(predecessor_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("predecessor build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(successor_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("successor build should succeed");
+    let spare = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-spare")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(spare_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("spare build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "pin-upgrade-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    predecessor
+        .register_local_memory()
+        .expect("predecessor memory should register");
+    successor
+        .register_local_memory()
+        .expect("successor memory should register");
+    spare
+        .register_local_memory()
+        .expect("spare memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    predecessor
+        .put("pin-upgrade-key", b"pin-upgrade-payload")
+        .expect("seed put should succeed");
+    let initial = predecessor
+        .query_route("pin-upgrade-key")
+        .expect("initial route query should succeed")
+        .expect("initial route should exist");
+    assert!(initial
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *predecessor.runtime_id()));
+
+    predecessor
+        .enter_draining()
+        .expect("predecessor should drain");
+    predecessor
+        .plan_handoff(
+            ClientEpoch(2),
+            HandoffKind::HotUpgrade,
+            1,
+            100,
+            Some(u64::MAX),
+        )
+        .expect("handoff planning should succeed");
+    successor
+        .activate_if_targeted_handoff()
+        .expect("successor activation should succeed")
+        .expect("targeted handoff should be visible");
+
+    let successor_runtime = successor.runtime_id().clone();
+    let migrated = predecessor
+        .evacuate_owned_replicas_to_runtime(&successor_runtime)
+        .expect("targeted hot-upgrade evacuation should succeed");
+    assert_eq!(migrated, 1);
+    assert!(
+        predecessor
+            .list_segments()
+            .expect("segment listing should succeed")
+            .is_empty(),
+        "predecessor segments should retire after migration"
+    );
+
+    let route = reader
+        .query_route("pin-upgrade-key")
+        .expect("post-upgrade route query should succeed")
+        .expect("post-upgrade route should exist");
+    assert!(route
+        .replicas
+        .iter()
+        .all(|replica| replica.owner != *predecessor.runtime_id()));
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == successor_runtime));
+    assert_eq!(
+        reader
+            .get("pin-upgrade-key")
+            .expect("reader get should succeed"),
+        b"pin-upgrade-payload"
+    );
 }
 
 #[test]

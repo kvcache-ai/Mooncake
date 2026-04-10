@@ -228,6 +228,42 @@ impl StoreClient {
             .preferred_storage_owners(preferred))
     }
 
+    fn migration_policy_for_successor_route(
+        &self,
+        route: &ObjectRoute,
+        successor: &ClientRuntimeId,
+    ) -> Result<ReplicationPolicy> {
+        let active = self
+            .compatible_live_clients(true)?
+            .into_iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
+            .map(|lease| lease.runtime)
+            .collect::<BTreeSet<_>>();
+        let mut preferred = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        let successor_key = successor.storage_key();
+        seen.insert(successor_key.clone());
+        preferred.push(successor_key);
+
+        for replica in route.replicas.iter().filter(|replica| {
+            replica.owner != self.lease.runtime
+                && replica.owner != *successor
+                && active.contains(&replica.owner)
+        }) {
+            let owner = replica.owner.storage_key();
+            if seen.insert(owner.clone()) {
+                preferred.push(owner);
+            }
+        }
+
+        Ok(ReplicationPolicy::new()
+            .replica_count(route.replicas.len().max(1))
+            .prefer_local(false)
+            .with_soft_pin(true)
+            .preferred_storage_owners(preferred))
+    }
+
     fn migrate_owned_route_via_writer(
         &self,
         writer: &StoreClient,
@@ -289,6 +325,65 @@ impl StoreClient {
 
     fn migrate_owned_route(&self, route: &ObjectRoute) -> Result<bool> {
         self.migrate_owned_route_via_writer(self, route)
+    }
+
+    fn migrate_owned_route_to_runtime(
+        &self,
+        successor: &ClientRuntimeId,
+        route: &ObjectRoute,
+    ) -> Result<bool> {
+        let (tenant, key) = self.split_scoped_route_key(route)?;
+        for _ in 0..4 {
+            let Some(observed) = self.query_route_in_tenant(tenant, key)? else {
+                return Ok(false);
+            };
+            if observed.state != RouteState::Active {
+                return Ok(false);
+            }
+            if !observed
+                .replicas
+                .iter()
+                .any(|replica| replica.owner == self.lease.runtime)
+            {
+                return Ok(false);
+            }
+
+            let payload = self.get_in_tenant(tenant, key)?;
+            let Some(confirmed) = self.query_route_in_tenant(tenant, key)? else {
+                return Ok(false);
+            };
+            if confirmed.version != observed.version {
+                continue;
+            }
+            if !confirmed
+                .replicas
+                .iter()
+                .any(|replica| replica.owner == self.lease.runtime)
+            {
+                return Ok(false);
+            }
+
+            let policy = self.migration_policy_for_successor_route(&confirmed, successor)?;
+            match self.put_scoped_with_policy_current(
+                tenant,
+                key,
+                &payload,
+                Some(&policy),
+                Some(&confirmed),
+                ReclaimMode::Immediate,
+            ) {
+                Ok(next) => {
+                    self.sync_route_to_live_authorities(&next)?;
+                    return Ok(true);
+                }
+                Err(StoreError::Conflict(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(StoreError::Conflict(format!(
+            "client hot-upgrade lost route update race for {}",
+            route.key.0
+        )))
     }
 
     fn current_owned_allocations(&self) -> Result<BTreeSet<AllocationSpan>> {
