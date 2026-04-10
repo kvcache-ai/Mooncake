@@ -184,9 +184,12 @@ fn decode_status(status: i32) -> TransferStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::mem::ManuallyDrop;
+
     use mooncake_transport_sys::classic as ffi;
 
-    use super::{check_zero, decode_status, encode_opcode, to_cstring};
+    use super::{check_zero, decode_status, encode_opcode, to_cstring, ClassicTransferEngine};
     use crate::{Opcode, TransferStatus};
 
     #[test]
@@ -220,5 +223,33 @@ mod tests {
         assert_eq!(decode_status(ffi::STATUS_TIMEOUT), TransferStatus::Timeout);
         assert_eq!(decode_status(ffi::STATUS_FAILED), TransferStatus::Failed);
         assert_eq!(decode_status(i32::MAX), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn classic_constructor_rejects_embedded_nul_before_touching_ffi() {
+        assert!(ClassicTransferEngine::new("bad\0uri", "local", "127.0.0.1", 1).is_err());
+        assert!(ClassicTransferEngine::new("redis://ok", "lo\0cal", "127.0.0.1", 1).is_err());
+        assert!(ClassicTransferEngine::new("redis://ok", "local", "127.0.0.1\0", 1).is_err());
+    }
+
+    #[test]
+    fn classic_methods_validate_inputs_before_calling_ffi() {
+        let engine = ManuallyDrop::new(ClassicTransferEngine {
+            raw: std::ptr::null_mut(),
+        });
+
+        assert!(engine
+            .register_local_memory(std::ptr::null_mut::<c_void>(), 0, "cpu:0\0", false)
+            .is_err());
+        assert!(engine.open_segment("bad\0segment").is_err());
+
+        let overflow = crate::TransferRequest {
+            opcode: Opcode::Write,
+            source: std::ptr::null_mut(),
+            target_id: (i32::MAX as u64) + 1,
+            target_offset: 0,
+            length: 1,
+        };
+        assert!(engine.submit(7, &[overflow]).is_err());
     }
 }
