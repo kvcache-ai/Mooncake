@@ -3,6 +3,135 @@ impl StoreClient {
         &self.lease.runtime
     }
 
+    pub fn find_hot_upgrade_successor(&self) -> Result<Option<ClientLease>> {
+        Ok(self
+            .compatible_live_clients(true)?
+            .into_iter()
+            .filter(|lease| lease.runtime.stable_id == self.lease.runtime.stable_id)
+            .filter(|lease| lease.runtime.epoch > self.lease.runtime.epoch)
+            .filter(|lease| {
+                matches!(
+                    lease.state,
+                    ClientLifecycleState::Standby | ClientLifecycleState::Active
+                )
+            })
+            .max_by_key(|lease| lease.runtime.epoch))
+    }
+
+    pub fn activate_if_targeted_handoff(&mut self) -> Result<Option<HandoffPlan>> {
+        if self.lease.state != ClientLifecycleState::Standby {
+            return Ok(None);
+        }
+        let Some(handoff) = self.metadata.get_handoff(&self.lease.runtime.stable_id)? else {
+            return Ok(None);
+        };
+        if handoff.to != self.lease.runtime {
+            return Ok(None);
+        }
+        if !matches!(
+            handoff.kind,
+            HandoffKind::HotUpgrade | HandoffKind::HotStandbyPromotion
+        ) {
+            return Ok(None);
+        }
+        if handoff
+            .deadline_ms
+            .is_some_and(|deadline_ms| Self::current_time_ms() > deadline_ms)
+        {
+            return Ok(None);
+        }
+        self.activate()?;
+        Ok(Some(handoff))
+    }
+
+    pub fn runtime_state(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLifecycleState>> {
+        Ok(self
+            .compatible_live_clients(true)?
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime)
+            .map(|lease| lease.state))
+    }
+
+    pub fn evacuate_owned_replicas_to_runtime(
+        &mut self,
+        successor: &ClientRuntimeId,
+    ) -> Result<usize> {
+        if !self.has_active_compatible_runtime(successor, false)?
+            && !self.has_active_compatible_runtime(successor, true)?
+        {
+            return Err(StoreError::InvalidState(format!(
+                "hot-upgrade successor {} is not active",
+                successor
+            )));
+        }
+
+        let _span = info_span!(
+            "store.evacuate_owned_replicas_to_runtime",
+            runtime = %self.lease.runtime,
+            successor = %successor
+        )
+        .entered();
+        let tracker = OperationTracker::new("evacuate_owned_replicas_to_runtime");
+        let result = (|| {
+            self.ensure_local_memory()?;
+            if self.lease.state != ClientLifecycleState::Draining {
+                self.enter_draining()?;
+            }
+            let segments = {
+                let state = self.state.lock();
+                state.memory_ref()?.storage_segments()
+            };
+            for segment in segments
+                .iter()
+                .filter(|segment| segment.state == SegmentLifecycleState::Active)
+            {
+                self.drain_segment_internal(&segment.segment_name, true)?;
+            }
+            self.flush_all_reclaims()?;
+
+            let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
+            let helper_writer = self.build_hot_upgrade_helper_writer()?;
+            let mut migrated = 0usize;
+            for route in routes {
+                let migrated_route = match helper_writer.as_ref() {
+                    Some(writer) => {
+                        self.migrate_owned_route_to_runtime_via_writer(writer, successor, &route)?
+                    }
+                    None => self.migrate_owned_route_to_runtime(successor, &route)?,
+                };
+                if migrated_route {
+                    migrated = migrated.saturating_add(1);
+                }
+            }
+            drop(helper_writer);
+
+            self.flush_all_reclaims()?;
+            let live_allocations = self.current_owned_allocations()?;
+            let _ = self.release_stale_local_allocations(&live_allocations)?;
+            self.flush_all_reclaims()?;
+            self.retire_empty_draining_segments()?;
+
+            let remaining = self
+                .list_segments()?
+                .into_iter()
+                .filter(|segment| segment.used_bytes != 0)
+                .collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "hot-upgrade evacuation still has live bytes on local segments: {}",
+                    remaining
+                        .iter()
+                        .map(|segment| format!("{}:{}", segment.segment_name.0, segment.used_bytes))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            Ok(migrated)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
     pub fn evacuate_owned_replicas_via(&mut self, writer: &StoreClient) -> Result<usize> {
         let _span = info_span!(
             "store.evacuate_owned_replicas_via",
@@ -69,6 +198,58 @@ impl StoreClient {
 
     pub fn default_tenant(&self) -> &str {
         &self.default_tenant
+    }
+
+    fn build_hot_upgrade_helper_writer(&self) -> Result<Option<StoreClient>> {
+        let Some(factory) = self.transport_factory.clone() else {
+            return Ok(None);
+        };
+
+        let helper_stable_id = format!(
+            "{}-hot-upgrade-helper-{}",
+            self.lease.runtime.stable_id.0,
+            Self::current_time_ms()
+        );
+        let helper_segment_name = format!(
+            "{}-segment-{}",
+            helper_stable_id.replace(':', "-"),
+            self.lease.runtime.epoch.0
+        );
+        let helper_transport = factory.create(&helper_segment_name)?;
+        let helper_expiry_ms = self
+            .lease
+            .expires_at_ms
+            .max(Self::current_time_ms().saturating_add(30_000));
+
+        let mut builder = StoreClientBuilder::new(self.metadata.clone(), helper_stable_id)
+            .epoch(self.lease.runtime.epoch)
+            .state(ClientLifecycleState::Active)
+            .tenant(self.default_tenant.clone())
+            .compatibility(self.lease.compatibility.clone())
+            .local_memory(self.local_memory.clone())
+            .transport(helper_transport)
+            .transport_factory(factory)
+            .route_control(self.route_control);
+
+        let mut labels = self.lease.endpoints.labels.clone();
+        labels.remove(control_address_label());
+        labels.insert("storage".to_string(), "false".to_string());
+        labels.insert("route".to_string(), "false".to_string());
+        for (key, value) in labels {
+            builder = builder.label(key, value);
+        }
+
+        if let WriteMode::Routed {
+            planner,
+            replica_count,
+        } = &self.write_mode
+        {
+            builder = builder.routed_writes(planner.clone(), *replica_count);
+        }
+
+        let helper = builder.build(helper_expiry_ms)?;
+        helper.register_local_memory()?;
+        Ok(Some(helper))
     }
 
     fn default_replica_count(&self) -> usize {
@@ -138,6 +319,13 @@ impl StoreClient {
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.runtime.cmp(&right.runtime));
         Ok(candidates)
+    }
+
+    fn current_time_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_millis() as u64
     }
 
     fn lookup_runtime_lease_once(

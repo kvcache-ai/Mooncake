@@ -57,6 +57,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment")?;
     let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment")?;
+    let target_c_bundle = build_tent_bundle(redis_port, "target-c-segment")?;
     let upgrade_bundle = build_tent_bundle(redis_port, "target-a-upgrade-segment")?;
     let reclaim_bundle = build_tent_bundle(redis_port, "target-reclaim-segment")?;
     let router_bundle = build_tent_bundle(redis_port, "router-segment")?;
@@ -86,6 +87,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         &[
             ("pool", "pool-a"),
             ("role", "scaleout"),
+            ("storage", "true"),
+        ],
+    )?;
+    let target_c = build_client(
+        metadata.clone(),
+        "store-c",
+        ClientEpoch(1),
+        ClientLifecycleState::Active,
+        target_c_bundle,
+        memory.clone(),
+        "tenant-a",
+        &[
+            ("pool", "pool-a"),
+            ("role", "post-upgrade-scaleout"),
             ("storage", "true"),
         ],
     )?;
@@ -214,6 +229,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     )?;
     target_a.register_local_memory()?;
     target_b.register_local_memory()?;
+    target_c.register_local_memory()?;
     target_upgrade.register_local_memory()?;
     reclaim_writer.register_local_memory()?;
     router.register_local_memory()?;
@@ -249,7 +265,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     run_batch_put_benchmark(&router, value_size, batch_bench_iters)?;
     run_batch_get_benchmark(&target_upgrade, &reader, value_size, batch_bench_iters)?;
-    target_a.activate()?;
     verify_true_client_shrink(&mut target_b, &router, &reader, value_size)?;
 
     println!(
@@ -995,19 +1010,80 @@ fn verify_hot_upgrade(
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
+    let preserved = payload("upgrade-preserved", value_size);
+    let promoted = payload("upgrade-promoted", value_size);
+    writer_a.put("upgrade-old-key", &preserved)?;
+    let old_route = routed_writer
+        .query_route("upgrade-old-key")?
+        .ok_or_else(|| StoreError::NotFound("upgrade-old-key".to_string()))?;
+    if !old_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *writer_a.runtime_id())
+    {
+        return Err(StoreError::InvalidState(
+            "seeded old key did not land on the predecessor runtime".to_string(),
+        ));
+    }
+
     writer_a.enter_draining()?;
+    let created_at_ms = now_ms();
+    let deadline_ms = created_at_ms + 5_000;
     writer_a.plan_handoff(
         ClientEpoch(2),
         HandoffKind::HotUpgrade,
         42,
-        now_ms(),
-        Some(now_ms() + 5_000),
+        created_at_ms,
+        Some(deadline_ms),
     )?;
-    writer_upgrade.activate()?;
+    let plan = writer_upgrade
+        .activate_if_targeted_handoff()?
+        .ok_or_else(|| {
+            StoreError::InvalidState(
+                "standby successor did not observe the targeted hot-upgrade handoff".to_string(),
+            )
+        })?;
+    if plan.to != *writer_upgrade.runtime_id() {
+        return Err(StoreError::InvalidState(format!(
+            "handoff targeted unexpected successor {}",
+            plan.to
+        )));
+    }
 
-    let preserved = payload("upgrade-preserved", value_size);
-    let promoted = payload("upgrade-promoted", value_size);
-    writer_a.put("upgrade-old-key", &preserved)?;
+    let migrated = writer_a.evacuate_owned_replicas_to_runtime(writer_upgrade.runtime_id())?;
+    if migrated == 0 {
+        return Err(StoreError::InvalidState(
+            "hot-upgrade evacuation did not migrate any owned routes".to_string(),
+        ));
+    }
+    if !writer_a.list_segments()?.is_empty() {
+        return Err(StoreError::InvalidState(
+            "predecessor still owns local segments after hot-upgrade evacuation".to_string(),
+        ));
+    }
+
+    let migrated_route = routed_writer
+        .query_route("upgrade-old-key")?
+        .ok_or_else(|| StoreError::NotFound("upgrade-old-key".to_string()))?;
+    if migrated_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *writer_a.runtime_id())
+    {
+        return Err(StoreError::InvalidState(
+            "migrated route still references the predecessor runtime".to_string(),
+        ));
+    }
+    if !migrated_route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *writer_upgrade.runtime_id())
+    {
+        return Err(StoreError::InvalidState(
+            "migrated route did not pin the successor runtime".to_string(),
+        ));
+    }
+
     writer_upgrade.put("upgrade-new-key", &promoted)?;
 
     let keys = [

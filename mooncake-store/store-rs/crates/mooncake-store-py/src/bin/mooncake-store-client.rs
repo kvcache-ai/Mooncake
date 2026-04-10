@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc,
 };
 use std::thread;
@@ -14,7 +14,9 @@ use clap::{Parser, ValueEnum};
 use mooncake_store_client::{
     init_tracing, start_metrics_http_server, stop_metrics_http_server, RouteControlMode,
 };
-use mooncake_store_core::{parse_hugepage_size, ClientEpoch, ClientLifecycleState};
+use mooncake_store_core::{
+    parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RouteControlArg {
     EmbeddedWrh,
@@ -107,6 +109,21 @@ struct Args {
     drain_on_exit: bool,
 }
 
+#[derive(Clone)]
+struct ShutdownSignal {
+    state: Arc<AtomicU8>,
+}
+
+impl ShutdownSignal {
+    fn requested(&self) -> bool {
+        self.state.load(Ordering::SeqCst) >= 1
+    }
+
+    fn forced(&self) -> bool {
+        self.state.load(Ordering::SeqCst) >= 2
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     validate_args(&args)?;
@@ -147,8 +164,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let mut next_heartbeat = now_ms().saturating_add(heartbeat_interval);
-    while !shutdown.load(Ordering::Relaxed) {
+    while !shutdown.requested() {
         let now = now_ms();
+        if should_follow_handoff(initial_state, epoch) {
+            if let Some(plan) = client.activate_if_targeted_handoff()? {
+                eprintln!(
+                    "{}",
+                    promoted_message(&stable_id, epoch, plan.from.epoch, plan.kind)
+                );
+            }
+        }
         if now >= next_heartbeat {
             client.heartbeat(now.saturating_add(args.lease_ttl_ms))?;
             next_heartbeat = now.saturating_add(heartbeat_interval);
@@ -158,19 +183,73 @@ fn main() -> Result<(), Box<dyn Error>> {
         thread::sleep(Duration::from_millis(wait_ms.min(100)));
     }
 
-    drop(dummy_server);
-
     if args.drain_on_exit {
-        client.enter_draining()?;
-        let evacuated = client.evacuate_owned_replicas()?;
-        eprintln!("{}", drained_message(&stable_id, evacuated));
+        let shutdown_summary = graceful_shutdown(
+            &client,
+            &shutdown,
+            &stable_id,
+            epoch,
+            args.lease_ttl_ms,
+            heartbeat_interval,
+        )?;
+        eprintln!("{shutdown_summary}");
     }
+    drop(dummy_server);
     client.shutdown();
     if metrics_addr.is_some() {
         stop_metrics_http_server()?;
     }
     eprintln!("{}", stopped_message(&stable_id));
     Ok(())
+}
+
+fn graceful_shutdown(
+    client: &StoreDispatcher,
+    shutdown: &ShutdownSignal,
+    stable_id: &str,
+    epoch: ClientEpoch,
+    lease_ttl_ms: u64,
+    heartbeat_interval_ms: u64,
+) -> Result<String, Box<dyn Error>> {
+    client.enter_draining()?;
+    let Some(successor) = client.find_hot_upgrade_successor()? else {
+        let evacuated = client.evacuate_owned_replicas()?;
+        return Ok(drained_message(stable_id, evacuated));
+    };
+
+    let created_at_ms = now_ms();
+    let deadline_ms = created_at_ms.saturating_add(
+        lease_ttl_ms
+            .min(30_000)
+            .max(heartbeat_interval_ms.max(1_000)),
+    );
+    let plan = client.plan_handoff(
+        successor.runtime.epoch,
+        HandoffKind::HotUpgrade,
+        created_at_ms,
+        created_at_ms,
+        Some(deadline_ms),
+    )?;
+    eprintln!(
+        "{}",
+        handoff_message(stable_id, epoch, &successor.runtime, deadline_ms)
+    );
+
+    wait_for_successor_activation(
+        client,
+        shutdown,
+        &successor.runtime,
+        lease_ttl_ms,
+        heartbeat_interval_ms,
+        deadline_ms,
+    )?;
+    let migrated = client.evacuate_owned_replicas_to_runtime(successor.runtime.clone())?;
+    Ok(upgraded_message(
+        &plan.stable_id.0,
+        epoch,
+        successor.runtime.epoch,
+        migrated,
+    ))
 }
 
 fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
@@ -250,6 +329,42 @@ fn started_message(
     )
 }
 
+fn handoff_message(
+    stable_id: &str,
+    from_epoch: ClientEpoch,
+    successor: &ClientRuntimeId,
+    deadline_ms: u64,
+) -> String {
+    format!(
+        "mooncake-store-client handoff stable_id={stable_id} from_epoch={} to_runtime={} deadline_ms={deadline_ms}",
+        from_epoch.0, successor
+    )
+}
+
+fn promoted_message(
+    stable_id: &str,
+    epoch: ClientEpoch,
+    from_epoch: ClientEpoch,
+    kind: HandoffKind,
+) -> String {
+    format!(
+        "mooncake-store-client promoted stable_id={stable_id} epoch={} from_epoch={} kind={kind:?}",
+        epoch.0, from_epoch.0
+    )
+}
+
+fn upgraded_message(
+    stable_id: &str,
+    from_epoch: ClientEpoch,
+    to_epoch: ClientEpoch,
+    migrated_routes: usize,
+) -> String {
+    format!(
+        "mooncake-store-client upgraded stable_id={stable_id} from_epoch={} to_epoch={} migrated_routes={migrated_routes}",
+        from_epoch.0, to_epoch.0
+    )
+}
+
 fn lifecycle_state_label(state: ClientLifecycleState) -> &'static str {
     match state {
         ClientLifecycleState::Standby => "standby",
@@ -270,13 +385,13 @@ fn stopped_message(stable_id: &str) -> String {
     format!("mooncake-store-client stopped stable_id={stable_id}")
 }
 
-fn install_signal_handler() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
-    let shutdown = Arc::new(AtomicBool::new(false));
+fn install_signal_handler() -> Result<ShutdownSignal, Box<dyn Error>> {
+    let shutdown = Arc::new(AtomicU8::new(0));
     let handle = shutdown.clone();
     ctrlc::set_handler(move || {
-        handle.store(true, Ordering::SeqCst);
+        let _ = handle.fetch_add(1, Ordering::SeqCst);
     })?;
-    Ok(shutdown)
+    Ok(ShutdownSignal { state: shutdown })
 }
 
 fn start_metrics_if_needed(bind_addr: Option<&str>) -> Result<Option<String>, Box<dyn Error>> {
@@ -291,6 +406,39 @@ fn effective_heartbeat_interval(requested_ms: u64, lease_ttl_ms: u64) -> u64 {
         return (lease_ttl_ms / 3).max(1_000);
     }
     requested_ms
+}
+
+fn should_follow_handoff(initial_state: ClientLifecycleState, epoch: ClientEpoch) -> bool {
+    initial_state == ClientLifecycleState::Standby && epoch.0 > 1
+}
+
+fn wait_for_successor_activation(
+    client: &StoreDispatcher,
+    shutdown: &ShutdownSignal,
+    successor: &ClientRuntimeId,
+    lease_ttl_ms: u64,
+    heartbeat_interval_ms: u64,
+    deadline_ms: u64,
+) -> Result<(), Box<dyn Error>> {
+    let poll_interval_ms = heartbeat_interval_ms.min(500).max(50);
+    loop {
+        if shutdown.forced() {
+            return Err("graceful hot-upgrade interrupted by repeated signal".into());
+        }
+        if let Some(ClientLifecycleState::Active) = client.runtime_state(successor.clone())? {
+            return Ok(());
+        }
+        let now = now_ms();
+        if now >= deadline_ms {
+            return Err(format!(
+                "successor {} did not become active before deadline",
+                successor
+            )
+            .into());
+        }
+        client.heartbeat(now.saturating_add(lease_ttl_ms))?;
+        thread::sleep(Duration::from_millis(poll_interval_ms));
+    }
 }
 
 fn now_ms() -> u64 {

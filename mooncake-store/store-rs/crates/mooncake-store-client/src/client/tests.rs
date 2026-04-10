@@ -764,6 +764,84 @@ fn hot_upgrade_handoff_is_published_after_draining() {
 }
 
 #[test]
+fn hot_upgrade_successor_discovery_uses_same_stable_higher_epoch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let predecessor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7101")
+        .segment_name("upgrade-find-old")
+        .build(10_000)
+        .expect("predecessor build should succeed");
+    let successor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .rpc_address("127.0.0.1:7102")
+        .segment_name("upgrade-find-new")
+        .build(10_000)
+        .expect("successor build should succeed");
+    let _other_stable = StoreClientBuilder::new(metadata, "upgrade-other")
+        .epoch(ClientEpoch(9))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7103")
+        .segment_name("upgrade-other")
+        .build(10_000)
+        .expect("other stable build should succeed");
+
+    let found = predecessor
+        .find_hot_upgrade_successor()
+        .expect("successor lookup should succeed")
+        .expect("successor should exist");
+    assert_eq!(found.runtime, successor.runtime_id().clone());
+}
+
+#[test]
+fn targeted_hot_upgrade_handoff_promotes_standby_successor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut predecessor = StoreClientBuilder::new(metadata.clone(), "upgrade-promote")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .rpc_address("127.0.0.1:7111")
+        .segment_name("upgrade-promote-old")
+        .build(10_000)
+        .expect("predecessor build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata, "upgrade-promote")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .rpc_address("127.0.0.1:7112")
+        .segment_name("upgrade-promote-new")
+        .build(10_000)
+        .expect("successor build should succeed");
+
+    predecessor
+        .enter_draining()
+        .expect("predecessor should drain");
+    predecessor
+        .plan_handoff(
+            ClientEpoch(2),
+            HandoffKind::HotUpgrade,
+            8,
+            100,
+            Some(u64::MAX),
+        )
+        .expect("handoff planning should succeed");
+
+    let plan = successor
+        .activate_if_targeted_handoff()
+        .expect("successor activation should succeed")
+        .expect("targeted handoff should be consumed");
+    assert_eq!(plan.from, predecessor.runtime_id().clone());
+    assert_eq!(plan.to, successor.runtime_id().clone());
+    assert_eq!(successor.lease().state, ClientLifecycleState::Active);
+    assert_eq!(
+        predecessor
+            .runtime_state(successor.runtime_id())
+            .expect("runtime state lookup should succeed"),
+        Some(ClientLifecycleState::Active)
+    );
+}
+
+#[test]
 fn query_route_uses_default_tenant_scope() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let client = StoreClientBuilder::new(metadata.clone(), "client-a")
@@ -1500,6 +1578,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1512,6 +1591,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(
@@ -1529,6 +1609,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
         .label("pool", "pool-a")
         .label("storage", "false")
         .label("route", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1536,6 +1617,8 @@ fn singleton_control_plane_paths_use_stream_sessions() {
     reader
         .register_local_memory()
         .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&storage, &router, &reader]);
 
     assert_eq!(router.control_client.active_stream_sessions(), 0);
     router
@@ -1694,6 +1777,680 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
             .get_in_tenant("tenant-a", "peer-key")
             .expect("reader get should succeed"),
         b"peer-payload"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-old-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-old-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-old-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-old-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-old-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-old-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "0.01")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-old-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner.clone(), 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-old-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-old-authority",
+            b"route-repair-payload",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("seed routed put should succeed");
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-old-authority");
+    let seed_route = reader
+        .query_route("route-repair-old-authority")
+        .expect("seed route query should succeed")
+        .expect("seed route should exist");
+    assert_eq!(seed_route.replicas[0].owner, *store_a.runtime_id());
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_a.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("old authority route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert!(
+        metadata
+            .get_object_route(&scoped_key)
+            .expect("metadata query should succeed")
+            .is_none(),
+        "seed route should stay off metadata in embedded WRH mode"
+    );
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-old-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-old-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-b route query should succeed")
+    .is_none());
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("store-c route query should succeed")
+    .is_none());
+
+    let repaired_route = reader
+        .query_route("route-repair-old-authority")
+        .expect("repair route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired_route, seed_route);
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-old-authority")
+            .expect("reader get should succeed after repair"),
+        b"route-repair-payload"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-meta-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-meta-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-meta-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-meta-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-meta-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "0.01")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-meta-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-meta-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-metadata",
+            b"route-repair-metadata-payload",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("seed routed put should succeed");
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-metadata");
+    let seed_route = reader
+        .query_route("route-repair-metadata")
+        .expect("seed route query should succeed")
+        .expect("seed route should exist");
+    assert_eq!(seed_route.replicas[0].owner, *store_a.runtime_id());
+    metadata
+        .compare_and_swap_object_route(&scoped_key, None, Some(&seed_route))
+        .expect("metadata route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_a.runtime_id().stable_id,
+        &scoped_key,
+        None,
+    )
+    .expect("old authority route removal should succeed");
+    assert!(crate::route_directory::authority_get(
+        &namespace,
+        &store_a.runtime_id().stable_id,
+        &scoped_key,
+    )
+    .expect("old authority route query should succeed")
+    .is_none());
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-scope")
+        .label("route_weight", "1000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let repaired_route = reader
+        .query_route("route-repair-metadata")
+        .expect("metadata repair route query should succeed")
+        .expect("metadata repair route should exist");
+    assert_eq!(repaired_route, seed_route);
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(seed_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-metadata")
+            .expect("reader get should succeed after metadata repair"),
+        b"route-repair-metadata-payload"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-stale-old-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-stale-old-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-stale-old-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-stale-old-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-stale-old-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "0.000001")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner.clone(), 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-old",
+            b"route-repair-stale-old-v1",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("first routed put should succeed");
+    let stale_route = reader
+        .query_route("route-repair-stale-old")
+        .expect("stale route query should succeed")
+        .expect("stale route should exist");
+    assert_eq!(stale_route.version, RouteVersion(1));
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-old",
+            b"route-repair-stale-old-v2",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("second routed put should succeed");
+    let fresh_route = reader
+        .query_route("route-repair-stale-old")
+        .expect("fresh route query should succeed")
+        .expect("fresh route should exist");
+    assert!(fresh_route.version > stale_route.version);
+    assert_eq!(
+        reader
+            .get("route-repair-stale-old")
+            .expect("reader should see fresh payload"),
+        b"route-repair-stale-old-v2"
+    );
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-stale-old");
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let mut divergent_route = fresh_route.clone();
+    divergent_route.replicas[0].owner =
+        ClientRuntimeId::new("zzzz-divergent-old-owner", ClientEpoch(99));
+    divergent_route.replicas[0].segment_name = SegmentName::new("zzzz-divergent-old-segment");
+    divergent_route.replicas[0].offset = divergent_route.replicas[0].offset.saturating_add(1);
+    divergent_route.replicas[0].segment_offset =
+        divergent_route.replicas[0].segment_offset.saturating_add(1);
+
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+        Some(&divergent_route),
+    )
+    .expect("store-b divergent route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+        Some(&divergent_route),
+    )
+    .expect("store-c divergent route insert should succeed");
+
+    let repaired_route = reader
+        .query_route("route-repair-stale-old")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired_route, fresh_route);
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"route_repair_divergent_authority\",status=\"ok\""));
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-stale-old")
+            .expect("reader get should succeed after divergent-authority repair"),
+        b"route-repair-stale-old-v2"
+    );
+}
+
+#[test]
+fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("repair-stale-meta-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("repair-stale-meta-b-segment"));
+    let store_c_transport = Arc::new(store_a_transport.peer("repair-stale-meta-c-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("repair-stale-meta-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("repair-stale-meta-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "0.000001")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "repair-stale-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-metadata",
+            b"route-repair-stale-metadata-v1",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("first routed put should succeed");
+    let stale_route = reader
+        .query_route("route-repair-stale-metadata")
+        .expect("stale route query should succeed")
+        .expect("stale route should exist");
+    assert_eq!(stale_route.version, RouteVersion(1));
+
+    writer
+        .put_with_policy(
+            "route-repair-stale-metadata",
+            b"route-repair-stale-metadata-v2",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("second routed put should succeed");
+    let fresh_route = reader
+        .query_route("route-repair-stale-metadata")
+        .expect("fresh route query should succeed")
+        .expect("fresh route should exist");
+    assert!(fresh_route.version > stale_route.version);
+
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::route-repair-stale-metadata");
+    metadata
+        .compare_and_swap_object_route(&scoped_key, None, Some(&fresh_route))
+        .expect("metadata fresh route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_a.runtime_id().stable_id,
+        &scoped_key,
+        None,
+    )
+    .expect("old authority route removal should succeed");
+
+    let store_b = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let store_c = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-c")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "repair-stale-scope")
+        .label("route_weight", "1000000")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_c_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-c build should succeed");
+
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    store_c
+        .register_local_memory()
+        .expect("store-c memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &store_c, &writer, &reader]);
+
+    let mut divergent_route = fresh_route.clone();
+    divergent_route.replicas[0].owner =
+        ClientRuntimeId::new("zzzz-divergent-metadata-owner", ClientEpoch(99));
+    divergent_route.replicas[0].segment_name = SegmentName::new("zzzz-divergent-metadata-segment");
+    divergent_route.replicas[0].offset = divergent_route.replicas[0].offset.saturating_add(1);
+    divergent_route.replicas[0].segment_offset =
+        divergent_route.replicas[0].segment_offset.saturating_add(1);
+
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_b.runtime_id().stable_id,
+        &scoped_key,
+        Some(&divergent_route),
+    )
+    .expect("store-b divergent route insert should succeed");
+    crate::route_directory::authority_replace(
+        &namespace,
+        &store_c.runtime_id().stable_id,
+        &scoped_key,
+        Some(&divergent_route),
+    )
+    .expect("store-c divergent route insert should succeed");
+
+    let repaired_route = reader
+        .query_route("route-repair-stale-metadata")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired_route, fresh_route);
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"route_repair_divergent_authority\",status=\"ok\""));
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_b.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-b repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        crate::route_directory::authority_get(
+            &namespace,
+            &store_c.runtime_id().stable_id,
+            &scoped_key,
+        )
+        .expect("store-c repaired route should be readable"),
+        Some(fresh_route.clone())
+    );
+    assert_eq!(
+        reader
+            .get("route-repair-stale-metadata")
+            .expect("reader get should succeed after metadata stale repair"),
+        b"route-repair-stale-metadata-v2"
     );
 }
 
@@ -3442,6 +4199,128 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
             expected[&key]
         );
     }
+}
+
+#[test]
+fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let predecessor_transport = Arc::new(TestTransport::new("pin-upgrade-old-segment"));
+    let predecessor_factory = predecessor_transport.factory();
+    let successor_transport = Arc::new(predecessor_transport.peer("pin-upgrade-new-segment"));
+    let spare_transport = Arc::new(predecessor_transport.peer("pin-upgrade-spare-segment"));
+    let reader_transport = Arc::new(predecessor_transport.peer("pin-upgrade-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut predecessor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
+        .epoch(ClientEpoch(1))
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(predecessor_transport)
+        .transport_factory(predecessor_factory)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("predecessor build should succeed");
+    let mut successor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
+        .epoch(ClientEpoch(2))
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(successor_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("successor build should succeed");
+    let spare = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-spare")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(spare_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("spare build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "pin-upgrade-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    predecessor
+        .register_local_memory()
+        .expect("predecessor memory should register");
+    successor
+        .register_local_memory()
+        .expect("successor memory should register");
+    spare
+        .register_local_memory()
+        .expect("spare memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    predecessor
+        .put("pin-upgrade-key", b"pin-upgrade-payload")
+        .expect("seed put should succeed");
+    let initial = predecessor
+        .query_route("pin-upgrade-key")
+        .expect("initial route query should succeed")
+        .expect("initial route should exist");
+    assert!(initial
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *predecessor.runtime_id()));
+
+    predecessor
+        .enter_draining()
+        .expect("predecessor should drain");
+    predecessor
+        .plan_handoff(
+            ClientEpoch(2),
+            HandoffKind::HotUpgrade,
+            1,
+            100,
+            Some(u64::MAX),
+        )
+        .expect("handoff planning should succeed");
+    successor
+        .activate_if_targeted_handoff()
+        .expect("successor activation should succeed")
+        .expect("targeted handoff should be visible");
+
+    let successor_runtime = successor.runtime_id().clone();
+    let migrated = predecessor
+        .evacuate_owned_replicas_to_runtime(&successor_runtime)
+        .expect("targeted hot-upgrade evacuation should succeed");
+    assert_eq!(migrated, 1);
+    assert!(
+        predecessor
+            .list_segments()
+            .expect("segment listing should succeed")
+            .is_empty(),
+        "predecessor segments should retire after migration"
+    );
+
+    let route = reader
+        .query_route("pin-upgrade-key")
+        .expect("post-upgrade route query should succeed")
+        .expect("post-upgrade route should exist");
+    assert!(route
+        .replicas
+        .iter()
+        .all(|replica| replica.owner != *predecessor.runtime_id()));
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == successor_runtime));
+    assert_eq!(
+        reader
+            .get("pin-upgrade-key")
+            .expect("reader get should succeed"),
+        b"pin-upgrade-payload"
+    );
 }
 
 #[test]

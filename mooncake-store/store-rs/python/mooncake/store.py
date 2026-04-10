@@ -258,6 +258,8 @@ class MooncakeDistributedStore:
         if len(args) == 8:
             args = args[:7]
         kwargs.pop("engine", None)
+        if "state" in kwargs and "initial_state" not in kwargs:
+            kwargs["initial_state"] = kwargs.pop("state")
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
         return self._invoke("setup", *args, **kwargs)
@@ -525,6 +527,9 @@ class MooncakeDistributedStore:
         metadata_url = config.get("metadata_server", config.get("metadata_url"))
         if metadata_url is None:
             raise TypeError("setup config requires `metadata_server`")
+        initial_state = _coerce_optional_str(
+            config.get("initial_state", config.get("state"))
+        ) or "active"
         return self._invoke(
             "setup",
             str(config["local_hostname"]),
@@ -535,6 +540,8 @@ class MooncakeDistributedStore:
             str(config.get("rdma_devices", "")),
             str(config.get("master_server_addr", config.get("master_server", ""))),
             stable_id=_coerce_optional_str(config.get("stable_id")),
+            epoch=_coerce_int(config.get("epoch"), 1),
+            initial_state=initial_state,
             tenant=str(config.get("tenant", "default")),
             labels=_coerce_mapping(config.get("labels")),
             routed_writes=_coerce_bool(config.get("routed_writes"), False),
