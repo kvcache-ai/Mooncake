@@ -1,0 +1,74 @@
+struct ResolvedObject {
+    tenant: String,
+    key: String,
+    replica: ReplicaRoute,
+}
+
+fn copy_into_region(allocation: RegionAllocation, value: &[u8]) {
+    unsafe {
+        ptr::copy_nonoverlapping(value.as_ptr(), allocation.addr.cast::<u8>(), value.len());
+    }
+}
+
+fn record_success_metric(operation: &'static str, bytes_in: u64, bytes_out: u64) {
+    let result: Result<()> = Ok(());
+    OperationTracker::new(operation)
+        .input_bytes(bytes_in)
+        .finish(&result, bytes_out);
+}
+
+fn flatten_slices(buffers: &[&[u8]]) -> Vec<u8> {
+    let total = buffers.iter().map(|buffer| buffer.len()).sum();
+    let mut payload = Vec::with_capacity(total);
+    for buffer in buffers {
+        payload.extend_from_slice(buffer);
+    }
+    payload
+}
+
+fn scatter_into_buffers(payload: &[u8], buffers: &mut [&mut [u8]]) {
+    let mut cursor = 0usize;
+    for buffer in buffers {
+        if cursor >= payload.len() {
+            buffer.fill(0);
+            continue;
+        }
+        let remaining = payload.len() - cursor;
+        let to_copy = remaining.min(buffer.len());
+        buffer[..to_copy].copy_from_slice(&payload[cursor..cursor + to_copy]);
+        if to_copy < buffer.len() {
+            buffer[to_copy..].fill(0);
+        }
+        cursor += to_copy;
+    }
+}
+
+fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
+    left.compatibility.store_api_version == right.compatibility.store_api_version
+        && left.compatibility.metadata_schema_version == right.compatibility.metadata_schema_version
+        && left.compatibility.transport_api_version == right.compatibility.transport_api_version
+}
+
+fn control_bind_host(rpc_address: &str) -> String {
+    if rpc_address.is_empty() {
+        return "127.0.0.1".to_string();
+    }
+    rpc_address
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty() && *host != "0.0.0.0" && *host != "::")
+        .unwrap_or("127.0.0.1")
+        .to_string()
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> u64 {
+    let mask = alignment.saturating_sub(1);
+    value.saturating_add(mask) & !mask
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should advance")
+        .as_millis() as u64
+}
