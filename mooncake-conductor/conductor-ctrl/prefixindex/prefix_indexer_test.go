@@ -81,6 +81,19 @@ func TestComputePrefixHash(t *testing.T) {
 			cacheSalt: 12345,
 			wantLen:   1,
 		},
+		{
+			name: "zero block size should return nil",
+			modelCtx: &ModelContext{
+				ModelName:      "test-model",
+				LoraName:       "none",
+				BlockSize:      0,
+				AdditionalSalt: "test-salt",
+				TenantID:       "default",
+			},
+			tokenIds:  []int32{1, 2, 3, 4},
+			cacheSalt: 0,
+			wantLen:   0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -115,7 +128,7 @@ func TestProcessStoreEvent(t *testing.T) {
 		Medium:          "cpu",
 	}
 
-	err := p.ProcessStoreEvent(event, 0, "instance-1")
+	err := p.ProcessStoreEvent(event, 0)
 	if err != nil {
 		t.Errorf("ProcessStoreEvent() error = %v", err)
 	}
@@ -127,16 +140,12 @@ func TestProcessStoreEvent(t *testing.T) {
 		BlockSize:      4,
 		TenantID:       "default",
 		AdditionalSalt: "",
+		InstanceID:     "instance-1",
 	}
 
-	value, exists := p.contextMap.Load(*modelCtx)
+	_, exists := p.contextMap.Load(*modelCtx)
 	if !exists {
 		t.Fatal("ProcessStoreEvent() did not create context data")
-	}
-
-	contextData := value.(*ContextData)
-	if contextData.instanceID != "instance-1" {
-		t.Errorf("ProcessStoreEvent() instanceID = %v, want %v", contextData.instanceID, "instance-1")
 	}
 }
 
@@ -154,7 +163,7 @@ func TestProcessStoreEvent_EmptyBlockHashes(t *testing.T) {
 		Medium:          "cpu",
 	}
 
-	err := p.ProcessStoreEvent(event, 0, "instance-1")
+	err := p.ProcessStoreEvent(event, 0)
 	if err != nil {
 		t.Errorf("ProcessStoreEvent() with empty BlockHashes should not error, got %v", err)
 	}
@@ -175,7 +184,7 @@ func TestProcessRemoveEvent(t *testing.T) {
 		Medium:          "cpu",
 	}
 
-	err := p.ProcessStoreEvent(storeEvent, 0, "instance-1")
+	err := p.ProcessStoreEvent(storeEvent, 0)
 	if err != nil {
 		t.Fatalf("ProcessStoreEvent() error = %v", err)
 	}
@@ -202,6 +211,7 @@ func TestProcessRemoveEvent(t *testing.T) {
 		BlockSize:      4,
 		TenantID:       "default",
 		AdditionalSalt: "",
+		InstanceID:     "instance-1",
 	}
 
 	value, exists := p.contextMap.Load(*modelCtx)
@@ -245,6 +255,7 @@ func TestCacheHitCompute(t *testing.T) {
 		BlockSize:      4,
 		TenantID:       "default",
 		AdditionalSalt: "", // Must match what ProcessStoreEvent uses internally
+		InstanceID:     "instance-1",
 	}
 
 	// Store an event first
@@ -259,14 +270,14 @@ func TestCacheHitCompute(t *testing.T) {
 		Medium:          "cpu",
 	}
 
-	err := p.ProcessStoreEvent(storeEvent, 0, "instance-1")
+	err := p.ProcessStoreEvent(storeEvent, 0)
 	if err != nil {
 		t.Fatalf("ProcessStoreEvent() error = %v", err)
 	}
 
 	// Now compute cache hit - using same tokenIds to get matching prefix
 	tokenIds := []int32{1, 2, 3, 4}
-	result := p.CacheHitCompute(modelCtx, tokenIds, "instance-1")
+	result := p.CacheHitCompute(modelCtx, tokenIds)
 
 	if result == nil {
 		t.Fatal("CacheHitCompute() returned nil")
@@ -294,7 +305,7 @@ func TestCacheHitCompute_NonExistentContext(t *testing.T) {
 
 	// Use tokenIds that don't match any stored data
 	tokenIds := []int32{1, 2, 3, 4}
-	result := p.CacheHitCompute(modelCtx, tokenIds, "instance-1")
+	result := p.CacheHitCompute(modelCtx, tokenIds)
 
 	if result == nil {
 		t.Fatal("CacheHitCompute() returned nil for non-existent context")
@@ -307,5 +318,31 @@ func TestCacheHitCompute_NonExistentContext(t *testing.T) {
 
 	if result.CPU != 0 || result.GPU != 0 {
 		t.Errorf("CacheHitCompute() expected zero CPU/GPU for non-existent context, got CPU=%d GPU=%d", result.CPU, result.GPU)
+	}
+}
+
+func TestCacheHitCompute_ZeroBlockSize(t *testing.T) {
+	p := NewPrefixCacheTable()
+
+	// Even without storing any data, zero BlockSize should not panic
+	modelCtx := &ModelContext{
+		ModelName:      "test-model",
+		LoraName:       "none",
+		BlockSize:      0, // Invalid BlockSize
+		TenantID:       "default",
+		AdditionalSalt: "test-salt",
+		InstanceID:     "instance-1",
+	}
+
+	tokenIds := []int32{1, 2, 3, 4}
+	result := p.CacheHitCompute(modelCtx, tokenIds)
+
+	// Should return zero values without panic
+	if result == nil {
+		t.Fatal("CacheHitCompute() returned nil for zero BlockSize")
+	}
+
+	if result.LongestMatchTokens != 0 {
+		t.Errorf("CacheHitCompute() LongestMatchTokens = %d, want 0 for zero BlockSize", result.LongestMatchTokens)
 	}
 }

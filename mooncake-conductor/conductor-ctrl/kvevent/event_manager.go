@@ -309,6 +309,8 @@ func (m *EventManager) StartHTTPServer() error {
 				response_result[tenantID][*req.InstanceID] = *result
 			}
 		} else {
+			m.tenantMutex.RLock()
+			defer m.tenantMutex.RUnlock()
 			if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
 				for instanceID := range instanceSet {
 					modelContext := &prefixindex.ModelContext{

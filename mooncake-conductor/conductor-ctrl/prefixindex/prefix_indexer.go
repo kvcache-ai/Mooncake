@@ -146,6 +146,10 @@ func (p *PrefixCacheTable) AddDpSize(modelcontext *ModelContext, dpRank int64) {
 
 func (p *PrefixCacheTable) ComputePrefixHash(modelcontext *ModelContext, tokenIds []int32, cacheSalt uint64) []uint64 {
 	// cacheSalt is used to separate hash from different customers
+	if modelcontext.BlockSize <= 0 {
+		slog.Warn("ComputePrefixHash: BlockSize must be greater than zero", "blockSize", modelcontext.BlockSize)
+		return nil
+	}
 	numBlocks := len(tokenIds) / int(modelcontext.BlockSize)
 	prefixHashes := make([]uint64, 0, numBlocks)
 
@@ -183,6 +187,13 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 	cacheSalt := xxhash.Sum64String(modelcontext.AdditionalSalt)
 
 	prefixHashes := p.ComputePrefixHash(modelcontext, tokenIds, cacheSalt)
+	if prefixHashes == nil {
+		slog.Error("CacheHitCompute: ComputePrefixHash returned nil, likely due to invalid BlockSize",
+			"modelName", modelcontext.ModelName,
+			"instanceID", modelcontext.InstanceID,
+			"blockSize", modelcontext.BlockSize)
+		return prefixMatchResult
+	}
 
 	// TODO @yejj710
 	// When there is no data in contextData, what information should be returned for the matched modelcontext
@@ -254,14 +265,6 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 		if len(event.BlockHashes) != 1 {
 			return fmt.Errorf("block hashes and tokens length mismatch")
 		}
-		// TODO mooncake event, only one block hash, in the future, remove it
-		// prefixStore := contextData.prefixStore
-		// for _, blockHash := range event.BlockHashes {
-		// 	if existingHash, exists := proxyHashMap[blockHash]; exists {
-		// 		p.addNewPrefixStore(prefixStore, existingHash, instanceID, event.Medium)
-		// 	}
-		// }
-		// return nil
 	}
 
 	newPrefixStore := make([]struct {
@@ -350,8 +353,23 @@ func (p *PrefixCacheTable) ProcessRemoveEvent(event common.RemovedEvent, dpRank 
 	defer contextData.prefixMu.Unlock()
 	prefixStore := contextData.prefixStore
 	for _, conductorHash := range removeConductorHash {
-		delete(prefixStore.prefixMap, conductorHash)
-		contextData.prefixStore.totalPrefixes--
+		cacheStoreInfo, exists := prefixStore.prefixMap[conductorHash]
+		if !exists {
+			continue
+		}
+
+		// Decrement replica count
+		cacheStoreInfo.TotalReplicaNums.Add(-1)
+
+		// Remove per-instance metadata
+		delete(cacheStoreInfo.engineLastAccessTime, instanceID)
+		delete(cacheStoreInfo.dpRankSet, dpRank)
+
+		// Only delete entry when all replicas are removed
+		if cacheStoreInfo.TotalReplicaNums.Load() <= 0 {
+			delete(prefixStore.prefixMap, conductorHash)
+			prefixStore.totalPrefixes--
+		}
 	}
 
 	return nil
@@ -364,7 +382,7 @@ func (p *PrefixCacheTable) computeHash(parentHash uint64, blockTokenIDs []int32)
 	binary.LittleEndian.PutUint64(parentHashBytes[:], parentHash)
 	_, _ = digest.Write(parentHashBytes[:])
 
-	var tokenIDsBytes [8]byte
+	var tokenIDsBytes [4]byte
 	for _, tokenID := range blockTokenIDs {
 		binary.LittleEndian.PutUint32(tokenIDsBytes[:], uint32(tokenID))
 		_, _ = digest.Write(tokenIDsBytes[:])

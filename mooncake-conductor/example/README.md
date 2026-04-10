@@ -115,7 +115,7 @@ mooncake_master -enable_kv_event_publish -kv_event_publisher_endpoint tcp://*:19
         "publisher": "zmq", 
         "enable_kv_cache_events": true, 
         "endpoint": "tcp://*:5557",
-        "topic": "kv-events",
+        "topic": "vllm",
         "replay_endpoint": "tcp://*:5558"
     }' \
     --kv-transfer-config \

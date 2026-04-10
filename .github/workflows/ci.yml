@@ -76,7 +76,7 @@ jobs:
     - name: Install coverage tools and build utilities
       run: |
         sudo apt-get update
-        sudo apt-get install -y lcov gcovr ninja-build
+        sudo apt-get install -y lcov gcovr ninja-build libzmq3-dev
 
     - name: Set up coverage compilation flags
       run: |
