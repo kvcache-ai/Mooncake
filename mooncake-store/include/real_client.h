@@ -526,7 +526,11 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
-        const std::vector<size_t> *buffer_capacities = nullptr);
+        const std::vector<size_t> *buffer_capacities = nullptr,
+        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+            *prepared_results = nullptr,
+        const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
+            nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -729,6 +733,10 @@ class RealClient : public PyClient {
                                   uint64_t dummy_addr, size_t buf_size,
                                   const MappedShm *&last_hit_shm,
                                   void *&out_real) const;
+
+    bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
+                                        uint64_t dummy_addr, size_t dst_offset,
+                                        size_t size, void *&out_real) const;
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
