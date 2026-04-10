@@ -236,6 +236,13 @@ Store metadata is responsible for:
 - fallback route persistence
 - handoff plans
 
+Redis metadata supports two authentication forms:
+
+- set `MC_REDIS_PASSWORD` for password-only Redis deployments
+- set both `MC_REDIS_USERNAME` and `MC_REDIS_PASSWORD` for Redis ACL users
+
+Credentials embedded in `redis://username:password@host:port/db` also work and take precedence over the environment variables. Prefer environment variables for cloud Redis passwords or any password containing URL-reserved characters.
+
 ### Transport metadata
 
 The transport layer is configured through `TentEngineConfig`.

@@ -82,6 +82,8 @@ fn main() -> Result<()> {
 }
 ```
 
+Redis authentication can come from URL-embedded credentials or from `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
+
 ## Enable Routed Writes
 
 Use `PlacementPlanner` and `routed_writes(...)` when a client should route writes to storage nodes.

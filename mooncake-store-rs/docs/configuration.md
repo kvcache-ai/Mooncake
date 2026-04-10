@@ -153,6 +153,33 @@ Notes:
 - when store metadata uses etcd, TENT metadata still needs Redis
 - set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint
 
+### Redis authentication
+
+Use `MC_REDIS_PASSWORD` for password-only Redis deployments, including cloud Redis instances that authenticate the default user:
+
+```bash
+export MC_REDIS_PASSWORD='<redis-password>'
+mooncake-store-client \
+  --local-hostname 127.0.0.1 \
+  --metadata-url redis://redis.example.com:6379/0 \
+  --stable-id store-a
+```
+
+Use `MC_REDIS_USERNAME` together with `MC_REDIS_PASSWORD` when Redis ACLs require a named user:
+
+```bash
+export MC_REDIS_USERNAME='<redis-username>'
+export MC_REDIS_PASSWORD='<redis-password>'
+```
+
+URL-embedded credentials are also accepted:
+
+```text
+redis://username:password@redis.example.com:6379/0
+```
+
+If both forms are present, credentials in the URL take precedence. Prefer environment variables when passwords contain reserved URL characters such as `@`, `/`, `:` or `#`; URL-embedded credentials must be percent-encoded. Route namespaces redact URL credentials before they are used for routing metadata identity.
+
 ## Python Compatibility Configuration
 
 `MooncakeDistributedStore.setup(...)` accepts the core store knobs plus Python-specific convenience parameters.
