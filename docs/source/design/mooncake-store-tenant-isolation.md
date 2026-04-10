@@ -346,6 +346,8 @@ sequenceDiagram
 - placement is tenant-policy-aware
 - tier-aware eviction is implemented
 - domain/object_set locality participates in preferred-segment decisions
+- master metadata storage now uses `LogicalObjectId` as the in-memory primary key
+- legacy raw key lookup is preserved through alias mapping, so key-based APIs keep working during migration
 
 #### TENT runtime side
 
