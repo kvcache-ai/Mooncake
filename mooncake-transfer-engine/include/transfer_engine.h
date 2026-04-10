@@ -17,6 +17,7 @@
 
 #include "memory_location.h"
 #include "multi_transport.h"
+#include "trace_context.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -98,11 +99,13 @@ class TransferEngine {
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest>& entries);
+                          const std::vector<TransferRequest>& entries,
+                          const tracing::TraceContext* trace_context = nullptr);
 
-    Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest>& entries,
-                                    TransferMetadata::NotifyDesc notify_msg);
+    Status submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg,
+        const tracing::TraceContext* trace_context = nullptr);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     // Multi-protocol API

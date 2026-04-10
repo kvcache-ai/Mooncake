@@ -55,7 +55,8 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs)
+         yalantinglibs::yalantinglibs
+         mooncake-tracing)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

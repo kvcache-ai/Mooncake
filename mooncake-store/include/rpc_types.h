@@ -193,6 +193,7 @@ struct TaskAssignment {
     std::string payload;
     int64_t created_at_ms_epoch;
     uint32_t max_retry_attempts;
+    std::string trace_carrier;
 
     TaskAssignment() = default;
     TaskAssignment(const Task& task)
@@ -203,10 +204,11 @@ struct TaskAssignment {
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   task.created_at.time_since_epoch())
                   .count())),
-          max_retry_attempts(task.max_retry_attempts) {}
+          max_retry_attempts(task.max_retry_attempts),
+          trace_carrier(task.trace_carrier) {}
 };
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
-         max_retry_attempts);
+         max_retry_attempts, trace_carrier);
 
 /**
  * @brief Task update structure

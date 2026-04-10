@@ -24,6 +24,7 @@
 #include "types.h"
 #include "serialize/serializer.hpp"
 #include "ha/snapshot/snapshot_logger.h"
+#include "tracing_facade.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils.h"
@@ -4284,14 +4285,22 @@ std::string MasterService::FormatTimestamp(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "master-service");
+    auto span =
+        tracing.StartSpan("CreateCopyTask", nullptr,
+                          {{"object.key", key},
+                           {"target.count", std::to_string(targets.size())}});
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -4300,6 +4309,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         if (!segment_accessor.ExistsSegmentName(target)) {
             LOG(ERROR) << "key=" << key << ", target_segment=" << target
                        << ", error=target_segment_not_mounted";
+            span.SetStatus("ERROR");
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (!segment_accessor.IsSegmentAllocatable(target)) {
@@ -4314,6 +4324,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const auto& segment_names = metadata.GetReplicaSegmentNames();
     if (segment_names.empty()) {
         LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
@@ -4328,22 +4339,39 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         LOG(ERROR) << "key=" << key
                    << ", segment_name=" << selected_source_segment
                    << ", error=client_id_not_found";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    return task_manager_.get_write_access()
-        .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.key = key,
+    auto task_id = task_manager_.get_write_access()
+                       .submit_task_typed_with_trace<TaskType::REPLICA_COPY>(
+                           select_client,
+                           {.key = key,
                             .source = selected_source_segment,
-                            .targets = targets});
+                            .targets = targets},
+                           tracing::EncodeTraceCarrier(
+                               tracing::ToCarrier(span.context())));
+    if (task_id.has_value()) {
+        span.SetAttribute("task.id", UuidToString(task_id.value()));
+    } else {
+        span.SetStatus("ERROR");
+    }
+    return task_id;
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "master-service");
+    auto span = tracing.StartSpan("CreateMoveTask", nullptr,
+                                  {{"object.key", key},
+                                   {"source.segment", source},
+                                   {"target.segment", target}});
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -4351,6 +4379,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         LOG(ERROR) << "key=" << key << ", source_segment=" << source
                    << ", target_segment=" << target
                    << ", error=source_target_segments_are_same";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -4358,6 +4387,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     if (!segment_accessor.ExistsSegmentName(target)) {
         LOG(ERROR) << "key=" << key << ", target_segment=" << target
                    << ", error=target_segment_not_mounted";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!segment_accessor.IsSegmentAllocatable(target)) {
@@ -4372,6 +4402,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         segment_names.end()) {
         LOG(ERROR) << "key=" << key << ", source_segment=" << source
                    << ", error=source_segment_not_found";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -4382,27 +4413,63 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     if (error != ErrorCode::OK) {
         LOG(ERROR) << "key=" << key << ", segment_name=" << source
                    << ", error=client_id_not_found";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    return task_manager_.get_write_access()
-        .submit_task_typed<TaskType::REPLICA_MOVE>(
-            select_client, {.key = key, .source = source, .target = target});
+    auto task_id =
+        task_manager_.get_write_access()
+            .submit_task_typed_with_trace<TaskType::REPLICA_MOVE>(
+                select_client, {.key = key, .source = source, .target = target},
+                tracing::EncodeTraceCarrier(
+                    tracing::ToCarrier(span.context())));
+    if (task_id.has_value()) {
+        span.SetAttribute("task.id", UuidToString(task_id.value()));
+    } else {
+        span.SetStatus("ERROR");
+    }
+    return task_id;
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
     const UUID& task_id) {
+    const auto task_status_to_string = [](TaskStatus status) -> std::string {
+        switch (status) {
+            case TaskStatus::PENDING:
+                return "PENDING";
+            case TaskStatus::PROCESSING:
+                return "PROCESSING";
+            case TaskStatus::FAILED:
+                return "FAILED";
+            case TaskStatus::SUCCESS:
+                return "SUCCESS";
+        }
+        return "UNKNOWN";
+    };
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "master-service");
+    auto span = tracing.StartSpan("QueryTask", nullptr,
+                                  {{"task.id", UuidToString(task_id)}});
     const auto& task_option =
         task_manager_.get_read_access().find_task_by_id(task_id);
     if (!task_option.has_value()) {
         LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
     }
+    span.SetAttribute("task.status",
+                      task_status_to_string(task_option->status));
     return QueryTaskResponse(task_option.value());
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "master-service");
+    auto span = tracing.StartSpan(
+        "FetchTasks", nullptr,
+        {{"client.id", UuidToString(client_id)},
+         {"batch.size.requested", std::to_string(batch_size)}});
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto& tasks =
         task_manager_.get_write_access().pop_tasks(client_id, batch_size);
@@ -4410,11 +4477,33 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     for (const auto& task : tasks) {
         assignments.emplace_back(task);
     }
+    span.SetAttribute("batch.size.returned",
+                      std::to_string(assignments.size()));
     return assignments;
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     const UUID& client_id, const TaskCompleteRequest& request) {
+    const auto task_status_to_string = [](TaskStatus status) -> std::string {
+        switch (status) {
+            case TaskStatus::PENDING:
+                return "PENDING";
+            case TaskStatus::PROCESSING:
+                return "PROCESSING";
+            case TaskStatus::FAILED:
+                return "FAILED";
+            case TaskStatus::SUCCESS:
+                return "SUCCESS";
+        }
+        return "UNKNOWN";
+    };
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "master-service");
+    auto span = tracing.StartSpan(
+        "MarkTaskToComplete", nullptr,
+        {{"client.id", UuidToString(client_id)},
+         {"task.id", UuidToString(request.id)},
+         {"task.status", task_status_to_string(request.status)}});
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
@@ -4422,6 +4511,7 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "task_id=" << request.id
                    << ", error=complete_task_failed";
+        span.SetStatus("ERROR");
         return tl::make_unexpected(err);
     }
     return {};

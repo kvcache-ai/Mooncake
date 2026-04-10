@@ -29,6 +29,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/
     ${CMAKE_CURRENT_BINARY_DIR}/include/
     ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-tracing/include
     ${ETCD_WRAPPER_INCLUDE}
 )
 

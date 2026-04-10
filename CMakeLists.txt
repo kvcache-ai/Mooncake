@@ -53,6 +53,8 @@ add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 add_subdirectory(mooncake-asio)
 
 add_subdirectory(mooncake-common)
+add_subdirectory(mooncake-tracing)
+include_directories(mooncake-tracing/include)
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/include)
 

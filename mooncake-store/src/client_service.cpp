@@ -27,6 +27,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "tracing_facade.h"
 
 namespace mooncake {
 
@@ -2270,7 +2271,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets,
+    const tracing::TraceContext* trace_context) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -2306,7 +2308,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        if (TransferWrite(target, slices, trace_context) != ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -2324,7 +2326,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
-    const std::vector<std::string>& targets) {
+    const std::vector<std::string>& targets,
+    const tracing::TraceContext* trace_context) {
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
@@ -2356,7 +2359,7 @@ tl::expected<void, ErrorCode> Client::Copy(
     auto result = ExecuteReplicaTransfer(
         key, "copy", [&]() { return master_client_.CopyEnd(key); },
         [&]() { return master_client_.CopyRevoke(key); }, response.source,
-        response.targets);
+        response.targets, trace_context);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -2366,9 +2369,9 @@ tl::expected<void, ErrorCode> Client::Copy(
     return result;
 }
 
-tl::expected<void, ErrorCode> Client::Move(const std::string& key,
-                                           const std::string& source,
-                                           const std::string& target) {
+tl::expected<void, ErrorCode> Client::Move(
+    const std::string& key, const std::string& source,
+    const std::string& target, const tracing::TraceContext* trace_context) {
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
@@ -2403,7 +2406,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     auto result = ExecuteReplicaTransfer(
         key, "move", [&]() { return master_client_.MoveEnd(key); },
         [&]() { return master_client_.MoveRevoke(key); }, response.source,
-        targets);
+        targets, trace_context);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -2510,31 +2513,59 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               TransferRequest::OpCode op_code,
+                               const tracing::TraceContext* trace_context) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto future =
-        transfer_submitter_->submit(replica_descriptor, slices, op_code);
+    size_t total_bytes = 0;
+    for (const auto& slice : slices) {
+        total_bytes += slice.size;
+    }
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "client-service");
+    auto operation_span = tracing.StartSpan(
+        "mooncake.transfer.operation", trace_context,
+        {{"transfer.op", op_code == TransferRequest::READ ? "READ" : "WRITE"},
+         {"slice.count", std::to_string(slices.size())},
+         {"bytes.total", std::to_string(total_bytes)}});
+
+    auto operation_context = operation_span.context();
+    auto future = transfer_submitter_->submit(replica_descriptor, slices,
+                                              op_code, &operation_context);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        operation_span.SetStatus("ERROR");
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    operation_span.SetAttribute(
+        "transfer.strategy",
+        future->strategy() == TransferStrategy::LOCAL_MEMCPY
+            ? "LOCAL_MEMCPY"
+            : (future->strategy() == TransferStrategy::TRANSFER_ENGINE
+                   ? "TRANSFER_ENGINE"
+                   : "FILE_READ"));
 
-    return future->get();
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        operation_span.SetStatus("ERROR");
+    }
+    return result;
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+                                std::vector<Slice>& slices,
+                                const tracing::TraceContext* trace_context) {
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
+                        trace_context);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+                               std::vector<Slice>& slices,
+                               const tracing::TraceContext* trace_context) {
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
@@ -2551,7 +2582,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferData(replica_descriptor, slices, TransferRequest::READ,
+                        trace_context);
 }
 
 void Client::PollAndDispatchTasks() {
@@ -2588,9 +2620,20 @@ void Client::TaskPollThreadMain() {
 }
 
 void Client::SubmitTask(const TaskAssignment& assignment) {
+    auto carrier = tracing::DecodeTraceCarrier(assignment.trace_carrier);
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "client-task");
+    auto span =
+        carrier.empty()
+            ? tracing.StartSpan("SubmitTask", nullptr,
+                                {{"task.id", UuidToString(assignment.id)}})
+            : tracing.StartSpanFromCarrier(
+                  "SubmitTask", carrier,
+                  {{"task.id", UuidToString(assignment.id)}});
     if (!task_running_.load()) {
         LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
+        span.SetStatus("ERROR");
         return;
     }
 
@@ -2598,6 +2641,7 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
     ClientTask client_task;
     client_task.assignment = assignment;
     client_task.retry_count = 0;
+    span.AddEvent("task enqueued");
 
     task_thread_pool_.enqueue(
         [this, client_task]() { ExecuteTask(client_task); });
@@ -2606,14 +2650,27 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
+    auto carrier = tracing::DecodeTraceCarrier(assignment.trace_carrier);
+    auto& tracing =
+        tracing::TracingFacade::Instance("mooncake-store", "client-task");
+    auto span =
+        carrier.empty()
+            ? tracing.StartSpan("ExecuteTask", nullptr,
+                                {{"task.id", UuidToString(assignment.id)}})
+            : tracing.StartSpanFromCarrier(
+                  "ExecuteTask", carrier,
+                  {{"task.id", UuidToString(assignment.id)}});
+    span.SetAttribute("task.retry_count",
+                      std::to_string(client_task.retry_count));
 
     try {
         switch (assignment.type) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result =
-                    Copy(payload.key, payload.source, payload.targets);
+                auto task_context = span.context();
+                auto copy_result = Copy(payload.key, payload.source,
+                                        payload.targets, &task_context);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -2624,8 +2681,9 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result =
-                    Move(payload.key, payload.source, payload.target);
+                auto task_context = span.context();
+                auto move_result = Move(payload.key, payload.source,
+                                        payload.target, &task_context);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -2638,6 +2696,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                            << ", task_id=" << assignment.id
                            << ", error=unknown_task_type"
                            << ", task_type=" << assignment.type;
+                span.SetStatus("ERROR");
                 result = ErrorCode::INVALID_PARAMS;
                 break;
         }
@@ -2645,7 +2704,13 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         LOG(ERROR) << "action=task_execution_failed"
                    << ", task_id=" << assignment.id << ", error=exception"
                    << ", exception=" << e.what();
+        span.SetStatus("ERROR");
         result = ErrorCode::INTERNAL_ERROR;
+    }
+
+    span.SetAttribute("task.result", toString(result));
+    if (result != ErrorCode::OK) {
+        span.SetStatus("ERROR");
     }
 
     if (result == ErrorCode::OK) {

@@ -76,6 +76,7 @@ struct Task {
     std::string message;
     UUID assigned_client;
     uint32_t max_retry_attempts;
+    std::string trace_carrier;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -166,7 +167,16 @@ class ScopedTaskWriteAccess {
         const UUID& client_id,
         const typename TaskPayloadTraits<Type>::type& payload) {
         std::string json = serialize_payload(payload);
-        return submit_task(client_id, Type, json);
+        return submit_task(client_id, Type, json, "");
+    }
+
+    template <TaskType Type>
+    tl::expected<UUID, ErrorCode> submit_task_typed_with_trace(
+        const UUID& client_id,
+        const typename TaskPayloadTraits<Type>::type& payload,
+        const std::string& trace_carrier) {
+        std::string json = serialize_payload(payload);
+        return submit_task(client_id, Type, json, trace_carrier);
     }
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
@@ -185,7 +195,8 @@ class ScopedTaskWriteAccess {
    private:
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
-                                              const std::string& payload);
+                                              const std::string& payload,
+                                              const std::string& trace_carrier);
 
     ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -250,7 +261,7 @@ class ClientTaskManager {
 };
 
 class TaskManagerSerializer {
-    static constexpr size_t kTaskSerializedFields = 8;
+    static constexpr size_t kTaskSerializedFields = 10;
     static constexpr size_t kMaxDecompressedSize = 1024 * 1024 * 1024;  // 1 GB
 
    public:

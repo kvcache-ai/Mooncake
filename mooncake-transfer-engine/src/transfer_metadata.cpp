@@ -24,6 +24,8 @@
 #include "config.h"
 #include "error.h"
 #include "transfer_metadata_plugin.h"
+#include "trace_support.h"
+#include "tracing_facade.h"
 
 namespace mooncake {
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -53,12 +55,16 @@ struct TransferNotifyUtil {
         Json::Value root;
         root["name"] = desc.name;
         root["notify_msg"] = desc.notify_msg;
+        root["trace_carrier"] = desc.trace_carrier;
         return root;
     }
 
     static int decode(Json::Value root, TransferMetadata::NotifyDesc &desc) {
         desc.name = root["name"].asString();
         desc.notify_msg = root["notify_msg"].asString();
+        desc.trace_carrier = root.isMember("trace_carrier")
+                                 ? root["trace_carrier"].asString()
+                                 : "";
         return 0;
     }
 };
@@ -173,13 +179,26 @@ std::string TransferMetadata::getFullMetadataKey(
 
 int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
                                         Json::Value &local_json) {
-    RWSpinlock::WriteGuard guard(notify_lock_);
     TransferMetadata::NotifyDesc peer_notify, local_reply;
     TransferNotifyUtil::decode(peer_json, peer_notify);
-    notifys.push_back(peer_notify);
+    auto carrier =
+        mooncake::tracing::DecodeCarrierString(peer_notify.trace_carrier);
+    auto &tracing = mooncake::tracing::TracingFacade::Instance(
+        "mooncake-transfer-engine", "transfer-metadata");
+    auto span = tracing.StartSpanFromCarrier(
+        "notify.received", carrier, {{"notify.name", peer_notify.name}});
+    span.AddEvent("carrier decode",
+                  {{"trace_carrier.present",
+                    peer_notify.trace_carrier.empty() ? "false" : "true"}});
+    span.AddEvent("notify received", {{"notify.name", peer_notify.name}});
+    {
+        RWSpinlock::WriteGuard guard(notify_lock_);
+        notifys.push_back(peer_notify);
+    }
     // reply
     local_reply.name = "";
     local_reply.notify_msg = "success";
+    local_reply.trace_carrier = peer_notify.trace_carrier;
     local_json = TransferNotifyUtil::encode(local_reply);
     return 0;
 }
