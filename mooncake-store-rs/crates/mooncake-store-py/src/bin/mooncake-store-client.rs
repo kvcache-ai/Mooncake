@@ -228,3 +228,144 @@ fn now_ms() -> u64 {
         .expect("time should be monotonic")
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use mooncake_store_client::RouteControlMode;
+
+    use super::{
+        effective_heartbeat_interval, now_ms, parse_hugepage_size_arg, parse_label,
+        start_metrics_if_needed, validate_args, Args, RouteControlArg,
+    };
+
+    fn sample_args() -> Args {
+        Args {
+            local_hostname: "127.0.0.1".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            storage_bytes: 1024,
+            scratch_bytes: 512,
+            protocol: "tcp".to_string(),
+            rdma_devices: String::new(),
+            stable_id: Some("sample".to_string()),
+            tenant: "default".to_string(),
+            labels: vec![],
+            routed_writes: false,
+            replica_count: 1,
+            keyspace: None,
+            local_segment_name: None,
+            lease_ttl_ms: 10_000,
+            heartbeat_interval_ms: 3_000,
+            metrics_addr: None,
+            client_server_address: None,
+            use_hugepage: false,
+            hugepage_size: None,
+            trace_filter: None,
+            route_control: RouteControlArg::EmbeddedWrh,
+            drain_on_exit: false,
+        }
+    }
+
+    #[test]
+    fn route_control_arg_maps_to_runtime_mode() {
+        assert_eq!(
+            RouteControlMode::from(RouteControlArg::EmbeddedWrh),
+            RouteControlMode::EmbeddedWrh
+        );
+        assert_eq!(
+            RouteControlMode::from(RouteControlArg::MetadataOnly),
+            RouteControlMode::MetadataOnly
+        );
+    }
+
+    #[test]
+    fn args_parser_accepts_core_flags() {
+        let args = Args::try_parse_from([
+            "mooncake-store-client",
+            "--local-hostname",
+            "127.0.0.1",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "--storage-bytes",
+            "2048",
+            "--scratch-bytes",
+            "1024",
+            "--protocol",
+            "tcp",
+            "--tenant",
+            "tenant-a",
+            "--label",
+            "pool=pool-a",
+            "--routed-writes",
+            "--replica-count",
+            "2",
+            "--route-control",
+            "metadata-only",
+        ])
+        .expect("args should parse");
+        assert_eq!(args.local_hostname, "127.0.0.1");
+        assert_eq!(args.metadata_url, "redis://127.0.0.1:6379/0");
+        assert_eq!(args.storage_bytes, 2048);
+        assert_eq!(args.scratch_bytes, 1024);
+        assert_eq!(args.tenant, "tenant-a");
+        assert_eq!(args.labels, vec![("pool".to_string(), "pool-a".to_string())]);
+        assert!(args.routed_writes);
+        assert_eq!(args.replica_count, 2);
+        assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
+    }
+
+    #[test]
+    fn validate_args_rejects_zero_capacities_and_ttl() {
+        validate_args(&sample_args()).expect("baseline args should validate");
+
+        let mut args = sample_args();
+        args.lease_ttl_ms = 0;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = sample_args();
+        args.storage_bytes = 0;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = sample_args();
+        args.scratch_bytes = 0;
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn label_and_hugepage_parsers_cover_success_and_error_paths() {
+        assert_eq!(
+            parse_label("pool=pool-a").expect("label should parse"),
+            ("pool".to_string(), "pool-a".to_string())
+        );
+        assert_eq!(
+            parse_label(" tenant = value ").expect("trimmed label should parse"),
+            ("tenant".to_string(), "value".to_string())
+        );
+        assert!(parse_label("missing-delimiter").is_err());
+        assert!(parse_label(" =value").is_err());
+
+        assert_eq!(
+            parse_hugepage_size_arg("2M").expect("2M should parse"),
+            2 * 1024 * 1024
+        );
+        assert!(parse_hugepage_size_arg("not-a-size").is_err());
+    }
+
+    #[test]
+    fn heartbeat_and_metrics_helpers_cover_edge_cases() {
+        assert_eq!(effective_heartbeat_interval(0, 9_000), 3_000);
+        assert_eq!(effective_heartbeat_interval(15_000, 9_000), 3_000);
+        assert_eq!(effective_heartbeat_interval(500, 2_000), 500);
+        assert_eq!(effective_heartbeat_interval(1_500, 9_000), 1_500);
+
+        assert_eq!(
+            start_metrics_if_needed(None).expect("disabled metrics should succeed"),
+            None
+        );
+
+        let first = now_ms();
+        let second = now_ms();
+        assert!(second >= first);
+    }
+}
