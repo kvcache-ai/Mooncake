@@ -54,6 +54,46 @@ class QueryResult {
     }
 };
 
+
+/**
+ * @brief State captured between BatchGetSubmit and BatchGetComplete.
+ * Holds in-flight TransferFutures and per-key metadata needed for completion.
+ */
+struct BatchGetState {
+    struct PendingTransfer {
+        size_t index;
+        std::string key;
+        TransferFuture future;
+        Replica::Descriptor replica;
+        bool cache_used;
+
+        PendingTransfer(size_t idx, std::string k, TransferFuture f,
+                        Replica::Descriptor r, bool cu)
+            : index(idx),
+              key(std::move(k)),
+              future(std::move(f)),
+              replica(std::move(r)),
+              cache_used(cu) {}
+    };
+
+    std::vector<PendingTransfer> pending_transfers;
+    std::vector<tl::expected<void, ErrorCode>> results;
+
+    // Saved for completion phase (lease check, hot cache)
+    std::vector<std::string> object_keys;
+    std::vector<std::chrono::steady_clock::time_point> lease_timeouts;
+    std::unordered_map<std::string, std::vector<Slice>> slices;
+
+    std::chrono::steady_clock::time_point submit_time;
+    size_t total_cache_hits = 0;
+
+    BatchGetState() = default;
+    BatchGetState(BatchGetState&&) = default;
+    BatchGetState& operator=(BatchGetState&&) = default;
+    BatchGetState(const BatchGetState&) = delete;
+    BatchGetState& operator=(const BatchGetState&) = delete;
+};
+
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
@@ -177,6 +217,24 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool prefer_same_node = false);
+
+    /**
+     * @brief Submit phase of async BatchGet. Submits RDMA transfers without
+     *        waiting for completion. Only supports memory replicas.
+     * @return BatchGetState holding in-flight TransferFutures
+     */
+    BatchGetState BatchGetSubmit(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    /**
+     * @brief Complete phase of async BatchGet. Waits for all TransferFutures,
+     *        performs hot cache updates, lease checks, and metrics.
+     * @return Per-key results
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchGetComplete(
+        BatchGetState& state);
 
     /**
      * @brief Stores data with replication
