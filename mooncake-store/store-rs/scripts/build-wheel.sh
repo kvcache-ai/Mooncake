@@ -78,6 +78,9 @@ fi
 if ! "${VENV_PYTHON}" -m pip show maturin >/dev/null 2>&1; then
   "${VENV_PYTHON}" -m pip install "maturin>=1.7,<2"
 fi
+if ! "${VENV_PYTHON}" -m pip show build >/dev/null 2>&1; then
+  "${VENV_PYTHON}" -m pip install "build>=1.2,<2"
+fi
 
 git -C "${REPO_ROOT}" submodule update --init --recursive
 
@@ -235,7 +238,34 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
             target_wheel.writestr(info, path.read_bytes())
 PY
 
+readarray -t VERSION_INFO < <("${VENV_PYTHON}" - <<'PY' "${REPO_ROOT}/pyproject.toml"
+import pathlib
+import sys
+import tomllib
+
+pyproject = pathlib.Path(sys.argv[1])
+data = tomllib.loads(pyproject.read_text())
+core_version = data["project"]["version"]
+meta_version = core_version.split("+", 1)[0]
+print(core_version)
+print(meta_version)
+PY
+)
+MOONCAKE_CORE_VERSION=${VERSION_INFO[0]}
+MOONCAKE_META_VERSION=${VERSION_INFO[1]}
+
+env \
+  MOONCAKE_CORE_VERSION="${MOONCAKE_CORE_VERSION}" \
+  MOONCAKE_META_VERSION="${MOONCAKE_META_VERSION}" \
+  "${VENV_PYTHON}" -m build \
+  --wheel \
+  --outdir "${WHEEL_DIR}" \
+  "${REPO_ROOT}/packages/mooncake-pro"
+
+LATEST_META_WHEEL=$(ls -1t "${WHEEL_DIR}"/mooncake_pro-*.whl 2>/dev/null | head -n 1 || true)
+
 cat <<EOF
 wheel:  ${LATEST_WHEEL}
+meta:   ${LATEST_META_WHEEL}
 client: ${BIN_DIR}/mooncake-store-client
 EOF

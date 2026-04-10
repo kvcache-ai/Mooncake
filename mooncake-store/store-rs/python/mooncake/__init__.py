@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
+
 _STORE_EXPORTS = {
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
@@ -11,7 +14,15 @@ _STORE_EXPORTS = {
     "stop_metrics_server",
 }
 
-__all__ = sorted(_STORE_EXPORTS)
+_DISTRIBUTION_NAME = "mooncake"
+__edition__ = "pro"
+
+try:
+    __version__ = package_version(_DISTRIBUTION_NAME)
+except PackageNotFoundError:
+    __version__ = "1.0.0+pro.1"
+
+__all__ = sorted(_STORE_EXPORTS | {"__edition__", "__version__"})
 
 
 def __getattr__(name: str):
