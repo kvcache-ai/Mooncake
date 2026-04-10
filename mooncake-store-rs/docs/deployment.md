@@ -86,8 +86,29 @@ Build the Python wheel and stage the standalone client binary:
 
 Default outputs:
 
-- `dist/wheels/`
+- `dist/wheels/mooncake-*.whl`
+- `dist/wheels/mooncake_pro-*.whl`
 - `dist/bin/mooncake-store-client`
+
+Recommended installation flow:
+
+```bash
+python3 -m venv .venv-wheel-test
+. .venv-wheel-test/bin/activate
+pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+```
+
+Or use the repository helper:
+
+```bash
+./scripts/install-pro-wheel.sh
+```
+
+Operational meaning:
+
+- `mooncake-pro` is the product-facing package users install
+- `mooncake` remains the runtime compatibility package imported by Python and expected by integrations such as SGLang
+- installing `mooncake-pro` upgrades an existing `mooncake` install to the matching Pro runtime without `--force-reinstall`
 
 ## Deployment Roles
 
