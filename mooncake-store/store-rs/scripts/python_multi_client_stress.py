@@ -74,7 +74,7 @@ class StressConfig:
                 "MC_STORE_RS_STRESS_STORAGE_SCRATCH_BYTES", 16 * 1024 * 1024
             ),
             writer_storage_bytes=_env_int(
-                "MC_STORE_RS_STRESS_WRITER_STORAGE_BYTES", 64 * 1024 * 1024
+                "MC_STORE_RS_STRESS_WRITER_STORAGE_BYTES", 0
             ),
             writer_scratch_bytes=_env_int(
                 "MC_STORE_RS_STRESS_WRITER_SCRATCH_BYTES", 16 * 1024 * 1024
@@ -443,7 +443,7 @@ def remote_only_replication(config: StressConfig) -> ReplicateConfig:
 
 
 def rw_storage_bytes(config: StressConfig) -> int:
-    return max(config.value_size, 4 * 1024)
+    return config.writer_storage_bytes
 
 
 def worker_result(

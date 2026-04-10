@@ -238,11 +238,24 @@ impl MooncakeCompatibilityFacade for StoreClient {
             return result;
         }
         let primary = self.segment_name()?;
-        let segment_name = {
+        let attach_primary = {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            !memory.has_storage_segment(&primary) && memory.storage_segments().is_empty()
+        };
+        let segment_name = if attach_primary {
+            primary.clone()
+        } else {
             let mut state = self.state.lock();
             state.next_segment_name(&primary)
         };
-        let transport = self.transport_factory()?.create(&segment_name.0)?;
+        let transport = if attach_primary {
+            self.transport.clone().ok_or_else(|| {
+                StoreError::Unsupported("transport is not configured".to_string())
+            })?
+        } else {
+            self.transport_factory()?.create(&segment_name.0)?
+        };
         {
             let mut state = self.state.lock();
             state.memory_mut()?.add_storage_segment(
@@ -258,9 +271,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     hugepage_size_bytes: self.local_memory.hugepage_size_bytes,
                 },
             )?;
-            state
-                .local_transports
-                .insert(segment_name.0.clone(), transport);
+            if !attach_primary {
+                state
+                    .local_transports
+                    .insert(segment_name.0.clone(), transport);
+            }
         };
         let segment_info = self
             .state

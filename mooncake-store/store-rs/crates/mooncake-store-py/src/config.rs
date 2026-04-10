@@ -58,7 +58,7 @@ impl CompatSetupArgs {
         let mut labels = self.labels;
         labels
             .entry("storage".to_string())
-            .or_insert_with(|| "true".to_string());
+            .or_insert_with(|| (self.global_segment_size != 0).to_string());
         Ok(CompatBuildPlan {
             metadata,
             tent_config,
@@ -258,6 +258,36 @@ mod tests {
         assert!(debug.contains("cache.local:6381"));
         assert!(debug.contains("4"));
         assert!(debug.contains("transports/rdma/enable"));
+    }
+
+    #[test]
+    fn compat_setup_defaults_storage_label_to_false_for_rw_only_clients() {
+        let plan = CompatSetupArgs {
+            local_hostname: "node-a".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            global_segment_size: 0,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            stable_id: Some("rw-only".to_string()),
+            tenant: "tenant-a".to_string(),
+            labels: BTreeMap::new(),
+            routed_writes: true,
+            replica_count: 1,
+            keyspace: None,
+            expires_at_ms: Some(10_000),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+        }
+        .build()
+        .expect("rw-only plan should build");
+
+        assert_eq!(plan.storage_bytes, 0);
+        assert_eq!(
+            plan.labels.get("storage").map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]

@@ -27,8 +27,8 @@ use super::{
 };
 use crate::{
     control_plane::{AllocatorService, AuthorityService, ReleaseOp},
-    render_prometheus_metrics, reset_metrics,
     memory::RegionAllocation,
+    render_prometheus_metrics, reset_metrics,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
@@ -640,6 +640,10 @@ fn storage_config_with_layout(
         .reclaim_grace_ms(0)
 }
 
+fn rw_only_config() -> LocalMemoryConfig {
+    storage_config_with_layout(0, 4096, 1)
+}
+
 fn publish_storage_node(
     metadata: &InMemoryMetadataBackend,
     transport: &TestTransport,
@@ -904,6 +908,79 @@ fn observability_metrics_render_remote_datapaths() {
 }
 
 #[test]
+fn rw_only_client_registers_without_segments_and_routes_to_remote_storage() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("rw-only-storage-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("rw-only-writer-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "rw-only-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage local memory should register");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "rw-only-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("rw-only writer should build");
+    writer
+        .register_local_memory()
+        .expect("rw-only writer scratch should register");
+
+    assert!(writer
+        .list_segments()
+        .expect("rw-only segment listing should succeed")
+        .is_empty());
+
+    writer
+        .put("remote-key", b"payload")
+        .expect("remote put should succeed");
+    writer
+        .batch_put(&[
+            PutRequest::new("remote-batch-a", b"left"),
+            PutRequest::new("remote-batch-b", b"right"),
+        ])
+        .expect("remote batch put should succeed");
+
+    let route = writer
+        .query_route("remote-key")
+        .expect("route lookup should succeed")
+        .expect("route should exist");
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner.stable_id.0, "rw-only-storage");
+    assert_eq!(
+        writer.get("remote-key").expect("remote get should succeed"),
+        b"payload"
+    );
+
+    let values = writer
+        .batch_get(&[
+            ObjectRef::new("remote-batch-a"),
+            ObjectRef::new("remote-batch-b"),
+        ])
+        .expect("remote batch get should succeed");
+    assert_eq!(values, vec![b"left".to_vec(), b"right".to_vec()]);
+    assert!(writer
+        .list_segments()
+        .expect("rw-only segment listing should still succeed")
+        .is_empty());
+}
+
+#[test]
 fn lookup_runtime_lease_reuses_live_client_snapshot() {
     let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),
@@ -943,6 +1020,48 @@ fn lookup_runtime_lease_reuses_live_client_snapshot() {
 
     assert!(after_first > before);
     assert_eq!(after_second, after_first);
+}
+
+#[test]
+fn rw_only_client_can_expand_into_primary_segment() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("rw-expand-segment"));
+    let client = StoreClientBuilder::new(metadata, "rw-expand")
+        .state(ClientLifecycleState::Active)
+        .transport(transport.clone())
+        .transport_factory(transport.factory())
+        .local_memory(rw_only_config())
+        .build(10_000)
+        .expect("rw-only client should build");
+
+    client
+        .register_local_memory()
+        .expect("scratch-only registration should succeed");
+    assert!(client
+        .list_segments()
+        .expect("scratch-only segment listing should succeed")
+        .is_empty());
+
+    let primary = client.segment_name().expect("primary segment should exist");
+    let expanded = client
+        .expand_local_memory(256)
+        .expect("rw-only expansion should succeed");
+    assert_eq!(expanded.segment_name, primary);
+
+    let listed = client.list_segments().expect("segment list should succeed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].segment_name, primary);
+    assert_eq!(listed[0].capacity_bytes, 256);
+
+    client
+        .put("local-after-expand", b"hello")
+        .expect("local put after expansion should succeed");
+    assert_eq!(
+        client
+            .get("local-after-expand")
+            .expect("local get after expansion should succeed"),
+        b"hello"
+    );
 }
 
 #[test]
@@ -2028,16 +2147,13 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         ..CompatibilityDescriptor::default()
     };
     let builder_transport = Arc::new(TestTransport::new("builder-compat-segment"));
-    let built = StoreClientBuilder::new(
-        Arc::new(InMemoryMetadataBackend::new()),
-        "builder-compat",
-    )
-    .compatibility(custom_compat.clone())
-    .route_control(RouteControlMode::MetadataOnly)
-    .state(ClientLifecycleState::Active)
-    .transport(builder_transport)
-    .build(10_000)
-    .expect("builder with compatibility and route_control should succeed");
+    let built = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), "builder-compat")
+        .compatibility(custom_compat.clone())
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .transport(builder_transport)
+        .build(10_000)
+        .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
 }
 
@@ -2070,9 +2186,7 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         Err(StoreError::Allocator(_))
     ));
 
-    client
-        .heartbeat(20_000)
-        .expect("heartbeat should succeed");
+    client.heartbeat(20_000).expect("heartbeat should succeed");
     client.enter_standby().expect("standby should succeed");
     client.activate().expect("activate should succeed");
     let handoff = client
@@ -2091,19 +2205,15 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .expect("local memory expansion should succeed");
     let listed = client.list_segments().expect("segment list should succeed");
     assert!(listed.iter().any(|segment| segment.segment_name == primary));
-    assert!(
-        listed
-            .iter()
-            .any(|segment| segment.segment_name == expanded.segment_name)
-    );
+    assert!(listed
+        .iter()
+        .any(|segment| segment.segment_name == expanded.segment_name));
     client
         .drain_segment(&expanded.segment_name)
         .expect("drain should succeed");
-    assert!(
-        client
-            .retire_segment(&expanded.segment_name)
-            .expect("retire should succeed")
-    );
+    assert!(client
+        .retire_segment(&expanded.segment_name)
+        .expect("retire should succeed"));
 
     let plain = client.put("plain", b"hello").expect("put should succeed");
     assert_eq!(client.get("plain").expect("get should succeed"), b"hello");
@@ -2155,7 +2265,12 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .put_from("from", source.as_ptr().cast(), 5)
         .expect("put_from should succeed");
     client
-        .put_from_in_tenant("tenant-b", "from", unsafe { source.as_ptr().add(16).cast() }, 6)
+        .put_from_in_tenant(
+            "tenant-b",
+            "from",
+            unsafe { source.as_ptr().add(16).cast() },
+            6,
+        )
         .expect("tenant put_from should succeed");
     client
         .put_from_with_policy(
@@ -2217,11 +2332,9 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         tenant_plain.replicas[0].length as usize
     );
     assert!(client.is_exist("plain").expect("plain should exist"));
-    assert!(
-        client
-            .is_exist_in_tenant("tenant-b", "plain")
-            .expect("tenant plain should exist")
-    );
+    assert!(client
+        .is_exist_in_tenant("tenant-b", "plain")
+        .expect("tenant plain should exist"));
     assert_eq!(
         client
             .batch_is_exist(&[
@@ -2323,7 +2436,9 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
     assert_eq!(&shard_left, b"pol");
     assert_eq!(&shard_right, b"icy!");
 
-    client.remove("plain", false).expect("remove should succeed");
+    client
+        .remove("plain", false)
+        .expect("remove should succeed");
     client
         .remove_in_tenant("tenant-b", "plain", false)
         .expect("tenant remove should succeed");
@@ -2338,11 +2453,9 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         )
         .expect("batch_remove should succeed");
     assert!(!client.is_exist("plain").expect("plain should be gone"));
-    assert!(
-        !client
-            .is_exist_in_tenant("tenant-b", "plain")
-            .expect("tenant plain should be gone")
-    );
+    assert!(!client
+        .is_exist_in_tenant("tenant-b", "plain")
+        .expect("tenant plain should be gone"));
 
     client
         .unregister_buffer(source.as_mut_ptr().cast(), source.len())
@@ -2427,11 +2540,18 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
             },
         ],
     );
-    assert!(cas_many[0].as_ref().expect("first batch cas should decode").applied);
-    assert!(!cas_many[1]
-        .as_ref()
-        .expect("second batch cas should decode")
-        .applied);
+    assert!(
+        cas_many[0]
+            .as_ref()
+            .expect("first batch cas should decode")
+            .applied
+    );
+    assert!(
+        !cas_many[1]
+            .as_ref()
+            .expect("second batch cas should decode")
+            .applied
+    );
 
     let replace_key = ObjectKey::new("tenant-z::replaced");
     let mut replaced_route = route.clone();
@@ -2521,7 +2641,12 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     let lease = client.lease().clone();
     let control = client.control_client.clone();
     let rpc_get = control
-        .batch_get_routes(&lease, &namespace, &authority, std::slice::from_ref(&scoped_key))
+        .batch_get_routes(
+            &lease,
+            &namespace,
+            &authority,
+            std::slice::from_ref(&scoped_key),
+        )
         .expect("rpc batch get should succeed");
     assert!(rpc_get[0]
         .as_ref()
