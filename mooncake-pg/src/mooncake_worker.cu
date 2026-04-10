@@ -4,6 +4,8 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 
+#include "pg_utils.h"
+
 namespace mooncake {
 
 class MooncakeWorkCpu : public ::c10d::Work {
@@ -65,18 +67,9 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
             return true;
         }
 
-        auto start = std::chrono::steady_clock::now();
-        while (!event_->query()) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                      start);
-            if (elapsed >= timeout) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
-        }
-        return true;
+        BackoffWaiter waiter(
+            BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
+        return waiter.wait_for(timeout, [this] { return event_->query(); });
     }
 };
 

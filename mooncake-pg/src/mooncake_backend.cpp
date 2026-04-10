@@ -103,17 +103,18 @@ MooncakeBackend::MooncakeBackend(
     const int size = distBackendOpts.group_size;
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
 
-    // Get device data
-    std::string location;
-    int deviceCount = 0;
-    cudaError_t err = cudaGetDeviceCount(&deviceCount);
-    if (err != cudaSuccess || deviceCount == 0) {
-        location = kWildcardLocation;
-    } else {
-        int deviceId_;
-        err = cudaGetDevice(&deviceId_);
-        TORCH_CHECK(!err, c10::str("Failed to get device id"));
-        location = GPU_PREFIX + std::to_string(deviceId_);
+    // Memory location for device specific buffers
+    // always kWildcardLocation for cpu backend
+    std::string location = kWildcardLocation;
+    if (!isCpu) {
+        int deviceCount = 0;
+        cudaError_t err = cudaGetDeviceCount(&deviceCount);
+        if (err == cudaSuccess && deviceCount != 0) {
+            int deviceId_;
+            err = cudaGetDevice(&deviceId_);
+            TORCH_CHECK(!err, c10::str("Failed to get device id"));
+            location = GPU_PREFIX + std::to_string(deviceId_);
+        }
     }
 
     // Initialize transfer engine
