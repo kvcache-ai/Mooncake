@@ -89,6 +89,22 @@ What the script verifies:
 - PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
 - Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
 
+### Eviction validation
+
+Native CLI eviction validation:
+
+```bash
+./scripts/test-client-eviction-cli.sh
+```
+
+What the script does:
+
+- builds the standalone `mooncake-store-client` binary
+- starts a storage client with `/metrics` enabled
+- uses an external routed Python client to issue `put`, `get`, and `batch_get`
+- warms one key, then waits for background storage-owner eviction to reclaim the cold replica
+- verifies both Prometheus metrics and tracing logs for the eviction path
+
 ### HiCache compatibility validation
 
 Run the compatibility checks for both Python execution modes:
@@ -320,6 +336,7 @@ The current end-to-end binary covers:
 Additional dedicated validation scripts cover:
 
 - CLI-driven hot-upgrade handoff with payload preservation
+- CLI-driven eviction with metrics and tracing validation
 - Python hot-upgrade startup argument parsing and wrapper forwarding
 
 The entry point is `crates/mooncake-store-e2e/src/main.rs`.

@@ -30,6 +30,7 @@ use crate::{
     memory::RegionAllocation,
     render_prometheus_metrics, reset_metrics,
     route_directory::build_route_directory,
+    snapshot_metrics,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
@@ -3257,6 +3258,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
 
 #[test]
 fn background_watermark_eviction_reclaims_without_front_path_pressure() {
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("background-evict-segment"));
     let client = StoreClientBuilder::new(metadata, "background-evict")
@@ -3304,6 +3306,22 @@ fn background_watermark_eviction_reclaims_without_front_path_pressure() {
         used <= 20,
         "background watermark eviction should reclaim down to the low watermark; used={used}"
     );
+
+    let metrics = snapshot_metrics();
+    let background = metrics
+        .iter()
+        .find(|snapshot| {
+            snapshot.operation == "storage_owner_background_eviction" && snapshot.status == "ok"
+        })
+        .expect("background eviction metric should be recorded");
+    assert!(background.calls_total >= 1);
+    assert!(background.bytes_out_total >= 1);
+
+    let evict_one = metrics
+        .iter()
+        .find(|snapshot| snapshot.operation == "storage_owner_evict_one" && snapshot.status == "ok")
+        .expect("per-eviction metric should be recorded");
+    assert!(evict_one.calls_total >= 1);
 }
 
 #[test]

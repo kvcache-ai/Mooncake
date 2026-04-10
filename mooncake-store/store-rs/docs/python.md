@@ -385,6 +385,20 @@ This script verifies:
 - `SIGTERM` triggers graceful handoff
 - the promoted successor preserves and serves the original payload after takeover
 
+Run the native CLI eviction black-box validation:
+
+```bash
+./scripts/test-client-eviction-cli.sh
+```
+
+This script verifies:
+
+- standalone `mooncake-store-client` storage process startup
+- routed writes from the Python compatibility layer into the CLI process
+- `put`, `get`, and `batch_get` around a real background eviction cycle
+- `/metrics` exposure for `storage_owner_background_eviction` and `storage_owner_evict_one`
+- tracing logs for route-owner CAS reclaim
+
 Run the HiCache compatibility validations:
 
 ```bash
@@ -401,6 +415,7 @@ Current coverage includes:
 - real-path registered-buffer reads and writes
 - hot-upgrade startup argument parsing and wrapper forwarding
 - CLI-driven hot-upgrade handoff with payload preservation
+- CLI-driven eviction with metrics and tracing validation
 - route query behavior
 - replication policy handling
 - metrics exposure
