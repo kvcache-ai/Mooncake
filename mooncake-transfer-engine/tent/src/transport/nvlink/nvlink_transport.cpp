@@ -172,13 +172,21 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
     }
 
     if (!is_async) {
-        err = cudaMemcpy(dst, src, task->request.length, kind);
+        err =
+            cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
-        } else {
-            task->transferred_bytes = task->request.length;
-            task->status_word = TransferStatusEnum::COMPLETED;
+            return;
         }
+
+        err = cudaStreamSynchronize(batch->stream);
+        if (err != cudaSuccess) {
+            task->status_word = TransferStatusEnum::FAILED;
+            return;
+        }
+
+        task->transferred_bytes = task->request.length;
+        task->status_word = TransferStatusEnum::COMPLETED;
         return;
     }
 

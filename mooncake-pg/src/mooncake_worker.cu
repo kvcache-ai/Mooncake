@@ -29,19 +29,30 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
-    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
-                     std::shared_ptr<TransferGroupMeta> meta)
-        : Work(-1, opType), event_(std::move(event)), meta_(std::move(meta)) {}
+    MooncakeWorkCuda(
+        c10d::OpType opType, std::shared_ptr<torch::Event> event,
+        std::shared_ptr<TransferGroupMeta> meta, const MooncakeWorker* worker,
+        std::vector<CudaTaskSubmissionToken> submitted_tasks)
+        : Work(-1, opType),
+          event_(std::move(event)),
+          meta_(std::move(meta)),
+          worker_(worker),
+          submitted_tasks_(std::move(submitted_tasks)) {}
 
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        return true;  // This should be a no-op
+        if (!worker_ || submitted_tasks_.empty()) {
+            return true;
+        }
+        return worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
     }
 
    protected:
     std::shared_ptr<torch::Event> event_;
     std::shared_ptr<TransferGroupMeta> meta_;
+    const MooncakeWorker* worker_;
+    std::vector<CudaTaskSubmissionToken> submitted_tasks_;
 };
 
 class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
@@ -71,7 +82,8 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  void* meta, Task* tasks, int numRanks,
+                                  uint64_t submitSequence, void* meta,
+                                  Task* tasks, int numRanks,
                                   const bool* activeRanks,
                                   int* activeRanksTensor, size_t taskId) {
     // Copy task into slot
@@ -79,15 +91,16 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
+    tasks[taskId].submit_sequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
 
-    // Mark active
-    __threadfence();  // Ensure writes visible to host
+    // Publish task metadata before notifying the host worker thread.
+    __threadfence_system();
     tasks[taskId].active = true;
 
     // Spin-wait until CPU proxy sets DONE
     while (tasks[taskId].active) {
-        __threadfence();
+        __threadfence_system();
     }
     for (int i = 0; i < numRanks; ++i) {
         activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
@@ -311,6 +324,8 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
+        tasks_[i].submit_sequence = 0;
+        submitted_task_sequence_[i].store(0, std::memory_order_relaxed);
     }
 }
 
@@ -411,18 +426,24 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     //  Alternately use even-odd items to maintain tasks
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
+    std::vector<CudaTaskSubmissionToken> submitted_tasks;
+    submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
         int bufferOffset = meta->taskCount % 2;
+        const uint64_t taskSequence =
+            next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
+        submitted_tasks.push_back(
+            {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             pos, realSize);
 
         hasCallback_[taskId] = false;
         enqueueTaskKernel<<<1, 1, 0, stream>>>(
-            opType, realSize, broadcastRoot, bufferOffset, meta.get(),
-            tasks_device_, meta->size, meta->activeRanksDevice,
+            opType, realSize, broadcastRoot, bufferOffset, taskSequence,
+            meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId);
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
@@ -435,10 +456,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
     if (opType == c10d::OpType::BARRIER) {
-        return c10::make_intrusive<MooncakeBarrierWorkCuda>(opType, event,
-                                                            meta);
+        return c10::make_intrusive<MooncakeBarrierWorkCuda>(
+            opType, event, meta, this, std::move(submitted_tasks));
     }
-    return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta);
+    return c10::make_intrusive<MooncakeWorkCuda>(
+        opType, event, meta, this, std::move(submitted_tasks));
 }
 
 }  // namespace mooncake

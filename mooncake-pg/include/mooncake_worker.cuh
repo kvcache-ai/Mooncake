@@ -11,9 +11,11 @@
 #include <transfer_engine.h>
 
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace mooncake {
 
@@ -51,6 +53,7 @@ __global__ struct Task {
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
+    uint64_t submit_sequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
 };
@@ -64,6 +67,12 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 void preloadReduceKernels();
 
 class ConnectionContext;
+
+struct CudaTaskSubmissionToken {
+    size_t task_id;
+    uint64_t sequence;
+};
+
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(int cuda_device_index = -1);
@@ -104,6 +113,10 @@ class MooncakeWorker {
      */
     bool drainTasks(const TransferGroupMeta* meta) const;
 
+    bool waitUntilTasksSubmitted(
+        const std::vector<CudaTaskSubmissionToken>& tasks,
+        std::chrono::milliseconds timeout) const;
+
    private:
     void startWorker();
 
@@ -122,6 +135,8 @@ class MooncakeWorker {
 
     int cpuTaskCount = 0;
     int cudaTaskCount = 0;
+    std::atomic<uint64_t> next_cuda_task_sequence_{1};
+    std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
     std::thread worker_thread_;
 };
