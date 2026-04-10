@@ -91,30 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let shutdown = install_signal_handler()?;
     let heartbeat_interval =
         effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
-    let labels = args.labels.into_iter().collect::<BTreeMap<_, _>>();
-    let runtime = CompatRuntimeArgs {
-        setup: CompatSetupArgs {
-            local_hostname: args.local_hostname,
-            metadata_url: args.metadata_url,
-            transport_metadata_url: args.transport_metadata_url,
-            global_segment_size: args.storage_bytes,
-            local_buffer_size: args.scratch_bytes,
-            protocol: args.protocol,
-            _rdma_devices: args.rdma_devices,
-            stable_id: args.stable_id,
-            tenant: args.tenant,
-            labels,
-            routed_writes: args.routed_writes,
-            replica_count: args.replica_count,
-            keyspace: args.keyspace,
-            expires_at_ms: Some(now_ms().saturating_add(args.lease_ttl_ms)),
-            use_hugepage: args.use_hugepage.then_some(true),
-            hugepage_size_bytes: args.hugepage_size,
-        },
-        local_segment_name: args.local_segment_name,
-        route_control: args.route_control.into(),
-    }
-    .build()?;
+    let runtime = build_runtime_args(&args).build()?;
 
     let stable_id = runtime.stable_id.clone();
     let segment_name = runtime.segment_name.clone();
@@ -129,16 +106,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     eprintln!(
-        "mooncake-store-client started stable_id={} segment={} lease_ttl_ms={} heartbeat_interval_ms={} metrics_addr={} client_server_address={} ",
-        stable_id,
-        segment_name,
-        args.lease_ttl_ms,
-        heartbeat_interval,
-        metrics_addr.as_deref().unwrap_or("disabled"),
-        dummy_server
-            .as_ref()
-            .map(|server| server.address())
-            .unwrap_or("disabled"),
+        "{}",
+        started_message(
+            &stable_id,
+            &segment_name,
+            args.lease_ttl_ms,
+            heartbeat_interval,
+            metrics_addr.as_deref(),
+            dummy_server.as_ref().map(|server| server.address()),
+        )
     );
 
     let mut next_heartbeat = now_ms().saturating_add(heartbeat_interval);
@@ -158,16 +134,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.drain_on_exit {
         client.enter_draining()?;
         let evacuated = client.evacuate_owned_replicas()?;
-        eprintln!(
-            "mooncake-store-client drained stable_id={} evacuated_routes={}",
-            stable_id, evacuated
-        );
+        eprintln!("{}", drained_message(&stable_id, evacuated));
     }
     client.shutdown();
     if metrics_addr.is_some() {
         stop_metrics_http_server()?;
     }
-    eprintln!("mooncake-store-client stopped stable_id={}", stable_id);
+    eprintln!("{}", stopped_message(&stable_id));
     Ok(())
 }
 
@@ -197,6 +170,54 @@ fn parse_label(input: &str) -> Result<(String, String), String> {
 
 fn parse_hugepage_size_arg(input: &str) -> Result<usize, String> {
     parse_hugepage_size(input).map_err(|error| error.to_string())
+}
+
+fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
+    CompatRuntimeArgs {
+        setup: CompatSetupArgs {
+            local_hostname: args.local_hostname.clone(),
+            metadata_url: args.metadata_url.clone(),
+            transport_metadata_url: args.transport_metadata_url.clone(),
+            global_segment_size: args.storage_bytes,
+            local_buffer_size: args.scratch_bytes,
+            protocol: args.protocol.clone(),
+            _rdma_devices: args.rdma_devices.clone(),
+            stable_id: args.stable_id.clone(),
+            tenant: args.tenant.clone(),
+            labels: args.labels.iter().cloned().collect::<BTreeMap<_, _>>(),
+            routed_writes: args.routed_writes,
+            replica_count: args.replica_count,
+            keyspace: args.keyspace.clone(),
+            expires_at_ms: Some(now_ms().saturating_add(args.lease_ttl_ms)),
+            use_hugepage: args.use_hugepage.then_some(true),
+            hugepage_size_bytes: args.hugepage_size,
+        },
+        local_segment_name: args.local_segment_name.clone(),
+        route_control: args.route_control.into(),
+    }
+}
+
+fn started_message(
+    stable_id: &str,
+    segment_name: &str,
+    lease_ttl_ms: u64,
+    heartbeat_interval_ms: u64,
+    metrics_addr: Option<&str>,
+    client_server_address: Option<&str>,
+) -> String {
+    format!(
+        "mooncake-store-client started stable_id={stable_id} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} metrics_addr={} client_server_address={} ",
+        metrics_addr.unwrap_or("disabled"),
+        client_server_address.unwrap_or("disabled"),
+    )
+}
+
+fn drained_message(stable_id: &str, evacuated_routes: usize) -> String {
+    format!("mooncake-store-client drained stable_id={stable_id} evacuated_routes={evacuated_routes}")
+}
+
+fn stopped_message(stable_id: &str) -> String {
+    format!("mooncake-store-client stopped stable_id={stable_id}")
 }
 
 fn install_signal_handler() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
@@ -235,8 +256,9 @@ mod tests {
     use mooncake_store_client::RouteControlMode;
 
     use super::{
-        effective_heartbeat_interval, now_ms, parse_hugepage_size_arg, parse_label,
-        start_metrics_if_needed, validate_args, Args, RouteControlArg,
+        build_runtime_args, drained_message, effective_heartbeat_interval, now_ms,
+        parse_hugepage_size_arg, parse_label, start_metrics_if_needed, started_message,
+        stopped_message, validate_args, Args, RouteControlArg,
     };
 
     fn sample_args() -> Args {
@@ -316,6 +338,55 @@ mod tests {
     }
 
     #[test]
+    fn args_parser_accepts_extended_optional_flags() {
+        let args = Args::try_parse_from([
+            "mooncake-store-client",
+            "--local-hostname",
+            "10.0.0.1",
+            "--metadata-url",
+            "etcd://127.0.0.1:2379",
+            "--transport-metadata-url",
+            "redis://127.0.0.1:6379/9",
+            "--stable-id",
+            "node-a",
+            "--tenant",
+            "tenant-b",
+            "--keyspace",
+            "ks-a",
+            "--local-segment-name",
+            "segment-a",
+            "--lease-ttl-ms",
+            "9000",
+            "--heartbeat-interval-ms",
+            "2500",
+            "--metrics-addr",
+            "127.0.0.1:0",
+            "--client-server-address",
+            "127.0.0.1:7001",
+            "--use-hugepage",
+            "--hugepage-size",
+            "2M",
+            "--trace-filter",
+            "info",
+            "--drain-on-exit",
+        ])
+        .expect("extended args should parse");
+        assert_eq!(args.transport_metadata_url.as_deref(), Some("redis://127.0.0.1:6379/9"));
+        assert_eq!(args.stable_id.as_deref(), Some("node-a"));
+        assert_eq!(args.keyspace.as_deref(), Some("ks-a"));
+        assert_eq!(args.local_segment_name.as_deref(), Some("segment-a"));
+        assert_eq!(args.metrics_addr.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(
+            args.client_server_address.as_deref(),
+            Some("127.0.0.1:7001")
+        );
+        assert!(args.use_hugepage);
+        assert_eq!(args.hugepage_size, Some(2 * 1024 * 1024));
+        assert_eq!(args.trace_filter.as_deref(), Some("info"));
+        assert!(args.drain_on_exit);
+    }
+
+    #[test]
     fn validate_args_rejects_zero_capacities_and_ttl() {
         validate_args(&sample_args()).expect("baseline args should validate");
 
@@ -367,5 +438,76 @@ mod tests {
         let first = now_ms();
         let second = now_ms();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn runtime_arg_builder_preserves_config_shape() {
+        let mut args = sample_args();
+        args.transport_metadata_url = Some("redis://127.0.0.1:6380/1".to_string());
+        args.rdma_devices = "mlx5_0".to_string();
+        args.keyspace = Some("tenant/keyspace".to_string());
+        args.local_segment_name = Some("segment-a".to_string());
+        args.metrics_addr = Some("127.0.0.1:9090".to_string());
+        args.client_server_address = Some("127.0.0.1:7001".to_string());
+        args.use_hugepage = true;
+        args.hugepage_size = Some(2 * 1024 * 1024);
+        args.trace_filter = Some("debug".to_string());
+        args.labels = vec![
+            ("pool".to_string(), "a".to_string()),
+            ("storage".to_string(), "true".to_string()),
+        ];
+        args.routed_writes = true;
+        args.replica_count = 3;
+        args.route_control = RouteControlArg::MetadataOnly;
+
+        let runtime_args = build_runtime_args(&args);
+        assert_eq!(runtime_args.setup.local_hostname, "127.0.0.1");
+        assert_eq!(runtime_args.setup.metadata_url, "redis://127.0.0.1:6379/0");
+        assert_eq!(
+            runtime_args.setup.transport_metadata_url.as_deref(),
+            Some("redis://127.0.0.1:6380/1")
+        );
+        assert_eq!(runtime_args.setup._rdma_devices, "mlx5_0");
+        assert_eq!(runtime_args.setup.keyspace.as_deref(), Some("tenant/keyspace"));
+        assert_eq!(runtime_args.local_segment_name.as_deref(), Some("segment-a"));
+        assert_eq!(runtime_args.setup.use_hugepage, Some(true));
+        assert_eq!(runtime_args.setup.hugepage_size_bytes, Some(2 * 1024 * 1024));
+        assert_eq!(runtime_args.setup.replica_count, 3);
+        assert!(runtime_args.setup.routed_writes);
+        assert_eq!(runtime_args.route_control, RouteControlMode::MetadataOnly);
+        assert_eq!(
+            runtime_args
+                .setup
+                .labels
+                .get("storage")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(runtime_args.setup.expires_at_ms.is_some());
+    }
+
+    #[test]
+    fn lifecycle_messages_stay_human_readable() {
+        let started = started_message(
+            "node-a",
+            "segment-a",
+            9_000,
+            3_000,
+            Some("127.0.0.1:9090"),
+            None,
+        );
+        assert!(started.contains("stable_id=node-a"));
+        assert!(started.contains("segment=segment-a"));
+        assert!(started.contains("metrics_addr=127.0.0.1:9090"));
+        assert!(started.contains("client_server_address=disabled"));
+
+        assert_eq!(
+            drained_message("node-a", 7),
+            "mooncake-store-client drained stable_id=node-a evacuated_routes=7"
+        );
+        assert_eq!(
+            stopped_message("node-a"),
+            "mooncake-store-client stopped stable_id=node-a"
+        );
     }
 }
