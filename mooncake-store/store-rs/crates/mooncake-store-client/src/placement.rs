@@ -49,11 +49,17 @@ impl PlacementPlanner {
         objects: &[ObjectRef<'_>],
         replica_count: usize,
     ) -> Result<Vec<PlacementChoice>> {
-        self.plan_from_lease(
-            observer.lease(),
+        if replica_count == 0 {
+            return Err(StoreError::InvalidState(
+                "replica_count must be greater than zero".to_string(),
+            ));
+        }
+        let candidates = self.candidates_for_client(observer, replica_count)?;
+        self.plan_with_candidates(
             observer.default_tenant(),
             objects,
             replica_count,
+            &candidates,
         )
     }
 
@@ -62,7 +68,9 @@ impl PlacementPlanner {
         observer: &StoreClient,
         object: &ObjectRef<'_>,
     ) -> Result<Vec<ClientRuntimeId>> {
-        self.ranked_candidates_from_lease(observer.lease(), observer.default_tenant(), object)
+        let tenant = object.tenant.unwrap_or(observer.default_tenant());
+        let candidates = self.candidates_for_client(observer, 1)?;
+        Ok(self.rank_candidates(tenant, object.key, &candidates))
     }
 
     pub fn rank_many(
@@ -70,7 +78,8 @@ impl PlacementPlanner {
         observer: &StoreClient,
         objects: &[ObjectRef<'_>],
     ) -> Result<Vec<PlacementChoice>> {
-        self.rank_many_from_lease(observer.lease(), observer.default_tenant(), objects)
+        let candidates = self.candidates_for_client(observer, 1)?;
+        self.rank_many_with_candidates(observer.default_tenant(), objects, &candidates)
     }
 
     pub fn plan_from_lease(
@@ -92,18 +101,7 @@ impl PlacementPlanner {
                 candidates.len()
             )));
         }
-
-        let mut plans = Vec::with_capacity(objects.len());
-        for object in objects {
-            let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let scored = self.rank_candidates(&tenant, object.key, &candidates);
-            plans.push(PlacementChoice {
-                tenant,
-                key: object.key.to_string(),
-                owners: scored.into_iter().take(replica_count).collect(),
-            });
-        }
-        Ok(plans)
+        self.plan_with_candidates(default_tenant, objects, replica_count, &candidates)
     }
 
     pub fn ranked_candidates_from_lease(
@@ -124,17 +122,24 @@ impl PlacementPlanner {
         objects: &[ObjectRef<'_>],
     ) -> Result<Vec<PlacementChoice>> {
         let candidates = self.candidates(observer)?;
-        let mut plans = Vec::with_capacity(objects.len());
-        for object in objects {
-            let tenant = object.tenant.unwrap_or(default_tenant).to_string();
-            let owners = self.rank_candidates(&tenant, object.key, &candidates);
-            plans.push(PlacementChoice {
-                tenant,
-                key: object.key.to_string(),
-                owners,
-            });
+        self.rank_many_with_candidates(default_tenant, objects, &candidates)
+    }
+
+    fn candidates_for_client(
+        &self,
+        observer: &StoreClient,
+        minimum: usize,
+    ) -> Result<Vec<ClientLease>> {
+        let minimum = minimum.max(1);
+        let candidates = observer.placement_candidates_snapshot(
+            &self.scope_label_key,
+            &self.required_labels,
+            false,
+        )?;
+        if candidates.len() >= minimum {
+            return Ok(candidates);
         }
-        Ok(plans)
+        observer.placement_candidates_snapshot(&self.scope_label_key, &self.required_labels, true)
     }
 
     fn candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
@@ -189,6 +194,51 @@ impl PlacementPlanner {
             .collect::<Vec<_>>();
         scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
         scored.into_iter().map(|(_, runtime)| runtime).collect()
+    }
+
+    fn plan_with_candidates(
+        &self,
+        default_tenant: &str,
+        objects: &[ObjectRef<'_>],
+        replica_count: usize,
+        candidates: &[ClientLease],
+    ) -> Result<Vec<PlacementChoice>> {
+        if candidates.len() < replica_count {
+            return Err(StoreError::InvalidState(format!(
+                "not enough active placement candidates: have={} need={replica_count}",
+                candidates.len()
+            )));
+        }
+        let mut plans = Vec::with_capacity(objects.len());
+        for object in objects {
+            let tenant = object.tenant.unwrap_or(default_tenant).to_string();
+            let scored = self.rank_candidates(&tenant, object.key, candidates);
+            plans.push(PlacementChoice {
+                tenant,
+                key: object.key.to_string(),
+                owners: scored.into_iter().take(replica_count).collect(),
+            });
+        }
+        Ok(plans)
+    }
+
+    fn rank_many_with_candidates(
+        &self,
+        default_tenant: &str,
+        objects: &[ObjectRef<'_>],
+        candidates: &[ClientLease],
+    ) -> Result<Vec<PlacementChoice>> {
+        let mut plans = Vec::with_capacity(objects.len());
+        for object in objects {
+            let tenant = object.tenant.unwrap_or(default_tenant).to_string();
+            let owners = self.rank_candidates(&tenant, object.key, candidates);
+            plans.push(PlacementChoice {
+                tenant,
+                key: object.key.to_string(),
+                owners,
+            });
+        }
+        Ok(plans)
     }
 }
 
