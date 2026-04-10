@@ -429,18 +429,28 @@ int EfaContext::preTouchMemory(void* addr, size_t length) {
 
 uint64_t EfaContext::rkey(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    auto it = mr_map_.find((uint64_t)addr);
-    if (it != mr_map_.end() && it->second.mr) {
-        return it->second.key;
+    // Range lookup: find the MR that contains this address
+    for (auto& entry : mr_map_) {
+        if ((uint64_t)addr >= entry.first &&
+            (uint64_t)addr < entry.first + entry.second.length) {
+            if (entry.second.mr) {
+                return entry.second.key;
+            }
+        }
     }
     return 0;
 }
 
 uint64_t EfaContext::lkey(void* addr) {
     RWSpinlock::ReadGuard guard(mr_lock_);
-    auto it = mr_map_.find((uint64_t)addr);
-    if (it != mr_map_.end() && it->second.mr) {
-        return fi_mr_key(it->second.mr);
+    // Range lookup: find the MR that contains this address
+    for (auto& entry : mr_map_) {
+        if ((uint64_t)addr >= entry.first &&
+            (uint64_t)addr < entry.first + entry.second.length) {
+            if (entry.second.mr) {
+                return fi_mr_key(entry.second.mr);
+            }
+        }
     }
     return 0;
 }

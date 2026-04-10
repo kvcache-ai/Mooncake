@@ -139,6 +139,12 @@ class EfaTransport : public Transport {
     std::vector<std::shared_ptr<EfaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
 
+    // Track chunked MR registrations: original base addr -> list of chunk addrs
+    // When a buffer exceeds max_mr_size, it is split into multiple chunks.
+    // This map allows unregisterLocalMemory to find and unregister all chunks.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+
     // CQ polling worker threads
     std::atomic<bool> worker_running_{false};
     std::vector<std::thread> worker_threads_;

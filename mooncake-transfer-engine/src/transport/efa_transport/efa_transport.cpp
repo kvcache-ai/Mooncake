@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -157,9 +158,6 @@ int EfaTransport::preTouchMemory(void* addr, size_t length) {
 
     auto hwc = std::thread::hardware_concurrency();
     auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
-    if (length > (size_t)globalConfig().max_mr_size) {
-        length = (size_t)globalConfig().max_mr_size;
-    }
     size_t block_size = length / num_threads;
     if (block_size == 0) {
         return 0;
@@ -205,105 +203,151 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                                               bool update_metadata,
                                               bool force_sequential) {
     (void)remote_accessible;
-    BufferDesc buffer_desc;
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
 
     int access_rights = kBaseAccessRights;
+    size_t max_mr = (size_t)globalConfig().max_mr_size;
 
-    bool do_pre_touch = context_list_.size() > 0 &&
-                        std::thread::hardware_concurrency() >= 4 &&
-                        length >= (size_t)4 * 1024 * 1024 * 1024;
-    if (do_pre_touch) {
-        int ret = preTouchMemory(addr, length);
-        if (ret != 0) {
-            return ret;
+    // Use a chunk limit slightly below max_mr_size to avoid boundary issues.
+    // Some drivers reject fi_mr_reg at exactly max_mr_size.
+    const size_t kMrMargin = 1ULL << 30;  // 1 GB margin
+    size_t chunk_limit = (max_mr > kMrMargin) ? max_mr - kMrMargin : max_mr;
+
+    // Determine chunk boundaries
+    std::vector<std::pair<void*, size_t>> chunks;
+    if (max_mr > 0 && length > chunk_limit) {
+        size_t offset = 0;
+        while (offset < length) {
+            size_t chunk_len = std::min(chunk_limit, length - offset);
+            chunks.emplace_back(static_cast<char*>(addr) + offset, chunk_len);
+            offset += chunk_len;
         }
-    }
-
-    int use_parallel_reg = 0;
-    if (!force_sequential) {
-        use_parallel_reg = globalConfig().parallel_reg_mr;
-        if (use_parallel_reg == -1) {
-            use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
-        }
-    }
-
-    auto reg_start = std::chrono::steady_clock::now();
-
-    if (use_parallel_reg) {
-        std::vector<std::thread> reg_threads;
-        reg_threads.reserve(context_list_.size());
-        std::vector<int> ret_codes(context_list_.size(), 0);
-        const int ar = access_rights;
-
-        for (size_t i = 0; i < context_list_.size(); ++i) {
-            reg_threads.emplace_back([this, &ret_codes, i, addr, length, ar]() {
-                ret_codes[i] =
-                    context_list_[i]->registerMemoryRegion(addr, length, ar);
-            });
-        }
-
-        for (auto& thread : reg_threads) {
-            thread.join();
-        }
-
-        for (size_t i = 0; i < ret_codes.size(); ++i) {
-            if (ret_codes[i] != 0) {
-                LOG(ERROR)
-                    << "Failed to register memory region with EFA context "
-                    << i;
-                return ret_codes[i];
-            }
-        }
+        LOG(INFO) << "Auto-splitting buffer " << addr << " (" << length
+                  << " bytes) into " << chunks.size() << " chunks of <= "
+                  << chunk_limit << " bytes each";
     } else {
-        for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->registerMemoryRegion(addr, length,
-                                                             access_rights);
-            if (ret) {
-                LOG(ERROR)
-                    << "Failed to register memory region with EFA context "
-                    << i;
-                return ret;
-            }
-        }
+        chunks.emplace_back(addr, length);
     }
 
-    auto reg_end = std::chrono::steady_clock::now();
-    auto reg_duration_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
-                                                              reg_start)
-            .count();
-
-    if (globalConfig().trace) {
-        LOG(INFO) << "EFA registerMemoryRegion: addr=" << addr
-                  << ", length=" << length
-                  << ", contexts=" << context_list_.size()
-                  << ", parallel=" << (use_parallel_reg ? "true" : "false")
-                  << ", duration=" << reg_duration_ms << "ms";
-    }
-
-    // Collect keys from all contexts
-    for (auto& context : context_list_) {
-        buffer_desc.lkey.push_back(context->lkey(addr));
-        buffer_desc.rkey.push_back(context->rkey(addr));
-    }
-
+    // Resolve location name once (based on original buffer)
+    std::string resolved_name;
     if (name == kWildcardLocation) {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
         if (entries.empty()) return -1;
-        buffer_desc.name = entries[0].location;
+        resolved_name = entries[0].location;
     } else {
-        buffer_desc.name = name;
+        resolved_name = name;
     }
 
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
-    int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-    if (rc) return rc;
+    // Register each chunk
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        void* chunk_addr = chunks[ci].first;
+        size_t chunk_len = chunks[ci].second;
+
+        bool do_pre_touch = context_list_.size() > 0 &&
+                            std::thread::hardware_concurrency() >= 4 &&
+                            chunk_len >= (size_t)4 * 1024 * 1024 * 1024;
+        if (do_pre_touch) {
+            int ret = preTouchMemory(chunk_addr, chunk_len);
+            if (ret != 0) {
+                return ret;
+            }
+        }
+
+        int use_parallel_reg = 0;
+        if (!force_sequential) {
+            use_parallel_reg = globalConfig().parallel_reg_mr;
+            if (use_parallel_reg == -1) {
+                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+            }
+        }
+
+        auto reg_start = std::chrono::steady_clock::now();
+
+        if (use_parallel_reg) {
+            std::vector<std::thread> reg_threads;
+            reg_threads.reserve(context_list_.size());
+            std::vector<int> ret_codes(context_list_.size(), 0);
+            const int ar = access_rights;
+
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                reg_threads.emplace_back(
+                    [this, &ret_codes, i, chunk_addr, chunk_len, ar]() {
+                        ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                            chunk_addr, chunk_len, ar);
+                    });
+            }
+
+            for (auto& thread : reg_threads) {
+                thread.join();
+            }
+
+            for (size_t i = 0; i < ret_codes.size(); ++i) {
+                if (ret_codes[i] != 0) {
+                    LOG(ERROR)
+                        << "Failed to register memory region chunk " << ci
+                        << " with EFA context " << i;
+                    return ret_codes[i];
+                }
+            }
+        } else {
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                int ret = context_list_[i]->registerMemoryRegion(
+                    chunk_addr, chunk_len, access_rights);
+                if (ret) {
+                    LOG(ERROR)
+                        << "Failed to register memory region chunk " << ci
+                        << " with EFA context " << i;
+                    return ret;
+                }
+            }
+        }
+
+        auto reg_end = std::chrono::steady_clock::now();
+        auto reg_duration_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
+                                                                  reg_start)
+                .count();
+
+        if (globalConfig().trace) {
+            LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci
+                      << ", addr=" << chunk_addr
+                      << ", length=" << chunk_len
+                      << ", contexts=" << context_list_.size()
+                      << ", parallel="
+                      << (use_parallel_reg ? "true" : "false")
+                      << ", duration=" << reg_duration_ms << "ms";
+        }
+
+        // Collect keys and add metadata for this chunk
+        BufferDesc buffer_desc;
+        for (auto& context : context_list_) {
+            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+            buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+        }
+
+        buffer_desc.name = resolved_name;
+        buffer_desc.addr = (uint64_t)chunk_addr;
+        buffer_desc.length = chunk_len;
+        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+        if (rc) return rc;
+    }
+
+    // Track chunks for unregistration if buffer was split
+    if (chunks.size() > 1) {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        std::vector<uint64_t> chunk_addrs;
+        chunk_addrs.reserve(chunks.size());
+        for (auto& chunk : chunks) {
+            chunk_addrs.push_back((uint64_t)chunk.first);
+        }
+        chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+    }
+
     return 0;
 }
 
@@ -314,6 +358,40 @@ int EfaTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int EfaTransport::unregisterLocalMemoryInternal(void* addr,
                                                 bool update_metadata,
                                                 bool force_sequential) {
+    // Check if this buffer was split into chunks
+    std::vector<uint64_t> chunk_addrs;
+    {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        auto it = chunk_map_.find((uint64_t)addr);
+        if (it != chunk_map_.end()) {
+            chunk_addrs = it->second;
+            chunk_map_.erase(it);
+        }
+    }
+
+    if (!chunk_addrs.empty()) {
+        // Unregister all chunks
+        for (auto chunk_addr : chunk_addrs) {
+            void* ca = (void*)chunk_addr;
+            int rc = metadata_->removeLocalMemoryBuffer(ca, update_metadata);
+            if (rc) {
+                LOG(ERROR) << "Failed to remove chunk metadata at " << ca;
+                return rc;
+            }
+
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                int ret = context_list_[i]->unregisterMemoryRegion(ca);
+                if (ret) {
+                    LOG(ERROR) << "Failed to unregister chunk " << ca
+                               << " with EFA context " << i;
+                    return ret;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // Non-chunked buffer: original path
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
 
@@ -788,6 +866,38 @@ int EfaTransport::initializeEfaResources() {
         LOG(ERROR) << "EfaTransport: No available EFA devices";
         return ERR_DEVICE_NOT_FOUND;
     }
+
+    // Query EFA device max_mr_size via ibverbs and clamp globalConfig.
+    // libfabric does not expose max_mr_size, so we go through the ibverbs layer.
+    {
+        int num_devices = 0;
+        struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
+        if (dev_list) {
+            const std::string& first_efa = efa_devices[0];
+            for (int i = 0; i < num_devices; ++i) {
+                if (first_efa == ibv_get_device_name(dev_list[i])) {
+                    struct ibv_context* ctx = ibv_open_device(dev_list[i]);
+                    if (ctx) {
+                        struct ibv_device_attr attr;
+                        if (ibv_query_device(ctx, &attr) == 0) {
+                            auto& config = globalConfig();
+                            if (config.max_mr_size >
+                                (uint64_t)attr.max_mr_size) {
+                                config.max_mr_size = attr.max_mr_size;
+                                LOG(INFO) << "EfaTransport: Clamped "
+                                             "max_mr_size to device limit: "
+                                          << config.max_mr_size;
+                            }
+                        }
+                        ibv_close_device(ctx);
+                    }
+                    break;
+                }
+            }
+            ibv_free_device_list(dev_list);
+        }
+    }
+
     return 0;
 }
 
