@@ -729,6 +729,10 @@ class RealClient : public PyClient {
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
+    bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
+                                size_t offset, size_t size,
+                                void *&out_real) const;
+
     bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                   uint64_t dummy_addr, size_t buf_size,
                                   const MappedShm *&last_hit_shm,

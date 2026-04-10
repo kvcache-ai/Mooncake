@@ -158,9 +158,9 @@ void fill_ranged_read_results_with_error(
 
 PyClient::~PyClient() {}
 
-namespace {
-bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
-                            size_t offset, size_t size, void *&out_real) {
+bool RealClient::map_dummy_range_in_shm(const MappedShm &shm,
+                                        uint64_t dummy_addr, size_t offset,
+                                        size_t size, void *&out_real) const {
     if (dummy_addr < shm.dummy_base_addr) {
         return false;
     }
@@ -177,7 +177,6 @@ bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
                                         static_cast<uint64_t>(offset));
     return true;
 }
-}  // namespace
 
 bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                           uint64_t dummy_addr, size_t buf_size,
