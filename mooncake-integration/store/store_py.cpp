@@ -1573,8 +1573,7 @@ PYBIND11_MODULE(store, m) {
                 return real_client->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "",
-                    enable_offload);
+                    master_server_addr, transfer_engine, "", enable_offload);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),

@@ -323,8 +323,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path, int local_rpc_port,
-    bool enable_offload,
+    const std::string &ipc_socket_path, int local_rpc_port, bool enable_offload,
     bool start_offload_rpc_server) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
@@ -574,16 +573,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             offload_rpc_server_ =
                 std::make_unique<coro_rpc::coro_rpc_server>(1, port, "0.0.0.0");
-            offload_rpc_server_->register_handler<
-                &RealClient::batch_get_offload_object>(this);
-            offload_rpc_server_->register_handler<
-                &RealClient::release_offload_buffer>(this);
+            offload_rpc_server_
+                ->register_handler<&RealClient::batch_get_offload_object>(this);
+            offload_rpc_server_
+                ->register_handler<&RealClient::release_offload_buffer>(this);
             offload_rpc_server_->async_start();
             auto err = offload_rpc_server_->get_errc();
             if (err) {
                 LOG(WARNING) << "Failed to start offload RPC server on port "
-                             << port << ": " << err.message()
-                             << ", retry " << (retry + 1) << "/" << kMaxRetries;
+                             << port << ": " << err.message() << ", retry "
+                             << (retry + 1) << "/" << kMaxRetries;
                 offload_rpc_server_.reset();
                 continue;
             }
@@ -606,7 +605,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         this->local_rpc_addr =
             rpc_host + ":" + std::to_string(offload_rpc_port_);
-
     }
     if (enable_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
@@ -637,11 +635,10 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_offload) {
-    return to_py_ret(setup_internal(local_hostname, metadata_server,
-                                    global_segment_size, local_buffer_size,
-                                    protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path,
-                                    50052, enable_offload, true));
+    return to_py_ret(setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, 50052, enable_offload, true));
 }
 
 namespace {
@@ -739,8 +736,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path,
-                          50052, enable_offload, true);
+                          master_server_addr, nullptr, ipc_socket_path, 50052,
+                          enable_offload, true);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
