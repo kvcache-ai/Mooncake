@@ -249,13 +249,13 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
         results = self.store.get_into_ranges(
             [buffer_ptr0, buffer_ptr1],
-            [[key1, key2, key1], [key2, key1]],
-            [[0, 8, 20], [4, 16]],
-            [[1, 2, 30], [0, 10]],
-            [[4, 5, 3], [6, 4]],
+            [[key1, key2], [key2, key1]],
+            [[[0, 20], [8]], [[4], [16]]],
+            [[[1, 30], [2]], [[0], [10]]],
+            [[[4, 3], [5]], [[6], [4]]],
         )
 
-        self.assertEqual(results, [[4, 5, 3], [6, 4]])
+        self.assertEqual(results, [[[4, 3], [5]], [[6], [4]]])
         self.assertEqual(bytes(buffer0[0:4]), data1[1:5])
         self.assertEqual(bytes(buffer0[8:13]), data2[2:7])
         self.assertEqual(bytes(buffer0[20:23]), data1[30:33])
@@ -263,30 +263,30 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(bytes(buffer1[16:20]), data1[10:14])
 
         mismatch_results = self.store.get_into_ranges(
-            [buffer_ptr0], [[key1, key2]], [[0]], [[0, 1]], [[4, 4]]
+            [buffer_ptr0], [[key1, key2]], [[[0], []]], [[[0, 1], []]], [[[4, 4], []]]
         )
         self.assertEqual(len(mismatch_results), 1)
         self.assertEqual(len(mismatch_results[0]), 2)
-        for result in mismatch_results[0]:
-            self.assertLess(result, 0, "mismatched ranges should fail")
+        self.assertLess(mismatch_results[0][0][0], 0, "mismatched ranges should fail")
+        self.assertEqual(len(mismatch_results[0][1]), 0)
 
         source_overflow_results = self.store.get_into_ranges(
-            [buffer_ptr0], [[key1]], [[0]], [[len(data1) - 1]], [[4]]
+            [buffer_ptr0], [[key1]], [[[0]]], [[[len(data1) - 1]]], [[[4]]]
         )
         self.assertEqual(len(source_overflow_results), 1)
-        self.assertLess(source_overflow_results[0][0], 0)
+        self.assertLess(source_overflow_results[0][0][0], 0)
 
         destination_overflow_results = self.store.get_into_ranges(
-            [buffer_ptr0], [[key1]], [[buffer_size - 1]], [[0]], [[4]]
+            [buffer_ptr0], [[key1]], [[[buffer_size - 1]]], [[[0]]], [[[4]]]
         )
         self.assertEqual(len(destination_overflow_results), 1)
-        self.assertLess(destination_overflow_results[0][0], 0)
+        self.assertLess(destination_overflow_results[0][0][0], 0)
 
         missing_key_results = self.store.get_into_ranges(
-            [buffer_ptr0], [["missing-key", key1]], [[0, 8]], [[0, 0]], [[4, 4]]
+            [buffer_ptr0], [["missing-key", key1]], [[[0], [8]]], [[[0], [0]]], [[[4], [4]]]
         )
-        self.assertLess(missing_key_results[0][0], 0)
-        self.assertEqual(missing_key_results[0][1], 4)
+        self.assertLess(missing_key_results[0][0][0], 0)
+        self.assertEqual(missing_key_results[0][1][0], 4)
 
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.unregister_buffer(buffer_ptr0), 0)

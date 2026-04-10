@@ -13,6 +13,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -59,16 +60,25 @@ bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                           uint64_t dummy_addr, size_t buf_size,
                                           const MappedShm *&last_hit_shm,
                                           void *&out_real) const {
-    if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
-        dummy_addr + buf_size <=
-            last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
+    auto range_fits = [](uint64_t addr, size_t size,
+                         const MappedShm &shm) -> bool {
+        if (addr < shm.dummy_base_addr) {
+            return false;
+        }
+        const uint64_t offset = addr - shm.dummy_base_addr;
+        if (offset > shm.shm_size) {
+            return false;
+        }
+        return size <= shm.shm_size - offset;
+    };
+
+    if (last_hit_shm && range_fits(dummy_addr, buf_size, *last_hit_shm)) {
         out_real = reinterpret_cast<void *>(dummy_addr +
                                             last_hit_shm->shm_addr_offset);
         return true;
     }
     for (const auto &shm : shm_ctx.mapped_shms) {
-        if (dummy_addr >= shm.dummy_base_addr &&
-            dummy_addr + buf_size <= shm.dummy_base_addr + shm.shm_size) {
+        if (range_fits(dummy_addr, buf_size, shm)) {
             out_real =
                 reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset);
             last_hit_shm = &shm;
@@ -2085,7 +2095,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     }
 
     if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "get_into_range only supports memory replicas";
+        LOG(ERROR) << "ranged reads only support memory replicas";
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
@@ -2122,42 +2132,34 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
     return to_py_ret(get_into_range_internal(key, buffer, 0, 0, size, true));
 }
 
-std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
 RealClient::get_into_ranges_internal(
     const std::vector<void *> &buffers,
     const std::vector<std::vector<std::string>> &all_keys,
-    const std::vector<std::vector<size_t>> &all_dst_offsets,
-    const std::vector<std::vector<size_t>> &all_src_offsets,
-    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities) {
     const size_t buffer_count = buffers.size();
-    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>> results(
-        buffer_count);
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        results(buffer_count);
 
     if (buffer_count != all_keys.size() ||
         buffer_count != all_dst_offsets.size() ||
         buffer_count != all_src_offsets.size() ||
         buffer_count != all_sizes.size()) {
         LOG(ERROR) << "get_into_ranges: top-level size mismatch";
-        for (size_t i = 0; i < buffer_count; ++i) {
-            const size_t item_count =
-                i < all_keys.size() ? all_keys[i].size() : 1;
-            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
+        return build_ranged_read_internal_error_results(
+            buffer_count, all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     }
 
     std::vector<size_t> resolved_buffer_capacities;
     if (buffer_capacities != nullptr) {
         if (buffer_capacities->size() != buffer_count) {
             LOG(ERROR) << "get_into_ranges: buffer capacities size mismatch";
-            for (size_t i = 0; i < buffer_count; ++i) {
-                results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                    all_keys[i].size(),
-                    tl::unexpected(ErrorCode::INVALID_PARAMS));
-            }
-            return results;
+            return build_ranged_read_internal_error_results(
+                buffer_count, all_keys, all_dst_offsets,
+                ErrorCode::INVALID_PARAMS);
         }
         resolved_buffer_capacities = *buffer_capacities;
     } else {
@@ -2179,35 +2181,37 @@ RealClient::get_into_ranges_internal(
         metadata_cache;
 
     for (size_t i = 0; i < buffer_count; ++i) {
-        const size_t item_count = all_keys[i].size();
-        results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-            item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+        const size_t key_count = all_keys[i].size();
+        results[i].resize(key_count);
 
-        if (item_count != all_dst_offsets[i].size() ||
-            item_count != all_src_offsets[i].size() ||
-            item_count != all_sizes[i].size()) {
-            LOG(ERROR) << "get_into_ranges: size mismatch for buffer index "
-                       << i;
+        if (key_count != all_dst_offsets[i].size() ||
+            key_count != all_src_offsets[i].size() ||
+            key_count != all_sizes[i].size()) {
+            LOG(ERROR)
+                << "get_into_ranges: key-group size mismatch for buffer index "
+                << i;
+            for (size_t j = 0; j < key_count; ++j) {
+                results[i][j] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                    1, tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
             continue;
         }
 
         const size_t buffer_size = resolved_buffer_capacities[i];
-        if (buffer_size == 0 && item_count > 0) {
-            if (buffer_capacities == nullptr) {
-                continue;
-            }
+        if (buffer_size == 0 && key_count > 0 && buffer_capacities == nullptr) {
+            continue;
         }
 
-        for (size_t j = 0; j < item_count; ++j) {
-            if (all_sizes[i][j] > 0 &&
-                (all_dst_offsets[i][j] > buffer_size ||
-                 all_sizes[i][j] > buffer_size - all_dst_offsets[i][j])) {
+        for (size_t j = 0; j < key_count; ++j) {
+            const size_t fragment_count = all_dst_offsets[i][j].size();
+            results[i][j] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                fragment_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+
+            if (fragment_count != all_src_offsets[i][j].size() ||
+                fragment_count != all_sizes[i][j].size()) {
                 LOG(ERROR)
-                    << "get_into_ranges: destination overflow, buffer_index="
-                    << i << " item_index=" << j
-                    << " dst_offset=" << all_dst_offsets[i][j]
-                    << " size=" << all_sizes[i][j]
-                    << " buffer_size=" << buffer_size;
+                    << "get_into_ranges: fragment size mismatch, buffer_index="
+                    << i << " key_index=" << j;
                 continue;
             }
 
@@ -2215,48 +2219,54 @@ RealClient::get_into_ranges_internal(
                 all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
             (void)inserted;
             auto &metadata_result = metadata_it->second;
-            if (!metadata_result) {
-                if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-                     metadata_result.error() ==
-                         ErrorCode::REPLICA_IS_NOT_READY) &&
-                    all_src_offsets[i][j] == 0) {
-                    VLOG(1) << "Object not found for key: " << all_keys[i][j];
-                }
-                results[i][j] = tl::unexpected(metadata_result.error());
-                continue;
-            }
 
-            results[i][j] = execute_ranged_read(
-                all_keys[i][j], buffers[i], all_dst_offsets[i][j],
-                all_src_offsets[i][j], all_sizes[i][j],
-                metadata_result.value());
+            for (size_t k = 0; k < fragment_count; ++k) {
+                if (all_sizes[i][j][k] > 0 &&
+                    (all_dst_offsets[i][j][k] > buffer_size ||
+                     all_sizes[i][j][k] >
+                         buffer_size - all_dst_offsets[i][j][k])) {
+                    LOG(ERROR)
+                        << "get_into_ranges: destination overflow, "
+                           "buffer_index="
+                        << i << " key_index=" << j << " fragment_index=" << k
+                        << " dst_offset=" << all_dst_offsets[i][j][k]
+                        << " size=" << all_sizes[i][j][k]
+                        << " buffer_size=" << buffer_size;
+                    continue;
+                }
+
+                if (!metadata_result) {
+                    if ((metadata_result.error() ==
+                             ErrorCode::OBJECT_NOT_FOUND ||
+                         metadata_result.error() ==
+                             ErrorCode::REPLICA_IS_NOT_READY) &&
+                        all_src_offsets[i][j][k] == 0) {
+                        VLOG(1)
+                            << "Object not found for key: " << all_keys[i][j];
+                    }
+                    results[i][j][k] = tl::unexpected(metadata_result.error());
+                    continue;
+                }
+
+                results[i][j][k] = execute_ranged_read(
+                    all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
+                    all_src_offsets[i][j][k], all_sizes[i][j][k],
+                    metadata_result.value());
+            }
         }
     }
 
     return results;
 }
 
-std::vector<std::vector<int64_t>> RealClient::get_into_ranges(
+std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     const std::vector<void *> &buffers,
     const std::vector<std::vector<std::string>> &all_keys,
-    const std::vector<std::vector<size_t>> &all_dst_offsets,
-    const std::vector<std::vector<size_t>> &all_src_offsets,
-    const std::vector<std::vector<size_t>> &all_sizes) {
-    auto internal_results = get_into_ranges_internal(
-        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes);
-    std::vector<std::vector<int64_t>> results;
-    results.reserve(internal_results.size());
-
-    for (const auto &row : internal_results) {
-        std::vector<int64_t> converted;
-        converted.reserve(row.size());
-        for (const auto &result : row) {
-            converted.push_back(to_py_ret(result));
-        }
-        results.emplace_back(std::move(converted));
-    }
-
-    return results;
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes));
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -2566,19 +2576,17 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
     }
     auto &context = it->second;
 
-    for (const auto &shm : context.mapped_shms) {
-        if (dummy_buffer >= shm.dummy_base_addr &&
-            dummy_buffer + size <= shm.dummy_base_addr + shm.shm_size) {
-            void *real_buffer =
-                reinterpret_cast<void *>(dummy_buffer + shm.shm_addr_offset);
-            return upsert_from_internal(key, real_buffer, size, config);
-        }
+    void *real_buffer = nullptr;
+    const MappedShm *last_hit_shm = nullptr;
+    if (!map_dummy_buffer_to_real(context, dummy_buffer, size, last_hit_shm,
+                                  real_buffer)) {
+        LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
+                   << ") not found in any mapped shared memory for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
-               << ") not found in any mapped shared memory for client "
-               << client_id;
-    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    return upsert_from_internal(key, real_buffer, size, config);
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -2601,36 +2609,17 @@ RealClient::batch_upsert_from_dummy_helper(
     const MappedShm *last_hit_shm = nullptr;
 
     for (size_t i = 0; i < dummy_buffers.size(); ++i) {
-        uint64_t dummy_addr = dummy_buffers[i];
-        size_t size = sizes[i];
-        bool found = false;
-
-        if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
-            dummy_addr + size <=
-                last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
-            buffers.push_back(reinterpret_cast<void *>(
-                dummy_addr + last_hit_shm->shm_addr_offset));
-            found = true;
-        } else {
-            for (const auto &shm : context.mapped_shms) {
-                if (dummy_addr >= shm.dummy_base_addr &&
-                    dummy_addr + size <= shm.dummy_base_addr + shm.shm_size) {
-                    buffers.push_back(reinterpret_cast<void *>(
-                        dummy_addr + shm.shm_addr_offset));
-                    found = true;
-                    last_hit_shm = &shm;
-                    break;
-                }
-            }
-        }
-
-        if (!found) {
-            LOG(ERROR) << "Dummy buffer at " << dummy_addr << " (size " << size
+        void *real_ptr = nullptr;
+        if (!map_dummy_buffer_to_real(context, dummy_buffers[i], sizes[i],
+                                      last_hit_shm, real_ptr)) {
+            LOG(ERROR) << "Dummy buffer at " << dummy_buffers[i] << " (size "
+                       << sizes[i]
                        << ") not found in any mapped shared memory for client "
                        << client_id;
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        buffers.push_back(real_ptr);
     }
     return batch_upsert_from_internal(keys, buffers, sizes, config);
 }
@@ -2935,15 +2924,25 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     void *real_buffer = nullptr;
 
     for (const auto &shm : context.mapped_shms) {
-        if (dummy_addr >= shm.dummy_base_addr &&
-            dummy_addr + dst_offset + size <=
-                shm.dummy_base_addr + shm.shm_size) {
-            real_buffer =
-                reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset +
-                                         static_cast<uint64_t>(dst_offset));
-            found = true;
-            break;
+        if (dummy_addr < shm.dummy_base_addr) {
+            continue;
         }
+        const uint64_t buffer_offset = dummy_addr - shm.dummy_base_addr;
+        if (buffer_offset > shm.shm_size ||
+            dst_offset > shm.shm_size - buffer_offset) {
+            continue;
+        }
+        const size_t write_offset =
+            static_cast<size_t>(buffer_offset) + dst_offset;
+        if (write_offset < buffer_offset || write_offset > shm.shm_size ||
+            size > shm.shm_size - write_offset) {
+            continue;
+        }
+        real_buffer =
+            reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset +
+                                     static_cast<uint64_t>(dst_offset));
+        found = true;
+        break;
     }
 
     if (!found) {
@@ -2957,83 +2956,113 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     return get_into_range_internal(key, real_buffer, 0, src_offset, size);
 }
 
-std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
 RealClient::get_into_ranges_shm_helper(
     const std::vector<uint64_t> &dummy_buffers,
     const std::vector<std::vector<std::string>> &all_keys,
-    const std::vector<std::vector<size_t>> &all_dst_offsets,
-    const std::vector<std::vector<size_t>> &all_src_offsets,
-    const std::vector<std::vector<size_t>> &all_sizes, int32_t device_id,
-    const UUID &client_id) {
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
         LOG(ERROR) << "Failed to set context for physical device " << device_id;
-        return std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>(
+        return std::vector<
+            std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>(
             dummy_buffers.size(),
-            std::vector<tl::expected<int64_t, ErrorCode>>(
-                1, tl::unexpected(ErrorCode::INVALID_PARAMS)));
+            std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>(
+                1, std::vector<tl::expected<int64_t, ErrorCode>>(
+                       1, tl::unexpected(ErrorCode::INVALID_PARAMS))));
     }
 #endif
 
     const size_t buffer_count = dummy_buffers.size();
-    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>> results(
-        buffer_count);
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        results(buffer_count);
 
     if (buffer_count != all_keys.size() ||
         buffer_count != all_dst_offsets.size() ||
         buffer_count != all_src_offsets.size() ||
         buffer_count != all_sizes.size()) {
         LOG(ERROR) << "get_into_ranges_shm_helper: top-level size mismatch";
-        for (size_t i = 0; i < buffer_count; ++i) {
-            const size_t item_count =
-                i < all_keys.size() ? all_keys[i].size() : 1;
-            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
+        return build_ranged_read_internal_error_results(
+            buffer_count, all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     }
 
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        for (size_t i = 0; i < buffer_count; ++i) {
-            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                all_keys[i].size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        return results;
+        return build_ranged_read_internal_error_results(
+            buffer_count, all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     }
     std::vector<size_t> buffer_sizes(buffer_count, 0);
+    bool needs_dummy_capacity_scan = false;
     for (size_t i = 0; i < buffer_count; ++i) {
-        const size_t item_count = all_keys[i].size();
-        results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-            item_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+        const size_t key_count = all_keys[i].size();
+        results[i].resize(key_count);
 
-        if (item_count != all_dst_offsets[i].size() ||
-            item_count != all_src_offsets[i].size() ||
-            item_count != all_sizes[i].size()) {
-            LOG(ERROR)
-                << "get_into_ranges_shm_helper: size mismatch for buffer index "
-                << i;
+        if (key_count != all_dst_offsets[i].size() ||
+            key_count != all_src_offsets[i].size() ||
+            key_count != all_sizes[i].size()) {
+            LOG(ERROR) << "get_into_ranges_shm_helper: key-group size mismatch "
+                          "for buffer index "
+                       << i;
+            for (size_t j = 0; j < key_count; ++j) {
+                results[i][j] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                    1, tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
             continue;
         }
 
         size_t max_required = 0;
-        for (size_t j = 0; j < item_count; ++j) {
-            max_required =
-                std::max(max_required, all_dst_offsets[i][j] + all_sizes[i][j]);
+        for (size_t j = 0; j < key_count; ++j) {
+            const size_t fragment_count = all_dst_offsets[i][j].size();
+            results[i][j] = std::vector<tl::expected<int64_t, ErrorCode>>(
+                fragment_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+
+            if (fragment_count != all_src_offsets[i][j].size() ||
+                fragment_count != all_sizes[i][j].size()) {
+                LOG(ERROR) << "get_into_ranges_shm_helper: fragment size "
+                              "mismatch, buffer_index="
+                           << i << " key_index=" << j;
+                continue;
+            }
+
+            for (size_t k = 0; k < fragment_count; ++k) {
+                const size_t dst_offset = all_dst_offsets[i][j][k];
+                const size_t fragment_size = all_sizes[i][j][k];
+                if (dst_offset >
+                    std::numeric_limits<size_t>::max() - fragment_size) {
+                    LOG(ERROR)
+                        << "get_into_ranges_shm_helper: destination "
+                           "range overflow, buffer_index="
+                        << i << " key_index=" << j << " fragment_index=" << k;
+                    continue;
+                }
+                needs_dummy_capacity_scan = true;
+                max_required =
+                    std::max(max_required, dst_offset + fragment_size);
+            }
         }
         buffer_sizes[i] = max_required;
+    }
+
+    if (!needs_dummy_capacity_scan) {
+        return results;
     }
 
     auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
         it->second, dummy_buffers, buffer_sizes, client_id);
     if (!real_buffers_result) {
         for (size_t i = 0; i < buffer_count; ++i) {
-            results[i] = std::vector<tl::expected<int64_t, ErrorCode>>(
-                all_keys[i].size(),
-                tl::unexpected(real_buffers_result.error()));
+            const size_t key_count = all_keys[i].size();
+            results[i] =
+                std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>(
+                    key_count,
+                    std::vector<tl::expected<int64_t, ErrorCode>>(
+                        1, tl::unexpected(real_buffers_result.error())));
         }
         return results;
     }

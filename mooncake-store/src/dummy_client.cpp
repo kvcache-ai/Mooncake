@@ -766,45 +766,28 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     return to_py_ret(*result);
 }
 
-std::vector<std::vector<int64_t>> DummyClient::get_into_ranges(
+std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<void*>& buffers,
     const std::vector<std::vector<std::string>>& all_keys,
-    const std::vector<std::vector<size_t>>& all_dst_offsets,
-    const std::vector<std::vector<size_t>>& all_src_offsets,
-    const std::vector<std::vector<size_t>>& all_sizes) {
+    const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes) {
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
     auto internal_results =
         invoke_rpc<&RealClient::get_into_ranges_shm_helper,
-                   std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>(
+                   std::vector<std::vector<
+                       std::vector<tl::expected<int64_t, ErrorCode>>>>>(
             dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
             all_sizes, device_id_, client_id_);
 
-    const size_t buffer_count = buffers.size();
-    std::vector<std::vector<int64_t>> results;
-    results.reserve(buffer_count);
     if (!internal_results) {
         LOG(ERROR) << "get_into_ranges RPC failed";
-        for (size_t i = 0; i < buffer_count; ++i) {
-            const size_t item_count =
-                i < all_keys.size() ? all_keys[i].size() : 1;
-            results.emplace_back(
-                item_count,
-                static_cast<int64_t>(toInt(internal_results.error())));
-        }
-        return results;
+        return build_ranged_read_error_results(buffers.size(), all_keys,
+                                               all_dst_offsets,
+                                               internal_results.error());
     }
 
-    const auto& nested_results = internal_results.value();
-    for (const auto& row : nested_results) {
-        std::vector<int64_t> converted;
-        converted.reserve(row.size());
-        for (const auto& result : row) {
-            converted.push_back(to_py_ret(result));
-        }
-        results.emplace_back(std::move(converted));
-    }
-
-    return results;
+    return convert_ranged_read_results(internal_results.value());
 }
 
 std::string DummyClient::get_hostname() const {

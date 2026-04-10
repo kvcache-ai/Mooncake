@@ -110,12 +110,13 @@ class RealClient : public PyClient {
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
-    std::vector<std::vector<int64_t>> get_into_ranges(
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
-        const std::vector<std::vector<size_t>> &all_dst_offsets,
-        const std::vector<std::vector<size_t>> &all_src_offsets,
-        const std::vector<std::vector<size_t>> &all_sizes) override;
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
+        override;
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -433,14 +434,14 @@ class RealClient : public PyClient {
         const std::string &key, uint64_t buffer, size_t dst_offset,
         size_t src_offset, size_t size, const UUID &client_id);
 
-    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
         const std::vector<uint64_t> &dummy_buffers,
         const std::vector<std::vector<std::string>> &all_keys,
-        const std::vector<std::vector<size_t>> &all_dst_offsets,
-        const std::vector<std::vector<size_t>> &all_src_offsets,
-        const std::vector<std::vector<size_t>> &all_sizes, int32_t device_id,
-        const UUID &client_id);
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        int32_t device_id, const UUID &client_id);
 
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
@@ -518,13 +519,13 @@ class RealClient : public PyClient {
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
 
-    std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
-        const std::vector<std::vector<size_t>> &all_dst_offsets,
-        const std::vector<std::vector<size_t>> &all_src_offsets,
-        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
