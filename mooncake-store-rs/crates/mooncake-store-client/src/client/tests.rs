@@ -1190,6 +1190,120 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
 }
 
 #[test]
+fn routed_put_reuses_live_client_snapshot_for_placement() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let storage_transport = Arc::new(TestTransport::new("storage-placement-cache-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("writer-placement-cache-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "storage-placement-cache")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-placement-cache")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let before = metadata.list_live_clients_calls();
+    writer
+        .put_in_tenant("tenant-a", "placement-cache-a", b"alpha")
+        .expect("first put should succeed");
+    let after_first = metadata.list_live_clients_calls();
+
+    writer
+        .put_in_tenant("tenant-a", "placement-cache-b", b"beta")
+        .expect("second put should succeed");
+    let after_second = metadata.list_live_clients_calls();
+
+    assert!(after_first > before);
+    assert_eq!(
+        after_second, after_first,
+        "steady-state routed put should reuse the client live snapshot"
+    );
+}
+
+#[test]
+fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let storage_transport = Arc::new(TestTransport::new("storage-batch-placement-cache-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("writer-batch-placement-cache-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "storage-batch-placement-cache")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-batch-placement-cache")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let before = metadata.list_live_clients_calls();
+    writer
+        .batch_put(&[
+            PutRequest::new("placement-batch-a", b"alpha").tenant("tenant-a"),
+            PutRequest::new("placement-batch-b", b"bravo").tenant("tenant-a"),
+        ])
+        .expect("first batch put should succeed");
+    let after_first = metadata.list_live_clients_calls();
+
+    writer
+        .batch_put(&[
+            PutRequest::new("placement-batch-c", b"charlie").tenant("tenant-a"),
+            PutRequest::new("placement-batch-d", b"delta").tenant("tenant-a"),
+        ])
+        .expect("second batch put should succeed");
+    let after_second = metadata.list_live_clients_calls();
+
+    assert!(after_first > before);
+    assert_eq!(
+        after_second, after_first,
+        "steady-state routed batch put should reuse the client live snapshot"
+    );
+}
+
+#[test]
 fn singleton_control_plane_paths_use_stream_sessions() {
     let metadata = Arc::new(NoHotPathMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),

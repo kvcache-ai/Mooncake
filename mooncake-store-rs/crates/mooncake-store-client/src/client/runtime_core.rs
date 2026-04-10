@@ -108,6 +108,40 @@ impl StoreClient {
             .collect())
     }
 
+    pub(crate) fn placement_candidates_snapshot(
+        &self,
+        scope_label_key: &str,
+        required_labels: &BTreeMap<String, String>,
+        force_refresh: bool,
+    ) -> Result<Vec<ClientLease>> {
+        let scope = self.lease.endpoints.labels.get(scope_label_key).cloned();
+        let mut candidates = self
+            .compatible_live_clients(force_refresh)?
+            .into_iter()
+            .filter(|lease| lease.state == ClientLifecycleState::Active)
+            .filter(|lease| {
+                scope.as_ref().is_none_or(|scope| {
+                    lease
+                        .endpoints
+                        .labels
+                        .get(scope_label_key)
+                        .is_some_and(|value| value == scope)
+                })
+            })
+            .filter(|lease| {
+                required_labels.iter().all(|(key, value)| {
+                    lease
+                        .endpoints
+                        .labels
+                        .get(key)
+                        .is_some_and(|candidate| candidate == value)
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.runtime.cmp(&right.runtime));
+        Ok(candidates)
+    }
+
     fn lookup_runtime_lease_once(
         &self,
         runtime: &ClientRuntimeId,
