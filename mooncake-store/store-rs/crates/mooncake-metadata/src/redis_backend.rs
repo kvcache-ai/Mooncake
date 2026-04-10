@@ -5,7 +5,7 @@ use mooncake_store_core::{
     MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
     SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
-use redis::{Commands, Script};
+use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
 
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
@@ -231,8 +231,12 @@ pub struct RedisMetadataBackend {
 
 impl RedisMetadataBackend {
     pub fn new(config: RedisMetadataConfig) -> Result<Self> {
-        let route_namespace = format!("redis://{}#{}", config.url, config.keyspace.prefix());
-        let client = redis::Client::open(config.url.as_str())
+        let route_namespace = format!(
+            "redis://{}#{}",
+            redacted_route_namespace_source(&config.url),
+            config.keyspace.prefix()
+        );
+        let client = redis::Client::open(redis_connection_info(&config.url)?)
             .map_err(|error| metadata_error("redis client open", error))?;
         Ok(Self {
             client,
@@ -294,6 +298,44 @@ impl RedisMetadataBackend {
                 ],
             )
             .map_err(|error| metadata_error("redis hset segment state", error))
+    }
+}
+
+fn redis_connection_info(url: &str) -> Result<ConnectionInfo> {
+    let mut info = url
+        .to_string()
+        .into_connection_info()
+        .map_err(|error| metadata_error("redis connection info", error))?;
+    apply_redis_auth_env(&mut info.redis);
+    Ok(info)
+}
+
+fn apply_redis_auth_env(info: &mut RedisConnectionInfo) {
+    if info.username.is_some() || info.password.is_some() {
+        return;
+    }
+
+    let password = std::env::var("MC_REDIS_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let Some(password) = password else {
+        return;
+    };
+
+    info.password = Some(password);
+    info.username = std::env::var("MC_REDIS_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty());
+}
+
+fn redacted_route_namespace_source(url: &str) -> String {
+    match redis::parse_redis_url(url) {
+        Some(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        None => url.to_string(),
     }
 }
 
@@ -580,6 +622,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -590,7 +633,10 @@ mod tests {
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
     };
 
-    use super::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
+    use super::{
+        redacted_route_namespace_source, redis_connection_info, MetadataKeyspace,
+        RedisMetadataBackend, RedisMetadataConfig,
+    };
 
     struct RedisTestServer {
         child: Child,
@@ -697,6 +743,13 @@ mod tests {
                 priority: 1,
             }],
         }
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock should not be poisoned")
     }
 
     #[test]
@@ -842,6 +895,56 @@ mod tests {
                 .get_handoff(&handoff.stable_id)
                 .expect("handoff get should succeed"),
             Some(handoff)
+        );
+    }
+
+    #[test]
+    fn redis_connection_info_injects_env_auth_when_url_has_no_credentials() {
+        let _guard = env_lock();
+        std::env::set_var("MC_REDIS_USERNAME", "cloud-user");
+        std::env::set_var("MC_REDIS_PASSWORD", "cloud-pass");
+
+        let info = redis_connection_info("redis://127.0.0.1:6379/7")
+            .expect("redis connection info should parse");
+        assert_eq!(info.redis.username.as_deref(), Some("cloud-user"));
+        assert_eq!(info.redis.password.as_deref(), Some("cloud-pass"));
+        assert_eq!(info.redis.db, 7);
+
+        std::env::remove_var("MC_REDIS_USERNAME");
+        std::env::remove_var("MC_REDIS_PASSWORD");
+    }
+
+    #[test]
+    fn redis_connection_info_prefers_explicit_url_credentials() {
+        let _guard = env_lock();
+        std::env::set_var("MC_REDIS_USERNAME", "env-user");
+        std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
+
+        let info = redis_connection_info("redis://url-user:url-pass@127.0.0.1:6379/3")
+            .expect("redis connection info should parse");
+        assert_eq!(info.redis.username.as_deref(), Some("url-user"));
+        assert_eq!(info.redis.password.as_deref(), Some("url-pass"));
+        assert_eq!(info.redis.db, 3);
+
+        std::env::remove_var("MC_REDIS_USERNAME");
+        std::env::remove_var("MC_REDIS_PASSWORD");
+    }
+
+    #[test]
+    fn route_namespace_redacts_url_credentials() {
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new("redis://user:secret@127.0.0.1:6379/0")
+                .keyspace(MetadataKeyspace::new("test/redacted")),
+        )
+        .expect("redis backend should initialize");
+
+        let namespace = backend.route_namespace();
+        assert!(namespace.contains("127.0.0.1:6379/0"));
+        assert!(namespace.contains("test/redacted"));
+        assert!(!namespace.contains("user:secret"));
+        assert_eq!(
+            redacted_route_namespace_source("redis://user:secret@127.0.0.1:6379/0"),
+            "redis://127.0.0.1:6379/0".to_string()
         );
     }
 }

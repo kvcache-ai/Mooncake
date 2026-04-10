@@ -149,6 +149,7 @@ The Python compatibility layer accepts metadata URLs:
 Notes:
 
 - HTTP metadata endpoints are not supported
+- Redis store metadata accepts URL-embedded credentials or `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`
 - when store metadata uses etcd, TENT metadata still needs Redis
 - set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint
 
@@ -191,6 +192,8 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_METRICS_ADDR` | e2e and applications | bind address for the in-process metrics server |
 | `MC_STORE_RS_REDIS_URL` | Rust e2e | metadata Redis URL |
 | `MC_STORE_RS_REDIS_PORT` | local scripts and e2e | local Redis port |
+| `MC_REDIS_USERNAME` | Redis metadata backends and TENT Redis plugin | optional Redis ACL username |
+| `MC_REDIS_PASSWORD` | Redis metadata backends and TENT Redis plugin | optional Redis password; enables auth when set |
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
 | `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
