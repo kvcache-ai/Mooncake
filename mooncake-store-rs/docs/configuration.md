@@ -115,7 +115,7 @@ The runtime and examples use these conventions:
 
 | Key | Purpose |
 |-----|---------|
-| `storage` | opt a client into routed placement candidate sets |
+| `storage` | opt a client into routed placement candidate sets and enable local CLOCK eviction when it owns storage memory |
 | `pool` | default placement scope label |
 | `route_scope` | optional route-authority scope |
 

@@ -36,6 +36,7 @@ After installation:
 - `MooncakeHostMemAllocator` for caller-owned registered buffers
 - real and dummy execution modes for Mooncake / HiCache-style integration
 - batch I/O, registered-buffer I/O, and multi-buffer I/O
+- the same storage-owner CLOCK eviction and route-owner CAS reclaim as Rust callers
 - route query, lifecycle, and metrics helpers
 - wheel packaging for the native extension plus the bundled runtime libraries
 
@@ -51,6 +52,7 @@ This mode:
 
 - constructs a Rust `StoreClient`
 - registers local memory and participates in route / allocator control plane RPC
+- participates in the same hit-report and replica-route tracking RPC used by Rust clients
 - supports routed writes, replication policy, segment lifecycle, metrics, and tracing
 - is the normal path for Python clients that should behave like store-rs nodes
 
@@ -66,6 +68,8 @@ This mode:
 - is the compatibility path used by the HiCache dummy flow
 
 Dummy mode is intentionally narrower than real mode. It exists to preserve compatibility for callers that expect the old dummy client / standalone server split.
+
+The standalone server behind dummy mode still uses the same Rust runtime internally, so route publication, reclaim, eviction, tracing, and metrics stay aligned with the real path.
 
 ## Build From a Checkout
 
@@ -150,6 +154,11 @@ Useful flags:
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
 - `--client-server-address host:port` to expose the standalone compatibility server for dummy clients
 - `--use-hugepage` and `--hugepage-size 2MB|1GB` to enable hugepage-backed local memory
+
+Role reminder:
+
+- use `--label storage=true` on storage nodes that should accept routed placement and run local CLOCK eviction
+- use `--label storage=false` on routed rw nodes that should place remotely without owning local storage
 
 ## Basic Real-Mode Example
 

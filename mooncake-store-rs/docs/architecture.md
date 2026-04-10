@@ -17,6 +17,7 @@ This document describes the runtime architecture implemented in `mooncake-store-
 | `StoreClient` | User-facing API, local state, batching, reclaim scheduling | Yes |
 | `RouteDirectory` | Route lookup and route CAS | Yes |
 | `ControlPlaneClient` | Peer-to-peer route and allocator RPC | Yes |
+| `StorageOwnerState` | Local replica tracking, CLOCK eviction, route-aware reclaim | Yes on storage nodes |
 | `MetadataBackend` | Leases, segments, fallback route persistence | No for default route lookups |
 | `TentEngine` / `TentTransportFactory` | Data transfer and remote segment access | Yes |
 | `LocalAllocatorState` | Local segment reservation and release | Yes for local storage |
@@ -27,16 +28,21 @@ graph LR
     B --> C["RouteDirectory"]
     B --> D["Allocator"]
     B --> E["ControlPlaneClient"]
+    B --> J["StorageOwnerState"]
     B --> F["TentEngine / Transport"]
     C --> G["MetadataBackend"]
     D --> G
+    J --> C
+    J --> D
     E --> H["Peer client control plane"]
+    E --> J
     F --> I["Peer client segment"]
 
     style B fill:#e3f2fd
     style C fill:#e8f5e9
     style D fill:#fff3e0
     style E fill:#ede7f6
+    style J fill:#fce4ec
     style G fill:#f3e5f5
 ```
 
@@ -87,6 +93,7 @@ sequenceDiagram
     participant Client as StoreClient
     participant Route as RouteDirectory
     participant Alloc as Allocator/ControlPlane
+    participant Evict as Storage Owner State
     participant Peer as Remote Storage Client
     participant TE as TE/TENT
 
@@ -98,6 +105,8 @@ sequenceDiagram
     TE-->>Peer: transfer payload
     Client->>Route: publish ObjectRoute
     Route-->>Client: route version / CAS result
+    Client->>Evict: track local replicas
+    Client->>Peer: batch track remote replica routes (best effort)
 ```
 
 ### Placement rules
@@ -113,6 +122,17 @@ The current implementation supports:
 
 The default request policy prefers local storage when available. When local capacity is insufficient, the client allocates on remote storage nodes selected by the planner and the replication policy.
 
+### Remote storage-owner tracking
+
+Route publication and eviction are intentionally decoupled across two owners:
+
+- the route owner is responsible for the authoritative object route version
+- the storage owner is responsible for the actual bytes and local capacity
+
+After a write publishes a route, the writer groups replicas by remote storage owner and sends the published routes through `BatchTrackReplicaRoutes`.
+
+This lets each storage owner update its local eviction clock from the published route directly, instead of rebuilding state from metadata during normal write traffic.
+
 ## Read Path
 
 For reads, the client first resolves the object route, then groups reads by remote segment and submits transfer requests through TE/TENT.
@@ -122,6 +142,7 @@ sequenceDiagram
     participant App
     participant Client as StoreClient
     participant Route as RouteDirectory
+    participant Evict as Storage Owner State
     participant TE as TE/TENT
     participant Peer as Remote Storage Client
 
@@ -131,6 +152,8 @@ sequenceDiagram
     Client->>TE: open segment and submit read batch
     TE-->>Peer: fetch bytes
     TE-->>Client: completion status
+    Client->>Evict: mark local hits
+    Client->>Peer: batch report remote hits (best effort)
     Client-->>App: value or copied buffer
 ```
 
@@ -141,13 +164,22 @@ The read path supports:
 - multi-buffer reads for fragmented targets
 - registered-buffer reads for reduced copy overhead
 
+### Read-hit reporting
+
+Successful reads update eviction heat at the storage owner:
+
+- local hits are reported directly into the local `StorageOwnerState`
+- remote hits are grouped by replica owner and sent through `BatchReportRouteHits`
+
+Hit reporting is best-effort. It improves eviction quality but is not part of correctness.
+
 ## Allocation and Reclaim
 
 Allocation is split by storage ownership.
 
 - local allocations use `LocalAllocatorState`
 - remote allocations use control-plane RPC to the owning client
-- metadata allocation remains the fallback when allocator RPC is unavailable
+- metadata allocation remains the fallback only when allocator RPC is unavailable because of transport or unsupported-endpoint failures
 
 Local memory supports two backing strategies:
 
@@ -163,14 +195,47 @@ Reclaim is explicit and route-aware.
 - `reclaim_grace_ms` controls delayed release behavior
 - remote release uses batched allocator RPC
 
+### Storage-owner CLOCK with route-owner CAS
+
+Capacity pressure is resolved by the storage owner, but correctness is still enforced by the route owner.
+
+```mermaid
+sequenceDiagram
+    participant Client as StoreClient
+    participant Alloc as LocalAllocatorState
+    participant Evict as StorageOwnerState
+    participant Route as RouteDirectory
+
+    Client->>Alloc: reserve local space
+    Alloc-->>Client: Allocator error
+    Client->>Evict: evict_one(preferred_segment?)
+    Evict->>Evict: pick CLOCK victim
+    Evict->>Route: CAS route without victim replica
+    Route-->>Evict: applied / current route
+    Evict->>Alloc: release victim bytes after CAS success
+    Evict-->>Client: reclaimed or exhausted
+    Client->>Alloc: retry reservation
+```
+
+The important invariants are:
+
+- a replica is never released before its route entry is removed
+- a failed CAS refreshes local eviction state instead of guessing
+- a storage owner can rebuild its CLOCK from route state if best-effort tracking falls behind
+- local CLOCK eviction is enabled only on clients labeled `storage=true`
+- routed writers without local storage keep the spill-remote behavior
+
+Remote allocator RPC follows the same pattern on the storage owner side. A live remote storage owner returns a real allocator error when it still cannot free capacity. The caller does not silently downgrade that case to metadata allocation.
+
 ## Control Plane
 
 The control plane is implemented with protobuf and tonic.
 
-It handles two categories of RPC:
+It handles three categories of RPC:
 
 - route RPC: batch get, compare-and-swap, replace
 - allocator RPC: batch reserve any, reserve specific, release
+- eviction RPC: batch report route hits, batch track replica routes
 
 Single-item calls are intentionally folded into the batch path so that the implementation can reuse streaming sessions and keep the control-plane logic uniform.
 
@@ -222,6 +287,12 @@ Examples include:
 - control-plane batch operations
 - bytes in and bytes out
 - accumulated latency and max latency
+
+The same tracker framework also covers eviction-related work such as:
+
+- storage-owner eviction attempts
+- route-hit reporting RPC
+- replica-route tracking RPC
 
 ### Tracing
 

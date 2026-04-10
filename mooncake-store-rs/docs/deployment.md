@@ -197,6 +197,12 @@ Typical settings:
 - `register_local_memory()` after `build(...)`
 - optional hugepage-backed local memory through `LocalMemoryConfig`
 
+Operational behavior:
+
+- `storage=true` opts the client into routed placement candidate sets
+- the same label also enables local storage-owner CLOCK eviction when reservation pressure appears
+- writers publish remote replica routes back to the storage owner automatically, so eviction does not need metadata scans on the hot path
+
 ### Routed writer
 
 A routed writer accepts write requests and places replicas onto storage nodes selected by `PlacementPlanner`.
@@ -206,6 +212,12 @@ Typical settings:
 - `label("storage", "false")`
 - `routed_writes(planner, replica_count)`
 - local memory for scratch space and optional local placement
+
+Operational behavior:
+
+- routed writers can run with `storage_bytes=0` in inference/storage split deployments
+- when they do not own storage, they do not run local CLOCK eviction
+- remote placement still benefits from remote storage-owner eviction and route tracking
 
 ### Reader or stateless client
 
@@ -258,7 +270,8 @@ This is the default mode.
 - route ownership is selected on the client with weighted rendezvous hashing
 - the client prewarms a live-client membership snapshot during `build(...)`
 - background membership sync refreshes that snapshot after startup
-- normal route reads and compare-and-swap stay off the metadata hot path
+- route reads and CAS stay off the metadata hot path in steady state
+- storage owners manage local eviction separately from route ownership
 - metadata remains the fallback when authority RPC is unavailable
 
 ### `MetadataOnly`
