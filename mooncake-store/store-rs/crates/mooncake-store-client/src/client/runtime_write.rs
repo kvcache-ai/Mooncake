@@ -552,6 +552,7 @@ impl StoreClient {
         {
             match cas_result {
                 Ok(cas) if cas.applied => {
+                    self.storage_owner.track_route(&pending.route);
                     if let Some(previous) = pending.previous.as_ref() {
                         self.schedule_route_reclaim(previous)?;
                     }
@@ -578,6 +579,7 @@ impl StoreClient {
                 }
             }
         }
+        self.track_remote_storage_owners_best_effort(&published);
         if let Some(error) = first_error {
             return Err(error);
         }

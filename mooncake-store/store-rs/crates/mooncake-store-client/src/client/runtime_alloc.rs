@@ -112,7 +112,7 @@ impl StoreClient {
                         {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
-                                Err(error) => {
+                                Err(error) if should_fallback_to_metadata_allocator(&error) => {
                                     debug!(
                                         storage_runtime = %storage_runtime,
                                         error = %error,
@@ -130,6 +130,10 @@ impl StoreClient {
                                             continue;
                                         }
                                     }
+                                }
+                                Err(error) => {
+                                    resolved[index] = Some(Err(error));
+                                    continue;
                                 }
                             };
                             resolved[index] = Some(Ok((
@@ -198,7 +202,7 @@ impl StoreClient {
                         {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
-                                Err(error) => {
+                                Err(error) if should_fallback_to_metadata_allocator(&error) => {
                                     debug!(
                                         storage_runtime = %storage_runtime,
                                         segment = %request.segment_name.0,
@@ -217,6 +221,10 @@ impl StoreClient {
                                             continue;
                                         }
                                     }
+                                }
+                                Err(error) => {
+                                    resolved[index] = Some(Err(error));
+                                    continue;
                                 }
                             };
                             resolved[index] = Some(Ok((
@@ -426,6 +434,7 @@ impl StoreClient {
     }
 
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
+        self.storage_owner.untrack_route(route);
         let grace_ms = self.local_memory.reclaim_grace_ms;
         if grace_ms == 0 {
             return self.release_route_allocations(route);
@@ -546,6 +555,7 @@ impl StoreClient {
     }
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {
+        self.storage_owner.untrack_route(route);
         let releases = route
             .replicas
             .iter()

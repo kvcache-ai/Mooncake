@@ -10,10 +10,18 @@ impl ControlPlaneClient {
                 StoreError::Transport(format!("control plane runtime init failed: {error}"))
             })?;
         Ok(Self {
-            runtime,
+            runtime: Mutex::new(Some(runtime)),
             channels: Mutex::new(BTreeMap::new()),
             streams: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    fn with_runtime<T>(&self, f: impl FnOnce(&Runtime) -> T) -> T {
+        let runtime = self.runtime.lock();
+        let runtime = runtime
+            .as_ref()
+            .expect("control plane runtime should remain available while client is alive");
+        f(runtime)
     }
 
     pub(crate) fn batch_get_routes(
@@ -329,6 +337,127 @@ impl ControlPlaneClient {
         result
     }
 
+    pub(crate) fn batch_report_route_hits(
+        &self,
+        lease: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_eviction_batch_report_route_hits");
+        let result = (|| {
+            if keys.is_empty() {
+                return Ok(0);
+            }
+            let request = pb::BatchReportRouteHitsRequest {
+                keys: keys.iter().map(|key| key.0.clone()).collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::EvictionReportRouteHits(
+                    request.clone(),
+                )),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::EvictionReportRouteHits(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_report_route_hits reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_report_route_hits reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return Ok(reply.accepted as usize);
+                }
+                Err(error) => {
+                    warn!(
+                        items = keys.len(),
+                        error = %error,
+                        "control stream batch_report_route_hits failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let channel = self.channel_for(lease)?;
+            let reply =
+                self.rpc(
+                    |mut client| async move {
+                        client.batch_report_route_hits(Request::new(request)).await
+                    },
+                    channel,
+                )?;
+            decode_error(reply.error)?;
+            Ok(reply.accepted as usize)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn batch_track_replica_routes(
+        &self,
+        lease: &ClientLease,
+        routes: &[ObjectRoute],
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_eviction_batch_track_replica_routes");
+        let result = (|| {
+            if routes.is_empty() {
+                return Ok(0);
+            }
+            let request = pb::BatchTrackReplicaRoutesRequest {
+                routes: routes.iter().map(pb_object_route).collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(
+                    pb::control_stream_request::Body::EvictionTrackReplicaRoutes(request.clone()),
+                ),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::EvictionTrackReplicaRoutes(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_track_replica_routes reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_track_replica_routes reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return Ok(reply.accepted as usize);
+                }
+                Err(error) => {
+                    warn!(
+                        items = routes.len(),
+                        error = %error,
+                        "control stream batch_track_replica_routes failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                |mut client| async move {
+                    client
+                        .batch_track_replica_routes(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            decode_error(reply.error)?;
+            Ok(reply.accepted as usize)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
     pub(crate) fn reserve_any(
         &self,
         lease: &ClientLease,
@@ -638,24 +767,26 @@ impl ControlPlaneClient {
         }
 
         let channel = self.channel_for(lease)?;
-        let session = self.runtime.block_on(async move {
-            let (sender, receiver) = mpsc::channel(128);
-            let outbound = ReceiverStream::new(receiver);
-            let mut client =
-                pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
-            let inbound = client
-                .control_stream(Request::new(outbound))
-                .await
-                .map(Response::into_inner)
-                .map_err(status_to_store_error)?;
-            let session = Arc::new(ControlStreamSession {
-                sender,
-                pending: Arc::new(Mutex::new(BTreeMap::new())),
-                next_request_id: AtomicU64::new(1),
-                closed: AtomicBool::new(false),
-            });
-            spawn_stream_reader(session.clone(), inbound);
-            Ok::<_, StoreError>(session)
+        let session = self.with_runtime(|runtime| {
+            runtime.block_on(async move {
+                let (sender, receiver) = mpsc::channel(128);
+                let outbound = ReceiverStream::new(receiver);
+                let mut client =
+                    pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+                let inbound = client
+                    .control_stream(Request::new(outbound))
+                    .await
+                    .map(Response::into_inner)
+                    .map_err(status_to_store_error)?;
+                let session = Arc::new(ControlStreamSession {
+                    sender,
+                    pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    next_request_id: AtomicU64::new(1),
+                    closed: AtomicBool::new(false),
+                });
+                spawn_stream_reader(session.clone(), inbound);
+                Ok::<_, StoreError>(session)
+            })
         })?;
         self.streams
             .lock()
@@ -682,8 +813,7 @@ impl ControlPlaneClient {
             let request = build(request_id);
             let sender = session.sender.clone();
             let send_result = self
-                .runtime
-                .block_on(async move { sender.send(request).await })
+                .with_runtime(|runtime| runtime.block_on(async move { sender.send(request).await }))
                 .map_err(|error| {
                     StoreError::Transport(format!("control stream send failed: {error}"))
                 });
@@ -701,9 +831,11 @@ impl ControlPlaneClient {
                 last_error = Some(error);
                 continue;
             }
-            let reply = self.runtime.block_on(rx).map_err(|_| {
-                StoreError::Transport("control stream response channel closed".to_string())
-            })?;
+            let reply = self
+                .with_runtime(|runtime| runtime.block_on(rx))
+                .map_err(|_| {
+                    StoreError::Transport("control stream response channel closed".to_string())
+                })?;
             match reply {
                 Ok(reply) => return Ok(reply),
                 Err(error) => {
@@ -737,11 +869,13 @@ impl ControlPlaneClient {
             })?
             .connect_timeout(CONNECT_TIMEOUT)
             .tcp_nodelay(true);
-        let channel = self.runtime.block_on(endpoint.connect()).map_err(|error| {
-            StoreError::Transport(format!(
-                "control plane connect to {address} failed: {error}"
-            ))
-        })?;
+        let channel = self
+            .with_runtime(|runtime| runtime.block_on(endpoint.connect()))
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "control plane connect to {address} failed: {error}"
+                ))
+            })?;
         debug!(address, "opened new control plane channel");
         self.channels.lock().insert(address, channel.clone());
         Ok(channel)
@@ -753,9 +887,10 @@ impl ControlPlaneClient {
         Fut: std::future::Future<Output = std::result::Result<Response<T>, Status>>,
     {
         let client = pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
-        self.runtime
-            .block_on(async move { f(client).await.map(Response::into_inner) })
-            .map_err(status_to_store_error)
+        self.with_runtime(|runtime| {
+            runtime.block_on(async move { f(client).await.map(Response::into_inner) })
+        })
+        .map_err(status_to_store_error)
     }
 
     pub(crate) fn clear_channels(&self) {
@@ -767,6 +902,14 @@ impl ControlPlaneClient {
     #[allow(dead_code)]
     pub(crate) fn active_stream_sessions(&self) -> usize {
         self.streams.lock().len()
+    }
+}
+
+impl Drop for ControlPlaneClient {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.get_mut().take() {
+            runtime.shutdown_background();
+        }
     }
 }
 

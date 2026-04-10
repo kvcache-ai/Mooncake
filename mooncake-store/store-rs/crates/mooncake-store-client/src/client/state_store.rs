@@ -135,3 +135,330 @@ impl StoreState {
         ready
     }
 }
+
+impl StorageOwnerState {
+    fn new(
+        runtime: ClientRuntimeId,
+        observer: ClientLease,
+        metadata: Arc<dyn MetadataBackend>,
+        route_directory: Arc<dyn RouteDirectory>,
+        allocator: Arc<Mutex<LocalAllocatorState>>,
+    ) -> Self {
+        Self {
+            runtime,
+            observer,
+            metadata,
+            route_directory,
+            allocator,
+            clock: Mutex::new(StorageClockState::default()),
+        }
+    }
+
+    fn report_route_hits(&self, keys: &[ObjectKey]) -> usize {
+        self.clock.lock().mark_hot_keys(keys);
+        keys.len()
+    }
+
+    fn track_routes(&self, routes: &[ObjectRoute]) -> usize {
+        let mut clock = self.clock.lock();
+        for route in routes {
+            clock.sync_route(route, &self.runtime);
+        }
+        routes.len()
+    }
+
+    fn track_route(&self, route: &ObjectRoute) {
+        self.clock.lock().track_route(route, &self.runtime);
+    }
+
+    fn untrack_route(&self, route: &ObjectRoute) {
+        self.clock.lock().untrack_route(route, &self.runtime);
+    }
+
+    fn sync_route(&self, route: &ObjectRoute) {
+        self.clock.lock().sync_route(route, &self.runtime);
+    }
+
+    fn evict_one(self: &Arc<Self>, preferred_segment: Option<&SegmentName>) -> Result<bool> {
+        let preferred_segment = preferred_segment.cloned();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let storage_owner = Arc::clone(self);
+            let thread = std::thread::Builder::new()
+                .name(format!("mooncake-storage-owner-evict-{}", self.runtime.stable_id.0))
+                .spawn(move || storage_owner.evict_one_blocking(preferred_segment.as_ref()))
+                .map_err(|error| {
+                    StoreError::Transport(format!(
+                        "failed to spawn storage-owner eviction worker: {error}"
+                    ))
+                })?;
+            return thread.join().map_err(|_| {
+                StoreError::Transport("storage-owner eviction worker panicked".to_string())
+            })?;
+        }
+        self.evict_one_blocking(preferred_segment.as_ref())
+    }
+
+    fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
+        let tracker = OperationTracker::new("storage_owner_evict_one");
+        let result = (|| {
+            for rebuild in 0..=1usize {
+                let budget = {
+                    let clock = self.clock.lock();
+                    clock.eviction_budget()
+                };
+                for _ in 0..budget.max(1) {
+                    let victim = {
+                        let mut clock = self.clock.lock();
+                        clock.pick_victim(preferred_segment)
+                    };
+                    let Some(victim) = victim else {
+                        break;
+                    };
+                    if self.evict_candidate(&victim)? {
+                        return Ok(true);
+                    }
+                }
+                if rebuild == 0 {
+                    self.rebuild_clock()?;
+                }
+            }
+            Ok(false)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
+        let Some(route) = self
+            .route_directory
+            .get_object_route(&self.observer, &victim.route_key)?
+        else {
+            self.clock.lock().remove_id(victim);
+            return Ok(false);
+        };
+        if route.state != RouteState::Active {
+            self.clock.lock().remove_id(victim);
+            return Ok(false);
+        }
+        let Some(replica_index) = route.replicas.iter().position(|replica| {
+            replica.owner == self.runtime
+                && replica.segment_name == victim.segment_name
+                && replica.segment_offset == victim.segment_offset
+        }) else {
+            self.sync_route(&route);
+            return Ok(false);
+        };
+
+        let evicted_replica = route.replicas[replica_index].clone();
+        let next = if route.replicas.len() == 1 {
+            None
+        } else {
+            let mut replicas = route.replicas.clone();
+            replicas.remove(replica_index);
+            replicas.sort_by_key(|replica| replica.priority);
+            for (priority, replica) in replicas.iter_mut().enumerate() {
+                replica.priority = priority as u16;
+            }
+            Some(ObjectRoute {
+                key: route.key.clone(),
+                version: route.version.next(),
+                state: route.state,
+                compatibility: route.compatibility.clone(),
+                replicas,
+            })
+        };
+
+        let cas = self.route_directory.compare_and_swap_object_route(
+            &self.observer,
+            &route.key,
+            Some(route.version),
+            next.as_ref(),
+        )?;
+        if !cas.applied {
+            match cas.current.as_ref() {
+                Some(current) => self.sync_route(current),
+                None => self.clock.lock().remove_id(victim),
+            }
+            return Ok(false);
+        }
+
+        self.clock.lock().remove_id(victim);
+        self.allocator.lock().release(
+            &self.runtime,
+            &evicted_replica.segment_name,
+            evicted_replica.segment_offset,
+            evicted_replica.length,
+        )?;
+        if let Some(next_route) = next.as_ref() {
+            self.sync_route(next_route);
+        }
+        debug!(
+            runtime = %self.runtime,
+            key = %route.key.0,
+            segment = %evicted_replica.segment_name.0,
+            offset_bytes = evicted_replica.segment_offset,
+            length_bytes = evicted_replica.length,
+            "storage-owner evicted replica via route-owner cas"
+        );
+        Ok(true)
+    }
+
+    fn rebuild_clock(&self) -> Result<()> {
+        let tracker = OperationTracker::new("storage_owner_rebuild_clock");
+        let result = (|| {
+            let routes = self.collect_routes_by_replica_owner(&self.runtime)?;
+            let pending_hot_keys = self.clock.lock().pending_hot_keys.clone();
+            let mut clock = StorageClockState::default();
+            clock.pending_hot_keys = pending_hot_keys;
+            for route in &routes {
+                clock.track_route(route, &self.runtime);
+            }
+            *self.clock.lock() = clock;
+            debug!(
+                runtime = %self.runtime,
+                routes = routes.len(),
+                "storage-owner rebuilt eviction clock"
+            );
+            Ok(())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
+        let mut routes = BTreeMap::new();
+        for route in self.metadata.list_object_routes()? {
+            if route.replicas.iter().any(|replica| replica.owner == *owner) {
+                Self::insert_latest_route(&mut routes, route);
+            }
+        }
+        Ok(routes.into_values().collect())
+    }
+
+    fn insert_latest_route(routes: &mut BTreeMap<String, ObjectRoute>, route: ObjectRoute) {
+        match routes.get(&route.key.0) {
+            Some(current) if current.version >= route.version => {}
+            _ => {
+                routes.insert(route.key.0.clone(), route);
+            }
+        }
+    }
+}
+
+impl StorageClockState {
+    fn eviction_budget(&self) -> usize {
+        self.entries.len().saturating_mul(2)
+    }
+
+    fn track_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        for replica in route.replicas.iter().filter(|replica| replica.owner == *runtime) {
+            self.upsert_replica(route, replica);
+        }
+    }
+
+    fn untrack_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        for replica in route.replicas.iter().filter(|replica| replica.owner == *runtime) {
+            self.remove_id(&ClockEntryId {
+                route_key: route.key.clone(),
+                segment_name: replica.segment_name.clone(),
+                segment_offset: replica.segment_offset,
+            });
+        }
+    }
+
+    fn sync_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        self.remove_key(&route.key);
+        self.track_route(route, runtime);
+    }
+
+    fn mark_hot_keys(&mut self, keys: &[ObjectKey]) {
+        let mut slots = Vec::new();
+        for key in keys {
+            self.pending_hot_keys.insert(key.clone());
+            if let Some(indices) = self.by_key.get(key) {
+                slots.extend(indices.iter().copied());
+            }
+        }
+        for index in slots {
+            if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
+                entry.hot = true;
+            }
+        }
+    }
+
+    fn pick_victim(&mut self, preferred_segment: Option<&SegmentName>) -> Option<ClockEntryId> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let limit = self.eviction_budget().max(1);
+        for _ in 0..limit {
+            let index = self.hand % self.entries.len();
+            self.hand = (self.hand + 1) % self.entries.len();
+            let Some(entry) = self.entries[index].as_mut() else {
+                continue;
+            };
+            if preferred_segment.is_some_and(|segment| entry.id.segment_name != *segment) {
+                continue;
+            }
+            if entry.hot {
+                entry.hot = false;
+                continue;
+            }
+            return Some(entry.id.clone());
+        }
+        None
+    }
+
+    fn upsert_replica(&mut self, route: &ObjectRoute, replica: &ReplicaRoute) {
+        let id = ClockEntryId {
+            route_key: route.key.clone(),
+            segment_name: replica.segment_name.clone(),
+            segment_offset: replica.segment_offset,
+        };
+        if let Some(index) = self.by_id.get(&id).copied() {
+            if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
+                entry.length_bytes = replica.length;
+            }
+            return;
+        }
+        let entry = ClockEntry {
+            id: id.clone(),
+            length_bytes: replica.length,
+            hot: self.pending_hot_keys.contains(&route.key),
+        };
+        let index = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(self.entries.len());
+        if index == self.entries.len() {
+            self.entries.push(Some(entry));
+        } else {
+            self.entries[index] = Some(entry);
+        }
+        self.by_id.insert(id.clone(), index);
+        self.by_key.entry(id.route_key).or_default().push(index);
+    }
+
+    fn remove_key(&mut self, key: &ObjectKey) {
+        let indices = self.by_key.remove(key).unwrap_or_default();
+        for index in indices {
+            if let Some(entry) = self.entries.get_mut(index).and_then(Option::take) {
+                self.by_id.remove(&entry.id);
+            }
+        }
+    }
+
+    fn remove_id(&mut self, id: &ClockEntryId) {
+        let Some(index) = self.by_id.remove(id) else {
+            return;
+        };
+        self.entries[index] = None;
+        if let Some(indices) = self.by_key.get_mut(&id.route_key) {
+            indices.retain(|candidate| *candidate != index);
+            if indices.is_empty() {
+                self.by_key.remove(&id.route_key);
+            }
+        }
+    }
+}

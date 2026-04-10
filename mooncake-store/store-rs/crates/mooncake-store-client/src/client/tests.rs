@@ -21,14 +21,15 @@ use parking_lot::Mutex;
 
 use super::{
     align_up_u64, compatibility_matches, control_bind_host, copy_into_region, flatten_slices,
-    now_ms, record_success_metric, scatter_into_buffers, LocalAllocatorAdapter,
+    now_ms, record_success_metric, scatter_into_buffers, LiveClientCache, LocalAllocatorAdapter,
     LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget,
-    SegmentAllocator, StoreState,
+    SegmentAllocator, StorageOwnerState, StoreState,
 };
 use crate::{
-    control_plane::{AllocatorService, AuthorityService, ReleaseOp},
+    control_plane::{AllocatorService, AuthorityService, ControlPlaneClient, ReleaseOp},
     memory::RegionAllocation,
     render_prometheus_metrics, reset_metrics,
+    route_directory::build_route_directory,
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
@@ -646,6 +647,36 @@ fn rw_only_config() -> LocalMemoryConfig {
 
 fn fast_live_client_sync_interval() -> Duration {
     Duration::from_millis(25)
+}
+
+fn test_storage_owner_state(
+    runtime: &ClientRuntimeId,
+    allocator: Arc<Mutex<LocalAllocatorState>>,
+) -> Arc<StorageOwnerState> {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let live_client_cache = Arc::new(Mutex::new(LiveClientCache::default()));
+    let control_client = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+    let lease = ClientLease {
+        runtime: runtime.clone(),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: 10_000,
+    };
+    let route_directory = build_route_directory(
+        RouteControlMode::MetadataOnly,
+        metadata.clone(),
+        &lease,
+        control_client.clone(),
+        live_client_cache.clone(),
+    );
+    Arc::new(StorageOwnerState::new(
+        runtime.clone(),
+        lease,
+        metadata,
+        route_directory,
+        allocator,
+    ))
 }
 
 fn publish_storage_node(
@@ -3018,6 +3049,161 @@ fn default_put_spills_to_remote_after_local_capacity_is_exhausted() {
 }
 
 #[test]
+fn storage_owner_clock_evicts_cold_local_replicas_before_hot_ones() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("clock-local-segment"));
+    let client = StoreClientBuilder::new(metadata, "clock-local")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(10_000)
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let hot = b"0123456789abcdef";
+    let cold = b"fedcba9876543210";
+    let fresh = b"abcdefghijklmnop";
+
+    client
+        .put("clock-hot", hot)
+        .expect("hot put should succeed");
+    client
+        .put("clock-cold", cold)
+        .expect("cold put should succeed");
+    assert_eq!(
+        client.get("clock-hot").expect("hot get should succeed"),
+        hot
+    );
+
+    let route = client
+        .put("clock-fresh", fresh)
+        .expect("fresh put should trigger eviction and succeed");
+    assert_eq!(route.replicas[0].owner, client.runtime_id().clone());
+    assert!(client
+        .query_route("clock-hot")
+        .expect("hot route query should succeed")
+        .is_some());
+    assert!(client
+        .query_route("clock-fresh")
+        .expect("fresh route query should succeed")
+        .is_some());
+    assert!(client
+        .query_route("clock-cold")
+        .expect("cold route query should succeed")
+        .is_none());
+    assert_eq!(
+        client
+            .get("clock-hot")
+            .expect("hot get should still succeed"),
+        hot
+    );
+    assert_eq!(
+        client
+            .get("clock-fresh")
+            .expect("fresh get should still succeed"),
+        fresh
+    );
+    assert!(matches!(
+        client.get("clock-cold"),
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+#[test]
+fn remote_hit_reports_drive_storage_owner_clock_eviction() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("clock-remote-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("clock-remote-router-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "clock-remote-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(10_000)
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let router = StoreClientBuilder::new(metadata.clone(), "clock-remote-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("router build should succeed");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    let hot = b"0123456789abcdef";
+    let cold = b"fedcba9876543210";
+    let fresh = b"abcdefghijklmnop";
+
+    let hot_route = router
+        .put("remote-clock-hot", hot)
+        .expect("hot put should succeed");
+    let cold_route = router
+        .put("remote-clock-cold", cold)
+        .expect("cold put should succeed");
+    assert_eq!(hot_route.replicas[0].owner, storage.runtime_id().clone());
+    assert_eq!(cold_route.replicas[0].owner, storage.runtime_id().clone());
+    assert_eq!(
+        router
+            .get("remote-clock-hot")
+            .expect("remote hot get should succeed"),
+        hot
+    );
+
+    let fresh_route = router
+        .put("remote-clock-fresh", fresh)
+        .expect("fresh put should trigger remote eviction and succeed");
+    assert_eq!(fresh_route.replicas[0].owner, storage.runtime_id().clone());
+    assert!(router
+        .query_route("remote-clock-hot")
+        .expect("hot route query should succeed")
+        .is_some());
+    assert!(router
+        .query_route("remote-clock-fresh")
+        .expect("fresh route query should succeed")
+        .is_some());
+    assert!(router
+        .query_route("remote-clock-cold")
+        .expect("cold route query should succeed")
+        .is_none());
+    assert_eq!(
+        router
+            .get("remote-clock-hot")
+            .expect("hot object should survive eviction"),
+        hot
+    );
+    assert_eq!(
+        router
+            .get("remote-clock-fresh")
+            .expect("fresh object should be readable"),
+        fresh
+    );
+    assert!(matches!(
+        router.get("remote-clock-cold"),
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+#[test]
 fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-prefer-segment"));
@@ -3740,6 +3926,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
     let local_allocator = LocalAllocatorAdapter {
         runtime: client.runtime_id().clone(),
         allocator: client.allocator.clone(),
+        storage_owner: client.storage_owner.clone(),
     };
     let primary = client.segment_name().expect("primary segment should exist");
     let single_reservation = local_allocator
@@ -4423,6 +4610,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     let adapter = LocalAllocatorAdapter {
         runtime: owner.clone(),
         allocator: shared_allocator.clone(),
+        storage_owner: test_storage_owner_state(&owner, shared_allocator.clone()),
     };
     let wrong_owner = ClientRuntimeId::new("other", ClientEpoch(9));
     assert!(matches!(

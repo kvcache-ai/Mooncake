@@ -89,6 +89,63 @@ impl AuthorityService for LocalAuthorityAdapter {
 struct LocalAllocatorAdapter {
     runtime: ClientRuntimeId,
     allocator: Arc<Mutex<LocalAllocatorState>>,
+    storage_owner: Arc<StorageOwnerState>,
+}
+
+impl LocalAllocatorAdapter {
+    fn reserve_any_with_eviction(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let mut last_error = None;
+        for _ in 0..=32usize {
+            match self.allocator.lock().reserve_any(owner, length_bytes) {
+                Ok(reservation) => return Ok(reservation),
+                Err(StoreError::Allocator(message)) => {
+                    last_error = Some(message);
+                }
+                Err(error) => return Err(error),
+            }
+            if !self.storage_owner.evict_one(None)? {
+                break;
+            }
+        }
+        Err(StoreError::Allocator(last_error.unwrap_or_else(|| {
+            format!("no writable active segment available for {}", owner)
+        })))
+    }
+
+    fn reserve_specific_with_eviction(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let mut last_error = None;
+        for _ in 0..=32usize {
+            match self
+                .allocator
+                .lock()
+                .reserve_specific(owner, segment_name, length_bytes)
+            {
+                Ok(reservation) => return Ok(reservation),
+                Err(StoreError::Allocator(message)) => {
+                    last_error = Some(message);
+                }
+                Err(error) => return Err(error),
+            }
+            if !self.storage_owner.evict_one(Some(segment_name))? {
+                break;
+            }
+        }
+        Err(StoreError::Allocator(last_error.unwrap_or_else(|| {
+            format!(
+                "segment capacity exhausted for {}:{} requested={}",
+                owner, segment_name.0, length_bytes
+            )
+        })))
+    }
 }
 
 impl AllocatorService for LocalAllocatorAdapter {
@@ -103,7 +160,7 @@ impl AllocatorService for LocalAllocatorAdapter {
                 owner, self.runtime
             )));
         }
-        self.allocator.lock().reserve_any(owner, length_bytes)
+        self.reserve_any_with_eviction(owner, length_bytes)
     }
 
     fn reserve_specific(
@@ -118,9 +175,7 @@ impl AllocatorService for LocalAllocatorAdapter {
                 owner, self.runtime
             )));
         }
-        self.allocator
-            .lock()
-            .reserve_specific(owner, segment_name, length_bytes)
+        self.reserve_specific_with_eviction(owner, segment_name, length_bytes)
     }
 
     fn release(
@@ -157,10 +212,9 @@ impl AllocatorService for LocalAllocatorAdapter {
                 })
                 .collect();
         }
-        let mut allocator = self.allocator.lock();
         length_bytes
             .iter()
-            .map(|length_bytes| allocator.reserve_any(owner, *length_bytes))
+            .map(|length_bytes| self.reserve_any_with_eviction(owner, *length_bytes))
             .collect()
     }
 
@@ -180,11 +234,10 @@ impl AllocatorService for LocalAllocatorAdapter {
                 })
                 .collect();
         }
-        let mut allocator = self.allocator.lock();
         requests
             .iter()
             .map(|request| {
-                allocator.reserve_specific(owner, &request.segment_name, request.length_bytes)
+                self.reserve_specific_with_eviction(owner, &request.segment_name, request.length_bytes)
             })
             .collect()
     }
@@ -216,3 +269,12 @@ impl AllocatorService for LocalAllocatorAdapter {
     }
 }
 
+impl EvictionService for LocalAllocatorAdapter {
+    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<usize> {
+        Ok(self.storage_owner.report_route_hits(keys))
+    }
+
+    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<usize> {
+        Ok(self.storage_owner.track_routes(routes))
+    }
+}

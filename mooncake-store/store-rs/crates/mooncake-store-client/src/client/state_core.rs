@@ -39,6 +39,38 @@ struct StoreState {
     next_local_segment_id: u64,
 }
 
+struct StorageOwnerState {
+    runtime: ClientRuntimeId,
+    observer: ClientLease,
+    metadata: Arc<dyn MetadataBackend>,
+    route_directory: Arc<dyn RouteDirectory>,
+    allocator: Arc<Mutex<LocalAllocatorState>>,
+    clock: Mutex<StorageClockState>,
+}
+
+#[derive(Default)]
+struct StorageClockState {
+    entries: Vec<Option<ClockEntry>>,
+    by_id: BTreeMap<ClockEntryId, usize>,
+    by_key: BTreeMap<ObjectKey, Vec<usize>>,
+    pending_hot_keys: BTreeSet<ObjectKey>,
+    hand: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ClockEntryId {
+    route_key: ObjectKey,
+    segment_name: SegmentName,
+    segment_offset: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ClockEntry {
+    id: ClockEntryId,
+    length_bytes: u64,
+    hot: bool,
+}
+
 #[derive(Default)]
 struct LocalAllocatorState {
     segments: BTreeMap<SegmentName, SegmentAllocator>,

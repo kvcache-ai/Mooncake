@@ -159,6 +159,12 @@ pub(crate) trait AllocatorService: Send + Sync {
     }
 }
 
+pub(crate) trait EvictionService: Send + Sync {
+    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<usize>;
+
+    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<usize>;
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ReserveSpecificOp {
     pub segment_name: SegmentName,
@@ -173,7 +179,7 @@ pub(crate) struct ReleaseOp {
 }
 
 pub(crate) struct ControlPlaneClient {
-    runtime: Runtime,
+    runtime: Mutex<Option<Runtime>>,
     channels: Mutex<BTreeMap<String, Channel>>,
     streams: Mutex<BTreeMap<String, Arc<ControlStreamSession>>>,
 }
