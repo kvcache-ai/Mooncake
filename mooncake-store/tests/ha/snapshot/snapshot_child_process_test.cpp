@@ -1,6 +1,11 @@
 #include "master_service.h"
 #include "master_metric_manager.h"
+#include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "ha/oplog/etcd_oplog_store.h"
+#endif
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -63,7 +68,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Create a default service with snapshot_restore enabled (backend
     // initialized)
-    void CreateDefaultService() {
+    void CreateDefaultService(ViewVersionId view_version = 0) {
         auto config = MasterServiceConfigBuilder()
                           .set_enable_snapshot(false)
                           .set_enable_snapshot_restore(true)
@@ -72,9 +77,32 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_child_timeout_seconds(60)
                           .set_snapshot_retention_count(3)
                           .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
                           .build();
         service_ = std::make_unique<MasterService>(config);
     }
+
+#ifdef STORE_USE_ETCD
+    void CreateEtcdHASnapshotService(const std::string& cluster_id,
+                                     const std::string& etcd_endpoints,
+                                     ViewVersionId view_version) {
+        auto config = MasterServiceConfigBuilder()
+                          .set_enable_snapshot(false)
+                          .set_enable_snapshot_restore(true)
+                          .set_enable_ha(true)
+                          .set_ha_backend_type("etcd")
+                          .set_ha_backend_connstring(etcd_endpoints)
+                          .set_cluster_id(cluster_id)
+                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                          .set_snapshot_interval_seconds(100)
+                          .set_snapshot_child_timeout_seconds(60)
+                          .set_snapshot_retention_count(3)
+                          .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
+                          .build();
+        service_ = std::make_unique<MasterService>(config);
+    }
+#endif
 
     // Helper wrappers for private methods (friend access)
     std::string CallFormatTimestamp(
@@ -107,9 +135,18 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return service_->snapshot_object_store_.get();
     }
 
+    ha::SnapshotCatalogStore* GetSnapshotCatalogStore() {
+        return service_->snapshot_catalog_store_.get();
+    }
+
     tl::expected<void, SerializationError> CallPersistState(
         const std::string& snapshot_id) {
         return service_->PersistState(snapshot_id);
+    }
+
+    tl::expected<void, SerializationError> CallPersistState(
+        const ha::SnapshotDescriptor& descriptor) {
+        return service_->PersistState(descriptor);
     }
 
     bool GetUseSnapshotBackupDir() {
@@ -217,7 +254,8 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
     auto* backend = GetSnapshotObjectStore();
     ASSERT_NE(backend, nullptr);
 
-    // Create 5 fake snapshot directories with timestamp-like names
+    // Create 5 fake snapshots with valid catalog descriptors so cleanup sees
+    // the same metadata shape as production snapshots.
     std::vector<std::string> snapshot_ids = {
         "20240101_000000_000", "20240102_000000_000", "20240103_000000_000",
         "20240104_000000_000", "20240105_000000_000"};
@@ -228,6 +266,15 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
         std::string manifest_key =
             "mooncake_master_snapshot/" + id + "/manifest.txt";
         backend->UploadString(manifest_key, "messagepack|1.0.0|" + id);
+
+        auto descriptor =
+            ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(id);
+        auto descriptor_payload =
+            ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
+                descriptor);
+        auto descriptor_key =
+            ha::snapshot_catalog_store_detail::BuildDescriptorKey(id);
+        backend->UploadString(descriptor_key, descriptor_payload);
     }
 
     // Keep only 2, cleanup with current snapshot_id = last one
@@ -294,6 +341,133 @@ TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
     EXPECT_TRUE(found) << "Snapshot thread should have generated latest.txt at "
                        << latest_path;
 }
+
+TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {
+    constexpr ViewVersionId kViewVersion = 37;
+    const std::string snapshot_id = "20240601_120000_123";
+    CreateDefaultService(kViewVersion);
+
+    auto before_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    auto persist_result = CallPersistState(snapshot_id);
+    auto after_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().snapshot_id, snapshot_id);
+    EXPECT_EQ(latest->value().manifest_key,
+              "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt");
+    EXPECT_EQ(latest->value().object_prefix,
+              "mooncake_master_snapshot/" + snapshot_id + "/");
+    EXPECT_EQ(latest->value().last_included_seq, 0u);
+    EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
+    const auto created_at_ms = latest->value().created_at_ms;
+    EXPECT_GE(created_at_ms, before_ms);
+    EXPECT_LE(created_at_ms, after_ms);
+}
+
+TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
+    const std::string snapshot_id = "20240601_120000_124";
+    CreateDefaultService();
+
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
+    descriptor.last_included_seq = 123;
+    descriptor.producer_view_version = 41;
+    descriptor.manifest_key =
+        "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
+    descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    descriptor.created_at_ms = 1717243200123;
+
+    auto persist_result = CallPersistState(descriptor);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().snapshot_id, descriptor.snapshot_id);
+    EXPECT_EQ(latest->value().manifest_key, descriptor.manifest_key);
+    EXPECT_EQ(latest->value().object_prefix, descriptor.object_prefix);
+    EXPECT_EQ(latest->value().last_included_seq, descriptor.last_included_seq);
+    EXPECT_EQ(latest->value().producer_view_version,
+              descriptor.producer_view_version);
+    EXPECT_EQ(latest->value().created_at_ms, descriptor.created_at_ms);
+}
+
+TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
+    MasterConfig legacy_config;
+    legacy_config.enable_ha = true;
+    legacy_config.ha_backend_type = "etcd";
+    legacy_config.ha_backend_connstring.clear();
+    legacy_config.etcd_endpoints = "127.0.0.1:2379";
+
+    WrappedMasterServiceConfig wrapped_config(legacy_config, 11);
+    EXPECT_EQ(wrapped_config.ha_backend_connstring,
+              legacy_config.etcd_endpoints);
+
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(service_config.ha_backend_connstring,
+              legacy_config.etcd_endpoints);
+}
+
+#ifdef STORE_USE_ETCD
+TEST_F(SnapshotChildProcessTest,
+       PersistState_UsesEtcdOplogBoundaryInSnapshotDescriptor) {
+    const std::string etcd_endpoints = "127.0.0.1:2379";
+    auto connect_err =
+        EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
+    if (connect_err != ErrorCode::OK) {
+        GTEST_SKIP() << "etcd is unavailable: " << toString(connect_err);
+    }
+
+    const std::string cluster_id =
+        "snapshot-descriptor-" + UuidToString(generate_uuid());
+    constexpr ViewVersionId kViewVersion = 19;
+    constexpr uint64_t kLatestSequenceId = 123;
+    const std::string snapshot_id = "20240601_120000_456";
+
+    EtcdOpLogStore oplog_store(cluster_id);
+    auto init_err = oplog_store.Init();
+    if (init_err != ErrorCode::OK) {
+        GTEST_SKIP() << "failed to initialize etcd oplog store: "
+                     << toString(init_err);
+    }
+
+    auto update_err = oplog_store.UpdateLatestSequenceId(kLatestSequenceId);
+    if (update_err != ErrorCode::OK) {
+        GTEST_SKIP() << "failed to update etcd latest sequence id: "
+                     << toString(update_err);
+    }
+
+    CreateEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
+    auto persist_result = CallPersistState(snapshot_id);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().last_included_seq, kLatestSequenceId);
+    EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
+    EXPECT_GT(latest->value().created_at_ms, 0);
+}
+#endif
 
 // ========== Snapshot Backup Dir ==========
 
@@ -372,6 +546,80 @@ TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
         << "No restore backup directory should exist when backup_dir is empty";
 
     restore_service.reset();
+}
+
+TEST_F(SnapshotChildProcessTest,
+       RestoreFallsBackToPreviousHealthySnapshotWhenLatestIsCorrupted) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_fallback_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value())
+        << "MountSegment failed";
+
+    const std::string key1 = "restore_fallback_key_1";
+    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put1.has_value()) << "PutStart for key1 failed";
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value())
+        << "PutEnd for key1 failed";
+    EXPECT_TRUE(service_->ExistKey(key1).value_or(false))
+        << "ExistKey should refresh lease for key1 before snapshot1";
+
+    const std::string snapshot_id1 = "20240702_120000_000";
+    auto persist_result = CallPersistState(snapshot_id1);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState for snapshot1 failed: "
+        << persist_result.error().message;
+
+    const std::string key2 = "restore_fallback_key_2";
+    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put2.has_value()) << "PutStart for key2 failed";
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value())
+        << "PutEnd for key2 failed";
+    EXPECT_TRUE(service_->ExistKey(key2).value_or(false))
+        << "ExistKey should refresh lease for key2 before snapshot2";
+
+    const std::string snapshot_id2 = "20240702_120500_000";
+    persist_result = CallPersistState(snapshot_id2);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState for snapshot2 failed: "
+        << persist_result.error().message;
+
+    const fs::path corrupted_metadata = fs::path(tmp_dir()) /
+                                        "mooncake_master_snapshot" /
+                                        snapshot_id2 / "metadata";
+    std::ofstream corrupt_stream(corrupted_metadata, std::ios::binary);
+    ASSERT_TRUE(corrupt_stream.is_open())
+        << "Failed to corrupt latest snapshot metadata";
+    corrupt_stream << "corrupted-snapshot-payload";
+    corrupt_stream.close();
+
+    service_.reset();
+
+    auto restore_config = MasterServiceConfigBuilder()
+                              .set_enable_snapshot(false)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                              .set_snapshot_interval_seconds(100)
+                              .set_snapshot_child_timeout_seconds(60)
+                              .set_snapshot_retention_count(3)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+
+    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false))
+        << "Restore should fall back to the previous healthy snapshot";
+    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false))
+        << "Corrupted latest snapshot must not be partially restored";
+
+    restored_service.reset();
 }
 
 // ========== Environment Variable Tests ==========

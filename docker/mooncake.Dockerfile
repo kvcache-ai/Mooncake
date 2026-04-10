@@ -12,6 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 ARG PYTHON_VERSION=3.10
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
 ARG EP_TORCH_VERSIONS="2.9.1"
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
@@ -22,18 +23,25 @@ ENV PYTHON_VERSION=${PYTHON_VERSION} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     PATH="/usr/local/go/bin:${PATH}"
 
-# Install base build utilities and python bindings
+# Install base build utilities and the requested Python version via deadsnakes PPA
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
         ninja-build \
-        python3 \
-        python3-dev \
-        python3-pip \
-        python-is-python3 \
+        software-properties-common \
         pkg-config && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv && \
+    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -52,6 +60,7 @@ RUN mkdir -p build && \
         -DUSE_CUDA=ON \
         -DWITH_EP=ON \
         -DSTORE_USE_ETCD=ON \
+        -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
     cmake --build .
@@ -76,11 +85,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install runtime dependencies required by Mooncake
+# Inherit build-args so the runtime stage installs the matching interpreter
+ARG PYTHON_VERSION=3.10
+ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+# Install runtime dependencies and the requested Python version
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
+        ca-certificates \
+        curl \
+        software-properties-common \
         ibverbs-providers \
         rdma-core \
         libibverbs1 \
@@ -89,10 +104,18 @@ RUN apt-get update && \
         liburing2 \
         libyaml-0-2 \
         libcurl4 && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} && \
+    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    apt-get purge -y --auto-remove software-properties-common curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-RUN python3 -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
+RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]

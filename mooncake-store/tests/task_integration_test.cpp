@@ -2,11 +2,17 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <csignal>
 #include <memory>
 #include <string>
 #include <thread>
 #include <chrono>
 #include <vector>
+
+#include <ylt/coro_http/coro_http_client.hpp>
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
+#include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "client_service.h"
 #include "master_client.h"
@@ -25,6 +31,65 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 
 namespace mooncake {
 namespace testing {
+
+namespace {
+
+struct HttpCreateDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    std::string status;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
+         error_message);
+
+struct HttpQueryDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    int32_t type{0};
+    std::string type_name;
+    int32_t status{0};
+    std::string status_name;
+    int64_t created_at_ms_epoch{0};
+    int64_t last_updated_at_ms_epoch{0};
+    std::vector<std::string> segments;
+    uint64_t succeeded_units{0};
+    uint64_t failed_units{0};
+    uint64_t blocked_units{0};
+    uint64_t active_units{0};
+    uint64_t migrated_bytes{0};
+    std::string message;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
+         status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
+         succeeded_units, failed_units, blocked_units, active_units,
+         migrated_bytes, message, error_code, error_message);
+
+struct HttpSegmentStatusResponse {
+    bool success{false};
+    std::string segment;
+    int32_t status{0};
+    std::string status_name;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
+         error_code, error_message);
+
+tl::expected<std::string, int> HttpPostJson(const std::string& url,
+                                            const std::string& body) {
+    coro_http::coro_http_client client;
+    auto response = client.post(url, body, coro_http::req_content_type::json);
+    if (response.status != 200) {
+        return tl::unexpected(response.status);
+    }
+    return std::string(response.resp_body);
+}
+
+}  // namespace
 
 class TaskExecutorIntegrationTest : public ::testing::Test {
    protected:
@@ -161,6 +226,69 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
                 if (task_response.status == TaskStatus::SUCCESS ||
                     task_response.status == TaskStatus::FAILED) {
                     return task_response.status == TaskStatus::SUCCESS;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
+    tl::expected<HttpCreateDrainJobResponse, int> CreateDrainJobViaHttp(
+        const CreateDrainJobRequest& request) {
+        std::string body;
+        struct_json::to_json(request, body);
+        auto response = HttpPostJson(
+            master_.http_metrics_base() + "/api/v1/drain_jobs", body);
+        if (!response.has_value()) {
+            return tl::unexpected(response.error());
+        }
+
+        HttpCreateDrainJobResponse parsed;
+        struct_json::from_json(parsed, response.value());
+        return parsed;
+    }
+
+    tl::expected<HttpQueryDrainJobResponse, int> QueryDrainJobViaHttp(
+        const std::string& job_id) {
+        auto response = httpGet(master_.http_metrics_base() +
+                                "/api/v1/drain_jobs/query?job_id=" + job_id);
+        if (!response.has_value()) {
+            return tl::unexpected(response.error());
+        }
+
+        HttpQueryDrainJobResponse parsed;
+        struct_json::from_json(parsed, response.value());
+        return parsed;
+    }
+
+    tl::expected<HttpSegmentStatusResponse, int> QuerySegmentStatusViaHttp(
+        const std::string& segment_name) {
+        auto response =
+            httpGet(master_.http_metrics_base() +
+                    "/api/v1/segments/status?segment=" + segment_name);
+        if (!response.has_value()) {
+            return tl::unexpected(response.error());
+        }
+
+        HttpSegmentStatusResponse parsed;
+        struct_json::from_json(parsed, response.value());
+        return parsed;
+    }
+
+    bool WaitForJobCompletionViaHttp(
+        const std::string& job_id, HttpQueryDrainJobResponse* final_job,
+        std::chrono::seconds timeout = std::chrono::seconds(30)) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            auto query_result = QueryDrainJobViaHttp(job_id);
+            if (query_result.has_value()) {
+                if (query_result->status_name == "SUCCEEDED" ||
+                    query_result->status_name == "FAILED" ||
+                    query_result->status_name == "CANCELED") {
+                    if (final_job != nullptr) {
+                        *final_job = query_result.value();
+                    }
+                    return query_result->status_name == "SUCCEEDED";
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -405,6 +533,197 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
 }
 
 // Test copy to multiple target segments
+TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
+    const std::string source_segment = "127.0.0.1:18001";
+    const std::string target_segment = "127.0.0.1:18002";
+    const auto key_prefix =
+        "test_drain_job_key_" +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+
+    const auto make_payload = [](const std::string& prefix, size_t payload_size,
+                                 char fill) {
+        std::string payload = prefix;
+        if (payload.size() < payload_size) {
+            payload.resize(payload_size, fill);
+        }
+        return payload;
+    };
+
+    std::vector<std::pair<std::string, std::string>> preload_items;
+    std::vector<std::pair<std::string, std::string>> redirected_items;
+    for (int i = 0; i < 12; ++i) {
+        preload_items.emplace_back(
+            key_prefix + "_preload_" + std::to_string(i),
+            make_payload("preload-" + std::to_string(i) + "-", 128 * 1024,
+                         static_cast<char>('a' + (i % 26))));
+    }
+    for (int i = 0; i < 4; ++i) {
+        redirected_items.emplace_back(
+            key_prefix + "_redirect_" + std::to_string(i),
+            make_payload("redirect-" + std::to_string(i) + "-", 32 * 1024,
+                         static_cast<char>('A' + (i % 26))));
+    }
+
+    const auto put_to_preferred_segment =
+        [&](const std::string& key, const std::string& value,
+            const std::string& preferred_segment) {
+            std::vector<Slice> slices;
+            slices.emplace_back(const_cast<char*>(value.data()), value.size());
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.preferred_segment = preferred_segment;
+
+            auto put_result = client1_->Put(key, slices, config);
+            ASSERT_TRUE(put_result.has_value())
+                << "Failed to put key=" << key << ": "
+                << toString(put_result.error());
+        };
+
+    const auto query_segments =
+        [&](const std::string& key) -> std::vector<std::string> {
+        auto query_result = client2_->Query(key);
+        if (!query_result.has_value()) {
+            ADD_FAILURE() << "Failed to query key=" << key << ": "
+                          << toString(query_result.error());
+            return {};
+        }
+        std::vector<std::string> segments;
+        for (const auto& replica : query_result->replicas) {
+            if (!replica.is_memory_replica()) {
+                ADD_FAILURE() << "Expected memory replica for key=" << key;
+                return {};
+            }
+            segments.push_back(replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_);
+        }
+        return segments;
+    };
+
+    const auto wait_for_segments = [&](const std::string& key,
+                                       const std::string& required_segment,
+                                       const std::string& forbidden_segment) {
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        std::vector<std::string> last_segments;
+        while (std::chrono::steady_clock::now() < deadline) {
+            last_segments = query_segments(key);
+            bool has_required = false;
+            bool has_forbidden = false;
+            for (const auto& segment : last_segments) {
+                if (segment == required_segment) {
+                    has_required = true;
+                }
+                if (!forbidden_segment.empty() &&
+                    segment == forbidden_segment) {
+                    has_forbidden = true;
+                }
+            }
+            if (has_required && !has_forbidden) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        FAIL() << "Replica placement mismatch for key=" << key
+               << ", required_segment=" << required_segment
+               << ", forbidden_segment=" << forbidden_segment << ", last_seen="
+               << (last_segments.empty() ? std::string("<empty>")
+                                         : last_segments.front());
+    };
+
+    const auto assert_key_data = [&](const std::string& key,
+                                     const std::string& expected_value) {
+        std::vector<uint8_t> read_buffer(expected_value.size());
+        std::vector<Slice> read_slices;
+        read_slices.emplace_back(read_buffer.data(), read_buffer.size());
+
+        auto get_result = client2_->Get(key, read_slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Failed to get key=" << key << ": "
+            << toString(get_result.error());
+
+        std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
+                              expected_value.size());
+        ASSERT_EQ(read_data, expected_value) << "Data mismatch for key=" << key;
+    };
+
+    size_t expected_migrated_bytes = 0;
+    for (const auto& [key, value] : preload_items) {
+        put_to_preferred_segment(key, value, source_segment);
+        wait_for_segments(key, source_segment, "");
+        expected_migrated_bytes += value.size();
+    }
+
+    CreateDrainJobRequest request;
+    request.segments = {source_segment};
+    request.target_segments = {target_segment};
+    request.max_concurrency = 1;
+
+    auto create_job_result = CreateDrainJobViaHttp(request);
+    ASSERT_TRUE(create_job_result.has_value())
+        << "Failed to create drain job over HTTP, status="
+        << create_job_result.error();
+    ASSERT_TRUE(create_job_result->success)
+        << "Drain job create returned error: "
+        << create_job_result->error_message;
+    EXPECT_EQ(create_job_result->status, "CREATED");
+
+    auto draining_status = QuerySegmentStatusViaHttp(source_segment);
+    ASSERT_TRUE(draining_status.has_value())
+        << "Failed to query segment status over HTTP, status="
+        << draining_status.error();
+    EXPECT_TRUE(draining_status->success);
+    EXPECT_EQ(draining_status->status_name, "DRAINING");
+
+    for (const auto& [key, value] : redirected_items) {
+        put_to_preferred_segment(key, value, source_segment);
+        wait_for_segments(key, target_segment, source_segment);
+    }
+
+    HttpQueryDrainJobResponse final_job;
+    ASSERT_TRUE(
+        WaitForJobCompletionViaHttp(create_job_result->job_id, &final_job))
+        << "Drain job did not complete within timeout";
+
+    EXPECT_EQ(final_job.status_name, "SUCCEEDED");
+    EXPECT_EQ(final_job.active_units, 0u);
+    EXPECT_EQ(final_job.failed_units, 0u);
+    EXPECT_GE(final_job.succeeded_units, preload_items.size());
+    EXPECT_GE(final_job.migrated_bytes, expected_migrated_bytes);
+
+    auto drained_status = QuerySegmentStatusViaHttp(source_segment);
+    ASSERT_TRUE(drained_status.has_value())
+        << "Failed to query drained segment status over HTTP, status="
+        << drained_status.error();
+    EXPECT_TRUE(drained_status->success);
+    EXPECT_EQ(drained_status->status_name, "DRAINED");
+
+    for (const auto& [key, value] : preload_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
+    for (const auto& [key, value] : redirected_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
+
+    client1_.reset();
+    if (client1_segment_ptr_ != nullptr) {
+        free(client1_segment_ptr_);
+        client1_segment_ptr_ = nullptr;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    for (const auto& [key, value] : preload_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
+    for (const auto& [key, value] : redirected_items) {
+        wait_for_segments(key, target_segment, source_segment);
+        assert_key_data(key, value);
+    }
+}
+
 TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {
     // Step 1: Put data on client1
     std::string test_key =

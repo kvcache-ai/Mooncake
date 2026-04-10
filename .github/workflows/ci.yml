@@ -10,7 +10,6 @@ on:
 permissions:
   contents: read
   actions: write
-  statuses: write
 
 jobs:
   build:
@@ -154,6 +153,17 @@ jobs:
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+      shell: bash
+
+    - name: Drain HTTP E2E test
+      if: matrix.python-version == '3.12'
+      run: |
+        cd build
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        # Keep the sanitizer gate on the C++ integration test. The Python
+        # drain script is manual/nightly only because pybind + ASan teardown in
+        # a Python host process is not stable.
+        DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
       shell: bash
 
     - name: Generate coverage report
@@ -393,6 +403,18 @@ jobs:
         python scripts/test_copy_move_api.py
       shell: bash
 
+    - name: Run Python Drain HTTP E2E Test (CI check)
+      env:
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+        python scripts/test_drain_http_api.py --timeout-sec 90
+      shell: bash
+
     - name: Run RPC Communicator Bandwidth Test
       run: |
         source test_env/bin/activate
@@ -494,6 +516,9 @@ jobs:
         df -h
       shell: bash
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
@@ -528,9 +553,8 @@ jobs:
     - name: Configure project with unit tests and examples
       run: |
         cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON
       shell: bash
-      # TODO: lack WITH_RUST_EXAMPLE
 
     - name: Build project with unit tests and examples
       run: |
@@ -539,6 +563,14 @@ jobs:
         cd build
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    - name: Check Mooncake Store Rust bindings and example
+      run: |
+        cd mooncake-store/rust
+        MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
+        MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
+          cargo check --example basic_usage --tests
       shell: bash
 
     - name: Configure project
@@ -627,27 +659,6 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
-    - name: Set pending status for downstream tests
-      if: github.event_name == 'pull_request'
-      continue-on-error: true
-      uses: actions/github-script@v7
-      with:
-        script: |
-          const contexts = [
-            'CI Test on ASCEND / build-and-test',
-            'Integration test / test-sglang-integration'
-          ];
-          for (const ctx of contexts) {
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.pull_request.head.sha,
-              state: 'pending',
-              context: ctx,
-              description: 'Waiting for Build & Test to complete...',
-              target_url: 'https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId
-            });
-          }
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
     - name: Spell Check Repo
@@ -700,3 +711,66 @@ jobs:
         ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
 
+
+  check-paths:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      should-run-downstream: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            src:
+              - 'mooncake-*/**'
+              - 'extern/**'
+              - 'CMakeLists.txt'
+              - 'scripts/**'
+              - '.github/workflows/**'
+
+  ascend-test:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    uses: ./.github/workflows/ci_ascend.yml
+    secrets: inherit
+
+  integration-test:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.should-run-downstream == 'true'
+    uses: ./.github/workflows/integration-test.yml
+    secrets: inherit
+
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - spell-check
+      - clang-format
+      - build
+      - build-musa
+      - build-flags
+      - build-docker
+      - test-wheel-ubuntu
+      - ascend-test
+      - integration-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required job results
+        run: |
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[] |
+            select(.value.result != "success" and .value.result != "skipped") |
+            "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "::error::The following jobs failed or were cancelled:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All checks passed or were acceptably skipped."
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

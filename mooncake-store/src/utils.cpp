@@ -322,6 +322,40 @@ int getFreeTcpPort() {
     return port;
 }
 
+std::vector<int> getFreeTcpPorts(int count) {
+    std::vector<int> ports;
+    std::vector<int> sockets;
+    ports.reserve(count);
+    sockets.reserve(count);
+
+    for (int i = 0; i < count; ++i) {
+        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) break;
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(0);
+        if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
+            0) {
+            ::close(sock);
+            break;
+        }
+        socklen_t len = sizeof(addr);
+        if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) !=
+            0) {
+            ::close(sock);
+            break;
+        }
+        ports.push_back(ntohs(addr.sin_port));
+        sockets.push_back(sock);
+    }
+
+    for (int sock : sockets) {
+        ::close(sock);
+    }
+    return ports;
+}
+
 int64_t time_gen() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())

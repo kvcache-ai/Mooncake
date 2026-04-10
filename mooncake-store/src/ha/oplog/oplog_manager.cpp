@@ -1,20 +1,19 @@
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 #include <algorithm>
 #include <chrono>
 #include <xxhash.h>
 #include <glog/logging.h>
 
-#include "etcd_oplog_store.h"
+#include "ha/oplog/oplog_store.h"
 
 namespace mooncake {
 
 OpLogManager::OpLogManager() = default;
 
-void OpLogManager::SetEtcdOpLogStore(
-    std::shared_ptr<EtcdOpLogStore> etcd_oplog_store) {
+void OpLogManager::SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    etcd_oplog_store_ = etcd_oplog_store;
+    oplog_store_ = oplog_store;
 }
 
 uint64_t OpLogManager::Append(OpType type, const std::string& key,
@@ -45,17 +44,17 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
     // persistence; must release mutex_ to avoid blocking other Append calls
     // during the wait.  The caller relies on sync semantics to know the
     // entry is durable before freeing/reusing associated memory.
-    if (etcd_oplog_store_) {
+    if (oplog_store_) {
         bool sync = (type != OpType::PUT_END);
         if (sync) {
             // Release lock before the blocking wait to avoid holding
             // mutex_ for the entire etcd round-trip.
             lock.unlock();
         }
-        ErrorCode err = etcd_oplog_store_->WriteOpLog(entry, sync);
+        ErrorCode err = oplog_store_->WriteOpLog(entry, sync);
         if (err != ErrorCode::OK) {
-            LOG(WARNING) << "Failed to write OpLog to etcd, sequence_id=" << seq
-                         << ", but entry is in memory buffer";
+            LOG(WARNING) << "Failed to write OpLog to store, sequence_id="
+                         << seq << ", but entry is in memory buffer";
         }
     }
 
@@ -83,12 +82,12 @@ OpLogEntry OpLogManager::AllocateEntry(OpType type, const std::string& key,
     return entry;
 }
 
-ErrorCode OpLogManager::PersistEntryToEtcd(const OpLogEntry& entry) const {
+ErrorCode OpLogManager::PersistEntry(const OpLogEntry& entry) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    auto store = etcd_oplog_store_;
+    auto store = oplog_store_;
     lock.unlock();
     if (!store) {
-        return ErrorCode::ETCD_OPERATION_ERROR;
+        return ErrorCode::INTERNAL_ERROR;
     }
     // Strategy 2+: PUT_END is Async, REMOVE (and others) are Sync
     bool sync = (entry.op_type != OpType::PUT_END);
@@ -99,7 +98,7 @@ tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
     OpType type, const std::string& key, const std::string& payload) {
     // Seq pre-allocation semantics: allocate first, then persist.
     OpLogEntry entry = AllocateEntry(type, key, payload);
-    ErrorCode err = PersistEntryToEtcd(entry);
+    ErrorCode err = PersistEntry(entry);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -130,6 +129,14 @@ void OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
 size_t OpLogManager::GetEntryCount() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return buffer_.size();
+}
+
+ErrorCode OpLogManager::CleanupOpLogBefore(uint64_t before_sequence_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!oplog_store_) {
+        return ErrorCode::OK;
+    }
+    return oplog_store_->CleanupOpLogBefore(before_sequence_id);
 }
 
 uint64_t OpLogManager::NowMs() {

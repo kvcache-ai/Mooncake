@@ -215,10 +215,45 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
         // If the memory region is allocated using cuMemAlloc,
         // we cannot use cudaIpcGetMemHandle, so skip it
         if (options.type == MNNVL) return Status::OK();
+
+        // Resolve the true cudaMalloc base address. Caching allocators
+        // (e.g. PyTorch) sub-allocate tensors within larger cudaMalloc
+        // segments. cudaIpcGetMemHandle returns a handle for the whole
+        // segment, so we need to register at segment granularity.
+        CUdeviceptr base_ptr = 0;
+        size_t alloc_size = 0;
+        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
+                                               (CUdeviceptr)desc.addr);
+        if (cu_err != CUDA_SUCCESS) {
+            LOG(ERROR) << "NVLinkTransport: cuMemGetAddressRange failed for "
+                       << "addr 0x" << std::hex << desc.addr << std::dec
+                       << " (error " << cu_err << ")";
+            return Status::InternalError(
+                "cuMemGetAddressRange failed" LOC_MARK);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            if (registered_base_addrs_.count((uint64_t)base_ptr)) {
+                // Already registered this cudaMalloc block, just tag transport
+                desc.addr = (uint64_t)base_ptr;
+                desc.length = alloc_size;
+                desc.transports.push_back(TransportType::NVLINK);
+                return Status::OK();
+            }
+        }
+
         cudaIpcMemHandle_t handle;
-        CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void*)desc.addr));
+        CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void*)base_ptr));
+        desc.addr = (uint64_t)base_ptr;
+        desc.length = alloc_size;
         desc.shm_path =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            registered_base_addrs_.insert((uint64_t)base_ptr);
+        }
     } else if (location.type() == "cpu" ||
                location.type() == kWildcardLocation) {
         if (host_register_)
@@ -232,11 +267,33 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
 }
 
 Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
-    desc.shm_path.clear();
     LocationParser location(desc.location);
-    if (location.type() == "cpu" && host_register_) {
+    if (location.type() == "cuda") {
+        // Resolve base the same way we did in addMemoryBuffer, so we
+        // remove the right entry even for sub-allocated addresses.
+        CUdeviceptr base_ptr = 0;
+        size_t alloc_size = 0;
+        CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
+                                               (CUdeviceptr)desc.addr);
+
+        uint64_t key = desc.addr;
+        if (cu_err == CUDA_SUCCESS) {
+            key = (uint64_t)base_ptr;
+        } else {
+            LOG(WARNING) << "NVLinkTransport: cuMemGetAddressRange failed for "
+                         << "addr 0x" << std::hex << desc.addr << std::dec
+                         << " during removal (error " << cu_err
+                         << "). Memory may already be freed.";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(register_mutex_);
+            registered_base_addrs_.erase(key);
+        }
+    } else if (location.type() == "cpu" && host_register_) {
         CHECK_CUDA(cudaHostUnregister((void*)desc.addr));
     }
+    desc.shm_path.clear();
     return Status::OK();
 }
 
@@ -259,14 +316,17 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
-    SegmentDesc* desc = nullptr;
-    auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
-    if (!status.ok()) return status;
 
-    auto buffer = desc->findBuffer(dest_addr, length);
-    if (!buffer || buffer->shm_path.empty())
-        return Status::InvalidArgument(
-            "Requested address is not in registered buffer" LOC_MARK);
+    BufferDesc* buffer;
+    auto& segment_manager = metadata_->segmentManager();
+    CHECK_STATUS(
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
+            buffer = segment->findBuffer(dest_addr, length);
+            if (!buffer || buffer->shm_path.empty())
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        }));
 
     if (!relocate_map_[target_id].count(buffer->addr)) {
         void* shm_addr = nullptr;

@@ -3767,6 +3767,12 @@ TEST_F(MasterServiceSnapshotTest, MoveStart) {
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, move_start_result.error());
 
+    // Test Case 8.5: Move to a non-existent target segment, should fail.
+    move_start_result = service_->MoveStart(client_id, key, "segment_2",
+                                            "non_existent_segment");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, move_start_result.error());
+
     // Test Case 9: Move to an already existing segment, should succeed but
     // return nullopt.
     move_start_result =

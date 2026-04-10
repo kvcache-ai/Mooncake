@@ -1,4 +1,4 @@
-#include "oplog_applier.h"
+#include "ha/oplog/oplog_applier.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -12,64 +12,16 @@
 
 #include <xxhash.h>
 
-#include "etcd_oplog_store.h"
 #include "metadata_store.h"
-#include "oplog_manager.h"
+#include "mock_metadata_store.h"
+#include "mock_oplog_store.h"
+#include "ha/oplog/oplog_manager.h"
 #include "types.h"
 
+using mooncake::test::MockMetadataStore;
+using mooncake::test::MockOpLogStore;
+
 namespace mooncake::test {
-
-// Mock MetadataStore for testing OpLogApplier
-class MockMetadataStore : public MetadataStore {
-   public:
-    MockMetadataStore() = default;
-    ~MockMetadataStore() override = default;
-
-    bool PutMetadata(const std::string& key,
-                     const StandbyObjectMetadata& metadata) override {
-        metadata_map_[key] = metadata;
-        return true;
-    }
-
-    bool Put(const std::string& key, const std::string& payload) override {
-        // For testing, we can use PutMetadata with empty metadata
-        StandbyObjectMetadata meta;
-        metadata_map_[key] = meta;
-        return true;
-    }
-
-    std::optional<StandbyObjectMetadata> GetMetadata(
-        const std::string& key) const override {
-        auto it = metadata_map_.find(key);
-        if (it != metadata_map_.end()) {
-            return it->second;
-        }
-        return std::nullopt;
-    }
-
-    bool Remove(const std::string& key) override {
-        auto it = metadata_map_.find(key);
-        if (it != metadata_map_.end()) {
-            metadata_map_.erase(it);
-            return true;
-        }
-        return false;
-    }
-
-    bool Exists(const std::string& key) const override {
-        return metadata_map_.find(key) != metadata_map_.end();
-    }
-
-    size_t GetKeyCount() const override { return metadata_map_.size(); }
-
-    // Test helper methods
-    void Clear() { metadata_map_.clear(); }
-
-    size_t Size() const { return metadata_map_.size(); }
-
-   private:
-    std::map<std::string, StandbyObjectMetadata> metadata_map_;
-};
 
 // Helper function to create a valid OpLogEntry with checksum
 // Uses the same checksum algorithm as OpLogManager (XXH32)
@@ -92,18 +44,15 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
     return e;
 }
 
-// Helper function to create a valid JSON payload for PUT_END
-std::string MakeValidJsonPayload(uint64_t client_id_first = 1,
-                                 uint64_t client_id_second = 2,
-                                 uint64_t size = 1024) {
-    // NOTE: OpLogApplier's current implementation expects PUT_END payload to be
-    // struct_pack-serialized MetadataPayload (msgpack binary), not JSON.
-    MetadataPayload payload;
+// Helper function to create a valid struct_pack payload for PUT_END
+std::string MakeValidPayload(uint64_t client_id_first = 1,
+                             uint64_t client_id_second = 2,
+                             uint64_t size = 1024) {
+    mooncake::MetadataPayload payload;
     payload.client_id = {client_id_first, client_id_second};
     payload.size = size;
-    payload.replicas = {};
-    auto buf = struct_pack::serialize(payload);
-    return std::string(buf.data(), buf.size());
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
 }
 
 class OpLogApplierTest : public ::testing::Test {
@@ -127,7 +76,7 @@ class OpLogApplierTest : public ::testing::Test {
 // ========== 4.1.1 Basic apply tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -139,7 +88,7 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd) {
 
 TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
     // First add a key
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
@@ -153,7 +102,7 @@ TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
 
 TEST_F(OpLogApplierTest, TestApplyRemove) {
     // First add a key
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
@@ -167,7 +116,7 @@ TEST_F(OpLogApplierTest, TestApplyRemove) {
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
     OpLogEntry entry =
-        MakeEntry(1, OpType::PUT_END, "key1", MakeValidJsonPayload());
+        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload());
     // Manually set an invalid op_type (assuming OpType is an enum)
     // Since we can't directly set invalid enum, we test with valid types
     // and verify that unsupported types in ProcessPendingEntries are handled
@@ -177,7 +126,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
 // ========== 4.1.2 Sequence ordering tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyInOrder) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
@@ -196,7 +145,7 @@ TEST_F(OpLogApplierTest, TestApplyInOrder) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
@@ -228,7 +177,7 @@ TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyWithGap) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
 
@@ -248,7 +197,7 @@ TEST_F(OpLogApplierTest, TestApplyWithGap) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry1_dup = MakeEntry(1, OpType::PUT_END, "key1_dup", payload);
 
@@ -266,50 +215,95 @@ TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
 
 // ========== 4.1.3 Gap resolution tests ==========
 
-TEST_F(OpLogApplierTest, TestRequestMissingOpLog_Success) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real EtcdOpLogStore, skipping integration test";
-#else
-    GTEST_SKIP() << "STORE_USE_ETCD not enabled";
-#endif
+class OpLogApplierGapTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("OpLogApplierGapTest");
+        FLAGS_logtostderr = 1;
+        mock_metadata_store_ = std::make_unique<MockMetadataStore>();
+        mock_oplog_store_ = std::make_unique<MockOpLogStore>();
+        applier_ = std::make_unique<OpLogApplier>(mock_metadata_store_.get(),
+                                                  "test_cluster",
+                                                  mock_oplog_store_.get());
+    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    std::unique_ptr<MockMetadataStore> mock_metadata_store_;
+    std::unique_ptr<MockOpLogStore> mock_oplog_store_;
+    std::unique_ptr<OpLogApplier> applier_;
+};
+
+TEST_F(OpLogApplierGapTest, RequestMissingOpLog_Success) {
+    std::string payload = MakeValidPayload();
+    // Pre-populate seq=2 in mock store
+    OpLogEntry missing = MakeEntry(2, OpType::PUT_END, "key2", payload);
+    mock_oplog_store_->WriteOpLog(missing);
+
+    // Apply seq=1
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+    // Apply seq=3 (gap at seq=2)
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::PUT_END, "key3", payload)));
+
+    // First call registers the gap in missing_sequence_ids_
+    applier_->ProcessPendingEntries();
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+
+    // Wait for gap resolution trigger (kMissingEntryRequestSeconds = 1s)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    applier_->ProcessPendingEntries();
+
+    // After gap resolution, all 3 should be applied
+    EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
+    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
+    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
+    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
 }
 
-TEST_F(OpLogApplierTest, TestRequestMissingOpLog_Failure) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real EtcdOpLogStore, skipping integration test";
-#else
-    GTEST_SKIP() << "STORE_USE_ETCD not enabled";
-#endif
+TEST_F(OpLogApplierGapTest, RequestMissingOpLog_StoreError) {
+    std::string payload = MakeValidPayload();
+    mock_oplog_store_->SetReadError(ErrorCode::ETCD_OPERATION_ERROR);
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::PUT_END, "key3", payload)));
+
+    // First call registers the gap
+    applier_->ProcessPendingEntries();
+
+    // Gap resolution should fail gracefully
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    applier_->ProcessPendingEntries();
+
+    // seq=2 not resolved, expected still at 2
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
-TEST_F(OpLogApplierTest, TestRequestMissingOpLog_Timeout) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real EtcdOpLogStore, skipping integration test";
-#else
-    GTEST_SKIP() << "STORE_USE_ETCD not enabled";
-#endif
-}
+TEST_F(OpLogApplierGapTest, RequestMissingOpLog_NotFound) {
+    std::string payload = MakeValidPayload();
+    // Don't preload seq=2 in mock store
 
-TEST_F(OpLogApplierTest, TestTryResolveGapsOnceForPromotion) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real EtcdOpLogStore, skipping integration test";
-#else
-    GTEST_SKIP() << "STORE_USE_ETCD not enabled";
-#endif
-}
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::PUT_END, "key3", payload)));
 
-TEST_F(OpLogApplierTest, TestGapResolution_Retry) {
-#ifdef STORE_USE_ETCD
-    GTEST_SKIP() << "Requires real EtcdOpLogStore, skipping integration test";
-#else
-    GTEST_SKIP() << "STORE_USE_ETCD not enabled";
-#endif
+    // First call registers the gap
+    applier_->ProcessPendingEntries();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    applier_->ProcessPendingEntries();
+
+    // Not found, should not advance
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
 // ========== 4.1.4 Checksum tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidChecksum) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -318,7 +312,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidChecksum) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidChecksum) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     // Tamper with the checksum
@@ -330,7 +324,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidChecksum) {
 }
 
 TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     // Tamper with the checksum
@@ -343,7 +337,7 @@ TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
 // ========== 4.1.5 Size validation tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidSize) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(OpLogManager::ValidateEntrySize(entry));
@@ -381,7 +375,7 @@ TEST_F(OpLogApplierTest, TestRecover) {
     EXPECT_EQ(11u, applier_->GetExpectedSequenceId());
 
     // Apply entry with seq=11 should succeed
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(11, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(12u, applier_->GetExpectedSequenceId());
@@ -393,14 +387,14 @@ TEST_F(OpLogApplierTest, TestRecover_ZeroSequenceId) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
     // Apply entry with seq=1 should succeed
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
 TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
 
@@ -424,7 +418,7 @@ TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
 // ========== 4.1.7 Pending entries tests ==========
 
 TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
     OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
@@ -458,7 +452,7 @@ TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
 }
 
 TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
 
@@ -487,7 +481,7 @@ TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
 }
 
 TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
     OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
 
@@ -516,10 +510,10 @@ TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
     EXPECT_FALSE(mock_metadata_store_->Exists("key4"));
 }
 
-// ========== 4.1.8 JSON parsing tests ==========
+// ========== 4.1.8 Payload deserialization tests ==========
 
-TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {
-    std::string payload = MakeValidJsonPayload(1, 2, 2048);
+TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidPayload) {
+    std::string payload = MakeValidPayload(1, 2, 2048);
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -533,9 +527,9 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {
     EXPECT_EQ(2048u, meta->size);
 }
 
-TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidJson) {
-    std::string invalid_json = "{invalid json}";
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", invalid_json);
+TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidPayload) {
+    std::string invalid_data = "{invalid data}";
+    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", invalid_data);
 
     // Should still succeed (fallback to empty metadata)
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
@@ -568,7 +562,7 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_EmptyPayload) {
 // ========== Additional Edge Case Tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntries_Batch) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     std::vector<OpLogEntry> entries;
     entries.push_back(MakeEntry(1, OpType::PUT_END, "key1", payload));
     entries.push_back(MakeEntry(2, OpType::PUT_END, "key2", payload));
@@ -581,7 +575,7 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_Batch) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     std::vector<OpLogEntry> entries;
     entries.push_back(MakeEntry(1, OpType::PUT_END, "key1", payload));
     entries.push_back(
@@ -609,15 +603,10 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
 TEST_F(OpLogApplierTest, TestGetExpectedSequenceId) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
-    std::string payload = MakeValidJsonPayload();
+    std::string payload = MakeValidPayload();
     OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-}
-
-TEST_F(OpLogApplierTest, TestGetKeySequenceId_Deprecated) {
-    // This method is deprecated and always returns 0
-    EXPECT_EQ(0u, applier_->GetKeySequenceId("any_key"));
 }
 
 }  // namespace mooncake::test

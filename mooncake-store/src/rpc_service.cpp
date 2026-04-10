@@ -67,9 +67,146 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
 
 void SetServiceUnavailable(coro_http::coro_http_response& resp,
                            std::string_view message) {
-    resp.add_header("Content-Type", "text/plain; version=0.0.4");
+    const std::string payload =
+        std::string("{\"success\":false,\"error_code\":") +
+        std::to_string(toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE)) +
+        ",\"error_message\":\"" + EscapeJson(message) + "\"}";
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
     resp.set_status_and_content(coro_http::status_type::service_unavailable,
-                                std::string(message));
+                                payload);
+}
+struct HttpErrorResponse {
+    bool success{false};
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpErrorResponse, success, error_code, error_message);
+
+struct HttpCreateDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    std::string status;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
+         error_message);
+
+struct HttpQueryDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    int32_t type{0};
+    std::string type_name;
+    int32_t status{0};
+    std::string status_name;
+    int64_t created_at_ms_epoch{0};
+    int64_t last_updated_at_ms_epoch{0};
+    std::vector<std::string> segments;
+    uint64_t succeeded_units{0};
+    uint64_t failed_units{0};
+    uint64_t blocked_units{0};
+    uint64_t active_units{0};
+    uint64_t migrated_bytes{0};
+    std::string message;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpQueryDrainJobResponse, success, job_id, type, type_name, status,
+         status_name, created_at_ms_epoch, last_updated_at_ms_epoch, segments,
+         succeeded_units, failed_units, blocked_units, active_units,
+         migrated_bytes, message, error_code, error_message);
+
+struct HttpCancelDrainJobResponse {
+    bool success{false};
+    std::string job_id;
+    std::string status;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpCancelDrainJobResponse, success, job_id, status, error_code,
+         error_message);
+
+struct HttpSegmentStatusResponse {
+    bool success{false};
+    std::string segment;
+    int32_t status{0};
+    std::string status_name;
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
+         error_code, error_message);
+
+template <typename T>
+void WriteJsonResponse(coro_http::coro_http_response& resp,
+                       coro_http::status_type status, const T& payload) {
+    std::string json;
+    struct_json::to_json(payload, json);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(status, std::move(json));
+}
+
+template <typename T>
+std::string EnumToString(const T& value) {
+    std::ostringstream oss;
+    oss << value;
+    return oss.str();
+}
+
+coro_http::status_type ErrorCodeToHttpStatus(ErrorCode error) {
+    switch (error) {
+        case ErrorCode::INVALID_PARAMS:
+            return coro_http::status_type::bad_request;
+        case ErrorCode::JOB_NOT_FOUND:
+        case ErrorCode::SEGMENT_NOT_FOUND:
+            return coro_http::status_type::not_found;
+        default:
+            return coro_http::status_type::internal_server_error;
+    }
+}
+
+void WriteErrorResponse(coro_http::coro_http_response& resp,
+                        coro_http::status_type status, ErrorCode error,
+                        std::string message = {}) {
+    HttpErrorResponse payload;
+    payload.error_code = toInt(error);
+    payload.error_message =
+        message.empty() ? toString(error) : std::move(message);
+    WriteJsonResponse(resp, status, payload);
+}
+
+tl::expected<UUID, ErrorCode> ParseJobId(std::string_view job_id_view) {
+    if (job_id_view.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    UUID job_id;
+    if (!StringToUuid(std::string(job_id_view), job_id)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return job_id;
+}
+
+HttpQueryDrainJobResponse ToHttpQueryDrainJobResponse(
+    const QueryJobResponse& job) {
+    HttpQueryDrainJobResponse payload;
+    payload.success = true;
+    payload.job_id = UuidToString(job.id);
+    payload.type = static_cast<int32_t>(job.type);
+    payload.type_name = EnumToString(job.type);
+    payload.status = static_cast<int32_t>(job.status);
+    payload.status_name = EnumToString(job.status);
+    payload.created_at_ms_epoch = job.created_at_ms_epoch;
+    payload.last_updated_at_ms_epoch = job.last_updated_at_ms_epoch;
+    payload.segments = job.segments;
+    payload.succeeded_units = job.succeeded_units;
+    payload.failed_units = job.failed_units;
+    payload.blocked_units = job.blocked_units;
+    payload.active_units = job.active_units;
+    payload.migrated_bytes = job.migrated_bytes;
+    payload.message = job.message;
+    return payload;
 }
 
 }  // namespace
@@ -379,6 +516,133 @@ void MasterAdminServer::InitHttpServer() {
             body += std::to_string(capacity);
             body += "\n";
             resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<POST>(
+        "/api/v1/drain_jobs",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            CreateDrainJobRequest request;
+            try {
+                struct_json::from_json(request, req.get_body());
+            } catch (const std::exception& e) {
+                WriteErrorResponse(
+                    resp, status_type::bad_request, ErrorCode::INVALID_PARAMS,
+                    std::string("Invalid JSON body: ") + e.what());
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->CreateDrainJob(request);
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            HttpCreateDrainJobResponse payload;
+            payload.success = true;
+            payload.job_id = UuidToString(result.value());
+            payload.status = "CREATED";
+            WriteJsonResponse(resp, status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/api/v1/drain_jobs/query",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto job_id_result =
+                ParseJobId(req.get_decode_query_value("job_id"));
+            if (!job_id_result.has_value()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   job_id_result.error(),
+                                   "Missing or invalid job_id");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->QueryDrainJob(job_id_result.value());
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            WriteJsonResponse(resp, status_type::ok,
+                              ToHttpQueryDrainJobResponse(result.value()));
+        });
+
+    http_server_.set_http_handler<POST>(
+        "/api/v1/drain_jobs/cancel",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto job_id_result =
+                ParseJobId(req.get_decode_query_value("job_id"));
+            if (!job_id_result.has_value()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   job_id_result.error(),
+                                   "Missing or invalid job_id");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->CancelDrainJob(job_id_result.value());
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            HttpCancelDrainJobResponse payload;
+            payload.success = true;
+            payload.job_id = UuidToString(job_id_result.value());
+            payload.status = "CANCELED";
+            WriteJsonResponse(resp, status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/api/v1/segments/status",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto segment_name = req.get_decode_query_value("segment");
+            if (segment_name.empty()) {
+                WriteErrorResponse(resp, status_type::bad_request,
+                                   ErrorCode::INVALID_PARAMS,
+                                   "Missing segment query parameter");
+                return;
+            }
+
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result =
+                service->QuerySegmentStatus(std::string(segment_name));
+            if (!result.has_value()) {
+                WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                                   result.error());
+                return;
+            }
+
+            HttpSegmentStatusResponse payload;
+            payload.success = true;
+            payload.segment = std::string(segment_name);
+            payload.status = static_cast<int32_t>(result.value());
+            payload.status_name = EnumToString(result.value());
+            WriteJsonResponse(resp, status_type::ok, payload);
         });
 
     http_server_.set_http_handler<GET>(
@@ -1397,6 +1661,26 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
         master_service_.NotifyOffloadSuccess(client_id, keys, metadatas);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    return master_service_.CreateDrainJob(request);
+}
+
+tl::expected<QueryJobResponse, ErrorCode> WrappedMasterService::QueryDrainJob(
+    const UUID& job_id) {
+    return master_service_.QueryDrainJob(job_id);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CancelDrainJob(
+    const UUID& job_id) {
+    return master_service_.CancelDrainJob(job_id);
+}
+
+tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
+    const std::string& segment_name) {
+    return master_service_.QuerySegmentStatus(segment_name);
 }
 
 void RegisterRpcService(

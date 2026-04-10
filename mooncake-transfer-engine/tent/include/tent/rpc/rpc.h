@@ -23,8 +23,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <async_simple/coro/Lazy.h>
 
 #include "tent/common/status.h"
 #include "ylt/coro_io/coro_io.hpp"
@@ -38,10 +41,15 @@ enum RpcFuncID {
     SendData,
     RecvData,
     Notify,
+    Probe,
     Delegate,
     Pin,
-    Unpin
+    Unpin,
+    SubscribeSegmentUpdate,
+    NotifySegmentUpdated,
 };
+
+class ClientPool;
 
 class CoroRpcAgent {
    public:
@@ -64,21 +72,29 @@ class CoroRpcAgent {
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
 
+    using AsyncCallback = std::function<void(Status, std::string)>;
+    void callAsync(const std::string &server_addr, int func_id,
+                   const std::string &request, AsyncCallback callback);
+
+    async_simple::coro::Lazy<std::pair<Status, std::string>> callCoroutine(
+        std::string server_addr, int func_id, std::string request);
+
    private:
     void process(int func_id);
+
+    std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
 
    private:
     coro_rpc::coro_rpc_server *server_ = nullptr;
 
-    std::mutex sessions_mutex_;
-    std::unordered_map<std::string, coro_rpc::coro_rpc_client *> sessions_;
-    std::atomic<int> uid_{0};
+    std::mutex pools_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
 
     std::mutex func_map_mutex_;
     std::unordered_map<int, Function> func_map_;
 
     std::atomic<bool> running_{false};
-    const static size_t kRpcThreads = 1;
+    constexpr static size_t kRpcThreads = 1;
 };
 
 }  // namespace tent

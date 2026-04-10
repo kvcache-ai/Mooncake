@@ -87,6 +87,45 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
     return impl_->unregisterLocalMemory(addr, update_metadata);
 }
 
+Status TransferEngine::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return impl_->submitTransfer(batch_id, entries);
+}
+
+Status TransferEngine::submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg) {
+    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// Multi-protocol API (only available when ENABLE_MULTI_PROTOCOL is defined)
+int TransferEngine::mp_registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    return impl_->mp_registerLocalMemory(buffer_map);
+}
+
+int TransferEngine::mp_unregisterLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    return impl_->mp_unregisterLocalMemory(buffer_map);
+}
+
+Status TransferEngine::mp_submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    std::string& proto) {
+    return impl_->mp_submitTransfer(batch_id, entries, proto);
+}
+
+Status TransferEngine::mp_submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+    return impl_->mp_submitTransferWithNotify(batch_id, entries, notify_msg,
+                                              proto);
+}
+#endif
+
 int TransferEngine::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
     return impl_->registerLocalMemoryBatch(buffer_list, location);
@@ -105,17 +144,6 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
     return impl_->freeBatchID(batch_id);
 }
 
-Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest>& entries) {
-    return impl_->submitTransfer(batch_id, entries);
-}
-
-Status TransferEngine::submitTransferWithNotify(
-    BatchID batch_id, const std::vector<TransferRequest>& entries,
-    TransferMetadata::NotifyDesc notify_msg) {
-    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
-}
-
 int TransferEngine::getNotifies(
     std::vector<TransferMetadata::NotifyDesc>& notifies) {
     return impl_->getNotifies(notifies);
@@ -129,6 +157,12 @@ int TransferEngine::sendNotifyByID(SegmentID target_id,
 int TransferEngine::sendNotifyByName(std::string remote_agent,
                                      TransferMetadata::NotifyDesc notify_msg) {
     return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
+}
+
+PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    return impl_->probePeerAliveByID(target_id) == 0
+               ? PeerLiveness::Alive
+               : PeerLiveness::Unreachable;
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -494,6 +528,16 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
         return (int)status.code();
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
+}
+
+PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    if (use_tent_) {
+        auto status = impl_tent_->probePeerAliveByID(target_id);
+        return status.ok() ? PeerLiveness::Alive : PeerLiveness::Unreachable;
+    }
+    return impl_->probePeerAliveByID(target_id) == 0
+               ? PeerLiveness::Alive
+               : PeerLiveness::Unreachable;
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,

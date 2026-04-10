@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
@@ -13,6 +14,10 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "ha/oplog/etcd_oplog_store.h"
+#endif
 #include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -61,6 +66,12 @@ tl::expected<SnapshotCatalogBackendKind, std::string> ParseSnapshotCatalogKind(
                                std::string(store_type));
 }
 
+int64_t CurrentTimeMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -71,9 +82,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      ha_backend_type_(config.ha_backend_type),
       ha_backend_connstring_(config.ha_backend_connstring),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
@@ -162,6 +175,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    job_dispatch_running_ = true;
+    job_dispatch_thread_ =
+        std::thread(&MasterService::JobDispatchThreadFunc, this);
+    VLOG(1) << "action=start_job_dispatch_thread";
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -225,6 +243,7 @@ MasterService::~MasterService() {
     client_monitor_running_ = false;
     snapshot_running_ = false;
     task_cleanup_running_ = false;
+    job_dispatch_running_ = false;
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
@@ -240,6 +259,9 @@ MasterService::~MasterService() {
     }
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
+    }
+    if (job_dispatch_thread_.joinable()) {
+        job_dispatch_thread_.join();
     }
 }
 
@@ -469,6 +491,17 @@ auto MasterService::QuerySegments(const std::string& segment)
         return tl::make_unexpected(err);
     }
     return std::make_pair(used, capacity);
+}
+
+auto MasterService::QuerySegmentStatus(const std::string& segment_name)
+    -> tl::expected<SegmentStatus, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return status;
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
@@ -1291,6 +1324,23 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& tgt_segment : tgt_segments) {
+            if (!segment_access.ExistsSegmentName(tgt_segment)) {
+                LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                           << ", error=target_segment_not_found";
+                return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            }
+            if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+                LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                           << ", error=target_segment_not_allocatable";
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+    }
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
@@ -1497,6 +1547,21 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
                    << " cannot be the same as move_src=" << src_segment;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        if (!segment_access.ExistsSegmentName(tgt_segment)) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", error=target_segment_not_found";
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", error=target_segment_not_allocatable";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
     }
 
     MetadataAccessorRW accessor(this, key);
@@ -2338,6 +2403,21 @@ void MasterService::SnapshotThreadFunc() {
             continue;
         }
 
+        const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        auto descriptor =
+            BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
+        if (!descriptor) {
+            LOG(ERROR) << "[Snapshot] Failed to build descriptor before fork, "
+                          "snapshot_id="
+                       << snapshot_id
+                       << ", code=" << toString(descriptor.error().code)
+                       << ", msg=" << descriptor.error().message;
+            close(log_pipe[0]);
+            close(log_pipe[1]);
+            continue;
+        }
+
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
@@ -2361,7 +2441,7 @@ void MasterService::SnapshotThreadFunc() {
             // Save current state using the configured persistence mechanism
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
-            auto result = PersistState(snapshot_id);
+            auto result = PersistState(descriptor.value());
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
@@ -2551,8 +2631,114 @@ void MasterService::HandleChildExit(pid_t pid, int status,
     }
 }
 
+tl::expected<ha::OpLogSequenceId, SerializationError>
+MasterService::ResolveSnapshotSequenceId() const {
+    if (!enable_ha_ || ha_backend_type_ != "etcd") {
+        // OpLog sequence ids start at 1. Returning 0 here is a sentinel that
+        // means "no persisted OpLog boundary", so a standby that later calls
+        // Recover(0) will replay from the first entry when oplog following is
+        // enabled.
+        return ha::OpLogSequenceId{0};
+    }
+
+#ifndef STORE_USE_ETCD
+    return tl::make_unexpected(SerializationError(
+        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+        "etcd snapshot sequence resolution is unavailable in this build"));
+#else
+    auto oplog_store = GetSnapshotBoundaryOpLogStore();
+    if (!oplog_store) {
+        return tl::make_unexpected(oplog_store.error());
+    }
+
+    uint64_t sequence_id = 0;
+    auto err = oplog_store.value()->GetLatestSequenceId(sequence_id);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ha::OpLogSequenceId{0};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to resolve snapshot sequence boundary: {}",
+                             toString(err))));
+    }
+
+    return static_cast<ha::OpLogSequenceId>(sequence_id);
+#endif
+}
+
+#ifdef STORE_USE_ETCD
+tl::expected<EtcdOpLogStore*, SerializationError>
+MasterService::GetSnapshotBoundaryOpLogStore() const {
+    if (ha_backend_connstring_.empty()) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::INVALID_PARAMS,
+            "etcd snapshot sequence resolution requires a backend connstring"));
+    }
+
+    std::lock_guard<std::mutex> lock(snapshot_boundary_oplog_store_mutex_);
+    if (snapshot_boundary_oplog_store_ != nullptr) {
+        return snapshot_boundary_oplog_store_.get();
+    }
+
+    auto err =
+        EtcdHelper::ConnectToEtcdStoreClient(ha_backend_connstring_.c_str());
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to connect to etcd for snapshot boundary: "
+                             "{}",
+                             toString(err))));
+    }
+
+    auto oplog_store = std::make_unique<EtcdOpLogStore>(cluster_id_);
+    err = oplog_store->Init();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(SerializationError(
+            err, fmt::format("failed to initialize etcd oplog store: {}",
+                             toString(err))));
+    }
+
+    snapshot_boundary_oplog_store_ = std::move(oplog_store);
+    return snapshot_boundary_oplog_store_.get();
+}
+#endif
+
+tl::expected<ha::SnapshotDescriptor, SerializationError>
+MasterService::BuildSnapshotDescriptor(const std::string& snapshot_id,
+                                       const std::string& manifest_path,
+                                       const std::string& object_prefix) const {
+    auto sequence_id = ResolveSnapshotSequenceId();
+    if (!sequence_id) {
+        return tl::make_unexpected(sequence_id.error());
+    }
+
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
+    descriptor.last_included_seq = sequence_id.value();
+    descriptor.producer_view_version = view_version_;
+    descriptor.manifest_key = manifest_path;
+    descriptor.object_prefix = object_prefix;
+    descriptor.created_at_ms = CurrentTimeMs();
+    return descriptor;
+}
+
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
+    const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+    const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+    auto descriptor =
+        BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
+    if (!descriptor) {
+        return tl::make_unexpected(descriptor.error());
+    }
+    return PersistState(descriptor.value());
+}
+
+tl::expected<void, SerializationError> MasterService::PersistState(
+    const ha::SnapshotDescriptor& descriptor) {
+    const std::string& snapshot_id = descriptor.snapshot_id;
+    const std::string& path_prefix = descriptor.object_prefix;
+    const std::string& manifest_path = descriptor.manifest_key;
+
     try {
         auto* snapshot_catalog_store = GetSnapshotCatalogStore();
         if (!snapshot_catalog_store) {
@@ -2609,8 +2795,6 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             "[Snapshot] task manager serialization_successful, snapshot_id={}",
             snapshot_id);
 
-        // Create storage path prefix
-        std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
         const auto& serialized_metadata = metadata_result.value();
         const auto& serialized_segment = segment_result.value();
         const auto& serialized_task_manager = task_manager_result.value();
@@ -2680,7 +2864,6 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         }
 
         // Upload manifest
-        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
             fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
                         SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
@@ -2711,10 +2894,6 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        ha::SnapshotDescriptor descriptor;
-        descriptor.snapshot_id = snapshot_id;
-        descriptor.manifest_key = manifest_path;
-        descriptor.object_prefix = path_prefix;
         auto publish_result = snapshot_catalog_store->Publish(descriptor);
         if (publish_result != ErrorCode::OK) {
             SNAP_LOG_ERROR(
@@ -2820,6 +2999,9 @@ void MasterService::CleanupOldSnapshot(int keep_count,
         return;
     }
 
+    // List() loads one descriptor per published snapshot. This remains cheap
+    // because CleanupOldSnapshot() itself enforces snapshot_retention_count_
+    // and keeps the catalog single-digit in normal deployments.
     auto list_result = snapshot_catalog_store->List(kUnlimitedSnapshotList);
     if (!list_result) {
         SNAP_LOG_ERROR("[Snapshot] error=list failed, snapshot_id={}, code={}",
@@ -2859,49 +3041,109 @@ void MasterService::CleanupOldSnapshot(int keep_count,
 }
 
 void MasterService::RestoreState() {
+    auto* snapshot_catalog_store = GetSnapshotCatalogStore();
+    if (!snapshot_catalog_store) {
+        LOG(ERROR) << "[Restore] Snapshot catalog store is not initialized, "
+                      "starting fresh";
+        return;
+    }
+
+    LOG(INFO) << "[Restore] Backend info: "
+              << snapshot_object_store_->GetConnectionInfo();
+
+    std::vector<ha::SnapshotDescriptor> restore_candidates;
+    std::unordered_set<std::string> candidate_ids;
+    std::optional<std::string> latest_snapshot_id;
+
+    auto latest_result = snapshot_catalog_store->GetLatest();
+    if (!latest_result) {
+        LOG(WARNING) << "[Restore] Failed to load latest snapshot marker: "
+                     << toString(latest_result.error())
+                     << ", falling back to published snapshot listing";
+    } else if (latest_result->has_value()) {
+        const auto& latest_snapshot = latest_result->value();
+        latest_snapshot_id = latest_snapshot.snapshot_id;
+        restore_candidates.push_back(latest_snapshot);
+        candidate_ids.emplace(latest_snapshot.snapshot_id);
+    }
+
+    // Snapshot ids use YYYYMMDD_HHMMSS_mmm, so lexicographic order matches
+    // creation order. List() may perform one descriptor read per published
+    // snapshot; retention cleanup keeps that set bounded in practice.
+    auto snapshots_result =
+        snapshot_catalog_store->List(kUnlimitedSnapshotList);
+    if (!snapshots_result) {
+        if (restore_candidates.empty()) {
+            LOG(ERROR) << "[Restore] Failed to list restorable snapshots: "
+                       << toString(snapshots_result.error())
+                       << ", starting fresh";
+            return;
+        }
+        LOG(WARNING) << "[Restore] Failed to list fallback snapshots: "
+                     << toString(snapshots_result.error())
+                     << ", attempting latest marker only";
+    } else {
+        for (const auto& snapshot : snapshots_result.value()) {
+            // Snapshot ids are timestamp-derived, so string comparison keeps
+            // only candidates at or before the latest marker chronologically.
+            if (latest_snapshot_id.has_value() &&
+                snapshot.snapshot_id > latest_snapshot_id.value()) {
+                continue;
+            }
+            if (!candidate_ids.emplace(snapshot.snapshot_id).second) {
+                continue;
+            }
+            restore_candidates.push_back(snapshot);
+        }
+    }
+
+    if (restore_candidates.empty()) {
+        LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    for (const auto& snapshot : restore_candidates) {
+        ResetStateAfterFailedRestoreAttempt();
+        if (TryRestoreStateFromSnapshot(snapshot, now)) {
+            return;
+        }
+    }
+
+    ResetStateAfterFailedRestoreAttempt();
+    LOG(ERROR) << "[Restore] Failed to restore from all candidate snapshots "
+               << "(count=" << restore_candidates.size() << "), starting fresh";
+}
+
+bool MasterService::TryRestoreStateFromSnapshot(
+    const ha::SnapshotDescriptor& snapshot,
+    const std::chrono::system_clock::time_point& now) {
+    const std::string& state_id = snapshot.snapshot_id;
+    std::string path_prefix = snapshot.object_prefix;
+    if (path_prefix.empty()) {
+        path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
+    }
+
+    std::string manifest_path = snapshot.manifest_key;
+    if (manifest_path.empty()) {
+        manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+    }
+
+    auto fail_restore = [&](const std::string& message) {
+        LOG(WARNING) << "[Restore] Snapshot candidate " << state_id
+                     << " is unusable: " << message;
+        ResetStateAfterFailedRestoreAttempt();
+        return false;
+    };
+
     try {
-        auto* snapshot_catalog_store = GetSnapshotCatalogStore();
-        if (!snapshot_catalog_store) {
-            LOG(ERROR) << "[Restore] Snapshot catalog store is not "
-                          "initialized, starting fresh";
-            return;
-        }
-
-        auto now = std::chrono::system_clock::now();
-
-        LOG(INFO) << "[Restore] Backend info: "
-                  << snapshot_object_store_->GetConnectionInfo();
-        // 1. Resolve the latest snapshot from the snapshot catalog.
-        auto latest_result = snapshot_catalog_store->GetLatest();
-        if (!latest_result) {
-            LOG(ERROR) << "[Restore] Failed to load latest snapshot: "
-                       << toString(latest_result.error()) << ", starting fresh";
-            return;
-        }
-        if (!latest_result.value().has_value()) {
-            LOG(ERROR)
-                << "[Restore] No previous snapshot found, starting fresh";
-            return;
-        }
-
-        const auto& latest_snapshot = latest_result.value().value();
-        const std::string& state_id = latest_snapshot.snapshot_id;
-        std::string path_prefix = latest_snapshot.object_prefix;
-        if (path_prefix.empty()) {
-            path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
-        }
-
-        // 2. Download manifest.txt to parse protocol version info
-        std::string manifest_path = latest_snapshot.manifest_key;
-        if (manifest_path.empty()) {
-            manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-        }
         std::string manifest_content;
-        if (!snapshot_object_store_->DownloadString(manifest_path,
-                                                    manifest_content)) {
-            LOG(ERROR) << "[Restore] Failed to download manifest file: "
-                       << manifest_path << " , starting fresh";
-            return;
+        auto manifest_result = snapshot_object_store_->DownloadString(
+            manifest_path, manifest_content);
+        if (!manifest_result) {
+            return fail_restore("failed to download manifest '" +
+                                manifest_path +
+                                "': " + manifest_result.error());
         }
 
         if (use_snapshot_backup_dir_) {
@@ -2915,50 +3157,37 @@ void MasterService::RestoreState() {
             }
         }
 
-        // Format: protocol_type|version|20230801_123456_000
         std::vector<std::string> parts;
         boost::split(parts, manifest_content, boost::is_any_of("|"));
-
-        std::string protocol_type;  // Protocol type
-        std::string version;        // Version
-
-        if (parts.size() >= 3) {
-            protocol_type = parts[0];
-            version = parts[1];
-        } else {
-            // Invalid format
-            LOG(ERROR) << "[Restore] Invalid snapshot manifest format: "
-                       << manifest_content;
-            return;
+        if (parts.size() < 3) {
+            return fail_restore("invalid snapshot manifest format");
         }
 
-        LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
+        const std::string& protocol_type = parts[0];
+        const std::string& version = parts[1];
+
+        LOG(INFO) << "[Restore] Trying snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
 
-        // Strict compatibility check: fail fast on version/protocol mismatch
         if (protocol_type != SNAPSHOT_SERIALIZER_TYPE) {
-            LOG(ERROR) << "[Restore] Unsupported protocol type: "
-                       << protocol_type
-                       << ", expected: " << SNAPSHOT_SERIALIZER_TYPE
-                       << ", starting fresh";
-            return;
+            return fail_restore("unsupported protocol type '" + protocol_type +
+                                "', expected '" + SNAPSHOT_SERIALIZER_TYPE +
+                                "'");
         }
         if (version != SNAPSHOT_SERIALIZER_VERSION) {
-            LOG(ERROR) << "[Restore] Incompatible snapshot version: " << version
-                       << ", expected: " << SNAPSHOT_SERIALIZER_VERSION
-                       << ", starting fresh";
-            return;
+            return fail_restore("incompatible snapshot version '" + version +
+                                "', expected '" + SNAPSHOT_SERIALIZER_VERSION +
+                                "'");
         }
 
-        // 3. Download metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
         auto download_result = snapshot_object_store_->DownloadBuffer(
             metadata_path, metadata_content);
         if (!download_result) {
-            LOG(ERROR) << "[Restore] Failed to download metadata file: "
-                       << metadata_path << "error=" << download_result.error();
-            return;
+            return fail_restore("failed to download metadata '" +
+                                metadata_path +
+                                "': " + download_result.error());
         }
 
         if (use_snapshot_backup_dir_) {
@@ -2973,15 +3202,14 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
-        // 4. Download segments
         std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         std::vector<uint8_t> segments_content;
         download_result = snapshot_object_store_->DownloadBuffer(
             segments_path, segments_content);
         if (!download_result) {
-            LOG(ERROR) << "Failed to download segments file: " << segments_path
-                       << " error=" << download_result.error();
-            return;
+            return fail_restore("failed to download segments '" +
+                                segments_path +
+                                "': " + download_result.error());
         }
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
@@ -2995,17 +3223,15 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download segments file success";
 
-        // 5. Download task manager state
         std::string task_manager_path =
             path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
         std::vector<uint8_t> task_manager_content;
         download_result = snapshot_object_store_->DownloadBuffer(
             task_manager_path, task_manager_content);
         if (!download_result) {
-            LOG(ERROR) << "Failed to download task manager file: "
-                       << task_manager_path
-                       << " error=" << download_result.error();
-            return;
+            return fail_restore("failed to download task_manager '" +
+                                task_manager_path +
+                                "': " + download_result.error());
         }
         if (use_snapshot_backup_dir_) {
             auto save_result = FileUtil::SaveBinaryToFile(
@@ -3019,45 +3245,37 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download task manager file success";
 
-        // 6. Deserialize state
         SegmentSerializer segment_serializer(&segment_manager_);
         MetadataSerializer metadata_serializer(this);
         TaskManagerSerializer task_manager_serializer(&task_manager_);
 
         auto segments_result = segment_serializer.Deserialize(segments_content);
         if (!segments_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize segments: "
-                       << segments_result.error().code << " - "
-                       << segments_result.error().message;
-            segment_serializer.Reset();
-            return;
+            return fail_restore(
+                fmt::format("failed to deserialize segments: {} - {}",
+                            static_cast<int>(segments_result.error().code),
+                            segments_result.error().message));
         }
         LOG(INFO) << "[Restore] Deserialize segments success";
 
         auto metadata_result =
             metadata_serializer.Deserialize(metadata_content);
         if (!metadata_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize metadata: "
-                       << metadata_result.error().code;
-            metadata_serializer.Reset();
-            segment_serializer.Reset();
-            return;
+            return fail_restore(
+                fmt::format("failed to deserialize metadata: {} - {}",
+                            static_cast<int>(metadata_result.error().code),
+                            metadata_result.error().message));
         }
-
         LOG(INFO) << "[Restore] Deserialize metadata success";
 
         auto task_manager_result =
             task_manager_serializer.Deserialize(task_manager_content);
         if (!task_manager_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize task manager: "
-                       << task_manager_result.error().code << " - "
-                       << task_manager_result.error().message;
-            task_manager_serializer.Reset();
-            metadata_serializer.Reset();
-            segment_serializer.Reset();
-            return;
+            return fail_restore(
+                fmt::format("failed to deserialize task manager: {} - {}",
+                            static_cast<int>(task_manager_result.error().code),
+                            task_manager_result.error().message));
         }
-
         LOG(INFO) << "[Restore] Deserialize task manager success";
 
         std::vector<std::string> segment_names;
@@ -3068,18 +3286,17 @@ void MasterService::RestoreState() {
         }
 
         {
-            // After deserialization, iterate through metadata_shards_ to clean
-            // up non-ready metadata
             const bool skip_cleanup = std::getenv(
                 "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
             if (!skip_cleanup) {
+                auto cleanup_now = now;
                 for (auto& shard : metadata_shards_) {
                     for (auto it = shard.metadata.begin();
                          it != shard.metadata.end();) {
                         if (it->second.HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
-                            (it->second.IsLeaseExpired() &&
-                             !it->second.IsSoftPinned(now))) {
+                            (it->second.IsLeaseExpired(cleanup_now) &&
+                             !it->second.IsSoftPinned(cleanup_now))) {
                             VLOG(1)
                                 << "clear metadata key=" << it->first
                                 << " ,lease_timeout="
@@ -3106,8 +3323,6 @@ void MasterService::RestoreState() {
                 }
             }
 
-            // Restore memory usage
-            // Step 1: Reset memory usage
             MasterMetricManager::instance().reset_allocated_mem_size();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
@@ -3148,7 +3363,6 @@ void MasterService::RestoreState() {
         }
 
         {
-            // Reset total capacity
             MasterMetricManager::instance().reset_total_mem_capacity();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
@@ -3158,11 +3372,8 @@ void MasterService::RestoreState() {
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
             std::vector<std::pair<Segment, UUID>> unready_segments;
-
-            // Get all unready segments and their corresponding client_ids
             if (segment_access.GetUnreadySegments(unready_segments) ==
                 ErrorCode::OK) {
-                // Remove all unready segments
                 for (const auto& [segment, client_id] : unready_segments) {
                     UnmountSegment(segment.id, client_id);
                 }
@@ -3174,9 +3385,8 @@ void MasterService::RestoreState() {
             if (err == ErrorCode::OK) {
                 int64_t total_size = 0;
                 for (const auto& [segment, client_id] : all_segments) {
-                    Ping(client_id);  // Add to heartbeat monitoring
+                    Ping(client_id);
                     total_size += static_cast<int64_t>(segment.size);
-                    // Restore segment usage
                     MasterMetricManager::instance().inc_total_mem_capacity(
                         segment.name, segment.size);
                 }
@@ -3190,13 +3400,34 @@ void MasterService::RestoreState() {
 
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
                   << state_id;
-
+        return true;
     } catch (const std::exception& e) {
-        LOG(ERROR) << "[Restore] Exception during state restoration: "
-                   << e.what();
+        return fail_restore("exception during state restoration: " +
+                            std::string(e.what()));
     } catch (...) {
-        LOG(ERROR) << "[Restore] Unknown exception during state restoration";
+        return fail_restore("unknown exception during state restoration");
     }
+}
+
+void MasterService::ResetStateAfterFailedRestoreAttempt() {
+    SegmentSerializer segment_serializer(&segment_manager_);
+    MetadataSerializer metadata_serializer(this);
+    TaskManagerSerializer task_manager_serializer(&task_manager_);
+
+    task_manager_serializer.Reset();
+    metadata_serializer.Reset();
+    segment_serializer.Reset();
+
+    {
+        std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        ok_client_.clear();
+    }
+    PodUUID pod_uuid;
+    while (client_ping_queue_.pop(pod_uuid)) {
+    }
+
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
@@ -4071,6 +4302,12 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
                        << ", error=target_segment_not_mounted";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (!segment_accessor.IsSegmentAllocatable(target)) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_allocatable";
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
     }
 
     const auto& metadata = accessor.Get();
@@ -4122,6 +4359,11 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         LOG(ERROR) << "key=" << key << ", target_segment=" << target
                    << ", error=target_segment_not_mounted";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!segment_accessor.IsSegmentAllocatable(target)) {
+        LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                   << ", error=target_segment_not_allocatable";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     const auto& metadata = accessor.Get();
@@ -4183,6 +4425,474 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
         return tl::make_unexpected(err);
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
+    const CreateDrainJobRequest& request) {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    return ValidateDrainRequestLocked(segment_access, request);
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
+    ScopedSegmentAccess& segment_access, const CreateDrainJobRequest& request) {
+    if (request.segments.empty() || request.max_concurrency == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::unordered_set<std::string> unique_segments(request.segments.begin(),
+                                                    request.segments.end());
+    if (unique_segments.size() != request.segments.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    for (const auto& segment_name : request.segments) {
+        if (!segment_access.ExistsSegmentName(segment_name)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        if (status != SegmentStatus::OK) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+
+    for (const auto& target_segment : request.target_segments) {
+        if (unique_segments.contains(target_segment)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!segment_access.ExistsSegmentName(target_segment)) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (!segment_access.IsSegmentAllocatable(target_segment)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+    return {};
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
+    const CreateDrainJobRequest& request) {
+    std::vector<std::string> draining_segments;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        auto valid = ValidateDrainRequestLocked(segment_access, request);
+        if (!valid.has_value()) {
+            return tl::make_unexpected(valid.error());
+        }
+
+        draining_segments.reserve(request.segments.size());
+        for (const auto& segment_name : request.segments) {
+            auto err = segment_access.SetSegmentStatusByName(
+                segment_name, SegmentStatus::DRAINING);
+            if (err != ErrorCode::OK) {
+                for (const auto& updated_segment : draining_segments) {
+                    (void)segment_access.SetSegmentStatusByName(
+                        updated_segment, SegmentStatus::OK);
+                }
+                return tl::make_unexpected(err);
+            }
+            draining_segments.push_back(segment_name);
+        }
+    }
+
+    auto job = std::make_shared<DrainJob>();
+    job->id = generate_uuid();
+    job->request = request;
+    job->created_at = std::chrono::system_clock::now();
+    job->last_updated_at = job->created_at;
+    job->status = JobStatus::CREATED;
+    job->message = "Drain job created";
+
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        drain_jobs_.emplace(job->id, job);
+    }
+
+    return job->id;
+}
+
+tl::expected<QueryJobResponse, ErrorCode> MasterService::QueryDrainJob(
+    const UUID& job_id) {
+    std::shared_ptr<DrainJob> job;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        auto it = drain_jobs_.find(job_id);
+        if (it == drain_jobs_.end()) {
+            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
+        }
+        job = it->second;
+    }
+
+    std::lock_guard<std::mutex> job_lock(job->mutex);
+    QueryJobResponse response;
+    response.id = job->id;
+    response.type = job->type;
+    response.status = job->status;
+    response.created_at_ms_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            job->created_at.time_since_epoch())
+            .count());
+    response.last_updated_at_ms_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            job->last_updated_at.time_since_epoch())
+            .count());
+    response.segments = job->request.segments;
+    response.succeeded_units = job->succeeded_units;
+    response.failed_units = job->failed_units;
+    response.blocked_units = job->blocked_units;
+    response.active_units = static_cast<uint64_t>(job->active_tasks.size());
+    response.migrated_bytes = job->migrated_bytes;
+    response.message = job->message;
+    return response;
+}
+
+tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
+    const UUID& job_id) {
+    std::shared_ptr<DrainJob> job;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        auto it = drain_jobs_.find(job_id);
+        if (it == drain_jobs_.end()) {
+            return tl::make_unexpected(ErrorCode::JOB_NOT_FOUND);
+        }
+        job = it->second;
+    }
+
+    std::vector<std::string> segments_to_restore;
+    {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED || !job->active_tasks.empty()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+
+        job->status = JobStatus::CANCELED;
+        job->last_updated_at = std::chrono::system_clock::now();
+        job->message = "Drain job canceled";
+        segments_to_restore = job->request.segments;
+    }
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    for (const auto& segment_name : segments_to_restore) {
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+                ErrorCode::OK &&
+            status != SegmentStatus::UNMOUNTING) {
+            (void)segment_access.SetSegmentStatusByName(segment_name,
+                                                        SegmentStatus::OK);
+        }
+    }
+    return {};
+}
+
+std::string MasterService::MakeDrainUnitKey(
+    const std::string& key, const std::string& source_segment) const {
+    return std::to_string(key.size()) + ":" + key + ":" + source_segment;
+}
+
+std::optional<std::string> MasterService::SelectDrainTargetForKey(
+    const ObjectMetadata& metadata, const std::string& source_segment,
+    const std::vector<std::string>& requested_targets) {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::string> candidate_segments = requested_targets;
+    if (candidate_segments.empty()) {
+        auto err = segment_access.GetAllSegments(candidate_segments);
+        if (err != ErrorCode::OK) {
+            return std::nullopt;
+        }
+    }
+
+    const auto existing_segments = metadata.GetReplicaSegmentNames();
+    double best_util = std::numeric_limits<double>::max();
+    std::optional<std::string> best_target;
+    for (const auto& candidate : candidate_segments) {
+        if (candidate == source_segment) {
+            continue;
+        }
+        if (std::find(existing_segments.begin(), existing_segments.end(),
+                      candidate) != existing_segments.end()) {
+            continue;
+        }
+        if (!segment_access.IsSegmentAllocatable(candidate)) {
+            continue;
+        }
+        size_t used = 0, capacity = 0;
+        if (segment_access.QuerySegments(candidate, used, capacity) !=
+                ErrorCode::OK ||
+            capacity == 0) {
+            continue;
+        }
+        const double util =
+            static_cast<double>(used) / static_cast<double>(capacity);
+        if (util < best_util) {
+            best_util = util;
+            best_target = candidate;
+        }
+    }
+    return best_target;
+}
+
+void MasterService::RefreshDrainJobTasks(DrainJob& job) {
+    auto read_access = task_manager_.get_read_access();
+    std::vector<UUID> finished_task_ids;
+    finished_task_ids.reserve(job.active_tasks.size());
+
+    for (const auto& [task_id, active_task] : job.active_tasks) {
+        auto task_opt = read_access.find_task_by_id(task_id);
+        if (!task_opt.has_value()) {
+            finished_task_ids.push_back(task_id);
+            job.failed_units++;
+            job.terminal_failed_unit_keys.insert(active_task.unit_key);
+            continue;
+        }
+        if (!task_opt->is_finished()) {
+            continue;
+        }
+
+        finished_task_ids.push_back(task_id);
+        if (task_opt->status == TaskStatus::SUCCESS) {
+            job.succeeded_units++;
+            job.migrated_bytes += active_task.bytes;
+            job.completed_unit_keys.insert(active_task.unit_key);
+        } else {
+            job.failed_units++;
+            auto& retry_count = job.retry_counts[active_task.unit_key];
+            retry_count++;
+            if (retry_count >= kMaxDrainUnitRetries) {
+                job.terminal_failed_unit_keys.insert(active_task.unit_key);
+            }
+        }
+    }
+
+    for (const auto& task_id : finished_task_ids) {
+        job.active_tasks.erase(task_id);
+    }
+}
+
+void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
+    if (job.status == JobStatus::CREATED) {
+        job.status = JobStatus::PLANNING;
+    }
+
+    const uint32_t max_concurrency =
+        std::max<uint32_t>(1, job.request.max_concurrency);
+    if (job.active_tasks.size() >= max_concurrency) {
+        job.status = JobStatus::RUNNING;
+        return;
+    }
+
+    struct DrainPlan {
+        std::string key;
+        std::string source_segment;
+        std::string target_segment;
+        size_t bytes;
+        std::string unit_key;
+    };
+
+    const size_t slots = max_concurrency - job.active_tasks.size();
+    std::vector<DrainPlan> plans;
+    plans.reserve(slots);
+    std::unordered_set<std::string> active_unit_keys;
+    for (const auto& [_, task] : job.active_tasks) {
+        active_unit_keys.insert(task.unit_key);
+    }
+
+    std::unordered_set<std::string> blocked_unit_keys;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        for (size_t i = 0; i < kNumShards; ++i) {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [key, metadata] : shard->metadata) {
+                for (const auto& source_segment : job.request.segments) {
+                    const auto unit_key = MakeDrainUnitKey(key, source_segment);
+                    if (job.completed_unit_keys.contains(unit_key) ||
+                        active_unit_keys.contains(unit_key) ||
+                        job.terminal_failed_unit_keys.contains(unit_key)) {
+                        continue;
+                    }
+
+                    const auto replica_segments =
+                        metadata.GetReplicaSegmentNames();
+                    if (std::find(replica_segments.begin(),
+                                  replica_segments.end(),
+                                  source_segment) == replica_segments.end()) {
+                        continue;
+                    }
+
+                    if (metadata.IsHardPinned() || !metadata.IsLeaseExpired() ||
+                        !metadata.AllReplicas(&Replica::fn_is_completed) ||
+                        shard->replication_tasks.contains(key)) {
+                        blocked_unit_keys.insert(unit_key);
+                        continue;
+                    }
+
+                    auto target = SelectDrainTargetForKey(
+                        metadata, source_segment, job.request.target_segments);
+                    if (!target.has_value()) {
+                        blocked_unit_keys.insert(unit_key);
+                        continue;
+                    }
+
+                    if (plans.size() < slots) {
+                        plans.push_back({key, source_segment, *target,
+                                         metadata.size, unit_key});
+                    }
+                }
+            }
+        }
+    }
+
+    job.blocked_units = blocked_unit_keys.size();
+
+    for (const auto& plan : plans) {
+        auto task_id =
+            CreateMoveTask(plan.key, plan.source_segment, plan.target_segment);
+        if (task_id.has_value()) {
+            ActiveDrainTask active_task;
+            active_task.task_id = task_id.value();
+            active_task.key = plan.key;
+            active_task.source_segment = plan.source_segment;
+            active_task.target_segment = plan.target_segment;
+            active_task.bytes = plan.bytes;
+            active_task.unit_key = plan.unit_key;
+            job.active_tasks.emplace(task_id.value(), std::move(active_task));
+        } else if (task_id.error() == ErrorCode::NO_AVAILABLE_HANDLE ||
+                   task_id.error() ==
+                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+                   task_id.error() == ErrorCode::OBJECT_HAS_REPLICATION_TASK) {
+            job.blocked_units++;
+        } else {
+            job.failed_units++;
+            auto& retry_count = job.retry_counts[plan.unit_key];
+            retry_count++;
+            if (retry_count >= kMaxDrainUnitRetries) {
+                job.terminal_failed_unit_keys.insert(plan.unit_key);
+            }
+        }
+    }
+
+    job.status = JobStatus::RUNNING;
+    job.last_updated_at = std::chrono::system_clock::now();
+    job.message = "Drain job running";
+}
+
+bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
+    if (!job.active_tasks.empty()) {
+        return false;
+    }
+
+    std::unordered_set<std::string> remaining_segments;
+    std::unordered_set<std::string> remaining_unit_keys;
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        for (size_t i = 0; i < kNumShards; ++i) {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [key, metadata] : shard->metadata) {
+                const auto replica_segments = metadata.GetReplicaSegmentNames();
+                for (const auto& source_segment : job.request.segments) {
+                    if (std::find(replica_segments.begin(),
+                                  replica_segments.end(),
+                                  source_segment) != replica_segments.end()) {
+                        remaining_segments.insert(source_segment);
+                        remaining_unit_keys.insert(
+                            MakeDrainUnitKey(key, source_segment));
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& segment_name : job.request.segments) {
+            if (!remaining_segments.contains(segment_name)) {
+                (void)segment_access.SetSegmentStatusByName(
+                    segment_name, SegmentStatus::DRAINED);
+            }
+        }
+    }
+
+    if (remaining_segments.empty()) {
+        job.status = JobStatus::SUCCEEDED;
+        job.last_updated_at = std::chrono::system_clock::now();
+        job.message = "Drain job finished successfully";
+        return true;
+    }
+
+    bool all_remaining_terminal_failed = !remaining_unit_keys.empty();
+    for (const auto& unit_key : remaining_unit_keys) {
+        if (!job.terminal_failed_unit_keys.contains(unit_key)) {
+            all_remaining_terminal_failed = false;
+            break;
+        }
+    }
+    if (!all_remaining_terminal_failed) {
+        return false;
+    }
+
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& segment_name : job.request.segments) {
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+                    ErrorCode::OK &&
+                status != SegmentStatus::UNMOUNTING) {
+                (void)segment_access.SetSegmentStatusByName(segment_name,
+                                                            SegmentStatus::OK);
+            }
+        }
+    }
+
+    job.status = JobStatus::FAILED;
+    job.last_updated_at = std::chrono::system_clock::now();
+    job.message = "Drain job failed: unrecoverable units remain";
+    return true;
+}
+
+void MasterService::ProcessDrainJobs() {
+    std::vector<std::shared_ptr<DrainJob>> jobs;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        jobs.reserve(drain_jobs_.size());
+        for (const auto& [_, job] : drain_jobs_) {
+            jobs.push_back(job);
+        }
+    }
+
+    for (const auto& job : jobs) {
+        if (!job) {
+            continue;
+        }
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status == JobStatus::SUCCEEDED ||
+            job->status == JobStatus::FAILED ||
+            job->status == JobStatus::CANCELED) {
+            continue;
+        }
+        RefreshDrainJobTasks(*job);
+        if (MaybeCompleteDrainJob(*job)) {
+            continue;
+        }
+        ScheduleDrainJobTasks(*job);
+    }
+}
+
+void MasterService::JobDispatchThreadFunc() {
+    while (job_dispatch_running_) {
+        ProcessDrainJobs();
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+    }
 }
 
 tl::expected<void, SerializationError>

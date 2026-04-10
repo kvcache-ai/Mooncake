@@ -60,7 +60,10 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},
         {ErrorCode::SERIALIZE_FAIL, "SERIALIZE_FAIL"},
         {ErrorCode::DESERIALIZE_FAIL, "DESERIALIZE_FAIL"},
-        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"}};
+        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
+        {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
+        {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
+        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

@@ -268,6 +268,8 @@ enum class ErrorCode : int32_t {
     ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
+    OPLOG_ENTRY_NOT_FOUND =
+        -1004,  ///< OpLog entry not found (backend-agnostic).
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
@@ -293,10 +295,11 @@ enum class ErrorCode : int32_t {
     SERIALIZE_FAIL = -1501,         ///< Serialization failed.
     DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
     PERSISTENT_FAIL = -1503,        ///< Persistent failed.
-    // Task errors (Range: -1400 to -1499)
+    // Task and job errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
     TASK_PENDING_LIMIT_EXCEEDED =
-        -1401,  ///< Total pending tasks exceed the limit.
+        -1401,              ///< Total pending tasks exceed the limit.
+    JOB_NOT_FOUND = -1402,  ///< Job not found.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

@@ -60,6 +60,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
@@ -111,7 +112,11 @@ option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If W
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
-
+option(ENABLE_MULTI_PROTOCOL "option for enabling multi-protocol support in transfer engine" OFF)
+if (ENABLE_MULTI_PROTOCOL)
+    add_compile_definitions(ENABLE_MULTI_PROTOCOL)
+    message(STATUS "Multi-protocol support is enabled")
+endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
 set(LRU_MAX_CAPACITY 1000)
@@ -135,7 +140,7 @@ if (USE_NVMEOF)
 endif()
 
 if (USE_MNNVL)
-  if (NOT USE_HIP AND NOT USE_MUSA)
+  if (NOT USE_HIP AND NOT USE_MUSA AND NOT USE_MACA)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)
@@ -150,6 +155,31 @@ if (USE_CUDA)
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
   )
+endif()
+
+if (NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
+  if (DEFINED ENV{NEUWARE_HOME} AND NOT "$ENV{NEUWARE_HOME}" STREQUAL "")
+    set(NEUWARE_ROOT "$ENV{NEUWARE_HOME}" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+  else()
+    set(NEUWARE_ROOT "/usr/local/neuware" CACHE PATH "Path to Cambricon Neuware SDK" FORCE)
+  endif()
+endif()
+
+if (NOT DEFINED MLU_INCLUDE_DIR OR MLU_INCLUDE_DIR STREQUAL "")
+  set(MLU_INCLUDE_DIR "${NEUWARE_ROOT}/include")
+endif()
+
+if (NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
+  set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
+endif()
+
+if (USE_MLU)
+  add_compile_definitions(USE_MLU)
+  message(STATUS "MLU support is enabled")
+  include_directories(${MLU_INCLUDE_DIR})
+  if (EXISTS "${MLU_LIB_DIR}")
+    link_directories(${MLU_LIB_DIR})
+  endif()
 endif()
 
 if (USE_MACA)

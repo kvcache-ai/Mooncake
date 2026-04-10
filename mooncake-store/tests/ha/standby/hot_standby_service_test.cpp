@@ -29,6 +29,20 @@ class FakeSnapshotProvider final : public SnapshotProvider {
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
 };
 
+LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
+                            std::string key, uint64_t size) {
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = std::move(snapshot_id);
+    snapshot.snapshot_sequence_id = seq_id;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = size;
+    metadata.last_sequence_id = seq_id;
+    snapshot.metadata.emplace_back(std::move(key), metadata);
+    return snapshot;
+}
+
 }  // namespace
 
 class HotStandbyServiceTest : public ::testing::Test {
@@ -41,7 +55,7 @@ class HotStandbyServiceTest : public ::testing::Test {
         config_.max_replication_lag_entries = 1000;
 
         service_ = std::make_unique<HotStandbyService>(config_);
-        etcd_endpoints_ = "http://localhost:2379";
+        oplog_endpoints_ = "http://localhost:2379";
         cluster_id_ = "test_cluster_001";
     }
 
@@ -54,7 +68,7 @@ class HotStandbyServiceTest : public ::testing::Test {
 
     HotStandbyConfig config_;
     std::unique_ptr<HotStandbyService> service_;
-    std::string etcd_endpoints_;
+    std::string oplog_endpoints_;
     std::string cluster_id_;
 };
 
@@ -95,7 +109,7 @@ TEST_F(HotStandbyServiceTest, TestStart) {
         << "Requires real etcd connection, run in integration environment.";
 #else
     ErrorCode err =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
@@ -109,10 +123,10 @@ TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
     // After the first Start fails and state becomes FAILED, the second Start
     // should still return INTERNAL_ERROR
     ErrorCode err1 =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err1);
     ErrorCode err2 =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err2);
 #endif
 }
@@ -152,7 +166,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
     // to FAILED
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
     ErrorCode err =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 #endif
@@ -179,7 +193,7 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
     // In non-etcd mode, the sync phase is not actually executed; just ensure
     // the call is safe
     ErrorCode err =
-        service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 #endif
 }
@@ -203,7 +217,7 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
 #else
     // In non-etcd mode, calling Start will not change applied/primary, but the
     // state machine enters FAILED
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     StandbySyncStatus status = service_->GetSyncStatus();
     EXPECT_EQ(StandbyState::FAILED, status.state);
 #endif
@@ -278,7 +292,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
                     "test warm start.";
 #else
     // In non-etcd mode, only verify that Start is safe to call
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -287,7 +301,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd and snapshot provider configuration.";
 #else
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -300,7 +314,7 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
     config_.enable_snapshot_bootstrap = true;
     // Recreate service to apply the new configuration
     service_.reset(new HotStandbyService(config_));
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     SUCCEED();
 #endif
 }
@@ -310,15 +324,7 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     config_.enable_oplog_following = false;
     service_ = std::make_unique<HotStandbyService>(config_);
 
-    LoadedSnapshot snapshot;
-    snapshot.snapshot_id = "20260330_120000_000";
-    snapshot.snapshot_sequence_id = 42;
-
-    StandbyObjectMetadata metadata;
-    metadata.client_id = UUID{1, 2};
-    metadata.size = 4096;
-    metadata.last_sequence_id = 42;
-    snapshot.metadata.emplace_back("key-1", metadata);
+    auto snapshot = MakeSnapshot("20260330_120000_000", 42, "key-1", 4096);
 
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
@@ -339,6 +345,39 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     ASSERT_EQ(1u, exported.size());
     EXPECT_EQ("key-1", exported[0].first);
     EXPECT_EQ(4096u, exported[0].second.size);
+}
+
+TEST_F(HotStandbyServiceTest,
+       TestStart_SnapshotOnlyRestartRefreshesNewerCatalogSnapshot) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+    service_->Stop();
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_121500_000", 84, "key-new", 8192))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+
+    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-new", exported[0].first);
+    EXPECT_EQ(8192u, exported[0].second.size);
+    EXPECT_EQ(84u, exported[0].second.last_sequence_id);
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
@@ -405,7 +444,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
 #else
     config_.enable_verification = true;
     service_.reset(new HotStandbyService(config_));
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     service_->Stop();
     SUCCEED();
 #endif
@@ -417,7 +456,7 @@ TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd connection to start service.";
 #else
-    (void)service_->Start("primary_unused", etcd_endpoints_, cluster_id_);
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
     service_->Stop();
     SUCCEED();
 #endif

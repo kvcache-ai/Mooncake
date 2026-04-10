@@ -53,6 +53,9 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
+#endif
         std::vector<uint32_t> lkey;         // for rdma
         std::vector<uint32_t> rkey;         // for rdma
         std::string shm_name;               // for nvlink and hip
@@ -189,6 +192,7 @@ class TransferMetadata {
 
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+    int sendProbe(const std::string &peer_server_name);
 
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
@@ -203,6 +207,7 @@ class TransferMetadata {
                             Json::Value &local_json);
     int receivePeerNotify(const Json::Value &peer_json,
                           Json::Value &local_json);
+    int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
     std::string getFullMetadataKey(const std::string &segment_name) const;
 
     bool p2p_handshake_mode_{false};

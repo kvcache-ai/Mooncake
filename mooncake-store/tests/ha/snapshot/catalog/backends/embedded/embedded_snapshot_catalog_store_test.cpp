@@ -161,11 +161,12 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest, GetLatestTrimsWhitespaceMarker) {
 
 TEST_F(EmbeddedSnapshotCatalogStoreTest,
        ListReturnsSnapshotsInDescendingOrder) {
-    PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
-              "m1");
-    PutObject("mooncake_master_snapshot/20240303_120000_001/metadata", "d3");
-    PutObject("mooncake_master_snapshot/20240302_120000_001/segments", "d2");
-    PutObject("mooncake_master_snapshot/latest.txt", "20240303_120000_001");
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240303_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
     PutObject("mooncake_master_snapshot/not-a-snapshot/file.txt", "ignore");
 
     auto snapshots = store_.List(2);
@@ -175,12 +176,52 @@ TEST_F(EmbeddedSnapshotCatalogStoreTest,
     EXPECT_EQ(snapshots->at(1).snapshot_id, "20240302_120000_001");
 }
 
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       ListSkipsSnapshotsWhenDescriptorMissing) {
+    PutObject("mooncake_master_snapshot/20240303_120000_001/manifest.txt",
+              "m3");
+
+    auto snapshots = store_.List(0);
+    ASSERT_TRUE(snapshots.has_value());
+    EXPECT_TRUE(snapshots->empty());
+}
+
+TEST_F(EmbeddedSnapshotCatalogStoreTest,
+       ListSkipsUnreadableSnapshotsAndKeepsHealthyEntries) {
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240303_120000_001")),
+              ErrorCode::OK);
+
+    auto delete_result = backend_.DeleteObjectsWithPrefix(
+        "mooncake_master_snapshot/20240303_120000_001/descriptor.txt");
+    ASSERT_TRUE(delete_result.has_value()) << delete_result.error();
+
+    auto snapshots = store_.List(0);
+    ASSERT_TRUE(snapshots.has_value());
+    ASSERT_EQ(snapshots->size(), 1u);
+    EXPECT_EQ(snapshots->at(0).snapshot_id, "20240301_120000_001");
+}
+
+TEST(EmbeddedSnapshotCatalogStoreStandaloneTest,
+     ListReturnsInvalidParamsWhenObjectStoreMissing) {
+    ha::backends::embedded::EmbeddedSnapshotCatalogStore store(nullptr);
+
+    auto snapshots = store.List(0);
+    ASSERT_FALSE(snapshots.has_value());
+    EXPECT_EQ(snapshots.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(EmbeddedSnapshotCatalogStoreTest, DeleteRemovesSnapshotObjectsByPrefix) {
     PutObject("mooncake_master_snapshot/20240301_120000_001/manifest.txt",
               "m1");
     PutObject("mooncake_master_snapshot/20240301_120000_001/metadata", "d1");
     PutObject("mooncake_master_snapshot/20240302_120000_001/manifest.txt",
               "m2");
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240301_120000_001")),
+              ErrorCode::OK);
+    ASSERT_EQ(store_.Publish(MakeDescriptor("20240302_120000_001")),
+              ErrorCode::OK);
 
     auto delete_result = store_.Delete("20240301_120000_001");
     ASSERT_EQ(delete_result, ErrorCode::OK);

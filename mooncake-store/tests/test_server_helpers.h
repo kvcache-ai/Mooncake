@@ -29,15 +29,23 @@ class InProcMaster {
 
     bool Start(InProcMasterConfig config) {
         try {
-            // Choose ports if not provided
+            // Choose ports if not provided.
+            // Allocate all needed ports atomically to avoid collisions
+            // from rapid sequential getFreeTcpPort() calls (TOCTOU).
+            int needed = (!config.rpc_port.has_value()) +
+                         (!config.http_metrics_port.has_value()) +
+                         (!config.http_metadata_port.has_value());
+            auto free_ports = getFreeTcpPorts(needed);
+            if (static_cast<int>(free_ports.size()) < needed) return false;
+            int idx = 0;
             rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
-                                                    : getFreeTcpPort();
+                                                    : free_ports[idx++];
             http_metrics_port_ = config.http_metrics_port.has_value()
                                      ? config.http_metrics_port.value()
-                                     : getFreeTcpPort();
+                                     : free_ports[idx++];
             http_metadata_port_ = config.http_metadata_port.has_value()
                                       ? config.http_metadata_port.value()
-                                      : getFreeTcpPort();
+                                      : free_ports[idx++];
 
             // Optional HTTP metadata server
             if (http_metadata_port_ > 0) {

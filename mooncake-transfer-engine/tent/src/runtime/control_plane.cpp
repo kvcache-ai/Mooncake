@@ -92,6 +92,11 @@ Status ControlClient::notify(const std::string& server_addr,
     return tl_rpc_agent.call(server_addr, Notify, request, response);
 }
 
+Status ControlClient::probe(const std::string& server_addr) {
+    std::string request, response;
+    return tl_rpc_agent.call(server_addr, Probe, request, response);
+}
+
 inline void to_json(json& j, const Request& r) {
     j = json{{"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
              {"source", reinterpret_cast<uintptr_t>(r.source)},
@@ -199,6 +204,10 @@ ControlService::ControlService(const std::string& type,
             onNotify(request, response);
         });
     rpc_server_->registerFunction(
+        Probe, [this](const std::string_view& request, std::string& response) {
+            onProbe(request, response);
+        });
+    rpc_server_->registerFunction(
         Delegate,
         [this](const std::string_view& request, std::string& response) {
             onDelegate(request, response);
@@ -210,6 +219,16 @@ ControlService::ControlService(const std::string& type,
     rpc_server_->registerFunction(
         Unpin, [this](const std::string_view& request, std::string& response) {
             onUnpinStageBuffer(request, response);
+        });
+    rpc_server_->registerFunction(
+        SubscribeSegmentUpdate,
+        [this](const std::string_view& request, std::string& response) {
+            onSubscribeSegmentUpdate(request, response);
+        });
+    rpc_server_->registerFunction(
+        NotifySegmentUpdated,
+        [this](const std::string_view& request, std::string& response) {
+            onSegmentUpdated(request, response);
         });
 }
 
@@ -285,6 +304,12 @@ void ControlService::onNotify(const std::string_view& request,
     if (notify_callback_) notify_callback_(message);
 }
 
+void ControlService::onProbe(const std::string_view& request,
+                             std::string& response) {
+    (void)request;
+    (void)response;
+}
+
 void ControlService::onDelegate(const std::string_view& request,
                                 std::string& response) {
     Request user_request = json::parse(std::string(request)).get<Request>();
@@ -304,6 +329,52 @@ void ControlService::onUnpinStageBuffer(const std::string_view& request,
                                         std::string& response) {
     uint64_t addr = json::parse(request).get<uint64_t>();
     impl_->unlockStageBuffer(addr);
+}
+
+void ControlService::onSubscribeSegmentUpdate(const std::string_view& request,
+                                              std::string& response) {
+    std::string peer_addr =
+        json::parse(std::string(request)).get<std::string>();
+    manager_->addSubscriber(peer_addr);
+}
+
+void ControlService::onSegmentUpdated(const std::string_view& request,
+                                      std::string& response) {
+    std::string segment_name =
+        json::parse(std::string(request)).get<std::string>();
+
+    manager_->invalidateAllCacheForRemote(segment_name);
+
+    VLOG(1) << "Invalidated cache for segment " << segment_name
+            << " due to remote update notification";
+}
+
+void ControlClient::subscribeSegmentUpdateAsync(
+    const std::string& server_addr, const std::string& subscriber_addr) {
+    json j = subscriber_addr;
+    std::string request = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, SubscribeSegmentUpdate, request,
+        [](const Status& status, const std::string&) {
+            if (!status.ok()) {
+                LOG(ERROR) << "SubscribeSegmentUpdate RPC failed with: "
+                           << status.ToString();
+            }
+        });
+}
+
+void ControlClient::notifySegmentUpdatedAsync(
+    const std::string& server_addr, const std::string& segment_name,
+    const onNotifySegmentUpdateFailure& on_failure) {
+    json j = segment_name;
+    std::string request = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, NotifySegmentUpdated, request,
+        [on_failure](const Status& status, const std::string&) {
+            if (!status.ok()) {
+                on_failure();
+            }
+        });
 }
 
 }  // namespace tent

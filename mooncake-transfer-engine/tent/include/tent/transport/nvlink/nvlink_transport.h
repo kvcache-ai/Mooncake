@@ -17,8 +17,10 @@
 
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_set>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -109,6 +111,9 @@ class NVLinkTransport : public Transport {
     std::string machine_id_;
     uint64_t async_memcpy_threshold_;
     bool host_register_;
+
+    std::mutex register_mutex_;
+    std::unordered_set<uint64_t> registered_base_addrs_;
 };
 }  // namespace tent
 }  // namespace mooncake

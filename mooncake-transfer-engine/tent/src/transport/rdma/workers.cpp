@@ -122,28 +122,37 @@ Status Workers::cancel(RdmaSliceList& slice_list) {
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
-    std::string target_seg_name, target_dev_name;
-    std::string rpc_server_addr;
+    std::string rpc_server_addr, target_seg_name, target_dev_name;
     RouteHint hint;
+    auto& segment_manager = transport_->metadata_->segmentManager();
     auto target_id = path.remote_segment_id;
     auto device_id = path.remote_device_id;
-    auto& segment_manager = transport_->metadata_->segmentManager();
-    if (target_id == LOCAL_SEGMENT_ID) {
-        hint.segment = segment_manager.getLocal().get();
-    } else {
-        segment_manager.getRemoteCached(hint.segment, target_id);
-    }
-    if (hint.segment->type != SegmentType::Memory) return nullptr;
-    hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
-    if (target_id != LOCAL_SEGMENT_ID) {
-        rpc_server_addr = hint.segment->getMemory().rpc_server_addr;
-    }
-    target_seg_name = hint.segment->name;
-    target_dev_name = hint.topo->getNicName(device_id);
-    if (target_seg_name.empty() || target_dev_name.empty()) {
-        LOG(ERROR) << "Empty target segment or device name";
+
+    auto status =
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
+            hint.segment = segment;
+            if (segment->type != SegmentType::Memory) {
+                return Status::NeedsRefreshCache(
+                    "Segment type is not Memory" LOC_MARK);
+            }
+            hint.topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
+            if (target_id != LOCAL_SEGMENT_ID) {
+                rpc_server_addr = segment->rpc_server_addr;
+            }
+            target_seg_name = segment->name;
+            target_dev_name = hint.topo->getNicName(device_id);
+            if (target_seg_name.empty() || target_dev_name.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty target segment or device name" LOC_MARK);
+            }
+            return Status::OK();
+        });
+
+    if (!status.ok()) {
+        LOG(ERROR) << status.ToString();
         return nullptr;
     }
+
     auto context = transport_->context_set_[path.local_device_id].get();
     if (context->status() != RdmaContext::DEVICE_ENABLED) {
         // LOG(WARNING) << "Context " << context->name() << " is not serving";
@@ -449,18 +458,20 @@ void Workers::monitorThread() {
 Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
                              uint64_t addr, uint64_t length) {
     auto& segment_manager = transport_->metadata_->segmentManager();
-    if (segment_id == LOCAL_SEGMENT_ID) {
-        hint.segment = segment_manager.getLocal().get();
-    } else {
-        CHECK_STATUS(segment_manager.getRemoteCached(hint.segment, segment_id));
-    }
-    hint.buffer = hint.segment->findBuffer(addr, length);
-    if (!hint.buffer) {
-        return Status::AddressNotRegistered(
-            "No matched buffer in given address range" LOC_MARK);
-    }
-    if (hint.segment->type != SegmentType::Memory)
-        return Status::AddressNotRegistered("Segment type not memory" LOC_MARK);
+    CHECK_STATUS(segment_manager.withCachedSegment(
+        segment_id, [&](SegmentDesc* segment) {
+            hint.segment = segment;
+            hint.buffer = segment->findBuffer(addr, length);
+            if (!hint.buffer)
+                return Status::NeedsRefreshCache(
+                    "No matched buffer in given address range" LOC_MARK);
+
+            if (hint.segment->type != SegmentType::Memory)
+                return Status::NeedsRefreshCache(
+                    "Segment type not memory" LOC_MARK);
+            return Status::OK();
+        }));
+
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
     std::string location = hint.buffer->location;
     if (!hint.buffer->regions.empty()) {
