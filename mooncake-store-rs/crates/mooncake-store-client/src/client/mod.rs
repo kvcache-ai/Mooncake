@@ -17,7 +17,7 @@ use tracing::{debug, info, info_span};
 
 use crate::control_plane::{
     control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
-    ControlPlaneHandle, ReleaseOp, ReserveSpecificOp,
+    ControlPlaneHandle, EvictionService, ReleaseOp, ReserveSpecificOp,
 };
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, StorageExtentInfo, StorageSegmentSpec,
@@ -49,6 +49,7 @@ pub struct StoreClient {
     _control_plane: ControlPlaneHandle,
     control_client: Arc<ControlPlaneClient>,
     allocator: Arc<Mutex<LocalAllocatorState>>,
+    storage_owner: Arc<StorageOwnerState>,
     lease: ClientLease,
     live_client_cache: SharedLiveClientCache,
     membership_sync: MembershipSyncHandle,

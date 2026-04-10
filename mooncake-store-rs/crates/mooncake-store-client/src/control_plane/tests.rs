@@ -15,11 +15,11 @@ use super::{
     pb_segment_reservation, status_to_store_error, store_error_from_pb, try_cas_result,
     try_compatibility, try_object_route, try_replica_route, try_replica_tier, try_route_state,
     try_runtime_id, try_segment_reservation, AllocatorService, AuthorityService,
-    ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, GrpcControlPlaneService,
-    ReleaseOp, ReserveSpecificOp,
+    ControlPlaneClient, ControlPlaneHandle, ControlStreamSession, EvictionService,
+    GrpcControlPlaneService, ReleaseOp, ReserveSpecificOp,
 };
-use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use crate::control_plane::pb;
+use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
@@ -162,6 +162,25 @@ impl AllocatorService for TestAllocator {
     }
 }
 
+#[derive(Default)]
+struct TestEviction {
+    reported: Mutex<Vec<ObjectKey>>,
+}
+
+impl EvictionService for TestEviction {
+    fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> mooncake_store_core::Result<usize> {
+        self.reported.lock().extend_from_slice(keys);
+        Ok(keys.len())
+    }
+
+    fn batch_track_routes(&self, routes: &[ObjectRoute]) -> mooncake_store_core::Result<usize> {
+        self.reported
+            .lock()
+            .extend(routes.iter().map(|route| route.key.clone()));
+        Ok(routes.len())
+    }
+}
+
 struct ClosingStreamService {
     inner: GrpcControlPlaneService,
 }
@@ -261,6 +280,20 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.batch_release(request).await
     }
 
+    async fn batch_report_route_hits(
+        &self,
+        request: Request<pb::BatchReportRouteHitsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReportRouteHitsReply>, Status> {
+        self.inner.batch_report_route_hits(request).await
+    }
+
+    async fn batch_track_replica_routes(
+        &self,
+        request: Request<pb::BatchTrackReplicaRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchTrackReplicaRoutesReply>, Status> {
+        self.inner.batch_track_replica_routes(request).await
+    }
+
     async fn control_stream(
         &self,
         _request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
@@ -279,6 +312,7 @@ impl ClosingStreamHandle {
     fn spawn(
         authority: Arc<dyn AuthorityService>,
         allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
     ) -> mooncake_store_core::Result<Self> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
             StoreError::Transport(format!("closing stream bind failed: {error}"))
@@ -301,7 +335,7 @@ impl ClosingStreamHandle {
                     .build()
                     .expect("test runtime should start");
                 let service = ClosingStreamService {
-                    inner: GrpcControlPlaneService::new(authority, allocator),
+                    inner: GrpcControlPlaneService::new(authority, allocator, eviction),
                 };
                 runtime.block_on(async move {
                     let listener = tokio::net::TcpListener::from_std(listener)
@@ -313,9 +347,12 @@ impl ClosingStreamHandle {
                                 service,
                             ),
                         )
-                        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                            let _ = shutdown_rx.await;
-                        })
+                        .serve_with_incoming_shutdown(
+                            TcpListenerStream::new(listener),
+                            async move {
+                                let _ = shutdown_rx.await;
+                            },
+                        )
                         .await
                         .expect("closing stream server should run");
                 });
@@ -395,11 +432,17 @@ fn sample_lease(address: &str) -> ClientLease {
 fn control_plane_client_round_trips_routes_and_allocator_calls() {
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
     let owner = sample_owner();
     authority.insert(sample_route("alpha", 1, &owner));
 
-    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority.clone(), allocator.clone())
-        .expect("control plane server should start");
+    let mut handle = ControlPlaneHandle::spawn(
+        "127.0.0.1",
+        authority.clone(),
+        allocator.clone(),
+        eviction.clone(),
+    )
+    .expect("control plane server should start");
     let lease = sample_lease(handle.address());
     let client = ControlPlaneClient::new().expect("control plane client should start");
     let authority_id = ClientStableId::new("authority");
@@ -486,6 +529,20 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
         .expect("list by owner should succeed");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key.0, "beta");
+
+    assert_eq!(
+        client
+            .batch_report_route_hits(&lease, &[ObjectKey::new("beta"), ObjectKey::new("alpha")])
+            .expect("batch report route hits should succeed"),
+        2
+    );
+    assert_eq!(
+        client
+            .batch_track_replica_routes(&lease, &[sample_route("delta", 3, &owner)])
+            .expect("batch track replica routes should succeed"),
+        1
+    );
+    assert_eq!(eviction.reported.lock().len(), 3);
 
     let single_reservation = client
         .reserve_any(&lease, &owner, 32)
@@ -716,9 +773,10 @@ fn control_plane_client_short_circuits_empty_batches_and_rejects_bad_uris() {
 fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
     let owner = sample_owner();
     authority.insert(sample_route("alpha", 1, &owner));
-    let service = GrpcControlPlaneService::new(authority, allocator);
+    let service = GrpcControlPlaneService::new(authority, allocator, eviction.clone());
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
@@ -877,6 +935,26 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .expect_err("batch release requires owner");
         assert_eq!(release_error.code(), tonic::Code::InvalidArgument);
 
+        let hit_reply = service
+            .batch_report_route_hits(Request::new(pb::BatchReportRouteHitsRequest {
+                keys: vec!["alpha".to_string(), "beta".to_string()],
+            }))
+            .await
+            .expect("batch report route hits should reply")
+            .into_inner();
+        assert_eq!(hit_reply.accepted, 2);
+        assert_eq!(eviction.reported.lock().len(), 2);
+
+        let track_reply = service
+            .batch_track_replica_routes(Request::new(pb::BatchTrackReplicaRoutesRequest {
+                routes: vec![pb_object_route(&sample_route("delta", 4, &owner))],
+            }))
+            .await
+            .expect("batch track routes should reply")
+            .into_inner();
+        assert_eq!(track_reply.accepted, 1);
+        assert_eq!(eviction.reported.lock().len(), 3);
+
         let stream_reply = handle_control_stream_request(
             &service,
             pb::ControlStreamRequest {
@@ -888,6 +966,48 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
         assert_eq!(stream_reply.request_id, 99);
         assert!(stream_reply.error.is_some());
         assert!(stream_reply.body.is_none());
+
+        let hit_stream_reply = handle_control_stream_request(
+            &service,
+            pb::ControlStreamRequest {
+                request_id: 100,
+                body: Some(pb::control_stream_request::Body::EvictionReportRouteHits(
+                    pb::BatchReportRouteHitsRequest {
+                        keys: vec!["gamma".to_string()],
+                    },
+                )),
+            },
+        )
+        .await;
+        let pb::control_stream_reply::Body::EvictionReportRouteHits(body) = hit_stream_reply
+            .body
+            .expect("hit stream reply should include body")
+        else {
+            panic!("unexpected hit stream reply body");
+        };
+        assert_eq!(body.accepted, 1);
+
+        let track_stream_reply = handle_control_stream_request(
+            &service,
+            pb::ControlStreamRequest {
+                request_id: 101,
+                body: Some(
+                    pb::control_stream_request::Body::EvictionTrackReplicaRoutes(
+                        pb::BatchTrackReplicaRoutesRequest {
+                            routes: vec![pb_object_route(&sample_route("omega", 1, &owner))],
+                        },
+                    ),
+                ),
+            },
+        )
+        .await;
+        let pb::control_stream_reply::Body::EvictionTrackReplicaRoutes(body) = track_stream_reply
+            .body
+            .expect("track stream reply should include body")
+        else {
+            panic!("unexpected track stream reply body");
+        };
+        assert_eq!(body.accepted, 1);
     });
 }
 
@@ -895,11 +1015,13 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
 fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
     let owner = sample_owner();
     authority.insert(sample_route("alpha", 1, &owner));
 
-    let mut handle = ClosingStreamHandle::spawn(authority.clone(), allocator.clone())
-        .expect("closing stream server should start");
+    let mut handle =
+        ClosingStreamHandle::spawn(authority.clone(), allocator.clone(), eviction.clone())
+            .expect("closing stream server should start");
     let lease = sample_lease(handle.address());
     let client = ControlPlaneClient::new().expect("control plane client should build");
     let authority_id = ClientStableId::new("authority");
@@ -978,6 +1100,20 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
         .expect("fallback release should succeed");
     assert!(release[0].is_ok());
     assert_eq!(allocator.released.lock().len(), 1);
+
+    assert_eq!(
+        client
+            .batch_report_route_hits(&lease, &[ObjectKey::new("alpha")])
+            .expect("fallback hit reporting should succeed"),
+        1
+    );
+    assert_eq!(
+        client
+            .batch_track_replica_routes(&lease, &[sample_route("track-alpha", 5, &owner)])
+            .expect("fallback route tracking should succeed"),
+        1
+    );
+    assert_eq!(eviction.reported.lock().len(), 2);
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);

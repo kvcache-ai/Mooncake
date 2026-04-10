@@ -13,6 +13,7 @@ impl ControlPlaneHandle {
         bind_host: &str,
         authority: Arc<dyn AuthorityService>,
         allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
     ) -> Result<Self> {
         let listener = std::net::TcpListener::bind((bind_host, 0)).map_err(|error| {
             StoreError::Transport(format!("control plane bind on {bind_host} failed: {error}"))
@@ -35,7 +36,16 @@ impl ControlPlaneHandle {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let thread = thread::Builder::new()
             .name(format!("store-control-{address}"))
-            .spawn(move || run_server(runtime, listener, shutdown_rx, authority, allocator))
+            .spawn(move || {
+                run_server(
+                    runtime,
+                    listener,
+                    shutdown_rx,
+                    authority,
+                    allocator,
+                    eviction,
+                )
+            })
             .map_err(|error| {
                 StoreError::Transport(format!("control plane spawn failed: {error}"))
             })?;
@@ -70,8 +80,9 @@ fn run_server(
     shutdown: oneshot::Receiver<()>,
     authority: Arc<dyn AuthorityService>,
     allocator: Arc<dyn AllocatorService>,
+    eviction: Arc<dyn EvictionService>,
 ) {
-    let service = GrpcControlPlaneService::new(authority, allocator);
+    let service = GrpcControlPlaneService::new(authority, allocator, eviction);
     let result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
@@ -95,16 +106,19 @@ fn run_server(
 pub(super) struct GrpcControlPlaneService {
     authority: Arc<dyn AuthorityService>,
     allocator: Arc<dyn AllocatorService>,
+    eviction: Arc<dyn EvictionService>,
 }
 
 impl GrpcControlPlaneService {
     pub(super) fn new(
         authority: Arc<dyn AuthorityService>,
         allocator: Arc<dyn AllocatorService>,
+        eviction: Arc<dyn EvictionService>,
     ) -> Self {
         Self {
             authority,
             allocator,
+            eviction,
         }
     }
 }
@@ -218,6 +232,52 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             },
             Err(error) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
+                error: Some(pb_error(error)),
+            },
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn batch_report_route_hits(
+        &self,
+        request: Request<pb::BatchReportRouteHitsRequest>,
+    ) -> std::result::Result<Response<pb::BatchReportRouteHitsReply>, Status> {
+        let request = request.into_inner();
+        let keys = request
+            .keys
+            .into_iter()
+            .map(ObjectKey::new)
+            .collect::<Vec<_>>();
+        let reply = match self.eviction.batch_report_route_hits(&keys) {
+            Ok(accepted) => pb::BatchReportRouteHitsReply {
+                accepted: accepted as u64,
+                error: None,
+            },
+            Err(error) => pb::BatchReportRouteHitsReply {
+                accepted: 0,
+                error: Some(pb_error(error)),
+            },
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn batch_track_replica_routes(
+        &self,
+        request: Request<pb::BatchTrackReplicaRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchTrackReplicaRoutesReply>, Status> {
+        let request = request.into_inner();
+        let routes = request
+            .routes
+            .into_iter()
+            .map(try_object_route)
+            .collect::<Result<Vec<_>>>();
+        let reply = match routes.and_then(|routes| self.eviction.batch_track_routes(&routes)) {
+            Ok(accepted) => pb::BatchTrackReplicaRoutesReply {
+                accepted: accepted as u64,
+                error: None,
+            },
+            Err(error) => pb::BatchTrackReplicaRoutesReply {
+                accepted: 0,
                 error: Some(pb_error(error)),
             },
         };
@@ -561,8 +621,11 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         &self,
         request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
-        let service =
-            GrpcControlPlaneService::new(self.authority.clone(), self.allocator.clone());
+        let service = GrpcControlPlaneService::new(
+            self.authority.clone(),
+            self.allocator.clone(),
+            self.eviction.clone(),
+        );
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         tokio::spawn(async move {
@@ -605,6 +668,16 @@ pub(super) async fn handle_control_stream_request(
             .await
             .map(Response::into_inner)
             .map(pb::control_stream_reply::Body::RouteListByReplicaOwner),
+        Some(pb::control_stream_request::Body::EvictionReportRouteHits(batch)) => service
+            .batch_report_route_hits(Request::new(batch))
+            .await
+            .map(Response::into_inner)
+            .map(pb::control_stream_reply::Body::EvictionReportRouteHits),
+        Some(pb::control_stream_request::Body::EvictionTrackReplicaRoutes(batch)) => service
+            .batch_track_replica_routes(Request::new(batch))
+            .await
+            .map(Response::into_inner)
+            .map(pb::control_stream_reply::Body::EvictionTrackReplicaRoutes),
         Some(pb::control_stream_request::Body::RouteReplace(batch)) => service
             .batch_replace_routes(Request::new(batch))
             .await

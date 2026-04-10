@@ -49,6 +49,10 @@ fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
         && left.compatibility.transport_api_version == right.compatibility.transport_api_version
 }
 
+fn should_fallback_to_metadata_allocator(error: &StoreError) -> bool {
+    matches!(error, StoreError::Transport(_) | StoreError::Unsupported(_))
+}
+
 fn control_bind_host(rpc_address: &str) -> String {
     if rpc_address.is_empty() {
         return "127.0.0.1".to_string();

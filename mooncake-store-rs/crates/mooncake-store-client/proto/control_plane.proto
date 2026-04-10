@@ -16,6 +16,8 @@ service ControlPlaneService {
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
   rpc ListRoutesByReplicaOwner(ListRoutesByReplicaOwnerRequest) returns (ListRoutesByReplicaOwnerReply);
+  rpc BatchReportRouteHits(BatchReportRouteHitsRequest) returns (BatchReportRouteHitsReply);
+  rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
   rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
 
@@ -251,6 +253,24 @@ message ListRoutesByReplicaOwnerReply {
   ErrorDetail error = 2;
 }
 
+message BatchReportRouteHitsRequest {
+  repeated string keys = 1;
+}
+
+message BatchReportRouteHitsReply {
+  uint64 accepted = 1;
+  ErrorDetail error = 2;
+}
+
+message BatchTrackReplicaRoutesRequest {
+  repeated ObjectRoute routes = 1;
+}
+
+message BatchTrackReplicaRoutesReply {
+  uint64 accepted = 1;
+  ErrorDetail error = 2;
+}
+
 message ControlStreamRequest {
   uint64 request_id = 1;
   oneof body {
@@ -261,6 +281,8 @@ message ControlStreamRequest {
     BatchReserveSpecificRequest allocator_reserve_specific = 6;
     BatchReleaseRequest allocator_release = 7;
     ListRoutesByReplicaOwnerRequest route_list_by_replica_owner = 8;
+    BatchReportRouteHitsRequest eviction_report_route_hits = 9;
+    BatchTrackReplicaRoutesRequest eviction_track_replica_routes = 10;
   }
 }
 
@@ -274,6 +296,8 @@ message ControlStreamReply {
     BatchReserveSpecificReply allocator_reserve_specific = 6;
     BatchReleaseReply allocator_release = 7;
     ListRoutesByReplicaOwnerReply route_list_by_replica_owner = 8;
+    BatchReportRouteHitsReply eviction_report_route_hits = 9;
+    BatchTrackReplicaRoutesReply eviction_track_replica_routes = 10;
   }
-  ErrorDetail error = 9;
+  ErrorDetail error = 11;
 }

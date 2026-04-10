@@ -68,6 +68,8 @@ impl StoreClient {
                 "route update lost race for tenant={tenant} key={key}"
             )));
         }
+        self.storage_owner.track_route(&route);
+        self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
         if let Some(previous) = current {
             self.reclaim_route(previous, reclaim_mode)?;
         }
@@ -658,6 +660,7 @@ impl StoreClient {
             .map(|index| lengths[*index] as u64)
             .sum::<u64>();
         if remote_indices.is_empty() {
+            self.report_get_hits_best_effort(resolved);
             debug!(
                 runtime = %self.lease.runtime,
                 total_items = resolved.len(),
@@ -709,7 +712,113 @@ impl StoreClient {
             remote_direct_fallbacks,
             "batch get completed across local and remote paths"
         );
+        self.report_get_hits_best_effort(resolved);
         Ok(lengths)
+    }
+
+    fn report_get_hits_best_effort(&self, resolved: &[ResolvedObject]) {
+        if resolved.is_empty() {
+            return;
+        }
+        let mut local_hits = BTreeSet::new();
+        let mut remote_hits = BTreeMap::<ClientRuntimeId, BTreeSet<ObjectKey>>::new();
+        for entry in resolved {
+            let key = self.scoped_key(&entry.tenant, &entry.key);
+            if entry.replica.owner == self.lease.runtime {
+                local_hits.insert(key);
+            } else {
+                remote_hits
+                    .entry(entry.replica.owner.clone())
+                    .or_default()
+                    .insert(key);
+            }
+        }
+        if !local_hits.is_empty() {
+            let local_hits = local_hits.into_iter().collect::<Vec<_>>();
+            let _ = self.storage_owner.report_route_hits(&local_hits);
+        }
+        if remote_hits.is_empty() {
+            return;
+        }
+        let leases = match self.lookup_runtime_leases(remote_hits.keys().cloned()) {
+            Ok(leases) => leases,
+            Err(error) => {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    error = %error,
+                    targets = remote_hits.len(),
+                    "failed to resolve storage-owner leases for hit reporting"
+                );
+                return;
+            }
+        };
+        for (owner, keys) in remote_hits {
+            let Some(lease) = leases.get(&owner) else {
+                continue;
+            };
+            let keys = keys.into_iter().collect::<Vec<_>>();
+            if let Err(error) = self.control_client.batch_report_route_hits(lease, &keys) {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    storage_owner = %owner,
+                    error = %error,
+                    items = keys.len(),
+                    "storage-owner hit report failed"
+                );
+            }
+        }
+    }
+
+    fn track_remote_storage_owners_best_effort(&self, routes: &[ObjectRoute]) {
+        if routes.is_empty() {
+            return;
+        }
+        let mut grouped = BTreeMap::<ClientRuntimeId, BTreeMap<String, ObjectRoute>>::new();
+        for route in routes {
+            let mut owners = BTreeSet::new();
+            for replica in route
+                .replicas
+                .iter()
+                .filter(|replica| replica.owner != self.lease.runtime)
+            {
+                if owners.insert(replica.owner.clone()) {
+                    grouped
+                        .entry(replica.owner.clone())
+                        .or_default()
+                        .insert(route.key.0.clone(), route.clone());
+                }
+            }
+        }
+        if grouped.is_empty() {
+            return;
+        }
+        let leases = match self.lookup_runtime_leases(grouped.keys().cloned()) {
+            Ok(leases) => leases,
+            Err(error) => {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    error = %error,
+                    targets = grouped.len(),
+                    "failed to resolve storage-owner leases for route tracking"
+                );
+                return;
+            }
+        };
+        for (owner, routes) in grouped {
+            let Some(lease) = leases.get(&owner) else {
+                continue;
+            };
+            let routes = routes.into_values().collect::<Vec<_>>();
+            if let Err(error) = self.control_client.batch_track_replica_routes(lease, &routes) {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    storage_owner = %owner,
+                    error = %error,
+                    items = routes.len(),
+                    "storage-owner route tracking failed"
+                );
+            }
+        }
     }
 
     fn plan_remote_get_chunk(

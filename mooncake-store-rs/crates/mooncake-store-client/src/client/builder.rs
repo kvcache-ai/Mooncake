@@ -140,13 +140,37 @@ impl StoreClientBuilder {
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
         let live_client_cache = Arc::new(Mutex::new(LiveClientCache::default()));
         let control_client = Arc::new(ControlPlaneClient::new()?);
+        let provisional_lease = ClientLease {
+            runtime: runtime.clone(),
+            state: self.initial_state,
+            compatibility: self.compatibility,
+            endpoints: endpoints.clone(),
+            expires_at_ms,
+        };
+        let route_directory = build_route_directory(
+            self.route_control,
+            self.metadata.clone(),
+            &provisional_lease,
+            control_client.clone(),
+            live_client_cache.clone(),
+        );
+        let storage_owner = Arc::new(StorageOwnerState::new(
+            runtime.clone(),
+            provisional_lease.clone(),
+            self.metadata.clone(),
+            route_directory.clone(),
+            allocator.clone(),
+        ));
+        let storage_adapter = Arc::new(LocalAllocatorAdapter {
+            runtime: runtime.clone(),
+            allocator: allocator.clone(),
+            storage_owner: storage_owner.clone(),
+        });
         let control_plane = ControlPlaneHandle::spawn(
             &control_bind_host(&endpoints.rpc_address),
             Arc::new(LocalAuthorityAdapter),
-            Arc::new(LocalAllocatorAdapter {
-                runtime: runtime.clone(),
-                allocator: allocator.clone(),
-            }),
+            storage_adapter.clone(),
+            storage_adapter,
         )?;
         endpoints
             .labels
@@ -155,7 +179,7 @@ impl StoreClientBuilder {
         let lease = ClientLease {
             runtime: runtime.clone(),
             state: self.initial_state,
-            compatibility: self.compatibility,
+            compatibility: provisional_lease.compatibility.clone(),
             endpoints,
             expires_at_ms,
         };
@@ -165,13 +189,6 @@ impl StoreClientBuilder {
             &live_client_cache,
             "live_client_snapshot_prewarm",
         )?;
-        let route_directory = build_route_directory(
-            self.route_control,
-            self.metadata.clone(),
-            &lease,
-            control_client.clone(),
-            live_client_cache.clone(),
-        );
         let membership_sync = MembershipSyncHandle::spawn(
             &runtime,
             self.metadata.clone(),
@@ -184,6 +201,7 @@ impl StoreClientBuilder {
             _control_plane: control_plane,
             control_client,
             allocator,
+            storage_owner,
             lease,
             live_client_cache,
             membership_sync,

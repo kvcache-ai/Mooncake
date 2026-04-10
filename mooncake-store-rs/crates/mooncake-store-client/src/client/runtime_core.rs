@@ -489,14 +489,44 @@ impl StoreClient {
                     }
                 }
             }
-            return match segment_name {
-                Some(segment_name) => {
-                    self.allocator
+            let allow_local_eviction = self
+                .lease
+                .endpoints
+                .labels
+                .get("storage")
+                .is_some_and(|value| value == "true");
+            if !allow_local_eviction {
+                return match segment_name {
+                    Some(segment_name) => self
+                        .allocator
                         .lock()
-                        .reserve_specific(owner, segment_name, length_bytes)
+                        .reserve_specific(owner, segment_name, length_bytes),
+                    None => self.allocator.lock().reserve_any(owner, length_bytes),
+                };
+            }
+            let mut last_error = None;
+            for _ in 0..=32usize {
+                let reservation = match segment_name {
+                    Some(segment_name) => self
+                        .allocator
+                        .lock()
+                        .reserve_specific(owner, segment_name, length_bytes),
+                    None => self.allocator.lock().reserve_any(owner, length_bytes),
+                };
+                match reservation {
+                    Ok(reservation) => return Ok(reservation),
+                    Err(StoreError::Allocator(message)) => {
+                        last_error = Some(message);
+                    }
+                    Err(error) => return Err(error),
                 }
-                None => self.allocator.lock().reserve_any(owner, length_bytes),
-            };
+                if !self.storage_owner.evict_one(segment_name)? {
+                    break;
+                }
+            }
+            return Err(StoreError::Allocator(last_error.unwrap_or_else(|| {
+                format!("no writable active segment available for {}", owner)
+            })));
         }
 
         let owner_lease = self.lookup_runtime_lease(owner)?;
@@ -513,7 +543,7 @@ impl StoreClient {
         };
         match rpc_result {
             Ok(reservation) => Ok(reservation),
-            Err(error) => {
+            Err(error) if should_fallback_to_metadata_allocator(&error) => {
                 debug!(
                     owner = %owner,
                     segment = segment_name.map(|segment| segment.0.as_str()).unwrap_or("*"),
@@ -522,6 +552,7 @@ impl StoreClient {
                 );
                 self.reserve_segment_allocation_via_metadata(owner, segment_name, length_bytes)
             }
+            Err(error) => Err(error),
         }
     }
 
