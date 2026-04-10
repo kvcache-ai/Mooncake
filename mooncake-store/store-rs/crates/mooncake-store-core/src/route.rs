@@ -124,3 +124,63 @@ pub struct RouteCasRequest {
 fn default_segment_alignment_bytes() -> u64 {
     1
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        default_segment_alignment_bytes, ObjectKey, RouteVersion, SegmentAnnouncement,
+        SegmentLifecycleState, SegmentName,
+    };
+    use crate::{
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        CompatibilityDescriptor,
+    };
+
+    #[test]
+    fn object_and_segment_name_helpers_wrap_strings_directly() {
+        assert_eq!(ObjectKey::new("alpha").0, "alpha");
+        assert_eq!(SegmentName::new("segment-a").0, "segment-a");
+    }
+
+    #[test]
+    fn route_version_next_saturates_at_max_value() {
+        assert_eq!(RouteVersion(9).next(), RouteVersion(10));
+        assert_eq!(RouteVersion(u64::MAX).next(), RouteVersion(u64::MAX));
+    }
+
+    #[test]
+    fn segment_announcement_defaults_state_and_alignment_for_serde() {
+        let announcement: SegmentAnnouncement = serde_json::from_value(json!({
+            "owner": {
+                "stable_id": "runtime-a",
+                "epoch": 1
+            },
+            "segment_name": "segment-a",
+            "capacity_bytes": 4096,
+            "used_bytes": 1024,
+            "tags": ["storage"]
+        }))
+        .expect("announcement should deserialize");
+        assert_eq!(announcement.state, SegmentLifecycleState::Active);
+        assert_eq!(announcement.alignment_bytes, default_segment_alignment_bytes());
+    }
+
+    #[test]
+    fn client_lease_round_trip_keeps_runtime_contract() {
+        let lease = ClientLease {
+            runtime: ClientRuntimeId::new("runtime-a", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: 42,
+        };
+        let encoded = serde_json::to_value(&lease).expect("lease should serialize");
+        let decoded: ClientLease =
+            serde_json::from_value(encoded).expect("lease should deserialize");
+        assert_eq!(decoded.runtime, ClientRuntimeId::new("runtime-a", ClientEpoch(1)));
+        assert_eq!(decoded.state, ClientLifecycleState::Active);
+        assert_eq!(decoded.expires_at_ms, 42);
+    }
+}

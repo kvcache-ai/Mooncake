@@ -91,24 +91,7 @@ impl ClassicTransferEngine {
     }
 
     pub fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
-        let mut native_requests = requests
-            .iter()
-            .map(|request| {
-                let target_id = i32::try_from(request.target_id).map_err(|_| {
-                    StoreError::Transport(format!(
-                        "target_id {} does not fit classic segment id",
-                        request.target_id
-                    ))
-                })?;
-                Ok(ffi::TransferRequest {
-                    opcode: encode_opcode(request.opcode),
-                    source: request.source,
-                    target_id,
-                    target_offset: request.target_offset,
-                    length: request.length,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut native_requests = encode_requests(requests)?;
 
         let rc = unsafe {
             ffi::submitTransfer(
@@ -170,6 +153,26 @@ fn encode_opcode(opcode: Opcode) -> i32 {
     }
 }
 
+fn encode_request(request: &TransferRequest) -> Result<ffi::TransferRequest> {
+    let target_id = i32::try_from(request.target_id).map_err(|_| {
+        StoreError::Transport(format!(
+            "target_id {} does not fit classic segment id",
+            request.target_id
+        ))
+    })?;
+    Ok(ffi::TransferRequest {
+        opcode: encode_opcode(request.opcode),
+        source: request.source,
+        target_id,
+        target_offset: request.target_offset,
+        length: request.length,
+    })
+}
+
+fn encode_requests(requests: &[TransferRequest]) -> Result<Vec<ffi::TransferRequest>> {
+    requests.iter().map(encode_request).collect()
+}
+
 fn decode_status(status: i32) -> TransferStatus {
     match status {
         ffi::STATUS_WAITING => TransferStatus::Waiting,
@@ -189,8 +192,11 @@ mod tests {
 
     use mooncake_transport_sys::classic as ffi;
 
-    use super::{check_zero, decode_status, encode_opcode, to_cstring, ClassicTransferEngine};
-    use crate::{Opcode, TransferStatus};
+    use super::{
+        check_zero, decode_status, encode_opcode, encode_request, encode_requests, to_cstring,
+        ClassicTransferEngine,
+    };
+    use crate::{Opcode, TransferRequest, TransferStatus};
 
     #[test]
     fn cstring_conversion_rejects_embedded_nul() {
@@ -251,5 +257,38 @@ mod tests {
             length: 1,
         };
         assert!(engine.submit(7, &[overflow]).is_err());
+    }
+
+    #[test]
+    fn classic_request_encoding_is_explicit_and_checked() {
+        let request = TransferRequest {
+            opcode: Opcode::Write,
+            source: std::ptr::null_mut(),
+            target_id: 17,
+            target_offset: 23,
+            length: 29,
+        };
+        let native = encode_request(&request).expect("request should encode");
+        assert_eq!(native.opcode, ffi::OPCODE_WRITE);
+        assert_eq!(native.target_id, 17);
+        assert_eq!(native.target_offset, 23);
+        assert_eq!(native.length, 29);
+
+        let read = TransferRequest {
+            opcode: Opcode::Read,
+            ..request
+        };
+        let batch = encode_requests(&[request, read]).expect("batch should encode");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[1].opcode, ffi::OPCODE_READ);
+
+        let overflow = TransferRequest {
+            opcode: Opcode::Write,
+            source: std::ptr::null_mut(),
+            target_id: (i32::MAX as u64) + 1,
+            target_offset: 0,
+            length: 1,
+        };
+        assert!(encode_request(&overflow).is_err());
     }
 }
