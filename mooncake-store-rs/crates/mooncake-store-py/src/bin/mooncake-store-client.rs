@@ -14,7 +14,7 @@ use clap::{Parser, ValueEnum};
 use mooncake_store_client::{
     init_tracing, start_metrics_http_server, stop_metrics_http_server, RouteControlMode,
 };
-use mooncake_store_core::parse_hugepage_size;
+use mooncake_store_core::{parse_hugepage_size, ClientEpoch, ClientLifecycleState};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RouteControlArg {
     EmbeddedWrh,
@@ -26,6 +26,27 @@ impl From<RouteControlArg> for RouteControlMode {
         match value {
             RouteControlArg::EmbeddedWrh => RouteControlMode::EmbeddedWrh,
             RouteControlArg::MetadataOnly => RouteControlMode::MetadataOnly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum InitialStateArg {
+    Standby,
+    Active,
+    Draining,
+    Sealed,
+    Offline,
+}
+
+impl From<InitialStateArg> for ClientLifecycleState {
+    fn from(value: InitialStateArg) -> Self {
+        match value {
+            InitialStateArg::Standby => ClientLifecycleState::Standby,
+            InitialStateArg::Active => ClientLifecycleState::Active,
+            InitialStateArg::Draining => ClientLifecycleState::Draining,
+            InitialStateArg::Sealed => ClientLifecycleState::Sealed,
+            InitialStateArg::Offline => ClientLifecycleState::Offline,
         }
     }
 }
@@ -50,6 +71,10 @@ struct Args {
     rdma_devices: String,
     #[arg(long)]
     stable_id: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    epoch: u64,
+    #[arg(long, value_enum, default_value_t = InitialStateArg::Active)]
+    initial_state: InitialStateArg,
     #[arg(long, default_value = "default")]
     tenant: String,
     #[arg(long = "label", value_parser = parse_label)]
@@ -94,6 +119,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let runtime = build_runtime_args(&args).build()?;
 
     let stable_id = runtime.stable_id.clone();
+    let epoch = runtime.epoch;
+    let initial_state = runtime.initial_state;
     let segment_name = runtime.segment_name.clone();
     let client = Arc::new(StoreDispatcher::spawn(
         runtime.client,
@@ -109,6 +136,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "{}",
         started_message(
             &stable_id,
+            epoch,
+            initial_state,
             &segment_name,
             args.lease_ttl_ms,
             heartbeat_interval,
@@ -147,6 +176,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     if args.lease_ttl_ms == 0 {
         return Err("--lease-ttl-ms must be greater than zero".into());
+    }
+    if args.epoch == 0 {
+        return Err("--epoch must be greater than zero".into());
     }
     if args.storage_bytes == 0 {
         return Err("--storage-bytes must be greater than zero".into());
@@ -193,12 +225,16 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
             hugepage_size_bytes: args.hugepage_size,
         },
         local_segment_name: args.local_segment_name.clone(),
+        epoch: ClientEpoch(args.epoch),
+        initial_state: args.initial_state.into(),
         route_control: args.route_control.into(),
     }
 }
 
 fn started_message(
     stable_id: &str,
+    epoch: ClientEpoch,
+    initial_state: ClientLifecycleState,
     segment_name: &str,
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
@@ -206,14 +242,28 @@ fn started_message(
     client_server_address: Option<&str>,
 ) -> String {
     format!(
-        "mooncake-store-client started stable_id={stable_id} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} metrics_addr={} client_server_address={} ",
+        "mooncake-store-client started stable_id={stable_id} epoch={} initial_state={} segment={segment_name} lease_ttl_ms={lease_ttl_ms} heartbeat_interval_ms={heartbeat_interval_ms} metrics_addr={} client_server_address={} ",
+        epoch.0,
+        lifecycle_state_label(initial_state),
         metrics_addr.unwrap_or("disabled"),
         client_server_address.unwrap_or("disabled"),
     )
 }
 
+fn lifecycle_state_label(state: ClientLifecycleState) -> &'static str {
+    match state {
+        ClientLifecycleState::Standby => "standby",
+        ClientLifecycleState::Active => "active",
+        ClientLifecycleState::Draining => "draining",
+        ClientLifecycleState::Sealed => "sealed",
+        ClientLifecycleState::Offline => "offline",
+    }
+}
+
 fn drained_message(stable_id: &str, evacuated_routes: usize) -> String {
-    format!("mooncake-store-client drained stable_id={stable_id} evacuated_routes={evacuated_routes}")
+    format!(
+        "mooncake-store-client drained stable_id={stable_id} evacuated_routes={evacuated_routes}"
+    )
 }
 
 fn stopped_message(stable_id: &str) -> String {
@@ -254,11 +304,12 @@ fn now_ms() -> u64 {
 mod tests {
     use clap::Parser;
     use mooncake_store_client::RouteControlMode;
+    use mooncake_store_core::{ClientEpoch, ClientLifecycleState};
 
     use super::{
         build_runtime_args, drained_message, effective_heartbeat_interval, now_ms,
         parse_hugepage_size_arg, parse_label, start_metrics_if_needed, started_message,
-        stopped_message, validate_args, Args, RouteControlArg,
+        stopped_message, validate_args, Args, InitialStateArg, RouteControlArg,
     };
 
     fn sample_args() -> Args {
@@ -271,6 +322,8 @@ mod tests {
             protocol: "tcp".to_string(),
             rdma_devices: String::new(),
             stable_id: Some("sample".to_string()),
+            epoch: 1,
+            initial_state: InitialStateArg::Active,
             tenant: "default".to_string(),
             labels: vec![],
             routed_writes: false,
@@ -331,10 +384,15 @@ mod tests {
         assert_eq!(args.storage_bytes, 2048);
         assert_eq!(args.scratch_bytes, 1024);
         assert_eq!(args.tenant, "tenant-a");
-        assert_eq!(args.labels, vec![("pool".to_string(), "pool-a".to_string())]);
+        assert_eq!(
+            args.labels,
+            vec![("pool".to_string(), "pool-a".to_string())]
+        );
         assert!(args.routed_writes);
         assert_eq!(args.replica_count, 2);
         assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
+        assert_eq!(args.epoch, 1);
+        assert_eq!(args.initial_state, InitialStateArg::Active);
     }
 
     #[test]
@@ -349,6 +407,10 @@ mod tests {
             "redis://127.0.0.1:6379/9",
             "--stable-id",
             "node-a",
+            "--epoch",
+            "2",
+            "--initial-state",
+            "standby",
             "--tenant",
             "tenant-b",
             "--keyspace",
@@ -371,8 +433,13 @@ mod tests {
             "--drain-on-exit",
         ])
         .expect("extended args should parse");
-        assert_eq!(args.transport_metadata_url.as_deref(), Some("redis://127.0.0.1:6379/9"));
+        assert_eq!(
+            args.transport_metadata_url.as_deref(),
+            Some("redis://127.0.0.1:6379/9")
+        );
         assert_eq!(args.stable_id.as_deref(), Some("node-a"));
+        assert_eq!(args.epoch, 2);
+        assert_eq!(args.initial_state, InitialStateArg::Standby);
         assert_eq!(args.keyspace.as_deref(), Some("ks-a"));
         assert_eq!(args.local_segment_name.as_deref(), Some("segment-a"));
         assert_eq!(args.metrics_addr.as_deref(), Some("127.0.0.1:0"));
@@ -387,11 +454,45 @@ mod tests {
     }
 
     #[test]
-    fn validate_args_rejects_zero_capacities_and_ttl() {
+    fn hot_upgrade_startup_flags_flow_into_runtime_args() {
+        let args = Args::try_parse_from([
+            "mooncake-store-client",
+            "--local-hostname",
+            "10.0.0.2",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "--stable-id",
+            "store-a",
+            "--epoch",
+            "7",
+            "--initial-state",
+            "standby",
+            "--local-segment-name",
+            "store-a-next",
+        ])
+        .expect("hot-upgrade args should parse");
+
+        validate_args(&args).expect("hot-upgrade args should validate");
+        let runtime_args = build_runtime_args(&args);
+        assert_eq!(runtime_args.setup.stable_id.as_deref(), Some("store-a"));
+        assert_eq!(runtime_args.epoch, ClientEpoch(7));
+        assert_eq!(runtime_args.initial_state, ClientLifecycleState::Standby);
+        assert_eq!(
+            runtime_args.local_segment_name.as_deref(),
+            Some("store-a-next")
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_zero_capacities_ttl_and_epoch() {
         validate_args(&sample_args()).expect("baseline args should validate");
 
         let mut args = sample_args();
         args.lease_ttl_ms = 0;
+        assert!(validate_args(&args).is_err());
+
+        let mut args = sample_args();
+        args.epoch = 0;
         assert!(validate_args(&args).is_err());
 
         let mut args = sample_args();
@@ -459,6 +560,8 @@ mod tests {
         args.routed_writes = true;
         args.replica_count = 3;
         args.route_control = RouteControlArg::MetadataOnly;
+        args.epoch = 11;
+        args.initial_state = InitialStateArg::Draining;
 
         let runtime_args = build_runtime_args(&args);
         assert_eq!(runtime_args.setup.local_hostname, "127.0.0.1");
@@ -468,19 +571,26 @@ mod tests {
             Some("redis://127.0.0.1:6380/1")
         );
         assert_eq!(runtime_args.setup._rdma_devices, "mlx5_0");
-        assert_eq!(runtime_args.setup.keyspace.as_deref(), Some("tenant/keyspace"));
-        assert_eq!(runtime_args.local_segment_name.as_deref(), Some("segment-a"));
+        assert_eq!(
+            runtime_args.setup.keyspace.as_deref(),
+            Some("tenant/keyspace")
+        );
+        assert_eq!(
+            runtime_args.local_segment_name.as_deref(),
+            Some("segment-a")
+        );
         assert_eq!(runtime_args.setup.use_hugepage, Some(true));
-        assert_eq!(runtime_args.setup.hugepage_size_bytes, Some(2 * 1024 * 1024));
+        assert_eq!(
+            runtime_args.setup.hugepage_size_bytes,
+            Some(2 * 1024 * 1024)
+        );
         assert_eq!(runtime_args.setup.replica_count, 3);
         assert!(runtime_args.setup.routed_writes);
         assert_eq!(runtime_args.route_control, RouteControlMode::MetadataOnly);
+        assert_eq!(runtime_args.epoch, ClientEpoch(11));
+        assert_eq!(runtime_args.initial_state, ClientLifecycleState::Draining);
         assert_eq!(
-            runtime_args
-                .setup
-                .labels
-                .get("storage")
-                .map(String::as_str),
+            runtime_args.setup.labels.get("storage").map(String::as_str),
             Some("true")
         );
         assert!(runtime_args.setup.expires_at_ms.is_some());
@@ -490,6 +600,8 @@ mod tests {
     fn lifecycle_messages_stay_human_readable() {
         let started = started_message(
             "node-a",
+            ClientEpoch(2),
+            ClientLifecycleState::Standby,
             "segment-a",
             9_000,
             3_000,
@@ -497,6 +609,8 @@ mod tests {
             None,
         );
         assert!(started.contains("stable_id=node-a"));
+        assert!(started.contains("epoch=2"));
+        assert!(started.contains("initial_state=standby"));
         assert!(started.contains("segment=segment-a"));
         assert!(started.contains("metrics_addr=127.0.0.1:9090"));
         assert!(started.contains("client_server_address=disabled"));

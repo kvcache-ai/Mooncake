@@ -174,6 +174,25 @@ store.put("hello", b"world")
 assert store.get("hello") == b"world"
 ```
 
+Hot-upgrade startups can keep the long-lived `stable_id`, bump `epoch`, and
+start the successor in standby mode:
+
+```python
+upgrade = MooncakeDistributedStore()
+upgrade.setup(
+    "127.0.0.1",
+    "redis://127.0.0.1:6380/0",
+    128 * 1024 * 1024,
+    16 * 1024 * 1024,
+    "tcp",
+    "",
+    "",
+    stable_id="py-store-a",
+    epoch=2,
+    initial_state="standby",
+)
+```
+
 ## Routed Writes
 
 ```python
@@ -288,10 +307,10 @@ If hugepage mode is requested, the host kernel must already have compatible huge
 ### Lifecycle and Capacity
 
 - `activate`, `enter_standby`, `enter_draining`
+- `setup(..., stable_id=..., epoch=..., initial_state=...)` for hot-upgrade startup identity
 - `expand_local_memory`
 - `drain_segment`, `retire_segment`
 - `evacuate_owned_replicas`
-- `plan_handoff`
 
 ### Observability
 
