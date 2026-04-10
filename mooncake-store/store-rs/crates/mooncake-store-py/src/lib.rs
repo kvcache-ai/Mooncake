@@ -17,7 +17,9 @@ use mooncake_store_client::{
     MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
     ReplicationPolicy, RouteControlMode,
 };
-use mooncake_store_core::{ObjectRoute, SegmentAnnouncement, SegmentName, StoreError};
+use mooncake_store_core::{
+    ClientEpoch, ClientLifecycleState, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
+};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -74,7 +76,8 @@ impl PyMooncakeDistributedStore {
         local_segment_name = None,
         expires_at_ms = None,
         use_hugepage = None,
-        hugepage_size = None
+        hugepage_size = None,
+        route_control = "embedded_wrh"
     ))]
     #[allow(clippy::too_many_arguments)]
     fn setup(
@@ -97,7 +100,9 @@ impl PyMooncakeDistributedStore {
         expires_at_ms: Option<u64>,
         use_hugepage: Option<bool>,
         hugepage_size: Option<usize>,
+        route_control: &str,
     ) -> PyResult<i32> {
+        let route_control = parse_route_control_arg(route_control)?;
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
                 local_hostname: local_hostname.to_string(),
@@ -118,7 +123,9 @@ impl PyMooncakeDistributedStore {
                 hugepage_size_bytes: hugepage_size,
             },
             local_segment_name,
-            route_control: RouteControlMode::EmbeddedWrh,
+            epoch: ClientEpoch(1),
+            initial_state: ClientLifecycleState::Active,
+            route_control,
         }
         .build()
         .map_err(store_error_to_py)?;
@@ -1444,6 +1451,16 @@ fn store_error_to_py(error: StoreError) -> PyErr {
         | StoreError::Allocator(message)
         | StoreError::Metadata(message)
         | StoreError::Transport(message) => PyRuntimeError::new_err(message),
+    }
+}
+
+fn parse_route_control_arg(value: &str) -> PyResult<RouteControlMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "embedded_wrh" | "embedded-wrh" | "wrh" => Ok(RouteControlMode::EmbeddedWrh),
+        "metadata_only" | "metadata-only" | "metadata" => Ok(RouteControlMode::MetadataOnly),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported route_control {value:?}; expected embedded_wrh or metadata_only"
+        ))),
     }
 }
 
