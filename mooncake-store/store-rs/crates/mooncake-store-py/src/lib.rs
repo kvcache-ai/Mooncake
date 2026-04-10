@@ -1477,7 +1477,8 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
+        LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner, StoreClient,
+        StoreClientBuilder, StoreTransport,
     };
     use mooncake_store_core::{
         ClientEpoch, ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor, ObjectKey,
@@ -1535,6 +1536,13 @@ mod tests {
                     live_batches: BTreeSet::new(),
                     registered_memory: BTreeMap::new(),
                 })),
+            }
+        }
+
+        fn peer(&self, local_segment: &str) -> Self {
+            Self {
+                local_segment: local_segment.to_string(),
+                state: self.state.clone(),
             }
         }
     }
@@ -1813,6 +1821,63 @@ mod tests {
         store
     }
 
+    fn build_routed_real_store(name: &str) -> (PyMooncakeDistributedStore, String, StoreClient) {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let storage_transport = Arc::new(TestTransport::new(&format!("{name}-storage-segment")));
+        let writer_transport = Arc::new(storage_transport.peer(&format!("{name}-writer-segment")));
+
+        let storage = StoreClientBuilder::new(metadata.clone(), format!("{name}-storage"))
+            .epoch(ClientEpoch(1))
+            .state(ClientLifecycleState::Active)
+            .compatibility(CompatibilityDescriptor::default())
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(storage_transport)
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .storage_bytes(4 * 1024)
+                    .scratch_bytes(4 * 1024)
+                    .alignment(1)
+                    .reclaim_grace_ms(0),
+            )
+            .build(60_000)
+            .expect("storage client should build");
+        storage
+            .register_local_memory()
+            .expect("storage local memory should register");
+        let storage_owner = storage.runtime_id().storage_key();
+
+        let writer = StoreClientBuilder::new(metadata.clone(), format!("{name}-writer"))
+            .epoch(ClientEpoch(1))
+            .state(ClientLifecycleState::Active)
+            .compatibility(CompatibilityDescriptor::default())
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(writer_transport)
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .storage_bytes(4 * 1024)
+                    .scratch_bytes(4 * 1024)
+                    .alignment(1)
+                    .reclaim_grace_ms(0),
+            )
+            .routed_writes(
+                PlacementPlanner::new(metadata).require_label("storage", "true"),
+                1,
+            )
+            .build(60_000)
+            .expect("writer client should build");
+        let dispatcher = StoreDispatcher::spawn(writer, format!("dispatcher-{name}"))
+            .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("writer local memory should register");
+
+        let mut store = PyMooncakeDistributedStore::new();
+        store.replace_backend(StoreBackend::Real(dispatcher));
+        (store, storage_owner, storage)
+    }
+
     fn bind_addr() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let address = listener
@@ -1844,6 +1909,17 @@ mod tests {
             sleep(Duration::from_millis(25));
         }
         (store, server)
+    }
+
+    fn metric_counter(metrics: &str, operation: &str, status: &str) -> u64 {
+        let prefix = format!(
+            "mooncake_store_client_operation_total{{operation=\"{operation}\",status=\"{status}\"}} "
+        );
+        metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
     }
 
     fn sample_segment() -> SegmentAnnouncement {
@@ -2270,6 +2346,72 @@ mod tests {
 
         store.close();
         assert!(store.get_hostname().is_err());
+    }
+
+    #[test]
+    fn python_batch_put_with_shared_policy_hits_fast_batch_path() {
+        init_python();
+        let (mut store, storage_owner, _storage) = build_routed_real_store("py-fast-batch");
+        let before_metrics = store.metrics_text();
+        let status = store
+            .batch_put(
+                vec![
+                    ("alpha".to_string(), b"one".to_vec()),
+                    ("beta".to_string(), b"two".to_vec()),
+                ],
+                None,
+                None,
+                None,
+                None,
+                Some(storage_owner),
+                None,
+                false,
+                false,
+                false,
+            )
+            .expect("python batch_put should succeed");
+        assert_eq!(status, 0);
+
+        Python::with_gil(|py| {
+            assert_eq!(
+                store
+                    .get(py, "alpha", None)
+                    .expect("alpha get should succeed")
+                    .as_bytes(),
+                b"one"
+            );
+            assert_eq!(
+                store
+                    .get(py, "beta", None)
+                    .expect("beta get should succeed")
+                    .as_bytes(),
+                b"two"
+            );
+        });
+
+        let metrics = store.metrics_text();
+        assert!(
+            metric_counter(&metrics, "batch_put_stage_rank", "ok")
+                > metric_counter(&before_metrics, "batch_put_stage_rank", "ok")
+        );
+        assert!(
+            metric_counter(&metrics, "batch_put_stage_reserve", "ok")
+                > metric_counter(&before_metrics, "batch_put_stage_reserve", "ok")
+        );
+        assert!(
+            metric_counter(&metrics, "batch_put_stage_load_routes", "ok")
+                > metric_counter(&before_metrics, "batch_put_stage_load_routes", "ok")
+        );
+        assert!(
+            metric_counter(&metrics, "batch_put_stage_write", "ok")
+                > metric_counter(&before_metrics, "batch_put_stage_write", "ok")
+        );
+        assert!(
+            metric_counter(&metrics, "batch_put_stage_route_cas", "ok")
+                > metric_counter(&before_metrics, "batch_put_stage_route_cas", "ok")
+        );
+
+        store.close();
     }
 
     #[test]

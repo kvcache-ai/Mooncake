@@ -105,6 +105,24 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<Vec<usize>>;
 }
 
+impl StoreClient {
+    fn shared_batch_replication_policy(
+        requests: &[PutRequest<'_>],
+    ) -> Option<Option<ReplicationPolicy>> {
+        if requests.is_empty() {
+            return Some(None);
+        }
+        if requests.iter().all(|request| request.policy.is_none()) {
+            return Some(None);
+        }
+        let shared = requests[0].policy.clone().unwrap_or_default();
+        requests
+            .iter()
+            .all(|request| request.policy.clone().unwrap_or_default() == shared)
+            .then_some(Some(shared))
+    }
+}
+
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
         let _span = info_span!(
@@ -781,12 +799,12 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("batch_put").input_bytes(bytes_in);
-        let can_use_fast_routed_batch = matches!(self.write_mode, WriteMode::Routed { .. })
-            && requests.iter().all(|request| request.policy.is_none());
-        if can_use_fast_routed_batch {
-            let result = self.batch_put_scoped_routed(requests);
-            tracker.finish(&result, bytes_in);
-            return result;
+        if matches!(self.write_mode, WriteMode::Routed { .. }) {
+            if let Some(shared_policy) = Self::shared_batch_replication_policy(requests) {
+                let result = self.batch_put_scoped_routed(requests, shared_policy.as_ref());
+                tracker.finish(&result, bytes_in);
+                return result;
+            }
         }
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {

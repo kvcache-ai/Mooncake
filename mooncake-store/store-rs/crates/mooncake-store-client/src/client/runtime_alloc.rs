@@ -39,13 +39,19 @@ impl StoreClient {
         let mut resolved = std::iter::repeat_with(|| None)
             .take(requests.len())
             .collect::<Vec<_>>();
-        let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
+        struct RemoteReservationGroup {
+            lease: ClientLease,
+            any_indices: Vec<usize>,
+            specific_indices: Vec<usize>,
+        }
+
+        let mut remote_groups = BTreeMap::<ClientRuntimeId, RemoteReservationGroup>::new();
         for (index, request) in requests.iter().enumerate() {
             if request.storage_runtime == self.lease.runtime {
                 resolved[index] = Some(
                     self.reserve_segment_allocation(
                         &request.storage_runtime,
-                        None,
+                        request.segment_name.as_ref(),
                         request.length_bytes,
                         request.require_local_memory,
                     )
@@ -70,84 +76,186 @@ impl StoreClient {
             };
             remote_groups
                 .entry(request.storage_runtime.clone())
-                .or_insert_with(|| (lease, Vec::new()))
-                .1
-                .push(index);
+                .or_insert_with(|| RemoteReservationGroup {
+                    lease,
+                    any_indices: Vec::new(),
+                    specific_indices: Vec::new(),
+                });
+            let group = remote_groups
+                .get_mut(&request.storage_runtime)
+                .expect("remote reservation group should exist");
+            if request.segment_name.is_some() {
+                group.specific_indices.push(index);
+            } else {
+                group.any_indices.push(index);
+            }
         }
 
-        for (storage_runtime, (lease, indices)) in remote_groups {
-            let lengths = indices
-                .iter()
-                .map(|index| requests[*index].length_bytes)
-                .collect::<Vec<_>>();
-            match self
-                .control_client
-                .batch_reserve_any(&lease, &storage_runtime, &lengths)
-            {
-                Ok(results) => {
-                    for ((index, length_bytes), result) in indices
-                        .iter()
-                        .copied()
-                        .zip(lengths.into_iter())
-                        .zip(results.into_iter())
-                    {
-                        let reservation = match result {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                debug!(
-                                    storage_runtime = %storage_runtime,
-                                    error = %error,
-                                    length_bytes,
-                                    "allocator batch reserve rpc failed; falling back to metadata allocator"
-                                );
-                                match self.reserve_segment_allocation_via_metadata(
-                                    &storage_runtime,
-                                    None,
-                                    length_bytes,
-                                ) {
-                                    Ok(reservation) => reservation,
-                                    Err(error) => {
-                                        resolved[index] = Some(Err(error));
-                                        continue;
+        for (storage_runtime, group) in remote_groups {
+            if !group.any_indices.is_empty() {
+                let lengths = group
+                    .any_indices
+                    .iter()
+                    .map(|index| requests[*index].length_bytes)
+                    .collect::<Vec<_>>();
+                match self
+                    .control_client
+                    .batch_reserve_any(&group.lease, &storage_runtime, &lengths)
+                {
+                    Ok(results) => {
+                        for ((index, length_bytes), result) in group
+                            .any_indices
+                            .iter()
+                            .copied()
+                            .zip(lengths.into_iter())
+                            .zip(results.into_iter())
+                        {
+                            let reservation = match result {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    debug!(
+                                        storage_runtime = %storage_runtime,
+                                        error = %error,
+                                        length_bytes,
+                                        "allocator batch reserve rpc failed; falling back to metadata allocator"
+                                    );
+                                    match self.reserve_segment_allocation_via_metadata(
+                                        &storage_runtime,
+                                        None,
+                                        length_bytes,
+                                    ) {
+                                        Ok(reservation) => reservation,
+                                        Err(error) => {
+                                            resolved[index] = Some(Err(error));
+                                            continue;
+                                        }
                                     }
                                 }
-                            }
-                        };
-                        resolved[index] = Some(Ok((
-                            ReplicaWriteTarget {
-                                storage_runtime: storage_runtime.clone(),
-                                segment_name: reservation.segment_name.clone(),
-                            },
-                            reservation,
-                        )));
+                            };
+                            resolved[index] = Some(Ok((
+                                ReplicaWriteTarget {
+                                    storage_runtime: storage_runtime.clone(),
+                                    segment_name: reservation.segment_name.clone(),
+                                },
+                                reservation,
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        debug!(
+                            storage_runtime = %storage_runtime,
+                            error = %error,
+                            items = group.any_indices.len(),
+                            "allocator batch reserve rpc failed; falling back to metadata allocator"
+                        );
+                        for index in &group.any_indices {
+                            let reservation = match self.reserve_segment_allocation_via_metadata(
+                                &storage_runtime,
+                                None,
+                                requests[*index].length_bytes,
+                            ) {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    resolved[*index] = Some(Err(error));
+                                    continue;
+                                }
+                            };
+                            resolved[*index] = Some(Ok((
+                                ReplicaWriteTarget {
+                                    storage_runtime: storage_runtime.clone(),
+                                    segment_name: reservation.segment_name.clone(),
+                                },
+                                reservation,
+                            )));
+                        }
                     }
                 }
-                Err(error) => {
-                    debug!(
-                        storage_runtime = %storage_runtime,
-                        error = %error,
-                        items = indices.len(),
-                        "allocator batch reserve rpc failed; falling back to metadata allocator"
-                    );
-                    for index in indices {
-                        let reservation = match self.reserve_segment_allocation_via_metadata(
-                            &storage_runtime,
-                            None,
-                            requests[index].length_bytes,
-                        ) {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                resolved[index] = Some(Err(error));
-                                continue;
-                            }
-                        };
-                        resolved[index] = Some(Ok((
-                            ReplicaWriteTarget {
-                                storage_runtime: storage_runtime.clone(),
-                                segment_name: reservation.segment_name.clone(),
-                            },
-                            reservation,
-                        )));
+            }
+
+            if !group.specific_indices.is_empty() {
+                let ops = group
+                    .specific_indices
+                    .iter()
+                    .map(|index| ReserveSpecificOp {
+                        segment_name: requests[*index]
+                            .segment_name
+                            .clone()
+                            .expect("specific reservation batch item must carry a segment name"),
+                        length_bytes: requests[*index].length_bytes,
+                    })
+                    .collect::<Vec<_>>();
+                match self
+                    .control_client
+                    .batch_reserve_specific(&group.lease, &storage_runtime, &ops)
+                {
+                    Ok(results) => {
+                        for ((index, request), result) in group
+                            .specific_indices
+                            .iter()
+                            .copied()
+                            .zip(ops.iter())
+                            .zip(results.into_iter())
+                        {
+                            let reservation = match result {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    debug!(
+                                        storage_runtime = %storage_runtime,
+                                        segment = %request.segment_name.0,
+                                        error = %error,
+                                        length_bytes = request.length_bytes,
+                                        "allocator batch reserve_specific rpc failed; falling back to metadata allocator"
+                                    );
+                                    match self.reserve_segment_allocation_via_metadata(
+                                        &storage_runtime,
+                                        Some(&request.segment_name),
+                                        request.length_bytes,
+                                    ) {
+                                        Ok(reservation) => reservation,
+                                        Err(error) => {
+                                            resolved[index] = Some(Err(error));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+                            resolved[index] = Some(Ok((
+                                ReplicaWriteTarget {
+                                    storage_runtime: storage_runtime.clone(),
+                                    segment_name: reservation.segment_name.clone(),
+                                },
+                                reservation,
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        debug!(
+                            storage_runtime = %storage_runtime,
+                            error = %error,
+                            items = group.specific_indices.len(),
+                            "allocator batch reserve_specific rpc failed; falling back to metadata allocator"
+                        );
+                        for (index, request) in group.specific_indices.iter().copied().zip(ops.iter())
+                        {
+                            let reservation = match self.reserve_segment_allocation_via_metadata(
+                                &storage_runtime,
+                                Some(&request.segment_name),
+                                request.length_bytes,
+                            ) {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    resolved[index] = Some(Err(error));
+                                    continue;
+                                }
+                            };
+                            resolved[index] = Some(Ok((
+                                ReplicaWriteTarget {
+                                    storage_runtime: storage_runtime.clone(),
+                                    segment_name: reservation.segment_name.clone(),
+                                },
+                                reservation,
+                            )));
+                        }
                     }
                 }
             }

@@ -116,7 +116,11 @@ impl StoreClient {
         Ok(absolute_offsets)
     }
 
-    fn batch_put_scoped_routed(&self, requests: &[PutRequest<'_>]) -> Result<Vec<ObjectRoute>> {
+    fn batch_put_scoped_routed(
+        &self,
+        requests: &[PutRequest<'_>],
+        policy: Option<&ReplicationPolicy>,
+    ) -> Result<Vec<ObjectRoute>> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
         self.validate_unique_requests(requests)?;
@@ -130,8 +134,7 @@ impl StoreClient {
                 "batch routed put requires routed write mode".to_string(),
             ));
         };
-        let default_policy = self.resolve_replication_policy(None)?;
-        let prefer_local = default_policy.prefer_local && self.has_active_local_storage();
+        let resolved_policy = self.resolve_replication_policy(policy)?;
 
         let object_refs = requests
             .iter()
@@ -151,7 +154,7 @@ impl StoreClient {
         struct PendingBatchReservation<'a> {
             scoped_key: ObjectKey,
             value: &'a [u8],
-            candidates: Vec<ClientRuntimeId>,
+            candidates: Vec<ReplicaPlacementCandidate>,
             next_candidate: usize,
             targets: Vec<ReplicaWriteTarget>,
             reservations: Vec<mooncake_store_core::SegmentReservation>,
@@ -170,17 +173,62 @@ impl StoreClient {
                 .sum::<usize>() as u64,
         );
         let reserve_result = (|| {
+            let mut shared_candidates = Vec::new();
+            let mut shared_seen = BTreeSet::new();
+            for segment in &resolved_policy.preferred_segments {
+                match self.lookup_preferred_segment(segment) {
+                    Ok(preferred) => {
+                        if !shared_seen.insert(preferred.owner.clone()) {
+                            continue;
+                        }
+                        shared_candidates.push(ReplicaPlacementCandidate {
+                            target: ReplicaPlacementTarget::Segment {
+                                storage_runtime: preferred.owner,
+                                segment_name: preferred.segment_name,
+                            },
+                            soft: resolved_policy.with_soft_pin,
+                        });
+                    }
+                    Err(error) if self.should_skip_candidate(&error, resolved_policy.with_soft_pin) => {
+                        debug!(
+                            segment = %segment.0,
+                            error = %error,
+                            "batch put is skipping preferred segment after lookup failure"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            for storage_runtime in &resolved_policy.preferred_storage_runtimes {
+                if !shared_seen.insert(storage_runtime.clone()) {
+                    continue;
+                }
+                shared_candidates.push(ReplicaPlacementCandidate {
+                    target: ReplicaPlacementTarget::StorageRuntime(storage_runtime.clone()),
+                    soft: true,
+                });
+            }
+            if resolved_policy.prefer_local
+                && self.has_active_local_storage()
+                && shared_seen.insert(self.lease.runtime.clone())
+            {
+                shared_candidates.push(ReplicaPlacementCandidate {
+                    target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
+                    soft: true,
+                });
+            }
+
             let mut pending = Vec::with_capacity(requests.len());
             for (request, plan) in requests.iter().zip(plans.iter()) {
                 let tenant = request.tenant.unwrap_or(self.default_tenant());
-                let mut candidates = Vec::new();
-                let mut seen = BTreeSet::new();
-                if prefer_local && seen.insert(self.lease.runtime.clone()) {
-                    candidates.push(self.lease.runtime.clone());
-                }
+                let mut candidates = shared_candidates.clone();
+                let mut seen = shared_seen.clone();
                 for owner in &plan.owners {
                     if seen.insert(owner.clone()) {
-                        candidates.push(owner.clone());
+                        candidates.push(ReplicaPlacementCandidate {
+                            target: ReplicaPlacementTarget::StorageRuntime(owner.clone()),
+                            soft: true,
+                        });
                     }
                 }
                 if candidates.is_empty() {
@@ -201,24 +249,34 @@ impl StoreClient {
 
             while pending
                 .iter()
-                .any(|entry| entry.targets.len() < default_policy.replica_count)
+                .any(|entry| entry.targets.len() < resolved_policy.replica_count)
             {
                 let mut round_requests = Vec::new();
                 let mut round_indices = Vec::new();
+                let mut round_candidates = Vec::new();
                 let mut exhausted_key = None;
                 for (index, entry) in pending.iter_mut().enumerate() {
-                    if entry.targets.len() >= default_policy.replica_count {
+                    if entry.targets.len() >= resolved_policy.replica_count {
                         continue;
                     }
-                    let Some(owner) = entry.candidates.get(entry.next_candidate).cloned() else {
+                    let Some(candidate) = entry.candidates.get(entry.next_candidate).cloned() else {
                         exhausted_key = Some(entry.scoped_key.0.clone());
                         break;
                     };
                     entry.next_candidate += 1;
+                    let storage_runtime = candidate.target.storage_runtime().clone();
+                    let segment_name = match &candidate.target {
+                        ReplicaPlacementTarget::StorageRuntime(_) => None,
+                        ReplicaPlacementTarget::Segment { segment_name, .. } => {
+                            Some(segment_name.clone())
+                        }
+                    };
                     round_indices.push(index);
+                    round_candidates.push(candidate);
                     round_requests.push(StorageRuntimeReservationRequest {
-                        require_local_memory: owner == self.lease.runtime,
-                        storage_runtime: owner,
+                        require_local_memory: storage_runtime == self.lease.runtime,
+                        storage_runtime,
+                        segment_name,
                         length_bytes: entry.value.len() as u64,
                     });
                 }
@@ -230,22 +288,28 @@ impl StoreClient {
                 }
 
                 let round_results = self.reserve_storage_runtime_segments_batch(&round_requests)?;
-                let mut made_progress = false;
-                for ((index, request), result) in round_indices
+                let mut exhausted_candidates = 0usize;
+                for (((index, request), candidate), result) in round_indices
                     .into_iter()
                     .zip(round_requests.into_iter())
+                    .zip(round_candidates.into_iter())
                     .zip(round_results.into_iter())
                 {
                     match result {
                         Ok((target, reservation)) => {
                             pending[index].targets.push(target);
                             pending[index].reservations.push(reservation);
-                            made_progress = true;
                         }
-                        Err(error) if self.should_skip_candidate(&error, true) => {
+                        Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            exhausted_candidates += 1;
                             debug!(
                                 key = %pending[index].scoped_key.0,
                                 storage_runtime = %request.storage_runtime,
+                                segment = request
+                                    .segment_name
+                                    .as_ref()
+                                    .map(|segment| segment.0.as_str())
+                                    .unwrap_or("*"),
                                 error = %error,
                                 "batch put is skipping placement candidate"
                             );
@@ -256,11 +320,11 @@ impl StoreClient {
                         }
                     }
                 }
-                if made_progress {
+                if exhausted_candidates == 0 {
                     continue;
                 }
                 if pending.iter().all(|entry| {
-                    entry.targets.len() >= default_policy.replica_count
+                    entry.targets.len() >= resolved_policy.replica_count
                         || entry.next_candidate >= entry.candidates.len()
                 }) {
                     release_pending(&pending);
