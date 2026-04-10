@@ -3,9 +3,9 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "mooncake-store-rs"
+name = "mooncake"
 version = "0.1.0"
-description = "Rust Mooncake store compatibility layer with Python bindings"
+description = "Unified Mooncake-compatible distribution with Rust store and upstream transfer engine"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
@@ -19,13 +19,23 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 keywords = ["mooncake", "store", "rust", "distributed-cache"]
+dependencies = [
+    "aiohttp",
+    "requests",
+]
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 
 [project.scripts]
-mooncake-store-client = "mooncake.cli_client:main"
+mooncake_master = "mooncake.cli:main"
+mooncake_client = "mooncake.cli:main"
+transfer_engine_bench = "mooncake.cli:main"
+mooncake-store-client = "mooncake.cli:main"
+mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
+mc_store_rest_server = "mooncake.mooncake_store_service:main"
+transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
 
 [tool.maturin]
 manifest-path = "crates/mooncake-store-py/Cargo.toml"
