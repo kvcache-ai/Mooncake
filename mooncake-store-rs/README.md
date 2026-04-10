@@ -213,6 +213,22 @@ This script verifies both layers:
 - PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
 - Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
 
+### Run the eviction validation
+
+Native CLI eviction validation:
+
+```bash
+./scripts/test-client-eviction-cli.sh
+```
+
+This script:
+
+- builds the standalone `mooncake-store-client` binary
+- starts a real storage client with `/metrics` enabled
+- drives `put`, `get`, and `batch_get` through an external routed Python client
+- waits for background storage-owner eviction to reclaim the cold replica
+- verifies eviction through `/metrics` and tracing logs
+
 ### Run the multi-client stress benchmark
 
 ```bash
