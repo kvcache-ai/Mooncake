@@ -80,13 +80,8 @@ UPSTREAM_BUILD_DIR=$(resolve_upstream_build_dir)
 export LD_LIBRARY_PATH="${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/src:${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "${COVERAGE_DIR}"
-rm -rf \
-  "${SUMMARY_FILE}" \
-  "${JSON_FILE}" \
-  "${HTML_DIR}" \
-  "${COVERAGE_DIR}/workspace-no-e2e.json" \
-  "${COVERAGE_DIR}/workspace-no-e2e-html" \
-  "${COVERAGE_DIR}/workspace-no-e2e-index.html"
+rm -f "${SUMMARY_FILE}" "${JSON_FILE}"
+rm -rf "${HTML_DIR}"
 
 cd "${REPO_ROOT}"
 
@@ -102,9 +97,9 @@ echo "==> generating JSON report at ${JSON_FILE}"
 cargo llvm-cov "${COMMON_ARGS[@]}" --json --output-path "${JSON_FILE}"
 
 echo "==> generating HTML report at ${HTML_DIR}"
-cargo llvm-cov "${COMMON_ARGS[@]}" --html --output-dir "${HTML_DIR}"
+cargo llvm-cov "${COMMON_ARGS[@]}" --html --output-dir "${COVERAGE_DIR}"
 
 echo
 echo "coverage summary: ${SUMMARY_FILE}"
 echo "coverage json:    ${JSON_FILE}"
-echo "coverage html:    ${HTML_DIR}/html/index.html"
+echo "coverage html:    ${HTML_DIR}/index.html"
