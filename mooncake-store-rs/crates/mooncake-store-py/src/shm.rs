@@ -286,7 +286,9 @@ pub fn recv_shm_register_request(listener: &UnixListener) -> Result<(ShmRegister
     }
     (&stream)
         .write_all(&(0i32).to_ne_bytes())
-        .map_err(|error| StoreError::Transport(format!("failed to ack shm registration: {error}")))?;
+        .map_err(|error| {
+            StoreError::Transport(format!("failed to ack shm registration: {error}"))
+        })?;
     Ok((request, fd))
 }
 
@@ -318,8 +320,8 @@ pub fn map_registered_region(fd: OwnedFd, size: usize) -> Result<OwnedMappedRegi
 }
 
 fn memfd_create(name: &str, hugepage: Option<HugePageConfig>) -> Result<OwnedFd> {
-    let name = CString::new(name)
-        .map_err(|_| StoreError::Allocator("invalid memfd name".to_string()))?;
+    let name =
+        CString::new(name).map_err(|_| StoreError::Allocator("invalid memfd name".to_string()))?;
     let flags = libc::MFD_CLOEXEC | hugepage.map(hugepage_memfd_flags).unwrap_or(0);
     let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
     if fd < 0 {

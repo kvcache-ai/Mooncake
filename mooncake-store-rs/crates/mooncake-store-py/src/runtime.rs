@@ -5,9 +5,7 @@ use mooncake_store_client::{
     LocalMemoryConfig, PlacementPlanner, RouteControlMode, StoreClient, StoreClientBuilder,
     TentTransportFactory,
 };
-use mooncake_store_core::{
-    ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result,
-};
+use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
 use mooncake_transport::TentEngine;
 
 pub use crate::config::CompatSetupArgs;

@@ -1,6 +1,6 @@
 mod config;
+pub mod dispatcher;
 mod dummy_client;
-mod dummy_loop;
 pub mod dummy_service;
 pub mod runtime;
 mod shm;
@@ -9,28 +9,40 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::slice;
 
+use dispatcher::StoreDispatcher;
 use dummy_client::DummySession;
 use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
     start_metrics_http_server, stop_metrics_http_server, GetRequest, MooncakeCompatibilityFacade,
     MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef, PutFromRequest, PutRequest,
-    ReplicationPolicy, RouteControlMode, StoreClient,
+    ReplicationPolicy, RouteControlMode,
 };
-use mooncake_store_core::{
-    ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
-};
+use mooncake_store_core::{ObjectRoute, SegmentAnnouncement, SegmentName, StoreError};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use runtime::CompatRuntimeArgs;
 
-#[pyclass(name = "MooncakeDistributedStore", unsendable)]
-struct PyMooncakeDistributedStore {
-    client: Option<StoreClient>,
-    dummy: Option<DummySession>,
+enum StoreBackend {
+    Real(StoreDispatcher),
+    Dummy(DummySession),
 }
 
-#[pyclass(name = "MooncakeHostMemAllocator", unsendable)]
+impl StoreBackend {
+    fn close(&self) {
+        match self {
+            Self::Real(dispatcher) => dispatcher.shutdown(),
+            Self::Dummy(dummy) => dummy.close(),
+        }
+    }
+}
+
+#[pyclass(name = "MooncakeDistributedStore")]
+struct PyMooncakeDistributedStore {
+    backend: Option<StoreBackend>,
+}
+
+#[pyclass(name = "MooncakeHostMemAllocator")]
 struct PyMooncakeHostMemAllocator {
     use_hugepage: Option<bool>,
     hugepage_size: Option<usize>,
@@ -40,10 +52,7 @@ struct PyMooncakeHostMemAllocator {
 impl PyMooncakeDistributedStore {
     #[new]
     fn new() -> Self {
-        Self {
-            client: None,
-            dummy: None,
-        }
+        Self { backend: None }
     }
 
     #[pyo3(signature = (
@@ -114,10 +123,16 @@ impl PyMooncakeDistributedStore {
         .build()
         .map_err(store_error_to_py)?;
         let _ = master_server;
-        let client = runtime.client;
-        client.register_local_memory().map_err(store_error_to_py)?;
-        self.dummy = None;
-        self.client = Some(client);
+        let stable_id = runtime.stable_id.clone();
+        let dispatcher = StoreDispatcher::spawn(
+            runtime.client,
+            format!("mooncake-py-dispatcher-{stable_id}"),
+        )
+        .map_err(store_error_to_py)?;
+        dispatcher
+            .register_local_memory()
+            .map_err(store_error_to_py)?;
+        self.replace_backend(StoreBackend::Real(dispatcher));
         Ok(0)
     }
 
@@ -130,17 +145,14 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<i32> {
         let _ = (mem_pool_size, local_buffer_size);
         let session = DummySession::connect(server_address).map_err(store_error_to_py)?;
-        self.client = None;
-        self.dummy = Some(session);
+        self.replace_backend(StoreBackend::Dummy(session));
         Ok(0)
     }
 
     fn close(&mut self) {
-        if let Some(dummy) = self.dummy.as_ref() {
-            dummy.close();
+        if let Some(backend) = self.backend.take() {
+            backend.close();
         }
-        self.client = None;
-        self.dummy = None;
     }
 
     #[pyo3(signature = (
@@ -172,22 +184,6 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let policy = replication_policy(
-                replica_count,
-                preferred_segment,
-                preferred_segments,
-                preferred_storage_owner,
-                preferred_storage_owners,
-                prefer_local,
-                prefer_alloc_in_same_node,
-                with_soft_pin,
-            );
-            return dummy
-                .put(key, &value, tenant, policy.as_ref())
-                .map_err(store_error_to_py);
-        }
-        let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
             preferred_segment,
@@ -198,16 +194,26 @@ impl PyMooncakeDistributedStore {
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
-        match (tenant, policy.as_ref()) {
-            (Some(tenant), Some(policy)) => {
-                client.put_in_tenant_with_policy(tenant, key, &value, policy)
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => dummy
+                .put(key, &value, tenant, policy.as_ref())
+                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| match (tenant.as_deref(), policy.as_ref()) {
+                        (Some(tenant), Some(policy)) => {
+                            client.put_in_tenant_with_policy(tenant, &key, &value, policy)
+                        }
+                        (None, Some(policy)) => client.put_with_policy(&key, &value, policy),
+                        (Some(tenant), None) => client.put_in_tenant(tenant, &key, &value),
+                        (None, None) => client.put(&key, &value),
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(0)
             }
-            (None, Some(policy)) => client.put_with_policy(key, &value, policy),
-            (Some(tenant), None) => client.put_in_tenant(tenant, key, &value),
-            (None, None) => client.put(key, &value),
         }
-        .map_err(store_error_to_py)?;
-        Ok(0)
     }
 
     #[pyo3(signature = (key, *, tenant = None))]
@@ -217,110 +223,141 @@ impl PyMooncakeDistributedStore {
         key: &str,
         tenant: Option<&str>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
-            if status != 0 {
-                return Err(PyKeyError::new_err(format!(
-                    "dummy store get failed for key={key}"
-                )));
+        let value = match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Err(PyKeyError::new_err(format!(
+                        "dummy store get failed for key={key}"
+                    )));
+                }
+                value
             }
-            return Ok(PyBytes::new(py, &value));
-        }
-        let client = self.client_ref()?;
-        let value = match tenant {
-            Some(tenant) => client.get_in_tenant(tenant, key),
-            None => client.get(key),
-        }
-        .map_err(store_error_to_py)?;
+            StoreBackend::Real(dispatcher) => {
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| match tenant.as_deref() {
+                        Some(tenant) => client.get_in_tenant(tenant, &key),
+                        None => client.get(&key),
+                    })
+                    .map_err(store_error_to_py)?
+            }
+        };
         Ok(PyBytes::new(py, &value))
     }
 
     #[pyo3(signature = (key, *, tenant = None))]
     fn is_exist(&self, key: &str, tenant: Option<&str>) -> PyResult<bool> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let results = dummy
-                .batch_is_exist(&[key.to_string()], tenant)
-                .map_err(store_error_to_py)?;
-            return Ok(results.first().copied().unwrap_or_default() == 1);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let results = dummy
+                    .batch_is_exist(&[key.to_string()], tenant)
+                    .map_err(store_error_to_py)?;
+                Ok(results.first().copied().unwrap_or_default() == 1)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| match tenant.as_deref() {
+                        Some(tenant) => client.is_exist_in_tenant(tenant, &key),
+                        None => client.is_exist(&key),
+                    })
+                    .map_err(store_error_to_py)
+            }
         }
-        let client = self.client_ref()?;
-        match tenant {
-            Some(tenant) => client.is_exist_in_tenant(tenant, key),
-            None => client.is_exist(key),
-        }
-        .map_err(store_error_to_py)
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
     fn batch_is_exist(&self, keys: Vec<String>, tenant: Option<&str>) -> PyResult<Vec<i32>> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            return dummy.batch_is_exist(&keys, tenant).map_err(store_error_to_py);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => dummy
+                .batch_is_exist(&keys, tenant)
+                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let objects = keys
+                            .iter()
+                            .map(|key| {
+                                let mut object = ObjectRef::new(key.as_str());
+                                if let Some(tenant) = tenant.as_deref() {
+                                    object = object.tenant(tenant);
+                                }
+                                object
+                            })
+                            .collect::<Vec<_>>();
+                        client
+                            .batch_is_exist(&objects)
+                            .map(|items| items.into_iter().map(i32::from).collect())
+                    })
+                    .map_err(store_error_to_py)
+            }
         }
-        let client = self.client_ref()?;
-        let objects = keys
-            .iter()
-            .map(|key| {
-                let mut object = ObjectRef::new(key.as_str());
-                if let Some(tenant) = tenant {
-                    object = object.tenant(tenant);
-                }
-                object
-            })
-            .collect::<Vec<_>>();
-        client
-            .batch_is_exist(&objects)
-            .map(|items| items.into_iter().map(i32::from).collect())
-            .map_err(store_error_to_py)
     }
 
     fn get_hostname(&self) -> PyResult<String> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            return Ok(dummy.server_addr().to_string());
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => Ok(dummy.server_addr().to_string()),
+            StoreBackend::Real(dispatcher) => dispatcher
+                .run(|client| client.get_hostname())
+                .map_err(store_error_to_py),
         }
-        self.client_ref()?.get_hostname().map_err(store_error_to_py)
     }
 
     #[pyo3(signature = (key, *, tenant = None))]
     fn get_size(&self, key: &str, tenant: Option<&str>) -> PyResult<usize> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
-            if status != 0 {
-                return Ok(0);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let (status, value) = dummy.get(key, tenant).map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Ok(0);
+                }
+                Ok(value.len())
             }
-            return Ok(value.len());
+            StoreBackend::Real(dispatcher) => {
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| match tenant.as_deref() {
+                        Some(tenant) => client.get_size_in_tenant(tenant, &key),
+                        None => client.get_size(&key),
+                    })
+                    .map_err(store_error_to_py)
+            }
         }
-        let client = self.client_ref()?;
-        match tenant {
-            Some(tenant) => client.get_size_in_tenant(tenant, key),
-            None => client.get_size(key),
-        }
-        .map_err(store_error_to_py)
     }
 
     fn register_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            return dummy
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => dummy
                 .register_buffer(buffer_ptr, size)
-                .map_err(store_error_to_py);
+                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                let _ = pointer_from_usize(buffer_ptr)?;
+                dispatcher
+                    .register_buffer(buffer_ptr, size)
+                    .map_err(store_error_to_py)?;
+                Ok(0)
+            }
         }
-        let client = self.client_ref()?;
-        client
-            .register_buffer(pointer_from_usize(buffer_ptr)?, size)
-            .map_err(store_error_to_py)?;
-        Ok(0)
     }
 
     fn unregister_buffer(&self, buffer_ptr: usize, size: usize) -> PyResult<i32> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            return dummy
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => dummy
                 .unregister_buffer(buffer_ptr, Some(size))
-                .map_err(store_error_to_py);
+                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                let _ = pointer_from_usize(buffer_ptr)?;
+                dispatcher
+                    .unregister_buffer(buffer_ptr, size)
+                    .map_err(store_error_to_py)?;
+                Ok(0)
+            }
         }
-        let client = self.client_ref()?;
-        client
-            .unregister_buffer(pointer_from_usize(buffer_ptr)?, size)
-            .map_err(store_error_to_py)?;
-        Ok(0)
     }
 
     #[pyo3(signature = (
@@ -354,23 +391,6 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let policy = replication_policy(
-                replica_count,
-                preferred_segment,
-                preferred_segments,
-                preferred_storage_owner,
-                preferred_storage_owners,
-                prefer_local,
-                prefer_alloc_in_same_node,
-                with_soft_pin,
-            );
-            return dummy
-                .put_from(key, buffer_ptr, size, tenant, policy.as_ref())
-                .map_err(store_error_to_py);
-        }
-        let client = self.client_ref()?;
-        let buffer = pointer_from_usize(buffer_ptr)? as *const c_void;
         let policy = replication_policy(
             replica_count,
             preferred_segment,
@@ -381,16 +401,33 @@ impl PyMooncakeDistributedStore {
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
-        match (tenant, policy.as_ref()) {
-            (Some(tenant), Some(policy)) => {
-                client.put_from_in_tenant_with_policy(tenant, key, buffer, size, policy)
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => dummy
+                .put_from(key, buffer_ptr, size, tenant, policy.as_ref())
+                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                let _ = pointer_from_usize(buffer_ptr)?;
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let buffer = buffer_ptr as *const c_void;
+                        match (tenant.as_deref(), policy.as_ref()) {
+                            (Some(tenant), Some(policy)) => client
+                                .put_from_in_tenant_with_policy(tenant, &key, buffer, size, policy),
+                            (None, Some(policy)) => {
+                                client.put_from_with_policy(&key, buffer, size, policy)
+                            }
+                            (Some(tenant), None) => {
+                                client.put_from_in_tenant(tenant, &key, buffer, size)
+                            }
+                            (None, None) => client.put_from(&key, buffer, size),
+                        }
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(0)
             }
-            (None, Some(policy)) => client.put_from_with_policy(key, buffer, size, policy),
-            (Some(tenant), None) => client.put_from_in_tenant(tenant, key, buffer, size),
-            (None, None) => client.put_from(key, buffer, size),
         }
-        .map_err(store_error_to_py)?;
-        Ok(0)
     }
 
     #[pyo3(signature = (key, buffer_ptr, size, *, tenant = None))]
@@ -401,26 +438,34 @@ impl PyMooncakeDistributedStore {
         size: usize,
         tenant: Option<&str>,
     ) -> PyResult<usize> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let size = dummy
-                .get_into(key, buffer_ptr, size, tenant)
-                .map_err(store_error_to_py)?;
-            if size < 0 {
-                return Err(PyKeyError::new_err(format!(
-                    "dummy store get_into failed for key={key}"
-                )));
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let size = dummy
+                    .get_into(key, buffer_ptr, size, tenant)
+                    .map_err(store_error_to_py)?;
+                if size < 0 {
+                    return Err(PyKeyError::new_err(format!(
+                        "dummy store get_into failed for key={key}"
+                    )));
+                }
+                Ok(size as usize)
             }
-            return Ok(size as usize);
+            StoreBackend::Real(dispatcher) => {
+                let _ = pointer_from_usize(buffer_ptr)?;
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let buffer =
+                            unsafe { slice::from_raw_parts_mut(buffer_ptr as *mut u8, size) };
+                        match tenant.as_deref() {
+                            Some(tenant) => client.get_into_in_tenant(tenant, &key, buffer),
+                            None => client.get_into(&key, buffer),
+                        }
+                    })
+                    .map_err(store_error_to_py)
+            }
         }
-        let client = self.client_ref()?;
-        let buffer = unsafe {
-            slice::from_raw_parts_mut(pointer_from_usize(buffer_ptr)?.cast::<u8>(), size)
-        };
-        match tenant {
-            Some(tenant) => client.get_into_in_tenant(tenant, key, buffer),
-            None => client.get_into(key, buffer),
-        }
-        .map_err(store_error_to_py)
     }
 
     #[pyo3(signature = (
@@ -450,7 +495,6 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
-        let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
             preferred_segment,
@@ -461,21 +505,41 @@ impl PyMooncakeDistributedStore {
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
-        let requests = items
-            .iter()
-            .map(|(key, value)| {
-                let mut request = PutRequest::new(key, value);
-                if let Some(tenant) = tenant {
-                    request = request.tenant(tenant);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                for (key, value) in &items {
+                    let status = dummy
+                        .put(key, value, tenant, policy.as_ref())
+                        .map_err(store_error_to_py)?;
+                    if status != 0 {
+                        return Ok(status);
+                    }
                 }
-                if let Some(policy) = policy.clone() {
-                    request = request.replication(policy);
-                }
-                request
-            })
-            .collect::<Vec<_>>();
-        client.batch_put(&requests).map_err(store_error_to_py)?;
-        Ok(0)
+                Ok(0)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let requests = items
+                            .iter()
+                            .map(|(key, value)| {
+                                let mut request = PutRequest::new(key, value);
+                                if let Some(tenant) = tenant.as_deref() {
+                                    request = request.tenant(tenant);
+                                }
+                                if let Some(policy) = policy.clone() {
+                                    request = request.replication(policy);
+                                }
+                                request
+                            })
+                            .collect::<Vec<_>>();
+                        client.batch_put(&requests).map(|_| ())
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(0)
+            }
+        }
     }
 
     #[pyo3(signature = (
@@ -506,23 +570,6 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<Py<PyAny>> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let policy = replication_policy(
-                replica_count,
-                preferred_segment,
-                preferred_segments,
-                preferred_storage_owner,
-                preferred_storage_owners,
-                prefer_local,
-                prefer_alloc_in_same_node,
-                with_soft_pin,
-            );
-            let statuses = dummy
-                .batch_put_from(&items, tenant, policy.as_ref())
-                .map_err(store_error_to_py)?;
-            return Ok(PyList::new(py, statuses)?.into_any().unbind());
-        }
-        let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
             preferred_segment,
@@ -533,24 +580,44 @@ impl PyMooncakeDistributedStore {
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
-        let requests = items
-            .iter()
-            .map(|(key, buffer_ptr, size)| {
-                let mut request =
-                    PutFromRequest::new(key, (*buffer_ptr as *mut c_void).cast_const(), *size);
-                if let Some(tenant) = tenant {
-                    request = request.tenant(tenant);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let statuses = dummy
+                    .batch_put_from(&items, tenant, policy.as_ref())
+                    .map_err(store_error_to_py)?;
+                Ok(PyList::new(py, statuses)?.into_any().unbind())
+            }
+            StoreBackend::Real(dispatcher) => {
+                for (_, buffer_ptr, _) in &items {
+                    let _ = pointer_from_usize(*buffer_ptr)?;
                 }
-                if let Some(policy) = policy.clone() {
-                    request = request.replication(policy);
-                }
-                request
-            })
-            .collect::<Vec<_>>();
-        client
-            .batch_put_from(&requests)
-            .map_err(store_error_to_py)?;
-        Ok(PyList::new(py, vec![0; requests.len()])?.into_any().unbind())
+                let item_count = items.len();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let requests = items
+                            .iter()
+                            .map(|(key, buffer_ptr, size)| {
+                                let mut request = PutFromRequest::new(
+                                    key,
+                                    (*buffer_ptr as *mut c_void).cast_const(),
+                                    *size,
+                                );
+                                if let Some(tenant) = tenant.as_deref() {
+                                    request = request.tenant(tenant);
+                                }
+                                if let Some(policy) = policy.clone() {
+                                    request = request.replication(policy);
+                                }
+                                request
+                            })
+                            .collect::<Vec<_>>();
+                        client.batch_put_from(&requests).map(|_| requests.len())
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(PyList::new(py, vec![0; item_count])?.into_any().unbind())
+            }
+        }
     }
 
     #[pyo3(signature = (
@@ -638,33 +705,6 @@ impl PyMooncakeDistributedStore {
         prefer_alloc_in_same_node: bool,
         with_soft_pin: bool,
     ) -> PyResult<i32> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let policy = replication_policy(
-                replica_count,
-                preferred_segment,
-                preferred_segments,
-                preferred_storage_owner,
-                preferred_storage_owners,
-                prefer_local,
-                prefer_alloc_in_same_node,
-                with_soft_pin,
-            );
-            for (key, buffers) in &items {
-                let total = buffers.iter().map(Vec::len).sum();
-                let mut payload = Vec::with_capacity(total);
-                for buffer in buffers {
-                    payload.extend_from_slice(buffer);
-                }
-                let status = dummy
-                    .put(key, &payload, tenant, policy.as_ref())
-                    .map_err(store_error_to_py)?;
-                if status != 0 {
-                    return Ok(status);
-                }
-            }
-            return Ok(0);
-        }
-        let client = self.client_ref()?;
         let policy = replication_policy(
             replica_count,
             preferred_segment,
@@ -675,33 +715,57 @@ impl PyMooncakeDistributedStore {
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
-        let borrowed = items
-            .iter()
-            .map(|(_, buffers)| {
-                buffers
-                    .iter()
-                    .map(|buffer| buffer.as_slice())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let requests = items
-            .iter()
-            .zip(borrowed.iter())
-            .map(|((key, _), slices)| {
-                let mut request = MultiBufferPutRequest::new(key, slices.as_slice());
-                if let Some(tenant) = tenant {
-                    request = request.tenant(tenant);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                for (key, buffers) in &items {
+                    let total = buffers.iter().map(Vec::len).sum();
+                    let mut payload = Vec::with_capacity(total);
+                    for buffer in buffers {
+                        payload.extend_from_slice(buffer);
+                    }
+                    let status = dummy
+                        .put(key, &payload, tenant, policy.as_ref())
+                        .map_err(store_error_to_py)?;
+                    if status != 0 {
+                        return Ok(status);
+                    }
                 }
-                if let Some(policy) = policy.clone() {
-                    request = request.replication(policy);
-                }
-                request
-            })
-            .collect::<Vec<_>>();
-        client
-            .batch_put_from_multi_buffers(&requests)
-            .map_err(store_error_to_py)?;
-        Ok(0)
+                Ok(0)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let borrowed = items
+                            .iter()
+                            .map(|(_, buffers)| {
+                                buffers
+                                    .iter()
+                                    .map(|buffer| buffer.as_slice())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        let requests = items
+                            .iter()
+                            .zip(borrowed.iter())
+                            .map(|((key, _), slices)| {
+                                let mut request =
+                                    MultiBufferPutRequest::new(key, slices.as_slice());
+                                if let Some(tenant) = tenant.as_deref() {
+                                    request = request.tenant(tenant);
+                                }
+                                if let Some(policy) = policy.clone() {
+                                    request = request.replication(policy);
+                                }
+                                request
+                            })
+                            .collect::<Vec<_>>();
+                        client.batch_put_from_multi_buffers(&requests).map(|_| ())
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(0)
+            }
+        }
     }
 
     #[pyo3(signature = (
@@ -740,64 +804,6 @@ impl PyMooncakeDistributedStore {
                 "keys, all_buffer_ptrs, and all_sizes must have the same length",
             ));
         }
-        if let Some(dummy) = self.dummy.as_ref() {
-            let items = keys
-                .iter()
-                .zip(all_buffer_ptrs.iter())
-                .zip(all_sizes.iter())
-                .map(|((key, buffer_ptrs), sizes)| {
-                    if buffer_ptrs.len() != sizes.len() {
-                        return Err(PyValueError::new_err(
-                            "each multi-buffer pointer group must match its sizes group",
-                        ));
-                    }
-                    Ok((
-                        key.clone(),
-                        buffer_ptrs
-                            .iter()
-                            .copied()
-                            .zip(sizes.iter().copied())
-                            .collect::<Vec<_>>(),
-                    ))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            let policy = replication_policy(
-                replica_count,
-                preferred_segment,
-                preferred_segments,
-                preferred_storage_owner,
-                preferred_storage_owners,
-                prefer_local,
-                prefer_alloc_in_same_node,
-                with_soft_pin,
-            );
-            return dummy
-                .batch_put_from_multi_buffers(&items, tenant, policy.as_ref())
-                .map_err(store_error_to_py);
-        }
-        let client = self.client_ref()?;
-
-        let borrowed = all_buffer_ptrs
-            .iter()
-            .zip(all_sizes.iter())
-            .map(|(buffer_ptrs, sizes)| {
-                if buffer_ptrs.len() != sizes.len() {
-                    return Err(PyValueError::new_err(
-                        "each multi-buffer pointer group must match its sizes group",
-                    ));
-                }
-                buffer_ptrs
-                    .iter()
-                    .zip(sizes.iter())
-                    .map(|(buffer_ptr, size)| unsafe {
-                        Ok(slice::from_raw_parts(
-                            pointer_from_usize(*buffer_ptr)?.cast::<u8>(),
-                            *size,
-                        ))
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .collect::<PyResult<Vec<_>>>()?;
         let policy = replication_policy(
             replica_count,
             preferred_segment,
@@ -808,36 +814,98 @@ impl PyMooncakeDistributedStore {
             prefer_alloc_in_same_node,
             with_soft_pin,
         );
-
-        let requests = keys
-            .iter()
-            .zip(borrowed.iter())
-            .map(|(key, buffers)| {
-                let mut request = MultiBufferPutRequest::new(key, buffers.as_slice());
-                if let Some(tenant) = tenant {
-                    request = request.tenant(tenant);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let items = keys
+                    .iter()
+                    .zip(all_buffer_ptrs.iter())
+                    .zip(all_sizes.iter())
+                    .map(|((key, buffer_ptrs), sizes)| {
+                        if buffer_ptrs.len() != sizes.len() {
+                            return Err(PyValueError::new_err(
+                                "each multi-buffer pointer group must match its sizes group",
+                            ));
+                        }
+                        Ok((
+                            key.clone(),
+                            buffer_ptrs
+                                .iter()
+                                .copied()
+                                .zip(sizes.iter().copied())
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                dummy
+                    .batch_put_from_multi_buffers(&items, tenant, policy.as_ref())
+                    .map_err(store_error_to_py)
+            }
+            StoreBackend::Real(dispatcher) => {
+                for (buffer_ptrs, sizes) in all_buffer_ptrs.iter().zip(all_sizes.iter()) {
+                    if buffer_ptrs.len() != sizes.len() {
+                        return Err(PyValueError::new_err(
+                            "each multi-buffer pointer group must match its sizes group",
+                        ));
+                    }
+                    for buffer_ptr in buffer_ptrs {
+                        let _ = pointer_from_usize(*buffer_ptr)?;
+                    }
                 }
-                if let Some(policy) = policy.clone() {
-                    request = request.replication(policy);
-                }
-                request
-            })
-            .collect::<Vec<_>>();
-        client
-            .batch_put_from_multi_buffers(&requests)
-            .map_err(store_error_to_py)?;
-        Ok(vec![0; keys.len()])
+                let key_count = keys.len();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let borrowed = all_buffer_ptrs
+                            .iter()
+                            .zip(all_sizes.iter())
+                            .map(|(buffer_ptrs, sizes)| {
+                                buffer_ptrs
+                                    .iter()
+                                    .zip(sizes.iter())
+                                    .map(|(buffer_ptr, size)| unsafe {
+                                        slice::from_raw_parts(*buffer_ptr as *const u8, *size)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        let requests = keys
+                            .iter()
+                            .zip(borrowed.iter())
+                            .map(|(key, buffers)| {
+                                let mut request =
+                                    MultiBufferPutRequest::new(key, buffers.as_slice());
+                                if let Some(tenant) = tenant.as_deref() {
+                                    request = request.tenant(tenant);
+                                }
+                                if let Some(policy) = policy.clone() {
+                                    request = request.replication(policy);
+                                }
+                                request
+                            })
+                            .collect::<Vec<_>>();
+                        client.batch_put_from_multi_buffers(&requests).map(|_| ())
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(vec![0; key_count])
+            }
+        }
     }
 
     #[pyo3(signature = (key, force = false, *, tenant = None))]
     fn remove(&self, key: &str, force: bool, tenant: Option<&str>) -> PyResult<i32> {
-        let client = self.client_ref()?;
-        match tenant {
-            Some(tenant) => client.remove_in_tenant(tenant, key, force),
-            None => client.remove(key, force),
+        match self.real_dispatcher()? {
+            dispatcher => {
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| match tenant.as_deref() {
+                        Some(tenant) => client.remove_in_tenant(tenant, &key, force),
+                        None => client.remove(&key, force),
+                    })
+                    .map_err(store_error_to_py)?;
+                Ok(0)
+            }
         }
-        .map_err(store_error_to_py)?;
-        Ok(0)
     }
 
     #[pyo3(signature = (keys, force = false, *, tenant = None))]
@@ -847,21 +915,25 @@ impl PyMooncakeDistributedStore {
         force: bool,
         tenant: Option<&str>,
     ) -> PyResult<Vec<i32>> {
-        let client = self.client_ref()?;
-        let objects = keys
-            .iter()
-            .map(|key| {
-                let mut object = ObjectRef::new(key.as_str());
-                if let Some(tenant) = tenant {
-                    object = object.tenant(tenant);
-                }
-                object
+        let dispatcher = self.real_dispatcher()?;
+        let key_count = keys.len();
+        let tenant = tenant.map(str::to_string);
+        dispatcher
+            .run(move |client| {
+                let objects = keys
+                    .iter()
+                    .map(|key| {
+                        let mut object = ObjectRef::new(key.as_str());
+                        if let Some(tenant) = tenant.as_deref() {
+                            object = object.tenant(tenant);
+                        }
+                        object
+                    })
+                    .collect::<Vec<_>>();
+                client.batch_remove(&objects, force).map(|_| ())
             })
-            .collect::<Vec<_>>();
-        client
-            .batch_remove(&objects, force)
             .map_err(store_error_to_py)?;
-        Ok(vec![0; keys.len()])
+        Ok(vec![0; key_count])
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
@@ -871,18 +943,23 @@ impl PyMooncakeDistributedStore {
         keys: Vec<String>,
         tenant: Option<&str>,
     ) -> PyResult<Vec<Py<PyBytes>>> {
-        let client = self.client_ref()?;
-        let objects = keys
-            .iter()
-            .map(|key| {
-                let mut object = ObjectRef::new(key);
-                if let Some(tenant) = tenant {
-                    object = object.tenant(tenant);
-                }
-                object
+        let dispatcher = self.real_dispatcher()?;
+        let tenant = tenant.map(str::to_string);
+        let values = dispatcher
+            .run(move |client| {
+                let objects = keys
+                    .iter()
+                    .map(|key| {
+                        let mut object = ObjectRef::new(key);
+                        if let Some(tenant) = tenant.as_deref() {
+                            object = object.tenant(tenant);
+                        }
+                        object
+                    })
+                    .collect::<Vec<_>>();
+                client.batch_get(&objects)
             })
-            .collect::<Vec<_>>();
-        let values = client.batch_get(&objects).map_err(store_error_to_py)?;
+            .map_err(store_error_to_py)?;
         Ok(values
             .into_iter()
             .map(|value| PyBytes::new(py, &value).unbind())
@@ -905,36 +982,41 @@ impl PyMooncakeDistributedStore {
         items: Vec<(String, usize, usize)>,
         tenant: Option<&str>,
     ) -> PyResult<Vec<i64>> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            return dummy.batch_get_into(&items, tenant).map_err(store_error_to_py);
-        }
-        let client = self.client_ref()?;
-        let mut buffers = items
-            .iter()
-            .map(|(_, buffer_ptr, size)| unsafe {
-                slice::from_raw_parts_mut(
-                    pointer_from_usize(*buffer_ptr)
-                        .expect("pointer must be valid")
-                        .cast::<u8>(),
-                    *size,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut requests = items
-            .iter()
-            .zip(buffers.iter_mut())
-            .map(|((key, _, _), buffer)| {
-                let mut request = GetRequest::new(key, buffer);
-                if let Some(tenant) = tenant {
-                    request = request.tenant(tenant);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => dummy
+                .batch_get_into(&items, tenant)
+                .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                for (_, buffer_ptr, _) in &items {
+                    let _ = pointer_from_usize(*buffer_ptr)?;
                 }
-                request
-            })
-            .collect::<Vec<_>>();
-        client
-            .batch_get_into(&mut requests)
-            .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
-            .map_err(store_error_to_py)
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let mut buffers = items
+                            .iter()
+                            .map(|(_, buffer_ptr, size)| unsafe {
+                                slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size)
+                            })
+                            .collect::<Vec<_>>();
+                        let mut requests = items
+                            .iter()
+                            .zip(buffers.iter_mut())
+                            .map(|((key, _, _), buffer)| {
+                                let mut request = GetRequest::new(key, buffer);
+                                if let Some(tenant) = tenant.as_deref() {
+                                    request = request.tenant(tenant);
+                                }
+                                request
+                            })
+                            .collect::<Vec<_>>();
+                        client
+                            .batch_get_into(&mut requests)
+                            .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
+                    })
+                    .map_err(store_error_to_py)
+            }
+        }
     }
 
     #[pyo3(signature = (keys, buffer_ptrs, sizes, *, tenant = None))]
@@ -974,69 +1056,77 @@ impl PyMooncakeDistributedStore {
                 "keys, all_buffer_ptrs, and all_sizes must have the same length",
             ));
         }
-        if let Some(dummy) = self.dummy.as_ref() {
-            let items = keys
-                .iter()
-                .zip(all_buffer_ptrs.iter())
-                .zip(all_sizes.iter())
-                .map(|((key, buffer_ptrs), sizes)| {
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let items = keys
+                    .iter()
+                    .zip(all_buffer_ptrs.iter())
+                    .zip(all_sizes.iter())
+                    .map(|((key, buffer_ptrs), sizes)| {
+                        if buffer_ptrs.len() != sizes.len() {
+                            return Err(PyValueError::new_err(
+                                "each multi-buffer pointer group must match its sizes group",
+                            ));
+                        }
+                        Ok((
+                            key.clone(),
+                            buffer_ptrs
+                                .iter()
+                                .copied()
+                                .zip(sizes.iter().copied())
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                dummy
+                    .batch_get_into_multi_buffers(&items, tenant)
+                    .map_err(store_error_to_py)
+            }
+            StoreBackend::Real(dispatcher) => {
+                for (buffer_ptrs, sizes) in all_buffer_ptrs.iter().zip(all_sizes.iter()) {
                     if buffer_ptrs.len() != sizes.len() {
                         return Err(PyValueError::new_err(
                             "each multi-buffer pointer group must match its sizes group",
                         ));
                     }
-                    Ok((
-                        key.clone(),
-                        buffer_ptrs
+                    for buffer_ptr in buffer_ptrs {
+                        let _ = pointer_from_usize(*buffer_ptr)?;
+                    }
+                }
+                let tenant = tenant.map(str::to_string);
+                dispatcher
+                    .run(move |client| {
+                        let mut borrowed = all_buffer_ptrs
                             .iter()
-                            .copied()
-                            .zip(sizes.iter().copied())
-                            .collect::<Vec<_>>(),
-                    ))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            return dummy
-                .batch_get_into_multi_buffers(&items, tenant)
-                .map_err(store_error_to_py);
-        }
-        let client = self.client_ref()?;
+                            .zip(all_sizes.iter())
+                            .map(|(buffer_ptrs, sizes)| {
+                                buffer_ptrs
+                                    .iter()
+                                    .zip(sizes.iter())
+                                    .map(|(buffer_ptr, size)| unsafe {
+                                        slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
 
-        let mut borrowed = all_buffer_ptrs
-            .iter()
-            .zip(all_sizes.iter())
-            .map(|(buffer_ptrs, sizes)| {
-                if buffer_ptrs.len() != sizes.len() {
-                    return Err(PyValueError::new_err(
-                        "each multi-buffer pointer group must match its sizes group",
-                    ));
-                }
-                buffer_ptrs
-                    .iter()
-                    .zip(sizes.iter())
-                    .map(|(buffer_ptr, size)| unsafe {
-                        Ok(slice::from_raw_parts_mut(
-                            pointer_from_usize(*buffer_ptr)?.cast::<u8>(),
-                            *size,
-                        ))
+                        let mut requests = keys
+                            .iter()
+                            .zip(borrowed.iter_mut())
+                            .map(|(key, buffers)| {
+                                let mut request =
+                                    MultiBufferGetRequest::new(key, buffers.as_mut_slice());
+                                if let Some(tenant) = tenant.as_deref() {
+                                    request = request.tenant(tenant);
+                                }
+                                request
+                            })
+                            .collect::<Vec<_>>();
+                        client.batch_get_into_multi_buffers(&mut requests)
                     })
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-
-        let mut requests = keys
-            .iter()
-            .zip(borrowed.iter_mut())
-            .map(|(key, buffers)| {
-                let mut request = MultiBufferGetRequest::new(key, buffers.as_mut_slice());
-                if let Some(tenant) = tenant {
-                    request = request.tenant(tenant);
-                }
-                request
-            })
-            .collect::<Vec<_>>();
-        client
-            .batch_get_into_multi_buffers(&mut requests)
-            .map_err(store_error_to_py)
+                    .map_err(store_error_to_py)
+            }
+        }
     }
 
     #[pyo3(signature = (storage_bytes))]
@@ -1045,37 +1135,37 @@ impl PyMooncakeDistributedStore {
         py: Python<'py>,
         storage_bytes: usize,
     ) -> PyResult<Py<PyAny>> {
-        let client = self.client_ref()?;
-        let announcement = client
-            .expand_local_memory(storage_bytes)
+        let announcement = self
+            .real_dispatcher()?
+            .run(move |client| client.expand_local_memory(storage_bytes))
             .map_err(store_error_to_py)?;
         segment_to_py(py, &announcement)
     }
 
     fn drain_segment(&self, segment_name: &str) -> PyResult<i32> {
-        let client = self.client_ref()?;
-        client
-            .drain_segment(&SegmentName::new(segment_name))
+        let segment_name = SegmentName::new(segment_name);
+        self.real_dispatcher()?
+            .run(move |client| client.drain_segment(&segment_name))
             .map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn retire_segment(&self, segment_name: &str) -> PyResult<bool> {
-        let client = self.client_ref()?;
-        client
-            .retire_segment(&SegmentName::new(segment_name))
+        let segment_name = SegmentName::new(segment_name);
+        self.real_dispatcher()?
+            .run(move |client| client.retire_segment(&segment_name))
             .map_err(store_error_to_py)
     }
 
     fn evacuate_owned_replicas(&mut self) -> PyResult<usize> {
-        let client = self.client_mut()?;
-        client.evacuate_owned_replicas().map_err(store_error_to_py)
+        self.real_dispatcher()?
+            .evacuate_owned_replicas()
+            .map_err(store_error_to_py)
     }
 
     fn list_segments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyAny>>> {
-        let client = self.client_ref()?;
-        client
-            .list_segments()
+        self.real_dispatcher()?
+            .run(|client| client.list_segments())
             .map_err(store_error_to_py)?
             .iter()
             .map(|segment| segment_to_py(py, segment))
@@ -1089,58 +1179,68 @@ impl PyMooncakeDistributedStore {
         key: &str,
         tenant: Option<&str>,
     ) -> PyResult<Option<Py<PyAny>>> {
-        let client = self.client_ref()?;
-        let route = match tenant {
-            Some(tenant) => client.query_route_in_tenant(tenant, key),
-            None => client.query_route(key),
-        }
-        .map_err(store_error_to_py)?;
+        let key = key.to_string();
+        let tenant = tenant.map(str::to_string);
+        let route = self
+            .real_dispatcher()?
+            .run(move |client| match tenant.as_deref() {
+                Some(tenant) => client.query_route_in_tenant(tenant, &key),
+                None => client.query_route(&key),
+            })
+            .map_err(store_error_to_py)?;
         route.map(|route| route_to_py(py, &route)).transpose()
     }
 
     fn heartbeat(&mut self, expires_at_ms: u64) -> PyResult<i32> {
-        let client = self.client_mut()?;
-        client.heartbeat(expires_at_ms).map_err(store_error_to_py)?;
+        self.real_dispatcher()?
+            .heartbeat(expires_at_ms)
+            .map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn activate(&mut self) -> PyResult<i32> {
-        let client = self.client_mut()?;
-        client.activate().map_err(store_error_to_py)?;
+        self.real_dispatcher()?
+            .activate()
+            .map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn enter_standby(&mut self) -> PyResult<i32> {
-        let client = self.client_mut()?;
-        client.enter_standby().map_err(store_error_to_py)?;
+        self.real_dispatcher()?
+            .enter_standby()
+            .map_err(store_error_to_py)?;
         Ok(0)
     }
 
     fn enter_draining(&mut self) -> PyResult<i32> {
-        let client = self.client_mut()?;
-        client.enter_draining().map_err(store_error_to_py)?;
+        self.real_dispatcher()?
+            .enter_draining()
+            .map_err(store_error_to_py)?;
         Ok(0)
     }
 
     #[pyo3(signature = (force = false))]
     fn remove_all(&self, force: bool) -> PyResult<i64> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            let (status, removed) = dummy.remove_all(force).map_err(store_error_to_py)?;
-            if status != 0 {
-                return Err(PyRuntimeError::new_err("dummy remove_all failed"));
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let (status, removed) = dummy.remove_all(force).map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Err(PyRuntimeError::new_err("dummy remove_all failed"));
+                }
+                Ok(removed)
             }
-            return Ok(removed);
+            StoreBackend::Real(_) => Err(PyRuntimeError::new_err(
+                "remove_all is not available for real-mode native store",
+            )),
         }
-        Err(PyRuntimeError::new_err(
-            "remove_all is not available for real-mode native store",
-        ))
     }
 
     fn health_check(&self) -> PyResult<i32> {
-        if let Some(dummy) = self.dummy.as_ref() {
-            return Ok(dummy.health_check());
+        match self.backend.as_ref() {
+            Some(StoreBackend::Dummy(dummy)) => Ok(dummy.health_check()),
+            Some(StoreBackend::Real(_)) => Ok(0),
+            None => Ok(1),
         }
-        Ok(if self.client.is_some() { 0 } else { 1 })
     }
 
     fn metrics_text(&self) -> String {
@@ -1201,16 +1301,25 @@ fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 impl PyMooncakeDistributedStore {
-    fn client_ref(&self) -> PyResult<&StoreClient> {
-        self.client
+    fn replace_backend(&mut self, backend: StoreBackend) {
+        if let Some(previous) = self.backend.replace(backend) {
+            previous.close();
+        }
+    }
+
+    fn backend_ref(&self) -> PyResult<&StoreBackend> {
+        self.backend
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("store is not set up"))
     }
 
-    fn client_mut(&mut self) -> PyResult<&mut StoreClient> {
-        self.client
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("store is not set up"))
+    fn real_dispatcher(&self) -> PyResult<&StoreDispatcher> {
+        match self.backend_ref()? {
+            StoreBackend::Real(dispatcher) => Ok(dispatcher),
+            StoreBackend::Dummy(_) => Err(PyRuntimeError::new_err(
+                "operation is not available in dummy mode",
+            )),
+        }
     }
 }
 

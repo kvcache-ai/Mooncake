@@ -5567,7 +5567,7 @@ mod tests {
             .label("pool", "pool-a")
             .label("storage", "false")
             .transport(transport)
-            .local_memory(storage_config_with_layout(4096, 8, 1))
+            .local_memory(storage_config_with_layout(4096, 4, 1))
             .build(10_000)
             .expect("reader build should succeed");
 
@@ -6316,21 +6316,12 @@ mod tests {
             .expect("reader register buffer should succeed");
         let sizes = reader
             .batch_get_into(&mut [
-                GetRequest::new(
-                    "subrange-a",
-                    unsafe {
-                        std::slice::from_raw_parts_mut(target.as_mut_ptr(), payload_a.len())
-                    },
-                ),
-                GetRequest::new(
-                    "subrange-b",
-                    unsafe {
-                        std::slice::from_raw_parts_mut(
-                            target.as_mut_ptr().add(64),
-                            payload_b.len(),
-                        )
-                    },
-                ),
+                GetRequest::new("subrange-a", unsafe {
+                    std::slice::from_raw_parts_mut(target.as_mut_ptr(), payload_a.len())
+                }),
+                GetRequest::new("subrange-b", unsafe {
+                    std::slice::from_raw_parts_mut(target.as_mut_ptr().add(64), payload_b.len())
+                }),
             ])
             .expect("batch_get_into should accept registered subranges");
         assert_eq!(sizes, vec![payload_a.len(), payload_b.len()]);

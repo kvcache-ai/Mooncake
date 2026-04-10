@@ -8,7 +8,7 @@ use mooncake_transport::{
     SegmentInfo, TentEngine, TentEngineConfig, TransferProgress, TransferRequest, TransferStatus,
 };
 
-pub trait StoreTransport {
+pub trait StoreTransport: Send + Sync {
     fn segment_name(&self) -> Result<String>;
     fn rpc_server_address(&self) -> Result<(String, u16)>;
     fn open_segment(&self, segment_name: &str) -> Result<u64>;
@@ -44,7 +44,6 @@ impl TentTransportFactory {
 }
 
 impl StoreTransportFactory for TentTransportFactory {
-    #[allow(clippy::arc_with_non_send_sync)]
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
         Ok(Arc::new(TentEngine::new(
             &self.config.clone().set("local_segment_name", segment_name),

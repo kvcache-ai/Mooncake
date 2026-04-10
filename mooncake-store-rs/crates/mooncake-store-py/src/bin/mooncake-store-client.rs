@@ -4,16 +4,17 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use _store_rs::dummy_service::{SharedStoreClient, start_dummy_store_server};
+use _store_rs::dispatcher::StoreDispatcher;
+use _store_rs::dummy_service::start_dummy_store_server;
 use _store_rs::runtime::{CompatRuntimeArgs, CompatSetupArgs};
 use clap::{Parser, ValueEnum};
-use mooncake_store_core::parse_hugepage_size;
 use mooncake_store_client::{
-    init_tracing, start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
-    RouteControlMode,
+    init_tracing, start_metrics_http_server, stop_metrics_http_server, RouteControlMode,
 };
+use mooncake_store_core::parse_hugepage_size;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RouteControlArg {
     EmbeddedWrh,
@@ -88,7 +89,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let metrics_addr = start_metrics_if_needed(args.metrics_addr.as_deref())?;
     let shutdown = install_signal_handler()?;
-    let heartbeat_interval = effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
+    let heartbeat_interval =
+        effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
     let labels = args.labels.into_iter().collect::<BTreeMap<_, _>>();
     let runtime = CompatRuntimeArgs {
         setup: CompatSetupArgs {
@@ -116,10 +118,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let stable_id = runtime.stable_id.clone();
     let segment_name = runtime.segment_name.clone();
-    let mut store_client = runtime.client;
-    store_client.register_local_memory()?;
-    let (shared_client, mut shared_client_loop) = SharedStoreClient::new();
-    let client = Arc::new(shared_client);
+    let client = Arc::new(StoreDispatcher::spawn(
+        runtime.client,
+        format!("mooncake-store-dispatcher-{stable_id}"),
+    )?);
+    client.register_local_memory()?;
     let dummy_server = match args.client_server_address.as_deref() {
         Some(address) => Some(start_dummy_store_server(client.clone(), address)?),
         None => None,
@@ -141,33 +144,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut next_heartbeat = now_ms().saturating_add(heartbeat_interval);
     while !shutdown.load(Ordering::Relaxed) {
         let now = now_ms();
-        let wait_ms = next_heartbeat.saturating_sub(now).max(1);
-        shared_client_loop.pump(
-            &mut store_client,
-            Duration::from_millis(wait_ms.min(heartbeat_interval.max(1))),
-        );
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        let now = now_ms();
         if now >= next_heartbeat {
-            store_client.heartbeat(now.saturating_add(args.lease_ttl_ms))?;
+            client.heartbeat(now.saturating_add(args.lease_ttl_ms))?;
             next_heartbeat = now.saturating_add(heartbeat_interval);
+            continue;
         }
+        let wait_ms = next_heartbeat.saturating_sub(now).max(1);
+        thread::sleep(Duration::from_millis(wait_ms.min(100)));
     }
 
     drop(dummy_server);
-    drop(client);
-    shared_client_loop.drain(&mut store_client);
 
     if args.drain_on_exit {
-        store_client.enter_draining()?;
-        let evacuated = store_client.evacuate_owned_replicas()?;
+        client.enter_draining()?;
+        let evacuated = client.evacuate_owned_replicas()?;
         eprintln!(
             "mooncake-store-client drained stable_id={} evacuated_routes={}",
             stable_id, evacuated
         );
     }
+    client.shutdown();
     if metrics_addr.is_some() {
         stop_metrics_http_server()?;
     }
@@ -200,8 +196,7 @@ fn parse_label(input: &str) -> Result<(String, String), String> {
 }
 
 fn parse_hugepage_size_arg(input: &str) -> Result<usize, String> {
-    parse_hugepage_size(input)
-        .map_err(|error| error.to_string())
+    parse_hugepage_size(input).map_err(|error| error.to_string())
 }
 
 fn install_signal_handler() -> Result<Arc<AtomicBool>, Box<dyn Error>> {

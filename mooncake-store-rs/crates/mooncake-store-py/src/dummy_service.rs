@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use mooncake_store_core::StoreError;
@@ -12,10 +12,10 @@ use tokio::sync::oneshot;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-pub use crate::dummy_loop::{SharedStoreClient, SharedStoreClientLoop};
+use crate::dispatcher::StoreDispatcher;
 use crate::shm::{
-    DummyClientId, ShmRegisterRequest, bind_shm_listener, dummy_ipc_socket_path,
-    map_registered_region, recv_shm_register_request,
+    bind_shm_listener, dummy_ipc_socket_path, map_registered_region, recv_shm_register_request,
+    DummyClientId, ShmRegisterRequest,
 };
 
 pub mod pb {
@@ -79,7 +79,7 @@ impl Drop for DummyStoreServerHandle {
 }
 
 pub fn start_dummy_store_server(
-    client: Arc<SharedStoreClient>,
+    client: Arc<StoreDispatcher>,
     bind_addr: &str,
 ) -> Result<DummyStoreServerHandle, StoreError> {
     let socket_path = dummy_ipc_socket_path(bind_addr);
@@ -123,7 +123,9 @@ pub fn start_dummy_store_server(
             let runtime = Runtime::new().expect("dummy gRPC runtime should build");
             runtime.block_on(async move {
                 let result = Server::builder()
-                    .add_service(pb::dummy_store_service_server::DummyStoreServiceServer::new(service))
+                    .add_service(
+                        pb::dummy_store_service_server::DummyStoreServiceServer::new(service),
+                    )
                     .serve_with_shutdown(address, async move {
                         let _ = shutdown_rx.await;
                     })
@@ -146,19 +148,18 @@ pub fn start_dummy_store_server(
 }
 
 struct DummyStoreContext {
-    client: Arc<SharedStoreClient>,
+    client: Arc<StoreDispatcher>,
 }
 
 impl DummyStoreContext {
-    fn register_region(
-        &self,
-        request: ShmRegisterRequest,
-        fd: OwnedFd,
-    ) -> Result<(), StoreError> {
+    fn register_region(&self, request: ShmRegisterRequest, fd: OwnedFd) -> Result<(), StoreError> {
         let mapped = map_registered_region(fd, request.size as usize)?;
         self.client.register_buffer(mapped.base(), mapped.len())?;
         let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
-        if let Some(previous) = self.client.install_region(client_id, request.region_id, mapped) {
+        if let Some(previous) = self
+            .client
+            .install_region(client_id, request.region_id, mapped)
+        {
             if let Err(error) = self
                 .client
                 .unregister_buffer(previous.base(), previous.len())
@@ -295,7 +296,11 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
     ) -> Result<Response<pb::StatusReply>, Status> {
         let request = request.into_inner();
         let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
-        let status = match self.context.client.take_region(client_id, request.region_id) {
+        let status = match self
+            .context
+            .client
+            .take_region(client_id, request.region_id)
+        {
             Some(region) => match self
                 .context
                 .client

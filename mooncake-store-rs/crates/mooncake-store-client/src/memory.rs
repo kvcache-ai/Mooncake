@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::ptr;
 
-use mooncake_store_core::{
-    HugePageConfig, Result, SegmentLifecycleState, SegmentName, StoreError,
-};
+use mooncake_store_core::{HugePageConfig, Result, SegmentLifecycleState, SegmentName, StoreError};
 
 use crate::transport::StoreTransport;
 
@@ -288,13 +286,17 @@ pub struct RegionAllocation {
 
 #[derive(Debug)]
 struct RegisteredRegion {
-    base: *mut c_void,
+    base_addr: usize,
     capacity: usize,
     alignment: usize,
     owner: RegionOwner,
 }
 
 impl RegisteredRegion {
+    fn base_ptr(&self) -> *mut c_void {
+        self.base_addr as *mut c_void
+    }
+
     fn register(
         transport: &dyn StoreTransport,
         capacity: usize,
@@ -320,7 +322,7 @@ impl RegisteredRegion {
             return Err(error);
         }
         Ok(Self {
-            base,
+            base_addr: base as usize,
             capacity,
             alignment,
             owner,
@@ -348,7 +350,7 @@ impl RegisteredRegion {
     }
 
     fn allocation_at(&self, offset: usize) -> Result<RegionAllocation> {
-        let addr = unsafe { self.base.cast::<u8>().add(offset).cast::<c_void>() };
+        let addr = unsafe { (self.base_addr as *mut u8).add(offset).cast::<c_void>() };
         Ok(RegionAllocation { addr })
     }
 
@@ -359,12 +361,13 @@ impl RegisteredRegion {
                 self.capacity
             )));
         }
-        Ok(unsafe { self.base.cast::<u8>().add(offset).cast::<c_void>() })
+        Ok(unsafe { (self.base_addr as *mut u8).add(offset).cast::<c_void>() })
     }
 
     fn release(self, transport: &dyn StoreTransport) -> Result<()> {
-        transport.unregister_memory(self.base, self.capacity)?;
-        self.owner.release(transport, self.base)
+        let base = self.base_ptr();
+        transport.unregister_memory(base, self.capacity)?;
+        self.owner.release(transport, base)
     }
 }
 
@@ -425,11 +428,7 @@ fn allocate_hugepage_region(
             std::io::Error::last_os_error()
         )));
     }
-    Ok((
-        base,
-        mapped_len,
-        RegionOwner::HugePageMmap { mapped_len },
-    ))
+    Ok((base, mapped_len, RegionOwner::HugePageMmap { mapped_len }))
 }
 
 fn free_hugepage_region(base: *mut c_void, mapped_len: usize) -> Result<()> {
@@ -461,12 +460,10 @@ mod tests {
     use std::ffi::c_void;
 
     use mooncake_store_core::HugePageConfig;
-    use mooncake_transport::{
-        SegmentInfo, TransferProgress, TransferRequest, TransferStatus,
-    };
+    use mooncake_transport::{SegmentInfo, TransferProgress, TransferRequest, TransferStatus};
 
     use super::{
-        LocalMemoryConfig, RegionOwner, StoreTransport, align_up, allocate_hugepage_region,
+        align_up, allocate_hugepage_region, LocalMemoryConfig, RegionOwner, StoreTransport,
     };
 
     struct NoopTransport;
@@ -599,7 +596,10 @@ mod tests {
             .hugepage()
             .expect("hugepage config should resolve")
             .expect("hugepage config should be enabled");
-        assert_eq!(hugepage, HugePageConfig::new(2 * 1024 * 1024).expect("2MB is supported"));
+        assert_eq!(
+            hugepage,
+            HugePageConfig::new(2 * 1024 * 1024).expect("2MB is supported")
+        );
     }
 
     #[test]
@@ -608,8 +608,8 @@ mod tests {
         if !hugepages_available(hugepage.bytes()) {
             return;
         }
-        let (base, mapped_len, owner) =
-            allocate_hugepage_region(4096, 64, "cpu:0", hugepage).expect("hugetlb mmap should succeed");
+        let (base, mapped_len, owner) = allocate_hugepage_region(4096, 64, "cpu:0", hugepage)
+            .expect("hugetlb mmap should succeed");
         assert_eq!(mapped_len, hugepage.bytes());
         assert!(matches!(owner, RegionOwner::HugePageMmap { .. }));
         owner

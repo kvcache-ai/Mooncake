@@ -65,6 +65,9 @@ pub struct TentEngine {
     raw: ffi::TentEngineHandle,
 }
 
+unsafe impl Send for TentEngine {}
+unsafe impl Sync for TentEngine {}
+
 impl TentEngine {
     pub fn new(config: &TentEngineConfig) -> Result<Self> {
         config.apply()?;

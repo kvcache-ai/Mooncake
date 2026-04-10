@@ -10,8 +10,8 @@ use tonic::transport::{Channel, Endpoint};
 
 use crate::dummy_service::pb;
 use crate::shm::{
-    DummyClientId, ShmRegisterRequest, dummy_ipc_socket_path, resolve_shared_region,
-    send_shm_register_request, shared_region_for_registration,
+    dummy_ipc_socket_path, resolve_shared_region, send_shm_register_request,
+    shared_region_for_registration, DummyClientId, ShmRegisterRequest,
 };
 
 static DUMMY_RUNTIME: LazyLock<Runtime> =
@@ -33,11 +33,14 @@ struct RegisteredRegion {
 
 impl DummySession {
     pub fn connect(server_addr: &str) -> Result<Self> {
-        let endpoint = Endpoint::from_shared(format!("http://{server_addr}"))
-            .map_err(|error| StoreError::Transport(format!("invalid dummy server endpoint: {error}")))?;
+        let endpoint = Endpoint::from_shared(format!("http://{server_addr}")).map_err(|error| {
+            StoreError::Transport(format!("invalid dummy server endpoint: {error}"))
+        })?;
         let channel = DUMMY_RUNTIME
             .block_on(endpoint.connect())
-            .map_err(|error| StoreError::Transport(format!("failed to connect to dummy server: {error}")))?;
+            .map_err(|error| {
+                StoreError::Transport(format!("failed to connect to dummy server: {error}"))
+            })?;
         Ok(Self {
             channel,
             server_addr: server_addr.to_string(),
@@ -140,7 +143,9 @@ impl DummySession {
             .registered_regions
             .lock()
             .remove(&buffer_ptr)
-            .ok_or_else(|| StoreError::NotFound(format!("buffer {buffer_ptr:#x} is not registered")))?;
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("buffer {buffer_ptr:#x} is not registered"))
+            })?;
         if let Some(size) = size {
             if size != region.requested_len {
                 return Err(StoreError::Allocator(format!(
@@ -328,7 +333,9 @@ impl DummySession {
 
     pub fn remove_all(&self, force: bool) -> Result<(i32, i64)> {
         let reply = self
-            .rpc(|mut client| async move { client.remove_all(pb::RemoveAllRequest { force }).await })?
+            .rpc(
+                |mut client| async move { client.remove_all(pb::RemoveAllRequest { force }).await },
+            )?
             .into_inner();
         Ok((reply.status, reply.removed))
     }
