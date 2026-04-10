@@ -104,6 +104,7 @@ The current implementation supports:
 - transport-managed local memory
 - hugepage-backed native memory for Rust store segments
 - hugepage-backed shared memory for Python host buffers
+- background async eviction on storage nodes
 
 ### Remote allocation
 
@@ -139,6 +140,23 @@ The tracked identity is route-oriented rather than segment-only:
 - segment offset
 
 This lets the storage owner evict a precise replica instead of reclaiming blind segment regions.
+
+### Background watermarks
+
+Storage nodes reclaim proactively in the background.
+
+The current behavior is:
+
+- a background worker polls local usage
+- when used bytes reach the high watermark, eviction starts
+- eviction continues until used bytes fall to the low watermark or no more victims can be reclaimed
+- synchronous reserve-fail eviction still remains as the last-resort fallback
+
+Default local-memory settings are:
+
+- high watermark: `90%`
+- low watermark: `80%`
+- poll interval: `100ms`
 
 ### Read-hit reporting
 
@@ -177,6 +195,11 @@ This keeps the roles clean:
 - storage nodes reclaim their own local capacity
 - routed rw nodes keep the existing spill-remote behavior
 - scratch-only rw nodes can run with `storage_bytes=0`
+
+Startup also enforces the role boundary:
+
+- `storage=true` requires `storage_bytes > 0`
+- when `storage_bytes=0` and no explicit storage label is supplied, the runtime defaults the label to `storage=false`
 
 ## Delete and Reclaim
 

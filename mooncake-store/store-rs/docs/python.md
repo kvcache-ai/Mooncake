@@ -37,6 +37,7 @@ After installation:
 - real and dummy execution modes for Mooncake / HiCache-style integration
 - batch I/O, registered-buffer I/O, and multi-buffer I/O
 - the same storage-owner CLOCK eviction and route-owner CAS reclaim as Rust callers
+- the same background watermark eviction defaults as Rust callers
 - route query, lifecycle, and metrics helpers
 - wheel packaging for the native extension plus the bundled runtime libraries
 
@@ -159,6 +160,8 @@ Role reminder:
 
 - use `--label storage=true` on storage nodes that should accept routed placement and run local CLOCK eviction
 - use `--label storage=false` on routed rw nodes that should place remotely without owning local storage
+- `--label storage=true` requires `--storage-bytes > 0`
+- when `--storage-bytes 0` is used without an explicit storage label, the runtime defaults to `storage=false`
 
 ## Basic Real-Mode Example
 

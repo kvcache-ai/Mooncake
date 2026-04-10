@@ -56,9 +56,20 @@ impl CompatSetupArgs {
         let tent_config =
             build_tent_config(&self.local_hostname, &transport_redis_url, &self.protocol)?;
         let mut labels = self.labels;
-        labels
-            .entry("storage".to_string())
-            .or_insert_with(|| (self.global_segment_size != 0).to_string());
+        match labels.get("storage").map(String::as_str) {
+            Some("true") if self.global_segment_size == 0 => {
+                return Err(StoreError::InvalidState(
+                    "label storage=true requires storage_bytes > 0".to_string(),
+                ));
+            }
+            None => {
+                labels.insert(
+                    "storage".to_string(),
+                    (self.global_segment_size != 0).to_string(),
+                );
+            }
+            _ => {}
+        }
         Ok(CompatBuildPlan {
             metadata,
             tent_config,
@@ -183,6 +194,8 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -218,6 +231,62 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, StoreError::Unsupported(_)));
+    }
+
+    #[test]
+    fn build_plan_defaults_storage_false_when_storage_bytes_is_zero() {
+        let plan = CompatSetupArgs {
+            local_hostname: "127.0.0.1".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            global_segment_size: 0,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            stable_id: Some("sample".to_string()),
+            tenant: "default".to_string(),
+            labels: BTreeMap::new(),
+            routed_writes: false,
+            replica_count: 1,
+            keyspace: None,
+            expires_at_ms: Some(1),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+        }
+        .build()
+        .expect("build plan should succeed");
+        assert_eq!(
+            plan.labels.get("storage").map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn build_plan_rejects_storage_true_without_storage_bytes() {
+        let result = CompatSetupArgs {
+            local_hostname: "127.0.0.1".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            global_segment_size: 0,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            stable_id: Some("sample".to_string()),
+            tenant: "default".to_string(),
+            labels: BTreeMap::from([("storage".to_string(), "true".to_string())]),
+            routed_writes: false,
+            replica_count: 1,
+            keyspace: None,
+            expires_at_ms: Some(1),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+        }
+        .build();
+        let error = match result {
+            Ok(_) => panic!("build plan should reject storage=true without storage bytes"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::InvalidState(_)));
     }
 
     #[test]

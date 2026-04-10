@@ -42,6 +42,9 @@ System-managed behavior:
 | `tags` | `["dram"]` | tags published with the segment |
 | `alignment` | `64` | allocation alignment |
 | `reclaim_grace_ms` | `1000` | delayed reclaim window |
+| `eviction_high_watermark_percent` | `90` | start background eviction when local usage reaches this percentage |
+| `eviction_low_watermark_percent` | `80` | stop background eviction after usage falls to this percentage |
+| `eviction_poll_interval` | `100ms` | background storage-owner eviction polling interval; `0` disables the worker |
 | `hugepage_enabled` | `None` | override hugepage enablement for local storage and scratch |
 | `hugepage_size_bytes` | `None` | override hugepage size; `2 MiB` and `1 GiB` are supported |
 
@@ -49,9 +52,16 @@ Validation rules:
 
 - `scratch_bytes` must be greater than zero
 - `location` must not be empty
+- `eviction_high_watermark_percent` must be in `1..=100`
+- `eviction_low_watermark_percent` must be lower than `eviction_high_watermark_percent`
 - hugepage size must be either `2 MiB` or `1 GiB`
 
 `storage_bytes` may be `0`. This is how scratch-only rw clients are configured when storage and inference are deployed as separate roles.
+
+Storage-role normalization:
+
+- `storage=true` requires `storage_bytes > 0`
+- if `storage_bytes=0` and the storage label is missing, the runtime normalizes it to `storage=false`
 
 Hugepage behavior:
 
@@ -115,7 +125,7 @@ The runtime and examples use these conventions:
 
 | Key | Purpose |
 |-----|---------|
-| `storage` | opt a client into routed placement candidate sets and enable local CLOCK eviction when it owns storage memory |
+| `storage` | opt a client into routed placement candidate sets and enable local background/synchronous eviction when it owns storage memory |
 | `pool` | default placement scope label |
 | `route_scope` | optional route-authority scope |
 

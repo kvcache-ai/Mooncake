@@ -201,7 +201,9 @@ Operational behavior:
 
 - `storage=true` opts the client into routed placement candidate sets
 - the same label also enables local storage-owner CLOCK eviction when reservation pressure appears
+- the same label enables background watermark eviction when local storage is configured
 - writers publish remote replica routes back to the storage owner automatically, so eviction does not need metadata scans on the hot path
+- `storage=true` requires `storage_bytes > 0`
 
 ### Routed writer
 
@@ -218,6 +220,7 @@ Operational behavior:
 - routed writers can run with `storage_bytes=0` in inference/storage split deployments
 - when they do not own storage, they do not run local CLOCK eviction
 - remote placement still benefits from remote storage-owner eviction and route tracking
+- when `storage_bytes=0` and no explicit storage label is provided, the runtime normalizes the label to `storage=false`
 
 ### Reader or stateless client
 

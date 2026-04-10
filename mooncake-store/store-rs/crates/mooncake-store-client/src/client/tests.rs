@@ -629,6 +629,20 @@ fn storage_config_with_bytes(storage_bytes: usize) -> LocalMemoryConfig {
         .reclaim_grace_ms(0)
 }
 
+fn storage_config_with_background_eviction(
+    storage_bytes: usize,
+    high_percent: u8,
+    low_percent: u8,
+) -> LocalMemoryConfig {
+    LocalMemoryConfig::new()
+        .storage_bytes(storage_bytes)
+        .scratch_bytes(4096)
+        .alignment(1)
+        .reclaim_grace_ms(0)
+        .eviction_watermarks(high_percent, low_percent)
+        .eviction_poll_interval(Duration::from_millis(10))
+}
+
 fn storage_config_with_layout(
     storage_bytes: usize,
     scratch_bytes: usize,
@@ -1217,6 +1231,44 @@ fn rw_only_client_registers_without_segments_and_routes_to_remote_storage() {
         .list_segments()
         .expect("rw-only segment listing should still succeed")
         .is_empty());
+}
+
+#[test]
+fn builder_rejects_storage_true_without_storage_bytes() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("invalid-storage-role-segment"));
+    let result = StoreClientBuilder::new(metadata, "invalid-storage-role")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .build(10_000);
+    let error = match result {
+        Ok(_) => panic!("builder should reject storage=true without storage bytes"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::InvalidState(_)));
+}
+
+#[test]
+fn builder_defaults_storage_label_to_false_when_storage_bytes_is_zero() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("rw-default-storage-false-segment"));
+    let client = StoreClientBuilder::new(metadata, "rw-default-storage-false")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .build(10_000)
+        .expect("builder should succeed");
+    assert_eq!(
+        client
+            .lease()
+            .endpoints
+            .labels
+            .get("storage")
+            .map(String::as_str),
+        Some("false")
+    );
 }
 
 #[test]
@@ -3201,6 +3253,57 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
         router.get("remote-clock-cold"),
         Err(StoreError::NotFound(_))
     ));
+}
+
+#[test]
+fn background_watermark_eviction_reclaims_without_front_path_pressure() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("background-evict-segment"));
+    let client = StoreClientBuilder::new(metadata, "background-evict")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_background_eviction(100, 60, 20))
+        .build(10_000)
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    client
+        .put("background-a", &[1u8; 20])
+        .expect("put a should succeed");
+    client
+        .put("background-b", &[2u8; 20])
+        .expect("put b should succeed");
+    client
+        .put("background-c", &[3u8; 20])
+        .expect("put c should succeed");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let used = client
+            .list_segments()
+            .expect("segment list should succeed")
+            .into_iter()
+            .map(|segment| segment.used_bytes)
+            .sum::<u64>();
+        if used <= 20 {
+            break;
+        }
+        sleep(Duration::from_millis(20));
+    }
+
+    let used = client
+        .list_segments()
+        .expect("segment list should succeed")
+        .into_iter()
+        .map(|segment| segment.used_bytes)
+        .sum::<u64>();
+    assert!(
+        used <= 20,
+        "background watermark eviction should reclaim down to the low watermark; used={used}"
+    );
 }
 
 #[test]
