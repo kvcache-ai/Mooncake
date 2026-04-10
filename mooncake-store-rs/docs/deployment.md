@@ -76,6 +76,50 @@ What they validate:
 - dummy path through the standalone compatibility server plus shm registration
 - real path through the native distributed store runtime plus registered-buffer I/O
 
+### Multi-client stress benchmark
+
+Run the process-per-client stress benchmark:
+
+```bash
+./scripts/run-multi-client-stress.sh
+```
+
+What the script does:
+
+- auto-starts local Redis when needed
+- builds the release Python compatibility runtime
+- starts dedicated storage processes
+- starts dedicated rw processes
+- runs `put`, `get`, `batch-put`, and `batch-get` phases
+- prints a final steady-state bandwidth summary
+
+Example summary:
+
+```text
+steady-state bandwidth:
+- put: 24.82 MiB/s
+- get: 27.22 MiB/s
+- batch-put: 45.31 MiB/s
+- batch-get: 109.52 MiB/s
+```
+
+Use this summary as the primary throughput readout. The longer `stress phase=...` lines still include setup and prepare timing for debugging, but they are not the main throughput signal.
+
+Important stress-benchmark inputs:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MC_STORE_RS_STRESS_STORAGE_CLIENTS` | `4` | number of dedicated storage processes |
+| `MC_STORE_RS_STRESS_WRITER_CLIENTS` | `8` | number of concurrent rw worker processes |
+| `MC_STORE_RS_STRESS_WRITER_STORAGE_BYTES` | `0` | local storage bytes owned by rw workers |
+| `MC_STORE_RS_STRESS_VALUE_SIZE` | `4096` | payload size per object |
+| `MC_STORE_RS_STRESS_BATCH_SIZE` | `32` | objects per batch request |
+| `MC_STORE_RS_STRESS_SINGLE_ITERS` | `256` | steady-state single-request iterations per worker |
+| `MC_STORE_RS_STRESS_BATCH_ITERS` | `128` | steady-state batch iterations per worker |
+| `MC_STORE_RS_STRESS_WARMUP_ITERS` | `16` | pre-measurement warmup iterations per worker |
+| `MC_STORE_RS_STRESS_PHASES` | `put,get,batch-put,batch-get` | comma-separated phase list |
+| `MC_STORE_RS_STRESS_ROUTE_CONTROL` | `metadata_only` | route mode used by the benchmark |
+
 ### Wheel packaging
 
 Build the Python wheel and stage the standalone client binary:
@@ -178,6 +222,8 @@ Current repository scripts and examples use Redis-backed TENT metadata. In the P
 This is the default mode.
 
 - route ownership is selected on the client with weighted rendezvous hashing
+- the client prewarms a live-client membership snapshot during `build(...)`
+- background membership sync refreshes that snapshot after startup
 - normal route reads and compare-and-swap stay off the metadata hot path
 - metadata remains the fallback when authority RPC is unavailable
 

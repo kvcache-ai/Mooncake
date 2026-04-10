@@ -112,7 +112,7 @@ After installation, both interfaces are available:
 - `python -c "import mooncake"` loads the native extension
 - `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
 - `mooncake-store-client --help` runs the packaged standalone client command
-- `mooncake_master --version` prints the packaged Pro version banner
+- if your environment still exposes the upstream compatibility alias, `mooncake_master --version` prints the same packaged Pro version banner
 
 ## Standalone Client Binary
 

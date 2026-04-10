@@ -20,12 +20,15 @@ This document collects the main runtime knobs exposed by the current implementat
 | `transport_factory(...)` | none | used to create transports for peers |
 | `routed_writes(...)` | disabled | enables routed placement |
 | `route_control(...)` | `EmbeddedWrh` | selects route control mode |
+| `live_client_sync_interval(...)` | `1s` | background refresh interval for the live-client membership snapshot; `0` disables the worker |
 
 System-managed behavior:
 
 - the builder adds `route=true` when missing
 - the control-plane address label is published automatically
 - if transport is present, RPC address and segment name are inferred when possible
+- `build(...)` prewarms the live-client membership snapshot before serving requests
+- the background membership worker refreshes that snapshot after startup
 
 ## `LocalMemoryConfig`
 
@@ -44,10 +47,11 @@ System-managed behavior:
 
 Validation rules:
 
-- `storage_bytes` must be greater than zero
 - `scratch_bytes` must be greater than zero
 - `location` must not be empty
 - hugepage size must be either `2 MiB` or `1 GiB`
+
+`storage_bytes` may be `0`. This is how scratch-only rw clients are configured when storage and inference are deployed as separate roles.
 
 Hugepage behavior:
 
@@ -59,7 +63,7 @@ Hugepage behavior:
 
 | Mode | Default | Behavior |
 |------|---------|----------|
-| `RouteControlMode::EmbeddedWrh` | yes | client-side route authority selection with metadata fallback |
+| `RouteControlMode::EmbeddedWrh` | yes | client-side route authority selection with metadata fallback and a prewarmed background-refreshed membership snapshot |
 | `RouteControlMode::MetadataOnly` | no | route reads and writes go directly to metadata |
 
 Use `MetadataOnly` for bring-up and debugging. Use `EmbeddedWrh` for normal deployments.
