@@ -147,13 +147,20 @@ class SnapshotObjectStore {
     virtual std::string GetConnectionInfo() const = 0;
 
     /**
-     * @brief Factory method: create object store instance by type
-     * @param type Object store type
+     * @brief Configuration for creating a SnapshotObjectStore instance.
+     */
+    struct CreateConfig {
+        SnapshotObjectStoreType type = SnapshotObjectStoreType::LOCAL_FILE;
+        std::string etcd_endpoints;  // Only used when type == ETCD
+    };
+
+    /**
+     * @brief Factory method: create object store instance by config
+     * @param config Object store configuration
      * @return Smart pointer to object store instance
      */
     static std::unique_ptr<SnapshotObjectStore> Create(
-        SnapshotObjectStoreType type,
-        const std::string& etcd_endpoints = "");
+        const CreateConfig& config);
 };
 
 }  // namespace mooncake

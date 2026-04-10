@@ -29,6 +29,12 @@ EtcdSnapshotObjectStore::EtcdSnapshotObjectStore(
             "Failed to initialize snapshot etcd client: " + error);
     }
     if (err_msg) free(err_msg);
+
+    LOG(WARNING) << "EtcdSnapshotObjectStore: using etcd as snapshot object "
+                 << "store. Ensure the etcd server is configured with a "
+                 << "sufficiently large --max-request-bytes (recommended "
+                 << ">= 2GB for snapshot payloads). The default etcd limit "
+                 << "is 1.5MB which is too small for most snapshots.";
 }
 
 tl::expected<void, std::string> EtcdSnapshotObjectStore::UploadBuffer(
@@ -141,6 +147,11 @@ tl::expected<void, std::string> EtcdSnapshotObjectStore::ListObjectsWithPrefix(
                 object_keys.emplace_back(keys[i],
                                          static_cast<size_t>(key_sizes[i]));
                 free(keys[i]);
+            } else {
+                LOG(WARNING)
+                    << "EtcdSnapshotObjectStore::ListObjectsWithPrefix: "
+                    << "keys[" << i << "] is nullptr (possible Go-side "
+                    << "allocation failure), prefix=" << prefix;
             }
         }
         free(keys);
@@ -153,7 +164,7 @@ tl::expected<void, std::string> EtcdSnapshotObjectStore::ListObjectsWithPrefix(
 }
 
 bool EtcdSnapshotObjectStore::IsNotFoundError(const std::string& error) const {
-    return error.find("key not found") != std::string::npos;
+    return error.find(kKeyNotFoundSubstring) != std::string::npos;
 }
 
 std::string EtcdSnapshotObjectStore::GetConnectionInfo() const {

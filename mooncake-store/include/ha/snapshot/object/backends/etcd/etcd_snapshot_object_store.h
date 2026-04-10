@@ -23,6 +23,10 @@ namespace mooncake {
  */
 class EtcdSnapshotObjectStore : public SnapshotObjectStore {
    public:
+    // Must match the Go-side error string in etcd_wrapper.go
+    // (SnapshotStoreGetWrapper returns "key not found in etcd")
+    static constexpr const char* kKeyNotFoundSubstring = "key not found";
+
     explicit EtcdSnapshotObjectStore(const std::string& endpoints);
     ~EtcdSnapshotObjectStore() override = default;
 

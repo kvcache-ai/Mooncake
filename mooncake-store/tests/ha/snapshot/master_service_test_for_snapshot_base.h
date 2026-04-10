@@ -794,7 +794,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // validation.
         if (!service_->snapshot_object_store_) {
             service_->snapshot_object_store_ = SnapshotObjectStore::Create(
-                SnapshotObjectStoreType::LOCAL_FILE);
+                {SnapshotObjectStoreType::LOCAL_FILE});
         }
         if (!service_->snapshot_catalog_store_ &&
             service_->snapshot_object_store_) {

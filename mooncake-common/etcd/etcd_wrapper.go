@@ -299,6 +299,7 @@ func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 		return -1
 	}
 	if len(resp.Kvs) == 0 {
+		// The substring "key not found" is matched by C++ EtcdSnapshotObjectStore::kKeyNotFoundSubstring
 		*errMsg = C.CString("key not found in etcd")
 		return -2
 	} else {
@@ -1038,6 +1039,7 @@ func SnapshotStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 		return -1
 	}
 	if len(resp.Kvs) == 0 {
+		// The substring "key not found" is matched by C++ EtcdSnapshotObjectStore::kKeyNotFoundSubstring
 		*errMsg = C.CString("key not found in etcd")
 		return -2
 	} else {

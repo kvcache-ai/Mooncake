@@ -107,7 +107,7 @@ class MasterServiceSupervisorConfig {
     bool rpc_enable_tcp_no_delay = true;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
-    std::string etcd_endpoints = "0.0.0.0:2379";
+    std::string etcd_endpoints = "127.0.0.1:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -290,7 +290,7 @@ class WrappedMasterServiceConfig {
     std::string snapshot_object_store_type;
     std::string snapshot_catalog_store_type;
     std::string snapshot_catalog_store_connstring;
-    std::string etcd_endpoints = "0.0.0.0:2379";
+    std::string etcd_endpoints = "127.0.0.1:2379";
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -769,7 +769,7 @@ class MasterServiceConfig {
     std::string snapshot_object_store_type;
     std::string snapshot_catalog_store_type;
     std::string snapshot_catalog_store_connstring;
-    std::string etcd_endpoints = "0.0.0.0:2379";
+    std::string etcd_endpoints = "127.0.0.1:2379";
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,

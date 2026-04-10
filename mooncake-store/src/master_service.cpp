@@ -29,6 +29,7 @@
 #include "utils.h"
 #include "ha/snapshot/snapshot_socket_util.h"
 #include <sys/socket.h>
+#include <thread>
 
 namespace mooncake {
 
@@ -120,7 +121,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             snapshot_object_store_ = SnapshotObjectStore::Create(
-                snapshot_object_store_type_, etcd_endpoints_);
+                {snapshot_object_store_type_, etcd_endpoints_});
             snapshot_catalog_store_ = CreateSnapshotCatalogStore();
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot stores: " << e.what();
@@ -2514,6 +2515,20 @@ void MasterService::SnapshotThreadFunc() {
             close(log_pipe[1]);
             if (use_socketpair) {
                 close(sv[1]);  // close child end
+
+                // Drain child log pipe in a background thread to prevent
+                // the child from blocking when the pipe buffer fills up.
+                std::thread log_reader(
+                    [log_fd = log_pipe[0]]() {
+                        char buf[4096];
+                        while (true) {
+                            ssize_t n = ::read(log_fd, buf, sizeof(buf) - 1);
+                            if (n <= 0) break;
+                            buf[n] = '\0';
+                            LOG(INFO) << "[Snapshot-Child] " << buf;
+                        }
+                    });
+
                 // ETCD: parent reads from socketpair and uploads
                 auto result =
                     PersistStateViaParentUpload(sv[0], descriptor.value());
@@ -2522,6 +2537,9 @@ void MasterService::SnapshotThreadFunc() {
                 // Reap child process
                 int status = 0;
                 waitpid(pid, &status, 0);
+
+                // Child exited → pipe EOF → log_reader will finish
+                log_reader.join();
 
                 auto elapsed =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5212,8 +5230,19 @@ MasterService::PersistStateViaParentUpload(
     bool all_success = true;
     std::string error_msg;
 
+    // Set socket receive timeout to match snapshot_child_timeout_seconds_,
+    // so ReadExact won't block indefinitely if the child hangs.
+    struct timeval tv;
+    tv.tv_sec = static_cast<time_t>(snapshot_child_timeout_seconds_);
+    tv.tv_usec = 0;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        LOG(WARNING) << "[Snapshot] Failed to set SO_RCVTIMEO on socketpair: "
+                     << strerror(errno);
+    }
+
     LOG(INFO) << "[Snapshot] Parent upload started (ETCD mode), snapshot_id="
-              << snapshot_id << ", backend="
+              << snapshot_id << ", timeout=" << snapshot_child_timeout_seconds_
+              << "s, backend="
               << snapshot_object_store_->GetConnectionInfo();
 
     while (true) {
@@ -5273,12 +5302,20 @@ MasterService::PersistStateViaParentUpload(
                                  SNAPSHOT_BACKUP_SAVE_DIR / local_filename;
                 auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
                 if (!save_result) {
-                    LOG(ERROR) << "[Snapshot] Save to backup_dir failed: "
+                    LOG(ERROR) << "[Snapshot] Save to backup_dir also failed: "
                                << save_path;
+                    // Both upload and backup failed — abort
+                    ack = 1;
+                    WriteExact(socket_fd, &ack, sizeof(ack));
+                    return tl::make_unexpected(SerializationError(
+                        ErrorCode::PERSISTENT_FAIL,
+                        "upload and backup save both failed for key: " +
+                            key));
                 }
+                // Backup saved successfully — keep child alive to receive
+                // remaining components (ack stays 0).
                 error_msg.append(upload_result.error() + "\n");
                 all_success = false;
-                ack = 1;
             } else {
                 // fail-fast: notify child and stop
                 ack = 1;

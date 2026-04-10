@@ -11,11 +11,11 @@
 namespace mooncake {
 
 std::unique_ptr<SnapshotObjectStore> SnapshotObjectStore::Create(
-    SnapshotObjectStoreType type, const std::string& etcd_endpoints) {
-    switch (type) {
+    const CreateConfig& config) {
+    switch (config.type) {
 #ifdef STORE_USE_ETCD
         case SnapshotObjectStoreType::ETCD:
-            return std::make_unique<EtcdSnapshotObjectStore>(etcd_endpoints);
+            return std::make_unique<EtcdSnapshotObjectStore>(config.etcd_endpoints);
 #else
         case SnapshotObjectStoreType::ETCD:
             throw std::runtime_error(
