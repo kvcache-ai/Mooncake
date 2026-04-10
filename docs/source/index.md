@@ -86,6 +86,7 @@ performance/vllm-benchmark-results-v1
 performance/sglang-hicache-benchmark-results-v1
 performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result
+performance/ssd-offload-benchmark-results
 :::
 
 % API Documentation
