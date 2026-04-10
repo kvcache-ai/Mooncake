@@ -64,7 +64,7 @@
 
 namespace mooncake {
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
-                               std::string &local_server_name)
+                               std::string& local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
 
 MultiTransport::~MultiTransport() {}
@@ -85,7 +85,7 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         if (!batch_desc.task_list[task_id].is_finished) {
@@ -102,8 +102,8 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 }
 
 Status MultiTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
@@ -112,17 +112,17 @@ Status MultiTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto &request : entries) {
-        Transport *transport = nullptr;
+    for (auto& request : entries) {
+        Transport* transport = nullptr;
         auto status = selectTransport(request, transport);
         if (!status.ok()) return status;
         assert(transport);
-        auto &task = batch_desc.task_list[task_id];
+        auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest *>(&request);
+        task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
         task.request = &request;
 #endif
@@ -130,7 +130,7 @@ Status MultiTransport::submitTransfer(
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
-    for (auto &entry : submit_tasks) {
+    for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
@@ -143,9 +143,9 @@ Status MultiTransport::submitTransfer(
 
 #ifdef ENABLE_MULTI_PROTOCOL
 Status MultiTransport::mp_submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries,
-    std::string &proto) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    std::string& proto) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
@@ -154,17 +154,17 @@ Status MultiTransport::mp_submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport *, std::vector<Transport::TransferTask *> >
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto &request : entries) {
-        Transport *transport = nullptr;
+    for (auto& request : entries) {
+        Transport* transport = nullptr;
         auto status = mp_selectTransport(request, transport, proto);
         if (!status.ok()) return status;
         assert(transport);
-        auto &task = batch_desc.task_list[task_id];
+        auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest *>(&request);
+        task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
         task.request = &request;
 #endif
@@ -172,7 +172,7 @@ Status MultiTransport::mp_submitTransfer(
         submit_tasks[transport].push_back(&task);
     }
     Status overall_status = Status::OK();
-    for (auto &entry : submit_tasks) {
+    for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
@@ -185,13 +185,13 @@ Status MultiTransport::mp_submitTransfer(
 #endif
 
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                         TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                         TransferStatus& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
         return Status::InvalidArgument("Task ID out of range");
     }
-    auto &task = batch_desc.task_list[task_id];
+    auto& task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -208,7 +208,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             auto current_ts = getCurrentTimeInNano();
             const int64_t kPacketDeliveryTimeout =
                 globalConfig().slice_timeout * 1000000000;
-            for (auto &slice : task.slice_list) {
+            for (auto& slice : task.slice_list) {
                 auto ts = slice->ts;
                 if (ts > 0 && current_ts > ts &&
                     current_ts - ts > kPacketDeliveryTimeout) {
@@ -224,8 +224,8 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
-                                              TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                              TransferStatus& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
@@ -269,9 +269,9 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
-Transport *MultiTransport::installTransport(const std::string &proto,
+Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
-    Transport *transport = nullptr;
+    Transport* transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
     }
@@ -351,7 +351,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 
 #ifdef USE_BAREX
     bool use_eic = false;
-    for (auto &dev : topo->getHcaList()) {
+    for (auto& dev : topo->getHcaList()) {
         if (dev.find("soe") != std::string::npos ||
             dev.find("solar") != std::string::npos) {
             use_eic = true;
@@ -360,7 +360,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 
     if (std::string(proto) == "barex") {
         std::string nics;
-        for (auto &dev : topo->getHcaList()) {
+        for (auto& dev : topo->getHcaList()) {
             if (use_eic) {
                 if (dev.find("soe") == std::string::npos &&
                     dev.find("solar") == std::string::npos) {
@@ -391,8 +391,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     return transport;
 }
 
-Status MultiTransport::selectTransport(const TransferRequest &entry,
-                                       Transport *&transport) {
+Status MultiTransport::selectTransport(const TransferRequest& entry,
+                                       Transport*& transport) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
@@ -416,9 +416,9 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
-Status MultiTransport::mp_selectTransport(const TransferRequest &entry,
-                                          Transport *&transport,
-                                          std::string &preferred_proto) {
+Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
+                                          Transport*& transport,
+                                          std::string& preferred_proto) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         return Status::InvalidArgument("Invalid target segment ID " +
@@ -456,23 +456,23 @@ Status MultiTransport::mp_selectTransport(const TransferRequest &entry,
 }
 #endif
 
-Transport *MultiTransport::getTransport(const std::string &proto) {
+Transport* MultiTransport::getTransport(const std::string& proto) {
     if (!transport_map_.count(proto)) return nullptr;
     return transport_map_[proto].get();
 }
 
-std::vector<Transport *> MultiTransport::listTransports() {
-    std::vector<Transport *> transport_list;
-    for (auto &entry : transport_map_)
+std::vector<Transport*> MultiTransport::listTransports() {
+    std::vector<Transport*> transport_list;
+    for (auto& entry : transport_map_)
         transport_list.push_back(entry.second.get());
     return transport_list;
 }
 
-void *MultiTransport::getBaseAddr() {
+void* MultiTransport::getBaseAddr() {
 #ifdef USE_CXL
-    Transport *transport = getTransport("cxl");
+    Transport* transport = getTransport("cxl");
     if (transport) {
-        auto *cxl_transport = dynamic_cast<CxlTransport *>(transport);
+        auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
         return cxl_transport ? cxl_transport->getCxlBaseAddr() : 0;
     }
 #endif
