@@ -19,6 +19,8 @@
 #include "rpc_types.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_io/coro_io.hpp>
+#include <async_simple/coro/Lazy.h>
 
 namespace mooncake {
 
@@ -406,10 +408,11 @@ class RealClient : public PyClient {
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config, const UUID &client_id);
 
-    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_helper(
-        const std::vector<std::string> &keys,
-        const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes,
-        int32_t device_id, const UUID &client_id);
+    async_simple::coro::Lazy<std::vector<tl::expected<int64_t, ErrorCode>>>
+    batch_get_into_dummy_helper(const std::vector<std::string> &keys,
+                                const std::vector<uint64_t> &buffers,
+                                const std::vector<size_t> &sizes,
+                                int32_t device_id, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
@@ -645,7 +648,8 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
-    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
