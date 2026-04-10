@@ -4,6 +4,32 @@
 
 The Python package does not wrap a second store implementation. It reuses the same Rust runtime, control plane, allocator, reclaim logic, tracing, and metrics that the Rust client uses.
 
+## Package Model
+
+The repository now builds two Python wheels with different responsibilities:
+
+- `mooncake-*.whl` is the real runtime package
+- `mooncake_pro-*.whl` is the user-facing Pro metapackage
+
+Recommended installation flow:
+
+```bash
+pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+```
+
+For local wheelhouse installs you can also use:
+
+```bash
+./scripts/install-pro-wheel.sh
+```
+
+After installation:
+
+- Python code still imports `mooncake`
+- `pip list` clearly shows `mooncake-pro`
+- the installed runtime version is pinned through `mooncake-pro -> mooncake==...+pro...`
+- upgrading from an older `mooncake` install does not require `--force-reinstall`
+
 ## What the Python Layer Provides
 
 - `MooncakeDistributedStore` as the main compatibility API
@@ -63,8 +89,9 @@ By default the script:
 
 - creates or reuses `.venv-wheel`
 - installs `maturin`
-- embeds the standalone `mooncake-store-client` binary into the wheel package
-- builds the Python wheel into `dist/wheels/`
+- installs `build` for the Pro metapackage
+- embeds the standalone `mooncake-store-client` binary into the runtime wheel package
+- builds both wheels into `dist/wheels/`
 - copies the standalone `mooncake-store-client` artifact into `dist/bin/`
 
 Common variants:
@@ -77,13 +104,15 @@ DIST_DIR=artifacts ./scripts/build-wheel.sh
 Install the wheel into any compatible virtualenv:
 
 ```bash
-pip install dist/wheels/mooncake_store_rs-*.whl
+pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 ```
 
 After installation, both interfaces are available:
 
 - `python -c "import mooncake"` loads the native extension
+- `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
 - `mooncake-store-client --help` runs the packaged standalone client command
+- `mooncake_master --version` prints the packaged Pro version banner
 
 ## Standalone Client Binary
 

@@ -177,9 +177,17 @@ To package the Python module and the standalone client command together:
 ./scripts/build-wheel.sh
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
-pip install dist/wheels/mooncake_store_rs-*.whl
+pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
 mooncake-store-client --help
+python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
 ```
+
+This packaging flow now produces two wheels:
+
+- `mooncake-*.whl` is the real compatibility runtime package imported as `mooncake`
+- `mooncake_pro-*.whl` is the user-facing Pro metapackage and the recommended install target
+
+Installing `mooncake-pro` upgrades an existing `mooncake` installation to the matching Pro runtime without requiring `--force-reinstall`.
 
 ### Run the HiCache compatibility checks
 
@@ -295,8 +303,28 @@ Build a distributable wheel and package the standalone client binary:
 
 The default output layout is:
 
-- `dist/wheels/` for Python wheels
+- `dist/wheels/mooncake-*.whl` for the real runtime package
+- `dist/wheels/mooncake_pro-*.whl` for the user-facing Pro metapackage
 - `dist/bin/mooncake-store-client` for the standalone client runtime
+
+Recommended installation flow:
+
+```bash
+python3 -m venv .venv-wheel-test
+. .venv-wheel-test/bin/activate
+pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
+mooncake_master --version
+```
+
+For local wheelhouse installs, `scripts/install-pro-wheel.sh` wraps the same flow.
+
+Packaging model:
+
+- users install `mooncake-pro`
+- Python code and integrations still import `mooncake`
+- the `mooncake-pro` wheel pins a matching `mooncake==...+pro...` runtime version
+- this keeps the import path compatible while making the installed product identity obvious in `pip list`
 
 ```python
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
