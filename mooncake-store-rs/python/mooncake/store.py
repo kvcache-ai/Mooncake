@@ -13,11 +13,13 @@ import sys
 import threading
 from dataclasses import dataclass, field
 
+from ._runtime import package_dir, preload_native_libraries
+
 
 def _load_native():
-    package_dir = pathlib.Path(__file__).resolve().parent
-    repo_root = package_dir.parent.parent
-    _preload_upstream_libraries(package_dir)
+    root = package_dir()
+    repo_root = root.parent.parent
+    preload_native_libraries(root)
     try:
         from . import _store_rs as native  # type: ignore
 
@@ -48,52 +50,6 @@ def _load_native():
         raise ImportError(
             "cannot find native mooncake store module; run `cargo build -p mooncake-store-py` first"
         )
-
-
-def _preload_upstream_libraries(package_dir: pathlib.Path) -> None:
-    if (package_dir.parent / "mooncake_store_rs.libs").is_dir():
-        return
-    for library in _native_library_candidates(package_dir):
-        if library.exists():
-            ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
-
-
-def _native_library_candidates(package_dir: pathlib.Path) -> list[pathlib.Path]:
-    roots = [
-        package_dir,
-        package_dir / "lib",
-        package_dir.parent,
-        package_dir.parent.parent,
-    ]
-    relative_paths = [
-        pathlib.Path("libtransfer_engine.so"),
-        pathlib.Path("libtent_shared.so"),
-        pathlib.Path("third_party")
-        / "Mooncake"
-        / "build-rust"
-        / "mooncake-transfer-engine"
-        / "src"
-        / "libtransfer_engine.so",
-        pathlib.Path("third_party")
-        / "Mooncake"
-        / "build-rust"
-        / "mooncake-transfer-engine"
-        / "tent"
-        / "src"
-        / "libtent_shared.so",
-    ]
-    candidates: list[pathlib.Path] = []
-    seen: set[pathlib.Path] = set()
-    for root in roots:
-        for relative_path in relative_paths:
-            candidate = (root / relative_path).resolve()
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            candidates.append(candidate)
-    return candidates
-
-
 _native = _load_native()
 
 
