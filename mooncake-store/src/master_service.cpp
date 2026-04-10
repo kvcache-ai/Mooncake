@@ -4617,7 +4617,10 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
     }
 
     // Clear existing data
-    shard.metadata.clear();
+    shard->metadata.clear();
+    shard->raw_key_to_id.clear();
+    shard->tenant_domain_keys.clear();
+    shard->reuse_candidates.clear();
 
     // Deserialize metadata
     if (metadata_array == nullptr ||
@@ -4649,17 +4652,36 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
-        auto [it, inserted] = shard.metadata.emplace(
-            std::piecewise_construct, std::forward_as_tuple(std::move(key)),
+        metadata_ptr->legacy_raw_key = key;
+        LogicalObjectId object_id{metadata_ptr->tenant_id,
+                                  metadata_ptr->domain_id,
+                                  metadata_ptr->object_set,
+                                  metadata_ptr->logical_key.empty()
+                                      ? key
+                                      : metadata_ptr->logical_key};
+        auto [it, inserted] = shard->metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(object_id),
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->tenant_id,
+                metadata_ptr->domain_id, metadata_ptr->object_set,
+                metadata_ptr->sharing_scope, metadata_ptr->qos_tier,
+                metadata_ptr->logical_key.empty() ? key
+                                                  : metadata_ptr->logical_key,
+                metadata_ptr->canonical_key));
 
-        service_->IndexMetadata(*shard.operator->(), it->first, it->second);
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+        it->second.legacy_raw_key = key;
+        service_->IndexMetadata(*shard.operator->(), it->first, it->second);
+        if (max_restored_replica_id != nullptr) {
+            for (const auto& replica : it->second.GetAllReplicas()) {
+                *max_restored_replica_id =
+                    std::max<uint64_t>(*max_restored_replica_id, replica.id());
+            }
+        }
     }
 
     return {};
