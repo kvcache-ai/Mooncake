@@ -210,10 +210,12 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     int access_rights = kBaseAccessRights;
     size_t max_mr = (size_t)globalConfig().max_mr_size;
 
-    // Use a chunk limit slightly below max_mr_size to avoid boundary issues.
-    // Some drivers reject fi_mr_reg at exactly max_mr_size.
-    const size_t kMrMargin = 1ULL << 30;  // 1 GB margin
-    size_t chunk_limit = (max_mr > kMrMargin) ? max_mr - kMrMargin : max_mr;
+    // Use half of max_mr_size as chunk limit.  This provides substantial
+    // headroom below the per-NIC hardware limit and distributes the buffer
+    // across more NICs, improving transfer parallelism.  The previous
+    // approach (max_mr_size - 1GB) was too close to the hardware limit and
+    // caused sporadic fi_mr_reg failures under parallel registration.
+    size_t chunk_limit = (max_mr > 0) ? max_mr / 2 : max_mr;
 
     // Determine chunk boundaries
     std::vector<std::pair<void*, size_t>> chunks;
@@ -224,9 +226,9 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
             chunks.emplace_back(static_cast<char*>(addr) + offset, chunk_len);
             offset += chunk_len;
         }
-        LOG(INFO) << "Auto-splitting buffer " << addr << " (" << length
-                  << " bytes) into " << chunks.size() << " chunks of <= "
-                  << chunk_limit << " bytes each";
+        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
+                     << " bytes) into " << chunks.size() << " chunks of <= "
+                     << chunk_limit << " bytes each";
     } else {
         chunks.emplace_back(addr, length);
     }
@@ -243,10 +245,50 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         resolved_name = name;
     }
 
-    // Register each chunk
+    // Pre-compute NIC assignments for per-NIC partition.
+    // When buffer is split into multiple chunks, each chunk is registered on
+    // a disjoint subset of NICs (since per-NIC total MR = max_mr_size).
+    // This allows registering buffers up to max_mr_size × num_NICs.
+    std::vector<std::vector<size_t>> nic_assignments(chunks.size());
+    if (chunks.size() > 1) {
+        size_t num_nics = context_list_.size();
+        size_t num_chunks = chunks.size();
+        if (num_chunks > num_nics) {
+            LOG(ERROR) << "Buffer requires " << num_chunks
+                       << " chunks but only " << num_nics
+                       << " NICs available. Max registerable size = "
+                       << chunk_limit * num_nics << " bytes";
+            return ERR_INVALID_ARGUMENT;
+        }
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            size_t nics_per = num_nics / num_chunks;
+            size_t extra = num_nics % num_chunks;
+            size_t start = ci * nics_per + std::min(ci, extra);
+            size_t count = nics_per + (ci < extra ? 1 : 0);
+            for (size_t n = start; n < start + count; ++n) {
+                nic_assignments[ci].push_back(n);
+            }
+        }
+        for (size_t ci = 0; ci < num_chunks; ++ci) {
+            std::string nic_list;
+            for (size_t j = 0; j < nic_assignments[ci].size(); ++j) {
+                if (j > 0) nic_list += ",";
+                nic_list += std::to_string(nic_assignments[ci][j]);
+            }
+            LOG(WARNING) << "Per-NIC partition: chunk " << ci
+                         << " -> NICs [" << nic_list << "]";
+        }
+    } else {
+        for (size_t n = 0; n < context_list_.size(); ++n) {
+            nic_assignments[0].push_back(n);
+        }
+    }
+
+    // Register each chunk on its assigned NICs
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void* chunk_addr = chunks[ci].first;
         size_t chunk_len = chunks[ci].second;
+        const auto& assigned_nics = nic_assignments[ci];
 
         bool do_pre_touch = context_list_.size() > 0 &&
                             std::thread::hardware_concurrency() >= 4 &&
@@ -262,7 +304,7 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         if (!force_sequential) {
             use_parallel_reg = globalConfig().parallel_reg_mr;
             if (use_parallel_reg == -1) {
-                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+                use_parallel_reg = assigned_nics.size() > 1 && do_pre_touch;
             }
         }
 
@@ -270,15 +312,18 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
 
         if (use_parallel_reg) {
             std::vector<std::thread> reg_threads;
-            reg_threads.reserve(context_list_.size());
-            std::vector<int> ret_codes(context_list_.size(), 0);
+            reg_threads.reserve(assigned_nics.size());
+            std::vector<int> ret_codes(assigned_nics.size(), 0);
             const int ar = access_rights;
 
-            for (size_t i = 0; i < context_list_.size(); ++i) {
+            for (size_t j = 0; j < assigned_nics.size(); ++j) {
+                size_t nic_idx = assigned_nics[j];
                 reg_threads.emplace_back(
-                    [this, &ret_codes, i, chunk_addr, chunk_len, ar]() {
-                        ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                            chunk_addr, chunk_len, ar);
+                    [this, &ret_codes, j, nic_idx, chunk_addr, chunk_len,
+                     ar]() {
+                        ret_codes[j] =
+                            context_list_[nic_idx]->registerMemoryRegion(
+                                chunk_addr, chunk_len, ar);
                     });
             }
 
@@ -286,22 +331,22 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                 thread.join();
             }
 
-            for (size_t i = 0; i < ret_codes.size(); ++i) {
-                if (ret_codes[i] != 0) {
+            for (size_t j = 0; j < ret_codes.size(); ++j) {
+                if (ret_codes[j] != 0) {
                     LOG(ERROR)
                         << "Failed to register memory region chunk " << ci
-                        << " with EFA context " << i;
-                    return ret_codes[i];
+                        << " with EFA context " << assigned_nics[j];
+                    return ret_codes[j];
                 }
             }
         } else {
-            for (size_t i = 0; i < context_list_.size(); ++i) {
-                int ret = context_list_[i]->registerMemoryRegion(
+            for (size_t nic_idx : assigned_nics) {
+                int ret = context_list_[nic_idx]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights);
                 if (ret) {
                     LOG(ERROR)
                         << "Failed to register memory region chunk " << ci
-                        << " with EFA context " << i;
+                        << " with EFA context " << nic_idx;
                     return ret;
                 }
             }
@@ -317,13 +362,20 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
             LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci
                       << ", addr=" << chunk_addr
                       << ", length=" << chunk_len
-                      << ", contexts=" << context_list_.size()
+                      << ", nics=" << assigned_nics.size()
+                      << "/" << context_list_.size()
                       << ", parallel="
                       << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
         }
 
-        // Collect keys and add metadata for this chunk
+        LOG(WARNING) << "Chunk " << ci << "/" << chunks.size()
+                     << " registered on " << assigned_nics.size() << " NICs"
+                     << ", addr=" << chunk_addr
+                     << ", length=" << chunk_len
+                     << ", duration=" << reg_duration_ms << "ms";
+
+        // Collect keys: assigned NICs have valid keys, others get 0
         BufferDesc buffer_desc;
         for (auto& context : context_list_) {
             buffer_desc.lkey.push_back(context->lkey(chunk_addr));
@@ -337,15 +389,16 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         if (rc) return rc;
     }
 
-    // Track chunks for unregistration if buffer was split
+    // Track chunks and NIC assignments for unregistration
     if (chunks.size() > 1) {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-        std::vector<uint64_t> chunk_addrs;
-        chunk_addrs.reserve(chunks.size());
-        for (auto& chunk : chunks) {
-            chunk_addrs.push_back((uint64_t)chunk.first);
+        std::vector<ChunkRegistration> regs;
+        regs.reserve(chunks.size());
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            regs.push_back(
+                {(uint64_t)chunks[ci].first, nic_assignments[ci]});
         }
-        chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+        chunk_map_[(uint64_t)addr] = std::move(regs);
     }
 
     return 0;
@@ -358,32 +411,32 @@ int EfaTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int EfaTransport::unregisterLocalMemoryInternal(void* addr,
                                                 bool update_metadata,
                                                 bool force_sequential) {
-    // Check if this buffer was split into chunks
-    std::vector<uint64_t> chunk_addrs;
+    // Check if this buffer was split into chunks (per-NIC partition)
+    std::vector<ChunkRegistration> chunk_regs;
     {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
         auto it = chunk_map_.find((uint64_t)addr);
         if (it != chunk_map_.end()) {
-            chunk_addrs = it->second;
+            chunk_regs = std::move(it->second);
             chunk_map_.erase(it);
         }
     }
 
-    if (!chunk_addrs.empty()) {
-        // Unregister all chunks
-        for (auto chunk_addr : chunk_addrs) {
-            void* ca = (void*)chunk_addr;
+    if (!chunk_regs.empty()) {
+        // Unregister each chunk from its assigned NICs only
+        for (auto& reg : chunk_regs) {
+            void* ca = (void*)reg.addr;
             int rc = metadata_->removeLocalMemoryBuffer(ca, update_metadata);
             if (rc) {
                 LOG(ERROR) << "Failed to remove chunk metadata at " << ca;
                 return rc;
             }
 
-            for (size_t i = 0; i < context_list_.size(); ++i) {
-                int ret = context_list_[i]->unregisterMemoryRegion(ca);
+            for (size_t nic_idx : reg.nic_indices) {
+                int ret = context_list_[nic_idx]->unregisterMemoryRegion(ca);
                 if (ret) {
                     LOG(ERROR) << "Failed to unregister chunk " << ca
-                               << " with EFA context " << i;
+                               << " with EFA context " << nic_idx;
                     return ret;
                 }
             }
@@ -565,7 +618,9 @@ Status EfaTransport::submitTransferTask(
                 if (static_cast<size_t>(request_buffer_id) <
                         local_segment_desc->buffers.size() &&
                     local_segment_desc->buffers[request_buffer_id].lkey.size() >
-                        static_cast<size_t>(d)) {
+                        static_cast<size_t>(d) &&
+                    local_segment_desc->buffers[request_buffer_id].lkey[d] !=
+                        0) {
                     active_devs.push_back({d, ctx});
                 }
             }
@@ -923,16 +978,34 @@ int EfaTransport::selectDevice(SegmentDesc* desc, uint64_t offset,
             continue;
         }
 
-        device_id =
-            hint.empty()
-                ? desc->topology.selectDevice(buffer.name, retry_count)
-                : desc->topology.selectDevice(buffer.name, hint, retry_count);
-        if (device_id >= 0) return 0;
-        device_id = hint.empty() ? desc->topology.selectDevice(
-                                       kWildcardLocation, retry_count)
-                                 : desc->topology.selectDevice(
-                                       kWildcardLocation, hint, retry_count);
-        if (device_id >= 0) return 0;
+        // Try multiple attempts to find a device with valid MR registration.
+        // With per-NIC partition, not all devices have all buffers registered,
+        // so rkey[device_id] may be 0 for unassigned NICs.
+        int num_devices = static_cast<int>(desc->devices.size());
+        for (int attempt = 0; attempt < num_devices; ++attempt) {
+            int try_count = retry_count + attempt;
+            device_id =
+                hint.empty()
+                    ? desc->topology.selectDevice(buffer.name, try_count)
+                    : desc->topology.selectDevice(buffer.name, hint,
+                                                   try_count);
+            if (device_id >= 0 &&
+                static_cast<size_t>(device_id) < buffer.rkey.size() &&
+                buffer.rkey[device_id] != 0) {
+                return 0;
+            }
+            device_id =
+                hint.empty()
+                    ? desc->topology.selectDevice(kWildcardLocation,
+                                                   try_count)
+                    : desc->topology.selectDevice(kWildcardLocation, hint,
+                                                   try_count);
+            if (device_id >= 0 &&
+                static_cast<size_t>(device_id) < buffer.rkey.size() &&
+                buffer.rkey[device_id] != 0) {
+                return 0;
+            }
+        }
     }
     return ERR_ADDRESS_NOT_REGISTERED;
 }
