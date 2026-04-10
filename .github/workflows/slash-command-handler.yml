@@ -34,17 +34,6 @@ jobs:
             exit 1
           fi
 
-      - name: Get PR details
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_DATA=$(gh pr view ${{ github.event.issue.number }} \
-            --repo ${{ github.repository }} \
-            --json headRefName,headRefOid)
-          echo "sha=$(echo "$PR_DATA" | jq -r '.headRefOid')" >> $GITHUB_OUTPUT
-          echo "ref=$(echo "$PR_DATA" | jq -r '.headRefName')" >> $GITHUB_OUTPUT
-
       - name: Parse commands
         id: cmd
         run: |
@@ -58,26 +47,32 @@ jobs:
             echo "run_e2e=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Dispatch CI workflow
+      - name: Add run-ci label
         if: steps.cmd.outputs.run_ci == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run ci.yml \
+          gh pr edit ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
-            --ref ${{ steps.pr.outputs.ref }}
+            --remove-label "run-ci" 2>/dev/null || true
+          # Short sleep to ensure the removal event is processed before re-adding
+          sleep 1
+          gh pr edit ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --add-label "run-ci"
 
-      - name: Dispatch E2E CI workflow
+      - name: Add run-e2e-ci label
         if: steps.cmd.outputs.run_e2e == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run e2e-ci.yml \
+          gh pr edit ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
-            --ref ${{ steps.pr.outputs.ref }} \
-            -f pr_number=${{ github.event.issue.number }} \
-            -f pr_sha=${{ steps.pr.outputs.sha }} \
-            -f triggered_by=${{ github.event.comment.user.login }}
+            --remove-label "run-e2e-ci" 2>/dev/null || true
+          sleep 1
+          gh pr edit ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --add-label "run-e2e-ci"
 
       - name: React with rocket on success
         if: success()

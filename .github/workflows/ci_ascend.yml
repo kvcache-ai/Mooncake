@@ -1,7 +1,12 @@
 name: 'CI Test on ASCEND Platform'
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'Git ref to checkout (PR head SHA for pull_request_target)'
+        required: false
+        type: string
 
 jobs:
   build-and-test:
@@ -26,6 +31,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
         fetch-depth: 1
         persist-credentials: false
 

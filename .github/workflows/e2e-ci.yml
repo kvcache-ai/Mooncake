@@ -1,6 +1,9 @@
 name: E2E CI
 
 on:
+  pull_request_target:
+    branches: ["main"]
+    types: [labeled]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -18,21 +21,30 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
-  group: e2e-ci-${{ inputs.pr_number || github.sha }}
+  group: e2e-ci-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
   cancel-in-progress: true
 
 jobs:
   ascend-test:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-e2e-ci')
     uses: ./.github/workflows/ci_ascend.yml
+    with:
+      checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
     secrets: inherit
 
   integration-test:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-e2e-ci')
     uses: ./.github/workflows/integration-test.yml
     with:
-      pr_sha: ${{ inputs.pr_sha }}
-      pr_number: ${{ inputs.pr_number }}
+      pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+      pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
     secrets: inherit
 
   e2e-gate:
@@ -45,9 +57,8 @@ jobs:
     steps:
       - name: Check E2E results
         run: |
-          echo "PR: #${{ inputs.pr_number }}"
-          echo "SHA: ${{ inputs.pr_sha }}"
-          echo "Triggered by: ${{ inputs.triggered_by }}"
+          echo "PR: #${{ inputs.pr_number || github.event.pull_request.number }}"
+          echo "SHA: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}"
           failing=$(echo "$NEEDS_JSON" | jq -r '
             to_entries[] |
             select(.value.result != "success" and .value.result != "skipped") |
@@ -60,3 +71,18 @@ jobs:
           echo "All E2E checks passed."
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+
+  cleanup-label:
+    name: Cleanup E2E Label
+    if: always() && github.event_name != 'workflow_dispatch'
+    needs:
+      - e2e-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove run-e2e-ci label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label "run-e2e-ci" 2>/dev/null || true
