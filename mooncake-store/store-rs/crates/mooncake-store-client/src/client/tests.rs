@@ -1615,7 +1615,8 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
 }
 
 #[test]
-fn embedded_wrh_query_route_repairs_stale_authorities_from_old_authority() {
+fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-stale-old-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("repair-stale-old-b-segment"));
@@ -1730,26 +1731,36 @@ fn embedded_wrh_query_route_repairs_stale_authorities_from_old_authority() {
         .expect("store-c memory should register");
     sleep(Duration::from_millis(150));
 
+    let mut divergent_route = fresh_route.clone();
+    divergent_route.replicas[0].owner =
+        ClientRuntimeId::new("zzzz-divergent-old-owner", ClientEpoch(99));
+    divergent_route.replicas[0].segment_name = SegmentName::new("zzzz-divergent-old-segment");
+    divergent_route.replicas[0].offset = divergent_route.replicas[0].offset.saturating_add(1);
+    divergent_route.replicas[0].segment_offset =
+        divergent_route.replicas[0].segment_offset.saturating_add(1);
+
     crate::route_directory::authority_replace(
         &namespace,
         &store_b.runtime_id().stable_id,
         &scoped_key,
-        Some(&stale_route),
+        Some(&divergent_route),
     )
-    .expect("store-b stale route insert should succeed");
+    .expect("store-b divergent route insert should succeed");
     crate::route_directory::authority_replace(
         &namespace,
         &store_c.runtime_id().stable_id,
         &scoped_key,
-        Some(&stale_route),
+        Some(&divergent_route),
     )
-    .expect("store-c stale route insert should succeed");
+    .expect("store-c divergent route insert should succeed");
 
     let repaired_route = reader
         .query_route("route-repair-stale-old")
         .expect("repaired route query should succeed")
         .expect("repaired route should exist");
     assert_eq!(repaired_route, fresh_route);
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"route_repair_divergent_authority\",status=\"ok\""));
     assert_eq!(
         crate::route_directory::authority_get(
             &namespace,
@@ -1771,13 +1782,14 @@ fn embedded_wrh_query_route_repairs_stale_authorities_from_old_authority() {
     assert_eq!(
         reader
             .get("route-repair-stale-old")
-            .expect("reader get should succeed after stale-authority repair"),
+            .expect("reader get should succeed after divergent-authority repair"),
         b"route-repair-stale-old-v2"
     );
 }
 
 #[test]
-fn embedded_wrh_query_route_repairs_stale_authorities_from_metadata() {
+fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-stale-meta-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("repair-stale-meta-b-segment"));
@@ -1896,26 +1908,36 @@ fn embedded_wrh_query_route_repairs_stale_authorities_from_metadata() {
         .expect("store-c memory should register");
     sleep(Duration::from_millis(150));
 
+    let mut divergent_route = fresh_route.clone();
+    divergent_route.replicas[0].owner =
+        ClientRuntimeId::new("zzzz-divergent-metadata-owner", ClientEpoch(99));
+    divergent_route.replicas[0].segment_name = SegmentName::new("zzzz-divergent-metadata-segment");
+    divergent_route.replicas[0].offset = divergent_route.replicas[0].offset.saturating_add(1);
+    divergent_route.replicas[0].segment_offset =
+        divergent_route.replicas[0].segment_offset.saturating_add(1);
+
     crate::route_directory::authority_replace(
         &namespace,
         &store_b.runtime_id().stable_id,
         &scoped_key,
-        Some(&stale_route),
+        Some(&divergent_route),
     )
-    .expect("store-b stale route insert should succeed");
+    .expect("store-b divergent route insert should succeed");
     crate::route_directory::authority_replace(
         &namespace,
         &store_c.runtime_id().stable_id,
         &scoped_key,
-        Some(&stale_route),
+        Some(&divergent_route),
     )
-    .expect("store-c stale route insert should succeed");
+    .expect("store-c divergent route insert should succeed");
 
     let repaired_route = reader
         .query_route("route-repair-stale-metadata")
         .expect("repaired route query should succeed")
         .expect("repaired route should exist");
     assert_eq!(repaired_route, fresh_route);
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"route_repair_divergent_authority\",status=\"ok\""));
     assert_eq!(
         crate::route_directory::authority_get(
             &namespace,

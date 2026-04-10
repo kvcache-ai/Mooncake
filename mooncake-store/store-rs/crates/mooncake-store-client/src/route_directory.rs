@@ -1,18 +1,23 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend,
-    ObjectKey, ObjectRoute, Result, RouteCasRequest, RouteDirectory, RouteVersion, StoreError,
+    ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteDirectory,
+    RouteState, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
 use tracing::warn;
 
-use crate::control_plane::ControlPlaneClient;
+use crate::{control_plane::ControlPlaneClient, observability::OperationTracker};
 
 const ROUTE_SCOPE_LABEL: &str = "route_scope";
 const AUTHORITY_CANDIDATE_CACHE_TTL: Duration = Duration::from_millis(100);
+const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
+const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
+const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RouteControlMode {
@@ -417,11 +422,17 @@ impl EmbeddedWrhRouteDirectory {
             None => *current = Some(candidate),
             Some(existing) if candidate.version > existing.version => *current = Some(candidate),
             Some(existing) if candidate.version == existing.version && *existing != candidate => {
+                let choose_candidate =
+                    canonical_route_key(&candidate) < canonical_route_key(existing);
+                if choose_candidate {
+                    *existing = candidate.clone();
+                }
                 warn!(
                     key = %key.0,
                     authority = %authority,
                     version = candidate.version.0,
-                    "route authorities disagree on the same route version; keeping the first route"
+                    canonical = if choose_candidate { "candidate" } else { "existing" },
+                    "route authorities disagree on the same route version; choosing canonical route"
                 );
             }
             Some(_) => {}
@@ -458,12 +469,26 @@ impl EmbeddedWrhRouteDirectory {
         observed: &RouteAuthorityObservation,
     ) -> Option<RouteCasRequest> {
         match observed {
-            RouteAuthorityObservation::Missing => Some(RouteCasRequest {
-                key: key.clone(),
-                expected: None,
-                next: Some(best.clone()),
-            }),
+            RouteAuthorityObservation::Missing => {
+                record_route_repair_metric(ROUTE_REPAIR_MISSING_AUTHORITY);
+                Some(RouteCasRequest {
+                    key: key.clone(),
+                    expected: None,
+                    next: Some(best.clone()),
+                })
+            }
             RouteAuthorityObservation::Present(current) if current.version < best.version => {
+                record_route_repair_metric(ROUTE_REPAIR_STALE_AUTHORITY);
+                Some(RouteCasRequest {
+                    key: key.clone(),
+                    expected: Some(current.version),
+                    next: Some(best.clone()),
+                })
+            }
+            RouteAuthorityObservation::Present(current)
+                if current.version == best.version && current != best =>
+            {
+                record_route_repair_metric(ROUTE_REPAIR_DIVERGENT_AUTHORITY);
                 Some(RouteCasRequest {
                     key: key.clone(),
                     expected: Some(current.version),
@@ -1024,6 +1049,66 @@ fn route_weight(lease: &ClientLease) -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|weight| *weight > 0.0)
         .unwrap_or(1.0)
+}
+
+fn route_state_rank(state: RouteState) -> u8 {
+    match state {
+        RouteState::Active => 0,
+        RouteState::Deleting => 1,
+        RouteState::Tombstone => 2,
+    }
+}
+
+fn replica_tier_rank(tier: ReplicaTier) -> u8 {
+    match tier {
+        ReplicaTier::Dram => 0,
+        ReplicaTier::Nvme => 1,
+        ReplicaTier::File => 2,
+        ReplicaTier::Unknown => 3,
+    }
+}
+
+fn canonical_route_key(route: &ObjectRoute) -> String {
+    let mut key = String::new();
+    let _ = write!(
+        key,
+        "{}|{}|{}|{}|{}|{}|",
+        route.key.0,
+        route.version.0,
+        route_state_rank(route.state),
+        route.compatibility.store_api_version,
+        route.compatibility.metadata_schema_version,
+        route.compatibility.transport_api_version,
+    );
+    for capability in &route.compatibility.capabilities {
+        key.push_str(capability);
+        key.push(',');
+    }
+    key.push('|');
+    for replica in &route.replicas {
+        append_replica_key(&mut key, replica);
+    }
+    key
+}
+
+fn append_replica_key(key: &mut String, replica: &ReplicaRoute) {
+    let _ = write!(
+        key,
+        "{}|{}|{}|{}|{}|{}|{}|{};",
+        replica.owner,
+        replica.segment_name.0,
+        replica.offset,
+        replica.segment_offset,
+        replica.length,
+        replica.checksum.unwrap_or_default(),
+        replica_tier_rank(replica.tier),
+        replica.priority,
+    );
+}
+
+fn record_route_repair_metric(operation: &'static str) {
+    let result: Result<()> = Ok(());
+    OperationTracker::new(operation).finish(&result, 0);
 }
 
 fn ranked_before(
