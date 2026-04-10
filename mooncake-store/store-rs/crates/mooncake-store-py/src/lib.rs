@@ -2330,15 +2330,26 @@ mod tests {
         store.enter_standby().expect("standby should succeed");
         store.activate().expect("activate should succeed");
         store.enter_draining().expect("draining should succeed");
-        assert!(store.evacuate_owned_replicas().is_err());
-
         store
-            .remove("alpha", false, None)
-            .expect("remove should succeed");
+            .evacuate_owned_replicas()
+            .expect("owned replica evacuation should succeed");
         assert_eq!(
             store
-                .batch_remove(vec!["beta".to_string(), "gamma".to_string()], false, None)
-                .expect("batch_remove should succeed"),
+                .batch_is_exist(vec!["alpha".to_string(), "beta".to_string()], None)
+                .expect("batch_is_exist should succeed after evacuation"),
+            vec![0, 0]
+        );
+        assert!(!store
+            .is_exist("gamma", None)
+            .expect("gamma should be absent after evacuation"));
+        assert!(store.remove("alpha", false, None).is_err());
+        assert!(store
+            .batch_remove(vec!["beta".to_string(), "gamma".to_string()], false, None)
+            .is_err());
+        assert_eq!(
+            store
+                .batch_is_exist(vec!["beta".to_string(), "gamma".to_string()], None)
+                .expect("batch_is_exist should still succeed after delete attempts"),
             vec![0, 0]
         );
         assert!(store.remove_all(false).is_err());
