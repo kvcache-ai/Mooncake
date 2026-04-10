@@ -3206,7 +3206,8 @@ RealClient::batch_get_into_dummy_helper(
 
     // Hold shared_lock for the entire operation to prevent SHM from being
     // unmapped while batch_get_into_internal is using the translated buffers.
-    auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(dummy_client_mutex_);
+    auto lock = std::make_shared<std::shared_lock<std::shared_mutex>>(
+        dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
@@ -3224,11 +3225,13 @@ RealClient::batch_get_into_dummy_helper(
 
     // Run batch_get_into_internal (which may block on offload RPC + SSD I/O)
     // on a dedicated thread pool so the coro_rpc IO thread stays free for ping.
-    // The shared_lock is captured to keep SHM pinned until the operation completes.
+    // The shared_lock is captured to keep SHM pinned until the operation
+    // completes.
     auto buffers = buffers_result.value();
-    auto try_result = co_await coro_io::post([this, &keys, &buffers, &sizes, lock]() {
-        return batch_get_into_internal(keys, buffers, sizes);
-    });
+    auto try_result = co_await coro_io::post(
+        [this, &keys, buffers = std::move(buffers), &sizes, lock]() {
+            return batch_get_into_internal(keys, buffers, sizes);
+        });
     co_return try_result.value();
 }
 
@@ -4201,10 +4204,10 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
     // Run SSD I/O on a dedicated thread pool
     // so the coro_rpc IO thread is free to handle ping and other RPCs.
-    auto file_storage = file_storage_;
-    auto try_result = co_await coro_io::post([&file_storage, &keys, &sizes]() {
-        return file_storage->BatchGet(keys, sizes);
-    });
+    auto try_result = co_await coro_io::post(
+        [file_storage = file_storage_, &keys, &sizes]() {
+            return file_storage->BatchGet(keys, sizes);
+        });
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
