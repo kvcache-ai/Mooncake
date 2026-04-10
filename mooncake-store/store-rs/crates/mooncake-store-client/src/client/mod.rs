@@ -55,6 +55,7 @@ pub struct StoreClient {
     transport: Option<Arc<dyn StoreTransport>>,
     transport_factory: Option<Arc<dyn StoreTransportFactory>>,
     write_mode: WriteMode,
+    route_control: RouteControlMode,
     state: Mutex<StoreState>,
 }
 

@@ -285,7 +285,7 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let payload = self.get_in_tenant(tenant, key)?;
+            let payload = writer.get_in_tenant(tenant, key)?;
             let Some(confirmed) = self.query_route_in_tenant(tenant, key)? else {
                 return Ok(false);
             };
@@ -332,6 +332,15 @@ impl StoreClient {
         successor: &ClientRuntimeId,
         route: &ObjectRoute,
     ) -> Result<bool> {
+        self.migrate_owned_route_to_runtime_via_writer(self, successor, route)
+    }
+
+    fn migrate_owned_route_to_runtime_via_writer(
+        &self,
+        writer: &StoreClient,
+        successor: &ClientRuntimeId,
+        route: &ObjectRoute,
+    ) -> Result<bool> {
         let (tenant, key) = self.split_scoped_route_key(route)?;
         for _ in 0..4 {
             let Some(observed) = self.query_route_in_tenant(tenant, key)? else {
@@ -348,7 +357,7 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let payload = self.get_in_tenant(tenant, key)?;
+            let payload = writer.get_in_tenant(tenant, key)?;
             let Some(confirmed) = self.query_route_in_tenant(tenant, key)? else {
                 return Ok(false);
             };
@@ -363,8 +372,8 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let policy = self.migration_policy_for_successor_route(&confirmed, successor)?;
-            match self.put_scoped_with_policy_current(
+            let policy = writer.migration_policy_for_successor_route(&confirmed, successor)?;
+            match writer.put_scoped_with_policy_current(
                 tenant,
                 key,
                 &payload,
@@ -373,7 +382,7 @@ impl StoreClient {
                 ReclaimMode::Immediate,
             ) {
                 Ok(next) => {
-                    self.sync_route_to_live_authorities(&next)?;
+                    writer.sync_route_to_live_authorities(&next)?;
                     return Ok(true);
                 }
                 Err(StoreError::Conflict(_)) => continue,
