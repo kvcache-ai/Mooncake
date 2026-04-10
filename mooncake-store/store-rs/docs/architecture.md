@@ -189,7 +189,7 @@ Metadata backends store three persistent categories of data:
 | `evacuate_owned_replicas` / `evacuate_owned_replicas_via` | Rewrite live routes away from a draining client and retire emptied segments |
 | remove + reclaim | Delete route state and release segment space |
 
-These APIs are what the e2e suite uses to validate dynamic membership, elastic expansion, true client shrink, and hot-upgrade handoff.
+These APIs are what the e2e suite uses to validate dynamic membership, elastic expansion, true client shrink, and hot-upgrade handoff with payload preservation.
 
 ## Observability
 

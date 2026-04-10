@@ -193,6 +193,19 @@ upgrade.setup(
 )
 ```
 
+Behavior notes:
+
+- Python real mode reuses the same Rust hot-upgrade runtime as the native Rust client
+- keep `stable_id` fixed across the predecessor and successor, and only advance `epoch`
+- start the successor with `initial_state="standby"`, then shut down the predecessor gracefully
+- when the predecessor exits through `--drain-on-exit` or the equivalent runtime drain path, route handoff and payload migration both happen automatically
+- the promoted successor serves the preserved payloads after takeover; standby alone is not a continuous byte-for-byte mirror
+
+The repository validates this in two ways:
+
+- `scripts/test-client-hot-upgrade-cli.sh` exercises the packaged CLI binary, sends `SIGTERM`, and verifies that the successor can still read the original payload
+- `cargo test -p mooncake-store-py runtime_hot_upgrade_preserves_payload_on_successor -- --nocapture` covers the Python real-mode runtime directly
+
 ## Routed Writes
 
 ```python

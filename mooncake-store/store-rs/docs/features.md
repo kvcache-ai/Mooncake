@@ -144,7 +144,9 @@ The runtime models explicit client states:
 
 ### Handoff and upgrade
 
-The client can publish handoff plans and participate in successor upgrade flows.
+The client can publish handoff plans, promote a standby successor with the same
+`stable_id`, and preserve payloads on the promoted successor during graceful
+hot-upgrade flows.
 
 ### Elastic capacity
 

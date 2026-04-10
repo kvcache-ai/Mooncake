@@ -157,7 +157,7 @@ The e2e binary validates:
 - overwrite reclaim and delete reclaim
 - multi-tenant behavior
 - dynamic membership and elastic segment changes
-- hot-upgrade handoff flows
+- hot-upgrade handoff flows with payload preservation on the promoted successor
 
 ## Suggested Reading Order
 
