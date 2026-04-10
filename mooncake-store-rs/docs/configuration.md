@@ -228,5 +228,7 @@ For debugging:
 For upgrade and elasticity flows:
 
 - preserve `stable_id`
-- increment `epoch`
+- increment `epoch` on the successor
+- start the successor in `standby`
+- use a graceful drain path such as `--drain-on-exit` so route handoff and payload migration finish before exit
 - use `expand_local_memory`, `drain_segment`, `retire_segment`, and `evacuate_owned_replicas`

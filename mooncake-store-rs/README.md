@@ -87,7 +87,8 @@ The implementation is easier to understand when grouped by capability instead of
 - dynamic live-client membership
 - segment-level drain / retire flows
 - true client shrink through replica evacuation
-- hot-upgrade and elastic-capacity scenarios validated in e2e
+- hot-upgrade handoff with automatic payload preservation on the promoted successor
+- elastic-capacity scenarios validated in e2e
 
 ### Observability
 
@@ -161,6 +162,7 @@ This script will:
 - auto-start a local Redis instance on port `6380` when needed
 - build Mooncake TE/TENT from `third_party/Mooncake` when native artifacts are missing
 - run the Rust end-to-end suite
+- verify hot-upgrade route handoff together with payload preservation on the promoted successor
 - print batch put/get benchmark results
 
 For deployment details and script knobs, read `docs/deployment.md`.
@@ -439,4 +441,4 @@ The repository includes automated coverage for:
 - overwrite reclaim and delete reclaim
 - routed remote writes
 - multi-tenant operation
-- dynamic membership, elastic segment changes, and hot-upgrade handoff
+- dynamic membership, elastic segment changes, and hot-upgrade handoff with payload preservation

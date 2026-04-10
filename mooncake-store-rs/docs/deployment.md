@@ -209,6 +209,26 @@ The runtime also manages some labels internally, such as route capability and co
 - use a dedicated metadata keyspace per environment or test run
 - if hugepage mode is enabled, preallocate matching hugepages on the host before starting clients
 
+## Hot Standby and Hot Upgrade
+
+Use the same `stable_id` for the long-lived client identity, then start the successor with a higher `epoch` and `standby` lifecycle state.
+
+A typical operational sequence is:
+
+1. start the active predecessor with `--drain-on-exit`
+2. start the successor with the same `stable_id`, a larger `--epoch`, and `--initial-state standby`
+3. send `SIGTERM` or another graceful shutdown signal to the predecessor
+4. let the predecessor publish the targeted handoff and wait for the successor to promote itself
+
+During this flow the runtime automatically evacuates owned replicas to the promoted successor. Route ownership moves first, then the payloads pinned to the predecessor are copied onto the successor before the predecessor retires its drained segments.
+
+Operational implications:
+
+- hot standby alone does not continuously mirror payload bytes
+- payload migration happens during the hot-upgrade handoff, not during idle standby time
+- `--drain-on-exit` is the switch that turns a normal shutdown into a graceful upgrade handoff
+- the promoted successor keeps serving the same `stable_id` after takeover
+
 ## Validation Coverage
 
 The current end-to-end binary covers:
@@ -219,7 +239,7 @@ The current end-to-end binary covers:
 - overwrite reclaim and delete reclaim
 - routed writes and multi-replica publication
 - multi-tenant access
-- dynamic expansion, true client shrink, and hot-upgrade handoff
+- dynamic expansion, true client shrink, and hot-upgrade handoff with payload preservation
 
 The entry point is `crates/mooncake-store-e2e/src/main.rs`.
 

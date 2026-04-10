@@ -212,6 +212,8 @@ Common calls:
 
 Use `evacuate_owned_replicas_via(writer)` when you want a separate routed client to publish replacement routes during shrink.
 
+During graceful hot-upgrade, the same control surface is what moves route ownership and preserves payloads on the promoted successor.
+
 These operations are the current control surface for hot-upgrade, elastic growth, segment drain/retire, and full client shrink flows.
 
 ## Route Inspection
@@ -260,7 +262,7 @@ It covers:
 - batch put/get
 - registered-buffer and multi-buffer paths
 - delete reclaim and overwrite reclaim
-- dynamic expansion, true client shrink, and hot-upgrade
+- dynamic expansion, true client shrink, and hot-upgrade with payload preservation
 
 ## Next Reading
 
