@@ -29,10 +29,10 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
-    MooncakeWorkCuda(
-        c10d::OpType opType, std::shared_ptr<torch::Event> event,
-        std::shared_ptr<TransferGroupMeta> meta, const MooncakeWorker* worker,
-        std::vector<CudaTaskSubmissionToken> submitted_tasks)
+    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
+                     std::shared_ptr<TransferGroupMeta> meta,
+                     const MooncakeWorker* worker,
+                     std::vector<CudaTaskSubmissionToken> submitted_tasks)
         : Work(-1, opType),
           event_(std::move(event)),
           meta_(std::move(meta)),
@@ -459,8 +459,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         return c10::make_intrusive<MooncakeBarrierWorkCuda>(
             opType, event, meta, this, std::move(submitted_tasks));
     }
-    return c10::make_intrusive<MooncakeWorkCuda>(
-        opType, event, meta, this, std::move(submitted_tasks));
+    return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta, this,
+                                                 std::move(submitted_tasks));
 }
 
 }  // namespace mooncake

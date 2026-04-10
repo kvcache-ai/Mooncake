@@ -172,8 +172,8 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
     }
 
     if (!is_async) {
-        err =
-            cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                              batch->stream);
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
             return;

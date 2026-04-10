@@ -55,8 +55,8 @@ bool MooncakeWorker::waitUntilTasksSubmitted(
         return true;
     };
 
-    BackoffWaiter waiter(BackoffWaiterConfig::constantSleep(
-        std::chrono::microseconds(10)));
+    BackoffWaiter waiter(
+        BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
     if (timeout == kNoTimeout) {
         waiter.wait(submitted);
         return true;
