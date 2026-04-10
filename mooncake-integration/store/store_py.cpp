@@ -1804,6 +1804,60 @@ PYBIND11_MODULE(store, m) {
             })
         .def_readwrite("parallelism", &ReadTargetSpec::parallelism);
 
+    // Progressive get handle for per-chunk completion tracking
+    py::class_<ProgressiveGetHandle>(m, "ProgressiveGetHandle")
+        .def_property_readonly("num_chunks", &ProgressiveGetHandle::num_chunks)
+        .def(
+            "is_chunk_ready",
+            [](ProgressiveGetHandle &self, size_t idx) {
+                py::gil_scoped_release release;
+                return self.is_chunk_ready(idx);
+            },
+            py::arg("chunk_index"))
+        .def("completed_count",
+             [](ProgressiveGetHandle &self) {
+                 py::gil_scoped_release release;
+                 return self.completed_count();
+             })
+        .def(
+            "wait_chunk",
+            [](ProgressiveGetHandle &self, size_t idx) {
+                py::gil_scoped_release release;
+                return static_cast<int>(self.wait_chunk(idx));
+            },
+            py::arg("chunk_index"))
+        .def("wait_all", [](ProgressiveGetHandle &self) {
+            py::gil_scoped_release release;
+            return static_cast<int>(self.wait_all());
+        });
+
+    // Scatter read handle for per-chunk completion tracking
+    py::class_<ScatterReadHandle>(m, "ScatterReadHandle")
+        .def_property_readonly("num_chunks", &ScatterReadHandle::num_chunks)
+        .def(
+            "is_chunk_ready",
+            [](ScatterReadHandle &self, size_t idx) {
+                py::gil_scoped_release release;
+                return self.is_chunk_ready(idx);
+            },
+            py::arg("chunk_index"))
+        .def("completed_count",
+             [](ScatterReadHandle &self) {
+                 py::gil_scoped_release release;
+                 return self.completed_count();
+             })
+        .def(
+            "wait_chunk",
+            [](ScatterReadHandle &self, size_t idx) {
+                py::gil_scoped_release release;
+                return static_cast<int>(self.wait_chunk(idx));
+            },
+            py::arg("chunk_index"))
+        .def("wait_all", [](ScatterReadHandle &self) {
+            py::gil_scoped_release release;
+            return static_cast<int>(self.wait_all());
+        });
+
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     // Helper function to extract PyClient shared_ptr from
@@ -1945,6 +1999,59 @@ PYBIND11_MODULE(store, m) {
              })
         .def("get", &mooncake::MooncakeStorePyWrapper::get)
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def(
+            "progressive_get",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               uintptr_t buffer_ptr, size_t size, size_t chunk_size) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return py::cast<py::object>(py::none());
+                }
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                std::optional<ProgressiveGetHandle> handle;
+                {
+                    py::gil_scoped_release release;
+                    handle = self.store_->progressive_get(key, buffer, size,
+                                                          chunk_size);
+                }
+                if (!handle) {
+                    return py::cast<py::object>(py::none());
+                }
+                return py::cast(std::move(*handle));
+            },
+            py::arg("key"), py::arg("buffer"), py::arg("size"),
+            py::arg("chunk_size"),
+            "Start a progressive (chunked) get. Returns a "
+            "ProgressiveGetHandle or None on failure.\n"
+            "The buffer must be a registered memory address (uintptr_t).")
+        .def(
+            "streaming_batch_get_buffer_ranges",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys, uintptr_t buffer_ptr,
+               const std::vector<size_t> &dest_offsets,
+               const std::vector<size_t> &src_offsets,
+               const std::vector<size_t> &sizes) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return py::cast<py::object>(py::none());
+                }
+                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                std::optional<ScatterReadHandle> handle;
+                {
+                    py::gil_scoped_release release;
+                    handle = self.store_->streaming_batch_get_buffer_ranges(
+                        keys, buffer, dest_offsets, src_offsets, sizes);
+                }
+                if (!handle) {
+                    return py::cast<py::object>(py::none());
+                }
+                return py::cast(std::move(*handle));
+            },
+            py::arg("keys"), py::arg("buffer"), py::arg("dest_offsets"),
+            py::arg("src_offsets"), py::arg("sizes"),
+            "Start a streaming scatter read. Returns a "
+            "ScatterReadHandle or None on failure.\n"
+            "The buffer must be a registered memory address (uintptr_t).")
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {

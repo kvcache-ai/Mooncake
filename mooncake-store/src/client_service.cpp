@@ -904,6 +904,41 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+std::optional<ProgressiveGetHandle> Client::ProgressiveGet(
+    const std::string& key, void* dest_buffer, size_t buffer_size,
+    size_t chunk_size) {
+    auto query_result = Query(key);
+    if (!query_result) {
+        LOG(ERROR) << "ProgressiveGet: query failed for key=" << key
+                   << " error=" << toString(query_result.error());
+        return std::nullopt;
+    }
+
+    Replica::Descriptor replica;
+    ErrorCode err = FindFirstCompleteReplica(query_result->replicas, replica);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "ProgressiveGet: no complete replica for key=" << key;
+        return std::nullopt;
+    }
+
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "ProgressiveGet: only memory replicas supported, key="
+                   << key;
+        return std::nullopt;
+    }
+
+    uint64_t object_size =
+        replica.get_memory_descriptor().buffer_descriptor.size_;
+    if (buffer_size < object_size) {
+        LOG(ERROR) << "ProgressiveGet: buffer too small (" << buffer_size
+                   << " < " << object_size << ") for key=" << key;
+        return std::nullopt;
+    }
+
+    return transfer_submitter_->submitProgressiveRead(replica, dest_buffer,
+                                                      object_size, chunk_size);
+}
+
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
@@ -1028,6 +1063,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         }
     }
     return results;
+}
+
+std::optional<ScatterReadHandle> Client::StreamingBatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    auto handle = transfer_submitter_->submitStreamingBatchReadRanges(
+        dest_buffer, key_ranges, protocol_ == "rdma");
+    if (!handle) {
+        LOG(ERROR) << "Failed to submit streaming batch read ranges";
+        return std::nullopt;
+    }
+    return handle;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
@@ -1182,6 +1235,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
     return results;
+}
+
+ErrorCode Client::BatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto future = transfer_submitter_->submitBatchReadRanges(
+        dest_buffer, key_ranges, protocol_ == "rdma");
+    if (!future) {
+        LOG(ERROR) << "Failed to submit batch read ranges";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
 }
 
 bool Client::RedirectToHotCache(const std::string& key,
@@ -2821,7 +2892,19 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t src_offset) {
-    return TransferReadInternal(replica_descriptor, slices, src_offset);
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
+                                                       slices, src_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range read operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    return future->get();
 }
 
 void Client::PollAndDispatchTasks() {

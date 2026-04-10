@@ -63,6 +63,10 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
         override;
 
+    int64_t get_into_range(const std::string &key, void *buffer,
+                           size_t dst_offset, size_t src_offset,
+                           size_t size) override;
+
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
@@ -96,6 +100,12 @@ class DummyClient : public PyClient {
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
+
+    std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) override;
 
     int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
@@ -157,6 +167,23 @@ class DummyClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::string &segment_name = "") override {
         return {};
+    }
+
+    std::optional<ProgressiveGetHandle> progressive_get(
+        const std::string &key, void *buffer, size_t size,
+        size_t chunk_size) override {
+        LOG(ERROR) << "progressive_get not supported for DummyClient";
+        return std::nullopt;
+    }
+
+    std::optional<ScatterReadHandle> streaming_batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) override {
+        LOG(ERROR) << "streaming_batch_get_buffer_ranges not supported for "
+                      "DummyClient";
+        return std::nullopt;
     }
 
     int tearDownAll();

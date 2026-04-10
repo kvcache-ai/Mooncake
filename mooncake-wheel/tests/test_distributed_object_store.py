@@ -294,6 +294,41 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key1), 0)
         self.assertEqual(self.store.remove(key2), 0)
 
+    def test_streaming_batch_get_buffer_ranges(self):
+        """Test the streaming scatter read interface through the Python API."""
+        import ctypes
+
+        key1 = "test_streaming_batch_get_buffer_ranges_key_1"
+        key2 = "test_streaming_batch_get_buffer_ranges_key_2"
+        data1 = b"A" * 4096
+        data2 = b"B" * 4096
+
+        self.assertEqual(self.store.put(key1, data1), 0)
+        self.assertEqual(self.store.put(key2, data2), 0)
+
+        buffer_size = 2048
+        buffer = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
+
+        handle = self.store.streaming_batch_get_buffer_ranges(
+            [key1, key2],
+            buffer_ptr,
+            [0, 1024],
+            [0, 0],
+            [1024, 1024],
+        )
+        self.assertIsNotNone(handle)
+        self.assertEqual(handle.wait_all(), 0)
+
+        self.assertEqual(bytes(buffer[0:1024]), b"A" * 1024)
+        self.assertEqual(bytes(buffer[1024:2048]), b"B" * 1024)
+
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.remove(key1), 0)
+        self.assertEqual(self.store.remove(key2), 0)
+
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
         import ctypes

@@ -188,6 +188,43 @@ class Client {
         bool prefer_same_node = false);
 
     /**
+     * @brief Start a progressive (chunked) get for per-chunk completion
+     * tracking
+     * @param key Object key
+     * @param dest_buffer Destination buffer (must be registered)
+     * @param buffer_size Size of the destination buffer
+     * @param chunk_size Size per chunk; the transfer is split into
+     *        ceil(object_size/chunk_size) independently trackable tasks
+     * @return ProgressiveGetHandle for per-chunk polling, or nullopt on failure
+     */
+    std::optional<ProgressiveGetHandle> ProgressiveGet(const std::string& key,
+                                                       void* dest_buffer,
+                                                       size_t buffer_size,
+                                                       size_t chunk_size);
+
+    std::optional<ScatterReadHandle> StreamingBatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+
+    /**
+     * @brief Batch transfer read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode BatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
