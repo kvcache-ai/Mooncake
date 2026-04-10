@@ -4,7 +4,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
@@ -32,7 +32,7 @@ use crate::{
     transport::{StoreTransport, StoreTransportFactory},
     GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
-    ReplicationPolicy, RouteControlMode, StoreClientBuilder,
+    ReplicationPolicy, RouteControlMode, StoreClient, StoreClientBuilder,
 };
 
 struct TestTransport {
@@ -644,6 +644,10 @@ fn rw_only_config() -> LocalMemoryConfig {
     storage_config_with_layout(0, 4096, 1)
 }
 
+fn fast_live_client_sync_interval() -> Duration {
+    Duration::from_millis(25)
+}
+
 fn publish_storage_node(
     metadata: &InMemoryMetadataBackend,
     transport: &TestTransport,
@@ -697,6 +701,35 @@ fn publish_storage_node_with_capacity(
         })
         .expect("storage segment should publish");
     runtime
+}
+
+fn wait_for_runtime_visibility(client: &StoreClient, runtime: &ClientRuntimeId) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if client.lookup_runtime_lease(runtime).is_ok() {
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "runtime {} did not become visible in the client snapshot in time",
+        runtime
+    );
+}
+
+fn wait_for_membership_convergence(clients: &[&StoreClient]) {
+    let runtimes = clients
+        .iter()
+        .map(|client| client.runtime_id().clone())
+        .collect::<Vec<_>>();
+    for client in clients {
+        for runtime in &runtimes {
+            if runtime == client.runtime_id() {
+                continue;
+            }
+            wait_for_runtime_visibility(client, runtime);
+        }
+    }
 }
 
 #[test]
@@ -850,6 +883,7 @@ fn observability_metrics_render_remote_datapaths() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
         .build(10_000)
@@ -858,10 +892,13 @@ fn observability_metrics_render_remote_datapaths() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config_with_layout(4096, 4, 1))
         .build(10_000)
         .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
 
     writer
         .batch_put(&[
@@ -1085,6 +1122,7 @@ fn lookup_runtime_lease_reuses_live_client_snapshot() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1092,27 +1130,25 @@ fn lookup_runtime_lease_reuses_live_client_snapshot() {
     let client = StoreClientBuilder::new(metadata.clone(), "client-cache")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(client_transport)
         .local_memory(storage_config())
         .build(10_000)
         .expect("client build should succeed");
 
     let runtime = storage.runtime_id().clone();
-    let before = metadata.list_live_clients_calls();
+    let after_build = metadata.list_live_clients_calls();
     let lease = client
         .lookup_runtime_lease(&runtime)
-        .expect("first runtime lookup should succeed");
+        .expect("runtime lookup should succeed");
     assert_eq!(lease.runtime, runtime);
-    let after_first = metadata.list_live_clients_calls();
-
     let lease = client
         .lookup_runtime_lease(&runtime)
         .expect("second runtime lookup should succeed");
     assert_eq!(lease.runtime, runtime);
     let after_second = metadata.list_live_clients_calls();
 
-    assert!(after_first > before);
-    assert_eq!(after_second, after_first);
+    assert_eq!(after_second, after_build);
 }
 
 #[test]
@@ -1170,6 +1206,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1182,6 +1219,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(
@@ -1199,6 +1237,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
         .label("pool", "pool-a")
         .label("storage", "false")
         .label("route", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1219,13 +1258,12 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
         "embedded WRH should keep route state off metadata"
     );
 
-    let before = metadata.list_live_clients_calls();
+    let after_build = metadata.list_live_clients_calls();
     let route = reader
         .query_route_in_tenant("tenant-a", "route-cache-key")
-        .expect("first route query should succeed")
+        .expect("route query should succeed")
         .expect("route should exist");
     assert_eq!(route.key, ObjectKey::new("tenant-a::route-cache-key"));
-    let after_first = metadata.list_live_clients_calls();
 
     let route = reader
         .query_route_in_tenant("tenant-a", "route-cache-key")
@@ -1234,8 +1272,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
     assert_eq!(route.key, ObjectKey::new("tenant-a::route-cache-key"));
     let after_second = metadata.list_live_clients_calls();
 
-    assert!(after_first > before);
-    assert_eq!(after_second, after_first);
+    assert_eq!(after_second, after_build);
 }
 
 #[test]
@@ -1250,6 +1287,7 @@ fn routed_put_reuses_live_client_snapshot_for_placement() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1262,6 +1300,7 @@ fn routed_put_reuses_live_client_snapshot_for_placement() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(
@@ -1274,26 +1313,24 @@ fn routed_put_reuses_live_client_snapshot_for_placement() {
         .register_local_memory()
         .expect("writer memory should register");
 
-    let before = metadata.list_live_clients_calls();
+    let after_build = metadata.list_live_clients_calls();
     writer
         .put_in_tenant("tenant-a", "placement-cache-a", b"alpha")
         .expect("first put should succeed");
-    let after_first = metadata.list_live_clients_calls();
 
     writer
         .put_in_tenant("tenant-a", "placement-cache-b", b"beta")
         .expect("second put should succeed");
     let after_second = metadata.list_live_clients_calls();
 
-    assert!(after_first > before);
     assert_eq!(
-        after_second, after_first,
+        after_second, after_build,
         "steady-state routed put should reuse the client live snapshot"
     );
 }
 
 #[test]
-fn first_routed_put_shares_one_live_client_refresh_across_route_and_placement() {
+fn build_prewarms_live_client_snapshot_for_first_routed_put() {
     let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),
     )));
@@ -1305,6 +1342,7 @@ fn first_routed_put_shares_one_live_client_refresh_across_route_and_placement() 
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1317,6 +1355,7 @@ fn first_routed_put_shares_one_live_client_refresh_across_route_and_placement() 
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(writer_transport)
         .local_memory(rw_only_config())
         .routed_writes(
@@ -1329,7 +1368,7 @@ fn first_routed_put_shares_one_live_client_refresh_across_route_and_placement() 
         .register_local_memory()
         .expect("writer memory should register");
 
-    let before = metadata.list_live_clients_calls();
+    let after_build = metadata.list_live_clients_calls();
     writer
         .put_in_tenant_with_policy(
             "tenant-a",
@@ -1341,9 +1380,8 @@ fn first_routed_put_shares_one_live_client_refresh_across_route_and_placement() 
     let after_first = metadata.list_live_clients_calls();
 
     assert_eq!(
-        after_first - before,
-        1,
-        "first routed put should share one live-client refresh across route load, placement, and allocator lease lookup"
+        after_first, after_build,
+        "first routed put should use the prewarmed live-client snapshot without an on-request refresh"
     );
 }
 
@@ -1359,6 +1397,7 @@ fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1371,6 +1410,7 @@ fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(
@@ -1383,14 +1423,13 @@ fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
         .register_local_memory()
         .expect("writer memory should register");
 
-    let before = metadata.list_live_clients_calls();
+    let after_build = metadata.list_live_clients_calls();
     writer
         .batch_put(&[
             PutRequest::new("placement-batch-a", b"alpha").tenant("tenant-a"),
             PutRequest::new("placement-batch-b", b"bravo").tenant("tenant-a"),
         ])
         .expect("first batch put should succeed");
-    let after_first = metadata.list_live_clients_calls();
 
     writer
         .batch_put(&[
@@ -1400,11 +1439,52 @@ fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
         .expect("second batch put should succeed");
     let after_second = metadata.list_live_clients_calls();
 
-    assert!(after_first > before);
     assert_eq!(
-        after_second, after_first,
+        after_second, after_build,
         "steady-state routed batch put should reuse the client live snapshot"
     );
+}
+
+#[test]
+fn background_live_client_sync_refreshes_snapshot_without_request_refresh() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let writer_transport = Arc::new(TestTransport::new("writer-background-sync-segment"));
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-background-sync")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::from_millis(25))
+        .transport(writer_transport.clone())
+        .local_memory(rw_only_config())
+        .build(10_000)
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let after_build = metadata.list_live_clients_calls();
+    let storage_runtime = publish_storage_node(
+        metadata.inner.as_ref(),
+        writer_transport.as_ref(),
+        "storage-background-sync",
+        "storage-background-sync-seg",
+        "pool-a",
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if writer.lookup_runtime_lease(&storage_runtime).is_ok()
+            && metadata.list_live_clients_calls() > after_build
+        {
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+
+    panic!("background live-client sync did not observe the new storage runtime in time");
 }
 
 #[test]
@@ -1574,6 +1654,7 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
     let writer = StoreClientBuilder::new(metadata.clone(), "writer")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(writer_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1581,10 +1662,13 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
     let reader = StoreClientBuilder::new(metadata.clone(), "reader")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
         .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
 
     writer
         .put_in_tenant("tenant-a", "peer-key", b"peer-payload")
@@ -1620,6 +1704,7 @@ fn embedded_wrh_route_directory_ignores_pool_boundaries_by_default() {
     let writer = StoreClientBuilder::new(metadata.clone(), "writer-cross-pool")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-reclaim")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
         .build(10_000)
@@ -1627,10 +1712,13 @@ fn embedded_wrh_route_directory_ignores_pool_boundaries_by_default() {
     let reader = StoreClientBuilder::new(metadata.clone(), "reader-cross-pool")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config())
         .build(10_000)
         .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
 
     writer
         .put_in_tenant("tenant-a", "cross-pool-key", b"cross-pool-payload")
@@ -1664,6 +1752,7 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1676,6 +1765,7 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(
@@ -1692,6 +1782,7 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1699,6 +1790,8 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
     reader
         .register_local_memory()
         .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&storage, &router, &reader]);
 
     router
         .put_in_tenant("tenant-a", "hot-path-key", b"hot-path-payload")
@@ -1730,6 +1823,7 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1742,6 +1836,7 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(
@@ -1758,6 +1853,7 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -1765,6 +1861,8 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
     reader
         .register_local_memory()
         .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&storage, &router, &reader]);
 
     let first = router
         .batch_put(&[
@@ -1854,6 +1952,7 @@ fn batch_get_chunks_remote_reads_when_scratch_window_is_small() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
         .build(10_000)
@@ -1862,10 +1961,13 @@ fn batch_get_chunks_remote_reads_when_scratch_window_is_small() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config_with_layout(4096, 8, 1))
         .build(10_000)
         .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
 
     let policy = ReplicationPolicy::new()
         .prefer_local(false)
@@ -1908,6 +2010,7 @@ fn batch_get_into_falls_back_to_direct_when_value_exceeds_scratch() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
         .build(10_000)
@@ -1916,10 +2019,13 @@ fn batch_get_into_falls_back_to_direct_when_value_exceeds_scratch() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config_with_layout(4096, 4, 1))
         .build(10_000)
         .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
 
     writer
         .put_with_policy(
@@ -1946,6 +2052,7 @@ fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
     let writer = StoreClientBuilder::new(metadata.clone(), "writer-subrange")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
         .build(10_000)
@@ -1953,10 +2060,13 @@ fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
     let reader = StoreClientBuilder::new(metadata, "reader-subrange")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config())
         .build(10_000)
         .expect("reader build should succeed");
+
+    wait_for_membership_convergence(&[&writer, &reader]);
 
     let mut source = [0u8; 128];
     let payload_a = b"page-one";
@@ -3115,6 +3225,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -3123,6 +3234,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -3131,6 +3243,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
@@ -3140,6 +3253,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -3157,6 +3271,8 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
     reader
         .register_local_memory()
         .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&store_a, &store_b, &router, &reader]);
 
     let mut expected = BTreeMap::new();
     let mut owned_keys = Vec::new();
@@ -3225,6 +3341,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -3233,6 +3350,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -3241,6 +3359,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
@@ -3250,6 +3369,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(10_000)
@@ -3267,6 +3387,8 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
     reader
         .register_local_memory()
         .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&store_a, &store_b, &router, &reader]);
 
     let mut expected = BTreeMap::new();
     let mut owned_keys = Vec::new();

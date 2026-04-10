@@ -1045,6 +1045,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
 
 impl Drop for StoreClient {
     fn drop(&mut self) {
+        self.membership_sync.shutdown();
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {
