@@ -44,7 +44,12 @@ impl HugePageConfig {
     ) -> Result<Option<Self>> {
         let env_enabled = std::env::var_os(ENV_USE_HUGEPAGE).is_some();
         let env_size = std::env::var(ENV_HUGEPAGE_SIZE).ok();
-        Self::resolve_from_inputs(enabled_override, size_override, env_enabled, env_size.as_deref())
+        Self::resolve_from_inputs(
+            enabled_override,
+            size_override,
+            env_enabled,
+            env_size.as_deref(),
+        )
     }
 
     pub fn resolve_from_inputs(
@@ -91,9 +96,18 @@ mod tests {
 
     #[test]
     fn parse_supported_hugepage_sizes() {
-        assert_eq!(parse_hugepage_size("2MB").expect("2MB should parse"), HUGE_2MB);
-        assert_eq!(parse_hugepage_size("2m").expect("2m should parse"), HUGE_2MB);
-        assert_eq!(parse_hugepage_size("1GB").expect("1GB should parse"), HUGE_1GB);
+        assert_eq!(
+            parse_hugepage_size("2MB").expect("2MB should parse"),
+            HUGE_2MB
+        );
+        assert_eq!(
+            parse_hugepage_size("2m").expect("2m should parse"),
+            HUGE_2MB
+        );
+        assert_eq!(
+            parse_hugepage_size("1GB").expect("1GB should parse"),
+            HUGE_1GB
+        );
         assert_eq!(
             parse_hugepage_size("1073741824").expect("1GB bytes should parse"),
             HUGE_1GB
@@ -110,18 +124,16 @@ mod tests {
 
     #[test]
     fn resolve_hugepage_uses_env_defaults() {
-        let resolved =
-            HugePageConfig::resolve_from_inputs(None, None, true, Some("2MB"))
-                .expect("env hugepage config should resolve")
-                .expect("env hugepage config should be enabled");
+        let resolved = HugePageConfig::resolve_from_inputs(None, None, true, Some("2MB"))
+            .expect("env hugepage config should resolve")
+            .expect("env hugepage config should be enabled");
         assert_eq!(resolved.bytes(), HUGE_2MB);
     }
 
     #[test]
     fn resolve_hugepage_can_disable_env() {
-        let resolved =
-            HugePageConfig::resolve_from_inputs(Some(false), None, true, Some("1GB"))
-                .expect("explicit disable should resolve");
+        let resolved = HugePageConfig::resolve_from_inputs(Some(false), None, true, Some("1GB"))
+            .expect("explicit disable should resolve");
         assert!(resolved.is_none());
     }
 }
