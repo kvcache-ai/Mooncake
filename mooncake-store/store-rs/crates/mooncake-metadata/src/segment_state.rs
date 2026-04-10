@@ -265,4 +265,134 @@ mod tests {
         let payload = serde_json::to_string(&state).expect("state must serialize");
         assert!(payload.contains(r#""free_spans":[]"#));
     }
+
+    #[test]
+    fn reserve_reuses_free_spans_and_clears_tail_when_empty() {
+        let mut state = StoredSegmentState::new(announcement());
+        let owner = state.announcement.owner.clone();
+        let segment = state.announcement.segment_name.clone();
+
+        let first = state
+            .reserve(&owner, &segment, 128)
+            .expect("initial reservation should succeed");
+        let second = state
+            .reserve(&owner, &segment, 64)
+            .expect("second reservation should succeed");
+        state
+            .release(&owner, &segment, first.offset_bytes, first.length_bytes)
+            .expect("released span should become reusable");
+
+        let reused = state
+            .reserve(&owner, &segment, 32)
+            .expect("allocator should reuse the freed head span");
+        assert_eq!(reused.offset_bytes, first.offset_bytes);
+        assert_eq!(
+            state.free_spans,
+            vec![FreeSpan {
+                offset_bytes: 64,
+                length_bytes: 64,
+            }]
+        );
+
+        state
+            .release(&owner, &segment, second.offset_bytes, second.length_bytes)
+            .expect("tail release should succeed");
+        state
+            .release(&owner, &segment, reused.offset_bytes, reused.length_bytes)
+            .expect("final release should collapse allocator state");
+        assert_eq!(state.cursor_bytes, 0);
+        assert_eq!(state.announcement.used_bytes, 0);
+        assert!(state.free_spans.is_empty());
+    }
+
+    #[test]
+    fn reserve_release_and_deserialize_validate_edge_cases() {
+        let mut state = StoredSegmentState::new(announcement());
+        let owner = state.announcement.owner.clone();
+        let segment = state.announcement.segment_name.clone();
+
+        assert!(matches!(
+            state.reserve(&owner, &segment, 0),
+            Err(StoreError::Allocator(_))
+        ));
+        state.announcement.state = SegmentLifecycleState::Draining;
+        assert!(matches!(
+            state.reserve(&owner, &segment, 64),
+            Err(StoreError::InvalidState(_))
+        ));
+        state.announcement.state = SegmentLifecycleState::Active;
+        assert!(matches!(
+            state.reserve(&owner, &segment, 2048),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            state.release(&owner, &segment, 960, 128),
+            Err(StoreError::Allocator(_))
+        ));
+
+        let payload = r#"{
+            "announcement": {
+                "owner": {"stable_id":"stable","epoch":1},
+                "segment_name": "segment",
+                "capacity_bytes": 1024,
+                "used_bytes": 64,
+                "state": "Active",
+                "alignment_bytes": 64,
+                "tags": ["dram"]
+            },
+            "cursor_bytes": 128,
+            "free_spans": [{"offset_bytes":64,"length_bytes":64}]
+        }"#;
+        let parsed: StoredSegmentState =
+            serde_json::from_str(payload).expect("free-span arrays must deserialize");
+        assert_eq!(
+            parsed.free_spans,
+            vec![FreeSpan {
+                offset_bytes: 64,
+                length_bytes: 64,
+            }]
+        );
+
+        let invalid_payload = r#"{
+            "announcement": {
+                "owner": {"stable_id":"stable","epoch":1},
+                "segment_name": "segment",
+                "capacity_bytes": 1024,
+                "used_bytes": 0,
+                "state": "Active",
+                "alignment_bytes": 64,
+                "tags": ["dram"]
+            },
+            "cursor_bytes": 0,
+            "free_spans": {"unexpected": true}
+        }"#;
+        let error = serde_json::from_str::<StoredSegmentState>(invalid_payload)
+            .expect_err("non-empty object payload should be rejected");
+        assert!(error
+            .to_string()
+            .contains("free_spans object payload is only valid when empty"));
+    }
+
+    #[test]
+    fn merge_announcement_keeps_monotonic_usage_and_alignment_floor() {
+        let mut state = StoredSegmentState::new(announcement());
+        let mut next = announcement();
+        next.owner = ClientRuntimeId::new("next".to_string(), ClientEpoch(2));
+        next.segment_name = SegmentName::new("next-segment");
+        next.capacity_bytes = 2048;
+        next.used_bytes = 96;
+        next.state = SegmentLifecycleState::Draining;
+        next.alignment_bytes = 0;
+        next.tags = vec!["nvme".to_string()];
+
+        state.merge_announcement(&next);
+        assert_eq!(state.announcement.owner, next.owner);
+        assert_eq!(state.announcement.segment_name, next.segment_name);
+        assert_eq!(state.announcement.capacity_bytes, 2048);
+        assert_eq!(state.announcement.state, SegmentLifecycleState::Draining);
+        assert_eq!(state.announcement.tags, vec!["nvme".to_string()]);
+        assert_eq!(state.announcement.alignment_bytes, 1);
+        assert_eq!(state.announcement.used_bytes, 96);
+        assert_eq!(state.cursor_bytes, 96);
+    }
 }

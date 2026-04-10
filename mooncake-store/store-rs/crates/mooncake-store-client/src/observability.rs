@@ -389,7 +389,7 @@ fn read_http_path(stream: &mut TcpStream) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
@@ -407,9 +407,8 @@ mod tests {
             .input_bytes(16)
             .finish(&result, 16);
 
-        let Ok(address) = start_metrics_http_server("127.0.0.1:0") else {
-            return;
-        };
+        let address = start_metrics_http_server("127.0.0.1:0")
+            .expect("metrics server should start on an ephemeral port");
         let response = http_get(&address, "/metrics");
 
         assert!(response.contains("HTTP/1.1 200 OK"));
@@ -423,19 +422,124 @@ mod tests {
     fn metrics_http_server_serves_health_probe() {
         let _guard = test_lock().lock().expect("test lock poisoned");
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
-        let Ok(address) = start_metrics_http_server("127.0.0.1:0") else {
-            return;
-        };
+        let address = start_metrics_http_server("127.0.0.1:0")
+            .expect("metrics server should start on an ephemeral port");
         let response = http_get(&address, "/healthz");
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("ok\n"));
         stop_metrics_http_server().expect("metrics server should stop");
     }
 
+    #[test]
+    fn tracing_init_from_env_covers_invalid_disabled_and_repeated_paths() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let toggle_env = "MOONCAKE_TEST_TRACING_ENABLED";
+        let filter_env = "MOONCAKE_TEST_TRACING_FILTER";
+
+        let error = init_tracing(Some("["))
+            .expect_err("invalid tracing filter must surface configuration errors");
+        assert!(matches!(error, StoreError::InvalidState(_)));
+
+        with_env_var(toggle_env, None, || {
+            with_env_var(filter_env, None, || {
+                assert!(!init_tracing_from_env(toggle_env, filter_env)
+                    .expect("missing toggle should keep tracing disabled"));
+            })
+        });
+
+        with_env_var(toggle_env, Some("YES"), || {
+            with_env_var(filter_env, Some("info"), || {
+                assert!(init_tracing_from_env(toggle_env, filter_env)
+                    .expect("enabled env toggle should initialize tracing"));
+            })
+        });
+        std::env::set_var(toggle_env, "0");
+        with_env_var(toggle_env, Some("YES"), || ());
+        assert_eq!(std::env::var(toggle_env).as_deref(), Ok("0"));
+        std::env::remove_var(toggle_env);
+
+        init_tracing(Some("[")).expect("repeated tracing init should short-circuit cleanly");
+    }
+
+    #[test]
+    fn metrics_http_server_env_helpers_reuse_server_and_cover_routes() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let addr_env = "MOONCAKE_TEST_METRICS_ADDR";
+        stop_metrics_http_server().expect("metrics server cleanup should succeed");
+
+        with_env_var(addr_env, None, || {
+            assert_eq!(
+                start_metrics_http_server_from_env(addr_env)
+                    .expect("missing metrics env should be ignored"),
+                None
+            );
+        });
+        with_env_var(addr_env, Some("   "), || {
+            assert_eq!(
+                start_metrics_http_server_from_env(addr_env)
+                    .expect("blank metrics env should be ignored"),
+                None
+            );
+        });
+
+        let address = with_env_var(addr_env, Some("127.0.0.1:0"), || {
+            start_metrics_http_server_from_env(addr_env)
+                .expect("metrics env startup should succeed")
+                .expect("metrics env should produce a bound address")
+        });
+        assert_eq!(
+            metrics_http_server_addr().as_deref(),
+            Some(address.as_str())
+        );
+        assert_eq!(
+            start_metrics_http_server("127.0.0.1:1")
+                .expect("reusing an existing metrics server should succeed"),
+            address
+        );
+
+        let livez = http_get(&address, "/livez");
+        assert!(livez.contains("HTTP/1.1 200 OK"));
+        assert!(livez.ends_with("ok\n"));
+
+        let missing = http_get(&address, "/missing");
+        assert!(missing.contains("HTTP/1.1 404 Not Found"));
+        assert!(missing.ends_with("not found\n"));
+
+        let post = http_request(
+            &address,
+            &format!("POST /metrics HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(post.contains("HTTP/1.1 404 Not Found"));
+
+        stop_metrics_http_server().expect("metrics server should stop");
+    }
+
+    #[test]
+    fn metrics_http_connection_tolerates_empty_clients() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should report local address");
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("test listener should accept");
+            handle_metrics_http_connection(stream);
+        });
+
+        TcpStream::connect(address).expect("probe client should connect and drop immediately");
+        worker
+            .join()
+            .expect("http handler worker should exit cleanly");
+    }
+
     fn http_get(address: &str, path: &str) -> String {
-        let mut stream = TcpStream::connect(address).expect("http client should connect");
         let request =
             format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        http_request(address, &request)
+    }
+
+    fn http_request(address: &str, request: &str) -> String {
+        let mut stream = TcpStream::connect(address).expect("http client should connect");
         stream
             .write_all(request.as_bytes())
             .expect("http client should write request");
@@ -448,5 +552,19 @@ mod tests {
 
     fn test_lock() -> &'static Mutex<()> {
         TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var(key).ok();
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        result
     }
 }

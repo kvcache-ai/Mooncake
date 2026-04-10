@@ -457,16 +457,44 @@ fn align_up(value: usize, alignment: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::c_void;
+    use std::sync::Arc;
 
-    use mooncake_store_core::HugePageConfig;
+    use mooncake_store_core::{HugePageConfig, SegmentLifecycleState, SegmentName, StoreError};
     use mooncake_transport::{SegmentInfo, TransferProgress, TransferRequest, TransferStatus};
+    use parking_lot::Mutex;
 
     use super::{
-        align_up, allocate_hugepage_region, LocalMemoryConfig, RegionOwner, StoreTransport,
+        align_up, allocate_hugepage_region, free_hugepage_region, hugepage_map_flag,
+        LocalMemoryConfig, LocalMemoryState, RegionOwner, RegisteredRegion, StorageSegmentSpec,
+        StoreTransport,
     };
 
     struct NoopTransport;
+
+    #[derive(Default, Clone)]
+    struct RecordingTransport {
+        inner: Arc<Mutex<RecordingTransportState>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingTransportState {
+        allocations: BTreeMap<usize, Box<[u8]>>,
+        registered: BTreeMap<usize, usize>,
+    }
+
+    #[derive(Clone)]
+    struct FailingTransport {
+        inner: Arc<Mutex<FailingTransportState>>,
+        fail_adopt: bool,
+        fail_register: bool,
+    }
+
+    #[derive(Default)]
+    struct FailingTransportState {
+        allocations: BTreeMap<usize, Box<[u8]>>,
+    }
 
     impl StoreTransport for NoopTransport {
         fn segment_name(&self) -> mooncake_store_core::Result<String> {
@@ -566,6 +594,257 @@ mod tests {
         }
     }
 
+    impl StoreTransport for RecordingTransport {
+        fn segment_name(&self) -> mooncake_store_core::Result<String> {
+            Ok("recording-segment".to_string())
+        }
+
+        fn rpc_server_address(&self) -> mooncake_store_core::Result<(String, u16)> {
+            Ok(("127.0.0.1".to_string(), 0))
+        }
+
+        fn open_segment(&self, _segment_name: &str) -> mooncake_store_core::Result<u64> {
+            Ok(1)
+        }
+
+        fn close_segment(&self, _handle: u64) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn get_segment_info(&self, _handle: u64) -> mooncake_store_core::Result<SegmentInfo> {
+            Err(StoreError::Unsupported(
+                "unused in memory tests".to_string(),
+            ))
+        }
+
+        fn adopt_local_memory(
+            &self,
+            _addr: *mut c_void,
+            _size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn allocate_memory(
+            &self,
+            size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<*mut c_void> {
+            let mut memory = vec![0u8; size].into_boxed_slice();
+            let base = memory.as_mut_ptr() as usize;
+            self.inner.lock().allocations.insert(base, memory);
+            Ok(base as *mut c_void)
+        }
+
+        fn free_memory(&self, addr: *mut c_void) -> mooncake_store_core::Result<()> {
+            let base = addr as usize;
+            self.inner
+                .lock()
+                .allocations
+                .remove(&base)
+                .ok_or_else(|| StoreError::NotFound(format!("allocation {base:#x} not found")))?;
+            Ok(())
+        }
+
+        fn register_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            self.inner.lock().registered.insert(addr as usize, size);
+            Ok(())
+        }
+
+        fn unregister_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            let base = addr as usize;
+            match self.inner.lock().registered.remove(&base) {
+                Some(recorded) if recorded == size => Ok(()),
+                Some(recorded) => Err(StoreError::Allocator(format!(
+                    "registered size mismatch: expected={recorded} actual={size}"
+                ))),
+                None => Err(StoreError::NotFound(format!(
+                    "registered allocation {base:#x} not found"
+                ))),
+            }
+        }
+
+        fn allocate_batch(&self, _batch_size: usize) -> mooncake_store_core::Result<u64> {
+            Ok(1)
+        }
+
+        fn free_batch(&self, _batch_id: u64) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn submit(
+            &self,
+            _batch_id: u64,
+            _requests: &[TransferRequest],
+        ) -> mooncake_store_core::Result<()> {
+            Err(StoreError::Unsupported(
+                "unused in memory tests".to_string(),
+            ))
+        }
+
+        fn task_status(
+            &self,
+            _batch_id: u64,
+            _task_id: usize,
+        ) -> mooncake_store_core::Result<TransferProgress> {
+            Ok(TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            })
+        }
+
+        fn overall_status(&self, _batch_id: u64) -> mooncake_store_core::Result<TransferProgress> {
+            Ok(TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            })
+        }
+    }
+
+    impl FailingTransport {
+        fn adopt_failure() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(FailingTransportState::default())),
+                fail_adopt: true,
+                fail_register: false,
+            }
+        }
+
+        fn register_failure() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(FailingTransportState::default())),
+                fail_adopt: false,
+                fail_register: true,
+            }
+        }
+    }
+
+    impl StoreTransport for FailingTransport {
+        fn segment_name(&self) -> mooncake_store_core::Result<String> {
+            Err(StoreError::Unsupported(
+                "unused in failure tests".to_string(),
+            ))
+        }
+
+        fn rpc_server_address(&self) -> mooncake_store_core::Result<(String, u16)> {
+            Err(StoreError::Unsupported(
+                "unused in failure tests".to_string(),
+            ))
+        }
+
+        fn open_segment(&self, _segment_name: &str) -> mooncake_store_core::Result<u64> {
+            Err(StoreError::Unsupported(
+                "unused in failure tests".to_string(),
+            ))
+        }
+
+        fn close_segment(&self, _handle: u64) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn get_segment_info(&self, _handle: u64) -> mooncake_store_core::Result<SegmentInfo> {
+            Err(StoreError::Unsupported(
+                "unused in failure tests".to_string(),
+            ))
+        }
+
+        fn adopt_local_memory(
+            &self,
+            _addr: *mut c_void,
+            _size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<()> {
+            if self.fail_adopt {
+                return Err(StoreError::Transport("adopt failed".to_string()));
+            }
+            Ok(())
+        }
+
+        fn allocate_memory(
+            &self,
+            size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<*mut c_void> {
+            let mut memory = vec![0u8; size].into_boxed_slice();
+            let base = memory.as_mut_ptr() as usize;
+            self.inner.lock().allocations.insert(base, memory);
+            Ok(base as *mut c_void)
+        }
+
+        fn free_memory(&self, addr: *mut c_void) -> mooncake_store_core::Result<()> {
+            self.inner
+                .lock()
+                .allocations
+                .remove(&(addr as usize))
+                .ok_or_else(|| StoreError::NotFound("allocation not found".to_string()))?;
+            Ok(())
+        }
+
+        fn register_memory(
+            &self,
+            _addr: *mut c_void,
+            _size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            if self.fail_register {
+                return Err(StoreError::Transport("register failed".to_string()));
+            }
+            Ok(())
+        }
+
+        fn unregister_memory(
+            &self,
+            _addr: *mut c_void,
+            _size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn allocate_batch(&self, _batch_size: usize) -> mooncake_store_core::Result<u64> {
+            Ok(1)
+        }
+
+        fn free_batch(&self, _batch_id: u64) -> mooncake_store_core::Result<()> {
+            Ok(())
+        }
+
+        fn submit(
+            &self,
+            _batch_id: u64,
+            _requests: &[TransferRequest],
+        ) -> mooncake_store_core::Result<()> {
+            Err(StoreError::Unsupported(
+                "unused in failure tests".to_string(),
+            ))
+        }
+
+        fn task_status(
+            &self,
+            _batch_id: u64,
+            _task_id: usize,
+        ) -> mooncake_store_core::Result<TransferProgress> {
+            Ok(TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            })
+        }
+
+        fn overall_status(&self, _batch_id: u64) -> mooncake_store_core::Result<TransferProgress> {
+            Ok(TransferProgress {
+                status: TransferStatus::Completed,
+                transferred_bytes: 0,
+            })
+        }
+    }
+
     fn hugepages_available(bytes: usize) -> bool {
         let path = if bytes == 2 * 1024 * 1024 {
             "/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"
@@ -615,5 +894,473 @@ mod tests {
         owner
             .release(&NoopTransport, base)
             .expect("hugetlb region should unmap cleanly");
+    }
+
+    #[test]
+    fn local_memory_config_validate_rejects_invalid_inputs() {
+        let error = LocalMemoryConfig::new()
+            .storage_bytes(0)
+            .validate()
+            .expect_err("zero storage must fail");
+        assert!(matches!(error, StoreError::Allocator(_)));
+
+        let error = LocalMemoryConfig::new()
+            .scratch_bytes(0)
+            .validate()
+            .expect_err("zero scratch must fail");
+        assert!(matches!(error, StoreError::Allocator(_)));
+
+        let error = LocalMemoryConfig::new()
+            .location("")
+            .validate()
+            .expect_err("empty location must fail");
+        assert!(matches!(error, StoreError::Allocator(_)));
+    }
+
+    #[test]
+    fn local_memory_config_builder_keeps_tags_and_alignment_floor() {
+        let config = LocalMemoryConfig::new()
+            .tags(vec!["nvme".to_string(), "warm".to_string()])
+            .alignment(0)
+            .reclaim_grace_ms(7);
+        assert_eq!(config.tags, vec!["nvme".to_string(), "warm".to_string()]);
+        assert_eq!(config.alignment, 1);
+        assert_eq!(config.reclaim_grace_ms, 7);
+    }
+
+    #[test]
+    fn registered_region_plan_rejects_zero_length_and_overflow() {
+        let region = RegisteredRegion {
+            base_addr: 0x1000,
+            capacity: 64,
+            alignment: 16,
+            owner: RegionOwner::Transport,
+        };
+
+        let error = region
+            .plan(0, 0)
+            .expect_err("zero-length allocations are invalid");
+        assert!(matches!(error, StoreError::Allocator(_)));
+
+        let allocation = region
+            .plan(7, 15)
+            .expect("aligned allocation should succeed");
+        assert_eq!(allocation.addr as usize, 0x1010);
+
+        let error = region
+            .plan(64, 16)
+            .expect_err("exhausted region should fail");
+        assert!(matches!(error, StoreError::Allocator(_)));
+
+        let error = region
+            .address_at(64)
+            .expect_err("address_at should enforce capacity");
+        assert!(matches!(error, StoreError::Allocator(_)));
+    }
+
+    #[test]
+    fn registered_region_register_rolls_back_allocations_on_transport_failures() {
+        let adopt_failure = FailingTransport::adopt_failure();
+        let error = RegisteredRegion::register(&adopt_failure, 64, "cpu:0", 8, None)
+            .expect_err("adopt failures must roll back transport allocations");
+        assert!(matches!(error, StoreError::Transport(_)));
+        assert!(adopt_failure.inner.lock().allocations.is_empty());
+
+        let register_failure = FailingTransport::register_failure();
+        let error = RegisteredRegion::register(&register_failure, 64, "cpu:0", 8, None)
+            .expect_err("register failures must roll back transport allocations");
+        assert!(matches!(error, StoreError::Transport(_)));
+        assert!(register_failure.inner.lock().allocations.is_empty());
+    }
+
+    #[test]
+    fn local_memory_state_registers_and_manages_segments() {
+        let transport = RecordingTransport::default();
+        let primary = SegmentName::new("primary");
+        let mut state = LocalMemoryState::register(
+            &transport,
+            &primary,
+            &LocalMemoryConfig::new()
+                .storage_bytes(256)
+                .scratch_bytes(128)
+                .alignment(16)
+                .reclaim_grace_ms(0),
+        )
+        .expect("initial local memory registration should succeed");
+
+        assert!(state.has_storage_segment(&primary));
+        let allocations = state
+            .plan_scratch(&[1, 17])
+            .expect("scratch planning should succeed");
+        assert_eq!(allocations.len(), 2);
+        assert_eq!((allocations[1].addr as usize) % 16, 0);
+        assert!(
+            state
+                .storage_address(&primary, 32)
+                .expect("storage address should resolve") as usize
+                > 0
+        );
+
+        state
+            .update_storage_state(&primary, SegmentLifecycleState::Draining)
+            .expect("state transition should succeed");
+        let info = state.storage_segments();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].state, SegmentLifecycleState::Draining);
+
+        let extra = SegmentName::new("extra");
+        state
+            .add_storage_segment(
+                &transport,
+                StorageSegmentSpec {
+                    segment_name: extra.clone(),
+                    capacity_bytes: 64,
+                    state: SegmentLifecycleState::Active,
+                    tags: vec!["nvme".to_string()],
+                    location: "cpu:0".to_string(),
+                    alignment: 8,
+                    hugepage_enabled: None,
+                    hugepage_size_bytes: None,
+                },
+            )
+            .expect("adding a second segment should succeed");
+        assert!(state.has_storage_segment(&extra));
+        state
+            .remove_storage_segment(&transport, &extra)
+            .expect("removing extra segment should succeed");
+        assert!(!state.has_storage_segment(&extra));
+
+        state
+            .remove_storage_segment(&transport, &primary)
+            .expect("removing primary segment should succeed");
+        state
+            .release_scratch(&transport)
+            .expect("releasing scratch region should succeed");
+        assert!(transport.inner.lock().registered.is_empty());
+    }
+
+    #[test]
+    fn local_memory_state_reports_missing_and_duplicate_segments() {
+        let transport = RecordingTransport::default();
+        let primary = SegmentName::new("primary");
+        let mut state = LocalMemoryState::register(
+            &transport,
+            &primary,
+            &LocalMemoryConfig::new()
+                .storage_bytes(64)
+                .scratch_bytes(64)
+                .alignment(8),
+        )
+        .expect("initial registration should succeed");
+
+        let error = state
+            .add_storage_segment(
+                &transport,
+                StorageSegmentSpec {
+                    segment_name: primary.clone(),
+                    capacity_bytes: 64,
+                    state: SegmentLifecycleState::Active,
+                    tags: Vec::new(),
+                    location: "cpu:0".to_string(),
+                    alignment: 8,
+                    hugepage_enabled: None,
+                    hugepage_size_bytes: None,
+                },
+            )
+            .expect_err("duplicate segment names must be rejected");
+        assert!(matches!(error, StoreError::Conflict(_)));
+
+        let missing = SegmentName::new("missing");
+        assert!(matches!(
+            state.storage_address(&missing, 0),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            state.update_storage_state(&missing, SegmentLifecycleState::Retired),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            state.remove_storage_segment(&transport, &missing),
+            Err(StoreError::NotFound(_))
+        ));
+
+        state
+            .remove_storage_segment(&transport, &primary)
+            .expect("cleanup should succeed");
+        state
+            .release_scratch(&transport)
+            .expect("scratch cleanup should succeed");
+    }
+
+    #[test]
+    fn noop_transport_smoke_contract_covers_stubbed_methods() {
+        let transport = NoopTransport;
+        assert!(matches!(
+            transport.segment_name(),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            transport.rpc_server_address(),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            transport.open_segment("segment"),
+            Err(StoreError::Unsupported(_))
+        ));
+        transport.close_segment(1).expect("close should be a no-op");
+        assert!(matches!(
+            transport.get_segment_info(1),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            transport.allocate_memory(16, "cpu:0"),
+            Err(StoreError::Unsupported(_))
+        ));
+        transport
+            .free_memory(std::ptr::null_mut())
+            .expect("free should be a no-op");
+        transport
+            .register_memory(std::ptr::null_mut(), 0)
+            .expect("register should be a no-op");
+        transport
+            .unregister_memory(std::ptr::null_mut(), 0)
+            .expect("unregister should be a no-op");
+        assert!(matches!(
+            transport.allocate_batch(1),
+            Err(StoreError::Unsupported(_))
+        ));
+        transport
+            .free_batch(1)
+            .expect("free batch should be a no-op");
+        assert!(matches!(
+            transport.submit(1, &[]),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert_eq!(
+            transport
+                .task_status(1, 0)
+                .expect("task status should succeed")
+                .status,
+            TransferStatus::Completed
+        );
+        assert_eq!(
+            transport
+                .overall_status(1)
+                .expect("overall status should succeed")
+                .status,
+            TransferStatus::Completed
+        );
+    }
+
+    #[test]
+    fn recording_transport_smoke_contract_covers_stubbed_methods() {
+        let transport = RecordingTransport::default();
+        assert_eq!(
+            transport
+                .segment_name()
+                .expect("segment name should resolve"),
+            "recording-segment"
+        );
+        assert_eq!(
+            transport
+                .rpc_server_address()
+                .expect("rpc address should resolve"),
+            ("127.0.0.1".to_string(), 0)
+        );
+        assert_eq!(
+            transport
+                .open_segment("segment")
+                .expect("open should succeed"),
+            1
+        );
+        transport.close_segment(1).expect("close should be a no-op");
+        assert!(matches!(
+            transport.get_segment_info(1),
+            Err(StoreError::Unsupported(_))
+        ));
+        transport
+            .adopt_local_memory(std::ptr::null_mut(), 0, "cpu:0")
+            .expect("adopt should be a no-op");
+        let addr = transport
+            .allocate_memory(16, "cpu:0")
+            .expect("allocation should succeed");
+        transport
+            .register_memory(addr, 16)
+            .expect("register should succeed");
+        let batch_id = transport.allocate_batch(1).expect("batch should allocate");
+        transport
+            .free_batch(batch_id)
+            .expect("free batch should succeed");
+        assert!(matches!(
+            transport.submit(batch_id, &[]),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert_eq!(
+            transport
+                .task_status(batch_id, 0)
+                .expect("task status should succeed")
+                .status,
+            TransferStatus::Completed
+        );
+        assert_eq!(
+            transport
+                .overall_status(batch_id)
+                .expect("overall status should succeed")
+                .status,
+            TransferStatus::Completed
+        );
+        transport
+            .unregister_memory(addr, 16)
+            .expect("unregister should succeed");
+        transport.free_memory(addr).expect("free should succeed");
+    }
+
+    #[test]
+    fn recording_transport_unregister_surfaces_mismatch_and_missing_paths() {
+        let transport = RecordingTransport::default();
+        let addr = transport
+            .allocate_memory(16, "cpu:0")
+            .expect("allocation should succeed");
+        transport
+            .register_memory(addr, 16)
+            .expect("register should succeed");
+        transport.inner.lock().registered.insert(addr as usize, 8);
+        assert!(matches!(
+            transport.unregister_memory(addr, 16),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            transport.unregister_memory(addr, 16),
+            Err(StoreError::NotFound(_))
+        ));
+        transport.free_memory(addr).expect("free should succeed");
+        assert!(matches!(
+            transport.free_memory(addr),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn failing_transport_smoke_contract_covers_stubbed_methods() {
+        let register_failure = FailingTransport::register_failure();
+        assert!(matches!(
+            register_failure.segment_name(),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            register_failure.rpc_server_address(),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert!(matches!(
+            register_failure.open_segment("segment"),
+            Err(StoreError::Unsupported(_))
+        ));
+        register_failure
+            .close_segment(1)
+            .expect("close should be a no-op");
+        assert!(matches!(
+            register_failure.get_segment_info(1),
+            Err(StoreError::Unsupported(_))
+        ));
+        register_failure
+            .adopt_local_memory(std::ptr::null_mut(), 0, "cpu:0")
+            .expect("adopt should succeed when fail_adopt is disabled");
+        let addr = register_failure
+            .allocate_memory(16, "cpu:0")
+            .expect("allocation should succeed");
+        assert!(matches!(
+            register_failure.register_memory(addr, 16),
+            Err(StoreError::Transport(_))
+        ));
+        register_failure
+            .unregister_memory(addr, 16)
+            .expect("unregister should be a no-op");
+        let batch_id = register_failure
+            .allocate_batch(1)
+            .expect("batch allocation should succeed");
+        register_failure
+            .free_batch(batch_id)
+            .expect("free batch should succeed");
+        assert!(matches!(
+            register_failure.submit(batch_id, &[]),
+            Err(StoreError::Unsupported(_))
+        ));
+        assert_eq!(
+            register_failure
+                .task_status(batch_id, 0)
+                .expect("task status should succeed")
+                .status,
+            TransferStatus::Completed
+        );
+        assert_eq!(
+            register_failure
+                .overall_status(batch_id)
+                .expect("overall status should succeed")
+                .status,
+            TransferStatus::Completed
+        );
+        register_failure
+            .free_memory(addr)
+            .expect("free should succeed after allocation");
+
+        let adopt_failure = FailingTransport::adopt_failure();
+        assert!(matches!(
+            adopt_failure.adopt_local_memory(std::ptr::null_mut(), 0, "cpu:0"),
+            Err(StoreError::Transport(_))
+        ));
+        adopt_failure
+            .register_memory(std::ptr::null_mut(), 0)
+            .expect("register should succeed when fail_register is disabled");
+    }
+
+    #[test]
+    fn registered_region_plan_reports_checked_add_overflow() {
+        let region = RegisteredRegion {
+            base_addr: 0x1000,
+            capacity: usize::MAX,
+            alignment: 8,
+            owner: RegionOwner::Transport,
+        };
+        let error = region
+            .plan(usize::MAX, 8)
+            .expect_err("checked_add overflow must surface as allocator error");
+        assert!(matches!(error, StoreError::Allocator(_)));
+    }
+
+    #[test]
+    fn hugepage_allocator_rejects_invalid_inputs_before_syscall() {
+        let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
+
+        let error = allocate_hugepage_region(0, 64, "cpu:0", hugepage)
+            .expect_err("zero-sized hugepage allocation must fail");
+        assert!(matches!(error, StoreError::Allocator(_)));
+
+        let error = allocate_hugepage_region(4096, 64, "gpu:0", hugepage)
+            .expect_err("non-cpu hugepage allocation must fail");
+        assert!(matches!(error, StoreError::Unsupported(_)));
+    }
+
+    #[test]
+    fn hugepage_allocator_surfaces_kernel_result_without_hidden_branches() {
+        let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
+        let result = allocate_hugepage_region(4096, 64, "cpu:0", hugepage);
+        if hugepages_available(hugepage.bytes()) {
+            let (base, mapped_len, owner) =
+                result.expect("hugetlb mmap should succeed when pages are available");
+            assert_eq!(mapped_len, hugepage.bytes());
+            owner
+                .release(&NoopTransport, base)
+                .expect("hugetlb region should unmap cleanly");
+        } else {
+            assert!(matches!(result, Err(StoreError::Allocator(_))));
+        }
+
+        let one_gb = HugePageConfig::new(1024 * 1024 * 1024).expect("1GB hugepage should resolve");
+        assert_eq!(hugepage_map_flag(hugepage), libc::MAP_HUGE_2MB);
+        assert_eq!(hugepage_map_flag(one_gb), libc::MAP_HUGE_1GB);
+        assert!(matches!(
+            free_hugepage_region(1usize as *mut c_void, 4096),
+            Err(StoreError::Allocator(_))
+        ));
     }
 }

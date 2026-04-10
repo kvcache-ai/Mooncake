@@ -894,12 +894,67 @@ fn stable_hash(parts: &[&str]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, ClientStableId, CompatibilityDescriptor, ObjectKey,
-        ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        ClientStableId, CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RouteCasRequest, RouteDirectory, RouteState, RouteVersion,
+        SegmentName,
     };
 
-    use super::{authority_list_routes_by_replica_owner, authority_replace, route_mesh};
+    use super::{
+        authority_compare_and_swap, authority_compare_and_swap_many, authority_get,
+        authority_get_many, authority_list_routes_by_replica_owner, authority_replace,
+        authority_replace_many, build_route_directory, compatibility_matches, ranked_before,
+        route_capable, route_mesh, route_weight, stable_hash, weighted_rendezvous_score,
+        ClusterRouteMesh, ControlPlaneClient, EmbeddedWrhRouteDirectory, RouteControlMode,
+    };
+
+    fn lease(stable_id: &str, epoch: u64, route: bool, route_scope: Option<&str>) -> ClientLease {
+        let mut labels = BTreeMap::new();
+        if route {
+            labels.insert("route".to_string(), "true".to_string());
+        }
+        if let Some(route_scope) = route_scope {
+            labels.insert("route_scope".to_string(), route_scope.to_string());
+        }
+        labels.insert("route_weight".to_string(), format!("{}", epoch.max(1)));
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(epoch)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet {
+                rpc_address: format!("127.0.0.1:{}", 7000 + epoch as u16),
+                segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
+                labels,
+            },
+            expires_at_ms: 60_000,
+        }
+    }
+
+    fn route_for(key: &str, owner: &ClientRuntimeId) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key),
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: owner.clone(),
+                segment_name: SegmentName::new("seg-a"),
+                offset: 64,
+                segment_offset: 64,
+                length: 32,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        }
+    }
 
     #[test]
     fn authority_list_routes_filters_by_replica_owner() {
@@ -953,5 +1008,255 @@ mod tests {
         assert_eq!(found[0].key, route_a.key);
 
         route_mesh(namespace).lock().unregister_local(&authority);
+    }
+
+    #[test]
+    fn metadata_only_directory_round_trips_routes_via_metadata() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer", 1, true, None);
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let directory = build_route_directory(
+            RouteControlMode::MetadataOnly,
+            metadata.clone(),
+            &observer,
+            control,
+        );
+        let key = ObjectKey::new("tenant-a::alpha");
+        let route_v1 = route_for(&key.0, &observer.runtime);
+        let route_v2 = ObjectRoute {
+            version: RouteVersion(2),
+            ..route_v1.clone()
+        };
+
+        let created = directory
+            .compare_and_swap_object_route(&observer, &key, None, Some(&route_v1))
+            .expect("metadata-only create should succeed");
+        assert!(created.applied);
+        assert_eq!(created.current, Some(route_v1.clone()));
+        assert_eq!(
+            directory
+                .get_object_route(&observer, &key)
+                .expect("metadata-only get should succeed"),
+            Some(route_v1.clone())
+        );
+
+        let rejected = directory
+            .compare_and_swap_object_route(&observer, &key, None, Some(&route_v2))
+            .expect("metadata-only cas rejection should succeed");
+        assert!(!rejected.applied);
+
+        let updated = directory
+            .compare_and_swap_object_route(&observer, &key, Some(RouteVersion(1)), Some(&route_v2))
+            .expect("metadata-only update should succeed");
+        assert!(updated.applied);
+        assert_eq!(
+            metadata
+                .get_object_route(&key)
+                .expect("metadata get should succeed"),
+            Some(route_v2)
+        );
+    }
+
+    #[test]
+    fn authority_helpers_and_scoring_cover_local_mesh_behaviors() {
+        let namespace = "route-directory-helpers";
+        let authority = ClientStableId::new("authority-helpers");
+        let owner = ClientRuntimeId::new("owner-a", ClientEpoch(1));
+        let mut mesh = ClusterRouteMesh::default();
+        assert!(!mesh.is_local(&authority));
+        mesh.register_local(&authority);
+        mesh.register_local(&authority);
+        assert!(mesh.is_local(&authority));
+        mesh.unregister_local(&authority);
+        assert!(mesh.is_local(&authority));
+        mesh.unregister_local(&authority);
+        assert!(!mesh.is_local(&authority));
+
+        route_mesh(namespace).lock().register_local(&authority);
+        let route_a = route_for("tenant-a::alpha", &owner);
+        let route_b = route_for("tenant-a::beta", &owner);
+        let route_c = route_for("tenant-a::gamma", &owner);
+
+        let created =
+            authority_compare_and_swap(namespace, &authority, &route_a.key, None, Some(&route_a))
+                .expect("single cas create should succeed");
+        assert!(created.applied);
+        assert_eq!(
+            authority_get(namespace, &authority, &route_a.key).expect("single get should succeed"),
+            Some(route_a.clone())
+        );
+
+        let batched = authority_compare_and_swap_many(
+            namespace,
+            &authority,
+            &[
+                RouteCasRequest {
+                    key: route_a.key.clone(),
+                    expected: Some(RouteVersion(9)),
+                    next: Some(route_b.clone()),
+                },
+                RouteCasRequest {
+                    key: route_b.key.clone(),
+                    expected: None,
+                    next: Some(route_b.clone()),
+                },
+            ],
+        )
+        .expect("batch cas should succeed");
+        assert!(!batched[0].applied);
+        assert!(batched[1].applied);
+
+        authority_replace_many(
+            namespace,
+            &authority,
+            &[
+                RouteCasRequest {
+                    key: route_c.key.clone(),
+                    expected: None,
+                    next: Some(route_c.clone()),
+                },
+                RouteCasRequest {
+                    key: route_a.key.clone(),
+                    expected: None,
+                    next: None,
+                },
+            ],
+        )
+        .expect("batch replace should succeed");
+        let listed = authority_get_many(
+            namespace,
+            &authority,
+            &[
+                route_a.key.clone(),
+                route_b.key.clone(),
+                route_c.key.clone(),
+            ],
+        )
+        .expect("batch get should succeed");
+        assert_eq!(listed[0], None);
+        assert_eq!(listed[1], Some(route_b.clone()));
+        assert_eq!(listed[2], Some(route_c.clone()));
+
+        let capable = lease("capable", 2, true, Some("scope-a"));
+        let incapable = lease("incapable", 2, false, Some("scope-a"));
+        assert!(route_capable(&capable));
+        assert!(!route_capable(&incapable));
+        assert_eq!(route_weight(&capable), 2.0);
+
+        let same_hash = stable_hash(&["ns", "key", "authority"]);
+        assert_eq!(same_hash, stable_hash(&["ns", "key", "authority"]));
+        let weighted = weighted_rendezvous_score("ns", "key", "authority", 2.0);
+        assert!(weighted.is_finite());
+        assert!(ranked_before(
+            weighted,
+            &capable,
+            Some(&(weighted, lease("zzz", 1, true, Some("scope-a"))))
+        ));
+
+        let mut incompatible = capable.clone();
+        incompatible.compatibility.store_api_version += 1;
+        assert!(!compatibility_matches(&capable, &incompatible));
+
+        route_mesh(namespace).lock().unregister_local(&authority);
+        assert!(authority_get(namespace, &authority, &route_b.key).is_err());
+    }
+
+    #[test]
+    fn embedded_directory_prefers_scoped_local_authorities_and_mirrors_secondaries() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer", 1, false, Some("scope-a"));
+        let authority_a = lease("authority-a", 1, true, Some("scope-a"));
+        let authority_b = lease("authority-b", 2, true, Some("scope-a"));
+        let other_scope = lease("authority-c", 3, true, Some("scope-b"));
+        let incompatible = {
+            let mut lease = lease("authority-d", 4, true, Some("scope-a"));
+            lease.compatibility.transport_api_version += 1;
+            lease
+        };
+        for lease in [
+            observer.clone(),
+            authority_a.clone(),
+            authority_b.clone(),
+            other_scope,
+            incompatible,
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let directory = EmbeddedWrhRouteDirectory::new(metadata.clone(), &observer, control);
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&authority_b.runtime.stable_id);
+
+        let candidates = directory
+            .authority_candidates(&observer)
+            .expect("authority selection should succeed");
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|lease| {
+            lease
+                .endpoints
+                .labels
+                .get("route_scope")
+                .map(String::as_str)
+                == Some("scope-a")
+        }));
+
+        let key = ObjectKey::new("tenant-a::embedded-key");
+        let request = RouteCasRequest {
+            key: key.clone(),
+            expected: None,
+            next: Some(route_for(&key.0, &authority_b.runtime)),
+        };
+        let results = directory
+            .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
+            .expect("embedded cas should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .as_ref()
+                .expect("cas reply should decode")
+                .applied
+        );
+
+        let route_on_a = authority_get(&namespace, &authority_a.runtime.stable_id, &key)
+            .expect("route get should succeed");
+        let route_on_b = authority_get(&namespace, &authority_b.runtime.stable_id, &key)
+            .expect("route get should succeed");
+        assert_eq!(route_on_a, route_on_b);
+
+        assert!(directory
+            .get_object_routes(&observer, &[])
+            .expect("empty batch get should succeed")
+            .is_empty());
+        assert!(directory
+            .compare_and_swap_object_routes(&observer, &[])
+            .expect("empty batch cas should succeed")
+            .is_empty());
+
+        sleep(Duration::from_millis(150));
+        let authority_new = lease("authority-new", 5, true, Some("scope-a"));
+        metadata
+            .upsert_client_lease(&authority_new)
+            .expect("new lease should upsert");
+        let refreshed = directory
+            .authority_candidates(&observer)
+            .expect("refreshed candidate set should succeed");
+        assert!(refreshed
+            .iter()
+            .any(|lease| lease.runtime == authority_new.runtime));
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_a.runtime.stable_id);
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&authority_b.runtime.stable_id);
     }
 }

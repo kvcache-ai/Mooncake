@@ -461,7 +461,12 @@ fn recv_fd<T>(sock: RawFd) -> Result<(T, OwnedFd)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+
     use super::*;
+
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn hugepages_available(bytes: usize) -> bool {
         let path = if bytes == 2 * 1024 * 1024 {
@@ -479,6 +484,7 @@ mod tests {
 
     #[test]
     fn shared_regions_resolve_subranges() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
         let ptr = allocate_shared_region(4096).expect("shared alloc should succeed");
         let resolved = resolve_shared_region(ptr + 128, 512).expect("subrange should resolve");
         assert_eq!(resolved.offset, 128);
@@ -488,6 +494,7 @@ mod tests {
 
     #[test]
     fn shared_regions_can_use_hugepage_backing_when_available() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
         let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
         if !hugepages_available(hugepage.bytes()) {
             return;
@@ -499,5 +506,149 @@ mod tests {
         assert_eq!(registration.requested_len, 4096);
         assert_eq!(registration.registered_len, hugepage.bytes());
         free_shared_region(ptr).expect("hugepage shm free should succeed");
+    }
+
+    #[test]
+    fn shared_region_registration_round_trip_maps_and_slices() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let ptr = allocate_shared_region(4096).expect("shared alloc should succeed");
+        let registration =
+            shared_region_for_registration(ptr, 4096).expect("registration should resolve");
+        let socket_path = unique_socket_path("round-trip");
+        let listener = bind_shm_listener(&socket_path).expect("listener bind should succeed");
+        let client_id = DummyClientId::new();
+        let request = ShmRegisterRequest::new(
+            client_id,
+            registration.region_id,
+            registration.requested_len,
+        );
+        let worker = thread::spawn(move || recv_shm_register_request(&listener));
+
+        send_shm_register_request(&socket_path, &request, &registration.fd)
+            .expect("registration request should be accepted");
+        let (received, fd) = worker
+            .join()
+            .expect("listener worker should join")
+            .expect("listener should decode request");
+        let mapped = map_registered_region(fd, registration.registered_len)
+            .expect("received file descriptor should map");
+        mapped
+            .slice_mut(32, 4)
+            .expect("mutable slice should stay in range")
+            .copy_from_slice(b"pong");
+        assert_eq!(
+            mapped
+                .slice(32, 4)
+                .expect("read slice should stay in range"),
+            b"pong"
+        );
+        assert_eq!(mapped.len(), registration.registered_len);
+        assert_eq!(received.client_id_hi, client_id.high);
+        assert_eq!(received.client_id_lo, client_id.low);
+        assert_eq!(received.region_id, registration.region_id);
+        assert_eq!(received.size as usize, registration.requested_len);
+        assert!(matches!(
+            mapped.slice(mapped.len(), 1),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            mapped.slice_mut(mapped.len(), 1),
+            Err(StoreError::Allocator(_))
+        ));
+
+        free_shared_region(ptr).expect("shared region cleanup should succeed");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn shared_region_helpers_report_kernel_and_range_errors() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let sanitized = dummy_ipc_socket_path("tcp://127.0.0.1:7000?slot=1");
+        assert!(sanitized
+            .to_string_lossy()
+            .contains("tcp___127_0_0_1_7000_slot_1"));
+        assert!(matches!(
+            allocate_shared_region(0),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            memfd_create("bad\0name", None),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(dup_fd(-1), Err(StoreError::Allocator(_))));
+        assert!(matches!(ftruncate(-1, 1), Err(StoreError::Allocator(_))));
+        assert!(matches!(
+            mmap_shared(-1, 4096),
+            Err(StoreError::Allocator(_))
+        ));
+
+        let two_mb = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
+        let one_gb = HugePageConfig::new(1024 * 1024 * 1024).expect("1GB hugepage should resolve");
+        assert_ne!(hugepage_memfd_flags(two_mb) & libc::MFD_HUGETLB, 0);
+        assert_ne!(hugepage_memfd_flags(one_gb) & libc::MFD_HUGETLB, 0);
+
+        let ptr = allocate_shared_region(1024).expect("shared alloc should succeed");
+        assert!(matches!(
+            shared_region_for_registration(ptr, 2048),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            shared_region_for_registration(ptr + 8, 1024),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            resolve_shared_region(ptr + 900, 200),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            resolve_shared_region(usize::MAX, 1),
+            Err(StoreError::Allocator(_))
+        ));
+        free_shared_region(ptr).expect("shared region cleanup should succeed");
+        assert!(matches!(
+            free_shared_region(ptr),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            resolve_shared_region(ptr, 1),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn shm_registration_rejects_bad_magic() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let ptr = allocate_shared_region(1024).expect("shared alloc should succeed");
+        let registration =
+            shared_region_for_registration(ptr, 1024).expect("registration should resolve");
+        let socket_path = unique_socket_path("bad-magic");
+        let listener = bind_shm_listener(&socket_path).expect("listener bind should succeed");
+        let mut request =
+            ShmRegisterRequest::new(DummyClientId::new(), registration.region_id, 1024);
+        request.magic = 0;
+        let worker = thread::spawn(move || recv_shm_register_request(&listener));
+
+        let client_error = send_shm_register_request(&socket_path, &request, &registration.fd)
+            .expect_err("invalid magic should be rejected by the listener");
+        assert!(matches!(client_error, StoreError::Transport(_)));
+        let server_error = worker
+            .join()
+            .expect("listener worker should join")
+            .expect_err("server should reject invalid magic");
+        assert!(matches!(server_error, StoreError::Transport(_)));
+
+        free_shared_region(ptr).expect("shared region cleanup should succeed");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    fn unique_socket_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mooncake-store-rs-{label}-{}.sock",
+            DummyClientId::new().low
+        ))
+    }
+
+    fn test_lock() -> &'static Mutex<()> {
+        TEST_LOCK.get_or_init(|| Mutex::new(()))
     }
 }

@@ -219,4 +219,85 @@ mod tests {
         };
         assert!(matches!(error, StoreError::Unsupported(_)));
     }
+
+    #[test]
+    fn compat_setup_build_supports_etcd_metadata_and_defaults() {
+        let plan = CompatSetupArgs {
+            local_hostname: "node-a".to_string(),
+            metadata_url: "etcd://127.0.0.1:2379,https://etcd.example:32379".to_string(),
+            transport_metadata_url: Some("redis://cache.local:6381/4".to_string()),
+            global_segment_size: 4096,
+            local_buffer_size: 1024,
+            protocol: "rdma".to_string(),
+            _rdma_devices: String::new(),
+            stable_id: None,
+            tenant: "tenant-a".to_string(),
+            labels: BTreeMap::from([("pool".to_string(), "pool-a".to_string())]),
+            routed_writes: true,
+            replica_count: 0,
+            keyspace: Some("py/test".to_string()),
+            expires_at_ms: None,
+            use_hugepage: Some(true),
+            hugepage_size_bytes: Some(2 * 1024 * 1024),
+        }
+        .build()
+        .expect("compat build plan should succeed");
+
+        assert!(plan.stable_id.starts_with("py-store-"));
+        assert_eq!(plan.tenant, "tenant-a");
+        assert_eq!(plan.replica_count, 1);
+        assert_eq!(plan.storage_bytes, 4096);
+        assert_eq!(plan.scratch_bytes, 1024);
+        assert_eq!(plan.use_hugepage, Some(true));
+        assert_eq!(plan.hugepage_size_bytes, Some(2 * 1024 * 1024));
+        assert_eq!(plan.labels.get("pool").map(String::as_str), Some("pool-a"));
+        assert_eq!(plan.labels.get("storage").map(String::as_str), Some("true"));
+        assert!(plan.expires_at_ms > 0);
+
+        let debug = format!("{:?}", plan.tent_config);
+        assert!(debug.contains("cache.local:6381"));
+        assert!(debug.contains("4"));
+        assert!(debug.contains("transports/rdma/enable"));
+    }
+
+    #[test]
+    fn build_metadata_backend_validates_etcd_transport_url() {
+        let error = match build_metadata_backend(
+            "etcd://127.0.0.1:2379",
+            Some("http://bad-transport".to_string()),
+            MetadataKeyspace::default(),
+        ) {
+            Ok(_) => panic!("etcd metadata requires redis transport metadata"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Metadata(_)));
+    }
+
+    #[test]
+    fn build_metadata_backend_rejects_unknown_scheme() {
+        let error =
+            match build_metadata_backend("file:///tmp/metadata", None, MetadataKeyspace::default())
+            {
+                Ok(_) => panic!("unknown metadata scheme should fail"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, StoreError::Metadata(_)));
+    }
+
+    #[test]
+    fn build_tent_config_rejects_invalid_redis_inputs() {
+        let invalid_url = build_tent_config("127.0.0.1", "not-a-redis-url", "tcp")
+            .expect_err("bad url must fail");
+        assert!(matches!(invalid_url, StoreError::Metadata(_)));
+
+        let missing_host =
+            build_tent_config("127.0.0.1", "redis:///0", "auto").expect_err("host is required");
+        assert!(matches!(missing_host, StoreError::Metadata(_)));
+
+        let auto = build_tent_config("127.0.0.1", "redis://cache.local", "auto")
+            .expect("auto config should succeed");
+        let debug = format!("{auto:?}");
+        assert!(debug.contains("cache.local:6379"));
+        assert!(debug.contains("transports/tcp/enable"));
+    }
 }
