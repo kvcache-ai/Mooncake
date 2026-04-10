@@ -3429,9 +3429,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity) {
-    auto buffer_size_result =
-        get_registered_buffer_size(buffer, size_is_buffer_capacity ? "get_into"
-                                                                  : "get_into_range");
+    auto buffer_size_result = get_registered_buffer_size(
+        buffer, size_is_buffer_capacity ? "get_into" : "get_into_range");
     if (!buffer_size_result) {
         return tl::unexpected(buffer_size_result.error());
     }

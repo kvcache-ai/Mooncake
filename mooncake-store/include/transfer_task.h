@@ -179,7 +179,7 @@ class TransferEngineOperationState : public OperationState {
           batch_size_(batch_size),
           start_ts_(getCurrentTimeInMilli()) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState() override;
 
     bool is_completed() override;
 
@@ -365,6 +365,7 @@ class FilereadWorkerPool {
  * Each chunk maps 1:1 to a TransferEngine task within a single batch.
  * Callers poll individual chunk completion to overlap transfer with compute.
  */
+struct ScatterReadBuildResult;
 class ChunkedReadSession;
 
 class ProgressiveGetHandle {
