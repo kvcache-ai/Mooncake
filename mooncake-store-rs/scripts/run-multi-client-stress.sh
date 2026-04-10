@@ -23,6 +23,7 @@ Important environment variables:
   MC_STORE_RS_REDIS_URL                   Metadata Redis URL
   MC_STORE_RS_STRESS_STORAGE_CLIENTS      Number of storage clients, default 4
   MC_STORE_RS_STRESS_WRITER_CLIENTS       Number of concurrent Python benchmark worker processes, default 8
+  MC_STORE_RS_STRESS_WRITER_STORAGE_BYTES Local storage bytes per rw worker, default 0
   MC_STORE_RS_STRESS_VALUE_SIZE           Payload size in bytes, default 4096
   MC_STORE_RS_STRESS_BATCH_SIZE           Batch width, default 32
   MC_STORE_RS_STRESS_SINGLE_ITERS         Single put/get iterations per writer, default 256

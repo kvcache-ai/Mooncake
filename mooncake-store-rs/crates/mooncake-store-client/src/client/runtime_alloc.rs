@@ -365,21 +365,21 @@ impl StoreClient {
         let primary = memory
             .storage_segments()
             .into_iter()
-            .find(|segment| segment.segment_name == primary_segment)
-            .ok_or_else(|| {
-                StoreError::InvalidState("primary segment registration is missing".to_string())
-            })?;
+            .find(|segment| segment.segment_name == primary_segment);
         {
             let mut state = self.state.lock();
             state.next_local_segment_id = 1;
-            if let Some(transport) = self.transport.clone() {
+            if let Some(transport) = self.transport.clone().filter(|_| primary.is_some()) {
                 state
                     .local_transports
-                    .insert(primary.segment_name.0.clone(), transport);
+                    .insert(primary_segment.0.clone(), transport);
             }
             state.memory = Some(memory);
         }
-        self.publish_local_segment(&primary, 0)
+        match primary {
+            Some(primary) => self.publish_local_segment(&primary, 0),
+            None => Ok(()),
+        }
     }
 
     fn scoped_key(&self, tenant: &str, key: &str) -> ObjectKey {

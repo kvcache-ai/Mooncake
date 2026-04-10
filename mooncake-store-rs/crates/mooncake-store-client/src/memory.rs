@@ -72,13 +72,16 @@ impl LocalMemoryConfig {
         HugePageConfig::resolve(self.hugepage_enabled, self.hugepage_size_bytes)
     }
 
+    pub fn has_storage(&self) -> bool {
+        self.storage_bytes != 0
+    }
+
+    pub fn has_scratch(&self) -> bool {
+        self.scratch_bytes != 0
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.storage_bytes == 0 {
-            return Err(StoreError::Allocator(
-                "storage_bytes must be greater than zero".to_string(),
-            ));
-        }
-        if self.scratch_bytes == 0 {
+        if !self.has_scratch() {
             return Err(StoreError::Allocator(
                 "scratch_bytes must be greater than zero".to_string(),
             ));
@@ -134,29 +137,43 @@ impl LocalMemoryState {
     ) -> Result<Self> {
         config.validate()?;
         let hugepage = config.hugepage()?;
-        let storage = RegisteredRegion::register(
-            transport,
-            config.storage_bytes,
-            &config.location,
-            config.alignment,
-            hugepage,
-        )?;
-        let scratch = RegisteredRegion::register(
+        let storage = if config.has_storage() {
+            Some(RegisteredRegion::register(
+                transport,
+                config.storage_bytes,
+                &config.location,
+                config.alignment,
+                hugepage,
+            )?)
+        } else {
+            None
+        };
+        let scratch = match RegisteredRegion::register(
             transport,
             config.scratch_bytes,
             &config.location,
             config.alignment,
             hugepage,
-        )?;
+        ) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                if let Some(storage) = storage {
+                    let _ = storage.release(transport);
+                }
+                return Err(error);
+            }
+        };
         let mut segments = BTreeMap::new();
-        segments.insert(
-            primary_segment.clone(),
-            StorageExtent {
-                region: storage,
-                state: SegmentLifecycleState::Active,
-                tags: config.tags.clone(),
-            },
-        );
+        if let Some(storage) = storage {
+            segments.insert(
+                primary_segment.clone(),
+                StorageExtent {
+                    region: storage,
+                    state: SegmentLifecycleState::Active,
+                    tags: config.tags.clone(),
+                },
+            );
+        }
         Ok(Self {
             storage: segments,
             scratch,
@@ -898,11 +915,10 @@ mod tests {
 
     #[test]
     fn local_memory_config_validate_rejects_invalid_inputs() {
-        let error = LocalMemoryConfig::new()
+        LocalMemoryConfig::new()
             .storage_bytes(0)
             .validate()
-            .expect_err("zero storage must fail");
-        assert!(matches!(error, StoreError::Allocator(_)));
+            .expect("zero storage should be allowed for rw-only clients");
 
         let error = LocalMemoryConfig::new()
             .scratch_bytes(0)
@@ -1090,6 +1106,41 @@ mod tests {
         state
             .release_scratch(&transport)
             .expect("scratch cleanup should succeed");
+    }
+
+    #[test]
+    fn local_memory_state_supports_scratch_only_registration() {
+        let transport = RecordingTransport::default();
+        let primary = SegmentName::new("primary");
+        let state = LocalMemoryState::register(
+            &transport,
+            &primary,
+            &LocalMemoryConfig::new()
+                .storage_bytes(0)
+                .scratch_bytes(128)
+                .alignment(16),
+        )
+        .expect("scratch-only registration should succeed");
+
+        assert!(!state.has_storage_segment(&primary));
+        assert!(state.storage_segments().is_empty());
+        assert!(matches!(
+            state.storage_address(&primary, 0),
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(
+            state
+                .plan_scratch(&[1, 17])
+                .expect("scratch planning should still work")
+                .len(),
+            2
+        );
+        assert_eq!(transport.inner.lock().registered.len(), 1);
+
+        state
+            .release_scratch(&transport)
+            .expect("scratch region should release cleanly");
+        assert!(transport.inner.lock().registered.is_empty());
     }
 
     #[test]
