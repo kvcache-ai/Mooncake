@@ -1244,6 +1244,61 @@ fn routed_put_reuses_live_client_snapshot_for_placement() {
 }
 
 #[test]
+fn first_routed_put_shares_one_live_client_refresh_across_route_and_placement() {
+    let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
+        InMemoryMetadataBackend::new(),
+    )));
+    let storage_transport = Arc::new(TestTransport::new("storage-first-put-shared-cache-segment"));
+    let writer_transport =
+        Arc::new(storage_transport.peer("writer-first-put-shared-cache-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "storage-first-put-shared-cache")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "writer-first-put-shared-cache")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let before = metadata.list_live_clients_calls();
+    writer
+        .put_in_tenant_with_policy(
+            "tenant-a",
+            "cold-start-key",
+            b"payload",
+            &ReplicationPolicy::new().prefer_local(false),
+        )
+        .expect("cold-start routed put should succeed");
+    let after_first = metadata.list_live_clients_calls();
+
+    assert_eq!(
+        after_first - before,
+        1,
+        "first routed put should share one live-client refresh across route load, placement, and allocator lease lookup"
+    );
+}
+
+#[test]
 fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
     let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),

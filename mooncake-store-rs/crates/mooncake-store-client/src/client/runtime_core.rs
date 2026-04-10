@@ -94,9 +94,7 @@ impl StoreClient {
             }
         }
         let leases = self.metadata.list_live_clients()?;
-        let mut cache = self.live_client_cache.lock();
-        cache.refreshed_at = Some(Instant::now());
-        cache.leases = leases.clone();
+        self.live_client_cache.lock().store(leases.clone());
         Ok(leases)
     }
 

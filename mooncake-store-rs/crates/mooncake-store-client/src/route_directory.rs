@@ -1,18 +1,16 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
-
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend,
     ObjectKey, ObjectRoute, Result, RouteCasRequest, RouteDirectory, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
+use crate::client::SharedLiveClientCache;
 use crate::control_plane::ControlPlaneClient;
 
 const ROUTE_SCOPE_LABEL: &str = "route_scope";
-const AUTHORITY_CANDIDATE_CACHE_TTL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RouteControlMode {
@@ -26,6 +24,7 @@ pub(crate) fn build_route_directory(
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
     control_plane: Arc<ControlPlaneClient>,
+    live_client_cache: SharedLiveClientCache,
 ) -> Arc<dyn RouteDirectory> {
     match mode {
         RouteControlMode::MetadataOnly => Arc::new(MetadataRouteDirectory { metadata }),
@@ -33,6 +32,7 @@ pub(crate) fn build_route_directory(
             metadata,
             lease,
             control_plane,
+            live_client_cache,
         )),
     }
 }
@@ -67,7 +67,7 @@ struct EmbeddedWrhRouteDirectory {
     namespace: String,
     local_stable_id: ClientStableId,
     control_plane: Arc<ControlPlaneClient>,
-    authority_cache: Mutex<RouteAuthorityCache>,
+    live_client_cache: SharedLiveClientCache,
 }
 
 #[derive(Clone)]
@@ -76,27 +76,12 @@ struct RouteAuthoritySelection {
     secondary: Option<ClientLease>,
 }
 
-#[derive(Default)]
-struct RouteAuthorityCache {
-    refreshed_at: Option<Instant>,
-    leases: Vec<ClientLease>,
-}
-
-impl RouteAuthorityCache {
-    fn snapshot(&self) -> Option<Vec<ClientLease>> {
-        let refreshed_at = self.refreshed_at?;
-        if refreshed_at.elapsed() > AUTHORITY_CANDIDATE_CACHE_TTL {
-            return None;
-        }
-        Some(self.leases.clone())
-    }
-}
-
 impl EmbeddedWrhRouteDirectory {
     fn new(
         metadata: Arc<dyn MetadataBackend>,
         lease: &ClientLease,
         control_plane: Arc<ControlPlaneClient>,
+        live_client_cache: SharedLiveClientCache,
     ) -> Self {
         let namespace = metadata.route_namespace();
         route_mesh(&namespace)
@@ -107,26 +92,27 @@ impl EmbeddedWrhRouteDirectory {
             namespace,
             local_stable_id: lease.runtime.stable_id.clone(),
             control_plane,
-            authority_cache: Mutex::new(RouteAuthorityCache::default()),
+            live_client_cache,
         }
     }
 
     fn active_route_leases(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
         if !force_refresh {
-            if let Some(snapshot) = self.authority_cache.lock().snapshot() {
-                return Ok(snapshot);
+            if let Some(snapshot) = self.live_client_cache.lock().snapshot() {
+                return Ok(snapshot
+                    .into_iter()
+                    .filter(|lease| {
+                        lease.state == ClientLifecycleState::Active && route_capable(lease)
+                    })
+                    .collect::<Vec<_>>());
             }
         }
-        let leases = self
-            .metadata
-            .list_live_clients()?
+        let leases = self.metadata.list_live_clients()?;
+        self.live_client_cache.lock().store(leases.clone());
+        Ok(leases
             .into_iter()
             .filter(|lease| lease.state == ClientLifecycleState::Active && route_capable(lease))
-            .collect::<Vec<_>>();
-        let mut cache = self.authority_cache.lock();
-        cache.refreshed_at = Some(Instant::now());
-        cache.leases = leases.clone();
-        Ok(leases)
+            .collect())
     }
 
     fn authority_candidates_once(
@@ -1020,6 +1006,9 @@ mod tests {
             metadata.clone(),
             &observer,
             control,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::LiveClientCache::default(),
+            )),
         );
         let key = ObjectKey::new("tenant-a::alpha");
         let route_v1 = route_for(&key.0, &observer.runtime);
@@ -1186,7 +1175,14 @@ mod tests {
         }
 
         let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
-        let directory = EmbeddedWrhRouteDirectory::new(metadata.clone(), &observer, control);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            metadata.clone(),
+            &observer,
+            control,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::LiveClientCache::default(),
+            )),
+        );
         let namespace = metadata.route_namespace();
         route_mesh(&namespace)
             .lock()

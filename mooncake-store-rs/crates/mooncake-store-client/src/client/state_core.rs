@@ -1,16 +1,23 @@
+pub(crate) type SharedLiveClientCache = Arc<Mutex<LiveClientCache>>;
+
 #[derive(Default)]
-struct LiveClientCache {
+pub(crate) struct LiveClientCache {
     refreshed_at: Option<Instant>,
     leases: Vec<ClientLease>,
 }
 
 impl LiveClientCache {
-    fn snapshot(&self) -> Option<Vec<ClientLease>> {
+    pub(crate) fn snapshot(&self) -> Option<Vec<ClientLease>> {
         let refreshed_at = self.refreshed_at?;
         if refreshed_at.elapsed() > LIVE_CLIENT_CACHE_TTL {
             return None;
         }
         Some(self.leases.clone())
+    }
+
+    pub(crate) fn store(&mut self, leases: Vec<ClientLease>) {
+        self.refreshed_at = Some(Instant::now());
+        self.leases = leases;
     }
 }
 
@@ -446,4 +453,3 @@ enum ReclaimMode {
     Scheduled,
     Immediate,
 }
-
