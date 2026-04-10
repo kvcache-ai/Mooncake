@@ -378,6 +378,7 @@ struct PreparedObjectWrite<'a> {
 #[derive(Clone, Debug)]
 struct StorageRuntimeReservationRequest {
     storage_runtime: ClientRuntimeId,
+    segment_name: Option<SegmentName>,
     length_bytes: u64,
     require_local_memory: bool,
 }

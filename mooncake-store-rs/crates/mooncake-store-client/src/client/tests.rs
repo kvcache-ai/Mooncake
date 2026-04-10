@@ -952,6 +952,55 @@ fn observability_metrics_render_fast_batch_put_stages() {
 }
 
 #[test]
+fn observability_metrics_render_fast_batch_put_stages_for_shared_policy() {
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("metrics-fast-shared-policy-segment"));
+    publish_storage_node(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "metrics-fast-shared-policy-storage",
+        "metrics-fast-shared-policy-storage-seg",
+        "pool-a",
+    );
+    let writer = StoreClientBuilder::new(metadata.clone(), "metrics-fast-shared-policy-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_segment("metrics-fast-shared-policy-storage-seg");
+    let routes = writer
+        .batch_put(&[
+            PutRequest::new("fast-policy-a", b"left").replication(policy.clone()),
+            PutRequest::new("fast-policy-b", b"right").replication(policy),
+        ])
+        .expect("shared-policy fast routed batch put should succeed");
+    assert_eq!(routes.len(), 2);
+    assert!(routes.iter().all(|route| {
+        route.replicas.len() == 1
+            && route.replicas[0].segment_name
+                == SegmentName::new("metrics-fast-shared-policy-storage-seg")
+    }));
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"batch_put_stage_rank\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_reserve\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
+}
+
+#[test]
 fn rw_only_client_registers_without_segments_and_routes_to_remote_storage() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let storage_transport = Arc::new(TestTransport::new("rw-only-storage-segment"));
