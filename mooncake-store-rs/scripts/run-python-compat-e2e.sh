@@ -55,6 +55,30 @@ from mooncake.store import (
 
 stamp = int(time.time() * 1000)
 keyspace = f"mc/store-rs/py-compat/{stamp}"
+
+
+def wait_for_embedded_wrh_replication(writer, reader) -> None:
+    config = ReplicateConfig(replica_num=2)
+    key = "__wrh-ready__"
+    payload = b"wrh-ready"
+    deadline = time.time() + 10.0
+    last_error = None
+    while time.time() < deadline:
+        try:
+            assert writer.put(key, payload, config=config) == 0
+            route = writer.query_route(key)
+            if route is None or len(route["replicas"]) != 2:
+                raise AssertionError(f"replication route not converged: {route}")
+            if writer.get(key) == payload and reader.get(key) == payload:
+                return
+        except Exception as error:
+            last_error = error
+        time.sleep(0.1)
+    raise AssertionError(
+        f"embedded WRH replication did not converge before timeout: {last_error!r}"
+    )
+
+
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
@@ -81,6 +105,8 @@ assert store_peer.setup(
     keyspace=keyspace,
     labels={"pool": "pool-a", "storage": "true"},
 ) == 0
+
+wait_for_embedded_wrh_replication(store, store_peer)
 
 assert store.put("py-key", b"hello-python") == 0
 assert store.get("py-key") == b"hello-python"
