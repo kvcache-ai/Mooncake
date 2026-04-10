@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-    types: [synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch: {}
 
 permissions:
@@ -23,6 +23,7 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -239,6 +240,7 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
@@ -275,6 +277,7 @@ jobs:
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
@@ -434,6 +437,7 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -603,6 +607,7 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
@@ -625,6 +630,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -640,6 +646,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -688,6 +695,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
@@ -723,6 +731,7 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
