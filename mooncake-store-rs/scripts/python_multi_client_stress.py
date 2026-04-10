@@ -158,25 +158,21 @@ class StorageCluster:
 
 def run_phase(ctx: Any, config: StressConfig, phase: str) -> dict[str, Any]:
     if phase == "put":
-        started = time.perf_counter()
-        results = run_workers(ctx, config, phase, "put-worker", put_worker_main, measured=True)
-        return finalize_phase(phase, config, time.perf_counter() - started, results)
+        run = run_workers(ctx, config, phase, "put-worker", put_worker_main, measured=True)
+        return finalize_phase(phase, config, run)
     if phase == "get":
-        started = time.perf_counter()
-        results = run_workers(ctx, config, phase, "rw-worker", get_worker_main, measured=True)
-        return finalize_phase(phase, config, time.perf_counter() - started, results)
+        run = run_workers(ctx, config, phase, "rw-worker", get_worker_main, measured=True)
+        return finalize_phase(phase, config, run)
     if phase == "batch-put":
-        started = time.perf_counter()
-        results = run_workers(
+        run = run_workers(
             ctx, config, phase, "batch-put-worker", batch_put_worker_main, measured=True
         )
-        return finalize_phase(phase, config, time.perf_counter() - started, results)
+        return finalize_phase(phase, config, run)
     if phase == "batch-get":
-        started = time.perf_counter()
-        results = run_workers(
+        run = run_workers(
             ctx, config, phase, "rw-worker", batch_get_worker_main, measured=True
         )
-        return finalize_phase(phase, config, time.perf_counter() - started, results)
+        return finalize_phase(phase, config, run)
     raise ValueError(f"unsupported phase {phase}")
 
 
@@ -188,39 +184,94 @@ def run_workers(
     target,
     *,
     measured: bool,
-) -> list[dict[str, Any]]:
-    result_queue = ctx.Queue()
+) -> dict[str, Any]:
+    message_queue = ctx.Queue()
+    start_event = ctx.Event()
     processes: list[mp.Process] = []
+    phase_start = time.perf_counter()
     for worker_index in range(config.writer_clients):
         process = ctx.Process(
             target=worker_entry,
-            args=(target, config, phase, role, worker_index, result_queue, measured),
+            args=(
+                target,
+                config,
+                phase,
+                role,
+                worker_index,
+                message_queue,
+                start_event,
+                measured,
+            ),
             name=f"{role}-{worker_index}",
         )
         process.start()
         processes.append(process)
 
-    wait_processes(processes, config.child_timeout_ms, role)
-    results: list[dict[str, Any]] = []
-    expected = config.writer_clients if measured else 0
-    deadline = time.time() + 5.0
-    while expected > 0:
+    ready: dict[int, dict[str, Any]] = {}
+    result_map: dict[int, dict[str, Any]] = {}
+    deadline = time.time() + config.child_timeout_ms / 1000.0
+    while measured and len(ready) < config.writer_clients:
         remaining = deadline - time.time()
         if remaining <= 0:
-            break
+            terminate_processes(processes)
+            raise RuntimeError(f"{role} readiness timed out after {config.child_timeout_ms} ms")
         try:
-            message = result_queue.get(timeout=min(remaining, 0.2))
+            message = message_queue.get(timeout=min(remaining, 0.2))
         except queue.Empty:
+            raise_if_process_failed(processes, role)
             continue
         if "error" in message:
+            terminate_processes(processes)
             raise RuntimeError(message["error"])
-        results.append(message)
-        expected -= 1
-    if measured and len(results) != config.writer_clients:
-        raise RuntimeError(
-            f"{role} expected {config.writer_clients} results, got {len(results)}"
-        )
-    return results
+        kind = message.get("kind")
+        if kind == "ready":
+            ready[int(message["worker_index"])] = message
+            continue
+        if kind == "result":
+            result_map[int(message["worker_index"])] = message["result"]
+            continue
+
+    measured_start = time.perf_counter()
+    start_event.set()
+
+    while measured and len(result_map) < config.writer_clients:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            terminate_processes(processes)
+            raise RuntimeError(f"{role} timed out after {config.child_timeout_ms} ms")
+        try:
+            message = message_queue.get(timeout=min(remaining, 0.2))
+        except queue.Empty:
+            raise_if_process_failed(processes, role)
+            continue
+        if "error" in message:
+            terminate_processes(processes)
+            raise RuntimeError(message["error"])
+        kind = message.get("kind")
+        if kind == "ready":
+            ready[int(message["worker_index"])] = message
+            continue
+        if kind == "result":
+            result_map[int(message["worker_index"])] = message["result"]
+
+    ordered_results: list[dict[str, Any]] = []
+    for worker_index in range(config.writer_clients):
+        result = result_map.get(worker_index)
+        if result is None and measured:
+            raise RuntimeError(
+                f"{role} expected result for worker={worker_index}, got {sorted(result_map)}"
+            )
+        if result is not None:
+            ordered_results.append(result)
+    wait_processes(processes, config.child_timeout_ms, role)
+    phase_end = time.perf_counter()
+    return {
+        "results": ordered_results,
+        "phase_wall_s": phase_end - phase_start,
+        "prepare_wall_s": measured_start - phase_start,
+        "measured_wall_s": phase_end - measured_start,
+        "ready": [ready[index] for index in sorted(ready)],
+    }
 
 
 def worker_entry(
@@ -229,15 +280,30 @@ def worker_entry(
     phase: str,
     role: str,
     worker_index: int,
-    result_queue,
+    message_queue,
+    start_event,
     measured: bool,
 ) -> None:
     try:
-        result = target(config, phase, role, worker_index)
+        result = target(
+            config,
+            phase,
+            role,
+            worker_index,
+            message_queue,
+            start_event,
+            measured,
+        )
         if measured:
-            result_queue.put(result)
+            message_queue.put(
+                {
+                    "kind": "result",
+                    "worker_index": worker_index,
+                    "result": result,
+                }
+            )
     except Exception:
-        result_queue.put(
+        message_queue.put(
             {
                 "error": "".join(
                     traceback.format_exception(*sys.exc_info())
@@ -282,8 +348,16 @@ def storage_process_main(
 
 
 def put_worker_main(
-    config: StressConfig, phase: str, role: str, worker_index: int
+    config: StressConfig,
+    phase: str,
+    role: str,
+    worker_index: int,
+    message_queue,
+    start_event,
+    measured: bool,
 ) -> dict[str, Any]:
+    worker_start = time.perf_counter()
+    setup_start = worker_start
     store = build_store(
         config,
         stable_id=f"stress-{phase}-{role}-{worker_index}",
@@ -292,23 +366,55 @@ def put_worker_main(
         labels={"pool": config.pool, "role": role, "storage": "false"},
         routed_writes=True,
     )
+    setup_s = time.perf_counter() - setup_start
     value = payload(f"{phase}-worker-{worker_index}", config.value_size)
     replicate = remote_only_replication(config)
     latencies: list[int] = []
+    prepare_start = time.perf_counter()
     for index in range(config.warmup_iters):
         key = f"{phase}/warmup/{worker_index}/{index}"
         ensure_status(store.put(key, value, config=replicate), f"put warmup {key}")
+    prepare_s = time.perf_counter() - prepare_start
+    if measured:
+        message_queue.put(
+            {
+                "kind": "ready",
+                "worker_index": worker_index,
+                "setup_s": setup_s,
+                "prepare_s": prepare_s,
+            }
+        )
+        start_event.wait()
+    measured_start = time.perf_counter()
     for index in range(config.single_iters):
         key = f"{phase}/bench/{worker_index}/{index}"
         request_start = time.perf_counter_ns()
         ensure_status(store.put(key, value, config=replicate), f"put {key}")
         latencies.append((time.perf_counter_ns() - request_start) // 1_000)
-    return worker_result(latencies, config.single_iters, config.single_iters, config.single_iters * config.value_size)
+    measured_s = time.perf_counter() - measured_start
+    return worker_result(
+        latencies,
+        config.single_iters,
+        config.single_iters,
+        config.single_iters * config.value_size,
+        setup_s=setup_s,
+        prepare_s=prepare_s,
+        measured_s=measured_s,
+        worker_wall_s=time.perf_counter() - worker_start,
+    )
 
 
 def get_worker_main(
-    config: StressConfig, phase: str, role: str, worker_index: int
+    config: StressConfig,
+    phase: str,
+    role: str,
+    worker_index: int,
+    message_queue,
+    start_event,
+    measured: bool,
 ) -> dict[str, Any]:
+    worker_start = time.perf_counter()
+    setup_start = worker_start
     store = build_store(
         config,
         stable_id=f"stress-{phase}-{role}-{worker_index}",
@@ -317,26 +423,58 @@ def get_worker_main(
         labels={"pool": config.pool, "role": role, "storage": "false"},
         routed_writes=True,
     )
+    setup_s = time.perf_counter() - setup_start
     value = payload(f"{phase}-worker-{worker_index}", config.value_size)
     replicate = remote_only_replication(config)
     keys = build_single_keys(phase, worker_index, config.warmup_iters + config.single_iters)
+    prepare_start = time.perf_counter()
     for key in keys:
         ensure_status(store.put(key, value, config=replicate), f"get preload {key}")
     sleep_ms(config.visibility_wait_ms)
     for key in keys[: config.warmup_iters]:
         ensure_length(get_with_retry(store, key), config.value_size, key)
+    prepare_s = time.perf_counter() - prepare_start
+    if measured:
+        message_queue.put(
+            {
+                "kind": "ready",
+                "worker_index": worker_index,
+                "setup_s": setup_s,
+                "prepare_s": prepare_s,
+            }
+        )
+        start_event.wait()
+    measured_start = time.perf_counter()
     latencies: list[int] = []
     for key in keys[config.warmup_iters :]:
         request_start = time.perf_counter_ns()
         value = get_with_retry(store, key)
         latencies.append((time.perf_counter_ns() - request_start) // 1_000)
         ensure_length(value, config.value_size, key)
-    return worker_result(latencies, config.single_iters, config.single_iters, config.single_iters * config.value_size)
+    measured_s = time.perf_counter() - measured_start
+    return worker_result(
+        latencies,
+        config.single_iters,
+        config.single_iters,
+        config.single_iters * config.value_size,
+        setup_s=setup_s,
+        prepare_s=prepare_s,
+        measured_s=measured_s,
+        worker_wall_s=time.perf_counter() - worker_start,
+    )
 
 
 def batch_put_worker_main(
-    config: StressConfig, phase: str, role: str, worker_index: int
+    config: StressConfig,
+    phase: str,
+    role: str,
+    worker_index: int,
+    message_queue,
+    start_event,
+    measured: bool,
 ) -> dict[str, Any]:
+    worker_start = time.perf_counter()
+    setup_start = worker_start
     store = build_store(
         config,
         stable_id=f"stress-{phase}-{role}-{worker_index}",
@@ -345,11 +483,25 @@ def batch_put_worker_main(
         labels={"pool": config.pool, "role": role, "storage": "false"},
         routed_writes=True,
     )
+    setup_s = time.perf_counter() - setup_start
     value = payload(f"{phase}-worker-{worker_index}", config.value_size)
     replicate = remote_only_replication(config)
+    prepare_start = time.perf_counter()
     for batch_keys in build_batch_keys(phase, worker_index, config.warmup_iters, config.batch_size):
         items = [(key, value) for key in batch_keys]
         ensure_status(store.batch_put(items, config=replicate), f"batch-put warmup worker={worker_index}")
+    prepare_s = time.perf_counter() - prepare_start
+    if measured:
+        message_queue.put(
+            {
+                "kind": "ready",
+                "worker_index": worker_index,
+                "setup_s": setup_s,
+                "prepare_s": prepare_s,
+            }
+        )
+        start_event.wait()
+    measured_start = time.perf_counter()
     latencies: list[int] = []
     for batch_keys in build_batch_keys(phase, worker_index, config.batch_iters, config.batch_size):
         items = [(key, value) for key in batch_keys]
@@ -358,12 +510,30 @@ def batch_put_worker_main(
         latencies.append((time.perf_counter_ns() - request_start) // 1_000)
     objects = config.batch_iters * config.batch_size
     total_bytes = objects * config.value_size
-    return worker_result(latencies, config.batch_iters, objects, total_bytes)
+    measured_s = time.perf_counter() - measured_start
+    return worker_result(
+        latencies,
+        config.batch_iters,
+        objects,
+        total_bytes,
+        setup_s=setup_s,
+        prepare_s=prepare_s,
+        measured_s=measured_s,
+        worker_wall_s=time.perf_counter() - worker_start,
+    )
 
 
 def batch_get_worker_main(
-    config: StressConfig, phase: str, role: str, worker_index: int
+    config: StressConfig,
+    phase: str,
+    role: str,
+    worker_index: int,
+    message_queue,
+    start_event,
+    measured: bool,
 ) -> dict[str, Any]:
+    worker_start = time.perf_counter()
+    setup_start = worker_start
     store = build_store(
         config,
         stable_id=f"stress-{phase}-{role}-{worker_index}",
@@ -372,6 +542,7 @@ def batch_get_worker_main(
         labels={"pool": config.pool, "role": role, "storage": "false"},
         routed_writes=True,
     )
+    setup_s = time.perf_counter() - setup_start
     value = payload(f"{phase}-worker-{worker_index}", config.value_size)
     replicate = remote_only_replication(config)
     batches = build_batch_keys(
@@ -380,6 +551,7 @@ def batch_get_worker_main(
         config.warmup_iters + config.batch_iters,
         config.batch_size,
     )
+    prepare_start = time.perf_counter()
     for batch_keys in batches:
         items = [(key, value) for key in batch_keys]
         ensure_status(
@@ -389,6 +561,18 @@ def batch_get_worker_main(
     sleep_ms(config.visibility_wait_ms)
     for batch_keys in batches[: config.warmup_iters]:
         ensure_batch_lengths(batch_get_with_retry(store, batch_keys), config.value_size, len(batch_keys), batch_keys)
+    prepare_s = time.perf_counter() - prepare_start
+    if measured:
+        message_queue.put(
+            {
+                "kind": "ready",
+                "worker_index": worker_index,
+                "setup_s": setup_s,
+                "prepare_s": prepare_s,
+            }
+        )
+        start_event.wait()
+    measured_start = time.perf_counter()
     latencies: list[int] = []
     for batch_keys in batches[config.warmup_iters :]:
         request_start = time.perf_counter_ns()
@@ -397,7 +581,17 @@ def batch_get_worker_main(
         ensure_batch_lengths(values, config.value_size, len(batch_keys), batch_keys)
     objects = config.batch_iters * config.batch_size
     total_bytes = objects * config.value_size
-    return worker_result(latencies, config.batch_iters, objects, total_bytes)
+    measured_s = time.perf_counter() - measured_start
+    return worker_result(
+        latencies,
+        config.batch_iters,
+        objects,
+        total_bytes,
+        setup_s=setup_s,
+        prepare_s=prepare_s,
+        measured_s=measured_s,
+        worker_wall_s=time.perf_counter() - worker_start,
+    )
 
 
 def build_store(
@@ -447,13 +641,25 @@ def rw_storage_bytes(config: StressConfig) -> int:
 
 
 def worker_result(
-    latencies: list[int], request_count: int, object_count: int, total_bytes: int
+    latencies: list[int],
+    request_count: int,
+    object_count: int,
+    total_bytes: int,
+    *,
+    setup_s: float,
+    prepare_s: float,
+    measured_s: float,
+    worker_wall_s: float,
 ) -> dict[str, Any]:
     return {
         "request_latencies_us": latencies,
         "request_count": request_count,
         "object_count": object_count,
         "total_bytes": total_bytes,
+        "setup_s": setup_s,
+        "prepare_s": prepare_s,
+        "measured_s": measured_s,
+        "worker_wall_s": worker_wall_s,
     }
 
 
@@ -505,6 +711,20 @@ def wait_ready(
         raise RuntimeError(message["traceback"])
 
 
+def terminate_processes(processes: list[mp.Process]) -> None:
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+
+
+def raise_if_process_failed(processes: list[mp.Process], role: str) -> None:
+    for process in processes:
+        if process.exitcode not in (None, 0):
+            raise RuntimeError(
+                f"{role} process {process.name} exited with code {process.exitcode}"
+            )
+
+
 def wait_processes(processes: list[mp.Process], timeout_ms: int, role: str) -> None:
     deadline = time.time() + timeout_ms / 1000.0
     alive = set(range(len(processes)))
@@ -530,8 +750,9 @@ def wait_processes(processes: list[mp.Process], timeout_ms: int, role: str) -> N
 
 
 def finalize_phase(
-    phase: str, config: StressConfig, elapsed_s: float, workers: list[dict[str, Any]]
+    phase: str, config: StressConfig, run: dict[str, Any]
 ) -> dict[str, Any]:
+    workers = list(run["results"])
     latencies = sorted(
         latency
         for worker in workers
@@ -540,13 +761,25 @@ def finalize_phase(
     request_count = sum(int(worker["request_count"]) for worker in workers)
     object_count = sum(int(worker["object_count"]) for worker in workers)
     total_bytes = sum(int(worker["total_bytes"]) for worker in workers)
+    setup_values = [float(worker["setup_s"]) for worker in workers]
+    prepare_values = [float(worker["prepare_s"]) for worker in workers]
+    measured_values = [float(worker["measured_s"]) for worker in workers]
+    worker_wall_values = [float(worker["worker_wall_s"]) for worker in workers]
     avg_request_us = 0.0 if not latencies else sum(latencies) / len(latencies)
     return {
         "phase": phase,
         "request_count": request_count,
         "object_count": object_count,
         "total_bytes": total_bytes,
-        "elapsed_s": elapsed_s,
+        "phase_wall_s": float(run["phase_wall_s"]),
+        "prepare_wall_s": float(run["prepare_wall_s"]),
+        "measured_wall_s": float(run["measured_wall_s"]),
+        "worker_setup_avg_ms": average_seconds_to_ms(setup_values),
+        "worker_prepare_avg_ms": average_seconds_to_ms(prepare_values),
+        "worker_prepare_p95_ms": percentile_float_seconds_to_ms(prepare_values, 95),
+        "worker_measured_avg_ms": average_seconds_to_ms(measured_values),
+        "worker_measured_p95_ms": percentile_float_seconds_to_ms(measured_values, 95),
+        "worker_wall_avg_ms": average_seconds_to_ms(worker_wall_values),
         "avg_request_us": avg_request_us,
         "p50_request_us": percentile(latencies, 50),
         "p95_request_us": percentile(latencies, 95),
@@ -576,13 +809,24 @@ def print_config(config: StressConfig) -> None:
 
 
 def print_phase(config: StressConfig, phase: str, result: dict[str, Any]) -> None:
-    elapsed_s = float(result["elapsed_s"])
+    phase_wall_s = float(result["phase_wall_s"])
+    prepare_wall_s = float(result["prepare_wall_s"])
+    measured_wall_s = float(result["measured_wall_s"])
     request_count = int(result["request_count"])
     object_count = int(result["object_count"])
     total_bytes = int(result["total_bytes"])
-    request_rate = 0.0 if elapsed_s == 0 else request_count / elapsed_s
-    object_rate = 0.0 if elapsed_s == 0 else object_count / elapsed_s
-    throughput_mib_s = 0.0 if elapsed_s == 0 else total_bytes / elapsed_s / (1024 * 1024)
+    phase_request_rate = 0.0 if phase_wall_s == 0 else request_count / phase_wall_s
+    phase_object_rate = 0.0 if phase_wall_s == 0 else object_count / phase_wall_s
+    phase_throughput_mib_s = (
+        0.0 if phase_wall_s == 0 else total_bytes / phase_wall_s / (1024 * 1024)
+    )
+    measured_request_rate = (
+        0.0 if measured_wall_s == 0 else request_count / measured_wall_s
+    )
+    measured_object_rate = 0.0 if measured_wall_s == 0 else object_count / measured_wall_s
+    measured_throughput_mib_s = (
+        0.0 if measured_wall_s == 0 else total_bytes / measured_wall_s / (1024 * 1024)
+    )
     batch_size = 1 if phase in ("put", "get") else config.batch_size
     print(
         "stress "
@@ -594,15 +838,26 @@ def print_phase(config: StressConfig, phase: str, result: dict[str, Any]) -> Non
         f"requests={request_count} "
         f"objects={object_count} "
         f"value_size={config.value_size} "
-        f"elapsed_s={elapsed_s:.3f} "
-        f"request_rate={request_rate:.2f} "
-        f"object_rate={object_rate:.2f} "
-        f"throughput_mib_s={throughput_mib_s:.2f} "
+        f"phase_wall_s={phase_wall_s:.3f} "
+        f"prepare_wall_s={prepare_wall_s:.3f} "
+        f"measured_wall_s={measured_wall_s:.3f} "
+        f"phase_request_rate={phase_request_rate:.2f} "
+        f"phase_object_rate={phase_object_rate:.2f} "
+        f"phase_throughput_mib_s={phase_throughput_mib_s:.2f} "
+        f"measured_request_rate={measured_request_rate:.2f} "
+        f"measured_object_rate={measured_object_rate:.2f} "
+        f"measured_throughput_mib_s={measured_throughput_mib_s:.2f} "
         f"avg_request_us={result['avg_request_us']:.2f} "
         f"p50_request_us={result['p50_request_us']} "
         f"p95_request_us={result['p95_request_us']} "
         f"p99_request_us={result['p99_request_us']} "
-        f"max_request_us={result['max_request_us']}"
+        f"max_request_us={result['max_request_us']} "
+        f"worker_setup_avg_ms={result['worker_setup_avg_ms']:.2f} "
+        f"worker_prepare_avg_ms={result['worker_prepare_avg_ms']:.2f} "
+        f"worker_prepare_p95_ms={result['worker_prepare_p95_ms']:.2f} "
+        f"worker_measured_avg_ms={result['worker_measured_avg_ms']:.2f} "
+        f"worker_measured_p95_ms={result['worker_measured_p95_ms']:.2f} "
+        f"worker_wall_avg_ms={result['worker_wall_avg_ms']:.2f}"
     )
 
 
@@ -661,6 +916,20 @@ def percentile(values: list[int], percentile_value: int) -> int:
         return 0
     rank = max(((len(values) * percentile_value + 99) // 100) - 1, 0)
     return values[min(rank, len(values) - 1)]
+
+
+def average_seconds_to_ms(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return (sum(values) / len(values)) * 1000.0
+
+
+def percentile_float_seconds_to_ms(values: list[float], percentile_value: int) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    rank = max(((len(sorted_values) * percentile_value + 99) // 100) - 1, 0)
+    return sorted_values[min(rank, len(sorted_values) - 1)] * 1000.0
 
 
 def sleep_ms(value: int) -> None:

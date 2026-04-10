@@ -143,7 +143,10 @@ impl StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let plans = planner.rank_many(self, &object_refs)?;
+        let rank_tracker = OperationTracker::new("batch_put_stage_rank");
+        let rank_result = planner.rank_many(self, &object_refs);
+        rank_tracker.finish(&rank_result, 0);
+        let plans = rank_result?;
 
         struct PendingBatchReservation<'a> {
             scoped_key: ObjectKey,
@@ -160,115 +163,126 @@ impl StoreClient {
             }
         };
 
-        let mut pending = Vec::with_capacity(requests.len());
-        for (request, plan) in requests.iter().zip(plans.iter()) {
-            let tenant = request.tenant.unwrap_or(self.default_tenant());
-            let mut candidates = Vec::new();
-            let mut seen = BTreeSet::new();
-            if prefer_local && seen.insert(self.lease.runtime.clone()) {
-                candidates.push(self.lease.runtime.clone());
-            }
-            for owner in &plan.owners {
-                if seen.insert(owner.clone()) {
-                    candidates.push(owner.clone());
+        let reserve_tracker = OperationTracker::new("batch_put_stage_reserve").input_bytes(
+            requests
+                .iter()
+                .map(|request| request.value.len())
+                .sum::<usize>() as u64,
+        );
+        let reserve_result = (|| {
+            let mut pending = Vec::with_capacity(requests.len());
+            for (request, plan) in requests.iter().zip(plans.iter()) {
+                let tenant = request.tenant.unwrap_or(self.default_tenant());
+                let mut candidates = Vec::new();
+                let mut seen = BTreeSet::new();
+                if prefer_local && seen.insert(self.lease.runtime.clone()) {
+                    candidates.push(self.lease.runtime.clone());
                 }
-            }
-            if candidates.is_empty() {
-                return Err(StoreError::InvalidState(format!(
-                    "no placement candidates available for tenant={} key={}",
-                    tenant, request.key
-                )));
-            }
-            pending.push(PendingBatchReservation {
-                scoped_key: self.scoped_key(tenant, request.key),
-                value: request.value,
-                candidates,
-                next_candidate: 0,
-                targets: Vec::with_capacity(*replica_count),
-                reservations: Vec::with_capacity(*replica_count),
-            });
-        }
-
-        while pending
-            .iter()
-            .any(|entry| entry.targets.len() < default_policy.replica_count)
-        {
-            let mut round_requests = Vec::new();
-            let mut round_indices = Vec::new();
-            let mut exhausted_key = None;
-            for (index, entry) in pending.iter_mut().enumerate() {
-                if entry.targets.len() >= default_policy.replica_count {
-                    continue;
+                for owner in &plan.owners {
+                    if seen.insert(owner.clone()) {
+                        candidates.push(owner.clone());
+                    }
                 }
-                let Some(owner) = entry.candidates.get(entry.next_candidate).cloned() else {
-                    exhausted_key = Some(entry.scoped_key.0.clone());
-                    break;
-                };
-                entry.next_candidate += 1;
-                round_indices.push(index);
-                round_requests.push(StorageRuntimeReservationRequest {
-                    require_local_memory: owner == self.lease.runtime,
-                    storage_runtime: owner,
-                    length_bytes: entry.value.len() as u64,
+                if candidates.is_empty() {
+                    return Err(StoreError::InvalidState(format!(
+                        "no placement candidates available for tenant={} key={}",
+                        tenant, request.key
+                    )));
+                }
+                pending.push(PendingBatchReservation {
+                    scoped_key: self.scoped_key(tenant, request.key),
+                    value: request.value,
+                    candidates,
+                    next_candidate: 0,
+                    targets: Vec::with_capacity(*replica_count),
+                    reservations: Vec::with_capacity(*replica_count),
                 });
             }
-            if let Some(key) = exhausted_key {
-                release_pending(&pending);
-                return Err(StoreError::InvalidState(format!(
-                    "not enough writable owners for key {key}"
-                )));
-            }
 
-            let round_results = self.reserve_storage_runtime_segments_batch(&round_requests)?;
-            let mut made_progress = false;
-            for ((index, request), result) in round_indices
-                .into_iter()
-                .zip(round_requests.into_iter())
-                .zip(round_results.into_iter())
+            while pending
+                .iter()
+                .any(|entry| entry.targets.len() < default_policy.replica_count)
             {
-                match result {
-                    Ok((target, reservation)) => {
-                        pending[index].targets.push(target);
-                        pending[index].reservations.push(reservation);
-                        made_progress = true;
+                let mut round_requests = Vec::new();
+                let mut round_indices = Vec::new();
+                let mut exhausted_key = None;
+                for (index, entry) in pending.iter_mut().enumerate() {
+                    if entry.targets.len() >= default_policy.replica_count {
+                        continue;
                     }
-                    Err(error) if self.should_skip_candidate(&error, true) => {
-                        debug!(
-                            key = %pending[index].scoped_key.0,
-                            storage_runtime = %request.storage_runtime,
-                            error = %error,
-                            "batch put is skipping placement candidate"
-                        );
-                    }
-                    Err(error) => {
-                        release_pending(&pending);
-                        return Err(error);
+                    let Some(owner) = entry.candidates.get(entry.next_candidate).cloned() else {
+                        exhausted_key = Some(entry.scoped_key.0.clone());
+                        break;
+                    };
+                    entry.next_candidate += 1;
+                    round_indices.push(index);
+                    round_requests.push(StorageRuntimeReservationRequest {
+                        require_local_memory: owner == self.lease.runtime,
+                        storage_runtime: owner,
+                        length_bytes: entry.value.len() as u64,
+                    });
+                }
+                if let Some(key) = exhausted_key {
+                    release_pending(&pending);
+                    return Err(StoreError::InvalidState(format!(
+                        "not enough writable owners for key {key}"
+                    )));
+                }
+
+                let round_results = self.reserve_storage_runtime_segments_batch(&round_requests)?;
+                let mut made_progress = false;
+                for ((index, request), result) in round_indices
+                    .into_iter()
+                    .zip(round_requests.into_iter())
+                    .zip(round_results.into_iter())
+                {
+                    match result {
+                        Ok((target, reservation)) => {
+                            pending[index].targets.push(target);
+                            pending[index].reservations.push(reservation);
+                            made_progress = true;
+                        }
+                        Err(error) if self.should_skip_candidate(&error, true) => {
+                            debug!(
+                                key = %pending[index].scoped_key.0,
+                                storage_runtime = %request.storage_runtime,
+                                error = %error,
+                                "batch put is skipping placement candidate"
+                            );
+                        }
+                        Err(error) => {
+                            release_pending(&pending);
+                            return Err(error);
+                        }
                     }
                 }
+                if made_progress {
+                    continue;
+                }
+                if pending.iter().all(|entry| {
+                    entry.targets.len() >= default_policy.replica_count
+                        || entry.next_candidate >= entry.candidates.len()
+                }) {
+                    release_pending(&pending);
+                    return Err(StoreError::InvalidState(
+                        "batch put exhausted all placement candidates".to_string(),
+                    ));
+                }
             }
-            if made_progress {
-                continue;
-            }
-            if pending.iter().all(|entry| {
-                entry.targets.len() >= default_policy.replica_count
-                    || entry.next_candidate >= entry.candidates.len()
-            }) {
-                release_pending(&pending);
-                return Err(StoreError::InvalidState(
-                    "batch put exhausted all placement candidates".to_string(),
-                ));
-            }
-        }
 
-        let mut prepared = Vec::with_capacity(pending.len());
-        for entry in pending {
-            prepared.push(PreparedObjectWrite {
-                scoped_key: entry.scoped_key,
-                value: entry.value,
-                targets: entry.targets,
-                reservations: entry.reservations,
-            });
-        }
+            let mut prepared = Vec::with_capacity(pending.len());
+            for entry in pending {
+                prepared.push(PreparedObjectWrite {
+                    scoped_key: entry.scoped_key,
+                    value: entry.value,
+                    targets: entry.targets,
+                    reservations: entry.reservations,
+                });
+            }
+            Ok(prepared)
+        })();
+        reserve_tracker.finish(&reserve_result, 0);
+        let prepared = reserve_result?;
         let release_prepared = |entries: &[PreparedObjectWrite<'_>]| {
             for entry in entries {
                 let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
@@ -297,140 +311,154 @@ impl StoreClient {
             None => None,
         };
 
-        let current_routes = match self.route_directory.get_object_routes(
+        let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
+        let current_routes_result = self.route_directory.get_object_routes(
             &self.lease,
             &prepared
                 .iter()
                 .map(|entry| entry.scoped_key.clone())
                 .collect::<Vec<_>>(),
-        ) {
+        );
+        route_load_tracker.finish(&current_routes_result, 0);
+        let current_routes = match current_routes_result {
             Ok(routes) => routes,
             Err(error) => {
                 release_prepared(&prepared);
                 return Err(error);
             }
         };
-        let mut routes = Vec::with_capacity(prepared.len());
-
-        for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
-            let mut replicas = Vec::with_capacity(entry.targets.len());
-            let mut remote_requests = Vec::new();
-            for (priority, (target, reservation)) in entry
-                .targets
+        let write_tracker = OperationTracker::new("batch_put_stage_write").input_bytes(
+            prepared
                 .iter()
-                .zip(entry.reservations.iter())
-                .enumerate()
-            {
-                let is_local = target.storage_runtime == self.lease.runtime
-                    && self
-                        .state
-                        .lock()
-                        .memory_ref()
-                        .map(|memory| memory.has_storage_segment(&target.segment_name))
-                        .unwrap_or(false);
-                let offset = if is_local {
-                    let addr = {
-                        let state = self.state.lock();
-                        state.memory_ref()?.storage_address(
-                            &target.segment_name,
-                            reservation.offset_bytes as usize,
-                        )?
-                    };
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            entry.value.as_ptr(),
-                            addr.cast::<u8>(),
-                            entry.value.len(),
-                        );
-                    }
-                    addr as u64
-                } else {
-                    let handle = {
-                        let mut state = self.state.lock();
-                        state.open_segment(transport, &target.segment_name.0)?
-                    };
-                    let info = transport.get_segment_info(handle)?;
-                    let buffer = info.buffers.first().ok_or_else(|| {
-                        StoreError::Transport(format!(
-                            "segment {} exposes no buffers",
-                            target.segment_name.0
-                        ))
-                    })?;
-                    let target_offset = buffer
-                        .base
-                        .checked_add(reservation.offset_bytes)
-                        .ok_or_else(|| {
-                            StoreError::Transport("remote target offset overflow".to_string())
+                .map(|entry| entry.value.len())
+                .sum::<usize>() as u64,
+        );
+        let write_result = (|| {
+            let mut routes = Vec::with_capacity(prepared.len());
+            for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
+                let mut replicas = Vec::with_capacity(entry.targets.len());
+                let mut remote_requests = Vec::new();
+                for (priority, (target, reservation)) in entry
+                    .targets
+                    .iter()
+                    .zip(entry.reservations.iter())
+                    .enumerate()
+                {
+                    let is_local = target.storage_runtime == self.lease.runtime
+                        && self
+                            .state
+                            .lock()
+                            .memory_ref()
+                            .map(|memory| memory.has_storage_segment(&target.segment_name))
+                            .unwrap_or(false);
+                    let offset = if is_local {
+                        let addr = {
+                            let state = self.state.lock();
+                            state.memory_ref()?.storage_address(
+                                &target.segment_name,
+                                reservation.offset_bytes as usize,
+                            )?
+                        };
+                        unsafe {
+                            ptr::copy_nonoverlapping(
+                                entry.value.as_ptr(),
+                                addr.cast::<u8>(),
+                                entry.value.len(),
+                            );
+                        }
+                        addr as u64
+                    } else {
+                        let handle = {
+                            let mut state = self.state.lock();
+                            state.open_segment(transport, &target.segment_name.0)?
+                        };
+                        let info = transport.get_segment_info(handle)?;
+                        let buffer = info.buffers.first().ok_or_else(|| {
+                            StoreError::Transport(format!(
+                                "segment {} exposes no buffers",
+                                target.segment_name.0
+                            ))
                         })?;
-                    remote_requests.push(TransferRequest {
-                        opcode: Opcode::Write,
-                        source: remote_scratch
+                        let target_offset = buffer
+                            .base
+                            .checked_add(reservation.offset_bytes)
                             .ok_or_else(|| {
-                                StoreError::InvalidState(
-                                    "remote write is missing a scratch slot".to_string(),
-                                )
-                            })?
-                            .addr,
-                        target_id: handle,
-                        target_offset,
+                                StoreError::Transport("remote target offset overflow".to_string())
+                            })?;
+                        remote_requests.push(TransferRequest {
+                            opcode: Opcode::Write,
+                            source: remote_scratch
+                                .ok_or_else(|| {
+                                    StoreError::InvalidState(
+                                        "remote write is missing a scratch slot".to_string(),
+                                    )
+                                })?
+                                .addr,
+                            target_id: handle,
+                            target_offset,
+                            length: entry.value.len() as u64,
+                        });
+                        target_offset
+                    };
+                    replicas.push(ReplicaRoute {
+                        owner: target.storage_runtime.clone(),
+                        segment_name: target.segment_name.clone(),
+                        offset,
+                        segment_offset: reservation.offset_bytes,
                         length: entry.value.len() as u64,
+                        checksum: None,
+                        tier: ReplicaTier::Dram,
+                        priority: priority as u16,
                     });
-                    target_offset
-                };
-                replicas.push(ReplicaRoute {
-                    owner: target.storage_runtime.clone(),
-                    segment_name: target.segment_name.clone(),
-                    offset,
-                    segment_offset: reservation.offset_bytes,
-                    length: entry.value.len() as u64,
-                    checksum: None,
-                    tier: ReplicaTier::Dram,
-                    priority: priority as u16,
+                }
+                if !remote_requests.is_empty() {
+                    let scratch = remote_scratch.ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "remote write is missing a scratch slot".to_string(),
+                        )
+                    })?;
+                    copy_into_region(scratch, entry.value);
+                    let batch_id = transport.allocate_batch(remote_requests.len())?;
+                    let submit_result = transport.submit(batch_id, &remote_requests);
+                    if let Err(error) = submit_result {
+                        let _ = transport.free_batch(batch_id);
+                        return Err(error);
+                    }
+                    let wait_result =
+                        wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
+                    let free_result = transport.free_batch(batch_id);
+                    wait_result?;
+                    free_result?;
+                }
+
+                let expected_version = current.as_ref().map(|route| route.version);
+                let next_version = current
+                    .as_ref()
+                    .map(|route| route.version.next())
+                    .unwrap_or(RouteVersion(1));
+                routes.push(PendingRoutePublish {
+                    key: entry.scoped_key.clone(),
+                    expected_version,
+                    previous: current,
+                    route: ObjectRoute {
+                        key: entry.scoped_key.clone(),
+                        version: next_version,
+                        state: RouteState::Active,
+                        compatibility: self.lease.compatibility.clone(),
+                        replicas,
+                    },
                 });
             }
-            if !remote_requests.is_empty() {
-                let scratch = remote_scratch.ok_or_else(|| {
-                    StoreError::InvalidState("remote write is missing a scratch slot".to_string())
-                })?;
-                copy_into_region(scratch, entry.value);
-                let batch_id = transport.allocate_batch(remote_requests.len())?;
-                let submit_result = transport.submit(batch_id, &remote_requests);
-                if let Err(error) = submit_result {
-                    let _ = transport.free_batch(batch_id);
-                    release_prepared(&prepared);
-                    return Err(error);
-                }
-                let wait_result =
-                    wait_for_batch_completion(transport, batch_id, DEFAULT_TRANSFER_TIMEOUT);
-                let free_result = transport.free_batch(batch_id);
-                if let Err(error) = wait_result {
-                    release_prepared(&prepared);
-                    return Err(error);
-                }
-                if let Err(error) = free_result {
-                    release_prepared(&prepared);
-                    return Err(error);
-                }
+            Ok(routes)
+        })();
+        write_tracker.finish(&write_result, 0);
+        let routes = match write_result {
+            Ok(routes) => routes,
+            Err(error) => {
+                release_prepared(&prepared);
+                return Err(error);
             }
-
-            let expected_version = current.as_ref().map(|route| route.version);
-            let next_version = current
-                .as_ref()
-                .map(|route| route.version.next())
-                .unwrap_or(RouteVersion(1));
-            routes.push(PendingRoutePublish {
-                key: entry.scoped_key.clone(),
-                expected_version,
-                previous: current,
-                route: ObjectRoute {
-                    key: entry.scoped_key.clone(),
-                    version: next_version,
-                    state: RouteState::Active,
-                    compatibility: self.lease.compatibility.clone(),
-                    replicas,
-                },
-            });
-        }
+        };
 
         let cas_requests = routes
             .iter()
@@ -440,10 +468,12 @@ impl StoreClient {
                 next: Some(pending.route.clone()),
             })
             .collect::<Vec<_>>();
-        let cas_results = match self
+        let cas_tracker = OperationTracker::new("batch_put_stage_route_cas");
+        let cas_results_result = self
             .route_directory
-            .compare_and_swap_object_routes(&self.lease, &cas_requests)
-        {
+            .compare_and_swap_object_routes(&self.lease, &cas_requests);
+        cas_tracker.finish(&cas_results_result, 0);
+        let cas_results = match cas_results_result {
             Ok(results) => results,
             Err(error) => {
                 release_prepared(&prepared);

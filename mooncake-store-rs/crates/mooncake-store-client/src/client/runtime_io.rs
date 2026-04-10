@@ -12,9 +12,16 @@ impl StoreClient {
         self.flush_due_reclaims()?;
         let scoped_key = self.scoped_key(tenant, key);
         let policy = self.resolve_replication_policy(policy)?;
-        let (targets, reservations) =
-            self.reserve_replica_targets(tenant, key, value.len(), &policy)?;
-        let offsets = match self.write_reserved_replicas(&targets, &reservations, value) {
+        let reserve_tracker =
+            OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
+        let reserve_result = self.reserve_replica_targets(tenant, key, value.len(), &policy);
+        reserve_tracker.finish(&reserve_result, 0);
+        let (targets, reservations) = reserve_result?;
+        let write_tracker =
+            OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
+        let write_result = self.write_reserved_replicas(&targets, &reservations, value);
+        write_tracker.finish(&write_result, value.len() as u64);
+        let offsets = match write_result {
             Ok(offsets) => offsets,
             Err(error) => {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
@@ -46,12 +53,15 @@ impl StoreClient {
                 })
                 .collect(),
         };
-        let cas = self.route_directory.compare_and_swap_object_route(
+        let cas_tracker = OperationTracker::new("put_stage_route_cas");
+        let cas_result = self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &route.key,
             expected_version,
             Some(&route),
-        )?;
+        );
+        cas_tracker.finish(&cas_result, 0);
+        let cas = cas_result?;
         if !cas.applied {
             let _ = self.release_reserved_allocations(&targets, &reservations);
             return Err(StoreError::Conflict(format!(
@@ -71,9 +81,12 @@ impl StoreClient {
         value: &[u8],
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ObjectRoute> {
-        let current = self
+        let load_tracker = OperationTracker::new("put_stage_load_route");
+        let current_result = self
             .route_directory
-            .get_object_route(&self.lease, &self.scoped_key(tenant, key))?;
+            .get_object_route(&self.lease, &self.scoped_key(tenant, key));
+        load_tracker.finish(&current_result, 0);
+        let current = current_result?;
         self.put_scoped_with_policy_current(
             tenant,
             key,

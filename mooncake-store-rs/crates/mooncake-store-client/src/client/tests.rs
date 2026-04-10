@@ -902,9 +902,53 @@ fn observability_metrics_render_remote_datapaths() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains("operation=\"route_lookup_many\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"put_stage_load_route\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"put_stage_reserve\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"put_stage_write\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"put_stage_route_cas\",status=\"ok\""));
     assert!(metrics.contains("operation=\"put_remote_batch_write\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
+}
+
+#[test]
+fn observability_metrics_render_fast_batch_put_stages() {
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("metrics-fast-batch-segment"));
+    publish_storage_node(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "metrics-fast-storage",
+        "metrics-fast-storage-seg",
+        "pool-a",
+    );
+    let writer = StoreClientBuilder::new(metadata.clone(), "metrics-fast-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    writer
+        .batch_put(&[
+            PutRequest::new("fast-batch-a", b"left"),
+            PutRequest::new("fast-batch-b", b"right"),
+        ])
+        .expect("fast routed batch put should succeed");
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"batch_put_stage_rank\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_reserve\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
 }
 
 #[test]
