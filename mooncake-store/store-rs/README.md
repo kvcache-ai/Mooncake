@@ -76,10 +76,14 @@ The implementation is easier to understand when grouped by capability instead of
 - native local-memory hugepage allocation
 - Python shm allocator hugepage allocation
 - local and remote allocation paths
+- storage-owner CLOCK eviction with route-owner CAS
+- best-effort read-hit reporting to storage owners
+- best-effort remote replica route tracking after publish
 - overwrite reclaim
 - delete reclaim
 - configurable reclaim grace window
 - elastic segment expansion and retirement
+- metadata allocator fallback only for transport or unsupported control-plane failures
 
 ### Lifecycle and Membership
 
@@ -119,19 +123,32 @@ graph TB
     App["Application"] --> Client["StoreClient"]
     Client --> Route["Route Directory\nEmbedded WRH or MetadataOnly"]
     Client --> Alloc["Allocator\nLocal or Remote"]
-    Client --> CP["Control Plane RPC\nroute + allocator"]
+    Client --> Evict["Storage Owner CLOCK\nReplica Tracking + Reclaim"]
+    Client --> CP["Control Plane RPC\nroute + allocator + eviction"]
     Client --> TE["Mooncake TE / TENT"]
     Route --> Meta["Metadata Backend\nRedis / etcd / in-memory"]
     Alloc --> Meta
+    Evict --> Route
+    Evict --> Alloc
+    CP --> Evict
     CP --> Peer["Peer Client"]
     TE --> Peer
 
     style Client fill:#e3f2fd
     style Route fill:#e8f5e9
     style Alloc fill:#fff3e0
+    style Evict fill:#fce4ec
     style Meta fill:#f3e5f5
     style TE fill:#ede7f6
 ```
+
+The runtime separates two owner roles:
+
+- route owner decides object-route versions and CAS
+- storage owner tracks locally stored replicas and runs eviction under capacity pressure
+- readers report replica hits to storage owners in batch
+- writers push published remote routes to storage owners in batch
+- metadata remains a durable fallback, not the default hot path
 
 For the runtime view, read `docs/architecture.md`.
 
