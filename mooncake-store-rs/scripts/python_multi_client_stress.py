@@ -108,17 +108,20 @@ def main() -> int:
     print_config(config)
 
     storage_cluster = StorageCluster.start(ctx, config)
+    results: list[dict[str, Any]] = []
     try:
         sleep_ms(config.membership_wait_ms)
         remaining = list(config.phases)
         while remaining:
             phase = remaining.pop(0)
             result = run_phase(ctx, config, phase)
+            results.append(result)
             print_phase(config, phase, result)
             if remaining:
                 sleep_ms(config.phase_pause_ms)
     finally:
         storage_cluster.stop()
+    print_bandwidth_summary(results)
     return 0
 
 
@@ -859,6 +862,24 @@ def print_phase(config: StressConfig, phase: str, result: dict[str, Any]) -> Non
         f"worker_measured_p95_ms={result['worker_measured_p95_ms']:.2f} "
         f"worker_wall_avg_ms={result['worker_wall_avg_ms']:.2f}"
     )
+
+
+def print_bandwidth_summary(results: list[dict[str, Any]]) -> None:
+    if not results:
+        return
+    print("steady-state bandwidth:")
+    for result in results:
+        phase = str(result["phase"])
+        throughput_mib_s = measured_throughput_mib_s(result)
+        print(f"- {phase}: {throughput_mib_s:.2f} MiB/s")
+
+
+def measured_throughput_mib_s(result: dict[str, Any]) -> float:
+    measured_wall_s = float(result["measured_wall_s"])
+    total_bytes = int(result["total_bytes"])
+    if measured_wall_s == 0.0:
+        return 0.0
+    return total_bytes / measured_wall_s / (1024 * 1024)
 
 
 def build_single_keys(phase: str, worker_index: int, count: int) -> list[str]:
