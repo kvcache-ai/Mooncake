@@ -109,7 +109,7 @@ mod tests {
     use mooncake_store_client::{
         GetRequest, MooncakeCompatibilityFacade, ObjectRef, PutRequest, RouteControlMode,
     };
-    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, StoreError};
+    use mooncake_store_core::{ClientEpoch, ClientLifecycleState, HandoffKind, StoreError};
 
     use super::{default_segment_name, now_ms, CompatRuntimeArgs};
     use crate::config::CompatSetupArgs;
@@ -321,5 +321,121 @@ mod tests {
         assert_eq!(route.replicas[0].owner.stable_id.0, writer.stable_id);
         assert!(writer.segment_name.contains("runtime-writer-segment"));
         assert_eq!(reader.expires_at_ms, 10_000);
+    }
+
+    #[test]
+    fn runtime_hot_upgrade_preserves_payload_on_successor() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let metadata_url = format!("{}/{}", server.url().trim_end_matches("/0"), 0);
+
+        let mut predecessor = sample_args("tcp", &metadata_url);
+        predecessor.setup.stable_id = Some("runtime-hot-upgrade".to_string());
+        predecessor.setup.keyspace = Some("runtime/hot-upgrade".to_string());
+        predecessor.setup.expires_at_ms = Some(now_ms() + 10_000);
+        predecessor.local_segment_name = Some("runtime-hot-upgrade-old".to_string());
+        predecessor.route_control = RouteControlMode::MetadataOnly;
+        predecessor
+            .setup
+            .labels
+            .insert("pool".to_string(), "pool-a".to_string());
+        predecessor
+            .setup
+            .labels
+            .insert("storage".to_string(), "true".to_string());
+        predecessor
+            .setup
+            .labels
+            .insert("route".to_string(), "false".to_string());
+
+        let mut successor = predecessor.clone();
+        successor.epoch = ClientEpoch(2);
+        successor.initial_state = ClientLifecycleState::Standby;
+        successor.local_segment_name = Some("runtime-hot-upgrade-new".to_string());
+
+        let mut reader = sample_args("tcp", &metadata_url);
+        reader.setup.stable_id = Some("runtime-hot-upgrade-reader".to_string());
+        reader.setup.keyspace = Some("runtime/hot-upgrade".to_string());
+        reader.setup.expires_at_ms = Some(now_ms() + 10_000);
+        reader.local_segment_name = Some("runtime-hot-upgrade-reader".to_string());
+        reader.route_control = RouteControlMode::MetadataOnly;
+        reader
+            .setup
+            .labels
+            .insert("pool".to_string(), "pool-a".to_string());
+        reader
+            .setup
+            .labels
+            .insert("storage".to_string(), "false".to_string());
+        reader
+            .setup
+            .labels
+            .insert("route".to_string(), "false".to_string());
+
+        let mut predecessor = predecessor
+            .build()
+            .expect("predecessor runtime should build");
+        let mut successor = successor.build().expect("successor runtime should build");
+        let reader = reader.build().expect("reader runtime should build");
+
+        predecessor
+            .client
+            .register_local_memory()
+            .expect("predecessor memory should register");
+        successor
+            .client
+            .register_local_memory()
+            .expect("successor memory should register");
+        reader
+            .client
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        predecessor
+            .client
+            .put("alpha", b"runtime-hot-upgrade-payload")
+            .expect("seed put should succeed");
+
+        predecessor
+            .client
+            .enter_draining()
+            .expect("predecessor should drain");
+        predecessor
+            .client
+            .plan_handoff(
+                ClientEpoch(2),
+                HandoffKind::HotUpgrade,
+                1,
+                100,
+                Some(u64::MAX),
+            )
+            .expect("handoff planning should succeed");
+        successor
+            .client
+            .activate_if_targeted_handoff()
+            .expect("successor activation should succeed")
+            .expect("targeted handoff should be visible");
+
+        let successor_runtime = successor.client.runtime_id().clone();
+        let migrated = predecessor
+            .client
+            .evacuate_owned_replicas_to_runtime(&successor_runtime)
+            .expect("targeted hot-upgrade evacuation should succeed");
+        assert_eq!(migrated, 1);
+
+        let route = reader
+            .client
+            .query_route("alpha")
+            .expect("route query should succeed")
+            .expect("route should exist after promotion");
+        assert_eq!(route.replicas[0].owner, successor_runtime);
+        assert_eq!(
+            reader
+                .client
+                .get("alpha")
+                .expect("reader get should succeed"),
+            b"runtime-hot-upgrade-payload"
+        );
     }
 }

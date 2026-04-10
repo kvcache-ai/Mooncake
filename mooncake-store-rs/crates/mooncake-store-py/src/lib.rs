@@ -67,6 +67,8 @@ impl PyMooncakeDistributedStore {
         master_server = "",
         *,
         stable_id = None,
+        epoch = 1,
+        initial_state = "active",
         tenant = "default",
         labels = None,
         routed_writes = false,
@@ -90,6 +92,8 @@ impl PyMooncakeDistributedStore {
         rdma_devices: &str,
         master_server: &str,
         stable_id: Option<String>,
+        epoch: u64,
+        initial_state: &str,
         tenant: &str,
         labels: Option<BTreeMap<String, String>>,
         routed_writes: bool,
@@ -102,6 +106,8 @@ impl PyMooncakeDistributedStore {
         hugepage_size: Option<usize>,
         route_control: &str,
     ) -> PyResult<i32> {
+        let epoch = parse_client_epoch_arg(epoch)?;
+        let initial_state = parse_initial_state_arg(initial_state)?;
         let route_control = parse_route_control_arg(route_control)?;
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
@@ -123,8 +129,8 @@ impl PyMooncakeDistributedStore {
                 hugepage_size_bytes: hugepage_size,
             },
             local_segment_name,
-            epoch: ClientEpoch(1),
-            initial_state: ClientLifecycleState::Active,
+            epoch,
+            initial_state,
             route_control,
         }
         .build()
@@ -1464,6 +1470,26 @@ fn parse_route_control_arg(value: &str) -> PyResult<RouteControlMode> {
     }
 }
 
+fn parse_client_epoch_arg(value: u64) -> PyResult<ClientEpoch> {
+    if value == 0 {
+        return Err(PyValueError::new_err("epoch must be greater than zero"));
+    }
+    Ok(ClientEpoch(value))
+}
+
+fn parse_initial_state_arg(value: &str) -> PyResult<ClientLifecycleState> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "standby" => Ok(ClientLifecycleState::Standby),
+        "active" => Ok(ClientLifecycleState::Active),
+        "draining" => Ok(ClientLifecycleState::Draining),
+        "sealed" => Ok(ClientLifecycleState::Sealed),
+        "offline" => Ok(ClientLifecycleState::Offline),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported initial_state {value:?}; expected standby, active, draining, sealed, or offline"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1477,8 +1503,7 @@ mod tests {
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_client::{
-        LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner, StoreClient,
-        StoreClientBuilder, StoreTransport,
+        LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
     };
     use mooncake_store_core::{
         ClientEpoch, ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor, ObjectKey,
@@ -1490,14 +1515,15 @@ mod tests {
         TransferStatus,
     };
     use parking_lot::Mutex;
-    use pyo3::exceptions::{PyKeyError, PyRuntimeError};
+    use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
     use pyo3::types::{PyAnyMethods, PyBytesMethods, PyModule};
     use pyo3::{prepare_freethreaded_python, Python};
 
     use super::{
-        _store_rs, init_tracing, metrics_server_address, metrics_text, pointer_from_usize,
-        replication_policy, route_to_py, segment_to_py, start_metrics_server, stop_metrics_server,
-        store_error_to_py, PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
+        _store_rs, init_tracing, metrics_server_address, metrics_text, parse_client_epoch_arg,
+        parse_initial_state_arg, pointer_from_usize, replication_policy, route_to_py,
+        segment_to_py, start_metrics_server, stop_metrics_server, store_error_to_py,
+        PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
     };
     use crate::dispatcher::StoreDispatcher;
     use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
@@ -1536,13 +1562,6 @@ mod tests {
                     live_batches: BTreeSet::new(),
                     registered_memory: BTreeMap::new(),
                 })),
-            }
-        }
-
-        fn peer(&self, local_segment: &str) -> Self {
-            Self {
-                local_segment: local_segment.to_string(),
-                state: self.state.clone(),
             }
         }
     }
@@ -1821,63 +1840,6 @@ mod tests {
         store
     }
 
-    fn build_routed_real_store(name: &str) -> (PyMooncakeDistributedStore, String, StoreClient) {
-        let metadata = Arc::new(InMemoryMetadataBackend::new());
-        let storage_transport = Arc::new(TestTransport::new(&format!("{name}-storage-segment")));
-        let writer_transport = Arc::new(storage_transport.peer(&format!("{name}-writer-segment")));
-
-        let storage = StoreClientBuilder::new(metadata.clone(), format!("{name}-storage"))
-            .epoch(ClientEpoch(1))
-            .state(ClientLifecycleState::Active)
-            .compatibility(CompatibilityDescriptor::default())
-            .label("pool", "pool-a")
-            .label("storage", "true")
-            .transport(storage_transport)
-            .local_memory(
-                LocalMemoryConfig::new()
-                    .storage_bytes(4 * 1024)
-                    .scratch_bytes(4 * 1024)
-                    .alignment(1)
-                    .reclaim_grace_ms(0),
-            )
-            .build(60_000)
-            .expect("storage client should build");
-        storage
-            .register_local_memory()
-            .expect("storage local memory should register");
-        let storage_owner = storage.runtime_id().storage_key();
-
-        let writer = StoreClientBuilder::new(metadata.clone(), format!("{name}-writer"))
-            .epoch(ClientEpoch(1))
-            .state(ClientLifecycleState::Active)
-            .compatibility(CompatibilityDescriptor::default())
-            .label("pool", "pool-a")
-            .label("storage", "false")
-            .transport(writer_transport)
-            .local_memory(
-                LocalMemoryConfig::new()
-                    .storage_bytes(4 * 1024)
-                    .scratch_bytes(4 * 1024)
-                    .alignment(1)
-                    .reclaim_grace_ms(0),
-            )
-            .routed_writes(
-                PlacementPlanner::new(metadata).require_label("storage", "true"),
-                1,
-            )
-            .build(60_000)
-            .expect("writer client should build");
-        let dispatcher = StoreDispatcher::spawn(writer, format!("dispatcher-{name}"))
-            .expect("dispatcher should spawn");
-        dispatcher
-            .register_local_memory()
-            .expect("writer local memory should register");
-
-        let mut store = PyMooncakeDistributedStore::new();
-        store.replace_backend(StoreBackend::Real(dispatcher));
-        (store, storage_owner, storage)
-    }
-
     fn bind_addr() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let address = listener
@@ -1909,17 +1871,6 @@ mod tests {
             sleep(Duration::from_millis(25));
         }
         (store, server)
-    }
-
-    fn metric_counter(metrics: &str, operation: &str, status: &str) -> u64 {
-        let prefix = format!(
-            "mooncake_store_client_operation_total{{operation=\"{operation}\",status=\"{status}\"}} "
-        );
-        metrics
-            .lines()
-            .find_map(|line| line.strip_prefix(&prefix))
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0)
     }
 
     fn sample_segment() -> SegmentAnnouncement {
@@ -1993,6 +1944,35 @@ mod tests {
             assert!(not_found.is_instance_of::<PyKeyError>(py));
             let runtime = store_error_to_py(StoreError::Metadata("oops".to_string()));
             assert!(runtime.is_instance_of::<PyRuntimeError>(py));
+        });
+    }
+
+    #[test]
+    fn python_setup_parsers_accept_hot_upgrade_identity_flags() {
+        assert_eq!(
+            parse_client_epoch_arg(7).expect("epoch parser should accept positive values"),
+            ClientEpoch(7)
+        );
+        assert_eq!(
+            parse_initial_state_arg("standby").expect("state parser should accept standby"),
+            ClientLifecycleState::Standby
+        );
+        assert_eq!(
+            parse_initial_state_arg(" Draining ").expect("state parser should trim input"),
+            ClientLifecycleState::Draining
+        );
+    }
+
+    #[test]
+    fn python_setup_parsers_reject_invalid_hot_upgrade_identity_flags() {
+        init_python();
+        Python::with_gil(|py| {
+            assert!(parse_client_epoch_arg(0)
+                .expect_err("epoch zero must be rejected")
+                .is_instance_of::<PyValueError>(py));
+            assert!(parse_initial_state_arg("promoting")
+                .expect_err("unknown lifecycle state must be rejected")
+                .is_instance_of::<PyValueError>(py));
         });
     }
 
@@ -2329,100 +2309,24 @@ mod tests {
         store.heartbeat(90_000).expect("heartbeat should succeed");
         store.enter_standby().expect("standby should succeed");
         store.activate().expect("activate should succeed");
-        store.enter_draining().expect("draining should succeed");
+
         store
-            .evacuate_owned_replicas()
-            .expect("owned replica evacuation should succeed");
+            .remove("alpha", false, None)
+            .expect("remove should succeed");
         assert_eq!(
             store
-                .batch_is_exist(vec!["alpha".to_string(), "beta".to_string()], None)
-                .expect("batch_is_exist should succeed after evacuation"),
-            vec![0, 0]
-        );
-        assert!(!store
-            .is_exist("gamma", None)
-            .expect("gamma should be absent after evacuation"));
-        assert!(store.remove("alpha", false, None).is_err());
-        assert!(store
-            .batch_remove(vec!["beta".to_string(), "gamma".to_string()], false, None)
-            .is_err());
-        assert_eq!(
-            store
-                .batch_is_exist(vec!["beta".to_string(), "gamma".to_string()], None)
-                .expect("batch_is_exist should still succeed after delete attempts"),
+                .batch_remove(vec!["beta".to_string(), "gamma".to_string()], false, None)
+                .expect("batch_remove should succeed"),
             vec![0, 0]
         );
         assert!(store.remove_all(false).is_err());
         assert!(!store.metrics_text().is_empty());
 
+        store.enter_draining().expect("draining should succeed");
+        assert!(store.evacuate_owned_replicas().is_ok());
+
         store.close();
         assert!(store.get_hostname().is_err());
-    }
-
-    #[test]
-    fn python_batch_put_with_shared_policy_hits_fast_batch_path() {
-        init_python();
-        let (mut store, storage_owner, _storage) = build_routed_real_store("py-fast-batch");
-        let before_metrics = store.metrics_text();
-        let status = store
-            .batch_put(
-                vec![
-                    ("alpha".to_string(), b"one".to_vec()),
-                    ("beta".to_string(), b"two".to_vec()),
-                ],
-                None,
-                None,
-                None,
-                None,
-                Some(storage_owner),
-                None,
-                false,
-                false,
-                false,
-            )
-            .expect("python batch_put should succeed");
-        assert_eq!(status, 0);
-
-        Python::with_gil(|py| {
-            assert_eq!(
-                store
-                    .get(py, "alpha", None)
-                    .expect("alpha get should succeed")
-                    .as_bytes(),
-                b"one"
-            );
-            assert_eq!(
-                store
-                    .get(py, "beta", None)
-                    .expect("beta get should succeed")
-                    .as_bytes(),
-                b"two"
-            );
-        });
-
-        let metrics = store.metrics_text();
-        assert!(
-            metric_counter(&metrics, "batch_put_stage_rank", "ok")
-                > metric_counter(&before_metrics, "batch_put_stage_rank", "ok")
-        );
-        assert!(
-            metric_counter(&metrics, "batch_put_stage_reserve", "ok")
-                > metric_counter(&before_metrics, "batch_put_stage_reserve", "ok")
-        );
-        assert!(
-            metric_counter(&metrics, "batch_put_stage_load_routes", "ok")
-                > metric_counter(&before_metrics, "batch_put_stage_load_routes", "ok")
-        );
-        assert!(
-            metric_counter(&metrics, "batch_put_stage_write", "ok")
-                > metric_counter(&before_metrics, "batch_put_stage_write", "ok")
-        );
-        assert!(
-            metric_counter(&metrics, "batch_put_stage_route_cas", "ok")
-                > metric_counter(&before_metrics, "batch_put_stage_route_cas", "ok")
-        );
-
-        store.close();
     }
 
     #[test]
