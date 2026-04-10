@@ -4733,10 +4733,14 @@ mod tests {
     };
     use parking_lot::Mutex;
 
+    use super::{
+        LocalAllocatorAdapter, LocalAllocatorState, PendingReclaim, SegmentAllocator, StoreState,
+    };
     use crate::{
-        render_prometheus_metrics, reset_metrics, transport::StoreTransport, GetRequest,
-        LocalMemoryConfig, MooncakeCompatibilityFacade, MultiBufferGetRequest, ObjectRef,
-        PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, StoreClientBuilder,
+        control_plane::AllocatorService, render_prometheus_metrics, reset_metrics,
+        transport::StoreTransport, GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade,
+        MultiBufferGetRequest, ObjectRef, PlacementPlanner, PutFromRequest, PutRequest,
+        ReplicationPolicy, StoreClientBuilder,
     };
 
     struct TestTransport {
@@ -6720,5 +6724,311 @@ mod tests {
                 expected[&key]
             );
         }
+    }
+
+    #[test]
+    fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let store_a_transport = Arc::new(TestTransport::new("writer-via-a-segment"));
+        let store_b_transport = Arc::new(store_a_transport.peer("writer-via-b-segment"));
+        let router_transport = Arc::new(store_a_transport.peer("writer-via-router-segment"));
+        let reader_transport = Arc::new(store_a_transport.peer("writer-via-reader-segment"));
+        let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+        let mut store_a = StoreClientBuilder::new(metadata.clone(), "writer-via-store-a")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(store_a_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("store-a build should succeed");
+        let store_b = StoreClientBuilder::new(metadata.clone(), "writer-via-store-b")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .transport(store_b_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("store-b build should succeed");
+        let router = StoreClientBuilder::new(metadata.clone(), "writer-via-router")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(router_transport)
+            .local_memory(storage_config())
+            .routed_writes(planner, 1)
+            .build(10_000)
+            .expect("router build should succeed");
+        let reader = StoreClientBuilder::new(metadata, "writer-via-reader")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(reader_transport)
+            .local_memory(storage_config())
+            .build(10_000)
+            .expect("reader build should succeed");
+
+        store_a
+            .register_local_memory()
+            .expect("store-a memory should register");
+        store_b
+            .register_local_memory()
+            .expect("store-b memory should register");
+        router
+            .register_local_memory()
+            .expect("router memory should register");
+        reader
+            .register_local_memory()
+            .expect("reader memory should register");
+
+        let mut expected = BTreeMap::new();
+        let mut owned_keys = Vec::new();
+        for index in 0..24 {
+            let key = format!("writer-via-key-{index}");
+            let value = format!("value-{index:02}").into_bytes();
+            router
+                .put_with_policy(&key, &value, &ReplicationPolicy::new().prefer_local(false))
+                .expect("seed routed put should succeed");
+            let route = router
+                .query_route(&key)
+                .expect("route query should succeed")
+                .expect("route should exist");
+            if route.replicas[0].owner == *store_a.runtime_id() {
+                expected.insert(key.clone(), value);
+                owned_keys.push(key);
+            }
+        }
+        assert!(
+            !owned_keys.is_empty(),
+            "expected at least one object to land on store-a"
+        );
+
+        let migrated = store_a
+            .evacuate_owned_replicas_via(&router)
+            .expect("explicit writer evacuation should succeed");
+        assert_eq!(migrated, owned_keys.len());
+        assert_eq!(store_a.lease().state, ClientLifecycleState::Draining);
+        assert!(
+            store_a
+                .list_segments()
+                .expect("segment listing should succeed")
+                .is_empty(),
+            "all local segments should retire after explicit writer evacuation"
+        );
+
+        for key in owned_keys {
+            let route = router
+                .query_route(&key)
+                .expect("post-evacuation route query should succeed")
+                .expect("post-evacuation route should exist");
+            assert!(
+                route
+                    .replicas
+                    .iter()
+                    .all(|replica| replica.owner != *store_a.runtime_id()),
+                "evacuated route still references store-a"
+            );
+            assert_eq!(
+                reader.get(&key).expect("reader get should succeed"),
+                expected[&key]
+            );
+        }
+    }
+
+    #[test]
+    fn internal_allocator_and_store_state_cover_edge_cases() {
+        let owner = ClientRuntimeId::new("writer", ClientEpoch(7));
+        let primary = SegmentAnnouncement {
+            owner: owner.clone(),
+            segment_name: SegmentName::new("alloc-primary"),
+            capacity_bytes: 128,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 16,
+            tags: vec!["dram".to_string()],
+        };
+        let secondary = SegmentAnnouncement {
+            segment_name: SegmentName::new("alloc-secondary"),
+            capacity_bytes: 64,
+            ..primary.clone()
+        };
+        let draining = SegmentAnnouncement {
+            segment_name: SegmentName::new("alloc-draining"),
+            state: SegmentLifecycleState::Draining,
+            ..primary.clone()
+        };
+
+        let mut allocator = LocalAllocatorState::default();
+        allocator.upsert(&primary);
+        allocator.upsert(&secondary);
+        allocator.upsert(&draining);
+        assert_eq!(allocator.announcements().len(), 3);
+        assert!(allocator.announcement(&primary.segment_name).is_some());
+        assert!(matches!(
+            allocator.update_state(&SegmentName::new("missing"), SegmentLifecycleState::Active),
+            Err(StoreError::NotFound(_))
+        ));
+
+        let first = allocator
+            .reserve_any(&owner, 17)
+            .expect("allocator should reserve from the largest segment");
+        assert_eq!(first.segment_name, primary.segment_name);
+        allocator
+            .release(
+                &owner,
+                &first.segment_name,
+                first.offset_bytes,
+                first.length_bytes,
+            )
+            .expect("release should succeed");
+        let reused = allocator
+            .reserve_specific(&owner, &first.segment_name, 17)
+            .expect("free span should be reusable");
+        assert_eq!(reused.offset_bytes, first.offset_bytes);
+        allocator.remove(&draining.segment_name);
+        assert!(allocator.announcement(&draining.segment_name).is_none());
+
+        let mut mismatch = SegmentAllocator::new(primary.clone());
+        let reserved = mismatch
+            .reserve(&owner, &primary.segment_name, 15)
+            .expect("reservation should succeed");
+        assert!(matches!(
+            mismatch.release(&owner, &primary.segment_name, reserved.offset_bytes, 14),
+            Err(StoreError::Allocator(_))
+        ));
+
+        let mut missing = SegmentAllocator::new(primary.clone());
+        assert!(matches!(
+            missing.release(&owner, &primary.segment_name, 0, 1),
+            Err(StoreError::Allocator(_))
+        ));
+
+        let mut merged = SegmentAllocator::new(primary.clone());
+        let recycled = merged
+            .reserve(&owner, &primary.segment_name, 15)
+            .expect("reservation should succeed");
+        merged
+            .release(
+                &owner,
+                &primary.segment_name,
+                recycled.offset_bytes,
+                recycled.length_bytes,
+            )
+            .expect("release should succeed");
+        let next_announcement = SegmentAnnouncement {
+            used_bytes: 64,
+            alignment_bytes: 1,
+            state: SegmentLifecycleState::Active,
+            tags: vec!["nvme".to_string()],
+            ..primary.clone()
+        };
+        merged.merge_announcement(&next_announcement);
+        assert_eq!(merged.announcement.state, SegmentLifecycleState::Active);
+        assert_eq!(merged.cursor_bytes, 64);
+        assert!(matches!(
+            merged.reserve(&owner, &primary.segment_name, 0),
+            Err(StoreError::Allocator(_))
+        ));
+
+        let shared_allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
+        shared_allocator.lock().upsert(&primary);
+        let adapter = LocalAllocatorAdapter {
+            runtime: owner.clone(),
+            allocator: shared_allocator.clone(),
+        };
+        let wrong_owner = ClientRuntimeId::new("other", ClientEpoch(9));
+        assert!(matches!(
+            adapter.reserve_any(&wrong_owner, 8),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(adapter
+            .batch_reserve_any(&wrong_owner, &[8, 8])
+            .into_iter()
+            .all(|result| matches!(result, Err(StoreError::InvalidState(_)))));
+
+        let batch = adapter.batch_reserve_any(&owner, &[8, 8]);
+        assert_eq!(batch.len(), 2);
+        let specific = adapter.batch_reserve_specific(
+            &owner,
+            &[crate::control_plane::ReserveSpecificOp {
+                segment_name: primary.segment_name.clone(),
+                length_bytes: 8,
+            }],
+        );
+        assert!(specific[0].is_ok());
+
+        let transport = TestTransport::new("state-primary");
+        let remote_handle = transport.add_external_segment("remote-segment", 128);
+        let mut state = StoreState::default();
+        assert!(matches!(
+            state.memory_ref(),
+            Err(StoreError::InvalidState(_))
+        ));
+        state.memory = Some(
+            crate::memory::LocalMemoryState::register(
+                &transport,
+                &SegmentName::new("state-primary"),
+                &storage_config(),
+            )
+            .expect("local memory should register"),
+        );
+        assert!(state.memory_mut().is_ok());
+        let next_a = state.next_segment_name(&SegmentName::new("state-primary"));
+        let next_b = state.next_segment_name(&SegmentName::new("state-primary"));
+        assert_ne!(next_a, next_b);
+        assert_eq!(
+            state
+                .open_segment(&transport, "remote-segment")
+                .expect("remote segment should open"),
+            remote_handle
+        );
+        assert_eq!(
+            state
+                .open_segment(&transport, "remote-segment")
+                .expect("remote segment should be cached"),
+            remote_handle
+        );
+
+        let mut buffer = [0u8; 64];
+        let buffer_ptr = buffer.as_mut_ptr().cast::<c_void>();
+        state
+            .register_external_buffer(&transport, buffer_ptr, buffer.len())
+            .expect("buffer registration should succeed");
+        assert!(state.buffer_is_registered(buffer_ptr, 16));
+        assert!(matches!(
+            state.register_external_buffer(
+                &transport,
+                unsafe { buffer.as_mut_ptr().add(8).cast() },
+                8
+            ),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(matches!(
+            state.unregister_external_buffer(&transport, buffer_ptr, 8),
+            Err(StoreError::Allocator(_))
+        ));
+        assert!(state.buffer_is_registered(buffer_ptr, 16));
+        state
+            .unregister_external_buffer(&transport, buffer_ptr, buffer.len())
+            .expect("buffer unregister should succeed");
+        assert!(!state.buffer_is_registered(buffer_ptr, 1));
+
+        state.pending_reclaims.push_back(PendingReclaim {
+            due_at_ms: 5,
+            storage_runtime: owner.clone(),
+            segment_name: SegmentName::new("seg-a"),
+            offset_bytes: 0,
+            length_bytes: 8,
+        });
+        state.pending_reclaims.push_back(PendingReclaim {
+            due_at_ms: 50,
+            storage_runtime: owner,
+            segment_name: SegmentName::new("seg-b"),
+            offset_bytes: 16,
+            length_bytes: 8,
+        });
+        assert_eq!(state.take_due_reclaims(10).len(), 1);
+        assert_eq!(state.pending_reclaims.len(), 1);
     }
 }

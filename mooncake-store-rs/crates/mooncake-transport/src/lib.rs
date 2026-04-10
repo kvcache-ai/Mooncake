@@ -47,3 +47,34 @@ pub struct TransferRequest {
 pub fn default_upstream_build_dir() -> &'static str {
     mooncake_transport_sys::DEFAULT_UPSTREAM_BUILD_DIR
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_upstream_build_dir, Opcode, TransferProgress, TransferRequest, TransferStatus,
+        TransportEngineKind,
+    };
+
+    #[test]
+    fn transport_public_types_are_constructible() {
+        let request = TransferRequest {
+            opcode: Opcode::Write,
+            source: std::ptr::null_mut(),
+            target_id: 7,
+            target_offset: 9,
+            length: 11,
+        };
+        let progress = TransferProgress {
+            status: TransferStatus::Completed,
+            transferred_bytes: 11,
+        };
+
+        assert_eq!(request.target_id, 7);
+        assert_eq!(progress.status, TransferStatus::Completed);
+        assert_eq!(
+            TransportEngineKind::ClassicTe,
+            TransportEngineKind::ClassicTe
+        );
+        assert!(!default_upstream_build_dir().is_empty());
+    }
+}

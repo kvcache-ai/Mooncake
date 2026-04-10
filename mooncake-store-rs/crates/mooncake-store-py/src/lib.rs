@@ -1446,3 +1446,1021 @@ fn store_error_to_py(error: StoreError) -> PyErr {
         | StoreError::Transport(message) => PyRuntimeError::new_err(message),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::c_void;
+    use std::net::TcpListener;
+    use std::ptr;
+    use std::slice;
+    use std::sync::Arc;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    use mooncake_metadata::InMemoryMetadataBackend;
+    use mooncake_store_client::{
+        LocalMemoryConfig, StoreClient, StoreClientBuilder, StoreTransport,
+    };
+    use mooncake_store_core::{
+        ClientEpoch, ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor, ObjectKey,
+        ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentAnnouncement,
+        SegmentLifecycleState, SegmentName, StoreError,
+    };
+    use mooncake_transport::{
+        Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
+        TransferStatus,
+    };
+    use parking_lot::Mutex;
+    use pyo3::exceptions::{PyKeyError, PyRuntimeError};
+    use pyo3::types::{PyAnyMethods, PyBytesMethods, PyModule};
+    use pyo3::{prepare_freethreaded_python, Python};
+
+    use super::{
+        _store_rs, init_tracing, metrics_server_address, metrics_text, pointer_from_usize,
+        replication_policy, route_to_py, segment_to_py, start_metrics_server, stop_metrics_server,
+        store_error_to_py, PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
+    };
+    use crate::dispatcher::StoreDispatcher;
+    use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
+
+    struct TestTransport {
+        local_segment: String,
+        state: Arc<Mutex<TestTransportState>>,
+    }
+
+    struct TestTransportState {
+        next_handle: u64,
+        next_batch: u64,
+        allocations: BTreeMap<usize, Box<[u8]>>,
+        segments_by_name: BTreeMap<String, u64>,
+        segments_by_handle: BTreeMap<u64, TestSegment>,
+        live_batches: BTreeSet<u64>,
+        registered_memory: BTreeMap<usize, usize>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestSegment {
+        base: usize,
+        len: usize,
+    }
+
+    impl TestTransport {
+        fn new(local_segment: &str) -> Self {
+            Self {
+                local_segment: local_segment.to_string(),
+                state: Arc::new(Mutex::new(TestTransportState {
+                    next_handle: 1,
+                    next_batch: 1,
+                    allocations: BTreeMap::new(),
+                    segments_by_name: BTreeMap::new(),
+                    segments_by_handle: BTreeMap::new(),
+                    live_batches: BTreeSet::new(),
+                    registered_memory: BTreeMap::new(),
+                })),
+            }
+        }
+    }
+
+    impl StoreTransport for TestTransport {
+        fn segment_name(&self) -> mooncake_store_core::Result<String> {
+            Ok(self.local_segment.clone())
+        }
+
+        fn rpc_server_address(&self) -> mooncake_store_core::Result<(String, u16)> {
+            Ok(("127.0.0.1".to_string(), 0))
+        }
+
+        fn open_segment(&self, segment_name: &str) -> mooncake_store_core::Result<u64> {
+            self.state
+                .lock()
+                .segments_by_name
+                .get(segment_name)
+                .copied()
+                .ok_or_else(|| StoreError::NotFound(format!("segment {segment_name} not found")))
+        }
+
+        fn close_segment(&self, handle: u64) -> mooncake_store_core::Result<()> {
+            if self.state.lock().segments_by_handle.contains_key(&handle) {
+                return Ok(());
+            }
+            Err(StoreError::NotFound(format!(
+                "segment handle {handle} not found"
+            )))
+        }
+
+        fn get_segment_info(&self, handle: u64) -> mooncake_store_core::Result<SegmentInfo> {
+            let state = self.state.lock();
+            let segment = state
+                .segments_by_handle
+                .get(&handle)
+                .copied()
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!("segment handle {handle} not found"))
+                })?;
+            Ok(SegmentInfo {
+                kind: SegmentKind::Memory,
+                buffers: vec![SegmentBuffer {
+                    base: segment.base as u64,
+                    length: segment.len as u64,
+                    location: "cpu:0".to_string(),
+                }],
+            })
+        }
+
+        fn adopt_local_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<()> {
+            let mut state = self.state.lock();
+            if state.segments_by_name.contains_key(&self.local_segment) {
+                return Ok(());
+            }
+            register_segment(&mut state, self.local_segment.clone(), addr as usize, size);
+            Ok(())
+        }
+
+        fn allocate_memory(
+            &self,
+            size: usize,
+            _location: &str,
+        ) -> mooncake_store_core::Result<*mut c_void> {
+            let mut state = self.state.lock();
+            let base = allocate_boxed_region(&mut state, size);
+            Ok(base as *mut c_void)
+        }
+
+        fn free_memory(&self, addr: *mut c_void) -> mooncake_store_core::Result<()> {
+            let base = addr as usize;
+            let mut state = self.state.lock();
+            state
+                .allocations
+                .remove(&base)
+                .ok_or_else(|| StoreError::NotFound(format!("allocation {base:#x} not found")))?;
+            let orphaned = state
+                .segments_by_handle
+                .iter()
+                .filter_map(|(handle, segment)| (segment.base == base).then_some(*handle))
+                .collect::<Vec<_>>();
+            for handle in orphaned {
+                state.segments_by_handle.remove(&handle);
+                state
+                    .segments_by_name
+                    .retain(|_, current_handle| *current_handle != handle);
+            }
+            state.registered_memory.remove(&base);
+            Ok(())
+        }
+
+        fn register_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            self.state
+                .lock()
+                .registered_memory
+                .insert(addr as usize, size);
+            Ok(())
+        }
+
+        fn unregister_memory(
+            &self,
+            addr: *mut c_void,
+            size: usize,
+        ) -> mooncake_store_core::Result<()> {
+            let mut state = self.state.lock();
+            match state.registered_memory.remove(&(addr as usize)) {
+                Some(recorded) if recorded == size => Ok(()),
+                Some(recorded) => Err(StoreError::Allocator(format!(
+                    "registered size mismatch: expected={recorded} actual={size}"
+                ))),
+                None => Err(StoreError::NotFound(format!(
+                    "registered allocation {:p} not found",
+                    addr
+                ))),
+            }
+        }
+
+        fn allocate_batch(&self, batch_size: usize) -> mooncake_store_core::Result<u64> {
+            if batch_size == 0 {
+                return Err(StoreError::Transport(
+                    "batch_size must be greater than zero".to_string(),
+                ));
+            }
+            let mut state = self.state.lock();
+            let batch_id = state.next_batch;
+            state.next_batch += 1;
+            state.live_batches.insert(batch_id);
+            Ok(batch_id)
+        }
+
+        fn free_batch(&self, batch_id: u64) -> mooncake_store_core::Result<()> {
+            if self.state.lock().live_batches.remove(&batch_id) {
+                return Ok(());
+            }
+            Err(StoreError::NotFound(format!("batch {batch_id} not found")))
+        }
+
+        fn submit(
+            &self,
+            batch_id: u64,
+            requests: &[TransferRequest],
+        ) -> mooncake_store_core::Result<()> {
+            let state = self.state.lock();
+            if !state.live_batches.contains(&batch_id) {
+                return Err(StoreError::NotFound(format!("batch {batch_id} not found")));
+            }
+            for request in requests {
+                let segment = state
+                    .segments_by_handle
+                    .get(&request.target_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        StoreError::NotFound(format!(
+                            "segment handle {} not found",
+                            request.target_id
+                        ))
+                    })?;
+                validate_request_bounds(segment, request)?;
+                unsafe {
+                    match request.opcode {
+                        Opcode::Write => ptr::copy_nonoverlapping(
+                            request.source.cast::<u8>(),
+                            request.target_offset as *mut u8,
+                            request.length as usize,
+                        ),
+                        Opcode::Read => ptr::copy_nonoverlapping(
+                            request.target_offset as *const u8,
+                            request.source.cast::<u8>(),
+                            request.length as usize,
+                        ),
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn task_status(
+            &self,
+            batch_id: u64,
+            _task_id: usize,
+        ) -> mooncake_store_core::Result<TransferProgress> {
+            self.overall_status(batch_id)
+        }
+
+        fn overall_status(&self, batch_id: u64) -> mooncake_store_core::Result<TransferProgress> {
+            if self.state.lock().live_batches.contains(&batch_id) {
+                return Ok(TransferProgress {
+                    status: TransferStatus::Completed,
+                    transferred_bytes: 0,
+                });
+            }
+            Err(StoreError::NotFound(format!("batch {batch_id} not found")))
+        }
+    }
+
+    fn allocate_boxed_region(state: &mut TestTransportState, size: usize) -> usize {
+        let mut memory = vec![0u8; size].into_boxed_slice();
+        let base = memory.as_mut_ptr() as usize;
+        state.allocations.insert(base, memory);
+        base
+    }
+
+    fn register_segment(
+        state: &mut TestTransportState,
+        segment_name: String,
+        base: usize,
+        size: usize,
+    ) -> u64 {
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        state.segments_by_name.insert(segment_name, handle);
+        state
+            .segments_by_handle
+            .insert(handle, TestSegment { base, len: size });
+        handle
+    }
+
+    fn validate_request_bounds(
+        segment: TestSegment,
+        request: &TransferRequest,
+    ) -> mooncake_store_core::Result<()> {
+        let start = usize::try_from(request.target_offset)
+            .map_err(|_| StoreError::Transport("target offset does not fit usize".to_string()))?;
+        let end = start
+            .checked_add(request.length as usize)
+            .ok_or_else(|| StoreError::Transport("request length overflow".to_string()))?;
+        let segment_end = segment
+            .base
+            .checked_add(segment.len)
+            .ok_or_else(|| StoreError::Transport("segment length overflow".to_string()))?;
+        if start < segment.base || end > segment_end {
+            return Err(StoreError::Transport(format!(
+                "request out of segment bounds: start={start} end={end} segment={}..{}",
+                segment.base, segment_end
+            )));
+        }
+        Ok(())
+    }
+
+    fn build_client(name: &str) -> StoreClient {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new(&format!("{name}-segment")));
+        StoreClientBuilder::new(metadata, name)
+            .epoch(ClientEpoch(1))
+            .state(ClientLifecycleState::Active)
+            .compatibility(CompatibilityDescriptor::default())
+            .transport(transport)
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .storage_bytes(4 * 1024)
+                    .scratch_bytes(4 * 1024)
+                    .alignment(1)
+                    .reclaim_grace_ms(0),
+            )
+            .build(60_000)
+            .expect("test store client should build")
+    }
+
+    fn build_real_store(name: &str) -> PyMooncakeDistributedStore {
+        let dispatcher = StoreDispatcher::spawn(build_client(name), format!("dispatcher-{name}"))
+            .expect("dispatcher should spawn");
+        dispatcher
+            .register_local_memory()
+            .expect("local memory should register");
+        let mut store = PyMooncakeDistributedStore::new();
+        store.replace_backend(StoreBackend::Real(dispatcher));
+        store
+    }
+
+    fn bind_addr() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener addr should resolve")
+            .to_string();
+        drop(listener);
+        address
+    }
+
+    fn build_dummy_store(name: &str) -> (PyMooncakeDistributedStore, DummyStoreServerHandle) {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(build_client(name), format!("dummy-dispatcher-{name}"))
+                .expect("dummy dispatcher should spawn"),
+        );
+        dispatcher
+            .register_local_memory()
+            .expect("dummy local memory should register");
+        let server =
+            start_dummy_store_server(dispatcher, &bind_addr()).expect("dummy server should start");
+        let mut store = PyMooncakeDistributedStore::new();
+        store
+            .setup_dummy(0, 0, server.address())
+            .expect("dummy store should connect");
+        for _ in 0..40 {
+            if store.health_check().expect("health check should succeed") == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(25));
+        }
+        (store, server)
+    }
+
+    fn sample_segment() -> SegmentAnnouncement {
+        SegmentAnnouncement {
+            owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
+            segment_name: SegmentName::new("segment-z"),
+            capacity_bytes: 256,
+            used_bytes: 32,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 8,
+            tags: vec!["dram".to_string()],
+        }
+    }
+
+    fn sample_route() -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new("key-z"),
+            version: RouteVersion(4),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
+                segment_name: SegmentName::new("segment-z"),
+                offset: 64,
+                segment_offset: 64,
+                length: 5,
+                checksum: Some(3),
+                tier: ReplicaTier::Dram,
+                priority: 1,
+            }],
+        }
+    }
+
+    fn init_python() {
+        prepare_freethreaded_python();
+    }
+
+    #[test]
+    fn helper_functions_and_module_registration_work() {
+        init_python();
+        let store = PyMooncakeDistributedStore::new();
+        assert_eq!(
+            store
+                .health_check()
+                .expect("default health check should succeed"),
+            1
+        );
+        assert!(pointer_from_usize(0).is_err());
+        assert!(replication_policy(None, None, None, None, None, true, false, false).is_none());
+
+        let policy = replication_policy(
+            Some(2),
+            Some("segment-a".to_string()),
+            Some(vec!["segment-b".to_string()]),
+            Some("writer-a".to_string()),
+            Some(vec!["writer-b".to_string()]),
+            false,
+            true,
+            true,
+        )
+        .expect("non-default replication hints should create a policy");
+        assert_eq!(policy.replica_count, Some(2));
+        assert_eq!(policy.preferred_segments.len(), 2);
+        assert_eq!(policy.preferred_storage_owners.len(), 2);
+        assert!(!policy.prefer_local);
+        assert!(policy.prefer_alloc_in_same_node);
+        assert!(policy.with_soft_pin);
+
+        Python::with_gil(|py| {
+            let not_found = store_error_to_py(StoreError::NotFound("missing".to_string()));
+            assert!(not_found.is_instance_of::<PyKeyError>(py));
+            let runtime = store_error_to_py(StoreError::Metadata("oops".to_string()));
+            assert!(runtime.is_instance_of::<PyRuntimeError>(py));
+        });
+    }
+
+    #[test]
+    fn helpers_convert_python_dicts_and_top_level_module_exports() {
+        init_python();
+        Python::with_gil(|py| {
+            let segment = sample_segment();
+            let route = sample_route();
+            let segment_dict = segment_to_py(py, &segment).expect("segment should convert");
+            let route_dict = route_to_py(py, &route).expect("route should convert");
+            let segment_any = segment_dict.bind(py);
+            let route_any = route_dict.bind(py);
+            assert_eq!(
+                segment_any
+                    .get_item("segment_name")
+                    .expect("segment field should exist")
+                    .extract::<String>()
+                    .expect("segment name should extract"),
+                "segment-z"
+            );
+            assert_eq!(
+                route_any
+                    .get_item("key")
+                    .expect("route field should exist")
+                    .extract::<String>()
+                    .expect("route key should extract"),
+                "key-z"
+            );
+
+            let module = PyModule::new(py, "_store_rs").expect("module should create");
+            _store_rs(&module).expect("module init should succeed");
+            assert!(module.getattr("MooncakeDistributedStore").is_ok());
+            assert!(module.getattr("MooncakeHostMemAllocator").is_ok());
+            assert!(module.getattr("metrics_text").is_ok());
+        });
+
+        stop_metrics_server().expect("metrics server cleanup should succeed");
+        init_tracing(Some("info")).expect("tracing init should be idempotent");
+        let address = start_metrics_server("127.0.0.1:0").expect("metrics server should start");
+        assert!(address.contains(':'));
+        assert!(metrics_server_address().is_some());
+        assert!(!metrics_text().is_empty());
+        stop_metrics_server().expect("metrics server should stop");
+        assert!(metrics_server_address().is_none());
+
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let ptr = allocator
+            .alloc(128)
+            .expect("allocator should return shared memory");
+        allocator
+            .free(ptr)
+            .expect("allocator should free shared memory");
+    }
+
+    #[test]
+    fn real_store_supports_core_python_compat_api() {
+        init_python();
+        let mut store = build_real_store("py-real");
+        assert_eq!(
+            store
+                .health_check()
+                .expect("real health check should succeed"),
+            0
+        );
+        assert_eq!(
+            store.get_hostname().expect("hostname should resolve"),
+            "127.0.0.1"
+        );
+
+        store
+            .put(
+                "alpha",
+                b"one".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put should succeed");
+        store
+            .batch_put(
+                vec![
+                    ("beta".to_string(), b"two".to_vec()),
+                    ("gamma".to_string(), b"three".to_vec()),
+                ],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("batch_put should succeed");
+
+        Python::with_gil(|py| {
+            assert_eq!(
+                store
+                    .get(py, "alpha", None)
+                    .expect("get should succeed")
+                    .as_bytes(),
+                b"one"
+            );
+            let batch = store
+                .batch_get(py, vec!["alpha".to_string(), "beta".to_string()], None)
+                .expect("batch_get should succeed");
+            assert_eq!(batch[0].bind(py).as_bytes(), b"one");
+            assert_eq!(batch[1].bind(py).as_bytes(), b"two");
+            let mirrored = store
+                .batch_get_buffer(py, vec!["gamma".to_string()], None)
+                .expect("batch_get_buffer should delegate to batch_get");
+            assert_eq!(mirrored[0].bind(py).as_bytes(), b"three");
+        });
+
+        assert!(store
+            .is_exist("alpha", None)
+            .expect("is_exist should succeed"));
+        assert_eq!(
+            store
+                .batch_is_exist(vec!["alpha".to_string(), "missing".to_string()], None)
+                .expect("batch_is_exist should succeed"),
+            vec![1, 0]
+        );
+        assert_eq!(
+            store.get_size("alpha", None).expect("size should resolve"),
+            3
+        );
+
+        let mut registered = vec![0u8; 32];
+        store
+            .register_buffer(registered.as_mut_ptr() as usize, registered.len())
+            .expect("register_buffer should succeed");
+        store
+            .unregister_buffer(registered.as_mut_ptr() as usize, registered.len())
+            .expect("unregister_buffer should succeed");
+
+        let source = b"from-buffer".to_vec();
+        store
+            .register_buffer(source.as_ptr() as usize, source.len())
+            .expect("source buffer registration should succeed");
+        store
+            .put_from(
+                "delta",
+                source.as_ptr() as usize,
+                source.len(),
+                None,
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put_from should succeed");
+        let mut read_buffer = vec![0u8; 32];
+        let copied = store
+            .get_into(
+                "delta",
+                read_buffer.as_mut_ptr() as usize,
+                read_buffer.len(),
+                None,
+            )
+            .expect("get_into should succeed");
+        assert_eq!(copied, source.len());
+        assert_eq!(&read_buffer[..copied], source.as_slice());
+
+        Python::with_gil(|py| {
+            let statuses = store
+                .batch_put_from(
+                    py,
+                    vec![
+                        (
+                            "epsilon".to_string(),
+                            source.as_ptr() as usize,
+                            source.len(),
+                        ),
+                        ("zeta".to_string(), source.as_ptr() as usize, source.len()),
+                    ],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .expect("batch_put_from should succeed");
+            assert_eq!(
+                statuses
+                    .bind(py)
+                    .extract::<Vec<i32>>()
+                    .expect("batch_put_from should return status list"),
+                vec![0, 0]
+            );
+        });
+        store
+            .unregister_buffer(source.as_ptr() as usize, source.len())
+            .expect("source buffer unregister should succeed");
+
+        let mut target_a = vec![0u8; 16];
+        let mut target_b = vec![0u8; 16];
+        let lengths = store
+            .batch_get_into(
+                vec![
+                    (
+                        "epsilon".to_string(),
+                        target_a.as_mut_ptr() as usize,
+                        target_a.len(),
+                    ),
+                    (
+                        "zeta".to_string(),
+                        target_b.as_mut_ptr() as usize,
+                        target_b.len(),
+                    ),
+                ],
+                None,
+            )
+            .expect("batch_get_into should succeed");
+        assert_eq!(lengths, vec![source.len() as i64, source.len() as i64]);
+        assert_eq!(&target_a[..source.len()], source.as_slice());
+        assert_eq!(&target_b[..source.len()], source.as_slice());
+
+        let raw_lengths = store
+            .batch_get_into_raw(
+                vec!["alpha".to_string()],
+                vec![read_buffer.as_mut_ptr() as usize],
+                vec![read_buffer.len()],
+                None,
+            )
+            .expect("batch_get_into_raw should succeed");
+        assert_eq!(raw_lengths, vec![3]);
+        assert!(store
+            .batch_get_into_raw(vec!["alpha".to_string()], vec![], vec![], None)
+            .is_err());
+
+        store
+            .batch_put_from_multi_buffers(
+                vec![(
+                    "multi".to_string(),
+                    vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()],
+                )],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("multi-buffer put should succeed");
+        let mut part1 = vec![0u8; 2];
+        let mut part2 = vec![0u8; 4];
+        let multi_lengths = store
+            .batch_get_into_multi_buffers(
+                vec!["multi".to_string()],
+                vec![vec![
+                    part1.as_mut_ptr() as usize,
+                    part2.as_mut_ptr() as usize,
+                ]],
+                vec![vec![part1.len(), part2.len()]],
+                false,
+                None,
+            )
+            .expect("multi-buffer get should succeed");
+        assert_eq!(multi_lengths, vec![6]);
+        assert_eq!(&part1, b"ab");
+        assert_eq!(&part2, b"cdef");
+
+        Python::with_gil(|py| {
+            assert!(store
+                .batch_put_from_raw(
+                    py,
+                    vec!["oops".to_string()],
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .is_err());
+        });
+
+        Python::with_gil(|py| {
+            let route = store
+                .query_route(py, "alpha", None)
+                .expect("query_route should succeed")
+                .expect("route should exist");
+            assert_eq!(
+                route
+                    .bind(py)
+                    .get_item("key")
+                    .expect("route key should exist")
+                    .extract::<String>()
+                    .expect("route key should extract"),
+                "default::alpha"
+            );
+            let segments = store
+                .list_segments(py)
+                .expect("list_segments should succeed");
+            assert!(!segments.is_empty());
+            let segment_name = segments[0]
+                .bind(py)
+                .get_item("segment_name")
+                .expect("segment_name should exist")
+                .extract::<String>()
+                .expect("segment_name should extract");
+            assert!(store.drain_segment(&segment_name).is_err());
+            match store.retire_segment(&segment_name) {
+                Ok(retired) => assert!(!retired),
+                Err(_) => {}
+            }
+        });
+
+        store.heartbeat(90_000).expect("heartbeat should succeed");
+        store.enter_standby().expect("standby should succeed");
+        store.activate().expect("activate should succeed");
+        store.enter_draining().expect("draining should succeed");
+        assert!(store.evacuate_owned_replicas().is_err());
+
+        store
+            .remove("alpha", false, None)
+            .expect("remove should succeed");
+        assert_eq!(
+            store
+                .batch_remove(vec!["beta".to_string(), "gamma".to_string()], false, None)
+                .expect("batch_remove should succeed"),
+            vec![0, 0]
+        );
+        assert!(store.remove_all(false).is_err());
+        assert!(!store.metrics_text().is_empty());
+
+        store.close();
+        assert!(store.get_hostname().is_err());
+    }
+
+    #[test]
+    fn dummy_store_exercises_dummy_rpc_and_shared_memory_paths() {
+        init_python();
+        let (mut store, server) = build_dummy_store("py-dummy");
+        assert_eq!(
+            store.health_check().expect("health check should succeed"),
+            0
+        );
+        assert_eq!(
+            store.get_hostname().expect("dummy hostname should resolve"),
+            server.address()
+        );
+
+        store
+            .put(
+                "alpha",
+                b"one".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("dummy put should succeed");
+        store
+            .batch_put(
+                vec![
+                    ("beta".to_string(), b"two".to_vec()),
+                    ("gamma".to_string(), b"three".to_vec()),
+                ],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("dummy batch_put should succeed");
+
+        Python::with_gil(|py| {
+            assert_eq!(
+                store
+                    .get(py, "alpha", None)
+                    .expect("dummy get should succeed")
+                    .as_bytes(),
+                b"one"
+            );
+            assert!(store
+                .batch_get(py, vec!["alpha".to_string()], None)
+                .is_err());
+            assert!(store.query_route(py, "alpha", None).is_err());
+        });
+        assert!(store
+            .is_exist("alpha", None)
+            .expect("dummy is_exist should succeed"));
+        assert_eq!(
+            store
+                .batch_is_exist(vec!["alpha".to_string(), "missing".to_string()], None)
+                .expect("dummy batch_is_exist should succeed"),
+            vec![1, 0]
+        );
+        assert_eq!(
+            store
+                .get_size("gamma", None)
+                .expect("dummy size should resolve"),
+            5
+        );
+
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let write_ptr = allocator
+            .alloc(64)
+            .expect("dummy write buffer should allocate");
+        let read_ptr = allocator
+            .alloc(64)
+            .expect("dummy read buffer should allocate");
+        unsafe {
+            slice::from_raw_parts_mut(write_ptr as *mut u8, 64)[..5].copy_from_slice(b"hello");
+        }
+
+        store
+            .register_buffer(write_ptr, 64)
+            .expect("dummy register_buffer should succeed");
+        store
+            .register_buffer(read_ptr, 64)
+            .expect("dummy register_buffer should succeed");
+        store
+            .put_from(
+                "buffered", write_ptr, 5, None, None, None, None, None, None, true, false, false,
+            )
+            .expect("dummy put_from should succeed");
+        let copied = store
+            .get_into("buffered", read_ptr, 64, None)
+            .expect("dummy get_into should succeed");
+        assert_eq!(copied, 5);
+        unsafe {
+            assert_eq!(slice::from_raw_parts(read_ptr as *const u8, 5), b"hello");
+        }
+
+        Python::with_gil(|py| {
+            let statuses = store
+                .batch_put_from(
+                    py,
+                    vec![("from-batch".to_string(), write_ptr, 5)],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .expect("dummy batch_put_from should succeed");
+            assert_eq!(
+                statuses
+                    .bind(py)
+                    .extract::<Vec<i32>>()
+                    .expect("dummy batch_put_from should return status list"),
+                vec![0]
+            );
+        });
+
+        let raw_statuses = store
+            .batch_put_from_multi_buffers_raw(
+                vec!["raw-multi".to_string()],
+                vec![vec![write_ptr, write_ptr + 2]],
+                vec![vec![2, 3]],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("dummy raw multi-buffer put should succeed");
+        assert_eq!(raw_statuses, vec![0]);
+
+        store
+            .batch_put_from_multi_buffers(
+                vec![(
+                    "vec-multi".to_string(),
+                    vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()],
+                )],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("dummy vec multi-buffer put should succeed");
+
+        let lengths = store
+            .batch_get_into(vec![("from-batch".to_string(), read_ptr, 64)], None)
+            .expect("dummy batch_get_into should succeed");
+        assert_eq!(lengths, vec![5]);
+        let multi_lengths = store
+            .batch_get_into_multi_buffers(
+                vec!["vec-multi".to_string()],
+                vec![vec![read_ptr, read_ptr + 2]],
+                vec![vec![2, 4]],
+                false,
+                None,
+            )
+            .expect("dummy batch_get_into_multi_buffers should succeed");
+        assert_eq!(multi_lengths, vec![6]);
+
+        assert!(store
+            .batch_get_into_raw(vec!["alpha".to_string()], vec![], vec![], None)
+            .is_err());
+
+        store
+            .unregister_buffer(read_ptr, 64)
+            .expect("dummy unregister_buffer should succeed");
+        assert!(store.get_into("buffered", read_ptr, 64, None).is_err());
+
+        let removed = store
+            .remove_all(false)
+            .expect("dummy remove_all should succeed");
+        assert!(removed >= 1);
+        assert!(store.remove("alpha", false, None).is_err());
+        Python::with_gil(|py| {
+            assert!(store.list_segments(py).is_err());
+        });
+
+        store.close();
+        allocator
+            .free(write_ptr)
+            .expect("dummy write buffer should free");
+        allocator
+            .free(read_ptr)
+            .expect("dummy read buffer should free");
+        server.shutdown().expect("dummy server should stop");
+    }
+}

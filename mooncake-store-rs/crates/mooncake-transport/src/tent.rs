@@ -292,3 +292,92 @@ unsafe fn read_segment_buffers(info: &ffi::TentSegmentInfo) -> Vec<SegmentBuffer
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+    use std::path::PathBuf;
+
+    use mooncake_transport_sys::tent as ffi;
+
+    use super::{
+        check_zero, cstring_from_path, decode_status, encode_opcode, read_segment_buffers,
+        read_string, to_cstring, TentEngineConfig,
+    };
+    use crate::{Opcode, TransferStatus};
+
+    #[test]
+    fn tent_config_builders_accumulate_overrides() {
+        let config = TentEngineConfig::new()
+            .config_path("tent.toml")
+            .set("log_level", "debug")
+            .set("rpc_server_port", "0");
+        let debug = format!("{config:?}");
+        assert!(debug.contains("tent.toml"));
+        assert!(debug.contains("log_level"));
+        assert!(debug.contains("rpc_server_port"));
+    }
+
+    #[test]
+    fn tent_string_helpers_validate_inputs() {
+        assert!(to_cstring("key", "value").is_ok());
+        assert!(to_cstring("key", "bad\0value").is_err());
+        assert!(cstring_from_path(&PathBuf::from("config.toml")).is_ok());
+    }
+
+    #[test]
+    fn tent_codecs_match_ffi_constants() {
+        check_zero(0, "tent").expect("zero rc should pass");
+        assert!(check_zero(1, "tent").is_err());
+        assert_eq!(encode_opcode(Opcode::Read), ffi::OPCODE_READ);
+        assert_eq!(encode_opcode(Opcode::Write), ffi::OPCODE_WRITE);
+        assert_eq!(decode_status(ffi::STATUS_WAITING), TransferStatus::Waiting);
+        assert_eq!(decode_status(ffi::STATUS_PENDING), TransferStatus::Pending);
+        assert_eq!(decode_status(ffi::STATUS_INVALID), TransferStatus::Invalid);
+        assert_eq!(
+            decode_status(ffi::STATUS_CANCELED),
+            TransferStatus::Canceled
+        );
+        assert_eq!(
+            decode_status(ffi::STATUS_COMPLETED),
+            TransferStatus::Completed
+        );
+        assert_eq!(decode_status(ffi::STATUS_TIMEOUT), TransferStatus::Timeout);
+        assert_eq!(decode_status(ffi::STATUS_FAILED), TransferStatus::Failed);
+    }
+
+    #[test]
+    fn tent_buffer_helpers_read_c_strings_and_buffers() {
+        let text = CString::new("tent-segment").expect("cstring should build");
+        let mut chars = [0 as c_char; 32];
+        for (dst, src) in chars.iter_mut().zip(text.as_bytes_with_nul()) {
+            *dst = *src as c_char;
+        }
+        assert_eq!(read_string(&chars), "tent-segment");
+
+        let location = CString::new("cpu:0").expect("cstring should build");
+        let mut location_buf = [0 as c_char; 64];
+        for (dst, src) in location_buf
+            .iter_mut()
+            .zip(location.as_bytes_with_nul().iter().copied())
+        {
+            *dst = src as c_char;
+        }
+        let mut buffers = vec![ffi::TentBufferInfo {
+            base: 11,
+            length: 22,
+            location: location_buf,
+        }];
+        let info = ffi::TentSegmentInfo {
+            kind: ffi::TYPE_MEMORY,
+            num_buffers: buffers.len() as i32,
+            buffers: buffers.as_mut_ptr(),
+        };
+        let parsed = unsafe { read_segment_buffers(&info) };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].base, 11);
+        assert_eq!(parsed[0].length, 22);
+        assert_eq!(parsed[0].location, "cpu:0");
+    }
+}

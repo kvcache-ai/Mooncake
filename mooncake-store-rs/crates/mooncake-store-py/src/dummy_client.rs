@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use mooncake_store_client::ReplicationPolicy;
 use mooncake_store_core::{Result, StoreError};
@@ -33,14 +35,25 @@ struct RegisteredRegion {
 
 impl DummySession {
     pub fn connect(server_addr: &str) -> Result<Self> {
-        let endpoint = Endpoint::from_shared(format!("http://{server_addr}")).map_err(|error| {
-            StoreError::Transport(format!("invalid dummy server endpoint: {error}"))
-        })?;
-        let channel = DUMMY_RUNTIME
-            .block_on(endpoint.connect())
-            .map_err(|error| {
-                StoreError::Transport(format!("failed to connect to dummy server: {error}"))
+        let endpoint_uri = format!("http://{server_addr}");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let channel = 'connect: loop {
+            let endpoint = Endpoint::from_shared(endpoint_uri.clone()).map_err(|error| {
+                StoreError::Transport(format!("invalid dummy server endpoint: {error}"))
             })?;
+            match DUMMY_RUNTIME.block_on(endpoint.connect()) {
+                Ok(channel) => break 'connect channel,
+                Err(_) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(StoreError::Transport(format!(
+                        "failed to connect to dummy server: {}",
+                        error,
+                    )));
+                }
+            }
+        };
         Ok(Self {
             channel,
             server_addr: server_addr.to_string(),

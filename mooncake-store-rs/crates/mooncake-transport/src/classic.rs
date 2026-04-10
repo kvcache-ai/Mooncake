@@ -181,3 +181,44 @@ fn decode_status(status: i32) -> TransferStatus {
         _ => TransferStatus::Failed,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mooncake_transport_sys::classic as ffi;
+
+    use super::{check_zero, decode_status, encode_opcode, to_cstring};
+    use crate::{Opcode, TransferStatus};
+
+    #[test]
+    fn cstring_conversion_rejects_embedded_nul() {
+        assert!(to_cstring("field", "hello").is_ok());
+        assert!(to_cstring("field", "bad\0value").is_err());
+    }
+
+    #[test]
+    fn check_zero_preserves_success_and_errors() {
+        check_zero(0, "demo").expect("zero rc should succeed");
+        let error = check_zero(-1, "demo").expect_err("non-zero rc should fail");
+        assert!(error.to_string().contains("demo failed"));
+    }
+
+    #[test]
+    fn opcode_and_status_codecs_match_ffi_constants() {
+        assert_eq!(encode_opcode(Opcode::Read), ffi::OPCODE_READ);
+        assert_eq!(encode_opcode(Opcode::Write), ffi::OPCODE_WRITE);
+        assert_eq!(decode_status(ffi::STATUS_WAITING), TransferStatus::Waiting);
+        assert_eq!(decode_status(ffi::STATUS_PENDING), TransferStatus::Pending);
+        assert_eq!(decode_status(ffi::STATUS_INVALID), TransferStatus::Invalid);
+        assert_eq!(
+            decode_status(ffi::STATUS_CANCELED),
+            TransferStatus::Canceled
+        );
+        assert_eq!(
+            decode_status(ffi::STATUS_COMPLETED),
+            TransferStatus::Completed
+        );
+        assert_eq!(decode_status(ffi::STATUS_TIMEOUT), TransferStatus::Timeout);
+        assert_eq!(decode_status(ffi::STATUS_FAILED), TransferStatus::Failed);
+        assert_eq!(decode_status(i32::MAX), TransferStatus::Failed);
+    }
+}
