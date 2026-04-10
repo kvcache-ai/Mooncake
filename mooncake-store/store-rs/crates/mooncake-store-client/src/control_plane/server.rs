@@ -71,10 +71,7 @@ fn run_server(
     authority: Arc<dyn AuthorityService>,
     allocator: Arc<dyn AllocatorService>,
 ) {
-    let service = GrpcControlPlaneService {
-        authority,
-        allocator,
-    };
+    let service = GrpcControlPlaneService::new(authority, allocator);
     let result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
@@ -95,9 +92,21 @@ fn run_server(
     }
 }
 
-struct GrpcControlPlaneService {
+pub(super) struct GrpcControlPlaneService {
     authority: Arc<dyn AuthorityService>,
     allocator: Arc<dyn AllocatorService>,
+}
+
+impl GrpcControlPlaneService {
+    pub(super) fn new(
+        authority: Arc<dyn AuthorityService>,
+        allocator: Arc<dyn AllocatorService>,
+    ) -> Self {
+        Self {
+            authority,
+            allocator,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -552,10 +561,8 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         &self,
         request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
-        let service = GrpcControlPlaneService {
-            authority: self.authority.clone(),
-            allocator: self.allocator.clone(),
-        };
+        let service =
+            GrpcControlPlaneService::new(self.authority.clone(), self.allocator.clone());
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         tokio::spawn(async move {
@@ -577,7 +584,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
     }
 }
 
-async fn handle_control_stream_request(
+pub(super) async fn handle_control_stream_request(
     service: &GrpcControlPlaneService,
     request: pb::ControlStreamRequest,
 ) -> pb::ControlStreamReply {

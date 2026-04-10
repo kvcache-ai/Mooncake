@@ -205,6 +205,8 @@ use self::codec::{
     try_cas_result, try_compatibility, try_object_route, try_replica_route, try_replica_tier,
     try_route_state, try_runtime_id, try_segment_reservation,
 };
+#[cfg(test)]
+use self::server::{handle_control_stream_request, GrpcControlPlaneService};
 
 #[cfg(test)]
 mod tests;
