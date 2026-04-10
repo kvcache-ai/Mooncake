@@ -340,6 +340,29 @@ Run the Python compatibility validation:
 ./scripts/run-python-compat-e2e.sh
 ```
 
+Run the hot-upgrade startup validation:
+
+```bash
+./scripts/test-python-client-hot-upgrade-args.sh
+```
+
+This script verifies:
+
+- PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
+- Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
+
+Run the native CLI hot-upgrade black-box validation:
+
+```bash
+./scripts/test-client-hot-upgrade-cli.sh
+```
+
+This script verifies:
+
+- an active predecessor and a standby successor can share the same `stable_id`
+- `SIGTERM` triggers graceful handoff
+- the promoted successor preserves and serves the original payload after takeover
+
 Run the HiCache compatibility validations:
 
 ```bash
@@ -354,6 +377,8 @@ Current coverage includes:
 - registered-buffer and multi-buffer paths
 - dummy-path shm registration
 - real-path registered-buffer reads and writes
+- hot-upgrade startup argument parsing and wrapper forwarding
+- CLI-driven hot-upgrade handoff with payload preservation
 - route query behavior
 - replication policy handling
 - metrics exposure

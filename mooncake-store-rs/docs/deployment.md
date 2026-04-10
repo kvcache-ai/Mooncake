@@ -62,6 +62,33 @@ What the script does:
 - creates two Python clients
 - validates single-object, batch, zero-copy, multi-buffer, route, and metrics paths
 
+### Hot-upgrade validation
+
+Native CLI hot-upgrade validation:
+
+```bash
+./scripts/test-client-hot-upgrade-cli.sh
+```
+
+What the script does:
+
+- builds the standalone `mooncake-store-client` binary
+- starts an active predecessor and a standby successor with the same `stable_id`
+- writes a real payload through an external routed client
+- sends `SIGTERM` to trigger graceful handoff
+- verifies that the successor promotes itself and can still read the original payload
+
+Python hot-upgrade argument and wrapper compatibility validation:
+
+```bash
+./scripts/test-python-client-hot-upgrade-args.sh
+```
+
+What the script verifies:
+
+- PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
+- Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
+
 ### HiCache compatibility validation
 
 Run the compatibility checks for both Python execution modes:
@@ -266,6 +293,11 @@ The current end-to-end binary covers:
 - routed writes and multi-replica publication
 - multi-tenant access
 - dynamic expansion, true client shrink, and hot-upgrade handoff
+
+Additional dedicated validation scripts cover:
+
+- CLI-driven hot-upgrade handoff with payload preservation
+- Python hot-upgrade startup argument parsing and wrapper forwarding
 
 The entry point is `crates/mooncake-store-e2e/src/main.rs`.
 
