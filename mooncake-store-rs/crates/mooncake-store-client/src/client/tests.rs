@@ -3023,6 +3023,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
 fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let predecessor_transport = Arc::new(TestTransport::new("pin-upgrade-old-segment"));
+    let predecessor_factory = predecessor_transport.factory();
     let successor_transport = Arc::new(predecessor_transport.peer("pin-upgrade-new-segment"));
     let spare_transport = Arc::new(predecessor_transport.peer("pin-upgrade-spare-segment"));
     let reader_transport = Arc::new(predecessor_transport.peer("pin-upgrade-reader-segment"));
@@ -3034,6 +3035,7 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .label("pool", "pool-a")
         .label("storage", "true")
         .transport(predecessor_transport)
+        .transport_factory(predecessor_factory)
         .local_memory(storage_config())
         .build(10_000)
         .expect("predecessor build should succeed");

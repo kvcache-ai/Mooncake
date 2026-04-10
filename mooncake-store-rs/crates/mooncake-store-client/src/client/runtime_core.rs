@@ -90,12 +90,20 @@ impl StoreClient {
             self.flush_all_reclaims()?;
 
             let routes = self.collect_routes_by_replica_owner(&self.lease.runtime)?;
+            let helper_writer = self.build_hot_upgrade_helper_writer()?;
             let mut migrated = 0usize;
             for route in routes {
-                if self.migrate_owned_route_to_runtime(successor, &route)? {
+                let migrated_route = match helper_writer.as_ref() {
+                    Some(writer) => {
+                        self.migrate_owned_route_to_runtime_via_writer(writer, successor, &route)?
+                    }
+                    None => self.migrate_owned_route_to_runtime(successor, &route)?,
+                };
+                if migrated_route {
                     migrated = migrated.saturating_add(1);
                 }
             }
+            drop(helper_writer);
 
             self.flush_all_reclaims()?;
             let live_allocations = self.current_owned_allocations()?;
@@ -190,6 +198,58 @@ impl StoreClient {
 
     pub fn default_tenant(&self) -> &str {
         &self.default_tenant
+    }
+
+    fn build_hot_upgrade_helper_writer(&self) -> Result<Option<StoreClient>> {
+        let Some(factory) = self.transport_factory.clone() else {
+            return Ok(None);
+        };
+
+        let helper_stable_id = format!(
+            "{}-hot-upgrade-helper-{}",
+            self.lease.runtime.stable_id.0,
+            Self::current_time_ms()
+        );
+        let helper_segment_name = format!(
+            "{}-segment-{}",
+            helper_stable_id.replace(':', "-"),
+            self.lease.runtime.epoch.0
+        );
+        let helper_transport = factory.create(&helper_segment_name)?;
+        let helper_expiry_ms = self
+            .lease
+            .expires_at_ms
+            .max(Self::current_time_ms().saturating_add(30_000));
+
+        let mut builder = StoreClientBuilder::new(self.metadata.clone(), helper_stable_id)
+            .epoch(self.lease.runtime.epoch)
+            .state(ClientLifecycleState::Active)
+            .tenant(self.default_tenant.clone())
+            .compatibility(self.lease.compatibility.clone())
+            .local_memory(self.local_memory.clone())
+            .transport(helper_transport)
+            .transport_factory(factory)
+            .route_control(self.route_control);
+
+        let mut labels = self.lease.endpoints.labels.clone();
+        labels.remove(control_address_label());
+        labels.insert("storage".to_string(), "false".to_string());
+        labels.insert("route".to_string(), "false".to_string());
+        for (key, value) in labels {
+            builder = builder.label(key, value);
+        }
+
+        if let WriteMode::Routed {
+            planner,
+            replica_count,
+        } = &self.write_mode
+        {
+            builder = builder.routed_writes(planner.clone(), *replica_count);
+        }
+
+        let helper = builder.build(helper_expiry_ms)?;
+        helper.register_local_memory()?;
+        Ok(Some(helper))
     }
 
     fn default_replica_count(&self) -> usize {

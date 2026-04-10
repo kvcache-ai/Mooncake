@@ -171,6 +171,7 @@ impl StoreClientBuilder {
             transport: self.transport,
             transport_factory: self.transport_factory,
             write_mode: self.write_mode,
+            route_control: self.route_control,
             state,
         })
     }
