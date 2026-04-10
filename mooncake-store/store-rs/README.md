@@ -429,6 +429,8 @@ For the complete configuration reference, read `docs/configuration.md`.
 
 If store metadata uses etcd in the Python compatibility layer, transport metadata still uses Redis. Set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint.
 
+For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD`; set `MC_REDIS_USERNAME` as well when Redis ACLs require a named user. Environment variables are preferred for passwords that contain URL-reserved characters such as `@`.
+
 ### Route control modes
 
 | Mode | Description | Default |

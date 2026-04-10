@@ -310,6 +310,16 @@ The compatibility layer accepts these metadata URL forms:
 | `redis://host:port/db` | Redis metadata backend |
 | `etcd://host1:2379,host2:2379` | etcd metadata backend |
 
+Redis authentication follows the same environment variables as the native store:
+
+```bash
+export MC_REDIS_PASSWORD='<redis-password>'
+# Optional when Redis ACLs require a named user:
+export MC_REDIS_USERNAME='<redis-username>'
+```
+
+Credentials embedded in `redis://username:password@host:port/db` are also accepted and take precedence over the environment variables. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
+
 ### Important note for etcd
 
 When the store metadata backend is etcd, TENT transport metadata still uses Redis. Provide that Redis endpoint through:
