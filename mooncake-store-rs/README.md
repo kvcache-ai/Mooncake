@@ -88,7 +88,7 @@ The implementation is easier to understand when grouped by capability instead of
 - build-time membership snapshot prewarm and background live-client sync
 - segment-level drain / retire flows
 - true client shrink through replica evacuation
-- hot-upgrade and elastic-capacity scenarios validated in e2e
+- hot-upgrade handoff with payload preservation validated by dedicated CLI and Python regression tests
 
 ### Observability
 
@@ -165,6 +165,33 @@ This script will:
 - print batch put/get benchmark results
 
 For deployment details and script knobs, read `docs/deployment.md`.
+
+### Run the hot-upgrade validation
+
+Native CLI hot-upgrade validation:
+
+```bash
+./scripts/test-client-hot-upgrade-cli.sh
+```
+
+This script:
+
+- builds the standalone `mooncake-store-client` binary
+- starts an active predecessor and a standby successor with the same `stable_id`
+- writes a real payload through an external routed client
+- sends `SIGTERM` to trigger graceful handoff
+- verifies that the successor promotes itself and can still read the original payload
+
+Python hot-upgrade argument and wrapper compatibility validation:
+
+```bash
+./scripts/test-python-client-hot-upgrade-args.sh
+```
+
+This script verifies both layers:
+
+- PyO3 native `setup(..., stable_id, epoch, initial_state)` argument parsing
+- Python wrapper forwarding of hot-upgrade startup arguments into the Rust runtime
 
 ### Run the multi-client stress benchmark
 
@@ -468,4 +495,4 @@ The repository includes automated coverage for:
 - overwrite reclaim and delete reclaim
 - routed remote writes
 - multi-tenant operation
-- dynamic membership, elastic segment changes, and hot-upgrade handoff
+- dynamic membership, elastic segment changes, and hot-upgrade handoff with payload preservation
