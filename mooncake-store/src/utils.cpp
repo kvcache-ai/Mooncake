@@ -385,16 +385,14 @@ std::string BuildCanonicalObjectKey(const std::string &tenant_id,
                                     const std::string &domain_id,
                                     const std::string &object_set,
                                     const std::string &logical_key) {
-    return tenant_id + "/" + domain_id + "/" + object_set + "/" +
-           logical_key;
+    return tenant_id + "/" + domain_id + "/" + object_set + "/" + logical_key;
 }
 
 LogicalObjectId BuildLogicalObjectId(const std::string &raw_key,
                                      const ReplicateConfig &config) {
-    return LogicalObjectId{config.tenant_id, config.domain_id,
-                           config.object_set,
-                           config.logical_key.empty() ? raw_key
-                                                      : config.logical_key};
+    return LogicalObjectId{
+        config.tenant_id, config.domain_id, config.object_set,
+        config.logical_key.empty() ? raw_key : config.logical_key};
 }
 
 ReuseIdentity BuildReuseIdentity(const std::string &tenant_id,

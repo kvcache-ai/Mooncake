@@ -41,9 +41,9 @@ TEST(UtilsTest, MaybeBuildReuseIdentityRejectsNonSharedScope) {
     EXPECT_FALSE(MaybeBuildReuseIdentity("tenant", "domain", "private",
                                          "tenant/domain/set/key")
                      .has_value());
-    EXPECT_FALSE(MaybeBuildReuseIdentity("tenant", "domain",
-                                         "tenant_shared", "")
-                     .has_value());
+    EXPECT_FALSE(
+        MaybeBuildReuseIdentity("tenant", "domain", "tenant_shared", "")
+            .has_value());
 }
 
 TEST(UtilsTest, MaybeBuildReuseIdentityAcceptsTenantSharedCanonicalKey) {
@@ -65,10 +65,10 @@ TEST(UtilsTest, BuildCanonicalObjectKeyMatchesLogicalIdentity) {
     config.logical_key = "logical-c";
 
     auto object_id = BuildLogicalObjectId("raw-key", config);
-    EXPECT_EQ(BuildCanonicalObjectKey(object_id.tenant_id, object_id.domain_id,
-                                      object_id.object_set,
-                                      object_id.logical_key),
-              "tenant-c/domain-c/set-c/logical-c");
+    EXPECT_EQ(
+        BuildCanonicalObjectKey(object_id.tenant_id, object_id.domain_id,
+                                object_id.object_set, object_id.logical_key),
+        "tenant-c/domain-c/set-c/logical-c");
 }
 
 TEST(UtilsTest, ByteSizeToString) {

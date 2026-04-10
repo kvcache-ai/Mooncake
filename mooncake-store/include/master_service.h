@@ -388,8 +388,7 @@ class MasterService {
         -> tl::expected<long, ErrorCode>;
     auto RemoveByRegexInScope(const std::string& str,
                               const std::string& tenant_id,
-                              const std::string& domain_id,
-                              bool force = false)
+                              const std::string& domain_id, bool force = false)
         -> tl::expected<long, ErrorCode>;
 
     /**
@@ -602,10 +601,21 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin = false)
+            bool enable_soft_pin, bool enable_hard_pin,
+            std::string tenant_id_, std::string domain_id_,
+            std::string object_set_, std::string sharing_scope_,
+            std::string qos_tier_, std::string logical_key_,
+            std::string canonical_key_)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              tenant_id(std::move(tenant_id_)),
+              domain_id(std::move(domain_id_)),
+              object_set(std::move(object_set_)),
+              sharing_scope(std::move(sharing_scope_)),
+              qos_tier(std::move(qos_tier_)),
+              logical_key(std::move(logical_key_)),
+              canonical_key(std::move(canonical_key_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -867,8 +877,7 @@ class MasterService {
         std::string domain_id;
 
         bool operator==(const TenantDomainKey& other) const {
-            return tenant_id == other.tenant_id &&
-                   domain_id == other.domain_id;
+            return tenant_id == other.tenant_id && domain_id == other.domain_id;
         }
     };
 
@@ -924,15 +933,14 @@ class MasterService {
             metadata GUARDED_BY(mutex);
         std::unordered_map<std::string, LogicalObjectId> raw_key_to_id
             GUARDED_BY(mutex);
-        std::unordered_map<TenantDomainKey,
-                           std::unordered_set<LogicalObjectId,
-                                              LogicalObjectIdHash>,
-                           TenantDomainKeyHash>
+        std::unordered_map<
+            TenantDomainKey,
+            std::unordered_set<LogicalObjectId, LogicalObjectIdHash>,
+            TenantDomainKeyHash>
             tenant_domain_keys GUARDED_BY(mutex);
-        std::unordered_map<ReuseKey,
-                           std::unordered_set<LogicalObjectId,
-                                              LogicalObjectIdHash>,
-                           ReuseKeyHash>
+        std::unordered_map<
+            ReuseKey, std::unordered_set<LogicalObjectId, LogicalObjectIdHash>,
+            ReuseKeyHash>
             reuse_candidates GUARDED_BY(mutex);
         std::unordered_set<LogicalObjectId, LogicalObjectIdHash> processing_keys
             GUARDED_BY(mutex);
@@ -995,18 +1003,17 @@ class MasterService {
     void UnindexMetadata(MetadataShard& shard, const LogicalObjectId& object_id,
                          const ObjectMetadata& metadata) const;
     void RebuildShardIndexes(MetadataShard& shard) const;
-    const std::unordered_set<LogicalObjectId, LogicalObjectIdHash>* FindScopedKeys(
-        const MetadataShard& shard, const std::string& tenant_id,
-        const std::string& domain_id) const;
+    const std::unordered_set<LogicalObjectId, LogicalObjectIdHash>*
+    FindScopedKeys(const MetadataShard& shard, const std::string& tenant_id,
+                   const std::string& domain_id) const;
 
     AdmissionRequestContext BuildAdmissionRequestContext(
         AdmissionRequestContext::Operation operation, const std::string& key,
         uint64_t value_length, const ReplicateConfig& config) const;
 
-    uint64_t ResolveAdmissionBytes(
-        const AdmissionRequestContext& context,
-        const MetadataShardAccessorRW& current_shard,
-        size_t current_shard_index) const;
+    uint64_t ResolveAdmissionBytes(const AdmissionRequestContext& context,
+                                   const MetadataShardAccessorRW& current_shard,
+                                   size_t current_shard_index) const;
 
     std::vector<std::string> ResolvePreferredSegments(
         const MetadataShardAccessorRW& current_shard,
@@ -1170,12 +1177,11 @@ class MasterService {
                                       logical_key.empty() ? key_ : logical_key};
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(object_id),
-                std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin, tenant_id, domain_id,
-                                      object_set, sharing_scope, qos_tier,
-                                      logical_key.empty() ? key_ : logical_key,
-                                      canonical_key));
+                std::forward_as_tuple(
+                    client_id, now, total_length, std::move(replicas),
+                    enable_soft_pin, enable_hard_pin, tenant_id, domain_id,
+                    object_set, sharing_scope, qos_tier,
+                    logical_key.empty() ? key_ : logical_key, canonical_key));
             it_ = result.first;
             it_->second.legacy_raw_key = key_;
             alias_it_ =
@@ -1228,7 +1234,8 @@ class MasterService {
 
         // Deserialize a single MetadataShard
         tl::expected<void, SerializationError> DeserializeShard(
-            const msgpack::object& obj, MetadataShard& shard);
+            const msgpack::object& obj, size_t shard_index,
+            uint64_t* max_restored_replica_id);
 
         // Serialize discarded replicas
         tl::expected<void, SerializationError> SerializeDiscardedReplicas(
@@ -1236,7 +1243,7 @@ class MasterService {
 
         // Deserialize discarded replicas
         tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
-            const msgpack::object& obj);
+            const msgpack::object& obj, uint64_t* max_restored_replica_id);
     };
 
     friend class MetadataAccessor;
@@ -1279,7 +1286,8 @@ class MasterService {
         const std::string key_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
-        std::unordered_map<std::string, LogicalObjectId>::const_iterator alias_it_;
+        std::unordered_map<std::string, LogicalObjectId>::const_iterator
+            alias_it_;
         std::unordered_map<LogicalObjectId, ObjectMetadata,
                            LogicalObjectIdHash>::const_iterator it_;
         std::unordered_set<LogicalObjectId, LogicalObjectIdHash>::const_iterator

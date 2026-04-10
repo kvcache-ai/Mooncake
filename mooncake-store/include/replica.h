@@ -107,7 +107,17 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node
+           << ", prefer_domain_locality: " << config.prefer_domain_locality
+           << ", prefer_object_set_locality: "
+           << config.prefer_object_set_locality
+           << ", tenant_id: " << config.tenant_id
+           << ", domain_id: " << config.domain_id
+           << ", object_set: " << config.object_set
+           << ", sharing_scope: " << config.sharing_scope
+           << ", qos_tier: " << config.qos_tier
+           << ", logical_key: " << config.logical_key
+           << ", canonical_key: " << config.canonical_key << " }";
         return os;
     }
 };
@@ -119,8 +129,7 @@ struct LogicalObjectId {
     std::string logical_key{};
 
     bool operator==(const LogicalObjectId& other) const {
-        return tenant_id == other.tenant_id &&
-               domain_id == other.domain_id &&
+        return tenant_id == other.tenant_id && domain_id == other.domain_id &&
                object_set == other.object_set &&
                logical_key == other.logical_key;
     }
@@ -142,8 +151,7 @@ struct ReuseIdentity {
     std::string canonical_key{};
 
     bool operator==(const ReuseIdentity& other) const {
-        return tenant_id == other.tenant_id &&
-               domain_id == other.domain_id &&
+        return tenant_id == other.tenant_id && domain_id == other.domain_id &&
                sharing_scope == other.sharing_scope &&
                canonical_key == other.canonical_key;
     }

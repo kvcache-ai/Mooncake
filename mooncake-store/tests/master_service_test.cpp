@@ -419,6 +419,87 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
 }
 
+TEST_F(MasterServiceTest, QuotaAdmissionStillRejectsInvalidParamsFirst) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(1024)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 0;
+    auto put_result =
+        service_->PutStart(client_id, "invalid_put", 1024, config);
+    ASSERT_FALSE(put_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result.error());
+
+    config.replica_num = 1;
+    auto upsert_result =
+        service_->UpsertStart(client_id, "invalid_upsert", 0, config);
+    ASSERT_FALSE(upsert_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert_result.error());
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionRejectsPutAndIsolatesLabels) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(1024)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig tenant_a_config;
+    tenant_a_config.replica_num = 1;
+    tenant_a_config.tenant_id = "tenant-a";
+    tenant_a_config.domain_id = "domain-a";
+    tenant_a_config.object_set = "set-a";
+
+    auto put_a1 =
+        service_->PutStart(client_id, "tenant_a_key_1", 1024, tenant_a_config);
+    ASSERT_TRUE(put_a1.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "tenant_a_key_1", ReplicaType::MEMORY)
+            .has_value());
+
+    auto put_a2 =
+        service_->PutStart(client_id, "tenant_a_key_2", 1, tenant_a_config);
+    ASSERT_FALSE(put_a2.has_value());
+    EXPECT_EQ(ErrorCode::QUOTA_EXCEEDED, put_a2.error());
+
+    ReplicateConfig tenant_b_config = tenant_a_config;
+    tenant_b_config.tenant_id = "tenant-b";
+    auto put_b =
+        service_->PutStart(client_id, "tenant_b_key_1", 1024, tenant_b_config);
+    ASSERT_TRUE(put_b.has_value());
+}
+
+TEST_F(MasterServiceTest, QuotaAdmissionDoesNotMaskAllocatorExhaustion) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(64 * 1024 * 1024)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.tenant_id = "tenant-a";
+    config.domain_id = "domain-a";
+    config.object_set = "set-a";
+
+    auto put_result = service_->PutStart(client_id, "allocator_exhaustion",
+                                         32 * 1024 * 1024, config);
+    ASSERT_FALSE(put_result.has_value());
+    EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, put_result.error());
+}
+
 TEST_F(MasterServiceTest, PutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
@@ -2961,6 +3042,309 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     service_->RemoveAll();
 }
 
+TEST_F(MasterServiceTest, TenantFairEvictionPrefersLargerTenant) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.25)
+                              .set_enable_tenant_fair_eviction(true)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 16;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key,
+                          const std::string& tenant_id) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = tenant_id;
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    };
+
+    std::vector<std::string> tenant_a_keys;
+    std::vector<std::string> tenant_b_keys;
+    for (int i = 0; i < 8; ++i) {
+        tenant_a_keys.push_back("tenant_a_" + std::to_string(i));
+        put_object(tenant_a_keys.back(), "tenant-a");
+    }
+    for (int i = 0; i < 2; ++i) {
+        tenant_b_keys.push_back("tenant_b_" + std::to_string(i));
+        put_object(tenant_b_keys.back(), "tenant-b");
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    int failed_puts = 0;
+    for (int i = 0; i < 16; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-c";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        const std::string key = "tenant_c_" + std::to_string(i);
+        if (service_->PutStart(client_id, key, value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 1000));
+
+    int tenant_a_survivors = 0;
+    for (const auto& key : tenant_a_keys) {
+        if (service_->GetReplicaList(key).has_value()) {
+            tenant_a_survivors++;
+        }
+    }
+    int tenant_b_survivors = 0;
+    for (const auto& key : tenant_b_keys) {
+        if (service_->GetReplicaList(key).has_value()) {
+            tenant_b_survivors++;
+        }
+    }
+
+    EXPECT_LT(tenant_a_survivors, static_cast<int>(tenant_a_keys.size()));
+    EXPECT_EQ(tenant_b_survivors, static_cast<int>(tenant_b_keys.size()));
+
+    service_->RemoveAll();
+}
+
+TEST_F(MasterServiceTest,
+       QosTierEvictionPrefersLowerTierWithinUnpinnedObjects) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& qos_tier,
+                          bool with_soft_pin = false) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = qos_tier;
+        config.with_soft_pin = with_soft_pin;
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    };
+
+    put_object("background_old", "background");
+    put_object("latency_old", "latency_critical");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        put_object("filler_" + std::to_string(i), "default");
+    }
+
+    int failed_puts = 0;
+    for (int i = 0; i < 4; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = "default";
+        if (service_
+                ->PutStart(client_id, "trigger_" + std::to_string(i),
+                           value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_
+                            ->PutEnd(client_id, "trigger_" + std::to_string(i),
+                                     ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto background_exists = service_->ExistKey("background_old");
+    auto latency_exists = service_->ExistKey("latency_old");
+    ASSERT_TRUE(background_exists.has_value());
+    ASSERT_TRUE(latency_exists.has_value());
+    EXPECT_FALSE(background_exists.value());
+    EXPECT_TRUE(latency_exists.value());
+
+    service_->RemoveAll(true);
+}
+
+TEST_F(MasterServiceTest, UnknownQosTierFallsBackToDefaultRank) {
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& qos_tier) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = qos_tier;
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    };
+
+    put_object("default_old", "default");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    put_object("unknown_old", "mystery-tier");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        put_object("filler_" + std::to_string(i), "default");
+    }
+
+    int failed_puts = 0;
+    for (int i = 0; i < 4; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = "default";
+        if (service_
+                ->PutStart(client_id, "trigger_" + std::to_string(i),
+                           value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_
+                            ->PutEnd(client_id, "trigger_" + std::to_string(i),
+                                     ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto default_exists = service_->ExistKey("default_old");
+    auto unknown_exists = service_->ExistKey("unknown_old");
+    ASSERT_TRUE(default_exists.has_value());
+    ASSERT_TRUE(unknown_exists.has_value());
+    EXPECT_FALSE(default_exists.value());
+    EXPECT_TRUE(unknown_exists.value());
+
+    service_->RemoveAll(true);
+}
+
+TEST_F(MasterServiceTest, QosTierDoesNotBypassSoftPinProtectionBoundary) {
+    const uint64_t kv_lease_ttl = 200;
+    const uint64_t kv_soft_pin_ttl = 10000;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
+                              .set_allow_evict_soft_pinned_objects(true)
+                              .set_eviction_ratio(0.1)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t segment_size = 1024 * 1024 * 8;
+    constexpr size_t value_size = 1024 * 1024;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, segment_size);
+
+    auto put_object = [&](const std::string& key, const std::string& qos_tier,
+                          bool with_soft_pin = false) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-a";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = qos_tier;
+        config.with_soft_pin = with_soft_pin;
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, value_size, config).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    };
+
+    put_object("soft_background_old", "background", true);
+    put_object("default_old", "default");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
+
+    for (int i = 0; i < 6; ++i) {
+        put_object("filler_" + std::to_string(i), "default");
+    }
+
+    int failed_puts = 0;
+    for (int i = 0; i < 4; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.tenant_id = "tenant-b";
+        config.domain_id = "domain-a";
+        config.object_set = "set-a";
+        config.qos_tier = "default";
+        if (service_
+                ->PutStart(client_id, "trigger_" + std::to_string(i),
+                           value_size, config)
+                .has_value()) {
+            ASSERT_TRUE(service_
+                            ->PutEnd(client_id, "trigger_" + std::to_string(i),
+                                     ReplicaType::MEMORY)
+                            .has_value());
+        } else {
+            failed_puts++;
+        }
+    }
+    ASSERT_GT(failed_puts, 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
+
+    auto soft_exists = service_->ExistKey("soft_background_old");
+    auto default_exists = service_->ExistKey("default_old");
+    ASSERT_TRUE(soft_exists.has_value());
+    ASSERT_TRUE(default_exists.has_value());
+    EXPECT_TRUE(soft_exists.value());
+    EXPECT_FALSE(default_exists.value());
+
+    service_->RemoveAll(true);
+}
+
 TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
@@ -4731,11 +5115,11 @@ TEST_F(MasterServiceTest, UpsertDifferentSize) {
 }
 
 TEST_F(MasterServiceTest, QuotaAdmissionBypassesSameSizeUpsert) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_admission_strategy_type(
-                                  AdmissionStrategyType::QUOTA)
-                              .set_admission_quota_bytes(2048)
-                              .build();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(2048)
+            .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -4746,8 +5130,8 @@ TEST_F(MasterServiceTest, QuotaAdmissionBypassesSameSizeUpsert) {
     config.domain_id = "domain-upsert-same-size";
     config.object_set = "set-upsert-same-size";
 
-    auto put_result = service_->PutStart(client_id, "same_size_upsert", 1024,
-                                         config);
+    auto put_result =
+        service_->PutStart(client_id, "same_size_upsert", 1024, config);
     ASSERT_TRUE(put_result.has_value());
     ASSERT_TRUE(
         service_->PutEnd(client_id, "same_size_upsert", ReplicaType::MEMORY)
@@ -4762,11 +5146,11 @@ TEST_F(MasterServiceTest, QuotaAdmissionBypassesSameSizeUpsert) {
 }
 
 TEST_F(MasterServiceTest, QuotaAdmissionRejectsDifferentSizeUpsert) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_admission_strategy_type(
-                                  AdmissionStrategyType::QUOTA)
-                              .set_admission_quota_bytes(2048)
-                              .build();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(2048)
+            .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -4777,8 +5161,8 @@ TEST_F(MasterServiceTest, QuotaAdmissionRejectsDifferentSizeUpsert) {
     config.domain_id = "domain-upsert-diff-size";
     config.object_set = "set-upsert-diff-size";
 
-    auto put_result = service_->PutStart(client_id, "diff_size_upsert", 1024,
-                                         config);
+    auto put_result =
+        service_->PutStart(client_id, "diff_size_upsert", 1024, config);
     ASSERT_TRUE(put_result.has_value());
     ASSERT_TRUE(
         service_->PutEnd(client_id, "diff_size_upsert", ReplicaType::MEMORY)
@@ -4791,11 +5175,11 @@ TEST_F(MasterServiceTest, QuotaAdmissionRejectsDifferentSizeUpsert) {
 }
 
 TEST_F(MasterServiceTest, QuotaAdmissionTenantSharedReusesCanonicalBytes) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_admission_strategy_type(
-                                  AdmissionStrategyType::QUOTA)
-                              .set_admission_quota_bytes(1024)
-                              .build();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(1024)
+            .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -4808,29 +5192,28 @@ TEST_F(MasterServiceTest, QuotaAdmissionTenantSharedReusesCanonicalBytes) {
     config.sharing_scope = "tenant_shared";
     config.canonical_key = "tenant-shared/domain-shared/set-shared/object-a";
 
-    auto put_first = service_->PutStart(client_id, "tenant_shared_key_1", 1024,
-                                        config);
+    auto put_first =
+        service_->PutStart(client_id, "tenant_shared_key_1", 1024, config);
     ASSERT_TRUE(put_first.has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "tenant_shared_key_1",
-                             ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "tenant_shared_key_1", ReplicaType::MEMORY)
+            .has_value());
 
     auto put_second =
         service_->PutStart(client_id, "tenant_shared_key_2", 1024, config);
     ASSERT_TRUE(put_second.has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "tenant_shared_key_2",
-                             ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, "tenant_shared_key_2", ReplicaType::MEMORY)
+            .has_value());
 }
 
-TEST_F(MasterServiceTest, QuotaAdmissionPrivateScopeStillChargesDuplicateBytes) {
-    auto service_config = MasterServiceConfig::builder()
-                              .set_admission_strategy_type(
-                                  AdmissionStrategyType::QUOTA)
-                              .set_admission_quota_bytes(1024)
-                              .build();
+TEST_F(MasterServiceTest,
+       QuotaAdmissionPrivateScopeStillChargesDuplicateBytes) {
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_admission_strategy_type(AdmissionStrategyType::QUOTA)
+            .set_admission_quota_bytes(1024)
+            .build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -4841,8 +5224,7 @@ TEST_F(MasterServiceTest, QuotaAdmissionPrivateScopeStillChargesDuplicateBytes) 
     config.domain_id = "domain-private";
     config.object_set = "set-private";
     config.sharing_scope = "private";
-    config.canonical_key =
-        "tenant-private/domain-private/set-private/object-a";
+    config.canonical_key = "tenant-private/domain-private/set-private/object-a";
 
     auto put_first =
         service_->PutStart(client_id, "private_key_1", 1024, config);
@@ -4870,9 +5252,10 @@ TEST_F(MasterServiceTest, ScopedMetadataQueriesStayWithinTenantDomain) {
         config.tenant_id = tenant_id;
         config.domain_id = domain_id;
         config.object_set = "set-a";
-        ASSERT_TRUE(service_->PutStart(client_id, key, 1024, config).has_value());
-        ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
-                        .has_value());
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, 1024, config).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     };
 
     put_object("scope_a_foo", "tenant-a", "domain-a");
@@ -4890,8 +5273,8 @@ TEST_F(MasterServiceTest, ScopedMetadataQueriesStayWithinTenantDomain) {
     EXPECT_FALSE(key_set.contains("scope_b_foo"));
     EXPECT_FALSE(key_set.contains("scope_c_foo"));
 
-    auto scoped_regex = service_->GetReplicaListByRegexInScope(
-        "foo$", "tenant-a", "domain-a");
+    auto scoped_regex =
+        service_->GetReplicaListByRegexInScope("foo$", "tenant-a", "domain-a");
     ASSERT_TRUE(scoped_regex.has_value());
     EXPECT_EQ(1u, scoped_regex->size());
     EXPECT_TRUE(scoped_regex->contains("scope_a_foo"));
@@ -5176,13 +5559,11 @@ TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
 
 TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
     std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context0 =
-        PrepareSimpleSegment(*service_, "segment_0", kDefaultSegmentBase,
-                             kDefaultSegmentSize);
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1",
-                             kDefaultSegmentBase + kDefaultSegmentSize,
-                             kDefaultSegmentSize);
+    [[maybe_unused]] const auto context0 = PrepareSimpleSegment(
+        *service_, "segment_0", kDefaultSegmentBase, kDefaultSegmentSize);
+    [[maybe_unused]] const auto context1 = PrepareSimpleSegment(
+        *service_, "segment_1", kDefaultSegmentBase + kDefaultSegmentSize,
+        kDefaultSegmentSize);
     const UUID client_id = generate_uuid();
 
     ReplicateConfig domain_a;
@@ -5191,7 +5572,8 @@ TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
     domain_a.tenant_id = "tenant-a";
     domain_a.domain_id = "domain-a";
     domain_a.object_set = "set-a";
-    auto put_a = service_->PutStart(client_id, "domain_object_a", 1024, domain_a);
+    auto put_a =
+        service_->PutStart(client_id, "domain_object_a", 1024, domain_a);
     ASSERT_TRUE(put_a.has_value());
     ASSERT_TRUE(
         service_->PutEnd(client_id, "domain_object_a", ReplicaType::MEMORY)
@@ -5203,7 +5585,8 @@ TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
     domain_b.tenant_id = "tenant-b";
     domain_b.domain_id = "domain-b";
     domain_b.object_set = "set-b";
-    auto put_b = service_->PutStart(client_id, "domain_object_b", 1024, domain_b);
+    auto put_b =
+        service_->PutStart(client_id, "domain_object_b", 1024, domain_b);
     ASSERT_TRUE(put_b.has_value());
     ASSERT_TRUE(
         service_->PutEnd(client_id, "domain_object_b", ReplicaType::MEMORY)
@@ -5216,13 +5599,12 @@ TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
     hinted.object_set = "set-b";
     hinted.prefer_domain_locality = true;
     hinted.prefer_object_set_locality = true;
-    auto hinted_put = service_->PutStart(client_id, "domain_object_c", 1024,
-                                         hinted);
+    auto hinted_put =
+        service_->PutStart(client_id, "domain_object_c", 1024, hinted);
     ASSERT_TRUE(hinted_put.has_value());
-    EXPECT_EQ("segment_1",
-              hinted_put.value()[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ("segment_1", hinted_put.value()[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
     ASSERT_TRUE(
         service_->PutEnd(client_id, "domain_object_c", ReplicaType::MEMORY)
             .has_value());
@@ -5231,13 +5613,11 @@ TEST_F(MasterServiceTest, ResolvePreferredSegmentsUsesDomainAndObjectSetHints) {
 TEST_F(MasterServiceTest,
        DomainObjectSetLocalityHintsIgnoreOtherTenantsInSameDomain) {
     std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context0 =
-        PrepareSimpleSegment(*service_, "segment_0", kDefaultSegmentBase,
-                             kDefaultSegmentSize);
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1",
-                             kDefaultSegmentBase + kDefaultSegmentSize,
-                             kDefaultSegmentSize);
+    [[maybe_unused]] const auto context0 = PrepareSimpleSegment(
+        *service_, "segment_0", kDefaultSegmentBase, kDefaultSegmentSize);
+    [[maybe_unused]] const auto context1 = PrepareSimpleSegment(
+        *service_, "segment_1", kDefaultSegmentBase + kDefaultSegmentSize,
+        kDefaultSegmentSize);
     const UUID client_id = generate_uuid();
 
     ReplicateConfig tenant_a;
@@ -5249,10 +5629,10 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(
         service_->PutStart(client_id, "tenant_a_locality_seed", 1024, tenant_a)
             .has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "tenant_a_locality_seed",
-                             ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client_id, "tenant_a_locality_seed", ReplicaType::MEMORY)
+            .has_value());
 
     ReplicateConfig tenant_b;
     tenant_b.replica_num = 1;
@@ -5263,10 +5643,10 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(
         service_->PutStart(client_id, "tenant_b_locality_seed", 1024, tenant_b)
             .has_value());
-    ASSERT_TRUE(service_
-                    ->PutEnd(client_id, "tenant_b_locality_seed",
-                             ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client_id, "tenant_b_locality_seed", ReplicaType::MEMORY)
+            .has_value());
 
     ReplicateConfig hinted;
     hinted.replica_num = 1;
@@ -5278,13 +5658,13 @@ TEST_F(MasterServiceTest,
     auto hinted_put =
         service_->PutStart(client_id, "tenant_a_locality_target", 1024, hinted);
     ASSERT_TRUE(hinted_put.has_value());
-    EXPECT_EQ("segment_0",
-              hinted_put.value()[0]
-                  .get_memory_descriptor()
-                  .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ("segment_0", hinted_put.value()[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
 }
 
-TEST_F(MasterServiceTest, DomainObjectSetPressureDrivesEvictionWithinTenantTier) {
+TEST_F(MasterServiceTest,
+       DomainObjectSetPressureDrivesEvictionWithinTenantTier) {
     const uint64_t kv_lease_ttl = 200;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
@@ -5307,8 +5687,8 @@ TEST_F(MasterServiceTest, DomainObjectSetPressureDrivesEvictionWithinTenantTier)
         config.domain_id = domain_id;
         config.object_set = object_set;
         config.qos_tier = "default";
-        ASSERT_TRUE(service_->PutStart(client_id, key, value_size, config)
-                        .has_value());
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, value_size, config).has_value());
         ASSERT_TRUE(
             service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     };
@@ -5327,8 +5707,9 @@ TEST_F(MasterServiceTest, DomainObjectSetPressureDrivesEvictionWithinTenantTier)
         config.domain_id = "domain-z";
         config.object_set = "set-z";
         config.qos_tier = "default";
-        if (service_->PutStart(client_id, "evict_trigger_" + std::to_string(i),
-                               value_size, config)
+        if (service_
+                ->PutStart(client_id, "evict_trigger_" + std::to_string(i),
+                           value_size, config)
                 .has_value()) {
             ASSERT_TRUE(service_
                             ->PutEnd(client_id,
@@ -5348,7 +5729,8 @@ TEST_F(MasterServiceTest, DomainObjectSetPressureDrivesEvictionWithinTenantTier)
     ASSERT_TRUE(domain_a_1.has_value());
     ASSERT_TRUE(domain_a_2.has_value());
     ASSERT_TRUE(domain_b_0.has_value());
-    EXPECT_FALSE(domain_a_0.value() && domain_a_1.value() && domain_a_2.value());
+    EXPECT_FALSE(domain_a_0.value() && domain_a_1.value() &&
+                 domain_a_2.value());
     EXPECT_TRUE(domain_b_0.value());
 
     service_->RemoveAll(true);

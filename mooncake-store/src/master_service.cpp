@@ -74,6 +74,81 @@ int64_t CurrentTimeMs() {
 
 }  // namespace
 
+tl::expected<SnapshotMetadataFields, SerializationError>
+ParseSnapshotMetadataFields(const msgpack::object& object) {
+    if (object.type != msgpack::type::ARRAY) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "snapshot metadata entry is not an array"));
+    }
+    if (object.via.array.size < 7) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "snapshot metadata entry is too short"));
+    }
+
+    try {
+        SnapshotMetadataFields fields;
+        msgpack::object* array = object.via.array.ptr;
+        uint32_t index = 0;
+
+        std::string client_id_str = array[index++].as<std::string>();
+        if (!StringToUuid(client_id_str, fields.client_id)) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot metadata entry has invalid client UUID: " +
+                    client_id_str));
+        }
+
+        fields.put_start_time_ms = array[index++].as<uint64_t>();
+        fields.size = array[index++].as<uint64_t>();
+        fields.lease_timeout_ms = array[index++].as<uint64_t>();
+        fields.has_soft_pin_timeout = array[index++].as<bool>();
+        fields.soft_pin_timeout_ms = array[index++].as<uint64_t>();
+
+        const uint32_t legacy_base_size = 7;
+        const uint32_t extended_base_size = 14;
+        const bool has_extended_metadata =
+            object.via.array.size >= extended_base_size &&
+            array[6].type == msgpack::type::STR;
+        if (has_extended_metadata) {
+            fields.tenant_id = array[index++].as<std::string>();
+            fields.domain_id = array[index++].as<std::string>();
+            fields.object_set = array[index++].as<std::string>();
+            fields.sharing_scope = array[index++].as<std::string>();
+            fields.qos_tier = array[index++].as<std::string>();
+            fields.logical_key = array[index++].as<std::string>();
+            fields.canonical_key = array[index++].as<std::string>();
+        }
+
+        fields.replica_count = array[index++].as<uint32_t>();
+        if (object.via.array.size != legacy_base_size + fields.replica_count &&
+            object.via.array.size !=
+                legacy_base_size + fields.replica_count + 1 &&
+            object.via.array.size !=
+                extended_base_size + fields.replica_count &&
+            object.via.array.size !=
+                extended_base_size + fields.replica_count + 1) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("snapshot metadata entry replica count mismatch: "
+                            "replicas={}, total_fields={}",
+                            fields.replica_count, object.via.array.size)));
+        }
+
+        fields.replica_index = index;
+        if (index + fields.replica_count < object.via.array.size) {
+            fields.hard_pinned = array[index + fields.replica_count].as<bool>();
+        }
+        return fields;
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "failed to parse snapshot metadata entry: " +
+                                   std::string(e.what())));
+    }
+}
+
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -397,8 +472,8 @@ std::optional<MasterService::ReuseKey> MasterService::MaybeBuildReuseKey(
         context.canonical_key.empty()) {
         return std::nullopt;
     }
-    return ReuseKey{context.tenant_id, context.domain_id,
-                    context.sharing_scope, context.canonical_key};
+    return ReuseKey{context.tenant_id, context.domain_id, context.sharing_scope,
+                    context.canonical_key};
 }
 
 void MasterService::IndexMetadata(MetadataShard& shard,
@@ -415,8 +490,8 @@ void MasterService::UnindexMetadata(MetadataShard& shard,
                                     const LogicalObjectId& object_id,
                                     const ObjectMetadata& metadata) const {
     shard.raw_key_to_id.erase(metadata.legacy_raw_key);
-    auto tenant_domain_it = shard.tenant_domain_keys.find(
-        BuildTenantDomainKey(metadata));
+    auto tenant_domain_it =
+        shard.tenant_domain_keys.find(BuildTenantDomainKey(metadata));
     if (tenant_domain_it != shard.tenant_domain_keys.end()) {
         tenant_domain_it->second.erase(object_id);
         if (tenant_domain_it->second.empty()) {
@@ -1049,8 +1124,8 @@ std::vector<std::string> MasterService::ResolvePreferredSegments(
 
     std::unordered_map<std::string, size_t> segment_hits;
     auto accumulate_segment_hits = [&](const auto& shard) {
-        auto scoped_keys =
-            FindScopedKeys(*shard.operator->(), config.tenant_id, config.domain_id);
+        auto scoped_keys = FindScopedKeys(*shard.operator->(), config.tenant_id,
+                                          config.domain_id);
         if (scoped_keys == nullptr) {
             return;
         }
@@ -1162,12 +1237,11 @@ auto MasterService::AllocateAndInsertMetadata(
 
     auto [metadata_it, inserted] = shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(object_id),
-        std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin,
-                              object_id.tenant_id, object_id.domain_id,
-                              object_id.object_set, config.sharing_scope,
-                              config.qos_tier, object_id.logical_key,
-                              canonical_key));
+        std::forward_as_tuple(
+            client_id, now, value_length, std::move(replicas),
+            config.with_soft_pin, config.with_hard_pin, object_id.tenant_id,
+            object_id.domain_id, object_id.object_set, config.sharing_scope,
+            config.qos_tier, object_id.logical_key, canonical_key));
     metadata_it->second.legacy_raw_key = key;
     IndexMetadata(*shard.operator->(), metadata_it->first, metadata_it->second);
     shard->processing_keys.insert(key);
@@ -3737,9 +3811,11 @@ bool MasterService::TryRestoreStateFromSnapshot(
                 "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
             if (!skip_cleanup) {
                 auto cleanup_now = now;
-                for (auto& shard : metadata_shards_) {
-                    for (auto it = shard.metadata.begin();
-                         it != shard.metadata.end();) {
+                for (size_t shard_idx = 0; shard_idx < kNumShards;
+                     ++shard_idx) {
+                    MetadataShardAccessorRW shard(this, shard_idx);
+                    for (auto it = shard->metadata.begin();
+                         it != shard->metadata.end();) {
                         if (it->second.HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
                             (it->second.IsLeaseExpired(cleanup_now) &&
@@ -3773,6 +3849,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
 
             MasterMetricManager::instance().reset_allocated_mem_size();
+            MasterMetricManager::instance()
+                .reset_all_labeled_inventory_metrics();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance()
                     .reset_segment_allocated_mem_size(segment_name);
@@ -3963,7 +4041,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                               [](const EvictionCandidate& lhs,
                                  const EvictionCandidate& rhs) {
                                   if (lhs.lease_timeout != rhs.lease_timeout) {
-                                      return lhs.lease_timeout < rhs.lease_timeout;
+                                      return lhs.lease_timeout <
+                                             rhs.lease_timeout;
                                   }
                                   return lhs.logical_key < rhs.logical_key;
                               });
@@ -4009,7 +4088,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                         const uint64_t tenant_pressure =
                             tenant_live_bytes[tenant_id];
-                        const uint64_t group_pressure = group_live_bytes[group_key];
+                        const uint64_t group_pressure =
+                            group_live_bytes[group_key];
                         const auto timeout = candidates[idx].lease_timeout;
                         const bool prefer_candidate =
                             !found_candidate || timeout < selected_timeout ||
@@ -4049,8 +4129,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto& tenant_id = *selected_tenant;
             auto& group_key = *selected_group;
             auto& candidates = buckets[selected_tier][group_key][tenant_id];
-            auto& idx = next_candidate_index[
-                bucket_index_key(selected_tier, group_key, tenant_id)];
+            auto& idx = next_candidate_index[bucket_index_key(
+                selected_tier, group_key, tenant_id)];
             const auto candidate = candidates[idx++];
 
             MetadataShardAccessorRW shard(
@@ -4096,8 +4176,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     const long first_pass_target = std::min(
-        static_cast<long>(std::ceil(object_count * evict_ratio_target)),
-        [&]() {
+        static_cast<long>(std::ceil(object_count * evict_ratio_target)), [&]() {
             long total = 0;
             for (const auto& [_, group_buckets] : no_pin_buckets) {
                 for (const auto& [_, tenant_buckets] : group_buckets) {
@@ -4502,9 +4581,8 @@ MasterService::MetadataSerializer::Deserialize(
 
         const msgpack::object& shard_obj = shard_oh.get();
 
-        // Get shard reference and deserialize
-        auto& shard = service_->metadata_shards_[shard_idx];
-        auto result = DeserializeShard(shard_obj, shard);
+        auto result =
+            DeserializeShard(shard_obj, shard_idx, &max_restored_replica_id);
         if (!result) {
             return tl::make_unexpected(SerializationError(
                 result.error().code,
@@ -4519,7 +4597,8 @@ MasterService::MetadataSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL,
             "Missing required field 'discarded_replicas' in snapshot data"));
     }
-    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
+    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj,
+                                                  &max_restored_replica_id);
     if (!dr_result) {
         return tl::make_unexpected(
             SerializationError(dr_result.error().code,
@@ -4534,6 +4613,14 @@ MasterService::MetadataSerializer::Deserialize(
             "Missing required field 'replica_next_id' in snapshot data"));
     }
     auto next_id = replica_next_id_obj->as<uint64_t>();
+    const uint64_t min_next_id = max_restored_replica_id + 1;
+    if (next_id < min_next_id) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format(
+                "replica_next_id {} is smaller than restored minimum {}",
+                next_id, min_next_id)));
+    }
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
 
@@ -4587,8 +4674,7 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
             return tl::make_unexpected(SerializationError(
                 result.error().code,
                 fmt::format("Failed to serialize metadata for key '{}': {}",
-                            metadata->legacy_raw_key,
-                            result.error().message)));
+                            metadata->legacy_raw_key, result.error().message)));
         }
     }
 
@@ -4653,12 +4739,11 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         auto metadata_ptr = std::move(metadata_result.value());
         metadata_ptr->legacy_raw_key = key;
-        LogicalObjectId object_id{metadata_ptr->tenant_id,
-                                  metadata_ptr->domain_id,
-                                  metadata_ptr->object_set,
-                                  metadata_ptr->logical_key.empty()
-                                      ? key
-                                      : metadata_ptr->logical_key};
+        LogicalObjectId object_id{
+            metadata_ptr->tenant_id, metadata_ptr->domain_id,
+            metadata_ptr->object_set,
+            metadata_ptr->logical_key.empty() ? key
+                                              : metadata_ptr->logical_key};
         auto [it, inserted] = shard->metadata.emplace(
             std::piecewise_construct, std::forward_as_tuple(object_id),
             std::forward_as_tuple(
@@ -4825,17 +4910,16 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         is_hard_pinned = array[index++].as<bool>();
     }
 
-    // Create ObjectMetadata instance
-    bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned);
+        size, std::move(replicas), has_soft_pin_timeout, is_hard_pinned,
+        tenant_id, domain_id, object_set, sharing_scope, qos_tier,
+        logical_key, canonical_key);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
-    // Set soft_pin_timeout (if exists)
     if (has_soft_pin_timeout) {
         metadata->soft_pin_timeout.emplace(
             std::chrono::system_clock::time_point(
