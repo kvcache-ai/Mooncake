@@ -60,7 +60,7 @@ static Status configureLaneCount(std::shared_ptr<Config> conf,
         std::stringstream ss;
         ss << "Invalid RDMA " << name << ": " << value
            << ", expected a positive integer";
-        return Status::InvalidArgument(ss.str() LOC_MARK);
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
     };
 
     auto status = validate_positive(num_lanes, "num_lanes");
@@ -89,7 +89,7 @@ static Status configureLaneCount(std::shared_ptr<Config> conf,
         ss << "Inconsistent RDMA lane configuration: " << name << "=" << value
            << " but expected lane count " << lane_count
            << " so worker/QP/CQ counts stay aligned";
-        return Status::InvalidArgument(ss.str() LOC_MARK);
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
     };
 
     status = validate_match(num_cq_list, "device.num_cq_list");
