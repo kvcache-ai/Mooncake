@@ -1823,8 +1823,9 @@ fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
         .iter()
         .map(|replica| replica.owner.clone())
         .collect::<BTreeSet<_>>();
-    assert!(owners.contains(client.runtime_id()));
-    assert!(owners.contains(&owner_a) || owners.contains(&owner_b));
+    assert!(!owners.contains(client.runtime_id()));
+    assert!(owners.contains(&owner_a));
+    assert!(owners.contains(&owner_b));
 
     for replica in &route.replicas {
         let (base, len) = transport
@@ -3677,7 +3678,7 @@ fn routed_batch_put_prefers_local_before_spilling_remote() {
     let client = StoreClientBuilder::new(metadata, "router-local-first")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
-        .label("storage", "false")
+        .label("storage", "true")
         .transport(transport)
         .local_memory(storage_config_with_bytes(8))
         .routed_writes(planner, 1)
@@ -3703,6 +3704,54 @@ fn routed_batch_put_prefers_local_before_spilling_remote() {
     assert_eq!(
         client
             .get("batch-spill-b")
+            .expect("second batch get should succeed"),
+        b"ijklmnop"
+    );
+}
+
+#[test]
+fn routed_batch_put_ignores_local_segments_when_storage_role_is_disabled() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("router-local-disabled-segment"));
+    let remote_owner = publish_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-batch-disabled",
+        "seg-batch-disabled",
+        "pool-a",
+        1024,
+        1,
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let client = StoreClientBuilder::new(metadata, "router-local-disabled")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(8))
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("client build should succeed");
+
+    let routes = client
+        .batch_put(&[
+            PutRequest::new("batch-remote-a", b"abcdefgh"),
+            PutRequest::new("batch-remote-b", b"ijklmnop"),
+        ])
+        .expect("batch put should succeed");
+
+    assert_eq!(routes.len(), 2);
+    assert_eq!(routes[0].replicas[0].owner, remote_owner);
+    assert_eq!(routes[1].replicas[0].owner, remote_owner);
+    assert_eq!(
+        client
+            .get("batch-remote-a")
+            .expect("first batch get should succeed"),
+        b"abcdefgh"
+    );
+    assert_eq!(
+        client
+            .get("batch-remote-b")
             .expect("second batch get should succeed"),
         b"ijklmnop"
     );

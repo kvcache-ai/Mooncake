@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +14,7 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, HandoffKind, MetadataBackend,
-    ObjectKey, Result, SegmentLifecycleState, SegmentName, StoreError,
+    ObjectKey, Result, SegmentLifecycleState, StoreError,
 };
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
@@ -40,7 +41,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(128);
-    let keyspace = MetadataKeyspace::new(format!("mc/store-rs/e2e/{}", unique_suffix()));
+    let run_id = unique_suffix();
+    let keyspace = MetadataKeyspace::new(format!("mc/store-rs/e2e/{run_id}"));
     let metadata = Arc::new(RedisMetadataBackend::new(
         RedisMetadataConfig::new(redis_url).keyspace(keyspace),
     )?);
@@ -55,16 +57,46 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "dynamic-membership".to_string(),
         ]);
 
-    let target_a_bundle = build_tent_bundle(redis_port, "target-a-segment")?;
-    let target_b_bundle = build_tent_bundle(redis_port, "target-b-segment")?;
-    let target_c_bundle = build_tent_bundle(redis_port, "target-c-segment")?;
-    let upgrade_bundle = build_tent_bundle(redis_port, "target-a-upgrade-segment")?;
-    let reclaim_bundle = build_tent_bundle(redis_port, "target-reclaim-segment")?;
-    let router_bundle = build_tent_bundle(redis_port, "router-segment")?;
-    let router_replica_bundle = build_tent_bundle(redis_port, "router-replica-segment")?;
-    let reader_bundle = build_tent_bundle(redis_port, "reader-segment")?;
-    let elastic_target_bundle = build_tent_bundle(redis_port, "elastic-target-segment")?;
-    let elastic_router_bundle = build_tent_bundle(redis_port, "elastic-router-segment")?;
+    let target_a_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "target-a-segment"),
+    )?;
+    let target_b_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "target-b-segment"),
+    )?;
+    let target_c_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "target-c-segment"),
+    )?;
+    let upgrade_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "target-a-upgrade-segment"),
+    )?;
+    let reclaim_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "target-reclaim-segment"),
+    )?;
+    let router_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "router-segment"),
+    )?;
+    let router_replica_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "router-replica-segment"),
+    )?;
+    let reader_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "reader-segment"),
+    )?;
+    let elastic_target_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "elastic-target-segment"),
+    )?;
+    let elastic_router_bundle = build_tent_bundle(
+        redis_port,
+        &scoped_segment_name(run_id, "elastic-router-segment"),
+    )?;
 
     let mut target_a = build_client(
         metadata.clone(),
@@ -237,18 +269,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     reader.register_local_memory()?;
     elastic_target.register_local_memory()?;
     elastic_router.register_local_memory()?;
-    wait_for_membership_convergence(&[
-        &target_a,
-        &target_b,
-        &target_c,
-        &target_upgrade,
-        &reclaim_writer,
-        &router,
-        &router_replica,
-        &reader,
-        &elastic_target,
-        &elastic_router,
-    ])?;
+    wait_for_membership_convergence(
+        metadata.as_ref(),
+        &[
+            &target_a,
+            &target_b,
+            &target_c,
+            &target_upgrade,
+            &reclaim_writer,
+            &router,
+            &router_replica,
+            &reader,
+            &elastic_target,
+            &elastic_router,
+        ],
+    )?;
 
     verify_single_put_get(&target_a, &reader, value_size)?;
     verify_multi_tenant_isolation(&target_a, &reader, value_size)?;
@@ -312,7 +347,8 @@ fn tent_base_config(redis_port: u16) -> TentEngineConfig {
 
 #[allow(clippy::arc_with_non_send_sync)]
 fn build_tent_bundle(redis_port: u16, local_segment_name: &str) -> Result<TentBundle> {
-    let config = tent_base_config(redis_port);
+    let rpc_port = reserve_tcp_port()?;
+    let config = tent_base_config(redis_port).set("rpc_server_port", rpc_port.to_string());
     let engine = Arc::new(TentEngine::new(
         &config.clone().set("local_segment_name", local_segment_name),
     )?);
@@ -320,6 +356,18 @@ fn build_tent_bundle(redis_port: u16, local_segment_name: &str) -> Result<TentBu
         engine,
         factory: Arc::new(TentTransportFactory::new(config)),
     })
+}
+
+fn scoped_segment_name(run_id: u64, base: &str) -> String {
+    format!("{base}-{run_id}")
+}
+
+fn reserve_tcp_port() -> Result<u16> {
+    TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| StoreError::Transport(format!("reserve tcp port: {error}")))?
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|error| StoreError::Transport(format!("inspect reserved tcp port: {error}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,6 +424,7 @@ fn build_routed_client(
 }
 
 fn wait_for_runtime_visibility(
+    metadata: &dyn MetadataBackend,
     client: &StoreClient,
     runtime: &mooncake_store_core::ClientRuntimeId,
 ) -> Result<()> {
@@ -388,14 +437,23 @@ fn wait_for_runtime_visibility(
         }
         sleep(Duration::from_millis(20));
     }
+    let visible = metadata
+        .list_live_clients()?
+        .into_iter()
+        .map(|lease| format!("{}({:?})", lease.runtime, lease.state))
+        .collect::<Vec<_>>();
     Err(StoreError::InvalidState(format!(
-        "runtime {} did not become visible to {} before deadline",
+        "runtime {} did not become visible to {} before deadline; metadata leases: {}",
         runtime,
-        client.runtime_id()
+        client.runtime_id(),
+        visible.join(", ")
     )))
 }
 
-fn wait_for_membership_convergence(clients: &[&StoreClient]) -> Result<()> {
+fn wait_for_membership_convergence(
+    metadata: &dyn MetadataBackend,
+    clients: &[&StoreClient],
+) -> Result<()> {
     let runtimes = clients
         .iter()
         .map(|client| client.runtime_id().clone())
@@ -405,7 +463,7 @@ fn wait_for_membership_convergence(clients: &[&StoreClient]) -> Result<()> {
             if runtime == client.runtime_id() {
                 continue;
             }
-            wait_for_runtime_visibility(client, runtime)?;
+            wait_for_runtime_visibility(metadata, client, runtime)?;
         }
     }
     Ok(())
@@ -778,7 +836,12 @@ fn verify_dynamic_expand_and_soft_shrink(
     reader: &StoreClient,
     value_size: usize,
 ) -> Result<()> {
-    let primary = SegmentName::new("elastic-target-segment");
+    let primary = target
+        .lease()
+        .endpoints
+        .segment_name
+        .clone()
+        .ok_or_else(|| StoreError::InvalidState("elastic target segment is missing".to_string()))?;
     let first = payload("elastic-initial", value_size);
     router.put_with_policy(
         "elastic-key",

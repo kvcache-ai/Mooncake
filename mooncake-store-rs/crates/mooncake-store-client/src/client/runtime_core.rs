@@ -657,6 +657,21 @@ impl StoreClient {
             })
     }
 
+    fn can_prefer_local_storage_for_write_mode(&self) -> bool {
+        if !self.has_active_local_storage() {
+            return false;
+        }
+        match self.write_mode {
+            WriteMode::Routed { .. } => self
+                .lease
+                .endpoints
+                .labels
+                .get("storage")
+                .is_some_and(|value| value == "true"),
+            WriteMode::LocalOnly => true,
+        }
+    }
+
     fn should_skip_candidate(&self, error: &StoreError, soft: bool) -> bool {
         soft && matches!(
             error,
@@ -784,7 +799,7 @@ impl StoreClient {
 
         if policy.prefer_local
             && !excluded.contains(&self.lease.runtime)
-            && self.has_active_local_storage()
+            && self.can_prefer_local_storage_for_write_mode()
         {
             let candidate = ReplicaPlacementCandidate {
                 target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
