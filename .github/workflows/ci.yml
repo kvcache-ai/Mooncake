@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
@@ -764,3 +765,22 @@ jobs:
           echo "All checks passed or were acceptably skipped."
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+
+  cleanup-label:
+    name: Cleanup CI Label
+    if: >
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs:
+      - ci-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove run-ci label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label "run-ci" 2>/dev/null || true

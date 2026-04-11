@@ -1,0 +1,65 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  handle:
+    if: >
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/run-ci') ||
+       contains(github.event.comment.body, '/run-e2e-ci'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add reaction to acknowledge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='eyes'
+
+      - name: Check commenter permissions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission')
+          if [[ "$PERM" != "admin" && "$PERM" != "maintain" && "$PERM" != "write" ]]; then
+            echo "::error::User ${{ github.event.comment.user.login }} lacks write permission (has: $PERM)"
+            exit 1
+          fi
+
+      - name: Parse commands and add labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          PR_NUMBER=${{ github.event.issue.number }}
+          LABELS=""
+
+          # Use word-boundary matching to avoid /run-e2e-ci triggering /run-ci
+          if echo "$COMMENT" | grep -qw '/run-e2e-ci'; then
+            LABELS="run-e2e-ci"
+          fi
+
+          if echo "$COMMENT" | grep -qw '/run-ci'; then
+            LABELS="${LABELS:+$LABELS,}run-ci"
+          fi
+
+          if [ -n "$LABELS" ]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo ${{ github.repository }} \
+              --add-label "$LABELS"
+          fi
+
+      - name: React with rocket on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='rocket'
