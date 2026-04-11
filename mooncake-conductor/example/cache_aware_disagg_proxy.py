@@ -14,7 +14,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 class CacheAwareRouter():
@@ -25,7 +24,6 @@ class CacheAwareRouter():
         self.block_size = block_size
 
     async def get_best_prefiller(self, token_ids: list, req_data):
-        # call conductor restful api to get cache hit status
         model_name = req_data.get("model", "deepseek")
         request_data = {
             "token_ids": token_ids,
@@ -35,10 +33,10 @@ class CacheAwareRouter():
         headers = {
             "Content-Type": "application/json",
         }
-        logger.debug(f"conductor request_data: {request_data}")
         response = await self.client.post(self.endpoint, json=request_data, headers=headers)
+        logger.debug(f"conductor query response: {response.json()}")
         response.raise_for_status()
-        return response.json()["HitStatus"]
+        return response.json()
 
     async def close(self) -> None:
         if self.client:
@@ -265,7 +263,6 @@ async def send_request_to_service(client_info: dict, endpoint: str,
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id
     }
-    logger.debug(f"req_data: {req_data}")
 
     response = await client_info['client'].post(endpoint,
                                                 json=req_data,
@@ -367,4 +364,15 @@ if __name__ == '__main__':
     global_args = parse_args()
 
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
+    
+    # Uvicorn has its own logging system that overrides Python's default logging configuration.
+    # When using Uvicorn, simply configuring a logger with logging.basicConfig() or adding handlers directly
+    # won't work because Uvicorn replaces the root logger configuration. We need to explicitly add our
+    # app's logger to Uvicorn's logging config to ensure our logs are properly displayed alongside Uvicorn's logs.
+    LOGGING_CONFIG["loggers"]["__main__"] = {
+        "handlers": ["default"],
+        "level": "INFO",
+        "propagate": False
+    }
     uvicorn.run(app, host=global_args.host, port=global_args.port)

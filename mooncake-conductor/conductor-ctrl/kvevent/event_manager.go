@@ -75,7 +75,7 @@ func NewEventManager(
 ) *EventManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	indexer := prefixindex.NewPrefixCacheTable()
-	// TODO 每个ModelContext创建一个独立的indexer
+	// TODO Create an independent indexer for each ModelContext
 
 	return &EventManager{
 		services:          services,
