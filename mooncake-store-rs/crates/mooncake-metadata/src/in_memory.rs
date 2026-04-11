@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 use parking_lot::RwLock;
 
@@ -14,6 +14,7 @@ struct InMemoryState {
     clients: BTreeMap<String, ClientLease>,
     handoffs: BTreeMap<String, HandoffPlan>,
     objects: BTreeMap<String, ObjectRoute>,
+    route_policies: BTreeMap<RoutePolicyDomain, RoutePolicy>,
     segments: BTreeMap<String, StoredSegmentState>,
 }
 
@@ -186,6 +187,23 @@ impl MetadataBackend for InMemoryMetadataBackend {
         })
     }
 
+    fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
+        Ok(self.state.read().route_policies.get(domain).cloned())
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> Result<bool> {
+        let mut state = self.state.write();
+        if state.route_policies.contains_key(domain) {
+            return Ok(false);
+        }
+        state.route_policies.insert(domain.clone(), policy.clone());
+        Ok(true)
+    }
+
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {
         self.state
             .write()
@@ -203,8 +221,8 @@ impl MetadataBackend for InMemoryMetadataBackend {
 mod tests {
     use mooncake_store_core::{
         ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
-        CompatibilityDescriptor, MetadataBackend, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName,
+        CompatibilityDescriptor, MetadataBackend, RouteControlMode, RoutePolicy, RoutePolicyDomain,
+        SegmentAnnouncement, SegmentLifecycleState, SegmentName,
     };
 
     use super::InMemoryMetadataBackend;
@@ -306,5 +324,49 @@ mod tests {
             .list_segments(Some(&owner))
             .expect("list should work");
         assert_eq!(segments[0].used_bytes, 64);
+    }
+
+    #[test]
+    fn route_policy_put_if_absent_is_domain_scoped() {
+        let metadata = InMemoryMetadataBackend::new();
+        let creator = ClientRuntimeId::new("route-owner", ClientEpoch(7));
+        let default_policy = RoutePolicy {
+            route_topk: 2,
+            route_control: RouteControlMode::EmbeddedWrh,
+            created_by: creator.clone(),
+            created_at_ms: 11,
+        };
+        let tenant_policy = RoutePolicy {
+            route_topk: 4,
+            route_control: RouteControlMode::MetadataOnly,
+            created_by: creator,
+            created_at_ms: 22,
+        };
+
+        assert!(metadata
+            .put_route_policy_if_absent(&RoutePolicyDomain::Default, &default_policy)
+            .expect("default route policy bootstrap should succeed"));
+        assert!(!metadata
+            .put_route_policy_if_absent(&RoutePolicyDomain::Default, &tenant_policy)
+            .expect("second default route policy bootstrap should be rejected"));
+        assert!(metadata
+            .put_route_policy_if_absent(
+                &RoutePolicyDomain::Tenant("tenant-a".to_string()),
+                &tenant_policy,
+            )
+            .expect("tenant-scoped route policy bootstrap should succeed"));
+
+        assert_eq!(
+            metadata
+                .get_route_policy(&RoutePolicyDomain::Default)
+                .expect("default route policy read should succeed"),
+            Some(default_policy),
+        );
+        assert_eq!(
+            metadata
+                .get_route_policy(&RoutePolicyDomain::Tenant("tenant-a".to_string()))
+                .expect("tenant route policy read should succeed"),
+            Some(tenant_policy),
+        );
     }
 }

@@ -10,8 +10,8 @@ use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, ObjectKey,
-    RouteCasRequest, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    StoreError,
+    RouteCasRequest, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -20,10 +20,10 @@ use mooncake_transport::{
 use parking_lot::Mutex;
 
 use super::{
-    align_up_u64, compatibility_matches, control_bind_host, copy_into_region, flatten_slices,
-    now_ms, record_success_metric, scatter_into_buffers, LiveClientCache, LocalAllocatorAdapter,
-    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget,
-    SegmentAllocator, StorageOwnerState, StoreState,
+    align_up_u64, bootstrap_route_policy, compatibility_matches, control_bind_host,
+    copy_into_region, flatten_slices, now_ms, record_success_metric, scatter_into_buffers,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    PendingReclaim, ReplicaWriteTarget, SegmentAllocator, StorageOwnerState, StoreState,
 };
 use crate::{
     control_plane::{AllocatorService, AuthorityService, ControlPlaneClient, ReleaseOp},
@@ -188,6 +188,21 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         ))
     }
 
+    fn get_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+    ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+        self.inner.get_route_policy(domain)
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.put_route_policy_if_absent(domain, policy)
+    }
+
     fn put_handoff(
         &self,
         handoff: &mooncake_store_core::HandoffPlan,
@@ -294,6 +309,21 @@ impl MetadataBackend for CountingMetadataBackend {
     ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
         self.inner
             .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn get_route_policy(
+        &self,
+        domain: &RoutePolicyDomain,
+    ) -> mooncake_store_core::Result<Option<RoutePolicy>> {
+        self.inner.get_route_policy(domain)
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.put_route_policy_if_absent(domain, policy)
     }
 
     fn put_handoff(
@@ -680,6 +710,7 @@ fn test_storage_owner_state(
     };
     let route_directory = build_route_directory(
         RouteControlMode::MetadataOnly,
+        2,
         metadata.clone(),
         &lease,
         control_client.clone(),
@@ -3849,6 +3880,57 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         .build(10_000)
         .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
+}
+
+#[test]
+fn builder_rejects_route_topk_below_two_before_runtime_start() {
+    let result = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), "builder-topk")
+        .route_topk(1)
+        .build(10_000);
+    assert!(matches!(result, Err(StoreError::InvalidState(_))));
+}
+
+#[test]
+fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let writer = ClientLease {
+        runtime: ClientRuntimeId::new("writer", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: 10_000,
+    };
+    bootstrap_route_policy(metadata.as_ref(), &writer, RouteControlMode::EmbeddedWrh, 3)
+        .expect("initial route policy bootstrap should succeed");
+    let stored = metadata
+        .get_route_policy(&RoutePolicyDomain::Default)
+        .expect("route policy get should succeed")
+        .expect("route policy should exist");
+    assert_eq!(stored.route_topk, 3);
+    assert_eq!(stored.route_control, RouteControlMode::EmbeddedWrh);
+
+    let follower = ClientLease {
+        runtime: ClientRuntimeId::new("reader", ClientEpoch(1)),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints: ClientEndpointSet::default(),
+        expires_at_ms: 10_000,
+    };
+    bootstrap_route_policy(
+        metadata.as_ref(),
+        &follower,
+        RouteControlMode::EmbeddedWrh,
+        3,
+    )
+    .expect("matching route policy should pass");
+    let error = bootstrap_route_policy(
+        metadata.as_ref(),
+        &follower,
+        RouteControlMode::EmbeddedWrh,
+        4,
+    )
+    .expect_err("mismatched route_topk should fail");
+    assert!(matches!(error, StoreError::InvalidState(_)));
 }
 
 #[test]

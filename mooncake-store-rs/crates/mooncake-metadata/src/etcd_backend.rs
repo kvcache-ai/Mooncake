@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 
 use crate::segment_state::StoredSegmentState;
@@ -428,6 +428,43 @@ impl MetadataBackend for EtcdMetadataBackend {
                     });
                 }
             }
+        })
+    }
+
+    fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
+        let key = self.config.keyspace.route_policy(domain);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get route policy"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                .transpose()
+        })
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> Result<bool> {
+        let key = self.config.keyspace.route_policy(domain);
+        let payload = serde_json::to_string(policy).map_err(json_error)?;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .txn(
+                    Txn::new()
+                        .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
+                        .and_then([TxnOp::put(key, payload, None)]),
+                )
+                .await
+                .map_err(etcd_error("etcd put route policy if absent"))?;
+            Ok(response.succeeded())
         })
     }
 

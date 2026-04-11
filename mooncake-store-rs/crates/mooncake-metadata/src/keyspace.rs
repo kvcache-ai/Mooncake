@@ -1,4 +1,6 @@
-use mooncake_store_core::{ClientRuntimeId, ClientStableId, ObjectKey, SegmentName};
+use mooncake_store_core::{
+    ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
+};
 
 #[derive(Clone, Debug)]
 pub struct MetadataKeyspace {
@@ -56,9 +58,36 @@ impl MetadataKeyspace {
         format!("{}/handoffs/{}", self.prefix, stable_id.0)
     }
 
+    pub fn route_policy(&self, domain: &RoutePolicyDomain) -> String {
+        match domain {
+            RoutePolicyDomain::Default => format!("{}/system/route-policy/default", self.prefix),
+            RoutePolicyDomain::Tenant(tenant) => format!(
+                "{}/system/route-policy/tenants/{}",
+                self.prefix,
+                encode_key_component(tenant)
+            ),
+        }
+    }
+
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
+}
+
+fn encode_key_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        match byte {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'_' | b'.' => {
+                encoded.push(*byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 impl Default for MetadataKeyspace {
@@ -70,7 +99,7 @@ impl Default for MetadataKeyspace {
 #[cfg(test)]
 mod tests {
     use mooncake_store_core::{
-        ClientEpoch, ClientRuntimeId, ClientStableId, ObjectKey, SegmentName,
+        ClientEpoch, ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName,
     };
 
     use super::MetadataKeyspace;
@@ -102,6 +131,14 @@ mod tests {
         assert_eq!(keyspace.object_prefix(), "tenant-a/objects/");
         assert_eq!(keyspace.object_pattern(), "tenant-a/objects/*");
         assert_eq!(keyspace.handoff(&stable), "tenant-a/handoffs/writer");
+        assert_eq!(
+            keyspace.route_policy(&RoutePolicyDomain::Default),
+            "tenant-a/system/route-policy/default"
+        );
+        assert_eq!(
+            keyspace.route_policy(&RoutePolicyDomain::Tenant("tenant/a".to_string())),
+            "tenant-a/system/route-policy/tenants/tenant%2Fa"
+        );
         assert_eq!(keyspace.prefix(), "tenant-a");
     }
 

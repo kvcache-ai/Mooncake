@@ -1,7 +1,7 @@
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend,
-    ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteDirectory,
-    RouteState, RouteVersion, StoreError,
+    ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteControlMode,
+    RouteDirectory, RouteState, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -20,15 +20,9 @@ const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
 const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
 const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RouteControlMode {
-    MetadataOnly,
-    #[default]
-    EmbeddedWrh,
-}
-
 pub(crate) fn build_route_directory(
     mode: RouteControlMode,
+    route_topk: usize,
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
     control_plane: Arc<ControlPlaneClient>,
@@ -37,6 +31,7 @@ pub(crate) fn build_route_directory(
     match mode {
         RouteControlMode::MetadataOnly => Arc::new(MetadataRouteDirectory { metadata }),
         RouteControlMode::EmbeddedWrh => Arc::new(EmbeddedWrhRouteDirectory::new(
+            route_topk,
             metadata,
             lease,
             control_plane,
@@ -76,6 +71,7 @@ impl RouteDirectory for MetadataRouteDirectory {
 }
 
 struct EmbeddedWrhRouteDirectory {
+    route_topk: usize,
     metadata: Arc<dyn MetadataBackend>,
     namespace: String,
     local_stable_id: ClientStableId,
@@ -85,15 +81,10 @@ struct EmbeddedWrhRouteDirectory {
 
 #[derive(Clone)]
 struct RouteAuthoritySelection {
-    primary: Option<ClientLease>,
-    secondary: Option<ClientLease>,
+    authorities: Vec<ClientLease>,
 }
 
-#[derive(Clone, Default)]
-struct RouteReadRepairState {
-    primary: RouteAuthorityObservation,
-    secondary: RouteAuthorityObservation,
-}
+type RouteReadRepairState = Vec<RouteAuthorityObservation>;
 
 #[derive(Clone, Default)]
 enum RouteAuthorityObservation {
@@ -103,13 +94,9 @@ enum RouteAuthorityObservation {
     Present(ObjectRoute),
 }
 
-#[derive(Clone, Copy)]
-enum RouteRepairTarget {
-    Primary,
-    Secondary,
-}
 impl EmbeddedWrhRouteDirectory {
     fn new(
+        route_topk: usize,
         metadata: Arc<dyn MetadataBackend>,
         lease: &ClientLease,
         control_plane: Arc<ControlPlaneClient>,
@@ -120,6 +107,7 @@ impl EmbeddedWrhRouteDirectory {
             .lock()
             .register_local(&lease.runtime.stable_id);
         Self {
+            route_topk,
             metadata,
             namespace,
             local_stable_id: lease.runtime.stable_id.clone(),
@@ -186,8 +174,7 @@ impl EmbeddedWrhRouteDirectory {
     ) -> RouteAuthoritySelection {
         let ranked = self.ranked_authorities_from_candidates(candidates, key);
         RouteAuthoritySelection {
-            primary: ranked.first().cloned(),
-            secondary: ranked.get(1).cloned(),
+            authorities: ranked.into_iter().take(self.route_topk).collect(),
         }
     }
 
@@ -231,7 +218,7 @@ impl EmbeddedWrhRouteDirectory {
         authority: &ClientLease,
         keys: &[ObjectKey],
     ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
-        if authority.runtime.stable_id == self.local_stable_id {
+        if self.authority_is_local(authority) {
             return self
                 .read_local_batch(&authority.runtime.stable_id, keys)
                 .map(|routes| routes.into_iter().map(Ok).collect());
@@ -257,7 +244,7 @@ impl EmbeddedWrhRouteDirectory {
         authority: &ClientLease,
         requests: &[RouteCasRequest],
     ) -> Result<Vec<Result<CasResult>>> {
-        if authority.runtime.stable_id == self.local_stable_id {
+        if self.authority_is_local(authority) {
             return self
                 .cas_local_batch(&authority.runtime.stable_id, requests)
                 .map(|results| results.into_iter().map(Ok).collect());
@@ -279,7 +266,7 @@ impl EmbeddedWrhRouteDirectory {
     }
 
     fn mirror_secondary_batch(&self, secondary: &ClientLease, requests: &[RouteCasRequest]) {
-        let result = if secondary.runtime.stable_id == self.local_stable_id {
+        let result = if self.authority_is_local(secondary) {
             self.replace_local_batch(&secondary.runtime.stable_id, requests)
                 .map(|_| requests.iter().map(|_| Ok(())).collect())
         } else {
@@ -314,13 +301,19 @@ impl EmbeddedWrhRouteDirectory {
         }
     }
 
+    fn authority_is_local(&self, authority: &ClientLease) -> bool {
+        route_mesh(&self.namespace)
+            .lock()
+            .is_local(&authority.runtime.stable_id)
+    }
+
     fn read_ranked_authorities(
         &self,
         keys: &[ObjectKey],
         ranked_authorities: &[Vec<ClientLease>],
         rank: usize,
         resolved: &mut [Option<ObjectRoute>],
-        repairs: Option<(&mut [RouteReadRepairState], RouteRepairTarget)>,
+        repairs: Option<&mut [RouteReadRepairState]>,
         failure_message: &'static str,
     ) -> Result<bool> {
         let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
@@ -353,10 +346,10 @@ impl EmbeddedWrhRouteDirectory {
                     {
                         match result {
                             Ok(Some(route)) => {
-                                if let Some((states, target)) = repairs.as_mut() {
+                                if let Some(states) = repairs.as_mut() {
                                     Self::set_repair_observation(
                                         &mut states[index],
-                                        *target,
+                                        rank,
                                         RouteAuthorityObservation::Present(route.clone()),
                                     );
                                 }
@@ -368,10 +361,10 @@ impl EmbeddedWrhRouteDirectory {
                                 );
                             }
                             Ok(None) => {
-                                if let Some((states, target)) = repairs.as_mut() {
+                                if let Some(states) = repairs.as_mut() {
                                     Self::set_repair_observation(
                                         &mut states[index],
-                                        *target,
+                                        rank,
                                         RouteAuthorityObservation::Missing,
                                     );
                                 }
@@ -445,12 +438,11 @@ impl EmbeddedWrhRouteDirectory {
 
     fn set_repair_observation(
         state: &mut RouteReadRepairState,
-        target: RouteRepairTarget,
+        rank: usize,
         observation: RouteAuthorityObservation,
     ) {
-        match target {
-            RouteRepairTarget::Primary => state.primary = observation,
-            RouteRepairTarget::Secondary => state.secondary = observation,
+        if let Some(slot) = state.get_mut(rank) {
+            *slot = observation;
         }
     }
 
@@ -502,24 +494,14 @@ impl EmbeddedWrhRouteDirectory {
             let Some(route) = route.as_ref() else {
                 continue;
             };
-            if let Some(primary) = selections[index].primary.clone() {
-                if let Some(request) =
-                    Self::repair_request(&keys[index], route, &repairs[index].primary)
+            for (rank, authority) in selections[index].authorities.iter().cloned().enumerate() {
+                if let Some(request) = repairs[index]
+                    .get(rank)
+                    .and_then(|observed| Self::repair_request(&keys[index], route, observed))
                 {
                     backfills
-                        .entry(primary.runtime.stable_id.0.clone())
-                        .or_insert_with(|| (primary, Vec::new()))
-                        .1
-                        .push(request);
-                }
-            }
-            if let Some(secondary) = selections[index].secondary.clone() {
-                if let Some(request) =
-                    Self::repair_request(&keys[index], route, &repairs[index].secondary)
-                {
-                    backfills
-                        .entry(secondary.runtime.stable_id.0.clone())
-                        .or_insert_with(|| (secondary, Vec::new()))
+                        .entry(authority.runtime.stable_id.0.clone())
+                        .or_insert_with(|| (authority, Vec::new()))
                         .1
                         .push(request);
                 }
@@ -587,31 +569,29 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let selections = ranked_authorities
             .iter()
             .map(|authorities| RouteAuthoritySelection {
-                primary: authorities.first().cloned(),
-                secondary: authorities.get(1).cloned(),
+                authorities: authorities.iter().take(self.route_topk).cloned().collect(),
             })
             .collect::<Vec<_>>();
         let mut resolved = vec![None; keys.len()];
-        let mut repairs = vec![RouteReadRepairState::default(); keys.len()];
+        let mut repairs =
+            vec![vec![RouteAuthorityObservation::Unobserved; self.route_topk]; keys.len()];
 
-        self.read_ranked_authorities(
-            keys,
-            &ranked_authorities,
-            0,
-            &mut resolved,
-            Some((repairs.as_mut_slice(), RouteRepairTarget::Primary)),
-            "authority route batch read failed; trying secondary or metadata",
-        )?;
-        self.read_ranked_authorities(
-            keys,
-            &ranked_authorities,
-            1,
-            &mut resolved,
-            Some((repairs.as_mut_slice(), RouteRepairTarget::Secondary)),
-            "secondary authority route batch read failed; trying other authorities or metadata",
-        )?;
+        for rank in 0..self.route_topk {
+            self.read_ranked_authorities(
+                keys,
+                &ranked_authorities,
+                rank,
+                &mut resolved,
+                Some(repairs.as_mut_slice()),
+                if rank == 0 {
+                    "authority route batch read failed; trying mirrored authorities or metadata"
+                } else {
+                    "mirrored authority route batch read failed; trying other authorities or metadata"
+                },
+            )?;
+        }
 
-        let mut rank = 2usize;
+        let mut rank = self.route_topk;
         while self.read_ranked_authorities(
             keys,
             &ranked_authorities,
@@ -666,7 +646,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .collect::<Vec<_>>();
         let mut primary_groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
         for (index, selection) in selections.iter().enumerate() {
-            let Some(primary) = selection.primary.clone() else {
+            let Some(primary) = selection.authorities.first().cloned() else {
                 continue;
             };
             primary_groups
@@ -681,7 +661,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 .iter()
                 .map(|index| requests[*index].clone())
                 .collect::<Vec<_>>();
-            if authority.runtime.stable_id == self.local_stable_id {
+            if self.authority_is_local(&authority) {
                 match self.cas_local_batch(&authority.runtime.stable_id, &batch_requests) {
                     Ok(results) => {
                         for (index, result) in indices.into_iter().zip(results.into_iter()) {
@@ -746,11 +726,11 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 ),
             };
             if result.as_ref().ok().is_some_and(|cas| cas.applied) {
-                if let (Some(primary), Some(secondary)) = (
-                    selections[index].primary.as_ref(),
-                    selections[index].secondary.as_ref(),
-                ) {
-                    if secondary.runtime.stable_id != primary.runtime.stable_id {
+                if let Some(primary) = selections[index].authorities.first() {
+                    for secondary in selections[index].authorities.iter().skip(1) {
+                        if secondary.runtime.stable_id == primary.runtime.stable_id {
+                            continue;
+                        }
                         mirrors
                             .entry(secondary.runtime.stable_id.0.clone())
                             .or_insert_with(|| (secondary.clone(), Vec::new()))
@@ -1286,6 +1266,7 @@ mod tests {
         let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
         let directory = build_route_directory(
             RouteControlMode::MetadataOnly,
+            2,
             metadata.clone(),
             &observer,
             control,
@@ -1467,8 +1448,13 @@ mod tests {
             "route_directory_test_prewarm",
         )
         .expect("route directory test should prewarm membership");
-        let directory =
-            EmbeddedWrhRouteDirectory::new(metadata.clone(), &observer, control, live_client_cache);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache,
+        );
         let namespace = metadata.route_namespace();
         route_mesh(&namespace)
             .lock()
@@ -1539,5 +1525,81 @@ mod tests {
         route_mesh(&namespace)
             .lock()
             .unregister_local(&authority_b.runtime.stable_id);
+    }
+
+    #[test]
+    fn embedded_directory_honors_route_topk_for_authority_mirrors() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-topk", 1, false, Some("scope-a"));
+        let authority_a = lease("authority-topk-a", 1, true, Some("scope-a"));
+        let authority_b = lease("authority-topk-b", 2, true, Some("scope-a"));
+        let authority_c = lease("authority-topk-c", 3, true, Some("scope-a"));
+        for lease in [
+            observer.clone(),
+            authority_a.clone(),
+            authority_b.clone(),
+            authority_c.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_topk_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            3,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache,
+        );
+        let namespace = metadata.route_namespace();
+        for authority in [
+            &authority_a.runtime.stable_id,
+            &authority_b.runtime.stable_id,
+            &authority_c.runtime.stable_id,
+        ] {
+            route_mesh(&namespace).lock().register_local(authority);
+        }
+
+        let key = ObjectKey::new("tenant-a::topk-3-key");
+        let request = RouteCasRequest {
+            key: key.clone(),
+            expected: None,
+            next: Some(route_for(&key.0, &authority_c.runtime)),
+        };
+        let results = directory
+            .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
+            .expect("embedded cas should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .as_ref()
+                .expect("cas reply should decode")
+                .applied
+        );
+
+        for authority in [
+            &authority_a.runtime.stable_id,
+            &authority_b.runtime.stable_id,
+            &authority_c.runtime.stable_id,
+        ] {
+            assert!(
+                authority_get(&namespace, authority, &key)
+                    .expect("route get should succeed")
+                    .is_some(),
+                "authority {authority} should have mirrored route",
+            );
+            route_mesh(&namespace).lock().unregister_local(authority);
+        }
     }
 }

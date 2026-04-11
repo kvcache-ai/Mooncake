@@ -65,6 +65,7 @@ fn main() -> Result<()> {
         .state(ClientLifecycleState::Active)
         .compatibility(CompatibilityDescriptor::default())
         .tenant("default")
+        .route_topk(2)
         .local_memory(
             LocalMemoryConfig::new()
                 .storage_bytes(128 * 1024 * 1024)
@@ -229,6 +230,8 @@ Use these methods when debugging placement or route state:
 - `lease()`
 
 The default route control mode is `EmbeddedWrh`. Use `route_control(RouteControlMode::MetadataOnly)` if you want metadata-backed route control for bring-up or debugging.
+
+Use `route_topk(...)` when you want a different WRH route-authority fanout. The runtime defaults to `2`, rejects values below `2`, and validates the setting against the route policy already stored in the active metadata keyspace.
 
 ## Observability
 

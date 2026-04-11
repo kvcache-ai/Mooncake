@@ -8,8 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey,
-    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteDirectory, RouteState,
-    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteControlMode,
+    RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, StoreError,
 };
 use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
@@ -27,7 +28,7 @@ use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
     authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
-    build_route_directory, RouteControlMode,
+    build_route_directory,
 };
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
@@ -35,6 +36,7 @@ const DEFAULT_TENANT: &str = "default";
 const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_LIVE_CLIENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_SUSPECT_RUNTIME_TTL: Duration = Duration::from_secs(5);
+const DEFAULT_ROUTE_TOPK: usize = 2;
 
 include!("types.rs");
 include!("builder.rs");
@@ -62,6 +64,7 @@ pub struct StoreClient {
     transport_factory: Option<Arc<dyn StoreTransportFactory>>,
     write_mode: WriteMode,
     route_control: RouteControlMode,
+    route_topk: usize,
     state: Mutex<StoreState>,
 }
 

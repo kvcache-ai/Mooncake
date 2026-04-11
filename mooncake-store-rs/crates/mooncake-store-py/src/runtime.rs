@@ -63,7 +63,8 @@ impl CompatRuntimeArgs {
             .local_memory(local_memory)
             .with_tent(engine)
             .transport_factory(factory)
-            .route_control(self.route_control);
+            .route_control(self.route_control)
+            .route_topk(plan.route_topk);
 
         for (key, value) in plan.labels {
             builder = builder.label(key, value);
@@ -195,6 +196,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 routed_writes: false,
                 replica_count: 1,
+                route_topk: 2,
                 keyspace: None,
                 expires_at_ms: Some(now_ms() + 10_000),
                 use_hugepage: None,

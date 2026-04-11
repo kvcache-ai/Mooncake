@@ -229,7 +229,8 @@ impl StoreClient {
             .local_memory(self.local_memory.clone())
             .transport(helper_transport)
             .transport_factory(factory)
-            .route_control(self.route_control);
+            .route_control(self.route_control)
+            .route_topk(self.route_topk);
 
         let mut labels = self.lease.endpoints.labels.clone();
         labels.remove(control_address_label());

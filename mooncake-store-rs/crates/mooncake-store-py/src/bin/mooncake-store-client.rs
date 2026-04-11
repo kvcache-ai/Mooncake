@@ -87,6 +87,8 @@ struct Args {
     routed_writes: bool,
     #[arg(long, default_value_t = 1)]
     replica_count: usize,
+    #[arg(long, default_value_t = 2)]
+    route_topk: usize,
     #[arg(long)]
     keyspace: Option<String>,
     #[arg(long)]
@@ -272,6 +274,9 @@ fn validate_args(args: &Args) -> Result<(), Box<dyn Error>> {
     {
         return Err("--label storage=true requires --storage-bytes > 0".into());
     }
+    if args.route_topk < 2 {
+        return Err("--route-topk must be greater than or equal to 2".into());
+    }
     Ok(())
 }
 
@@ -306,6 +311,7 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
             labels: args.labels.iter().cloned().collect::<BTreeMap<_, _>>(),
             routed_writes: args.routed_writes,
             replica_count: args.replica_count,
+            route_topk: args.route_topk,
             keyspace: args.keyspace.clone(),
             expires_at_ms: Some(now_ms().saturating_add(args.lease_ttl_ms)),
             use_hugepage: args.use_hugepage.then_some(true),
@@ -486,6 +492,7 @@ mod tests {
             labels: vec![],
             routed_writes: false,
             replica_count: 1,
+            route_topk: 2,
             keyspace: None,
             local_segment_name: None,
             lease_ttl_ms: 10_000,
@@ -533,6 +540,8 @@ mod tests {
             "--routed-writes",
             "--replica-count",
             "2",
+            "--route-topk",
+            "4",
             "--route-control",
             "metadata-only",
         ])
@@ -548,6 +557,7 @@ mod tests {
         );
         assert!(args.routed_writes);
         assert_eq!(args.replica_count, 2);
+        assert_eq!(args.route_topk, 4);
         assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
         assert_eq!(args.epoch, 1);
         assert_eq!(args.initial_state, InitialStateArg::Active);
@@ -668,6 +678,10 @@ mod tests {
         args.storage_bytes = 0;
         args.labels = vec![("storage".to_string(), "true".to_string())];
         assert!(validate_args(&args).is_err());
+
+        let mut args = sample_args();
+        args.route_topk = 1;
+        assert!(validate_args(&args).is_err());
     }
 
     #[test]
@@ -726,6 +740,7 @@ mod tests {
         ];
         args.routed_writes = true;
         args.replica_count = 3;
+        args.route_topk = 5;
         args.route_control = RouteControlArg::MetadataOnly;
         args.epoch = 11;
         args.initial_state = InitialStateArg::Draining;
@@ -753,6 +768,7 @@ mod tests {
             Some(2 * 1024 * 1024)
         );
         assert_eq!(runtime_args.setup.replica_count, 3);
+        assert_eq!(runtime_args.setup.route_topk, 5);
         assert!(runtime_args.setup.routed_writes);
         assert_eq!(runtime_args.route_control, RouteControlMode::MetadataOnly);
         assert_eq!(runtime_args.epoch, ClientEpoch(11));

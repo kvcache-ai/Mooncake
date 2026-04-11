@@ -221,6 +221,8 @@ The client supports tenant-scoped keys and tenant-aware request builders.
 
 This keeps API usage explicit while still allowing a default tenant for simpler applications.
 
+Route-authority policy remains cluster-scoped per metadata keyspace. Request-level tenants share the same `route_control + route_topk` policy unless they are placed into different metadata keyspaces.
+
 ## Dynamic Membership and Lifecycle
 
 ### Client lifecycle

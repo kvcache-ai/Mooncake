@@ -2,8 +2,9 @@ use crate::error::Result;
 use crate::identity::{ClientRuntimeId, ClientStableId};
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
+    RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+    SegmentReservation,
 };
 
 pub trait MetadataBackend: Send + Sync {
@@ -57,6 +58,14 @@ pub trait MetadataBackend: Send + Sync {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult>;
+
+    fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>>;
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> Result<bool>;
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()>;
 
