@@ -152,7 +152,7 @@ Useful flags:
 - `--transport-rpc-port <port>` to pin the TENT TCP data-plane port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
-- `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh
+- `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
 - `--client-server-address host:port` to expose the standalone compatibility server for dummy clients only
 - `--use-hugepage` and `--hugepage-size 2MB|1GB` to enable hugepage-backed local memory
@@ -307,6 +307,16 @@ If hugepage mode is requested, the host kernel must already have compatible huge
 - `batch_put_from_multi_buffers`
 - `batch_get_into`
 - `batch_get_into_multi_buffers`
+
+## Batch Read Soft-Miss Semantics
+
+The real backend keeps batch read behavior compatible with upstream Mooncake while avoiding Python-side crashes on transient backend failures.
+
+- `batch_get_into(...)` returns copied lengths and uses `-1` for soft misses
+- `batch_get_into_multi_buffers(...)` returns copied lengths and uses `-1` for soft misses
+- `batch_is_exist(...)` returns `1` for hit, `0` for miss, and negative status codes for soft backend failures
+- soft-miss downgrade covers `NotFound`, `InvalidState`, metadata errors, and transport errors on the real backend
+- single-key `get(...)` and `get_into(...)` keep normal exception behavior
 
 ### Lifecycle and Capacity
 

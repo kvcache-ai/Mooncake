@@ -91,7 +91,7 @@ struct Args {
     keyspace: Option<String>,
     #[arg(long)]
     local_segment_name: Option<String>,
-    #[arg(long, default_value_t = 600_000)]
+    #[arg(long, default_value_t = 30_000)]
     lease_ttl_ms: u64,
     #[arg(long, default_value_t = 30_000)]
     heartbeat_interval_ms: u64,

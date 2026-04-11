@@ -1,4 +1,5 @@
 pub(crate) type SharedLiveClientCache = Arc<Mutex<LiveClientCache>>;
+pub(crate) type SharedSuspectRuntimeCache = Arc<Mutex<SuspectRuntimeCache>>;
 
 #[derive(Default)]
 pub(crate) struct LiveClientCache {
@@ -15,6 +16,33 @@ impl LiveClientCache {
     pub(crate) fn store(&mut self, leases: Vec<ClientLease>) {
         self.refreshed_at = Some(Instant::now());
         self.leases = leases;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SuspectRuntimeCache {
+    suspects: BTreeMap<ClientRuntimeId, Instant>,
+}
+
+impl SuspectRuntimeCache {
+    pub(crate) fn mark(&mut self, runtime: ClientRuntimeId, deadline: Instant) {
+        self.suspects.insert(runtime, deadline);
+    }
+
+    pub(crate) fn contains(&mut self, runtime: &ClientRuntimeId) -> bool {
+        self.prune_expired();
+        self.suspects.contains_key(runtime)
+    }
+
+    pub(crate) fn reconcile_with_leases(&mut self, leases: &[ClientLease]) {
+        self.prune_expired();
+        self.suspects
+            .retain(|runtime, _| leases.iter().any(|lease| lease.runtime == *runtime));
+    }
+
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.suspects.retain(|_, deadline| *deadline > now);
     }
 }
 

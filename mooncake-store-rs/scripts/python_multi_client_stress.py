@@ -21,7 +21,7 @@ if str(PYTHON_ROOT) not in sys.path:
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
 
 
-LEASE_MS = 600_000
+LEASE_MS = 30_000
 
 
 @dataclass

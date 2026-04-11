@@ -36,6 +36,10 @@ impl StoreState {
         Ok(handle)
     }
 
+    fn invalidate_remote_segment(&mut self, segment_name: &str) {
+        self.remote_segments.remove(segment_name);
+    }
+
     fn register_external_buffer(
         &mut self,
         transport: &dyn StoreTransport,
