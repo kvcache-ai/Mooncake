@@ -365,6 +365,8 @@ fn main() -> Result<()> {
 }
 ```
 
+In Rust, TENT `rpc_server_port` is the real data-plane TCP port. Leaving it at `0` is fine for local demos; for cross-host or cross-container deployments, set a fixed port and make sure peers can reach `rpc_server_hostname:rpc_server_port`.
+
 ### Routed writes
 
 ```rust
@@ -475,6 +477,18 @@ For the complete configuration reference, read `docs/configuration.md`.
 If store metadata uses etcd in the Python compatibility layer, transport metadata still uses Redis. Set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint.
 
 For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD`; set `MC_REDIS_USERNAME` as well when Redis ACLs require a named user. Environment variables are preferred for passwords that contain URL-reserved characters such as `@`.
+
+### Port roles
+
+| Knob | Used by | Meaning |
+|------|---------|---------|
+| `transport_rpc_port` / TENT `rpc_server_port` | real mode | TENT TCP data-plane listen port; peer real clients use it for cross-host reads and writes |
+| `client_server_address` | dummy mode | standalone compatibility gRPC endpoint used by `setup_dummy(...)` |
+| `metrics_addr` | all modes | HTTP `/metrics` endpoint |
+
+`client_server_address` is not part of the real data path. Real clients create their own TENT runtime inside the calling process and publish `local_hostname + transport_rpc_port` to peers.
+
+For single-host demos, leaving `transport_rpc_port` unset keeps the old random-port behavior. For cross-host or cross-container deployments, set a fixed `transport_rpc_port` and make sure that port is reachable from peer nodes.
 
 ### Route control modes
 

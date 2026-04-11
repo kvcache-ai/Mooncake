@@ -149,11 +149,12 @@ Start a storage client:
 Useful flags:
 
 - `--transport-metadata-url` for TENT Redis when the metadata backend uses etcd
+- `--transport-rpc-port <port>` to pin the TENT TCP data-plane port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
 - `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
-- `--client-server-address host:port` to expose the standalone compatibility server for dummy clients
+- `--client-server-address host:port` to expose the standalone compatibility server for dummy clients only
 - `--use-hugepage` and `--hugepage-size 2MB|1GB` to enable hugepage-backed local memory
 
 Role reminder:
@@ -162,6 +163,13 @@ Role reminder:
 - use `--label storage=false` on routed rw nodes that should place remotely without owning local storage
 - `--label storage=true` requires `--storage-bytes > 0`
 - when `--storage-bytes 0` is used without an explicit storage label, the runtime defaults to `storage=false`
+
+Port reminder:
+
+- `transport_rpc_port` / `--transport-rpc-port` is the real-mode TENT data-plane port
+- `client_server_address` / `--client-server-address` is the dummy compatibility gRPC port
+- `metrics_addr` / `--metrics-addr` is only for `/metrics`
+- cross-host real-mode deployments should set both a reachable `local_hostname` and a fixed `transport_rpc_port`
 
 ## Basic Real-Mode Example
 
@@ -180,6 +188,7 @@ store.setup(
     stable_id="py-store-a",
     tenant="default",
     labels={"pool": "pool-a", "storage": "true"},
+    transport_rpc_port=17111,
 )
 
 store.put("hello", b"world")
@@ -240,6 +249,8 @@ allocator = MooncakeHostMemAllocator()
 ptr = allocator.alloc(4096)
 store.register_buffer(ptr, 4096)
 ```
+
+`setup_dummy(...)` only needs `client_server_address`. It does not consume `transport_rpc_port`, because the standalone server owns the real store runtime and TENT endpoint on behalf of the dummy client.
 
 ## Host Allocator and Hugepages
 

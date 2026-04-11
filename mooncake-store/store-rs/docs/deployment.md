@@ -124,6 +124,12 @@ What they validate:
 - dummy path through the standalone compatibility server plus shm registration
 - real path through the native distributed store runtime plus registered-buffer I/O
 
+Deployment note:
+
+- dummy mode needs a reachable `client_server_address`
+- real mode needs a reachable `local_hostname + transport_rpc_port`
+- `client_server_address` does not carry real-mode TENT traffic
+
 ### Multi-client stress benchmark
 
 Run the process-per-client stress benchmark:

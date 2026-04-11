@@ -204,10 +204,19 @@ Important Python-only compatibility knobs:
 | `routed_writes` | enable routed placement from Python |
 | `replica_count` | default replica count when routed writes are enabled |
 | `transport_metadata_url` | Redis endpoint for TENT when store metadata uses etcd |
+| `transport_rpc_port` | fixed TENT TCP data-plane port for real-mode peers |
 | `use_hugepage` | enable hugepage-backed local store memory |
 | `hugepage_size` | hugepage size for local store memory; accepts `2MB` or `1GB` |
 
-The config-dict path accepts the same hugepage knobs through `use_hugepage` and `hugepage_size`.
+The config-dict path accepts the same compatibility knobs. For port pinning, both `transport_rpc_port` and `rpc_server_port` map to the real-mode TENT data-plane port.
+
+Port role reminder:
+
+- `transport_rpc_port` / `rpc_server_port` is used by real clients and maps to TENT `rpc_server_port`
+- `client_server_address` belongs to the dummy compatibility server and is not used by real-mode peers
+- `metrics_addr` only exposes `/metrics`
+
+For cross-host or cross-container real-mode deployments, set a reachable `local_hostname` together with a fixed `transport_rpc_port`.
 
 `MooncakeHostMemAllocator(...)` exposes:
 
