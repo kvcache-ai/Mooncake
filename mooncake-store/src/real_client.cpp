@@ -415,6 +415,8 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+    // Start bandwidth metrics tracker if enabled via MC_ENABLE_BANDWIDTH_METRICS
+    bandwidth_tracker_.start("RealClient");
 }
 
 RealClient::~RealClient() {
@@ -1015,6 +1017,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(put_result.error());
     }
 
+    bandwidth_tracker_.record_write(value.size_bytes());
     return {};
 }
 
@@ -1097,11 +1100,16 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     auto results = client_->BatchPut(keys, ordered_batched_slices, config);
 
     // Check if any operations failed
+    size_t total_bytes = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             return tl::unexpected(results[i].error());
         }
+        if (i < values.size()) {
+            total_bytes += values[i].size_bytes();
+        }
     }
+    bandwidth_tracker_.record_write(total_bytes);
     return {};
 }
 
@@ -1185,6 +1193,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
         return tl::unexpected(put_result.error());
     }
 
+    bandwidth_tracker_.record_write(total_size);
     return {};
 }
 
@@ -2242,9 +2251,13 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
         return tl::unexpected(metadata_result.error());
     }
 
-    return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
-                               metadata_result.value(),
-                               size_is_buffer_capacity);
+    auto result = execute_ranged_read(key, buffer, dst_offset, src_offset, size,
+                                      metadata_result.value(),
+                                      size_is_buffer_capacity);
+    if (result.has_value() && result.value() > 0) {
+        bandwidth_tracker_.record_read(static_cast<size_t>(result.value()));
+    }
+    return result;
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
@@ -2479,7 +2492,13 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value() && i < sizes.size()) {
+            bandwidth_tracker_.record_write(sizes[i]);
+        }
+    }
+    return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
@@ -2517,6 +2536,7 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         return tl::unexpected(put_result.error());
     }
 
+    bandwidth_tracker_.record_write(size);
     return {};
 }
 
@@ -2558,6 +2578,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    bandwidth_tracker_.record_write(value.size_bytes());
     return {};
 }
 
@@ -2609,6 +2630,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    bandwidth_tracker_.record_write(size);
     return {};
 }
 
@@ -2653,7 +2675,13 @@ RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
         ordered_batched_slices.emplace_back(std::move(slices));
     }
 
-    return client_->BatchUpsert(keys, ordered_batched_slices, config);
+    auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value() && i < sizes.size()) {
+            bandwidth_tracker_.record_write(sizes[i]);
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batch_upsert_from(
@@ -2778,6 +2806,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
                    << toString(result.error());
         return tl::unexpected(result.error());
     }
+    bandwidth_tracker_.record_write(total_size);
     return {};
 }
 
@@ -2861,11 +2890,16 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
     auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
 
     // Check if any operations failed
+    size_t total_bytes = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             return tl::unexpected(results[i].error());
         }
+        if (i < values.size()) {
+            total_bytes += values[i].size_bytes();
+        }
     }
+    bandwidth_tracker_.record_write(total_bytes);
     return {};
 }
 
@@ -3277,6 +3311,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
               << "us, with memory key count: " << valid_operations.size()
               << ", offload key count: " << offload_object_count;
 
+    size_t total_read_bytes = 0;
+    for (const auto &r : results) {
+        if (r.has_value() && r.value() > 0) {
+            total_read_bytes += static_cast<size_t>(r.value());
+        }
+    }
+    if (total_read_bytes > 0) {
+        bandwidth_tracker_.record_read(total_read_bytes);
+    }
+
     return results;
 }
 
@@ -3403,7 +3447,17 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
     }
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    auto results = client_->BatchPut(keys, batched_slices, config);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value() && i < all_sizes.size()) {
+            size_t key_bytes = 0;
+            for (const auto &s : all_sizes[i]) {
+                key_bytes += s;
+            }
+            bandwidth_tracker_.record_write(key_bytes);
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
@@ -3556,6 +3610,17 @@ RealClient::batch_get_into_multi_buffers_internal(
             results[op.original_index] = tl::unexpected(error);
         }
     }
+
+    size_t total_read_bytes = 0;
+    for (const auto &r : results) {
+        if (r.has_value() && r.value() > 0) {
+            total_read_bytes += static_cast<size_t>(r.value());
+        }
+    }
+    if (total_read_bytes > 0) {
+        bandwidth_tracker_.record_read(total_read_bytes);
+    }
+
     return results;
 }
 

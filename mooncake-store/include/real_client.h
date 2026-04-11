@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "bandwidth_tracker.h"
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.hpp"
@@ -793,6 +794,9 @@ class RealClient : public PyClient {
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
+
+    // Bandwidth metrics tracker (active when MC_ENABLE_BANDWIDTH_METRICS=1)
+    BandwidthTracker bandwidth_tracker_;
 };
 
 }  // namespace mooncake

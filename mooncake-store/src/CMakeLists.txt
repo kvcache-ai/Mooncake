@@ -22,6 +22,7 @@ set(MOONCAKE_STORE_SOURCES
     aligned_client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
+    bandwidth_tracker.cpp
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp

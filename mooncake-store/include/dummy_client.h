@@ -4,6 +4,7 @@
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
+#include "bandwidth_tracker.h"
 #include "pyclient.h"
 #include "real_client.h"
 #include "shm_helper.h"
@@ -253,6 +254,9 @@ class DummyClient : public PyClient {
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
     int32_t device_id_ = 0;
+
+    // Bandwidth metrics tracker (active when MC_ENABLE_BANDWIDTH_METRICS=1)
+    BandwidthTracker bandwidth_tracker_;
 };
 
 }  // namespace mooncake

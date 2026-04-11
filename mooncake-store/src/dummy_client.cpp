@@ -137,6 +137,8 @@ DummyClient::DummyClient() : client_id_(generate_uuid()) {
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf);
+    // Start bandwidth metrics tracker if enabled via MC_ENABLE_BANDWIDTH_METRICS
+    bandwidth_tracker_.start("DummyClient");
 }
 
 DummyClient::~DummyClient() { tearDownAll(); }
@@ -524,35 +526,65 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_dummy_helper, void>(
-        key, value, config, client_id_));
+    size_t write_bytes = value.size_bytes();
+    auto result = invoke_rpc<&RealClient::put_dummy_helper, void>(
+        key, value, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(write_bytes);
+    }
+    return to_py_ret(result);
 }
 
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_batch_dummy_helper, void>(
-        keys, values, config, client_id_));
+    size_t write_bytes = 0;
+    for (const auto& v : values) {
+        write_bytes += v.size_bytes();
+    }
+    auto result = invoke_rpc<&RealClient::put_batch_dummy_helper, void>(
+        keys, values, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(write_bytes);
+    }
+    return to_py_ret(result);
 }
 
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_parts_dummy_helper, void>(
-        key, values, config, client_id_));
+    size_t write_bytes = 0;
+    for (const auto& v : values) {
+        write_bytes += v.size_bytes();
+    }
+    auto result = invoke_rpc<&RealClient::put_parts_dummy_helper, void>(
+        key, values, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(write_bytes);
+    }
+    return to_py_ret(result);
 }
 
 int DummyClient::upsert(const std::string& key, std::span<const char> value,
                         const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::upsert_dummy_helper, void>(
-        key, value, config, client_id_));
+    size_t write_bytes = value.size_bytes();
+    auto result = invoke_rpc<&RealClient::upsert_dummy_helper, void>(
+        key, value, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(write_bytes);
+    }
+    return to_py_ret(result);
 }
 
 int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
                              const ReplicateConfig& config) {
     uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
-    return to_py_ret(invoke_rpc<&RealClient::upsert_from_dummy_helper, void>(
-        key, dummy_addr, size, config, client_id_));
+    auto result = invoke_rpc<&RealClient::upsert_from_dummy_helper, void>(
+        key, dummy_addr, size, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(size);
+    }
+    return to_py_ret(result);
 }
 
 std::vector<int> DummyClient::batch_upsert_from(
@@ -567,8 +599,11 @@ std::vector<int> DummyClient::batch_upsert_from(
             keys.size(), keys, buffers, sizes, config, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
-    for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
+    for (size_t i = 0; i < internal_results.size(); ++i) {
+        results.push_back(to_py_ret(internal_results[i]));
+        if (internal_results[i].has_value() && i < sizes.size()) {
+            bandwidth_tracker_.record_write(sizes[i]);
+        }
     }
     return results;
 }
@@ -576,15 +611,31 @@ std::vector<int> DummyClient::batch_upsert_from(
 int DummyClient::upsert_parts(const std::string& key,
                               std::vector<std::span<const char>> values,
                               const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::upsert_parts_dummy_helper, void>(
-        key, values, config, client_id_));
+    size_t write_bytes = 0;
+    for (const auto& v : values) {
+        write_bytes += v.size_bytes();
+    }
+    auto result = invoke_rpc<&RealClient::upsert_parts_dummy_helper, void>(
+        key, values, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(write_bytes);
+    }
+    return to_py_ret(result);
 }
 
 int DummyClient::upsert_batch(const std::vector<std::string>& keys,
                               const std::vector<std::span<const char>>& values,
                               const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::upsert_batch_dummy_helper, void>(
-        keys, values, config, client_id_));
+    size_t write_bytes = 0;
+    for (const auto& v : values) {
+        write_bytes += v.size_bytes();
+    }
+    auto result = invoke_rpc<&RealClient::upsert_batch_dummy_helper, void>(
+        keys, values, config, client_id_);
+    if (result.has_value()) {
+        bandwidth_tracker_.record_write(write_bytes);
+    }
+    return to_py_ret(result);
 }
 
 int DummyClient::remove(const std::string& key, bool force) {
@@ -763,7 +814,11 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }
-    return to_py_ret(*result);
+    int64_t ret = to_py_ret(*result);
+    if (ret > 0) {
+        bandwidth_tracker_.record_read(static_cast<size_t>(ret));
+    }
+    return ret;
 }
 
 std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
@@ -787,6 +842,22 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                                                internal_results.error());
     }
 
+    // Accumulate successfully read bytes for bandwidth metrics.
+    size_t read_bytes = 0;
+    for (const auto& buf_results : internal_results.value()) {
+        for (const auto& key_results : buf_results) {
+            for (const auto& fragment_result : key_results) {
+                if (fragment_result.has_value() && fragment_result.value() > 0) {
+                    read_bytes +=
+                        static_cast<size_t>(fragment_result.value());
+                }
+            }
+        }
+    }
+    if (read_bytes > 0) {
+        bandwidth_tracker_.record_read(read_bytes);
+    }
+
     return convert_ranged_read_results(internal_results.value());
 }
 
@@ -805,8 +876,11 @@ std::vector<int> DummyClient::batch_put_from(
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
+    for (size_t i = 0; i < internal_results.size(); ++i) {
+        results.push_back(to_py_ret(internal_results[i]));
+        if (internal_results[i].has_value() && i < sizes.size()) {
+            bandwidth_tracker_.record_write(sizes[i]);
+        }
     }
 
     return results;
@@ -829,7 +903,11 @@ std::vector<int64_t> DummyClient::batch_get_into(
     results.reserve(internal_results.size());
 
     for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
+        int64_t ret = to_py_ret(result);
+        results.push_back(ret);
+        if (ret > 0) {
+            bandwidth_tracker_.record_read(static_cast<size_t>(ret));
+        }
     }
 
     return results;
@@ -856,8 +934,15 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
                                config, device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
-    for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
+    for (size_t i = 0; i < internal_results.size(); ++i) {
+        results.push_back(to_py_ret(internal_results[i]));
+        if (internal_results[i].has_value() && i < all_sizes.size()) {
+            size_t key_bytes = 0;
+            for (const auto& s : all_sizes[i]) {
+                key_bytes += s;
+            }
+            bandwidth_tracker_.record_write(key_bytes);
+        }
     }
     return results;
 }
@@ -877,7 +962,11 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     std::vector<int> results;
     results.reserve(internal_results.size());
     for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
+        int64_t ret = to_py_ret(result);
+        results.push_back(static_cast<int>(ret));
+        if (ret > 0) {
+            bandwidth_tracker_.record_read(static_cast<size_t>(ret));
+        }
     }
     return results;
 }
