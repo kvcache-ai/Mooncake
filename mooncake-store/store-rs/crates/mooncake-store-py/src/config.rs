@@ -34,6 +34,7 @@ pub struct CompatSetupArgs {
     pub local_buffer_size: usize,
     pub protocol: String,
     pub _rdma_devices: String,
+    pub transport_rpc_port: Option<u16>,
     pub stable_id: Option<String>,
     pub tenant: String,
     pub labels: BTreeMap<String, String>,
@@ -53,8 +54,12 @@ impl CompatSetupArgs {
             .unwrap_or_else(|| format!("py-store-{}", now_ms()));
         let (metadata, transport_redis_url) =
             build_metadata_backend(&self.metadata_url, self.transport_metadata_url, keyspace)?;
-        let tent_config =
-            build_tent_config(&self.local_hostname, &transport_redis_url, &self.protocol)?;
+        let tent_config = build_tent_config(
+            &self.local_hostname,
+            &transport_redis_url,
+            &self.protocol,
+            self.transport_rpc_port,
+        )?;
         let mut labels = self.labels;
         match labels.get("storage").map(String::as_str) {
             Some("true") if self.global_segment_size == 0 => {
@@ -140,6 +145,7 @@ fn build_tent_config(
     local_hostname: &str,
     transport_redis_url: &str,
     protocol: &str,
+    transport_rpc_port: Option<u16>,
 ) -> Result<TentEngineConfig> {
     let redis = Url::parse(transport_redis_url)
         .map_err(|error| StoreError::Metadata(format!("invalid redis url: {error}")))?;
@@ -170,7 +176,10 @@ fn build_tent_config(
         .set("metadata_servers", format!("{host}:{port}"))
         .set("redis_db_index", db_index)
         .set("rpc_server_hostname", local_hostname)
-        .set("rpc_server_port", "0")
+        .set(
+            "rpc_server_port",
+            transport_rpc_port.unwrap_or_default().to_string(),
+        )
         .set("log_level", "warning")
         .set("transports/tcp/enable", tcp_enable)
         .set("transports/shm/enable", "false")
@@ -258,11 +267,17 @@ mod tests {
 
     #[test]
     fn build_tent_config_uses_redis_url_parts() {
-        let config = build_tent_config("127.0.0.1", "redis://cache.local:6381/3", "tcp")
-            .expect("tent config should build");
+        let config = build_tent_config(
+            "127.0.0.1",
+            "redis://cache.local:6381/3",
+            "tcp",
+            Some(17111),
+        )
+        .expect("tent config should build");
         let debug = format!("{config:?}");
         assert!(debug.contains("cache.local:6381"));
         assert!(debug.contains("3"));
+        assert!(debug.contains("17111"));
     }
 
     #[test]
@@ -316,6 +331,7 @@ mod tests {
             local_buffer_size: 1024,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
+            transport_rpc_port: None,
             stable_id: Some("sample".to_string()),
             tenant: "default".to_string(),
             labels: BTreeMap::new(),
@@ -344,6 +360,7 @@ mod tests {
             local_buffer_size: 1024,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
+            transport_rpc_port: None,
             stable_id: Some("sample".to_string()),
             tenant: "default".to_string(),
             labels: BTreeMap::from([("storage".to_string(), "true".to_string())]),
@@ -372,6 +389,7 @@ mod tests {
             local_buffer_size: 1024,
             protocol: "rdma".to_string(),
             _rdma_devices: String::new(),
+            transport_rpc_port: Some(17112),
             stable_id: None,
             tenant: "tenant-a".to_string(),
             labels: BTreeMap::from([("pool".to_string(), "pool-a".to_string())]),
@@ -399,6 +417,7 @@ mod tests {
         let debug = format!("{:?}", plan.tent_config);
         assert!(debug.contains("cache.local:6381"));
         assert!(debug.contains("4"));
+        assert!(debug.contains("17112"));
         assert!(debug.contains("transports/rdma/enable"));
     }
 
@@ -412,6 +431,7 @@ mod tests {
             local_buffer_size: 1024,
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
+            transport_rpc_port: None,
             stable_id: Some("rw-only".to_string()),
             tenant: "tenant-a".to_string(),
             labels: BTreeMap::new(),
@@ -458,15 +478,15 @@ mod tests {
 
     #[test]
     fn build_tent_config_rejects_invalid_redis_inputs() {
-        let invalid_url = build_tent_config("127.0.0.1", "not-a-redis-url", "tcp")
+        let invalid_url = build_tent_config("127.0.0.1", "not-a-redis-url", "tcp", None)
             .expect_err("bad url must fail");
         assert!(matches!(invalid_url, StoreError::Metadata(_)));
 
-        let missing_host =
-            build_tent_config("127.0.0.1", "redis:///0", "auto").expect_err("host is required");
+        let missing_host = build_tent_config("127.0.0.1", "redis:///0", "auto", None)
+            .expect_err("host is required");
         assert!(matches!(missing_host, StoreError::Metadata(_)));
 
-        let auto = build_tent_config("127.0.0.1", "redis://cache.local", "auto")
+        let auto = build_tent_config("127.0.0.1", "redis://cache.local", "auto", None)
             .expect("auto config should succeed");
         let debug = format!("{auto:?}");
         assert!(debug.contains("cache.local:6379"));

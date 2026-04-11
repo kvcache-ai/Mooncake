@@ -71,6 +71,8 @@ struct Args {
     protocol: String,
     #[arg(long, default_value = "")]
     rdma_devices: String,
+    #[arg(long, alias = "rpc-server-port")]
+    transport_rpc_port: Option<u16>,
     #[arg(long)]
     stable_id: Option<String>,
     #[arg(long, default_value_t = 1)]
@@ -298,6 +300,7 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
             local_buffer_size: args.scratch_bytes,
             protocol: args.protocol.clone(),
             _rdma_devices: args.rdma_devices.clone(),
+            transport_rpc_port: args.transport_rpc_port,
             stable_id: args.stable_id.clone(),
             tenant: args.tenant.clone(),
             labels: args.labels.iter().cloned().collect::<BTreeMap<_, _>>(),
@@ -475,6 +478,7 @@ mod tests {
             scratch_bytes: 512,
             protocol: "tcp".to_string(),
             rdma_devices: String::new(),
+            transport_rpc_port: None,
             stable_id: Some("sample".to_string()),
             epoch: 1,
             initial_state: InitialStateArg::Active,
@@ -561,6 +565,8 @@ mod tests {
             "redis://127.0.0.1:6379/9",
             "--stable-id",
             "node-a",
+            "--transport-rpc-port",
+            "17111",
             "--epoch",
             "2",
             "--initial-state",
@@ -592,6 +598,7 @@ mod tests {
             Some("redis://127.0.0.1:6379/9")
         );
         assert_eq!(args.stable_id.as_deref(), Some("node-a"));
+        assert_eq!(args.transport_rpc_port, Some(17111));
         assert_eq!(args.epoch, 2);
         assert_eq!(args.initial_state, InitialStateArg::Standby);
         assert_eq!(args.keyspace.as_deref(), Some("ks-a"));
@@ -705,6 +712,7 @@ mod tests {
         let mut args = sample_args();
         args.transport_metadata_url = Some("redis://127.0.0.1:6380/1".to_string());
         args.rdma_devices = "mlx5_0".to_string();
+        args.transport_rpc_port = Some(17112);
         args.keyspace = Some("tenant/keyspace".to_string());
         args.local_segment_name = Some("segment-a".to_string());
         args.metrics_addr = Some("127.0.0.1:9090".to_string());
@@ -730,6 +738,7 @@ mod tests {
             Some("redis://127.0.0.1:6380/1")
         );
         assert_eq!(runtime_args.setup._rdma_devices, "mlx5_0");
+        assert_eq!(runtime_args.setup.transport_rpc_port, Some(17112));
         assert_eq!(
             runtime_args.setup.keyspace.as_deref(),
             Some("tenant/keyspace")
