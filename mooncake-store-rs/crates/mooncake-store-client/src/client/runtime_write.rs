@@ -79,8 +79,9 @@ impl StoreClient {
         );
 
         if !remote_requests.is_empty() {
+            let remote_bytes = (remote_requests.len() * value.len()) as u64;
             let tracker = OperationTracker::new("put_remote_batch_write")
-                .input_bytes((remote_requests.len() * value.len()) as u64);
+                .input_bytes(remote_bytes);
             let result = (|| {
                 let scratch = {
                     let state = self.state.lock();
@@ -111,6 +112,7 @@ impl StoreClient {
             })();
             tracker.finish(&result, 0);
             result?;
+            registry::record_transport_bytes("write", "storage", remote_bytes);
         }
 
         Ok(absolute_offsets)
@@ -400,6 +402,7 @@ impl StoreClient {
         let write_result = (|| {
             let mut routes = Vec::with_capacity(prepared.len());
             for (entry, current) in prepared.iter().zip(current_routes.into_iter()) {
+                let checksum = payload_checksum(entry.value);
                 let mut replicas = Vec::with_capacity(entry.targets.len());
                 let mut remote_requests = Vec::new();
                 for (priority, (target, reservation)) in entry
@@ -470,7 +473,7 @@ impl StoreClient {
                         offset,
                         segment_offset: reservation.offset_bytes,
                         length: entry.value.len() as u64,
-                        checksum: None,
+                        checksum: Some(checksum),
                         tier: ReplicaTier::Dram,
                         priority: priority as u16,
                     });
@@ -493,6 +496,11 @@ impl StoreClient {
                     let free_result = transport.free_batch(batch_id);
                     wait_result?;
                     free_result?;
+                    registry::record_transport_bytes(
+                        "write",
+                        "storage",
+                        remote_requests.iter().map(|request| request.length).sum(),
+                    );
                 }
 
                 let expected_version = current.as_ref().map(|route| route.version);
@@ -533,9 +541,28 @@ impl StoreClient {
             })
             .collect::<Vec<_>>();
         let cas_tracker = OperationTracker::new("batch_put_stage_route_cas");
+        let publish_started = Instant::now();
         let cas_results_result = self
             .route_directory
             .compare_and_swap_object_routes(&self.lease, &cas_requests);
+        registry::record_replication_publish(
+            match &cas_results_result {
+                Ok(results) if results.iter().any(|result| result.is_err()) => "error",
+                Ok(results) if results.iter().any(|result| {
+                    result
+                        .as_ref()
+                        .ok()
+                        .is_some_and(|cas| !cas.applied)
+                }) =>
+                {
+                    "conflict"
+                }
+                Ok(_) => "ok",
+                Err(StoreError::Conflict(_)) => "conflict",
+                Err(_) => "error",
+            },
+            publish_started.elapsed(),
+        );
         cas_tracker.finish(&cas_results_result, 0);
         let cas_results = match cas_results_result {
             Ok(results) => results,

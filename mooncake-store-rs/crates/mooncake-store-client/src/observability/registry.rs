@@ -537,6 +537,58 @@ pub(crate) fn record_route_cas(result: &'static str) {
         .add(ResultKey { result }, 1);
 }
 
+pub(crate) fn record_replication_publish(result: &'static str, duration: Duration) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .replication_publish_duration
+        .observe(ResultKey { result }, duration.as_secs_f64());
+}
+
+pub(crate) fn record_checksum_validation(result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .checksum_validation
+        .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_rebalance_route(phase: &'static str, result: &'static str) {
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .rebalance_routes
+        .add(PhaseResultKey { phase, result }, 1);
+}
+
+pub(crate) fn record_rebalance_bytes(phase: &'static str, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .rebalance_bytes
+        .add(PhaseKey { phase }, bytes);
+}
+
+pub(crate) fn record_transport_bytes(direction: &'static str, peer_kind: &'static str, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    metrics_registry()
+        .lock()
+        .expect("metrics lock poisoned")
+        .transport_bytes
+        .add(
+            TransportBytesKey {
+                direction,
+                peer_kind,
+            },
+            bytes,
+        );
+}
+
 pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration) {
     let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
     let key = ResultKey { result };
