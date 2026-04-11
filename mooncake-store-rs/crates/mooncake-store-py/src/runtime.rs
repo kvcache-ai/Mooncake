@@ -189,6 +189,7 @@ mod tests {
                 local_buffer_size: 1024,
                 protocol: protocol.to_string(),
                 _rdma_devices: String::new(),
+                transport_rpc_port: None,
                 stable_id: Some("py-runtime".to_string()),
                 tenant: "default".to_string(),
                 labels: BTreeMap::new(),
