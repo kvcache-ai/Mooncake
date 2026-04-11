@@ -56,11 +56,13 @@ The implementation is easier to understand when grouped by capability instead of
 ### Routing
 
 - default client-side route ownership with embedded weighted rendezvous hashing
+- configurable WRH authority fanout through `route_topk` with primary-plus-mirrors selection
 - optional `MetadataOnly` route mode
 - route read, replace, and compare-and-swap through the control plane
 - metadata fallback when route authorities are unavailable
 - prewarmed membership snapshots with background lease refresh instead of request-path membership refresh
 - read fail-fast on suspect or offline owners while keeping draining owners readable during handoff
+- cluster route policy bootstrap in metadata: the first client in a metadata keyspace publishes `route_control + route_topk`, later clients must match or fail startup
 
 ### Placement and Replication
 
@@ -161,6 +163,7 @@ The runtime separates two owner roles:
 
 - route owner decides object-route versions and CAS
 - storage owner tracks locally stored replicas and runs eviction under capacity pressure
+- `route_topk` controls how many route authorities are mirrored per key; it is distinct from write-side `replica_count`
 - storage owners reclaim in the background above the high watermark and stop at the low watermark
 - readers report replica hits to storage owners in batch
 - writers push published remote routes to storage owners in batch

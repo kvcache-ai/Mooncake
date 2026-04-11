@@ -27,6 +27,7 @@ pub struct StoreClientBuilder {
     transport_factory: Option<Arc<dyn StoreTransportFactory>>,
     write_mode: WriteMode,
     route_control: RouteControlMode,
+    route_topk: usize,
     live_client_sync_interval: Duration,
 }
 
@@ -45,6 +46,7 @@ impl StoreClientBuilder {
             transport_factory: None,
             write_mode: WriteMode::LocalOnly,
             route_control: RouteControlMode::EmbeddedWrh,
+            route_topk: DEFAULT_ROUTE_TOPK,
             live_client_sync_interval: DEFAULT_LIVE_CLIENT_SYNC_INTERVAL,
         }
     }
@@ -117,6 +119,11 @@ impl StoreClientBuilder {
         self
     }
 
+    pub fn route_topk(mut self, route_topk: usize) -> Self {
+        self.route_topk = route_topk;
+        self
+    }
+
     pub fn live_client_sync_interval(mut self, interval: Duration) -> Self {
         self.live_client_sync_interval = interval;
         self
@@ -126,6 +133,11 @@ impl StoreClientBuilder {
         if self.default_tenant.is_empty() {
             return Err(StoreError::InvalidState(
                 "default tenant must not be empty".to_string(),
+            ));
+        }
+        if self.route_topk < 2 {
+            return Err(StoreError::InvalidState(
+                "route_topk must be greater than or equal to 2".to_string(),
             ));
         }
 
@@ -165,8 +177,15 @@ impl StoreClientBuilder {
             endpoints: endpoints.clone(),
             expires_at_ms,
         };
+        bootstrap_route_policy(
+            self.metadata.as_ref(),
+            &provisional_lease,
+            self.route_control,
+            self.route_topk,
+        )?;
         let route_directory = build_route_directory(
             self.route_control,
+            self.route_topk,
             self.metadata.clone(),
             &provisional_lease,
             control_client.clone(),
@@ -233,7 +252,54 @@ impl StoreClientBuilder {
             transport_factory: self.transport_factory,
             write_mode: self.write_mode,
             route_control: self.route_control,
+            route_topk: self.route_topk,
             state,
         })
     }
+}
+
+fn bootstrap_route_policy(
+    metadata: &dyn MetadataBackend,
+    lease: &ClientLease,
+    route_control: RouteControlMode,
+    route_topk: usize,
+) -> Result<()> {
+    let domain = RoutePolicyDomain::Default;
+    let local = RoutePolicy {
+        route_topk: route_topk as u32,
+        route_control,
+        created_by: lease.runtime.clone(),
+        created_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    match metadata.get_route_policy(&domain)? {
+        Some(existing) => validate_route_policy(&local, &existing),
+        None => {
+            if metadata.put_route_policy_if_absent(&domain, &local)? {
+                return Ok(());
+            }
+            let Some(existing) = metadata.get_route_policy(&domain)? else {
+                return Err(StoreError::InvalidState(
+                    "route policy bootstrap raced but no policy was readable afterward"
+                        .to_string(),
+                ));
+            };
+            validate_route_policy(&local, &existing)
+        }
+    }
+}
+
+fn validate_route_policy(local: &RoutePolicy, existing: &RoutePolicy) -> Result<()> {
+    if local.semantically_matches(existing) {
+        return Ok(());
+    }
+    Err(StoreError::InvalidState(format!(
+        "route policy mismatch: local(route_control={:?}, route_topk={}) metadata(route_control={:?}, route_topk={})",
+        local.route_control,
+        local.route_topk,
+        existing.route_control,
+        existing.route_topk,
+    )))
 }

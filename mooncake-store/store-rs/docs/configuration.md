@@ -20,6 +20,7 @@ This document collects the main runtime knobs exposed by the current implementat
 | `transport_factory(...)` | none | used to create transports for peers |
 | `routed_writes(...)` | disabled | enables routed placement |
 | `route_control(...)` | `EmbeddedWrh` | selects route control mode |
+| `route_topk(...)` | `2` | WRH route-authority fanout; stored as cluster policy in the metadata keyspace; must be `>= 2` |
 | `live_client_sync_interval(...)` | `1s` | background refresh interval for the live-client membership snapshot; `0` disables the worker |
 
 System-managed behavior:
@@ -78,6 +79,24 @@ Hugepage behavior:
 
 Use `MetadataOnly` for bring-up and debugging. Use `EmbeddedWrh` for normal deployments.
 
+### Route authority policy
+
+`route_topk` controls how many WRH-ranked route authorities each key uses.
+
+- the highest-ranked authority is the CAS primary
+- the remaining `route_topk - 1` authorities are mirrors used for read repair and mirror publication
+- `route_topk` is **not** the same as write-side `replica_count`
+- the runtime rejects `route_topk < 2`
+
+Startup bootstrap is metadata-authoritative:
+
+- every client starts with a local route policy: `route_control + route_topk`
+- if the metadata keyspace has no route policy yet, the first successful client writes it with create-if-absent semantics
+- later clients must match the stored policy or startup fails immediately
+- the current bootstrap scope is the metadata keyspace, so request-level tenants share the same route-authority policy inside one deployment
+
+For tenant-isolated deployments that need different route-authority policy, use a different `MetadataKeyspace`.
+
 ## Routed Placement
 
 Routed placement is enabled through:
@@ -118,6 +137,11 @@ If `replica_count` is not set:
 
 - local-only clients default to one replica
 - routed clients default to the replica count passed to `routed_writes(...)`
+
+Keep the distinction clean:
+
+- `replica_count` controls how many data replicas a write publishes
+- `route_topk` controls how many route authorities keep mirrored route metadata
 
 ## Labels and Naming
 
@@ -203,6 +227,7 @@ Important Python-only compatibility knobs:
 | `labels` | lease labels such as `pool` and `storage` |
 | `routed_writes` | enable routed placement from Python |
 | `replica_count` | default replica count when routed writes are enabled |
+| `route_topk` | WRH route-authority fanout; must match the policy already stored in the metadata keyspace |
 | `transport_metadata_url` | Redis endpoint for TENT when store metadata uses etcd |
 | `transport_rpc_port` | fixed TENT TCP data-plane port for real-mode peers |
 | `use_hugepage` | enable hugepage-backed local store memory |

@@ -54,11 +54,22 @@ In the default route mode, the client chooses route authorities with embedded we
 
 - candidates come from live client leases
 - only compatible, route-capable clients are considered
-- one primary and one secondary authority are selected per key
+- the top `route_topk` authorities are selected per key
+- the highest-ranked authority is the CAS primary
+- the remaining `route_topk - 1` authorities are mirrored authorities
 - route reads and route CAS go to authorities over the control plane
 - metadata remains the fallback path when authorities are unavailable
 
 This keeps object route lookups off the metadata hot path while preserving a durable fallback.
+
+Route authority policy is bootstrap-validated through metadata:
+
+- every client starts with a local `route_control + route_topk` policy
+- the first client in a metadata keyspace writes that policy with create-if-absent semantics
+- later clients must match the stored policy or startup fails
+- request-level tenants share the same cluster route policy inside one metadata keyspace
+
+This keeps route-authority fanout deterministic across the cluster instead of letting each client silently pick a different authority set size.
 
 ### Alternative mode: `MetadataOnly`
 
@@ -66,7 +77,7 @@ This keeps object route lookups off the metadata hot path while preserving a dur
 
 | Route Mode | Route Read Path | Route Write Path | Best For |
 |------------|-----------------|------------------|----------|
-| `EmbeddedWrh` | Authority RPC first, metadata fallback | Authority CAS with secondary mirror | Normal deployments |
+| `EmbeddedWrh` | Authority RPC first, metadata fallback | Authority CAS with mirrored top-k publication | Normal deployments |
 | `MetadataOnly` | Metadata backend | Metadata backend | Simpler debugging and bring-up |
 
 ## Membership Snapshot Model
@@ -82,6 +93,12 @@ The shared snapshot is the membership truth used by the hot request path.
 - failed refresh keeps the last successful snapshot available
 
 This keeps `list_live_clients()` off the normal request path. Metadata still owns the durable lease set, but request-path consumers read a locally cached view that is refreshed asynchronously.
+
+The membership snapshot is runtime cache, not protocol configuration:
+
+- membership snapshots are refreshed in the background
+- route policy is durable cluster configuration stored in metadata
+- request-level tenants affect scoped object keys, not the cluster-wide route-authority policy
 
 ## Write Path
 
@@ -258,6 +275,8 @@ It handles three categories of RPC:
 - eviction RPC: batch report route hits, batch track replica routes
 
 Single-item calls are intentionally folded into the batch path so that the implementation can reuse streaming sessions and keep the control-plane logic uniform.
+
+For route control, that batch substrate serves both the CAS primary and the mirrored remainder of the `route_topk` authority set.
 
 ## Metadata Model
 

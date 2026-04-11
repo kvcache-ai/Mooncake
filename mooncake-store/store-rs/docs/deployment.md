@@ -298,6 +298,7 @@ Current repository scripts and examples use Redis-backed TENT metadata. In the P
 This is the default mode.
 
 - route ownership is selected on the client with weighted rendezvous hashing
+- the top `route_topk` authorities are selected per key; the first authority is primary and the rest are mirrors
 - the client prewarms a live-client membership snapshot during `build(...)`
 - background membership sync refreshes that snapshot after startup
 - steady-state reads use that cached snapshot instead of refreshing membership inline
@@ -305,6 +306,13 @@ This is the default mode.
 - storage owners manage local eviction separately from route ownership
 - read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners, and best-effort prune unreadable replicas after fallback
 - metadata remains the fallback when authority RPC is unavailable
+
+Cluster policy is metadata-authoritative:
+
+- every client starts with a local `route_control + route_topk` policy
+- the first client in a metadata keyspace persists that policy
+- later clients must match the stored policy or startup fails
+- request-level tenants share that policy inside one metadata keyspace
 
 ### `MetadataOnly`
 

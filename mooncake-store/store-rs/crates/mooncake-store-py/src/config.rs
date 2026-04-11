@@ -20,6 +20,7 @@ pub struct CompatBuildPlan {
     pub labels: BTreeMap<String, String>,
     pub routed_writes: bool,
     pub replica_count: usize,
+    pub route_topk: usize,
     pub storage_bytes: usize,
     pub scratch_bytes: usize,
     pub expires_at_ms: u64,
@@ -42,6 +43,7 @@ pub struct CompatSetupArgs {
     pub labels: BTreeMap<String, String>,
     pub routed_writes: bool,
     pub replica_count: usize,
+    pub route_topk: usize,
     pub keyspace: Option<String>,
     pub expires_at_ms: Option<u64>,
     pub use_hugepage: Option<bool>,
@@ -63,6 +65,11 @@ impl CompatSetupArgs {
             self.transport_rpc_port,
         )?;
         let mut labels = self.labels;
+        if self.route_topk < 2 {
+            return Err(StoreError::InvalidState(
+                "route_topk must be greater than or equal to 2".to_string(),
+            ));
+        }
         match labels.get("storage").map(String::as_str) {
             Some("true") if self.global_segment_size == 0 => {
                 return Err(StoreError::InvalidState(
@@ -85,6 +92,7 @@ impl CompatSetupArgs {
             labels,
             routed_writes: self.routed_writes,
             replica_count: self.replica_count.max(1),
+            route_topk: self.route_topk,
             storage_bytes: self.global_segment_size,
             scratch_bytes: self.local_buffer_size,
             expires_at_ms: self
@@ -336,6 +344,7 @@ mod tests {
             labels: BTreeMap::new(),
             routed_writes: false,
             replica_count: 1,
+            route_topk: 2,
             keyspace: None,
             expires_at_ms: Some(1),
             use_hugepage: None,
@@ -365,6 +374,7 @@ mod tests {
             labels: BTreeMap::from([("storage".to_string(), "true".to_string())]),
             routed_writes: false,
             replica_count: 1,
+            route_topk: 2,
             keyspace: None,
             expires_at_ms: Some(1),
             use_hugepage: None,
@@ -373,6 +383,36 @@ mod tests {
         .build();
         let error = match result {
             Ok(_) => panic!("build plan should reject storage=true without storage bytes"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn build_plan_rejects_route_topk_below_two() {
+        let result = CompatSetupArgs {
+            local_hostname: "127.0.0.1".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            global_segment_size: 4096,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            transport_rpc_port: None,
+            stable_id: Some("sample".to_string()),
+            tenant: "default".to_string(),
+            labels: BTreeMap::new(),
+            routed_writes: false,
+            replica_count: 1,
+            route_topk: 1,
+            keyspace: None,
+            expires_at_ms: Some(1),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+        }
+        .build();
+        let error = match result {
+            Ok(_) => panic!("build plan should reject route_topk < 2"),
             Err(error) => error,
         };
         assert!(matches!(error, StoreError::InvalidState(_)));
@@ -394,6 +434,7 @@ mod tests {
             labels: BTreeMap::from([("pool".to_string(), "pool-a".to_string())]),
             routed_writes: true,
             replica_count: 0,
+            route_topk: 3,
             keyspace: Some("py/test".to_string()),
             expires_at_ms: None,
             use_hugepage: Some(true),
@@ -405,6 +446,7 @@ mod tests {
         assert!(plan.stable_id.starts_with("py-store-"));
         assert_eq!(plan.tenant, "tenant-a");
         assert_eq!(plan.replica_count, 1);
+        assert_eq!(plan.route_topk, 3);
         assert_eq!(plan.storage_bytes, 4096);
         assert_eq!(plan.scratch_bytes, 1024);
         assert_eq!(plan.use_hugepage, Some(true));
@@ -436,6 +478,7 @@ mod tests {
             labels: BTreeMap::new(),
             routed_writes: true,
             replica_count: 1,
+            route_topk: 2,
             keyspace: None,
             expires_at_ms: Some(10_000),
             use_hugepage: None,

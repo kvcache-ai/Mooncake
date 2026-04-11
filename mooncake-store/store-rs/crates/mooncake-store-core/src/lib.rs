@@ -13,7 +13,7 @@ pub use identity::{ClientEndpointSet, ClientEpoch, ClientRuntimeId, ClientStable
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
-    RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    SegmentReservation,
+    RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
 };
 pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory};

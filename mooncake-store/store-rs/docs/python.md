@@ -151,6 +151,7 @@ Useful flags:
 - `--transport-metadata-url` for TENT Redis when the metadata backend uses etcd
 - `--transport-rpc-port <port>` to pin the TENT TCP data-plane port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
+- `--route-topk <n>` to control WRH route-authority fanout; it must be `>= 2` and match the policy already stored in the metadata keyspace
 - `--route-control metadata-only|embedded-wrh` to select the route authority mode
 - `--heartbeat-interval-ms` and `--lease-ttl-ms` to tune lease refresh; `--lease-ttl-ms` defaults to `30000`
 - `--drain-on-exit` to enter draining mode and evacuate owned replicas before shutdown
@@ -213,6 +214,7 @@ store.setup(
     labels={"pool": "pool-a", "storage": "false"},
     routed_writes=True,
     replica_count=2,
+    route_topk=2,
 )
 
 policy = ReplicateConfig(

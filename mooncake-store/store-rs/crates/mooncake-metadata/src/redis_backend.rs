@@ -2,8 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    MetadataBackend, ObjectKey, ObjectRoute, Result, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
 };
 use redis::{Commands, ConnectionInfo, IntoConnectionInfo, RedisConnectionInfo, Script};
 
@@ -578,6 +578,30 @@ impl MetadataBackend for RedisMetadataBackend {
             applied: current_payload.0 == 1,
             current,
         })
+    }
+
+    fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.route_policy(domain);
+        let payload: Option<String> = connection
+            .get(&key)
+            .map_err(|error| metadata_error("redis get route policy", error))?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(json_error))
+            .transpose()
+    }
+
+    fn put_route_policy_if_absent(
+        &self,
+        domain: &RoutePolicyDomain,
+        policy: &RoutePolicy,
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let key = self.keyspace.route_policy(domain);
+        let payload = serde_json::to_string(policy).map_err(json_error)?;
+        connection
+            .set_nx(key, payload)
+            .map_err(|error| metadata_error("redis setnx route policy", error))
     }
 
     fn put_handoff(&self, handoff: &HandoffPlan) -> Result<()> {

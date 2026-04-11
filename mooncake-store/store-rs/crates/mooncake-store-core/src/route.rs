@@ -121,6 +121,39 @@ pub struct RouteCasRequest {
     pub next: Option<ObjectRoute>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RouteControlMode {
+    MetadataOnly,
+    #[default]
+    EmbeddedWrh,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum RoutePolicyDomain {
+    Default,
+    Tenant(String),
+}
+
+impl Default for RoutePolicyDomain {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RoutePolicy {
+    pub route_topk: u32,
+    pub route_control: RouteControlMode,
+    pub created_by: ClientRuntimeId,
+    pub created_at_ms: u64,
+}
+
+impl RoutePolicy {
+    pub fn semantically_matches(&self, other: &Self) -> bool {
+        self.route_topk == other.route_topk && self.route_control == other.route_control
+    }
+}
+
 fn default_segment_alignment_bytes() -> u64 {
     1
 }
