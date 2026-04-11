@@ -112,6 +112,12 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         return reg.error();
     }
 
+    // 3.5. Start heartbeat immediately after registration so master does not
+    //      consider this client disconnected during a lengthy InitStorage.
+    //      build_heartbeat_request() and OnHAEvent() both guard against
+    //      uninitialized data_manager_ / ha_manager_, so this is safe.
+    StartHeartbeat(config.master_server_entry);
+
     // 4. Initialize TieredBackend + DataManager
     err = InitStorage(config);
     if (err != ErrorCode::OK) {
@@ -165,9 +171,6 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // Give RPC server a moment to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
-
-    // 6. Start heartbeat AFTER everything is fully initialized
-    StartHeartbeat(config.master_server_entry);
 
     return ErrorCode::OK;
 }
