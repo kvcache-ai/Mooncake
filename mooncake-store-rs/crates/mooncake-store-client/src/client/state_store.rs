@@ -181,6 +181,7 @@ impl StorageOwnerState {
 
     fn evict_until_low_watermark(&self, high_percent: u8, low_percent: u8) -> Result<usize> {
         let tracker = OperationTracker::new("storage_owner_background_eviction");
+        let started = Instant::now();
         let result = (|| {
             let (used_bytes, capacity_bytes) = self.allocator.lock().usage_bytes();
             if capacity_bytes == 0 {
@@ -217,6 +218,10 @@ impl StorageOwnerState {
             Ok(evicted)
         })();
         tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
+        registry::record_eviction(
+            if result.is_ok() { "ok" } else { "error" },
+            started.elapsed(),
+        );
         result
     }
 
@@ -349,8 +354,10 @@ impl StorageOwnerState {
         let result = (|| {
             let routes = self.collect_routes_by_replica_owner(&self.runtime)?;
             let pending_hot_keys = self.clock.lock().pending_hot_keys.clone();
-            let mut clock = StorageClockState::default();
-            clock.pending_hot_keys = pending_hot_keys;
+            let mut clock = StorageClockState {
+                pending_hot_keys,
+                ..StorageClockState::default()
+            };
             for route in &routes {
                 clock.track_route(route, &self.runtime);
             }

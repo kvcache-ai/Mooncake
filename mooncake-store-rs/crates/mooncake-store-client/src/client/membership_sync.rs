@@ -83,11 +83,11 @@ impl AsyncEvictionHandle {
     ) -> Result<Self> {
         if local_memory.eviction_poll_interval.is_zero()
             || !local_memory.has_storage()
-            || !lease
+            || lease
                 .endpoints
                 .labels
                 .get("storage")
-                .is_some_and(|value| value == "true")
+                .is_none_or(|value| value != "true")
         {
             return Ok(Self::disabled());
         }
@@ -140,9 +140,15 @@ pub(crate) fn refresh_live_client_cache(
     operation: &'static str,
 ) -> Result<Vec<ClientLease>> {
     let tracker = OperationTracker::new(operation);
+    let started = Instant::now();
     let result = metadata.list_live_clients();
     tracker.finish(&result, 0);
+    registry::record_membership_refresh(
+        if result.is_ok() { "ok" } else { "error" },
+        started.elapsed(),
+    );
     if let Ok(leases) = &result {
+        registry::record_runtime_leases(leases);
         live_client_cache.lock().store(leases.clone());
     }
     result

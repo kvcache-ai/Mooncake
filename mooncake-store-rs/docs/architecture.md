@@ -294,7 +294,15 @@ These APIs are what the e2e suite uses to validate dynamic membership, elastic e
 
 ## Observability
 
-The client contains a built-in metrics registry and a lightweight HTTP exporter.
+The client contains a built-in typed metrics registry and a lightweight HTTP exporter.
+
+Observability is split into three stages:
+
+- request-path code records facts into typed families close to the state transition
+- `snapshot_metrics()` builds one immutable view of registry + process facts
+- the exporter renders Prometheus text from that snapshot without mutating state
+
+This avoids continuing to grow one branchy `operation -> counters` map and keeps `/metrics` deterministic under concurrent request traffic.
 
 ### Metrics
 

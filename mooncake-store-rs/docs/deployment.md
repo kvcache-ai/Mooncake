@@ -105,6 +105,11 @@ What the script does:
 - warms one key, then waits for background storage-owner eviction to reclaim the cold replica
 - verifies both Prometheus metrics and tracing logs for the eviction path
 
+For production dashboards, pair the in-process exporter with infrastructure exporters:
+
+- use Mooncake Store RS for request, lease, route, capacity, lifecycle, and process metrics
+- use `node_exporter` or `cAdvisor` for host CPU, disk, filesystem, and network saturation
+
 ### HiCache compatibility validation
 
 Run the compatibility checks for both Python execution modes:

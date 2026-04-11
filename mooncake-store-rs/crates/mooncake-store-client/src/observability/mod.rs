@@ -1,79 +1,24 @@
-use std::collections::BTreeMap;
+mod exporter;
+mod process;
+pub(crate) mod registry;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{fmt, EnvFilter};
 
-type MetricKey = (&'static str, &'static str);
+pub use registry::{MetricsSnapshot, OperationMetricSnapshot};
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct OperationMetricSnapshot {
-    pub operation: &'static str,
-    pub status: &'static str,
-    pub calls_total: u64,
-    pub bytes_in_total: u64,
-    pub bytes_out_total: u64,
-    pub latency_total_us: u64,
-    pub latency_max_us: u64,
-}
-
-#[derive(Default)]
-struct OperationMetricState {
-    calls_total: u64,
-    bytes_in_total: u64,
-    bytes_out_total: u64,
-    latency_total_us: u64,
-    latency_max_us: u64,
-}
-
-#[derive(Default)]
-struct MetricsRegistry {
-    operations: BTreeMap<MetricKey, OperationMetricState>,
-}
-
-impl MetricsRegistry {
-    fn record(
-        &mut self,
-        operation: &'static str,
-        status: &'static str,
-        bytes_in: u64,
-        bytes_out: u64,
-        latency_us: u64,
-    ) {
-        let state = self.operations.entry((operation, status)).or_default();
-        state.calls_total = state.calls_total.saturating_add(1);
-        state.bytes_in_total = state.bytes_in_total.saturating_add(bytes_in);
-        state.bytes_out_total = state.bytes_out_total.saturating_add(bytes_out);
-        state.latency_total_us = state.latency_total_us.saturating_add(latency_us);
-        state.latency_max_us = state.latency_max_us.max(latency_us);
-    }
-
-    fn snapshot(&self) -> Vec<OperationMetricSnapshot> {
-        self.operations
-            .iter()
-            .map(|((operation, status), state)| OperationMetricSnapshot {
-                operation,
-                status,
-                calls_total: state.calls_total,
-                bytes_in_total: state.bytes_in_total,
-                bytes_out_total: state.bytes_out_total,
-                latency_total_us: state.latency_total_us,
-                latency_max_us: state.latency_max_us,
-            })
-            .collect()
-    }
-}
-
-static METRICS: OnceLock<Mutex<MetricsRegistry>> = OnceLock::new();
 static TRACING_STATE: OnceLock<()> = OnceLock::new();
 static METRICS_HTTP_SERVER: OnceLock<Mutex<Option<MetricsHttpServer>>> = OnceLock::new();
+#[cfg(test)]
+static METRICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 const HTTP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_millis(250);
@@ -96,17 +41,30 @@ impl MetricsHttpServer {
 
 pub struct OperationTracker {
     operation: &'static str,
+    scope: &'static str,
     start: Instant,
     bytes_in: u64,
+    _inflight: InflightGuard,
 }
 
 impl OperationTracker {
     pub fn new(operation: &'static str) -> Self {
+        let scope = default_scope(operation);
         Self {
             operation,
+            scope,
             start: Instant::now(),
             bytes_in: 0,
+            _inflight: InflightGuard::enter(operation, scope),
         }
+    }
+
+    pub fn scope(mut self, scope: &'static str) -> Self {
+        if self.scope != scope {
+            self._inflight = InflightGuard::enter(self.operation, scope);
+        }
+        self.scope = scope;
+        self
     }
 
     pub fn input_bytes(mut self, bytes_in: u64) -> Self {
@@ -115,12 +73,37 @@ impl OperationTracker {
     }
 
     pub fn finish<T>(&self, result: &Result<T>, bytes_out: u64) {
-        let status = if result.is_ok() { "ok" } else { "error" };
-        let latency_us = self.start.elapsed().as_micros() as u64;
-        metrics_registry()
-            .lock()
-            .expect("metrics lock poisoned")
-            .record(self.operation, status, self.bytes_in, bytes_out, latency_us);
+        let result_label = result_label(result);
+        self.finish_with_result(result_label, bytes_out);
+    }
+
+    pub(crate) fn finish_with_result(&self, result: &'static str, bytes_out: u64) {
+        registry::record_request(
+            self.operation,
+            self.scope,
+            result,
+            self.bytes_in,
+            bytes_out,
+            self.start.elapsed(),
+        );
+    }
+}
+
+pub struct InflightGuard {
+    operation: &'static str,
+    scope: &'static str,
+}
+
+impl InflightGuard {
+    pub fn enter(operation: &'static str, scope: &'static str) -> Self {
+        registry::increment_inflight(operation, scope);
+        Self { operation, scope }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        registry::decrement_inflight(self.operation, self.scope);
     }
 }
 
@@ -248,70 +231,21 @@ pub fn stop_metrics_http_server() -> Result<()> {
 }
 
 pub fn render_prometheus_metrics() -> String {
-    let snapshots = snapshot_metrics();
-    let mut output = String::new();
-    output.push_str("# HELP mooncake_store_client_operation_total Total StoreClient operations.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_total counter\n");
-    for snapshot in &snapshots {
-        output.push_str(&format!(
-            "mooncake_store_client_operation_total{{operation=\"{}\",status=\"{}\"}} {}\n",
-            snapshot.operation, snapshot.status, snapshot.calls_total
-        ));
-    }
-
-    output.push_str("# HELP mooncake_store_client_operation_bytes_in_total Total input bytes by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_bytes_in_total counter\n");
-    for snapshot in &snapshots {
-        output.push_str(&format!(
-            "mooncake_store_client_operation_bytes_in_total{{operation=\"{}\",status=\"{}\"}} {}\n",
-            snapshot.operation, snapshot.status, snapshot.bytes_in_total
-        ));
-    }
-
-    output.push_str("# HELP mooncake_store_client_operation_bytes_out_total Total output bytes by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_bytes_out_total counter\n");
-    for snapshot in &snapshots {
-        output.push_str(&format!(
-            "mooncake_store_client_operation_bytes_out_total{{operation=\"{}\",status=\"{}\"}} {}\n",
-            snapshot.operation, snapshot.status, snapshot.bytes_out_total
-        ));
-    }
-
-    output.push_str("# HELP mooncake_store_client_operation_latency_microseconds_total Total latency in microseconds by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_latency_microseconds_total counter\n");
-    for snapshot in &snapshots {
-        output.push_str(&format!(
-            "mooncake_store_client_operation_latency_microseconds_total{{operation=\"{}\",status=\"{}\"}} {}\n",
-            snapshot.operation, snapshot.status, snapshot.latency_total_us
-        ));
-    }
-
-    output.push_str("# HELP mooncake_store_client_operation_latency_microseconds_max Maximum latency in microseconds by StoreClient operation.\n");
-    output.push_str("# TYPE mooncake_store_client_operation_latency_microseconds_max gauge\n");
-    for snapshot in &snapshots {
-        output.push_str(&format!(
-            "mooncake_store_client_operation_latency_microseconds_max{{operation=\"{}\",status=\"{}\"}} {}\n",
-            snapshot.operation, snapshot.status, snapshot.latency_max_us
-        ));
-    }
-
-    output
+    exporter::render_prometheus_metrics(&snapshot_metrics())
 }
 
-pub fn snapshot_metrics() -> Vec<OperationMetricSnapshot> {
-    metrics_registry()
-        .lock()
-        .expect("metrics lock poisoned")
-        .snapshot()
+pub fn snapshot_metrics() -> MetricsSnapshot {
+    registry::snapshot_metrics(process::snapshot_process())
 }
 
 #[cfg(test)]
 pub fn reset_metrics() {
-    *metrics_registry().lock().expect("metrics lock poisoned") = MetricsRegistry::default();
+    registry::reset_metrics();
 }
 
-fn metrics_registry() -> &'static Mutex<MetricsRegistry> {
-    METRICS.get_or_init(|| Mutex::new(MetricsRegistry::default()))
+#[cfg(test)]
+pub fn metrics_test_lock() -> &'static Mutex<()> {
+    METRICS_TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn metrics_http_server() -> &'static Mutex<Option<MetricsHttpServer>> {
@@ -386,19 +320,36 @@ fn read_http_path(stream: &mut TcpStream) -> std::io::Result<String> {
     Ok(path.to_string())
 }
 
+fn default_scope(operation: &'static str) -> &'static str {
+    if operation.starts_with("control_") {
+        return "control_plane";
+    }
+    if operation.contains("background")
+        || operation.contains("evict")
+        || operation.contains("rebuild")
+    {
+        return "background";
+    }
+    "foreground"
+}
+
+fn result_label<T>(result: &Result<T>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(StoreError::Conflict(_)) => "conflict",
+        Err(_) => "error",
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::{Mutex, OnceLock};
-
-    use super::*;
-
-    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn metrics_http_server_serves_prometheus_text() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
         reset_metrics();
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
 
@@ -419,8 +370,54 @@ mod tests {
     }
 
     #[test]
+    fn request_metrics_include_histogram_bytes_and_inflight() {
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        reset_metrics();
+
+        let result: Result<()> = Ok(());
+        {
+            let tracker = OperationTracker::new("put")
+                .scope("foreground")
+                .input_bytes(16);
+            tracker.finish(&result, 8);
+
+            let active = render_prometheus_metrics();
+            assert!(active.contains(
+                "mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 1"
+            ));
+            assert!(active.contains(
+                "mooncake_store_request_total{operation=\"put\",scope=\"foreground\",result=\"ok\"} 1"
+            ));
+            assert!(active.contains(
+                "mooncake_store_request_duration_seconds_bucket{operation=\"put\",scope=\"foreground\",result=\"ok\",le=\"+Inf\"} 1"
+            ));
+            assert!(active.contains(
+                "mooncake_store_request_bytes_total{operation=\"put\",direction=\"in\",scope=\"foreground\"} 16"
+            ));
+            assert!(active.contains(
+                "mooncake_store_request_bytes_total{operation=\"put\",direction=\"out\",scope=\"foreground\"} 8"
+            ));
+        }
+
+        let idle = render_prometheus_metrics();
+        assert!(idle
+            .contains("mooncake_store_request_inflight{operation=\"put\",scope=\"foreground\"} 0"));
+    }
+
+    #[test]
+    fn process_metrics_are_rendered_with_request_snapshot() {
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        reset_metrics();
+
+        let metrics = render_prometheus_metrics();
+
+        assert!(metrics.contains("# HELP process_cpu_seconds_total"));
+        assert!(metrics.contains("# TYPE process_resident_memory_bytes gauge"));
+    }
+
+    #[test]
     fn metrics_http_server_serves_health_probe() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
         let address = start_metrics_http_server("127.0.0.1:0")
             .expect("metrics server should start on an ephemeral port");
@@ -432,7 +429,7 @@ mod tests {
 
     #[test]
     fn tracing_init_from_env_covers_invalid_disabled_and_repeated_paths() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
         let toggle_env = "MOONCAKE_TEST_TRACING_ENABLED";
         let filter_env = "MOONCAKE_TEST_TRACING_FILTER";
 
@@ -463,7 +460,7 @@ mod tests {
 
     #[test]
     fn metrics_http_server_env_helpers_reuse_server_and_cover_routes() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
         let addr_env = "MOONCAKE_TEST_METRICS_ADDR";
         stop_metrics_http_server().expect("metrics server cleanup should succeed");
 
@@ -516,7 +513,7 @@ mod tests {
 
     #[test]
     fn metrics_http_connection_tolerates_empty_clients() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
         let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral listener should bind");
         let address = listener
             .local_addr()
@@ -548,10 +545,6 @@ mod tests {
             .read_to_string(&mut response)
             .expect("http client should read response");
         response
-    }
-
-    fn test_lock() -> &'static Mutex<()> {
-        TEST_LOCK.get_or_init(|| Mutex::new(()))
     }
 
     fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {

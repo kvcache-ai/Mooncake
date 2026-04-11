@@ -256,6 +256,29 @@ The metrics HTTP server exposes:
 - `GET /metrics`
 - `GET /healthz`
 
+Exporter families:
+
+- `mooncake_store_request_total`, `mooncake_store_request_inflight`, `mooncake_store_request_bytes_total`
+- `mooncake_store_request_duration_seconds_bucket`
+- `mooncake_store_segment_capacity_bytes`, `mooncake_store_segment_used_bytes`
+- `mooncake_store_runtime_status`, `mooncake_store_runtime_lease_expires_at_ms`
+- `mooncake_store_route_cas_total`
+- `mooncake_store_segment_lifecycle_total`, `mooncake_store_eviction_total`, `mooncake_store_eviction_duration_seconds_bucket`
+- `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_open_fds`
+
+Recommended recording queries:
+
+```promql
+rate(mooncake_store_request_total{operation="get",result="error"}[5m])
+histogram_quantile(0.99, sum by (le, operation) (rate(mooncake_store_request_duration_seconds_bucket[5m])))
+mooncake_store_segment_used_bytes / mooncake_store_segment_capacity_bytes
+```
+
+Infrastructure split:
+
+- process-scoped facts come from this crate
+- host CPU, disk, and network should come from `node_exporter` or `cAdvisor`
+
 ## Practical Defaults
 
 For local development:

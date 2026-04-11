@@ -61,7 +61,10 @@ mod tests {
             store_api_version: 9,
             metadata_schema_version: 8,
             transport_api_version: 7,
-            capabilities: BTreeSet::from(["hot-upgrade".to_string(), "tenant-isolation".to_string()]),
+            capabilities: BTreeSet::from([
+                "hot-upgrade".to_string(),
+                "tenant-isolation".to_string(),
+            ]),
         };
         assert!(descriptor.supports("hot-upgrade"));
         assert!(descriptor.supports("tenant-isolation"));

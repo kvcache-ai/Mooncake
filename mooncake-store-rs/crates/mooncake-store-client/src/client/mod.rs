@@ -22,7 +22,7 @@ use crate::control_plane::{
 use crate::memory::{
     LocalMemoryConfig, LocalMemoryState, RegionAllocation, StorageExtentInfo, StorageSegmentSpec,
 };
-use crate::observability::OperationTracker;
+use crate::observability::{registry, OperationTracker};
 use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,

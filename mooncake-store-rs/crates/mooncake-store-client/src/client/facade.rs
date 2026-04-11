@@ -227,6 +227,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         self.allocator.lock().upsert(&segment);
         let result = self.metadata.publish_segment(&segment);
         tracker.finish(&result, used_bytes);
+        registry::record_segment_lifecycle(
+            "mount_segment",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -326,6 +330,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         );
         let publish_result = self.metadata.publish_segment(&announcement);
         tracker.finish(&publish_result, 0);
+        registry::record_segment_lifecycle(
+            "expand_local_memory",
+            if publish_result.is_ok() { "ok" } else { "error" },
+        );
         publish_result?;
         Ok(announcement)
     }
@@ -347,6 +355,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             );
         }
         tracker.finish(&result, 0);
+        registry::record_segment_lifecycle(
+            "drain_segment",
+            if result.is_ok() { "ok" } else { "error" },
+        );
         result
     }
 
@@ -406,6 +418,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .unpublish_segment(&self.lease.runtime, segment)
             .map(|_| true);
         tracker.finish(&result, 0);
+        if result.as_ref().copied().unwrap_or(false) {
+            registry::record_segment_lifecycle("retire_segment", "ok");
+        } else if result.is_err() {
+            registry::record_segment_lifecycle("retire_segment", "error");
+        }
         result
     }
 
