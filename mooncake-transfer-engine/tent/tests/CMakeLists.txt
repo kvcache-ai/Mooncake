@@ -31,3 +31,9 @@ target_include_directories(transfer_engine_config_override_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
+
+add_executable(tent_tcp_transport_test tcp_transport_test.cpp)
+target_link_libraries(tent_tcp_transport_test PRIVATE tent gtest gtest_main)
+target_include_directories(tent_tcp_transport_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
