@@ -152,6 +152,7 @@ fn build_tent_config(
         .and_then(|mut segments| segments.next())
         .filter(|segment| !segment.is_empty())
         .unwrap_or("0");
+    let auth = resolve_transport_redis_auth(&redis);
 
     let (tcp_enable, rdma_enable) = match protocol.to_ascii_lowercase().as_str() {
         "tcp" | "" => ("true", "false"),
@@ -164,7 +165,7 @@ fn build_tent_config(
         }
     };
 
-    Ok(TentEngineConfig::new()
+    let mut config = TentEngineConfig::new()
         .set("metadata_type", "redis")
         .set("metadata_servers", format!("{host}:{port}"))
         .set("redis_db_index", db_index)
@@ -174,7 +175,46 @@ fn build_tent_config(
         .set("transports/tcp/enable", tcp_enable)
         .set("transports/shm/enable", "false")
         .set("transports/rdma/enable", rdma_enable)
-        .set("transports/io_uring/enable", "false"))
+        .set("transports/io_uring/enable", "false")
+        .redis_db_index(db_index);
+    if let Some(username) = auth.username {
+        config = config.redis_username(username);
+    }
+    if let Some(password) = auth.password {
+        config = config.redis_password(password);
+    }
+    Ok(config)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TransportRedisAuth {
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn resolve_transport_redis_auth(redis: &Url) -> TransportRedisAuth {
+    let url_username = (!redis.username().is_empty()).then(|| redis.username().to_string());
+    let url_password = redis.password().map(str::to_string);
+    if url_username.is_some() || url_password.is_some() {
+        return TransportRedisAuth {
+            username: url_username,
+            password: url_password,
+        };
+    }
+
+    let password = std::env::var("MC_REDIS_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let Some(password) = password else {
+        return TransportRedisAuth::default();
+    };
+    let username = std::env::var("MC_REDIS_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty());
+    TransportRedisAuth {
+        username,
+        password: Some(password),
+    }
 }
 
 fn normalize_etcd_endpoint(endpoint: &str) -> String {
@@ -195,8 +235,14 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
 
     use super::*;
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn normalize_etcd_endpoint_adds_http_scheme() {
@@ -217,6 +263,33 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("cache.local:6381"));
         assert!(debug.contains("3"));
+    }
+
+    #[test]
+    fn resolve_transport_redis_auth_prefers_url_credentials() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        std::env::set_var("MC_REDIS_USERNAME", "env-user");
+        std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
+        let redis = Url::parse("redis://url-user:url-pass@cache.local:6381/3")
+            .expect("redis url should parse");
+        let auth = resolve_transport_redis_auth(&redis);
+        assert_eq!(auth.username.as_deref(), Some("url-user"));
+        assert_eq!(auth.password.as_deref(), Some("url-pass"));
+        std::env::remove_var("MC_REDIS_USERNAME");
+        std::env::remove_var("MC_REDIS_PASSWORD");
+    }
+
+    #[test]
+    fn resolve_transport_redis_auth_falls_back_to_env_password() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        std::env::set_var("MC_REDIS_USERNAME", "env-user");
+        std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
+        let redis = Url::parse("redis://cache.local:6381/3").expect("redis url should parse");
+        let auth = resolve_transport_redis_auth(&redis);
+        assert_eq!(auth.username.as_deref(), Some("env-user"));
+        assert_eq!(auth.password.as_deref(), Some("env-pass"));
+        std::env::remove_var("MC_REDIS_USERNAME");
+        std::env::remove_var("MC_REDIS_PASSWORD");
     }
 
     #[test]

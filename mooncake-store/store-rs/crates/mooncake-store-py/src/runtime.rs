@@ -103,6 +103,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -122,13 +123,18 @@ mod tests {
 
     impl RedisTestServer {
         fn start() -> Option<Self> {
+            Self::start_with_password(None)
+        }
+
+        fn start_with_password(password: Option<&str>) -> Option<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
             drop(listener);
 
             let dir = std::env::temp_dir().join(format!("mooncake-store-rs-runtime-redis-{port}"));
             let _ = std::fs::create_dir_all(&dir);
-            let child = Command::new("redis-server")
+            let mut command = Command::new("redis-server");
+            command
                 .arg("--save")
                 .arg("")
                 .arg("--appendonly")
@@ -140,11 +146,16 @@ mod tests {
                 .arg("--dir")
                 .arg(&dir)
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
+                .stderr(Stdio::null());
+            if let Some(password) = password {
+                command.arg("--requirepass").arg(password);
+            }
+            let child = command.spawn().ok()?;
 
-            let url = format!("redis://127.0.0.1:{port}/0");
+            let url = match password {
+                Some(password) => format!("redis://:{password}@127.0.0.1:{port}/0"),
+                None => format!("redis://127.0.0.1:{port}/0"),
+            };
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline {
                 if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -324,6 +335,60 @@ mod tests {
     }
 
     #[test]
+    fn runtime_builds_real_tent_clients_with_password_protected_redis() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let Some(server) = RedisTestServer::start_with_password(Some("runtime-secret")) else {
+            return;
+        };
+
+        let _env_guard = EnvVarGuard::replace_many(&[
+            ("MC_REDIS_USERNAME", None),
+            ("MC_REDIS_PASSWORD", None),
+            ("MC_REDIS_DB_INDEX", None),
+        ]);
+
+        let mut writer = sample_args("tcp", server.url());
+        writer.setup.stable_id = Some("runtime-auth-writer".to_string());
+        writer.setup.keyspace = Some("runtime/auth".to_string());
+        writer.local_segment_name = Some("runtime-auth-writer-segment".to_string());
+        writer.route_control = RouteControlMode::MetadataOnly;
+
+        let mut reader = sample_args("tcp", server.url());
+        reader.setup.stable_id = Some("runtime-auth-reader".to_string());
+        reader.setup.keyspace = Some("runtime/auth".to_string());
+        reader.local_segment_name = Some("runtime-auth-reader-segment".to_string());
+        reader.route_control = RouteControlMode::MetadataOnly;
+
+        let writer = writer
+            .build()
+            .expect("writer runtime should build with password-protected redis");
+        let reader = reader
+            .build()
+            .expect("reader runtime should build with password-protected redis");
+
+        writer
+            .client
+            .register_local_memory()
+            .expect("writer local memory should register");
+        reader
+            .client
+            .register_local_memory()
+            .expect("reader local memory should register");
+
+        writer
+            .client
+            .put("auth-alpha", b"hello-auth")
+            .expect("writer put should succeed");
+        assert_eq!(
+            reader
+                .client
+                .get("auth-alpha")
+                .expect("reader remote get should succeed with redis url auth"),
+            b"hello-auth"
+        );
+    }
+
+    #[test]
     fn runtime_hot_upgrade_preserves_payload_on_successor() {
         let Some(server) = RedisTestServer::start() else {
             return;
@@ -437,5 +502,39 @@ mod tests {
                 .expect("reader get should succeed"),
             b"runtime-hot-upgrade-payload"
         );
+    }
+
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn replace_many(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let mut saved = Vec::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                saved.push((*key, std::env::var(key).ok()));
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..).rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
 }

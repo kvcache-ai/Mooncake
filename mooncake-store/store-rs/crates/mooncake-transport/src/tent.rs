@@ -1,16 +1,20 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::tent as ffi;
 
 use crate::{Opcode, TransferProgress, TransferRequest, TransferStatus};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TentEngineConfig {
     config_path: Option<PathBuf>,
     overrides: BTreeMap<String, String>,
+    redis_username: Option<String>,
+    redis_password: Option<String>,
+    redis_db_index: Option<String>,
 }
 
 impl TentEngineConfig {
@@ -28,6 +32,21 @@ impl TentEngineConfig {
         self
     }
 
+    pub fn redis_username(mut self, username: impl Into<String>) -> Self {
+        self.redis_username = Some(username.into());
+        self
+    }
+
+    pub fn redis_password(mut self, password: impl Into<String>) -> Self {
+        self.redis_password = Some(password.into());
+        self
+    }
+
+    pub fn redis_db_index(mut self, db_index: impl Into<String>) -> Self {
+        self.redis_db_index = Some(db_index.into());
+        self
+    }
+
     fn apply(&self) -> Result<()> {
         if let Some(path) = &self.config_path {
             let path = cstring_from_path(path)?;
@@ -39,6 +58,21 @@ impl TentEngineConfig {
             unsafe { ffi::tent_set_config(key.as_ptr(), value.as_ptr()) };
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for TentEngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TentEngineConfig")
+            .field("config_path", &self.config_path)
+            .field("overrides", &self.overrides)
+            .field("redis_username", &self.redis_username)
+            .field(
+                "redis_password",
+                &self.redis_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redis_db_index", &self.redis_db_index)
+            .finish()
     }
 }
 
@@ -70,6 +104,10 @@ unsafe impl Sync for TentEngine {}
 
 impl TentEngine {
     pub fn new(config: &TentEngineConfig) -> Result<Self> {
+        let _lock = tent_engine_create_lock()
+            .lock()
+            .expect("tent engine create lock poisoned");
+        let _env = TentRedisEnvGuard::apply(config);
         config.apply()?;
         let raw = unsafe { ffi::tent_create_engine() };
         if raw.is_null() {
@@ -238,6 +276,51 @@ fn check_zero(rc: i32, operation: &str) -> Result<()> {
     }
 }
 
+fn tent_engine_create_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct TentRedisEnvGuard {
+    username: Option<String>,
+    password: Option<String>,
+    db_index: Option<String>,
+}
+
+impl TentRedisEnvGuard {
+    fn apply(config: &TentEngineConfig) -> Self {
+        Self {
+            username: set_env_override("MC_REDIS_USERNAME", config.redis_username.as_deref()),
+            password: set_env_override("MC_REDIS_PASSWORD", config.redis_password.as_deref()),
+            db_index: set_env_override("MC_REDIS_DB_INDEX", config.redis_db_index.as_deref()),
+        }
+    }
+}
+
+impl Drop for TentRedisEnvGuard {
+    fn drop(&mut self) {
+        restore_env_override("MC_REDIS_USERNAME", self.username.as_deref());
+        restore_env_override("MC_REDIS_PASSWORD", self.password.as_deref());
+        restore_env_override("MC_REDIS_DB_INDEX", self.db_index.as_deref());
+    }
+}
+
+fn set_env_override(key: &str, value: Option<&str>) -> Option<String> {
+    let previous = std::env::var(key).ok();
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    previous
+}
+
+fn restore_env_override(key: &str, previous: Option<&str>) {
+    match previous {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
 fn encode_opcode(opcode: Opcode) -> i32 {
     match opcode {
         Opcode::Read => ffi::OPCODE_READ,
@@ -312,11 +395,18 @@ mod tests {
         let config = TentEngineConfig::new()
             .config_path("tent.toml")
             .set("log_level", "debug")
-            .set("rpc_server_port", "0");
+            .set("rpc_server_port", "0")
+            .redis_username("user-a")
+            .redis_password("secret-pass")
+            .redis_db_index("7");
         let debug = format!("{config:?}");
         assert!(debug.contains("tent.toml"));
         assert!(debug.contains("log_level"));
         assert!(debug.contains("rpc_server_port"));
+        assert!(debug.contains("user-a"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("7"));
+        assert!(!debug.contains("secret-pass"));
     }
 
     #[test]
