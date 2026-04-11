@@ -1105,9 +1105,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         if (!results[i]) {
             return tl::unexpected(results[i].error());
         }
-        if (i < values.size()) {
-            total_bytes += values[i].size_bytes();
-        }
+        total_bytes += values[i].size_bytes();
     }
     bandwidth_tracker_.record_write(total_bytes);
     return {};
@@ -2895,9 +2893,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
         if (!results[i]) {
             return tl::unexpected(results[i].error());
         }
-        if (i < values.size()) {
-            total_bytes += values[i].size_bytes();
-        }
+        total_bytes += values[i].size_bytes();
     }
     bandwidth_tracker_.record_write(total_bytes);
     return {};
