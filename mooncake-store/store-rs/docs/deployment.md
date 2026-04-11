@@ -300,8 +300,10 @@ This is the default mode.
 - route ownership is selected on the client with weighted rendezvous hashing
 - the client prewarms a live-client membership snapshot during `build(...)`
 - background membership sync refreshes that snapshot after startup
+- steady-state reads use that cached snapshot instead of refreshing membership inline
 - route reads and CAS stay off the metadata hot path in steady state
 - storage owners manage local eviction separately from route ownership
+- read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners, and best-effort prune unreadable replicas after fallback
 - metadata remains the fallback when authority RPC is unavailable
 
 ### `MetadataOnly`
@@ -329,6 +331,7 @@ The runtime also manages some labels internally, such as route capability and co
 - keep `stable_id` stable across restarts and upgrades
 - increment `epoch` for successor processes during hot-upgrade flows
 - mount local memory before serving data traffic
+- keep `heartbeat_interval_ms` comfortably below the default `lease_ttl_ms=30000`
 - use a dedicated metadata keyspace per environment or test run
 - if hugepage mode is enabled, preallocate matching hugepages on the host before starting clients
 

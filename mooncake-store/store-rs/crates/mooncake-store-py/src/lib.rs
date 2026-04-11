@@ -4,6 +4,8 @@ mod dummy_client;
 pub mod dummy_service;
 pub mod runtime;
 mod shm;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -292,6 +294,7 @@ impl PyMooncakeDistributedStore {
                 .batch_is_exist(&keys, tenant)
                 .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
+                let item_count = keys.len();
                 let tenant = tenant.map(str::to_string);
                 dispatcher
                     .run(move |client| {
@@ -309,7 +312,13 @@ impl PyMooncakeDistributedStore {
                             .batch_is_exist(&objects)
                             .map(|items| items.into_iter().map(i32::from).collect())
                     })
-                    .map_err(store_error_to_py)
+                    .or_else(|error| {
+                        if should_soft_miss_error(&error) {
+                            Ok(soft_miss_exists_result(item_count, &error))
+                        } else {
+                            Err(store_error_to_py(error))
+                        }
+                    })
             }
         }
     }
@@ -1003,6 +1012,7 @@ impl PyMooncakeDistributedStore {
                 for (_, buffer_ptr, _) in &items {
                     let _ = pointer_from_usize(*buffer_ptr)?;
                 }
+                let item_count = items.len();
                 let tenant = tenant.map(str::to_string);
                 dispatcher
                     .run(move |client| {
@@ -1027,7 +1037,13 @@ impl PyMooncakeDistributedStore {
                             .batch_get_into(&mut requests)
                             .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
                     })
-                    .map_err(store_error_to_py)
+                    .or_else(|error| {
+                        if should_soft_miss_error(&error) {
+                            Ok(soft_miss_length_result(item_count, &error))
+                        } else {
+                            Err(store_error_to_py(error))
+                        }
+                    })
             }
         }
     }
@@ -1062,7 +1078,7 @@ impl PyMooncakeDistributedStore {
         all_sizes: Vec<Vec<usize>>,
         prefer_alloc_in_same_node: bool,
         tenant: Option<&str>,
-    ) -> PyResult<Vec<usize>> {
+    ) -> PyResult<Vec<i64>> {
         let _ = prefer_alloc_in_same_node;
         if keys.len() != all_buffer_ptrs.len() || keys.len() != all_sizes.len() {
             return Err(PyValueError::new_err(
@@ -1106,6 +1122,7 @@ impl PyMooncakeDistributedStore {
                         let _ = pointer_from_usize(*buffer_ptr)?;
                     }
                 }
+                let item_count = keys.len();
                 let tenant = tenant.map(str::to_string);
                 dispatcher
                     .run(move |client| {
@@ -1135,9 +1152,17 @@ impl PyMooncakeDistributedStore {
                                 request
                             })
                             .collect::<Vec<_>>();
-                        client.batch_get_into_multi_buffers(&mut requests)
+                        client
+                            .batch_get_into_multi_buffers(&mut requests)
+                            .map(|sizes| sizes.into_iter().map(|size| size as i64).collect())
                     })
-                    .map_err(store_error_to_py)
+                    .or_else(|error| {
+                        if should_soft_miss_error(&error) {
+                            Ok(soft_miss_length_result(item_count, &error))
+                        } else {
+                            Err(store_error_to_py(error))
+                        }
+                    })
             }
         }
     }
@@ -1458,6 +1483,37 @@ fn store_error_to_py(error: StoreError) -> PyErr {
         | StoreError::Metadata(message)
         | StoreError::Transport(message) => PyRuntimeError::new_err(message),
     }
+}
+
+fn should_soft_miss_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::NotFound(_)
+            | StoreError::InvalidState(_)
+            | StoreError::Metadata(_)
+            | StoreError::Transport(_)
+    )
+}
+
+fn soft_miss_status(error: &StoreError) -> i64 {
+    match error {
+        StoreError::NotFound(_) => -1,
+        StoreError::InvalidState(_) => -2,
+        StoreError::Metadata(_) => -3,
+        StoreError::Transport(_) => -4,
+        StoreError::Conflict(_) => -5,
+        StoreError::StaleEpoch(_) => -6,
+        StoreError::Unsupported(_) => -7,
+        StoreError::Allocator(_) => -8,
+    }
+}
+
+fn soft_miss_length_result(items: usize, error: &StoreError) -> Vec<i64> {
+    vec![soft_miss_status(error); items]
+}
+
+fn soft_miss_exists_result(items: usize, error: &StoreError) -> Vec<i32> {
+    vec![soft_miss_status(error) as i32; items]
 }
 
 fn parse_route_control_arg(value: &str) -> PyResult<RouteControlMode> {
@@ -2216,6 +2272,19 @@ mod tests {
             )
             .expect("batch_get_into_raw should succeed");
         assert_eq!(raw_lengths, vec![3]);
+        assert_eq!(
+            store
+                .batch_get_into(
+                    vec![(
+                        "missing".to_string(),
+                        read_buffer.as_mut_ptr() as usize,
+                        read_buffer.len(),
+                    )],
+                    None,
+                )
+                .expect("missing batch_get_into should degrade to soft miss"),
+            vec![-1]
+        );
         assert!(store
             .batch_get_into_raw(vec!["alpha".to_string()], vec![], vec![], None)
             .is_err());
@@ -2254,6 +2323,21 @@ mod tests {
         assert_eq!(multi_lengths, vec![6]);
         assert_eq!(&part1, b"ab");
         assert_eq!(&part2, b"cdef");
+        assert_eq!(
+            store
+                .batch_get_into_multi_buffers(
+                    vec!["missing-multi".to_string()],
+                    vec![vec![
+                        part1.as_mut_ptr() as usize,
+                        part2.as_mut_ptr() as usize,
+                    ]],
+                    vec![vec![part1.len(), part2.len()]],
+                    false,
+                    None,
+                )
+                .expect("missing multi-buffer get should degrade to soft miss"),
+            vec![-1]
+        );
 
         Python::with_gil(|py| {
             assert!(store

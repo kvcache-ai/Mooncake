@@ -1878,6 +1878,247 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
 }
 
 #[test]
+fn routed_read_skips_inactive_primary_replica_and_prunes_stale_route() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("inactive-primary-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("inactive-primary-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("inactive-primary-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("inactive-primary-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "inactive-primary-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "inactive-primary-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "inactive-primary-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "inactive-primary-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "inactive-primary-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "inactive-primary-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "inactive-primary-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "inactive-primary-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "inactive-primary-key",
+            b"inactive-primary-payload",
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated put should succeed");
+
+    let seeded = reader
+        .query_route("inactive-primary-key")
+        .expect("seeded route query should succeed")
+        .expect("seeded route should exist");
+    assert_eq!(seeded.replicas[0].owner, *store_a.runtime_id());
+    assert_eq!(seeded.replicas[1].owner, *store_b.runtime_id());
+
+    metadata
+        .update_client_state(store_a.runtime_id(), ClientLifecycleState::Offline)
+        .expect("store-a state should update");
+    assert_eq!(
+        reader
+            .runtime_state(store_a.runtime_id())
+            .expect("runtime state query should succeed"),
+        Some(ClientLifecycleState::Offline)
+    );
+
+    assert_eq!(
+        reader
+            .get("inactive-primary-key")
+            .expect("reader get should succeed via live secondary"),
+        b"inactive-primary-payload"
+    );
+
+    let repaired = reader
+        .query_route("inactive-primary-key")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired.replicas.len(), 1);
+    assert_eq!(repaired.replicas[0].owner, *store_b.runtime_id());
+    assert_eq!(repaired.replicas[0].priority, 0);
+}
+
+#[test]
+fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("transport-failed-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("transport-failed-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("transport-failed-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("transport-failed-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "transport-failed-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "transport-failed-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "transport-failed-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(10_000)
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "transport-failed-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "transport-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "transport-failed-key",
+            b"transport-failed-payload",
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated put should succeed");
+
+    let seeded = reader
+        .query_route("transport-failed-key")
+        .expect("seeded route query should succeed")
+        .expect("seeded route should exist");
+    assert_eq!(seeded.replicas[0].owner, *store_a.runtime_id());
+    assert_eq!(seeded.replicas[1].owner, *store_b.runtime_id());
+    assert_eq!(
+        reader
+            .runtime_state(store_a.runtime_id())
+            .expect("runtime state query should succeed"),
+        Some(ClientLifecycleState::Active)
+    );
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("transport-failed-a-segment")
+            .expect("primary segment handle should exist");
+        state.segments_by_handle.remove(&handle);
+    }
+
+    let error = reader
+        .get("transport-failed-key")
+        .expect_err("first reader get should fail on dead primary transport");
+    assert!(matches!(
+        error,
+        StoreError::NotFound(_) | StoreError::Transport(_) | StoreError::InvalidState(_)
+    ));
+
+    assert_eq!(
+        reader
+            .get("transport-failed-key")
+            .expect("retry should skip suspect primary and use live secondary"),
+        b"transport-failed-payload"
+    );
+
+    let repaired = reader
+        .query_route("transport-failed-key")
+        .expect("repaired route query should succeed")
+        .expect("repaired route should exist");
+    assert_eq!(repaired.replicas.len(), 1);
+    assert_eq!(repaired.replicas[0].owner, *store_b.runtime_id());
+    assert_eq!(repaired.replicas[0].priority, 0);
+}
+
+#[test]
 fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-old-a-segment"));

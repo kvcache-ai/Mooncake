@@ -165,7 +165,7 @@ impl StoreClient {
 
     fn route_scan_authorities(&self) -> Result<Vec<ClientLease>> {
         Ok(self
-            .compatible_live_clients(true)?
+            .available_compatible_live_clients(true)?
             .into_iter()
             .filter(|lease| {
                 lease
@@ -235,7 +235,7 @@ impl StoreClient {
 
     fn migration_policy_for_route(&self, route: &ObjectRoute) -> Result<ReplicationPolicy> {
         let active = self
-            .compatible_live_clients(true)?
+            .available_compatible_live_clients(true)?
             .into_iter()
             .filter(|lease| lease.state == ClientLifecycleState::Active)
             .map(|lease| lease.runtime)
@@ -260,7 +260,7 @@ impl StoreClient {
         successor: &ClientRuntimeId,
     ) -> Result<ReplicationPolicy> {
         let active = self
-            .compatible_live_clients(true)?
+            .available_compatible_live_clients(true)?
             .into_iter()
             .filter(|lease| lease.state == ClientLifecycleState::Active)
             .map(|lease| lease.runtime)
@@ -552,6 +552,76 @@ impl StoreClient {
         Ok(())
     }
 
+    fn select_readable_replica(
+        &self,
+        route: &ObjectRoute,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> Option<ReplicaRoute> {
+        route
+            .replicas
+            .iter()
+            .filter(|replica| {
+                replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
+            })
+            .min_by_key(|replica| replica.priority)
+            .cloned()
+    }
+
+    fn prune_unreadable_replicas_best_effort(
+        &self,
+        route: &ObjectRoute,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) {
+        let filtered = route
+            .replicas
+            .iter()
+            .filter(|replica| {
+                replica.owner == self.lease.runtime || readable_runtimes.contains(&replica.owner)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if filtered.is_empty() || filtered.len() == route.replicas.len() {
+            return;
+        }
+
+        let mut next = route.clone();
+        next.version = route.version.next();
+        next.replicas = filtered
+            .into_iter()
+            .enumerate()
+            .map(|(priority, mut replica)| {
+                replica.priority = priority as u16;
+                replica
+            })
+            .collect::<Vec<_>>();
+
+        match self.route_directory.compare_and_swap_object_route(
+            &self.lease,
+            &route.key,
+            Some(route.version),
+            Some(&next),
+        ) {
+            Ok(cas) if cas.applied => debug!(
+                runtime = %self.lease.runtime,
+                key = %route.key.0,
+                old_replicas = route.replicas.len(),
+                new_replicas = next.replicas.len(),
+                "pruned unreadable replica owners from stale route"
+            ),
+            Ok(_) => debug!(
+                runtime = %self.lease.runtime,
+                key = %route.key.0,
+                "stale route prune lost compare-and-swap race"
+            ),
+            Err(error) => debug!(
+                runtime = %self.lease.runtime,
+                key = %route.key.0,
+                error = %error,
+                "stale route prune failed"
+            ),
+        }
+    }
+
     fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
         let tracker = OperationTracker::new("route_lookup_many");
         let result = (|| {
@@ -569,6 +639,7 @@ impl StoreClient {
                     .map(|(_, scoped)| scoped.clone())
                     .collect::<Vec<_>>(),
             )?;
+            let readable_runtimes = self.readable_runtime_set(false)?;
             let mut resolved = Vec::with_capacity(objects.len());
             for (((tenant, _scoped), object), route) in scoped
                 .into_iter()
@@ -584,17 +655,31 @@ impl StoreClient {
                         object.key
                     )));
                 }
-                let replica = route
+                let (replica, readable_for_route) = match self
+                    .select_readable_replica(&route, &readable_runtimes)
+                {
+                    Some(replica) => (replica, readable_runtimes.clone()),
+                    None => {
+                        let refreshed_readable = self.readable_runtime_set(true)?;
+                        let replica = self
+                            .select_readable_replica(&route, &refreshed_readable)
+                            .ok_or_else(|| {
+                                StoreError::NotFound(format!(
+                                    "tenant={tenant} key={} has no readable replica owner",
+                                    object.key
+                                ))
+                            })?;
+                        (replica, refreshed_readable)
+                    }
+                };
+                if route
                     .replicas
                     .iter()
-                    .min_by_key(|replica| replica.priority)
-                    .cloned()
-                    .ok_or_else(|| {
-                        StoreError::InvalidState(format!(
-                            "tenant={tenant} key={} has no replica",
-                            object.key
-                        ))
-                    })?;
+                    .min_by_key(|candidate| candidate.priority)
+                    .is_some_and(|primary| primary.owner != replica.owner)
+                {
+                    self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
+                }
                 resolved.push(ResolvedObject {
                     tenant: tenant.to_string(),
                     key: object.key.to_string(),
@@ -863,6 +948,38 @@ impl StoreClient {
         }
     }
 
+    fn note_remote_read_failure(
+        &self,
+        entries: &[&ResolvedObject],
+        error: &StoreError,
+        context: &'static str,
+    ) {
+        if !matches!(
+            error,
+            StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+        ) {
+            return;
+        }
+        let mut failed_runtimes = BTreeSet::new();
+        {
+            let mut state = self.state.lock();
+            for entry in entries {
+                state.invalidate_remote_segment(&entry.replica.segment_name.0);
+                if entry.replica.owner != self.lease.runtime {
+                    failed_runtimes.insert(entry.replica.owner.clone());
+                }
+            }
+        }
+        for runtime in failed_runtimes {
+            self.mark_runtime_suspect(&runtime, context);
+        }
+        let _ = refresh_live_client_cache(
+            self.metadata.as_ref(),
+            &self.live_client_cache,
+            "live_client_snapshot_remote_read_failure",
+        );
+    }
+
     fn plan_remote_get_chunk(
         &self,
         remote_indices: &[usize],
@@ -963,6 +1080,13 @@ impl StoreClient {
             bytes_out,
             "executed remote batch get chunk"
         );
+        if let Err(error) = &result {
+            let failed = remote_indices
+                .iter()
+                .map(|index| &resolved[*index])
+                .collect::<Vec<_>>();
+            self.note_remote_read_failure(&failed, error, "remote_batch_get_failed");
+        }
         tracker.finish(&result, bytes_out);
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", bytes_out);
@@ -1031,6 +1155,13 @@ impl StoreClient {
             bytes_out = length,
             "executed remote direct get fallback"
         );
+        if let Err(error) = &result {
+            self.note_remote_read_failure(
+                &[resolved],
+                error,
+                "remote_direct_get_failed",
+            );
+        }
         tracker.finish(&result, length as u64);
         if result.is_ok() {
             registry::record_transport_bytes("read", "storage", length as u64);

@@ -32,8 +32,9 @@ use crate::route_directory::{
 use crate::transport::{wait_for_batch_completion, StoreTransport, StoreTransportFactory};
 
 const DEFAULT_TENANT: &str = "default";
-const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_LIVE_CLIENT_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_SUSPECT_RUNTIME_TTL: Duration = Duration::from_secs(5);
 
 include!("types.rs");
 include!("builder.rs");
@@ -52,6 +53,7 @@ pub struct StoreClient {
     storage_owner: Arc<StorageOwnerState>,
     lease: ClientLease,
     live_client_cache: SharedLiveClientCache,
+    suspect_runtime_cache: SharedSuspectRuntimeCache,
     membership_sync: MembershipSyncHandle,
     _async_eviction: AsyncEvictionHandle,
     default_tenant: String,

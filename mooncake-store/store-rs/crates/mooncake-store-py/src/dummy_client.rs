@@ -293,7 +293,7 @@ impl DummySession {
         &self,
         items: &[(String, Vec<(usize, usize)>)],
         tenant: Option<&str>,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<Vec<i64>> {
         let request = pb::BatchGetIntoMultiBuffersRequest {
             client_id_hi: self.client_id.high,
             client_id_lo: self.client_id.low,
@@ -313,21 +313,10 @@ impl DummySession {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
-        let lengths = self
+        Ok(self
             .rpc(|mut client| async move { client.batch_get_into_multi_buffers(request).await })?
             .into_inner()
-            .lengths;
-        lengths
-            .into_iter()
-            .zip(items.iter())
-            .map(|(length, (key, _))| {
-                usize::try_from(length).map_err(|_| {
-                    StoreError::NotFound(format!(
-                        "dummy batch_get_into_multi_buffers failed for key={key}"
-                    ))
-                })
-            })
-            .collect()
+            .lengths)
     }
 
     pub fn get_into(

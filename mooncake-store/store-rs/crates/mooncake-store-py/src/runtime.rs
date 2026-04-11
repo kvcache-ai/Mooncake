@@ -103,7 +103,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Mutex, OnceLock};
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -114,6 +113,7 @@ mod tests {
 
     use super::{default_segment_name, now_ms, CompatRuntimeArgs};
     use crate::config::CompatSetupArgs;
+    use crate::test_support::env_test_lock;
 
     struct RedisTestServer {
         child: Child,
@@ -196,7 +196,7 @@ mod tests {
                 routed_writes: false,
                 replica_count: 1,
                 keyspace: None,
-                expires_at_ms: Some(10_000),
+                expires_at_ms: Some(now_ms() + 10_000),
                 use_hugepage: None,
                 hugepage_size_bytes: None,
             },
@@ -231,6 +231,7 @@ mod tests {
 
     #[test]
     fn runtime_builds_real_tent_clients_and_moves_remote_bytes() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -332,12 +333,12 @@ mod tests {
             .expect("route should exist");
         assert_eq!(route.replicas[0].owner.stable_id.0, writer.stable_id);
         assert!(writer.segment_name.contains("runtime-writer-segment"));
-        assert_eq!(reader.expires_at_ms, 10_000);
+        assert!(reader.expires_at_ms >= now_ms());
     }
 
     #[test]
     fn runtime_builds_real_tent_clients_with_password_protected_redis() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
         let Some(server) = RedisTestServer::start_with_password(Some("runtime-secret")) else {
             return;
         };
@@ -391,6 +392,7 @@ mod tests {
 
     #[test]
     fn runtime_hot_upgrade_preserves_payload_on_successor() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -532,10 +534,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 }

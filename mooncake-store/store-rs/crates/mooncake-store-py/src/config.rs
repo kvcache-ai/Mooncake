@@ -10,6 +10,8 @@ use mooncake_store_core::{MetadataBackend, Result, StoreError};
 use mooncake_transport::TentEngineConfig;
 use url::Url;
 
+const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
+
 pub struct CompatBuildPlan {
     pub metadata: Arc<dyn MetadataBackend>,
     pub tent_config: TentEngineConfig,
@@ -85,7 +87,9 @@ impl CompatSetupArgs {
             replica_count: self.replica_count.max(1),
             storage_bytes: self.global_segment_size,
             scratch_bytes: self.local_buffer_size,
-            expires_at_ms: self.expires_at_ms.unwrap_or_else(|| now_ms() + 600_000),
+            expires_at_ms: self
+                .expires_at_ms
+                .unwrap_or_else(|| now_ms() + DEFAULT_COMPAT_LEASE_TTL_MS),
             use_hugepage: self.use_hugepage,
             hugepage_size_bytes: self.hugepage_size_bytes,
         })
@@ -244,14 +248,9 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
-
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::test_support::env_test_lock;
 
     #[test]
     fn normalize_etcd_endpoint_adds_http_scheme() {
@@ -282,7 +281,7 @@ mod tests {
 
     #[test]
     fn resolve_transport_redis_auth_prefers_url_credentials() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
         std::env::set_var("MC_REDIS_USERNAME", "env-user");
         std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
         let redis = Url::parse("redis://url-user:url-pass@cache.local:6381/3")
@@ -296,7 +295,7 @@ mod tests {
 
     #[test]
     fn resolve_transport_redis_auth_falls_back_to_env_password() {
-        let _guard = test_lock().lock().expect("test lock poisoned");
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
         std::env::set_var("MC_REDIS_USERNAME", "env-user");
         std::env::set_var("MC_REDIS_PASSWORD", "env-pass");
         let redis = Url::parse("redis://cache.local:6381/3").expect("redis url should parse");

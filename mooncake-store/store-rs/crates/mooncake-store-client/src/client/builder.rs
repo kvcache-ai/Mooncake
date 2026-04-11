@@ -156,6 +156,7 @@ impl StoreClientBuilder {
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
         let live_client_cache = Arc::new(Mutex::new(LiveClientCache::default()));
+        let suspect_runtime_cache = Arc::new(Mutex::new(SuspectRuntimeCache::default()));
         let control_client = Arc::new(ControlPlaneClient::new()?);
         let provisional_lease = ClientLease {
             runtime: runtime.clone(),
@@ -223,6 +224,7 @@ impl StoreClientBuilder {
             storage_owner,
             lease,
             live_client_cache,
+            suspect_runtime_cache,
             membership_sync,
             _async_eviction: async_eviction,
             default_tenant: self.default_tenant,

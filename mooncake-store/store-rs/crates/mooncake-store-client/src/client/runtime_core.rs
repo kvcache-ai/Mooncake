@@ -287,6 +287,16 @@ impl StoreClient {
             .collect())
     }
 
+    fn available_compatible_live_clients(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
+        let leases = self.compatible_live_clients(force_refresh)?;
+        let mut suspect_cache = self.suspect_runtime_cache.lock();
+        suspect_cache.reconcile_with_leases(&leases);
+        Ok(leases
+            .into_iter()
+            .filter(|lease| !suspect_cache.contains(&lease.runtime))
+            .collect())
+    }
+
     pub(crate) fn placement_candidates_snapshot(
         &self,
         scope_label_key: &str,
@@ -295,7 +305,7 @@ impl StoreClient {
     ) -> Result<Vec<ClientLease>> {
         let scope = self.lease.endpoints.labels.get(scope_label_key).cloned();
         let mut candidates = self
-            .compatible_live_clients(force_refresh)?
+            .available_compatible_live_clients(force_refresh)?
             .into_iter()
             .filter(|lease| lease.state == ClientLifecycleState::Active)
             .filter(|lease| {
@@ -328,12 +338,43 @@ impl StoreClient {
             .as_millis() as u64
     }
 
+    fn mark_runtime_suspect(&self, runtime: &ClientRuntimeId, context: &'static str) {
+        if *runtime == self.lease.runtime {
+            return;
+        }
+        let deadline = Instant::now() + DEFAULT_SUSPECT_RUNTIME_TTL;
+        self.suspect_runtime_cache
+            .lock()
+            .mark(runtime.clone(), deadline);
+        debug!(
+            runtime = %self.lease.runtime,
+            suspect_runtime = %runtime,
+            context,
+            ttl_ms = DEFAULT_SUSPECT_RUNTIME_TTL.as_millis() as u64,
+            "marked runtime as temporarily suspect after remote failure"
+        );
+    }
+
+    fn readable_runtime_set(&self, force_refresh: bool) -> Result<BTreeSet<ClientRuntimeId>> {
+        Ok(self
+            .available_compatible_live_clients(force_refresh)?
+            .into_iter()
+            .filter(|lease| {
+                matches!(
+                    lease.state,
+                    ClientLifecycleState::Active | ClientLifecycleState::Draining
+                )
+            })
+            .map(|lease| lease.runtime)
+            .collect())
+    }
+
     fn lookup_runtime_lease_once(
         &self,
         runtime: &ClientRuntimeId,
         force_refresh: bool,
     ) -> Result<ClientLease> {
-        self.compatible_live_clients(force_refresh)?
+        self.available_compatible_live_clients(force_refresh)?
             .into_iter()
             .find(|lease| lease.runtime == *runtime)
             .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", runtime)))
@@ -349,7 +390,7 @@ impl StoreClient {
         force_refresh: bool,
     ) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
         let mut leases = BTreeMap::new();
-        for lease in self.compatible_live_clients(force_refresh)? {
+        for lease in self.available_compatible_live_clients(force_refresh)? {
             if !wanted.contains(&lease.runtime) {
                 continue;
             }
@@ -385,7 +426,7 @@ impl StoreClient {
         selectors: &[String],
         force_refresh: bool,
     ) -> Result<Vec<ClientRuntimeId>> {
-        let compatible = self.compatible_live_clients(force_refresh)?;
+        let compatible = self.available_compatible_live_clients(force_refresh)?;
         let mut resolved = Vec::with_capacity(selectors.len());
         let mut seen = BTreeSet::new();
         for selector in selectors {
@@ -552,7 +593,10 @@ impl StoreClient {
                 );
                 self.reserve_segment_allocation_via_metadata(owner, segment_name, length_bytes)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                self.mark_runtime_suspect(owner, "allocator_rpc_failed");
+                Err(error)
+            }
         }
     }
 

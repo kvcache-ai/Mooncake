@@ -17,7 +17,7 @@ use mooncake_store_core::{
 };
 use mooncake_transport::{TentEngine, TentEngineConfig};
 
-const LEASE_MS: u64 = 600_000;
+const LEASE_MS: u64 = 30_000;
 const MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 

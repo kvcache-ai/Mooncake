@@ -59,6 +59,8 @@ The implementation is easier to understand when grouped by capability instead of
 - optional `MetadataOnly` route mode
 - route read, replace, and compare-and-swap through the control plane
 - metadata fallback when route authorities are unavailable
+- prewarmed membership snapshots with background lease refresh instead of request-path membership refresh
+- read fail-fast on suspect or offline owners while keeping draining owners readable during handoff
 
 ### Placement and Replication
 
@@ -91,6 +93,7 @@ The implementation is easier to understand when grouped by capability instead of
 - standby, activate, and draining states
 - handoff planning for upgrades
 - build-time membership snapshot prewarm and background live-client sync
+- default compatibility lease TTL of `30_000ms`
 - storage-role validation during startup
 - segment-level drain / retire flows
 - true client shrink through replica evacuation
@@ -123,6 +126,7 @@ The `/metrics` surface is now split by metric family instead of one flat operati
 - hugepage-aware allocator options
 - `ReplicateConfig` request policy mapping
 - batch APIs, route query, metrics helpers, lifecycle helpers
+- soft-miss batch compatibility for `batch_get_into`, `batch_get_into_multi_buffers`, and `batch_is_exist`
 - native module backed by the Rust implementation
 
 If you want a feature-by-feature view, read `docs/features.md`.
@@ -497,7 +501,7 @@ For single-host demos, leaving `transport_rpc_port` unset keeps the old random-p
 | `EmbeddedWrh` | Client-side weighted rendezvous chooses route owners and keeps route lookups off the metadata hot path | Yes |
 | `MetadataOnly` | Object routes are read and written directly from the metadata backend | No |
 
-In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `build(...)` and refreshes it in the background. Normal request paths reuse that shared snapshot instead of performing on-demand metadata refreshes.
+In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `build(...)` and refreshes it in the background. Normal request paths reuse that shared snapshot instead of performing on-demand metadata refreshes. Read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners after remote failures, and best-effort prune unreadable replicas from stale routes when fallback succeeds.
 
 ## Observability
 

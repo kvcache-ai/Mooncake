@@ -218,6 +218,19 @@ Port role reminder:
 
 For cross-host or cross-container real-mode deployments, set a reachable `local_hostname` together with a fixed `transport_rpc_port`.
 
+The compatibility client defaults `lease_ttl_ms` to `30000`. Keep the heartbeat interval comfortably below that TTL so dead peers converge quickly without triggering avoidable churn.
+
+## Read-side Membership and Failure Semantics
+
+The client keeps membership refresh out of the steady-state request path.
+
+- `build(...)` prewarms a live-client lease snapshot before serving reads
+- a background worker refreshes that snapshot after startup
+- steady-state reads reuse the cached snapshot instead of issuing inline membership refreshes
+- owners in `Active` and `Draining` state remain readable
+- owners that become offline or hit transport/metadata failures are marked suspect for a short TTL and skipped on later reads
+- when fallback to another replica succeeds, the client best-effort prunes unreadable owners from the route with CAS
+
 `MooncakeHostMemAllocator(...)` exposes:
 
 | Parameter | Meaning |
