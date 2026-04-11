@@ -206,6 +206,24 @@ class TieredBackend {
                                            UUID dest_tier_id,
                                            bool record_access = true);
 
+    /**
+     * @brief Notify the backend that a StorageTier bucket was autonomously
+     * evicted to free disk space.
+     *
+     * Removes the storage-tier replica from metadata_index_ for each evicted
+     * key and notifies the scheduler via OnDelete. The AllocationHandle
+     * destructor calls StorageTier::Free, which performs the correct per-key
+     * decrement of persisted_live_data_bytes_.
+     *
+     * Does NOT invoke remove_replica_callback_ (no master notification needed
+     * for autonomous local eviction in P2P mode).
+     *
+     * @param evicted_keys Keys that were in the evicted bucket.
+     * @param storage_tier_id UUID of the StorageTier that evicted the bucket.
+     */
+    void NotifyBucketEviction(const std::vector<std::string>& evicted_keys,
+                              UUID storage_tier_id);
+
     // --- Introspection & Internal ---
 
     std::vector<TierView> GetTierViews() const;

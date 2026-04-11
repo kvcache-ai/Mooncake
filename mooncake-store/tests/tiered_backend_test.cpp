@@ -1353,4 +1353,214 @@ TEST_F(TieredBackendTest, StoragePrefetch) {
     std::filesystem::remove_all("/tmp/mooncake_test_prefetch");
 }
 
+// ============================================================================
+// Bucket Eviction Metadata Cleanup Tests
+// ============================================================================
+
+// Test that bucket eviction removes stale entries from metadata_index_.
+// Before the fix, TriggerBucketEviction deleted bucket files but left zombie
+// AllocationHandles in metadata_index_ and stale entries in key_cache_shards_.
+// After the fix, NotifyBucketEviction cleans both structures atomically.
+TEST_F(TieredBackendTest, BucketEvictionCleansMetadataIndex) {
+    namespace fs = std::filesystem;
+    const char* test_dir = "/tmp/mooncake_test_bucket_eviction_meta";
+    fs::remove_all(test_dir);
+    fs::create_directories(test_dir);
+
+    // Use bucket storage backend (the default); set a tiny capacity so that
+    // allocating a second round of keys triggers automatic bucket eviction.
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", test_dir, 1);
+    // 128 KB staging buffer is plenty for a small test.
+    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "131072", 1);
+
+    // 20 KB SSD capacity: holds ~20 × 1 KB keys.
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 20480,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    {
+        TieredBackend backend;
+        ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+        UUID storage_id = GetTierIdByPriority(backend, 5).value();
+
+        // --- Step 1: Write 20 keys of 1 KB each to fill the tier ---
+        std::vector<std::string> first_batch_keys;
+        for (int i = 0; i < 20; ++i) {
+            std::string key = "evict_key_" + std::to_string(i);
+            first_batch_keys.push_back(key);
+
+            auto buf = CreateTestBuffer(1024);
+            auto h = AllocateAndWrite(backend, 1024, buf.get(), storage_id);
+            ASSERT_TRUE(h.has_value()) << "Allocation failed for " << key;
+            ASSERT_TRUE(backend.Commit(key, h.value()).has_value());
+        }
+
+        // Flush so data is persisted and staging memory is freed.
+        const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
+
+        // All keys should exist before eviction.
+        for (const auto& key : first_batch_keys) {
+            EXPECT_TRUE(backend.Exist(key))
+                << key << " should exist before eviction";
+        }
+
+        // Record usage before eviction.
+        size_t usage_before = 0;
+        for (const auto& tv : backend.GetTierViews()) {
+            if (tv.id == storage_id) usage_before = tv.usage;
+        }
+        EXPECT_GT(usage_before, 0u);
+
+        // --- Step 2: Allocate 5 KB more — triggers TriggerBucketEviction ---
+        auto extra = AllocateAndWrite(backend, 5 * 1024,
+                                      CreateTestBuffer(5 * 1024).get(),
+                                      storage_id);
+        ASSERT_TRUE(extra.has_value())
+            << "Allocation after eviction should succeed";
+        ASSERT_TRUE(backend.Commit("evict_extra_key", extra.value()).has_value());
+
+        // --- Step 3: Verify metadata was cleaned up ---
+
+        // At least some of the original keys must have been evicted.
+        int evicted_count = 0;
+        for (const auto& key : first_batch_keys) {
+            if (!backend.Exist(key)) {
+                ++evicted_count;
+                // Get() must also fail for evicted keys (no zombie handle).
+                auto get_res = backend.Get(key);
+                EXPECT_FALSE(get_res.has_value())
+                    << key << ": Get() should return error for evicted key";
+                if (!get_res.has_value()) {
+                    EXPECT_EQ(get_res.error(), ErrorCode::OBJECT_NOT_FOUND)
+                        << key << ": expected OBJECT_NOT_FOUND";
+                }
+            }
+        }
+        EXPECT_GT(evicted_count, 0) << "At least one key should have been evicted";
+
+        // Tier usage must not underflow (was the double-decrement bug).
+        for (const auto& tv : backend.GetTierViews()) {
+            if (tv.id == storage_id) {
+                EXPECT_LT(tv.usage, usage_before)
+                    << "Usage should decrease after eviction";
+                // usage is a size_t — if it wrapped around (underflow) it would
+                // be an astronomically large number.
+                // If usage wrapped around (underflow) it would be huge.
+                constexpr size_t kSanityLimit = 1ULL << 40;
+                EXPECT_LT(tv.usage, kSanityLimit)
+                    << "Usage underflow detected (double-decrement bug)";
+            }
+        }
+    }
+
+    fs::remove_all(test_dir);
+    unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+}
+
+// Test that bucket eviction of the SSD replica does NOT remove a concurrent
+// DRAM replica of the same key (only the SSD handle is cleaned up).
+TEST_F(TieredBackendTest, BucketEvictionPreservesDRAMReplica) {
+    namespace fs = std::filesystem;
+    const char* test_dir = "/tmp/mooncake_test_bucket_eviction_dram";
+    fs::remove_all(test_dir);
+    fs::create_directories(test_dir);
+
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", test_dir, 1);
+    setenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "131072", 1);
+
+    // Two tiers: DRAM (high priority) + a tiny STORAGE tier (20 KB).
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 104857600,
+                "priority": 100,
+                "tags": ["dram"],
+                "allocator_type": "OFFSET"
+            },
+            {
+                "type": "STORAGE",
+                "capacity": 20480,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    {
+        TieredBackend backend;
+        ASSERT_TRUE(InitTieredBackendForTest(backend, config).has_value());
+
+        UUID dram_id = GetTierIdByPriority(backend, 100).value();
+        UUID storage_id = GetTierIdByPriority(backend, 5).value();
+
+        // Write "shared_key" to DRAM.
+        auto buf_dram = CreateTestBuffer(1024);
+        auto h_dram =
+            AllocateAndWrite(backend, 1024, buf_dram.get(), dram_id);
+        ASSERT_TRUE(h_dram.has_value());
+        ASSERT_TRUE(backend.Commit("shared_key", h_dram.value()).has_value());
+
+        // Also create a SSD replica for "shared_key" (simulates MIGRATE).
+        auto buf_ssd = CreateTestBuffer(1024);
+        DataSource src;
+        src.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(buf_ssd), 1024);
+        src.type = MemoryType::DRAM;
+        ASSERT_TRUE(backend.CopyData("shared_key", src, storage_id).has_value())
+            << "CopyData to SSD failed";
+
+        // Fill the rest of the SSD tier with other keys so eviction is forced.
+        for (int i = 0; i < 19; ++i) {
+            std::string key = "filler_" + std::to_string(i);
+            auto buf = CreateTestBuffer(1024);
+            auto h = AllocateAndWrite(backend, 1024, buf.get(), storage_id);
+            ASSERT_TRUE(h.has_value()) << "Allocation failed for " << key;
+            ASSERT_TRUE(backend.Commit(key, h.value()).has_value());
+        }
+
+        const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
+
+        // Trigger eviction by allocating beyond SSD capacity.
+        auto extra =
+            AllocateAndWrite(backend, 5 * 1024,
+                             CreateTestBuffer(5 * 1024).get(), storage_id);
+        ASSERT_TRUE(extra.has_value()) << "Allocation triggering eviction failed";
+        ASSERT_TRUE(
+            backend.Commit("evict_trigger_key", extra.value()).has_value());
+
+        // Regardless of whether "shared_key"'s SSD replica was evicted,
+        // the DRAM replica must always survive.
+        auto dram_get = backend.Get("shared_key", dram_id);
+        EXPECT_TRUE(dram_get.has_value())
+            << "DRAM replica of shared_key must survive SSD bucket eviction";
+        if (dram_get.has_value()) {
+            EXPECT_EQ(dram_get.value()->loc.tier->GetTierId(), dram_id);
+        }
+
+        // The top-level Exist() should still be true (DRAM replica lives).
+        EXPECT_TRUE(backend.Exist("shared_key"))
+            << "shared_key must still exist via DRAM replica";
+    }
+
+    fs::remove_all(test_dir);
+    unsetenv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+}
+
 }  // namespace mooncake

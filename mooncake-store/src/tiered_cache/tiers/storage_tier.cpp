@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "tiered_cache/tiers/storage_tier.h"
+#include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/copier_registry.h"
 #include "utils.h"
 
@@ -390,6 +391,16 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
+
+        // Collect keys BEFORE eviction so we can clean up metadata afterwards.
+        std::vector<std::string> bucket_keys;
+        auto keys_res = bucket_backend->GetBucketKeys(bucket_id, bucket_keys);
+        if (!keys_res) {
+            LOG(WARNING) << "Failed to get keys for bucket " << bucket_id
+                         << " before eviction: " << keys_res.error();
+            bucket_keys.clear();
+        }
+
         auto evict_res = bucket_backend->EvictBucket(bucket_id);
         if (!evict_res) {
             LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
@@ -399,10 +410,14 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
 
         total_freed = evict_res.value();
 
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(total_freed,
-                                             std::memory_order_acq_rel);
+        // Notify TieredBackend to remove the evicted keys from metadata_index_
+        // and the scheduler's key_cache. The released AllocationHandle
+        // destructors call StorageTier::Free, which decrements
+        // persisted_live_data_bytes_ per-key. Do NOT subtract here to avoid
+        // double-counting.
+        if (backend_ && !bucket_keys.empty()) {
+            backend_->NotifyBucketEviction(bucket_keys, tier_id_);
+        }
 
         LOG(INFO) << "Evicted 1 bucket, freed " << total_freed << " bytes";
         return total_freed;
@@ -425,6 +440,16 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         }
 
         int64_t bucket_id = select_res.value();
+
+        // Collect keys BEFORE eviction so we can clean up metadata afterwards.
+        std::vector<std::string> bucket_keys;
+        auto keys_res = bucket_backend->GetBucketKeys(bucket_id, bucket_keys);
+        if (!keys_res) {
+            LOG(WARNING) << "Failed to get keys for bucket " << bucket_id
+                         << " before eviction: " << keys_res.error();
+            bucket_keys.clear();
+        }
+
         auto evict_res = bucket_backend->EvictBucket(bucket_id);
         if (!evict_res) {
             LOG(ERROR) << "Failed to evict bucket " << bucket_id << ": "
@@ -438,9 +463,12 @@ tl::expected<size_t, ErrorCode> StorageTier::TriggerBucketEviction(
         total_freed += freed;
         attempts++;
 
-        // Update live persisted bytes to reflect cache-visible space freed by
-        // eviction.
-        persisted_live_data_bytes_.fetch_sub(freed, std::memory_order_acq_rel);
+        // Notify TieredBackend to remove evicted keys from metadata_index_ and
+        // the scheduler. Handles are released here; their destructors decrement
+        // persisted_live_data_bytes_ per-key. Do NOT subtract here.
+        if (backend_ && !bucket_keys.empty()) {
+            backend_->NotifyBucketEviction(bucket_keys, tier_id_);
+        }
 
         LOG(INFO) << "Evicted bucket " << bucket_id << ", freed " << freed
                   << " bytes (total: " << total_freed << "/" << target_free_size
