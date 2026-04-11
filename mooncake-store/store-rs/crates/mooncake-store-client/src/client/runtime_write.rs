@@ -211,7 +211,7 @@ impl StoreClient {
                 });
             }
             if resolved_policy.prefer_local
-                && self.has_active_local_storage()
+                && self.can_prefer_local_storage_for_write_mode()
                 && shared_seen.insert(self.lease.runtime.clone())
             {
                 shared_candidates.push(ReplicaPlacementCandidate {

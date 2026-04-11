@@ -22,6 +22,10 @@ impl MetadataKeyspace {
         format!("{}/clients/*", self.prefix)
     }
 
+    pub fn client_index(&self) -> String {
+        format!("{}/indexes/clients", self.prefix)
+    }
+
     pub fn segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> String {
         format!(
             "{}/segments/{}:{}",
@@ -42,6 +46,13 @@ impl MetadataKeyspace {
         format!("{}*", self.segment_prefix(owner))
     }
 
+    pub fn segment_index(&self, owner: Option<&ClientRuntimeId>) -> String {
+        match owner {
+            Some(owner) => format!("{}/indexes/segments/{}", self.prefix, owner.storage_key()),
+            None => format!("{}/indexes/segments", self.prefix),
+        }
+    }
+
     pub fn object(&self, key: &ObjectKey) -> String {
         format!("{}/objects/{}", self.prefix, key.0)
     }
@@ -52,6 +63,10 @@ impl MetadataKeyspace {
 
     pub fn object_pattern(&self) -> String {
         format!("{}*", self.object_prefix())
+    }
+
+    pub fn object_index(&self) -> String {
+        format!("{}/indexes/objects", self.prefix)
     }
 
     pub fn handoff(&self, stable_id: &ClientStableId) -> String {
@@ -114,6 +129,7 @@ mod tests {
 
         assert_eq!(keyspace.client(&runtime), "tenant-a/clients/writer:9");
         assert_eq!(keyspace.client_pattern(), "tenant-a/clients/*");
+        assert_eq!(keyspace.client_index(), "tenant-a/indexes/clients");
         assert_eq!(
             keyspace.segment(&runtime, &segment),
             "tenant-a/segments/writer:9:seg-1"
@@ -127,9 +143,15 @@ mod tests {
             keyspace.segment_pattern(Some(&runtime)),
             "tenant-a/segments/writer:9:*"
         );
+        assert_eq!(
+            keyspace.segment_index(Some(&runtime)),
+            "tenant-a/indexes/segments/writer:9"
+        );
+        assert_eq!(keyspace.segment_index(None), "tenant-a/indexes/segments");
         assert_eq!(keyspace.object(&object), "tenant-a/objects/alpha");
         assert_eq!(keyspace.object_prefix(), "tenant-a/objects/");
         assert_eq!(keyspace.object_pattern(), "tenant-a/objects/*");
+        assert_eq!(keyspace.object_index(), "tenant-a/indexes/objects");
         assert_eq!(keyspace.handoff(&stable), "tenant-a/handoffs/writer");
         assert_eq!(
             keyspace.route_policy(&RoutePolicyDomain::Default),

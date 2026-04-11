@@ -279,7 +279,7 @@ impl RedisMetadataBackend {
         let tags = serde_json::to_string(&state.announcement.tags).map_err(json_error)?;
         connection
             .hset_multiple::<_, _, _, ()>(
-                key,
+                &key,
                 &[
                     ("owner", state.announcement.owner.storage_key()),
                     ("segment_name", state.announcement.segment_name.0.clone()),
@@ -297,7 +297,16 @@ impl RedisMetadataBackend {
                     ("state_json", payload),
                 ],
             )
-            .map_err(|error| metadata_error("redis hset segment state", error))
+            .map_err(|error| metadata_error("redis hset segment state", error))?;
+        connection
+            .sadd::<_, _, ()>(self.keyspace.segment_index(None), key.as_str())
+            .map_err(|error| metadata_error("redis sadd segment index", error))?;
+        connection
+            .sadd::<_, _, ()>(
+                self.keyspace.segment_index(Some(&state.announcement.owner)),
+                key,
+            )
+            .map_err(|error| metadata_error("redis sadd owner segment index", error))
     }
 }
 
@@ -350,12 +359,15 @@ impl MetadataBackend for RedisMetadataBackend {
         let payload = serde_json::to_string(lease).map_err(json_error)?;
         let ttl_ms = lease.expires_at_ms.saturating_sub(now_ms()).max(1);
         redis::cmd("SET")
-            .arg(key)
+            .arg(&key)
             .arg(payload)
             .arg("PX")
             .arg(ttl_ms)
             .query::<()>(&mut connection)
-            .map_err(|error| metadata_error("redis set client lease", error))
+            .map_err(|error| metadata_error("redis set client lease", error))?;
+        connection
+            .sadd::<_, _, ()>(self.keyspace.client_index(), key)
+            .map_err(|error| metadata_error("redis sadd client index", error))
     }
 
     fn update_client_state(
@@ -379,19 +391,45 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_live_clients(&self) -> Result<Vec<ClientLease>> {
         let mut connection = self.connection()?;
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(self.keyspace.client_pattern())
-            .query(&mut connection)
-            .map_err(|error| metadata_error("redis keys clients", error))?;
+        let index = self.keyspace.client_index();
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers client index", error))?;
+        if keys.is_empty() {
+            keys = redis::cmd("KEYS")
+                .arg(self.keyspace.client_pattern())
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis keys clients", error))?;
+            if !keys.is_empty() {
+                connection
+                    .sadd::<_, _, ()>(&index, keys.clone())
+                    .map_err(|error| metadata_error("redis sadd legacy client index", error))?;
+            }
+        }
+        let now = now_ms();
+        let mut stale = Vec::new();
         let mut leases = Vec::with_capacity(keys.len());
         for key in keys {
             let payload: Option<String> = connection
-                .get(&key)
+                .get(key.as_str())
                 .map_err(|error| metadata_error("redis get client lease", error))?;
-            if let Some(payload) = payload {
-                let lease = serde_json::from_str(&payload).map_err(json_error)?;
-                leases.push(lease);
+            match payload {
+                Some(payload) => {
+                    let lease =
+                        serde_json::from_str::<ClientLease>(&payload).map_err(json_error)?;
+                    if lease.expires_at_ms >= now {
+                        leases.push(lease);
+                    } else {
+                        stale.push(key);
+                    }
+                }
+                None => stale.push(key),
             }
+        }
+        if !stale.is_empty() {
+            connection
+                .srem::<_, _, ()>(&index, stale)
+                .map_err(|error| metadata_error("redis srem stale client index", error))?;
         }
         Ok(leases)
     }
@@ -418,20 +456,33 @@ impl MetadataBackend for RedisMetadataBackend {
         let mut connection = self.connection()?;
         let key = self.keyspace.segment(owner, segment);
         connection
-            .del::<_, ()>(key)
-            .map_err(|error| metadata_error("redis del segment", error))
+            .del::<_, ()>(&key)
+            .map_err(|error| metadata_error("redis del segment", error))?;
+        connection
+            .srem::<_, _, ()>(self.keyspace.segment_index(None), key.as_str())
+            .map_err(|error| metadata_error("redis srem segment index", error))?;
+        connection
+            .srem::<_, _, ()>(self.keyspace.segment_index(Some(owner)), key)
+            .map_err(|error| metadata_error("redis srem owner segment index", error))
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
         let mut connection = self.connection()?;
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(self.keyspace.segment_pattern(owner))
-            .query(&mut connection)
-            .map_err(|error| metadata_error("redis keys segments", error))?;
+        let index = self.keyspace.segment_index(owner);
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers segment index", error))?;
+        if keys.is_empty() {
+            keys = redis::cmd("KEYS")
+                .arg(self.keyspace.segment_pattern(owner))
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis keys segments", error))?;
+        }
+        let mut stale = Vec::new();
         let mut segments = Vec::with_capacity(keys.len());
         for key in keys {
             let payload: Option<String> = redis::cmd("HGET")
-                .arg(key)
+                .arg(key.as_str())
                 .arg("state_json")
                 .query(&mut connection)
                 .map_err(|error| metadata_error("redis hget segment state", error))?;
@@ -439,7 +490,14 @@ impl MetadataBackend for RedisMetadataBackend {
                 let state =
                     serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?;
                 segments.push(state.announcement);
+            } else {
+                stale.push(key);
             }
+        }
+        if !stale.is_empty() {
+            connection
+                .srem::<_, _, ()>(&index, stale)
+                .map_err(|error| metadata_error("redis srem stale segment index", error))?;
         }
         Ok(segments)
     }
@@ -528,20 +586,34 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
         let mut connection = self.connection()?;
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(self.keyspace.object_pattern())
-            .query(&mut connection)
-            .map_err(|error| metadata_error("redis keys objects", error))?;
+        let index = self.keyspace.object_index();
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers object index", error))?;
+        if keys.is_empty() {
+            keys = redis::cmd("KEYS")
+                .arg(self.keyspace.object_pattern())
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis keys objects", error))?;
+        }
+        let mut stale = Vec::new();
         let mut routes = Vec::with_capacity(keys.len());
         for key in keys {
             let payload: Option<String> = redis::cmd("HGET")
-                .arg(key)
+                .arg(key.as_str())
                 .arg("payload")
                 .query(&mut connection)
                 .map_err(|error| metadata_error("redis hget route payload", error))?;
             if let Some(payload) = payload {
                 routes.push(serde_json::from_str(&payload).map_err(json_error)?);
+            } else {
+                stale.push(key);
             }
+        }
+        if !stale.is_empty() {
+            connection
+                .srem::<_, _, ()>(&index, stale)
+                .map_err(|error| metadata_error("redis srem stale object index", error))?;
         }
         Ok(routes)
     }
@@ -557,8 +629,9 @@ impl MetadataBackend for RedisMetadataBackend {
             .map(|route| serde_json::to_string(route).map_err(json_error))
             .transpose()?;
         let next_version = next.map(|route| route.version.0).unwrap_or_default();
+        let object_key = self.keyspace.object(key);
         let current_payload = Script::new(CAS_OBJECT_ROUTE_SCRIPT)
-            .key(self.keyspace.object(key))
+            .key(&object_key)
             .arg(
                 expected
                     .map(|version| version.0.to_string())
@@ -568,6 +641,17 @@ impl MetadataBackend for RedisMetadataBackend {
             .arg(payload.clone().unwrap_or_else(|| "__delete__".to_string()))
             .invoke::<(i32, String)>(&mut connection)
             .map_err(|error| metadata_error("redis cas object route", error))?;
+        if current_payload.0 == 1 {
+            if next.is_some() {
+                connection
+                    .sadd::<_, _, ()>(self.keyspace.object_index(), object_key)
+                    .map_err(|error| metadata_error("redis sadd object index", error))?;
+            } else {
+                connection
+                    .srem::<_, _, ()>(self.keyspace.object_index(), object_key)
+                    .map_err(|error| metadata_error("redis srem object index", error))?;
+            }
+        }
 
         let current = if current_payload.1.is_empty() {
             None
@@ -656,6 +740,7 @@ mod tests {
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
     };
+    use redis::Commands;
 
     use super::{
         redacted_route_namespace_source, redis_connection_info, MetadataKeyspace,
@@ -920,6 +1005,60 @@ mod tests {
                 .expect("handoff get should succeed"),
             Some(handoff)
         );
+    }
+
+    #[test]
+    fn redis_backend_backfills_and_prunes_client_index() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-client-index");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        let lease = sample_lease(ClientLifecycleState::Active);
+        let client_key = keyspace.client(&lease.runtime);
+        let index_key = keyspace.client_index();
+        let payload = serde_json::to_string(&lease).expect("lease should serialize");
+
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+
+        redis::cmd("SET")
+            .arg(&client_key)
+            .arg(payload)
+            .arg("PX")
+            .arg(60_000)
+            .query::<()>(&mut connection)
+            .expect("legacy client lease insert should succeed");
+
+        let listed = backend
+            .list_live_clients()
+            .expect("legacy client listing should succeed");
+        assert_eq!(listed, vec![lease.clone()]);
+
+        let indexed: Vec<String> = connection
+            .smembers(&index_key)
+            .expect("client index read should succeed");
+        assert_eq!(indexed, vec![client_key.clone()]);
+
+        connection
+            .del::<_, ()>(&client_key)
+            .expect("client lease delete should succeed");
+
+        let listed = backend
+            .list_live_clients()
+            .expect("stale client listing should succeed");
+        assert!(listed.is_empty());
+
+        let indexed: Vec<String> = connection
+            .smembers(&index_key)
+            .expect("client index read after prune should succeed");
+        assert!(indexed.is_empty());
     }
 
     #[test]
