@@ -1072,6 +1072,15 @@ fn observability_metrics_render_remote_datapaths() {
     assert!(metrics.contains("operation=\"put_remote_batch_write\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
+    assert!(metrics
+        .contains("mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}"));
+    assert!(metrics.contains(
+        "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"storage\"}"
+    ));
+    assert!(metrics.contains(
+        "mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"storage\"}"
+    ));
+    assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"}"));
 }
 
 #[test]
@@ -4403,6 +4412,8 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
 
 #[test]
 fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("writer-via-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("writer-via-b-segment"));
@@ -4460,6 +4471,9 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
     reader
         .register_local_memory()
         .expect("reader memory should register");
+    store_a
+        .mount_segment(4096, 0, vec!["dram".to_string()])
+        .expect("admin mount should succeed");
 
     wait_for_membership_convergence(&[&store_a, &store_b, &router, &reader]);
 
@@ -4515,6 +4529,18 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
             expected[&key]
         );
     }
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains(
+        "mooncake_store_segment_lifecycle_total{action=\"mount_segment\",result=\"ok\"}"
+    ));
+    assert!(metrics.contains(
+        "mooncake_store_segment_lifecycle_total{action=\"retire_segment\",result=\"ok\"}"
+    ));
+    assert!(
+        metrics.contains("mooncake_store_rebalance_routes_total{phase=\"migrate\",result=\"ok\"}")
+    );
+    assert!(metrics.contains("mooncake_store_rebalance_bytes_total{phase=\"migrate\"}"));
 }
 
 #[test]

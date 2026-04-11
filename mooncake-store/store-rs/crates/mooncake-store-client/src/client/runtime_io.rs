@@ -32,6 +32,7 @@ impl StoreClient {
         let next_version = current
             .map(|route| route.version.next())
             .unwrap_or(RouteVersion(1));
+        let checksum = payload_checksum(value);
         let route = ObjectRoute {
             key: scoped_key,
             version: next_version,
@@ -47,18 +48,28 @@ impl StoreClient {
                     offset: *offset,
                     segment_offset: reservations[priority].offset_bytes,
                     length: value.len() as u64,
-                    checksum: None,
+                    checksum: Some(checksum),
                     tier: ReplicaTier::Dram,
                     priority: priority as u16,
                 })
                 .collect(),
         };
         let cas_tracker = OperationTracker::new("put_stage_route_cas");
+        let publish_started = Instant::now();
         let cas_result = self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &route.key,
             expected_version,
             Some(&route),
+        );
+        registry::record_replication_publish(
+            match &cas_result {
+                Ok(cas) if cas.applied => "ok",
+                Ok(_) => "conflict",
+                Err(StoreError::Conflict(_)) => "conflict",
+                Err(_) => "error",
+            },
+            publish_started.elapsed(),
         );
         cas_tracker.finish(&cas_result, 0);
         let cas = cas_result?;
@@ -326,12 +337,26 @@ impl StoreClient {
             ) {
                 Ok(next) => {
                     writer.sync_route_to_live_authorities(&next)?;
+                    registry::record_rebalance_route("migrate", "ok");
+                    registry::record_rebalance_bytes(
+                        "migrate",
+                        observed
+                            .replicas
+                            .iter()
+                            .filter(|replica| replica.owner == self.lease.runtime)
+                            .map(|replica| replica.length)
+                            .sum(),
+                    );
                     return Ok(true);
                 }
                 Err(StoreError::Conflict(_)) => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    registry::record_rebalance_route("migrate", "error");
+                    return Err(error);
+                }
             }
         }
+        registry::record_rebalance_route("migrate", "conflict");
         Err(StoreError::Conflict(format!(
             "client shrink lost route update race for {}",
             route.key.0
@@ -398,12 +423,26 @@ impl StoreClient {
             ) {
                 Ok(next) => {
                     writer.sync_route_to_live_authorities(&next)?;
+                    registry::record_rebalance_route("migrate", "ok");
+                    registry::record_rebalance_bytes(
+                        "migrate",
+                        observed
+                            .replicas
+                            .iter()
+                            .filter(|replica| replica.owner == self.lease.runtime)
+                            .map(|replica| replica.length)
+                            .sum(),
+                    );
                     return Ok(true);
                 }
                 Err(StoreError::Conflict(_)) => continue,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    registry::record_rebalance_route("migrate", "error");
+                    return Err(error);
+                }
             }
         }
+        registry::record_rebalance_route("migrate", "conflict");
         Err(StoreError::Conflict(format!(
             "client hot-upgrade lost route update race for {}",
             route.key.0
@@ -712,6 +751,9 @@ impl StoreClient {
             remote_direct_fallbacks,
             "batch get completed across local and remote paths"
         );
+        for (index, entry) in resolved.iter().enumerate() {
+            validate_replica_checksum(&entry.replica, &buffers[index][..lengths[index]])?;
+        }
         self.report_get_hits_best_effort(resolved);
         Ok(lengths)
     }
@@ -922,6 +964,9 @@ impl StoreClient {
             "executed remote batch get chunk"
         );
         tracker.finish(&result, bytes_out);
+        if result.is_ok() {
+            registry::record_transport_bytes("read", "storage", bytes_out);
+        }
         result
     }
 
@@ -987,6 +1032,9 @@ impl StoreClient {
             "executed remote direct get fallback"
         );
         tracker.finish(&result, length as u64);
+        if result.is_ok() {
+            registry::record_transport_bytes("read", "storage", length as u64);
+        }
         result
     }
 }

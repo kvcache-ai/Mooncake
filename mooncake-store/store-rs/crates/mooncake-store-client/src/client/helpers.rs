@@ -17,6 +17,35 @@ fn record_success_metric(operation: &'static str, bytes_in: u64, bytes_out: u64)
         .finish(&result, bytes_out);
 }
 
+fn payload_checksum(payload: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut checksum = FNV_OFFSET;
+    for byte in payload {
+        checksum ^= u64::from(*byte);
+        checksum = checksum.wrapping_mul(FNV_PRIME);
+    }
+    checksum
+}
+
+fn validate_replica_checksum(replica: &ReplicaRoute, payload: &[u8]) -> Result<()> {
+    let Some(expected) = replica.checksum else {
+        registry::record_checksum_validation("missing");
+        return Ok(());
+    };
+    let actual = payload_checksum(payload);
+    if actual == expected {
+        registry::record_checksum_validation("ok");
+        return Ok(());
+    }
+    registry::record_checksum_validation("mismatch");
+    Err(StoreError::InvalidState(format!(
+        "checksum mismatch for {}:{} expected={} actual={}",
+        replica.owner, replica.segment_name.0, expected, actual
+    )))
+}
+
 fn flatten_slices(buffers: &[&[u8]]) -> Vec<u8> {
     let total = buffers.iter().map(|buffer| buffer.len()).sum();
     let mut payload = Vec::with_capacity(total);
