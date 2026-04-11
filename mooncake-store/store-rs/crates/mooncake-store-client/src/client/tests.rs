@@ -28,7 +28,7 @@ use super::{
 use crate::{
     control_plane::{AllocatorService, AuthorityService, ControlPlaneClient, ReleaseOp},
     memory::RegionAllocation,
-    render_prometheus_metrics, reset_metrics,
+    metrics_test_lock, render_prometheus_metrics, reset_metrics,
     route_directory::build_route_directory,
     snapshot_metrics,
     transport::{StoreTransport, StoreTransportFactory},
@@ -964,6 +964,7 @@ fn batch_get_into_multi_buffers_rejects_insufficient_capacity() {
 
 #[test]
 fn observability_metrics_render_after_put_and_get() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("metrics-segment"));
@@ -991,6 +992,7 @@ fn observability_metrics_render_after_put_and_get() {
 
 #[test]
 fn observability_metrics_render_remote_datapaths() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("metrics-remote-segment"));
@@ -1074,6 +1076,7 @@ fn observability_metrics_render_remote_datapaths() {
 
 #[test]
 fn observability_metrics_render_fast_batch_put_stages() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("metrics-fast-batch-segment"));
@@ -1114,6 +1117,7 @@ fn observability_metrics_render_fast_batch_put_stages() {
 
 #[test]
 fn observability_metrics_render_fast_batch_put_stages_for_shared_policy() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("metrics-fast-shared-policy-segment"));
@@ -2180,6 +2184,7 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
 
 #[test]
 fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-stale-old-a-segment"));
@@ -2358,6 +2363,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
 
 #[test]
 fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-stale-meta-a-segment"));
@@ -3258,6 +3264,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
 
 #[test]
 fn background_watermark_eviction_reclaims_without_front_path_pressure() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("background-evict-segment"));
@@ -3457,6 +3464,7 @@ fn request_replication_policy_honors_preferred_segment() {
 
 #[test]
 fn helper_primitives_and_request_builders_cover_contracts() {
+    let _guard = metrics_test_lock().lock();
     reset_metrics();
 
     let object = ObjectRef::new("alpha").tenant("tenant-a");

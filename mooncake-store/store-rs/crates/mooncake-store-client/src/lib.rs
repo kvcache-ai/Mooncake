@@ -23,4 +23,4 @@ pub use transport::{
 };
 
 #[cfg(test)]
-pub use observability::reset_metrics;
+pub use observability::{metrics_test_lock, reset_metrics};

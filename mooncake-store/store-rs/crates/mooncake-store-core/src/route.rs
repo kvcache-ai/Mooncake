@@ -164,7 +164,10 @@ mod tests {
         }))
         .expect("announcement should deserialize");
         assert_eq!(announcement.state, SegmentLifecycleState::Active);
-        assert_eq!(announcement.alignment_bytes, default_segment_alignment_bytes());
+        assert_eq!(
+            announcement.alignment_bytes,
+            default_segment_alignment_bytes()
+        );
     }
 
     #[test]
@@ -179,7 +182,10 @@ mod tests {
         let encoded = serde_json::to_value(&lease).expect("lease should serialize");
         let decoded: ClientLease =
             serde_json::from_value(encoded).expect("lease should deserialize");
-        assert_eq!(decoded.runtime, ClientRuntimeId::new("runtime-a", ClientEpoch(1)));
+        assert_eq!(
+            decoded.runtime,
+            ClientRuntimeId::new("runtime-a", ClientEpoch(1))
+        );
         assert_eq!(decoded.state, ClientLifecycleState::Active);
         assert_eq!(decoded.expires_at_ms, 42);
     }

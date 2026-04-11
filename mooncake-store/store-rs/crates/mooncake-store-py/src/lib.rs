@@ -906,19 +906,16 @@ impl PyMooncakeDistributedStore {
 
     #[pyo3(signature = (key, force = false, *, tenant = None))]
     fn remove(&self, key: &str, force: bool, tenant: Option<&str>) -> PyResult<i32> {
-        match self.real_dispatcher()? {
-            dispatcher => {
-                let key = key.to_string();
-                let tenant = tenant.map(str::to_string);
-                dispatcher
-                    .run(move |client| match tenant.as_deref() {
-                        Some(tenant) => client.remove_in_tenant(tenant, &key, force),
-                        None => client.remove(&key, force),
-                    })
-                    .map_err(store_error_to_py)?;
-                Ok(0)
-            }
-        }
+        let dispatcher = self.real_dispatcher()?;
+        let key = key.to_string();
+        let tenant = tenant.map(str::to_string);
+        dispatcher
+            .run(move |client| match tenant.as_deref() {
+                Some(tenant) => client.remove_in_tenant(tenant, &key, force),
+                None => client.remove(&key, force),
+            })
+            .map_err(store_error_to_py)?;
+        Ok(0)
     }
 
     #[pyo3(signature = (keys, force = false, *, tenant = None))]

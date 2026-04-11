@@ -101,7 +101,16 @@ The implementation is easier to understand when grouped by capability instead of
 - tracing through `tracing` / `tracing-subscriber`
 - in-process Prometheus-style metrics
 - optional metrics HTTP server
-- control-plane and data-path metrics coverage
+- request, lease, capacity, route-CAS, lifecycle, eviction, and process metrics
+
+The `/metrics` surface is now split by metric family instead of one flat operation map:
+
+- `mooncake_store_request_*`: request totals, inflight, bytes, and latency histograms
+- `mooncake_store_segment_*`: per-segment used/capacity gauges
+- `mooncake_store_runtime_*`: runtime state and lease-expiry gauges
+- `mooncake_store_route_cas_total`: first-class CAS conflict accounting
+- `mooncake_store_segment_lifecycle_total` / `mooncake_store_eviction_*`: rebalance and allocator maintenance progress
+- `process_*`: in-process CPU, RSS, and open-fd facts
 
 ### Python Compatibility
 
@@ -488,6 +497,7 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 - `MC_STORE_RS_METRICS_ADDR=127.0.0.1:9090`
 - `render_prometheus_metrics()` returns a text snapshot
 - `start_metrics_http_server()` exposes `/metrics` and `/healthz`
+- host-level CPU, disk, and network remain the responsibility of `node_exporter` / `cAdvisor`
 
 ## Documentation Index
 

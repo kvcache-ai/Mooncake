@@ -315,6 +315,7 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn started_message(
     stable_id: &str,
     epoch: ClientEpoch,
@@ -425,7 +426,7 @@ fn wait_for_successor_activation(
     heartbeat_interval_ms: u64,
     deadline_ms: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let poll_interval_ms = heartbeat_interval_ms.min(500).max(50);
+    let poll_interval_ms = heartbeat_interval_ms.clamp(50, 500);
     loop {
         if shutdown.forced() {
             return Err("graceful hot-upgrade interrupted by repeated signal".into());

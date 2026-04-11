@@ -79,12 +79,16 @@ struct LocalAllocatorState {
 impl LocalAllocatorState {
     fn upsert(&mut self, announcement: &SegmentAnnouncement) {
         match self.segments.get_mut(&announcement.segment_name) {
-            Some(segment) => segment.merge_announcement(announcement),
+            Some(segment) => {
+                segment.merge_announcement(announcement);
+                registry::record_segment(&segment.announcement);
+            }
             None => {
                 self.segments.insert(
                     announcement.segment_name.clone(),
                     SegmentAllocator::new(announcement.clone()),
                 );
+                registry::record_segment(announcement);
             }
         }
     }
@@ -128,11 +132,14 @@ impl LocalAllocatorState {
             .get_mut(segment_name)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
         segment.announcement.state = next;
+        registry::record_segment(&segment.announcement);
         Ok(())
     }
 
     fn remove(&mut self, segment_name: &SegmentName) {
-        self.segments.remove(segment_name);
+        if let Some(segment) = self.segments.remove(segment_name) {
+            registry::record_segment_removed(&segment.announcement);
+        }
     }
 
     fn reserve_any(
@@ -180,7 +187,9 @@ impl LocalAllocatorState {
             .segments
             .get_mut(segment_name)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
-        segment.reserve(owner, segment_name, length_bytes)
+        let reservation = segment.reserve(owner, segment_name, length_bytes)?;
+        registry::record_segment(&segment.announcement);
+        Ok(reservation)
     }
 
     fn release(
@@ -194,7 +203,9 @@ impl LocalAllocatorState {
             .segments
             .get_mut(segment_name)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
-        segment.release(owner, segment_name, offset_bytes, length_bytes)
+        segment.release(owner, segment_name, offset_bytes, length_bytes)?;
+        registry::record_segment(&segment.announcement);
+        Ok(())
     }
 }
 

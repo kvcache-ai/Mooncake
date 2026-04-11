@@ -10,7 +10,10 @@ use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 use crate::client::SharedLiveClientCache;
-use crate::{control_plane::ControlPlaneClient, observability::OperationTracker};
+use crate::{
+    control_plane::ControlPlaneClient,
+    observability::{registry, OperationTracker},
+};
 
 const ROUTE_SCOPE_LABEL: &str = "route_scope";
 const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
@@ -62,8 +65,13 @@ impl RouteDirectory for MetadataRouteDirectory {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
-        self.metadata
-            .compare_and_swap_object_route(key, expected, next)
+        let result = self
+            .metadata
+            .compare_and_swap_object_route(key, expected, next);
+        if let Ok(cas) = &result {
+            record_cas_outcome(cas, next, key);
+        }
+        result
     }
 }
 
@@ -755,6 +763,9 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     }
                 }
             }
+            if let Ok(cas) = &result {
+                record_cas_outcome(cas, request.next.as_ref(), &request.key);
+            }
             results.push(result);
         }
 
@@ -855,16 +866,20 @@ pub(crate) fn authority_compare_and_swap(
         _ => false,
     };
     if !matches {
-        return Ok(CasResult {
+        let result = CasResult {
             applied: false,
             current,
-        });
+        };
+        record_cas_outcome(&result, next, key);
+        return Ok(result);
     }
     apply_route_update(&mut guard, authority, key, next);
-    Ok(CasResult {
+    let result = CasResult {
         applied: true,
         current: next.cloned(),
-    })
+    };
+    record_cas_outcome(&result, next, key);
+    Ok(result)
 }
 
 pub(crate) fn authority_compare_and_swap_many(
@@ -894,17 +909,21 @@ pub(crate) fn authority_compare_and_swap_many(
             _ => false,
         };
         if !matches {
-            results.push(CasResult {
+            let result = CasResult {
                 applied: false,
                 current,
-            });
+            };
+            record_cas_outcome(&result, request.next.as_ref(), &request.key);
+            results.push(result);
             continue;
         }
         apply_route_update(&mut guard, authority, &request.key, request.next.as_ref());
-        results.push(CasResult {
+        let result = CasResult {
             applied: true,
             current: request.next.clone(),
-        });
+        };
+        record_cas_outcome(&result, request.next.as_ref(), &request.key);
+        results.push(result);
     }
     Ok(results)
 }
@@ -1092,6 +1111,19 @@ fn append_replica_key(key: &mut String, replica: &ReplicaRoute) {
 fn record_route_repair_metric(operation: &'static str) {
     let result: Result<()> = Ok(());
     OperationTracker::new(operation).finish(&result, 0);
+}
+
+fn record_cas_outcome(cas: &CasResult, next: Option<&ObjectRoute>, key: &ObjectKey) {
+    if cas.applied {
+        registry::record_route_cas("ok");
+        if let Some(route) = next {
+            registry::record_route(route);
+        } else {
+            registry::remove_route(key);
+        }
+        return;
+    }
+    registry::record_route_cas("conflict");
 }
 
 #[cfg(test)]

@@ -117,6 +117,7 @@ impl OwnedMappedRegion {
         Ok(unsafe { slice::from_raw_parts(ptr, len) })
     }
 
+    #[allow(clippy::mut_from_ref)]
     pub fn slice_mut(&self, offset: usize, len: usize) -> Result<&mut [u8]> {
         let end = offset
             .checked_add(len)
