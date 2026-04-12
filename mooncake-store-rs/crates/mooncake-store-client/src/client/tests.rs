@@ -26,7 +26,9 @@ use super::{
     PendingReclaim, ReplicaWriteTarget, SegmentAllocator, StorageOwnerState, StoreState,
 };
 use crate::{
-    control_plane::{AllocatorService, AuthorityService, ControlPlaneClient, ReleaseOp},
+    control_plane::{
+        control_address_label, AllocatorService, AuthorityService, ControlPlaneClient, ReleaseOp,
+    },
     memory::RegionAllocation,
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
     route_directory::build_route_directory,
@@ -2148,6 +2150,94 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
     assert_eq!(repaired.replicas.len(), 1);
     assert_eq!(repaired.replicas[0].owner, *store_b.runtime_id());
     assert_eq!(repaired.replicas[0].priority, 0);
+}
+
+#[test]
+fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("put-failed-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("put-failed-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("put-failed-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "put-failed-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "put-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "put-failed-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "put-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "put-failed-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "put-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer]);
+
+    let mut stale_lease = store_a.lease().clone();
+    stale_lease.endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:1".to_string(),
+    );
+    metadata
+        .upsert_client_lease(&stale_lease)
+        .expect("stale lease update should succeed");
+    sleep(fast_live_client_sync_interval() * 3);
+
+    let dead_runtime = store_a.runtime_id().clone();
+    let dead_storage_key = dead_runtime.storage_key();
+    let live_runtime = store_b.runtime_id().clone();
+    let live_storage_key = live_runtime.storage_key();
+
+    let route = writer
+        .put_with_policy(
+            "put-failed-key",
+            b"put-failed-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([dead_storage_key, live_storage_key]),
+        )
+        .expect("put should skip dead preferred owner");
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, live_runtime);
+    assert_ne!(route.replicas[0].owner, dead_runtime);
+    assert_eq!(
+        writer
+            .get("put-failed-key")
+            .expect("writer get should succeed"),
+        b"put-failed-payload"
+    );
 }
 
 #[test]

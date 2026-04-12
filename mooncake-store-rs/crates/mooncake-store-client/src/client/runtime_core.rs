@@ -675,7 +675,10 @@ impl StoreClient {
     fn should_skip_candidate(&self, error: &StoreError, soft: bool) -> bool {
         soft && matches!(
             error,
-            StoreError::Allocator(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
+            StoreError::Allocator(_)
+                | StoreError::NotFound(_)
+                | StoreError::InvalidState(_)
+                | StoreError::Transport(_)
         )
     }
 
