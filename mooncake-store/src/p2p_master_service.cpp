@@ -127,18 +127,16 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
                    << ", client_id: " << req.client_id
                    << ", size: " << req.size;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    } else if (req.config.max_candidates ==
-                   WriteRouteRequestConfig::RETURN_ALL_CANDIDATES ||
-               candidates.size() <= req.config.max_candidates) {
-        // return all candidates
-        response.candidates = std::move(candidates);
     } else {
-        // return top max_candidates candidates
         std::sort(candidates.begin(), candidates.end(),
                   [](const auto& a, const auto& b) {
                       return a.priority > b.priority;
                   });
-        candidates.resize(req.config.max_candidates);
+        if (req.config.max_candidates !=
+                WriteRouteRequestConfig::RETURN_ALL_CANDIDATES &&
+            candidates.size() > req.config.max_candidates) {
+            candidates.resize(req.config.max_candidates);
+        }
         response.candidates = std::move(candidates);
     }
     return response;

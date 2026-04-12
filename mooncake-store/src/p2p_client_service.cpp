@@ -253,6 +253,12 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
     return [this](const std::string& key, const UUID& tier_id,
                   size_t size) -> tl::expected<void, ErrorCode> {
+        // In degraded mode, skip metadata notification to Master.
+        // The data is stored locally; the recovery pipeline will re-sync
+        // all local metadata to Master when the connection is restored.
+        if (ha_manager_ && ha_manager_->IsDegraded()) {
+            return {};
+        }
         if (async_route_notifier_) {
             return async_route_notifier_->EnqueueAdd(key, tier_id, size);
         }
@@ -265,6 +271,13 @@ RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
         [this](
             const std::string& key, const UUID& tier_id,
             enum REMOVE_CALLBACK_TYPE type) -> tl::expected<void, ErrorCode> {
+            // In degraded mode, skip metadata notification to Master.
+            // The recovery pipeline will re-sync all local metadata,
+            // and Master will discard routes for keys that no longer
+            // exist locally.
+            if (ha_manager_ && ha_manager_->IsDegraded()) {
+                return {};
+            }
             if (type == REMOVE_CALLBACK_TYPE::DELETE) {
                 if (async_route_notifier_) {
                     return async_route_notifier_->EnqueueRemove(key, tier_id);
