@@ -171,6 +171,7 @@ Port reminder:
 - `client_server_address` / `--client-server-address` is the dummy compatibility gRPC port
 - `metrics_addr` / `--metrics-addr` is only for `/metrics`
 - cross-host real-mode deployments should set both a reachable `local_hostname` and a fixed `transport_rpc_port`
+- `local_hostname` may also be passed as `host:port`; the compatibility layer will split the port into `transport_rpc_port`
 
 ## Basic Real-Mode Example
 
@@ -224,6 +225,54 @@ policy = ReplicateConfig(
 )
 store.put("key", b"payload", config=policy)
 ```
+
+## Real-Mode Validation Script
+
+Use `scripts/real_client_rw.py` for black-box real-mode validation against the current store-rs compatibility stack.
+
+Storage node:
+
+```bash
+python3 ./scripts/real_client_rw.py \
+  --local_host 10.0.0.11:17111 \
+  --metadata_url redis://10.0.0.10:6379/0 \
+  --storage-bytes $((128 * 1024 * 1024)) \
+  --mode idle \
+  --hold-seconds 600
+```
+
+RW-only writer:
+
+```bash
+python3 ./scripts/real_client_rw.py \
+  --local_host 10.0.0.21:17121 \
+  --metadata_url redis://10.0.0.10:6379/0 \
+  --storage-bytes 0 \
+  --routed-writes \
+  --mode write \
+  --key_prefix smoke
+```
+
+RW-only reader:
+
+```bash
+python3 ./scripts/real_client_rw.py \
+  --local_host 10.0.0.22:17122 \
+  --metadata_url redis://10.0.0.10:6379/0 \
+  --storage-bytes 0 \
+  --routed-writes \
+  --mode read \
+  --key_prefix smoke
+```
+
+Current script behavior:
+
+- validates only the current `redis://...` and `etcd://...` metadata modes
+- accepts `host:port` in `--local_host` and normalizes that port into real-mode TENT config
+- supports `idle`, `write`, `read`, and `both`
+- supports batch put/get validation through `--batch_size`
+- treats `--master_addr` as a deprecated compatibility alias and ignores it
+- exits with a regular error code on validation failure
 
 ## Basic Dummy-Mode Example
 
@@ -383,6 +432,12 @@ Run the Python compatibility validation:
 
 ```bash
 ./scripts/run-python-compat-e2e.sh
+```
+
+Run the black-box real-mode reader / writer validator:
+
+```bash
+python3 ./scripts/real_client_rw.py --help
 ```
 
 Run the hot-upgrade startup validation:

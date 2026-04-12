@@ -235,6 +235,13 @@ Important Python-only compatibility knobs:
 
 The config-dict path accepts the same compatibility knobs. For port pinning, both `transport_rpc_port` and `rpc_server_port` map to the real-mode TENT data-plane port.
 
+`local_hostname` accepts either:
+
+- a plain hostname such as `10.0.0.15`
+- `host:port`, which is normalized into `local_hostname=host` plus `transport_rpc_port=port`
+
+If `local_hostname` already embeds a port and `transport_rpc_port` or `rpc_server_port` is also provided, the values must match. The compatibility layer rejects mismatches instead of silently publishing an invalid real-mode endpoint.
+
 Port role reminder:
 
 - `transport_rpc_port` / `rpc_server_port` is used by real clients and maps to TENT `rpc_server_port`
@@ -242,6 +249,8 @@ Port role reminder:
 - `metrics_addr` only exposes `/metrics`
 
 For cross-host or cross-container real-mode deployments, set a reachable `local_hostname` together with a fixed `transport_rpc_port`.
+
+`master_server` / `master_server_addr` remains accepted on the Python compatibility entry points for upstream API parity, but the current store-rs runtime does not use a master-based control path. Real deployments should configure metadata with `redis://...` or `etcd://...`.
 
 The compatibility client defaults `lease_ttl_ms` to `30000`. Keep the heartbeat interval comfortably below that TTL so dead peers converge quickly without triggering avoidable churn.
 
