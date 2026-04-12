@@ -47,6 +47,7 @@ Status NVLinkTransport::install(std::string& local_segment_name,
             "NVLink transport has been installed" LOC_MARK);
     }
 
+    platform_ = dynamic_cast<CudaPlatform*>(&Platform::getLoader());
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
@@ -76,16 +77,6 @@ Status NVLinkTransport::uninstall() {
     return Status::OK();
 }
 
-struct CudaStreamNVLinkRAII {
-    cudaStream_t stream_;
-    CudaStreamNVLinkRAII() {
-        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
-    }
-    ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
-};
-
-thread_local CudaStreamNVLinkRAII tl_stream_nvlink;
-
 Status NVLinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto shm_batch = Slab<NVLinkSubBatch>::Get().allocate();
     if (!shm_batch)
@@ -93,9 +84,8 @@ Status NVLinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     batch = shm_batch;
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
-    shm_batch->stream = tl_stream_nvlink.stream_;
-    // CHECK_CUDA(cudaStreamCreateWithFlags(&shm_batch->stream,
-    // cudaStreamNonBlocking));
+    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream));
+    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream));
     return Status::OK();
 }
 
@@ -173,13 +163,13 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
 
     if (!is_async) {
         err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->stream);
+                              batch->sync_stream.get());
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
             return;
         }
 
-        err = cudaStreamSynchronize(batch->stream);
+        err = cudaStreamSynchronize(batch->sync_stream.get());
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
             return;
@@ -190,7 +180,8 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                          batch->async_stream.get());
 
     if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
 }
@@ -204,9 +195,9 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto& task = shm_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
-        auto err = cudaStreamQuery(shm_batch->stream);
+        auto err = cudaStreamQuery(shm_batch->async_stream.get());
         if (err == cudaSuccess) {
-            cudaStreamSynchronize(shm_batch->stream);
+            cudaStreamSynchronize(shm_batch->async_stream.get());
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {

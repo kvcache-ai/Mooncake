@@ -26,6 +26,7 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/platform/cuda.h"
 
 namespace mooncake {
 namespace tent {
@@ -41,7 +42,8 @@ struct MnnvlTask {
 struct MnnvlSubBatch : public Transport::SubBatch {
     std::vector<MnnvlTask> task_list;
     size_t max_size;
-    cudaStream_t stream;
+    CUDAStreamHandle sync_stream;
+    CUDAStreamHandle async_stream;
     virtual size_t size() const { return task_list.size(); }
 };
 
@@ -95,6 +97,7 @@ class MnnvlTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
+    CudaPlatform *platform_;
 
     struct OpenedMnnvlEntry {
         void *mnnvl_addr;

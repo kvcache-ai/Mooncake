@@ -45,7 +45,8 @@ bool MooncakeWorker::waitUntilTasksSubmitted(
     auto submitted = [this, &tasks] {
         for (const auto& task : tasks) {
             if (task.task_id >= kNumTasks_) {
-                return false;
+                LOG(ERROR) << "Invalid task id.";
+                return true;
             }
             if (submitted_task_sequence_[task.task_id].load(
                     std::memory_order_acquire) < task.sequence) {

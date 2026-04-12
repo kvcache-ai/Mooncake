@@ -28,6 +28,7 @@
 #include "tent/common/concurrent/ticket_lock.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/platform/cuda.h"
 
 namespace mooncake {
 namespace tent {
@@ -44,7 +45,8 @@ struct NVLinkTask {
 struct NVLinkSubBatch : public Transport::SubBatch {
     std::vector<NVLinkTask> task_list;
     size_t max_size;
-    cudaStream_t stream;
+    CUDAStreamHandle sync_stream;
+    CUDAStreamHandle async_stream;
     virtual size_t size() const { return task_list.size(); }
 };
 
@@ -93,6 +95,7 @@ class NVLinkTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
+    CudaPlatform *platform_;
 
     struct OpenedShmEntry {
         void *shm_addr;

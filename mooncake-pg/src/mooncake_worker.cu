@@ -44,10 +44,49 @@ class MooncakeWorkCuda : public ::c10d::Work {
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        if (!worker_ || submitted_tasks_.empty()) {
-            return true;
-        }
-        return worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+        // Wait until the task has been submitted to TransferEngine:
+        // This ensures that the CUDA kernels required for the transfer
+        // have been launched by the time `waitUntilTasksSubmitted` returns.
+        // Although this is not required for CPU-only transports such as
+        // RdmaTransport, we keep this behavior to avoid invasive changes
+        // to TE/TENT.
+        //
+        // Please note that this logic relies on the assumption that TE/TENT
+        // will launch all CUDA operations in `submitTransfer`.
+        // Unfortunately, TcpTransport in TE and TENT currently violates this
+        // assumption (cudaMemcpy(Async) may be called from a callback), which
+        // can cause hangs in PG when a CUDA operation such as `x.cpu().item()`
+        // follows the collective. For TE's TcpTransport, the use of cudaMemcpy
+        // on the default stream may also contribute to the hang.
+        //
+        // This wait is primarily needed for two reasons:
+        //   1. PyTorch documents that `wait` should ensure the operation is
+        //      issued, though not necessarily completed, for CUDA work.
+        //      In practice, this means the transfer kernel must at least be
+        //      launched; otherwise, a hang may occur.
+        //   2. The current stream is blocked on the event below. Any subsequent
+        //      work on `current_stream` will wait on that event, which
+        //      effectively waits for the task to be done. Therefore, we must
+        //      not block until all kernels needed for the transfer task have
+        //      been launched, in case TE/TENT use `current_stream` to
+        //      launch those kernels (though rare).
+        auto submitted =
+            worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+        if (!submitted) return false;
+
+        // Once all tasks have been submitted, create an event to synchronize
+        // the current stream and the enqueue stream, but do not wait on this
+        // event.
+        //
+        // See PyTorch docs for more details:
+        // https://docs.pytorch.org/docs/stable/distributed.html#synchronous-and-asynchronous-collective-operations
+        //   "wait() - in the case of CPU collectives, will block the process
+        //    until the operation is completed. In the case of CUDA collectives,
+        //    will block the currently active CUDA stream until the operation
+        //    is completed (but will not block the CPU)."
+        auto current_stream = at::cuda::getCurrentCUDAStream();
+        event_->block(current_stream);
+        return true;
     }
 
    protected:
@@ -408,16 +447,28 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const at::cuda::CUDAStream& stream,
-    const std::function<void(void* dst, size_t pos, size_t realSize)>&
-        tensorToBuffer,
-    const std::function<void(void* src, size_t pos, size_t realSize)>&
-        bufferToTensor) {
+    const at::cuda::CUDAStream& issue_stream,
+    const std::function<void(void* dst, size_t pos, size_t realSize,
+                             const at::cuda::CUDAStream&)>& tensorToBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize,
+                             const at::cuda::CUDAStream&)>& bufferToTensor) {
     connection_ctx->waitUntilNewRanksConnected();
 
     // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     //  Alternately use even-odd items to maintain tasks
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
+
+    // Get a non-blocking stream for enqueue:
+    //   The incoming `issue_stream` may be the Null Stream, which enforces
+    //   implicit synchronization semantics. Launching a spin-wait kernel
+    //   (enqueueTaskKernel) on such a stream can introduce potential deadlock.
+    at::cuda::CUDAStream enq_stream =
+        at::cuda::getStreamFromPool(false, issue_stream.device_index());
+
+    // Synchronize: enq_stream waits for issue_stream
+    auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
+    event_start->record(issue_stream);
+    event_start->block(enq_stream);
 
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
@@ -431,28 +482,29 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize);
+            pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
-        enqueueTaskKernel<<<1, 1, 0, stream>>>(
+        enqueueTaskKernel<<<1, 1, 0, enq_stream>>>(
             opType, realSize, broadcastRoot, bufferOffset, taskSequence,
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId);
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize);
+            pos, realSize, enq_stream);
 
         ++cudaTaskCount;
         ++meta->taskCount;
     }
 
-    auto event = std::make_shared<torch::Event>(torch::kCUDA);
-    event->record(stream);
+    auto event_end = std::make_shared<torch::Event>(torch::kCUDA);
+    event_end->record(enq_stream);
+
     if (opType == c10d::OpType::BARRIER) {
         return c10::make_intrusive<MooncakeBarrierWorkCuda>(
-            opType, event, meta, this, std::move(submitted_tasks));
+            opType, event_end, meta, this, std::move(submitted_tasks));
     }
-    return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta, this,
+    return c10::make_intrusive<MooncakeWorkCuda>(opType, event_end, meta, this,
                                                  std::move(submitted_tasks));
 }
 

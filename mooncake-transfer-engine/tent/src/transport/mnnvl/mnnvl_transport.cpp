@@ -101,6 +101,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
             "CUDA Fabric handle type not supported " LOC_MARK);
     }
 
+    platform_ = dynamic_cast<CudaPlatform *>(&Platform::getLoader());
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
@@ -137,16 +138,6 @@ Status MnnvlTransport::uninstall() {
     return Status::OK();
 }
 
-struct CudaStreamMnnvlRAII {
-    cudaStream_t stream_;
-    CudaStreamMnnvlRAII() {
-        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
-    }
-    ~CudaStreamMnnvlRAII() { cudaStreamDestroy(stream_); }
-};
-
-thread_local CudaStreamMnnvlRAII tl_stream_mnnvl;
-
 Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto mnnvl_batch = Slab<MnnvlSubBatch>::Get().allocate();
     if (!mnnvl_batch)
@@ -154,9 +145,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    mnnvl_batch->stream = tl_stream_mnnvl.stream_;
-    // CHECK_CUDA(cudaStreamCreateWithFlags(&mnnvl_batch->stream,
-    // cudaStreamNonBlocking));
+    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream));
+    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream));
     return Status::OK();
 }
 
@@ -238,17 +228,26 @@ void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
     }
 
     if (!is_async) {
-        err = cudaMemcpy(dst, src, task->request.length, kind);
+        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                              batch->sync_stream.get());
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
-        } else {
-            task->transferred_bytes = task->request.length;
-            task->status_word = TransferStatusEnum::COMPLETED;
+            return;
         }
+
+        err = cudaStreamSynchronize(batch->sync_stream.get());
+        if (err != cudaSuccess) {
+            task->status_word = TransferStatusEnum::FAILED;
+            return;
+        }
+
+        task->transferred_bytes = task->request.length;
+        task->status_word = TransferStatusEnum::COMPLETED;
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                          batch->async_stream.get());
 
     if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
 }
@@ -262,9 +261,9 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto &task = mnnvl_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
-        auto err = cudaStreamQuery(mnnvl_batch->stream);
+        auto err = cudaStreamQuery(mnnvl_batch->async_stream.get());
         if (err == cudaSuccess) {
-            cudaStreamSynchronize(mnnvl_batch->stream);
+            cudaStreamSynchronize(mnnvl_batch->async_stream.get());
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {

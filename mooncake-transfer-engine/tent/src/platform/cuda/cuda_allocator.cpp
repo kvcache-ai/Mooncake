@@ -56,7 +56,15 @@ Status CudaPlatform::free(void* ptr, size_t size) {
 }
 
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
-    CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
+    // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
+    // as the latter relies on the legacy default stream and can introduce
+    // unintended synchronization or even deadlocks in downstream
+    // components (e.g. mooncake-pg).
+    CUDAStreamHandle stream;
+    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_CUDA(
+        cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
+    CHECK_CUDA(cudaStreamSynchronize(stream.get()));
     return Status::OK();
 }
 }  // namespace tent

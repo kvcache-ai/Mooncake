@@ -91,11 +91,11 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const at::cuda::CUDAStream& stream,
-        const std::function<void(void* dst, size_t pos, size_t realSize)>&
-            tensorToBuffer,
-        const std::function<void(void* src, size_t pos, size_t realSize)>&
-            bufferToTensor);
+        const at::cuda::CUDAStream& issue_stream,
+        const std::function<void(void* dst, size_t pos, size_t realSize,
+                                 const at::cuda::CUDAStream&)>& tensorToBuffer,
+        const std::function<void(void* src, size_t pos, size_t realSize,
+                                 const at::cuda::CUDAStream&)>& bufferToTensor);
 
     void Start();
 
