@@ -2,3 +2,5 @@
 /Cargo.lock
 /dist
 /.venv-wheel
+*build/
+*.egg-info/
