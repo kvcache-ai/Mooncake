@@ -605,9 +605,9 @@ tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to put key: " << key
                        << " error: " << result.error();
             return result;
+        } else {
+            // the key exists, just ignore the error
         }
-        // REPLICA_NUM_EXCEEDED / REPLICA_ALREADY_EXISTS: object already
-        // stored, treat as success so callers don't retry needlessly.
     }
 
     return {};
