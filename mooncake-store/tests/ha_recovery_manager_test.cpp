@@ -132,24 +132,20 @@ std::string HARecoveryManagerTest::master_addr_;
 // State Machine Tests
 // ============================================================================
 
-TEST_F(HARecoveryManagerTest, InitialStateIsFull) {
+TEST_F(HARecoveryManagerTest, FullToDegragedOnUnreachable) {
     auto mgr = CreateManager();
     EXPECT_EQ(mgr->GetState(), HAClientState::FULL);
     EXPECT_FALSE(mgr->IsDegraded());
-}
-
-TEST_F(HARecoveryManagerTest, FullToDegragedOnUnreachable) {
-    auto mgr = CreateManager();
     mgr->HandleEvent(HAEvent::MASTER_UNREACHABLE);
     EXPECT_EQ(mgr->GetState(), HAClientState::DEGRADED);
     EXPECT_TRUE(mgr->IsDegraded());
 }
 
 TEST_F(HARecoveryManagerTest, FullToSyncingOnReachable) {
-    // FULL -> MASTER_REACHABLE -> SYNCING (Master restarted scenario)
+    // FULL -> MASTER_RECONNECTED -> SYNCING (Master restarted scenario)
     // Without DataManager, recovery thread exits quickly
     auto mgr = CreateManager();
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     // Should transition to SYNCING (recovery thread will run but no data_manager)
     // Give it a moment to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -165,7 +161,7 @@ TEST_F(HARecoveryManagerTest, DegradedToSyncingOnReachable) {
     mgr->HandleEvent(HAEvent::MASTER_UNREACHABLE);
     EXPECT_EQ(mgr->GetState(), HAClientState::DEGRADED);
 
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     // Should attempt SYNCING
     auto state = mgr->GetState();
     EXPECT_TRUE(state == HAClientState::SYNCING || state == HAClientState::FULL);
@@ -184,8 +180,8 @@ TEST_F(HARecoveryManagerTest, DuplicateUnreachableIsNoop) {
 TEST_F(HARecoveryManagerTest, SyncingToDegragedOnUnreachable) {
     auto mgr = CreateManagerWithNotifier();
 
-    // First go to SYNCING via MASTER_REACHABLE
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    // First go to SYNCING via MASTER_RECONNECTED
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     // Allow transition to start
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -198,18 +194,18 @@ TEST_F(HARecoveryManagerTest, ReachableDuringSyncingRestartsPipeline) {
     auto mgr = CreateManagerWithNotifier();
 
     // Start recovery
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Another MASTER_REACHABLE should abort old thread and restart
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    // Another MASTER_RECONNECTED should abort old thread and restart
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     // Should still be SYNCING
     EXPECT_EQ(mgr->GetState(), HAClientState::SYNCING);
 }
 
 TEST_F(HARecoveryManagerTest, StopFromSyncingGoesToDegraded) {
     auto mgr = CreateManagerWithNotifier();
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     mgr->Stop();
@@ -226,7 +222,7 @@ TEST_F(HARecoveryManagerTest, StopIdempotent) {
 TEST_F(HARecoveryManagerTest, DestructorCallsStop) {
     {
         auto mgr = CreateManagerWithNotifier();
-        mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+        mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         // Destructor should cleanly join recovery thread
     }
@@ -276,8 +272,8 @@ TEST_F(HARecoveryManagerTest, NotifierRestartedOnReachableFromDegraded) {
     mgr->HandleEvent(HAEvent::MASTER_UNREACHABLE);
     EXPECT_FALSE(notifier_->running_.load());
 
-    // MASTER_REACHABLE from DEGRADED should restart notifier
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    // MASTER_RECONNECTED from DEGRADED should restart notifier
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     EXPECT_TRUE(notifier_->running_.load());
 }
 
@@ -300,7 +296,7 @@ TEST_F(HARecoveryManagerTest, ConcurrentEvents) {
     // Thread B: rapid REACHABLE events
     std::thread t2([&]() {
         while (!stop.load(std::memory_order_relaxed)) {
-            mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+            mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     });
@@ -331,7 +327,7 @@ TEST_F(HARecoveryManagerTest, FullCycle_FullDegradedSyncingFull) {
     EXPECT_EQ(mgr->GetState(), HAClientState::DEGRADED);
 
     // DEGRADED -> SYNCING (no data_manager, recovery will fail fast)
-    mgr->HandleEvent(HAEvent::MASTER_REACHABLE);
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     // Without data_manager, stays SYNCING
     EXPECT_EQ(mgr->GetState(), HAClientState::SYNCING);

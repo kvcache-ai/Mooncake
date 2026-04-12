@@ -380,11 +380,12 @@ inline std::ostream& operator<<(std::ostream& os,
  * @brief Events that drive client-side HA state transitions.
  */
 enum class HAEvent {
-    MASTER_UNREACHABLE,  // Consecutive heartbeat failures exceeded threshold
-    MASTER_REACHABLE,    // Master is reachable. Triggered on:
-                         // 1. RegisterClient succeeded (Master restarted)
-                         // 2. Heartbeat recovered with HEALTH status
-                         //    (short-term network disconnection)
+    MASTER_UNREACHABLE,   // Consecutive heartbeat failures exceeded threshold
+    MASTER_RECONNECTED,   // Master connection restored. Triggered on:
+                          // 1. RegisterClient succeeded (Master restarted or
+                          //    client re-registered after reconnection)
+                          // 2. Heartbeat recovered with HEALTH status after
+                          //    a prior MASTER_UNREACHABLE event
 };
 
 /**

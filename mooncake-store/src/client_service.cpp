@@ -455,7 +455,6 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
     const int fail_heartbeat_interval_ms = 1000;
     // Increment after a heartbeat failure, reset after a heartbeat success
     int heartbeat_fail_count = 0;
-    bool master_reachable = true;
 
     auto register_client = [this]() {
         LOG(INFO) << "Sending RegisterClientRequest"
@@ -469,7 +468,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             LOG(INFO) << "Client registered successfully"
                       << ", client_id=" << client_id_
                       << ", view_version=" << res.value().view_version;
-            OnHAEvent(HAEvent::MASTER_REACHABLE);
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
         }
     };
     // Use another thread to register client to avoid blocking the heartbeat
@@ -491,7 +490,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             heartbeat_fail_count = 0;
             HandleHeartbeatResponse(heartbeat_result.value(),
                                     current_master_address, register_client,
-                                    register_client_future, master_reachable);
+                                    register_client_future);
             WaitForNextHeartbeat(success_heartbeat_interval_ms);
         } else {  // Heartbeat failed
             heartbeat_fail_count++;
@@ -499,9 +498,9 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                 // just retry
                 LOG(ERROR) << "Failed to send heartbeat to master";
             } else {
-                if (master_reachable) {
+                if (!connection_interrupted_) {
                     OnHAEvent(HAEvent::MASTER_UNREACHABLE);
-                    master_reachable = false;
+                    connection_interrupted_ = true;
                 }
                 // Attempt reconnect
                 if (ReconnectToMaster(is_ha_mode, current_master_address)) {
@@ -532,7 +531,7 @@ bool ClientService::HandleHeartbeatResponse(
     const HeartbeatResponse& response,
     const std::string& current_master_address,
     const std::function<void()>& register_client,
-    std::future<void>& register_client_future, bool& master_reachable) {
+    std::future<void>& register_client_future) {
     if (response.view_version != view_version_) {
         LOG(WARNING) << "Master view_version changed"
                      << ", client status in master: " << (int)response.status
@@ -544,11 +543,11 @@ bool ClientService::HandleHeartbeatResponse(
         HandleHeartbeatTaskResult(task_result);
     }
     if (response.status == ClientStatus::HEALTH) {
-        // Heartbeat recovered after degraded: Master still knows this client.
-        // Enter SYNCING to re-sync any keys whose callbacks failed.
-        if (!master_reachable) {
-            OnHAEvent(HAEvent::MASTER_REACHABLE);
-            master_reachable = true;
+        // Heartbeat recovered after a connection interruption: master still
+        // knows this client. Fire MASTER_RECONNECTED once to trigger re-sync.
+        if (connection_interrupted_) {
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
+            connection_interrupted_ = false;
         }
     } else if (response.status == ClientStatus::UNDEFINED &&
                !register_client_future.valid()) {

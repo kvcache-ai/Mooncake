@@ -83,7 +83,7 @@ void HARecoveryManager::HandleEvent(HAEvent event) {
             }
             break;
 
-        case HAEvent::MASTER_REACHABLE:
+        case HAEvent::MASTER_RECONNECTED:
             if (current == HAClientState::DEGRADED) {
                 if (notifier_) notifier_->Start();
             }
