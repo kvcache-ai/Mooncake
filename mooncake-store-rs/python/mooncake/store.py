@@ -75,6 +75,37 @@ def _normalize_hugepage_size(value) -> int | None:
     )
 
 
+def _normalize_local_hostname_and_transport_port(
+    local_hostname,
+    transport_rpc_port,
+) -> tuple[str, int | None]:
+    hostname = str(local_hostname).strip()
+    explicit_port = (
+        None if transport_rpc_port is None else int(transport_rpc_port)
+    )
+    embedded_host = hostname
+    embedded_port = None
+
+    if hostname.startswith("["):
+        closing = hostname.find("]")
+        if closing > 0 and closing + 1 < len(hostname) and hostname[closing + 1] == ":":
+            candidate = hostname[closing + 2 :]
+            if candidate.isdigit():
+                embedded_host = hostname[1:closing]
+                embedded_port = int(candidate)
+    elif hostname.count(":") == 1:
+        candidate_host, candidate_port = hostname.rsplit(":", 1)
+        if candidate_host and candidate_port.isdigit():
+            embedded_host = candidate_host
+            embedded_port = int(candidate_port)
+
+    if embedded_port is not None and explicit_port is not None and embedded_port != explicit_port:
+        raise ValueError(
+            "local_hostname embedded transport port conflicts with transport_rpc_port"
+        )
+    return embedded_host, explicit_port if explicit_port is not None else embedded_port
+
+
 class _BatchStatusResult(list):
     def status_code(self) -> int:
         for status in self:
@@ -257,11 +288,20 @@ class MooncakeDistributedStore:
             raise TypeError("setup accepts at most 8 positional arguments")
         if len(args) == 8:
             args = args[:7]
+        args = list(args)
         kwargs.pop("engine", None)
         if "state" in kwargs and "initial_state" not in kwargs:
             kwargs["initial_state"] = kwargs.pop("state")
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
+        if args:
+            local_hostname, transport_rpc_port = _normalize_local_hostname_and_transport_port(
+                args[0],
+                kwargs.get("transport_rpc_port"),
+            )
+            args[0] = local_hostname
+            if transport_rpc_port is not None and "transport_rpc_port" not in kwargs:
+                kwargs["transport_rpc_port"] = transport_rpc_port
         return self._invoke("setup", *args, **kwargs)
     def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str):
         return self._invoke("setup_dummy", mem_pool_size, local_buffer_size, server_address)
@@ -527,12 +567,19 @@ class MooncakeDistributedStore:
         metadata_url = config.get("metadata_server", config.get("metadata_url"))
         if metadata_url is None:
             raise TypeError("setup config requires `metadata_server`")
+        transport_rpc_port = _coerce_optional_int(
+            config.get("transport_rpc_port", config.get("rpc_server_port"))
+        )
+        local_hostname, transport_rpc_port = _normalize_local_hostname_and_transport_port(
+            config["local_hostname"],
+            transport_rpc_port,
+        )
         initial_state = _coerce_optional_str(
             config.get("initial_state", config.get("state"))
         ) or "active"
         return self._invoke(
             "setup",
-            str(config["local_hostname"]),
+            local_hostname,
             str(metadata_url),
             _coerce_int(config.get("global_segment_size"), 16 * 1024 * 1024),
             _coerce_int(config.get("local_buffer_size"), 16 * 1024 * 1024),
@@ -550,9 +597,7 @@ class MooncakeDistributedStore:
             transport_metadata_url=_coerce_optional_str(
                 config.get("transport_metadata_url")
             ),
-            transport_rpc_port=_coerce_optional_int(
-                config.get("transport_rpc_port", config.get("rpc_server_port"))
-            ),
+            transport_rpc_port=transport_rpc_port,
             local_segment_name=_coerce_optional_str(config.get("local_segment_name")),
             expires_at_ms=_coerce_optional_int(config.get("expires_at_ms")),
             use_hugepage=_coerce_optional_bool(config.get("use_hugepage")),
