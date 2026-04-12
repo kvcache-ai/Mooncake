@@ -1424,12 +1424,12 @@ TEST_F(TieredBackendTest, BucketEvictionCleansMetadataIndex) {
         EXPECT_GT(usage_before, 0u);
 
         // --- Step 2: Allocate 5 KB more — triggers TriggerBucketEviction ---
-        auto extra = AllocateAndWrite(backend, 5 * 1024,
-                                      CreateTestBuffer(5 * 1024).get(),
-                                      storage_id);
+        auto extra = AllocateAndWrite(
+            backend, 5 * 1024, CreateTestBuffer(5 * 1024).get(), storage_id);
         ASSERT_TRUE(extra.has_value())
             << "Allocation after eviction should succeed";
-        ASSERT_TRUE(backend.Commit("evict_extra_key", extra.value()).has_value());
+        ASSERT_TRUE(
+            backend.Commit("evict_extra_key", extra.value()).has_value());
 
         // --- Step 3: Verify metadata was cleaned up ---
 
@@ -1448,7 +1448,8 @@ TEST_F(TieredBackendTest, BucketEvictionCleansMetadataIndex) {
                 }
             }
         }
-        EXPECT_GT(evicted_count, 0) << "At least one key should have been evicted";
+        EXPECT_GT(evicted_count, 0)
+            << "At least one key should have been evicted";
 
         // Tier usage must not underflow (was the double-decrement bug).
         for (const auto& tv : backend.GetTierViews()) {
@@ -1512,16 +1513,14 @@ TEST_F(TieredBackendTest, BucketEvictionPreservesDRAMReplica) {
 
         // Write "shared_key" to DRAM.
         auto buf_dram = CreateTestBuffer(1024);
-        auto h_dram =
-            AllocateAndWrite(backend, 1024, buf_dram.get(), dram_id);
+        auto h_dram = AllocateAndWrite(backend, 1024, buf_dram.get(), dram_id);
         ASSERT_TRUE(h_dram.has_value());
         ASSERT_TRUE(backend.Commit("shared_key", h_dram.value()).has_value());
 
         // Also create a SSD replica for "shared_key" (simulates MIGRATE).
         auto buf_ssd = CreateTestBuffer(1024);
         DataSource src;
-        src.buffer =
-            std::make_unique<TempDRAMBuffer>(std::move(buf_ssd), 1024);
+        src.buffer = std::make_unique<TempDRAMBuffer>(std::move(buf_ssd), 1024);
         src.type = MemoryType::DRAM;
         ASSERT_TRUE(backend.CopyData("shared_key", src, storage_id).has_value())
             << "CopyData to SSD failed";
@@ -1538,10 +1537,10 @@ TEST_F(TieredBackendTest, BucketEvictionPreservesDRAMReplica) {
         const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
 
         // Trigger eviction by allocating beyond SSD capacity.
-        auto extra =
-            AllocateAndWrite(backend, 5 * 1024,
-                             CreateTestBuffer(5 * 1024).get(), storage_id);
-        ASSERT_TRUE(extra.has_value()) << "Allocation triggering eviction failed";
+        auto extra = AllocateAndWrite(
+            backend, 5 * 1024, CreateTestBuffer(5 * 1024).get(), storage_id);
+        ASSERT_TRUE(extra.has_value())
+            << "Allocation triggering eviction failed";
         ASSERT_TRUE(
             backend.Commit("evict_trigger_key", extra.value()).has_value());
 

@@ -927,12 +927,14 @@ void TieredBackend::NotifyBucketEviction(
         }
 
         // If the entry became empty, upgrade to a global write lock to remove
-        // the zombie entry from the index (same double-check pattern as Delete).
+        // the zombie entry from the index (same double-check pattern as
+        // Delete).
         if (need_cleanup) {
             std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
             auto it = metadata_index_.find(key);
             if (it != metadata_index_.end()) {
-                std::unique_lock<std::shared_mutex> entry_lock(it->second->mutex);
+                std::unique_lock<std::shared_mutex> entry_lock(
+                    it->second->mutex);
                 if (it->second->replicas.empty()) {
                     metadata_index_.erase(it);
                 }
