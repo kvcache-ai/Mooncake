@@ -186,6 +186,17 @@ assert kwargs["initial_state"] == "draining"
 assert "state" not in kwargs
 
 store.setup(
+    "127.0.0.1:17111",
+    "redis://127.0.0.1:6379/0",
+    1024,
+    512,
+    stable_id="py-store-port-a",
+)
+name, args, kwargs = store._worker.calls.pop()
+assert args[0] == "127.0.0.1"
+assert kwargs["transport_rpc_port"] == 17111
+
+store.setup(
     {
         "local_hostname": "127.0.0.1",
         "metadata_url": "redis://127.0.0.1:6379/0",
@@ -214,4 +225,28 @@ name, args, kwargs = store._worker.calls.pop()
 assert kwargs["stable_id"] == "py-store-d"
 assert kwargs["epoch"] == 1
 assert kwargs["initial_state"] == "offline"
+
+store.setup(
+    {
+        "local_hostname": "node-a:17112",
+        "metadata_server": "redis://127.0.0.1:6379/0",
+        "stable_id": "py-store-e",
+    }
+)
+name, args, kwargs = store._worker.calls.pop()
+assert args[0] == "node-a"
+assert kwargs["transport_rpc_port"] == 17112
+
+try:
+    store.setup(
+        "127.0.0.1:17111",
+        "redis://127.0.0.1:6379/0",
+        1024,
+        512,
+        transport_rpc_port=17112,
+    )
+except ValueError:
+    pass
+else:
+    raise AssertionError("conflicting transport ports should be rejected")
 PY

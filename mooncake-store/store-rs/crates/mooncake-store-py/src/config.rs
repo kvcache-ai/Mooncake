@@ -159,6 +159,8 @@ fn build_tent_config(
     protocol: &str,
     transport_rpc_port: Option<u16>,
 ) -> Result<TentEngineConfig> {
+    let (local_hostname, transport_rpc_port) =
+        normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
     let redis = Url::parse(transport_redis_url)
         .map_err(|error| StoreError::Metadata(format!("invalid redis url: {error}")))?;
     let host = redis
@@ -205,6 +207,50 @@ fn build_tent_config(
         config = config.redis_password(password);
     }
     Ok(config)
+}
+
+fn normalize_transport_listen_endpoint(
+    local_hostname: &str,
+    transport_rpc_port: Option<u16>,
+) -> Result<(String, Option<u16>)> {
+    let hostname = local_hostname.trim();
+    let (embedded_host, embedded_port) = parse_embedded_transport_port(hostname);
+    if let (Some(embedded), Some(explicit)) = (embedded_port, transport_rpc_port) {
+        if embedded != explicit {
+            return Err(StoreError::InvalidState(format!(
+                "local_hostname embedded transport port {embedded} conflicts with transport_rpc_port {explicit}"
+            )));
+        }
+    }
+    Ok((
+        embedded_host.to_string(),
+        transport_rpc_port.or(embedded_port),
+    ))
+}
+
+fn parse_embedded_transport_port(local_hostname: &str) -> (&str, Option<u16>) {
+    if let Some(inner) = local_hostname.strip_prefix('[') {
+        if let Some((host, suffix)) = inner.split_once(']') {
+            if let Some(port_text) = suffix.strip_prefix(':') {
+                if let Ok(port) = port_text.parse::<u16>() {
+                    return (host, Some(port));
+                }
+            }
+        }
+        return (local_hostname, None);
+    }
+
+    if local_hostname.matches(':').count() == 1 {
+        if let Some((host, port_text)) = local_hostname.rsplit_once(':') {
+            if !host.is_empty() {
+                if let Ok(port) = port_text.parse::<u16>() {
+                    return (host, Some(port));
+                }
+            }
+        }
+    }
+
+    (local_hostname, None)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -492,6 +538,28 @@ mod tests {
             plan.labels.get("storage").map(String::as_str),
             Some("false")
         );
+    }
+
+    #[test]
+    fn normalize_transport_listen_endpoint_extracts_embedded_port() {
+        let (host, port) = normalize_transport_listen_endpoint("node-a:17112", None)
+            .expect("embedded port should normalize");
+        assert_eq!(host, "node-a");
+        assert_eq!(port, Some(17112));
+
+        let (ipv6_host, ipv6_port) = normalize_transport_listen_endpoint("[::1]:17113", None)
+            .expect("ipv6 embedded port should normalize");
+        assert_eq!(ipv6_host, "::1");
+        assert_eq!(ipv6_port, Some(17113));
+    }
+
+    #[test]
+    fn normalize_transport_listen_endpoint_rejects_conflicting_ports() {
+        let error = match normalize_transport_listen_endpoint("node-a:17112", Some(17113)) {
+            Ok(_) => panic!("conflicting embedded port should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::InvalidState(_)));
     }
 
     #[test]
