@@ -573,8 +573,8 @@ TEST(PrefixIndexTest, ConcurrentInsertsAndReads) {
     for (int w = 0; w < kNumWriters; ++w) {
         threads.emplace_back([&idx, w]() {
             for (int i = 0; i < kKeysPerWriter; ++i) {
-                std::string key = "w" + std::to_string(w) + "/key_" +
-                                  std::to_string(i);
+                std::string key =
+                    "w" + std::to_string(w) + "/key_" + std::to_string(i);
                 idx.insert(key, 10, kClient1);
             }
         });
@@ -724,8 +724,8 @@ TEST(PrefixIndexTest, ListPrefixContinuationsExposesCompressedTrieEdges) {
     idx.insert("ac/two", 200, kClient1);
 
     // Tree: root → "a" (internal) → "b/one" (terminal), "c/two" (terminal)
-    // list_prefix_continuations("a") returns the FULL compressed edges from the "a"
-    // node, not truncated-at-delimiter immediate children. This is the
+    // list_prefix_continuations("a") returns the FULL compressed edges from the
+    // "a" node, not truncated-at-delimiter immediate children. This is the
     // intended radix tree behavior — edges can span multiple "levels."
     auto children = idx.list_prefix_continuations("a");
     ASSERT_EQ(children.size(), 2);
@@ -818,7 +818,7 @@ TEST(PrefixIndexTest, InvariantPrefixConsistency) {
     idx.insert("bbb/4", 40, kClient2);
     idx.insert("bbb/5", 50, kClient2);
 
-    std::vector<std::string> prefixes = {"", "a", "aa", "aaa", "aaa/",
+    std::vector<std::string> prefixes = {"",    "a", "aa",  "aaa",  "aaa/",
                                          "aab", "b", "bbb", "bbb/", "xyz"};
 
     for (const auto& p : prefixes) {
@@ -826,14 +826,13 @@ TEST(PrefixIndexTest, InvariantPrefixConsistency) {
         auto count = idx.count_by_prefix(p);
 
         // count must match number of returned keys.
-        EXPECT_EQ(count, keys.size())
-            << "Mismatch for prefix \"" << p << "\"";
+        EXPECT_EQ(count, keys.size()) << "Mismatch for prefix \"" << p << "\"";
 
         // Every returned key must start with the prefix.
         for (const auto& k : keys) {
             EXPECT_TRUE(k.substr(0, p.size()) == p)
-                << "Key \"" << k << "\" does not start with prefix \""
-                << p << "\"";
+                << "Key \"" << k << "\" does not start with prefix \"" << p
+                << "\"";
         }
     }
 }
@@ -932,8 +931,7 @@ TEST(PrefixIndexTest, StressChurnWithPeriodicClear) {
         uint64_t expected_bytes = 0;
         for (int i = 0; i < kKeysPerRound; ++i) {
             uint64_t sz = (i + 1) * 10;
-            idx.insert("r" + std::to_string(round) + "/k" +
-                           std::to_string(i),
+            idx.insert("r" + std::to_string(round) + "/k" + std::to_string(i),
                        sz, kClient1);
             expected_bytes += sz;
         }
@@ -945,8 +943,7 @@ TEST(PrefixIndexTest, StressChurnWithPeriodicClear) {
         // Remove half
         for (int i = 0; i < kKeysPerRound; i += 2) {
             uint64_t sz = (i + 1) * 10;
-            idx.remove("r" + std::to_string(round) + "/k" +
-                       std::to_string(i));
+            idx.remove("r" + std::to_string(round) + "/k" + std::to_string(i));
             expected_bytes -= sz;
         }
 
@@ -1245,7 +1242,7 @@ TEST(PrefixIndexTest, ListEntriesCountMatchesCountByPrefix) {
     idx.insert("aab/3", 30, kClient2);
     idx.insert("bbb/4", 40, kClient2);
 
-    std::vector<std::string> prefixes = {"", "a", "aa", "aaa", "aaa/",
+    std::vector<std::string> prefixes = {"",    "a", "aa",  "aaa", "aaa/",
                                          "aab", "b", "bbb", "xyz"};
     for (const auto& p : prefixes) {
         auto entries = idx.list_entries_by_prefix(p);
@@ -1262,7 +1259,7 @@ TEST(PrefixIndexTest, ListEntriesBytesSumMatchesBytesByPrefix) {
     idx.insert("aab/3", 30, kClient2);
     idx.insert("bbb/4", 40, kClient2);
 
-    std::vector<std::string> prefixes = {"", "a", "aa", "aaa", "aaa/",
+    std::vector<std::string> prefixes = {"",    "a", "aa",  "aaa", "aaa/",
                                          "aab", "b", "bbb", "xyz"};
     for (const auto& p : prefixes) {
         auto entries = idx.list_entries_by_prefix(p);
@@ -1280,7 +1277,7 @@ TEST(PrefixIndexTest, ListEntriesKeysMatchListKeysByPrefix) {
     idx.insert("aab/3", 30, kClient2);
     idx.insert("bbb/4", 40, kClient2);
 
-    std::vector<std::string> prefixes = {"", "a", "aa", "aaa", "aaa/",
+    std::vector<std::string> prefixes = {"",    "a", "aa",  "aaa", "aaa/",
                                          "aab", "b", "bbb", "xyz"};
     for (const auto& p : prefixes) {
         auto entries = idx.list_entries_by_prefix(p);
@@ -1309,8 +1306,8 @@ TEST(PrefixIndexTest, ConcurrentInsertsAndListEntries) {
     for (int w = 0; w < kNumWriters; ++w) {
         threads.emplace_back([&idx, w]() {
             for (int i = 0; i < kKeysPerWriter; ++i) {
-                std::string key = "w" + std::to_string(w) + "/key_" +
-                                  std::to_string(i);
+                std::string key =
+                    "w" + std::to_string(w) + "/key_" + std::to_string(i);
                 idx.insert(key, 10, kClient1);
             }
         });

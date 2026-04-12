@@ -126,7 +126,8 @@ class PrefixIndex {
      *
      * @param key    The full object key string. Must not be empty.
      * @param size   Object size in bytes (from ObjectMetadata on insert).
-     * @param client_id  Client UUID for this registration (may change on upsert).
+     * @param client_id  Client UUID for this registration (may change on
+     * upsert).
      */
     void insert(const std::string& key, uint64_t size, const UUID& client_id);
 
@@ -177,7 +178,8 @@ class PrefixIndex {
      * under one shared-lock acquisition, so the result is a consistent
      * snapshot of the trie at the time of the call.
      *
-     * @param prefix  The prefix to search for. Empty string returns all entries.
+     * @param prefix  The prefix to search for. Empty string returns all
+     * entries.
      * @return Vector of (key, TrieLeafData) pairs, sorted by key.
      */
     std::vector<std::pair<std::string, TrieLeafData>> list_entries_by_prefix(
