@@ -103,6 +103,7 @@ void AsyncMetadataNotifier::ResetShard(SenderShard& shard) {
     shard.normal_count = 0;
     shard.recovery_head = shard.recovery_tail = InvalidIdx;
     shard.recovery_count = 0;
+    shard.recovery_in_flight = 0;
     shard.free_stack.clear();
     for (size_t i = 0; i < shard.capacity; ++i) {
         shard.slots[i] = Slot{};
@@ -249,7 +250,7 @@ void AsyncMetadataNotifier::SenderLoop(size_t shard_idx) {
             });
         }
 
-        size_t n = CollectBatch(shard, batch);
+        auto [n, recovery_n] = CollectBatch(shard, batch);
 
         if (n == 0) {
             if (!running_.load(std::memory_order_acquire)) break;
@@ -257,11 +258,21 @@ void AsyncMetadataNotifier::SenderLoop(size_t shard_idx) {
         }
 
         SendBatch(batch, n);
+
+        // Decrement recovery_in_flight after the batch is actually sent.
+        // Notify WaitForRecoveryDrain when all recovery ops are drained.
+        if (recovery_n > 0) {
+            std::lock_guard<std::mutex> lk(shard.mutex);
+            shard.recovery_in_flight -= recovery_n;
+            if (shard.recovery_in_flight == 0 && shard.recovery_count == 0) {
+                shard.recovery_drain_cv.notify_all();
+            }
+        }
     }
 }
 
-size_t AsyncMetadataNotifier::CollectBatch(SenderShard& shard,
-                                           std::vector<PendingOp>& batch_out) {
+std::pair<size_t, size_t> AsyncMetadataNotifier::CollectBatch(
+    SenderShard& shard, std::vector<PendingOp>& batch_out) {
     std::unique_lock<std::mutex> lock(shard.mutex);
 
     shard.sender_cv.wait_for(lock, BatchTimeout, [&] {
@@ -270,7 +281,7 @@ size_t AsyncMetadataNotifier::CollectBatch(SenderShard& shard,
 
     // drop mode: don't collect any more batches — let the sender exit cleanly
     if (drop_on_stop_.load(std::memory_order_relaxed)) {
-        return 0;
+        return {0, 0};
     }
 
     // Phase 1: collect from normal queue (high priority)
@@ -286,14 +297,14 @@ size_t AsyncMetadataNotifier::CollectBatch(SenderShard& shard,
     }
 
     if (collected > 0) {
+        if (recovery_collected > 0) {
+            shard.recovery_in_flight += recovery_collected;
+        }
         lock.unlock();
         shard.producer_cv.notify_all();
-        if (recovery_collected > 0) {
-            shard.recovery_drain_cv.notify_all();
-        }
     }
 
-    return collected;
+    return {collected, recovery_collected};
 }
 
 size_t AsyncMetadataNotifier::CollectFromList(SenderShard& shard,
@@ -445,7 +456,7 @@ bool AsyncMetadataNotifier::WaitForRecoveryDrain(
     for (size_t i = 0; i < sender_thread_count_; ++i) {
         auto& shard = *shards_[i];
         std::unique_lock<std::mutex> lock(shard.mutex);
-        while (shard.recovery_count > 0) {
+        while (shard.recovery_count > 0 || shard.recovery_in_flight > 0) {
             if (abort_fn && abort_fn()) return false;
 
             auto remaining = deadline - std::chrono::steady_clock::now();

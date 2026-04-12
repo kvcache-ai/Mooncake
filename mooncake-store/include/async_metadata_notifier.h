@@ -111,38 +111,12 @@ class AsyncMetadataNotifier {
     };
 
     struct SenderShard {
+       public:
         SenderShard() = default;
         SenderShard(const SenderShard&) = delete;
         SenderShard& operator=(const SenderShard&) = delete;
         SenderShard(SenderShard&&) = delete;
         SenderShard& operator=(SenderShard&&) = delete;
-
-        std::mutex mutex;
-        std::condition_variable sender_cv;    // sender waits when both empty
-        std::condition_variable producer_cv;  // normal producer waits when full
-        std::condition_variable recovery_drain_cv;  // WaitForRecoveryDrain
-
-        // Pre-allocated slot pool — shared by both queues
-        std::vector<Slot> slots;
-        std::vector<size_t> free_stack;
-        size_t capacity = 0;
-        size_t normal_reserved = 0;  // slots reserved for normal ops
-
-        // Normal priority linked list
-        size_t normal_head = InvalidIdx;
-        size_t normal_tail = InvalidIdx;
-        size_t normal_count = 0;
-
-        // Recovery (low priority) linked list
-        size_t recovery_head = InvalidIdx;
-        size_t recovery_tail = InvalidIdx;
-        size_t recovery_count = 0;
-
-        // Shared coalesce index (covers both queues)
-        std::unordered_map<CoalesceKey, CoalesceEntry, CoalesceKeyHash>
-            coalesce_index;
-
-        std::thread sender_thread;
 
         bool IsFull() const { return free_stack.empty(); }
         bool IsFullForRecovery() const {
@@ -202,13 +176,48 @@ class AsyncMetadataNotifier {
             }
             count--;
         }
+
+       public:
+        std::mutex mutex;
+        std::condition_variable sender_cv;    // sender waits when both empty
+        std::condition_variable producer_cv;  // normal producer waits when full
+        std::condition_variable recovery_drain_cv;  // WaitForRecoveryDrain
+
+        // Pre-allocated slot pool — shared by both queues
+        std::vector<Slot> slots;
+        std::vector<size_t> free_stack;
+        size_t capacity = 0;
+        size_t normal_reserved = 0;  // slots reserved for normal ops
+
+        // Normal priority linked list
+        size_t normal_head = InvalidIdx;
+        size_t normal_tail = InvalidIdx;
+        size_t normal_count = 0;
+
+        // Recovery (low priority) linked list
+        size_t recovery_head = InvalidIdx;
+        size_t recovery_tail = InvalidIdx;
+        size_t recovery_count = 0;
+
+        // Shared coalesce index (covers both queues)
+        std::unordered_map<CoalesceKey, CoalesceEntry, CoalesceKeyHash>
+            coalesce_index;
+
+        // Recovery ops that have been dequeued by CollectBatch but whose
+        // SendBatch has not yet completed. WaitForRecoveryDrain waits for
+        // both recovery_count and recovery_in_flight to reach zero.
+        size_t recovery_in_flight = 0;
+
+        std::thread sender_thread;
     };
 
    private:
     tl::expected<void, ErrorCode> DoEnqueue(PendingOp&& op, bool is_recovery);
 
     void SenderLoop(size_t shard_idx);
-    size_t CollectBatch(SenderShard& shard, std::vector<PendingOp>& batch_out);
+    // Returns (total_collected, recovery_collected)
+    std::pair<size_t, size_t> CollectBatch(SenderShard& shard,
+                                           std::vector<PendingOp>& batch_out);
     size_t CollectFromList(SenderShard& shard,
                            std::vector<PendingOp>& batch_out, size_t offset,
                            size_t max_count, bool from_recovery);

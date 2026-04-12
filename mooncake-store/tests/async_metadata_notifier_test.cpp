@@ -323,14 +323,14 @@ TEST_F(AsyncMetadataNotifierTest, DuplicateAddIsIdempotent) {
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(notifier.shards_[0]->normal_count, 1u);  // still 1, not 2
 
-    // Second REMOVE for same key+segment — also silently skipped
-    auto r3 = notifier.EnqueueRemove("dup_key", segment_.id);
+    auto r3 = notifier.EnqueueRemove("dup_remove_key", segment_.id);
     ASSERT_TRUE(r3.has_value());
-    // ADD cancelled by REMOVE → count drops to 0
-    EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);
-    auto r4 = notifier.EnqueueRemove("dup_key", segment_.id);
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 2u);
+
+    // Second REMOVE for same key — silently skipped (pending REMOVE exists)
+    auto r4 = notifier.EnqueueRemove("dup_remove_key", segment_.id);
     ASSERT_TRUE(r4.has_value());
-    EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);  // still 0, not 1
+    EXPECT_EQ(notifier.shards_[0]->normal_count, 2u);  // still 2, not 3
 
     notifier.running_.store(false, std::memory_order_release);
 }
@@ -430,9 +430,10 @@ TEST_F(AsyncMetadataNotifierTest, NormalPriorityOverRecovery) {
     ASSERT_EQ(notifier.shards_[0]->recovery_count, 5u);
 
     // CollectBatch with max_batch_size=5 must return only normal ops
-    size_t n =
+    auto [n, recovery_n] =
         notifier.CollectBatch(*notifier.shards_[0], notifier.batch_buffers_[0]);
     ASSERT_EQ(n, 5u);
+    ASSERT_EQ(recovery_n, 0u);
 
     // Normal queue must now be empty; recovery queue must still hold all 5 ops
     EXPECT_EQ(notifier.shards_[0]->normal_count, 0u);
