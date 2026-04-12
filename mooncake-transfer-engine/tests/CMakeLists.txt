@@ -9,7 +9,7 @@ if (USE_HIP)
 endif()
 
 add_executable(rdma_transport_test ${WORKSPACE}/rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine)
+target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags glog::glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
 
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
@@ -65,6 +65,12 @@ if (USE_EFA)
     add_test(NAME efa_transport_test COMMAND efa_transport_test)
 endif()
 
+if (USE_UB)
+    add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
+    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME ub_transport_test COMMAND ub_transport_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
@@ -99,4 +105,11 @@ if (USE_ASCEND_DIRECT)
     )
 
     add_test(NAME ascend_direct_transport_test COMMAND ascend_direct_transport_test)
+endif()
+
+# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
+if (ENABLE_MULTI_PROTOCOL)
+    add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
+    target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()

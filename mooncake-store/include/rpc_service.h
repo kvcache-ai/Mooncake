@@ -2,6 +2,10 @@
 
 #include <csignal>
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <thread>
@@ -9,6 +13,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "ha/ha_types.h"
 #include "master_service.h"
 #include "types.h"
 #include "rpc_types.h"
@@ -23,8 +28,6 @@ class WrappedMasterService {
     WrappedMasterService(const WrappedMasterServiceConfig& config);
 
     ~WrappedMasterService();
-
-    void init_http_server();
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
@@ -77,6 +80,30 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
 
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config);
+
+    tl::expected<void, ErrorCode> UpsertEnd(const UUID& client_id,
+                                            const std::string& key,
+                                            ReplicaType replica_type);
+
+    tl::expected<void, ErrorCode> UpsertRevoke(const UUID& client_id,
+                                               const std::string& key,
+                                               ReplicaType replica_type);
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
     tl::expected<void, ErrorCode> Remove(const std::string& key,
                                          bool force = false);
 
@@ -105,6 +132,13 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
+
+    tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
+
+    tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
+        const std::string& segment);
+
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
@@ -114,6 +148,16 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 
@@ -160,9 +204,59 @@ class WrappedMasterService {
 
    private:
     MasterService master_service_;
-    std::thread metric_report_thread_;
+};
+
+class MasterAdminServer {
+   public:
+    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
+
+    ~MasterAdminServer();
+
+    bool Start();
+
+    void Stop();
+
+    void SetRuntimeState(ha::MasterRuntimeState state);
+
+    void SetObservedLeader(const std::optional<ha::MasterView>& leader_view);
+
+    void SetServiceDelegate(std::shared_ptr<WrappedMasterService> service);
+
+    void SetServiceAvailable(bool available);
+
+   private:
+    struct RuntimeSnapshot {
+        ha::MasterRuntimeState state = ha::MasterRuntimeState::kStarting;
+        std::optional<ha::MasterView> leader_view;
+        std::shared_ptr<WrappedMasterService> service;
+        bool service_available = false;
+    };
+
+    RuntimeSnapshot SnapshotState() const;
+
+    std::string BuildMetricsText() const;
+
+    std::string BuildMetricsSummaryText() const;
+
+    std::string BuildHealthJson() const;
+
+    std::string BuildLeaderJson() const;
+
+    std::shared_ptr<WrappedMasterService> GetActiveService() const;
+
+    void InitHttpServer();
+
+    uint16_t http_port_;
+    bool enable_metric_reporting_ = false;
     coro_http::coro_http_server http_server_;
-    std::atomic<bool> metric_report_running_;
+    std::thread metric_report_thread_;
+    std::atomic<bool> metric_report_running_{false};
+    std::atomic<bool> started_{false};
+    mutable std::mutex state_mutex_;
+    ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};
+    std::optional<ha::MasterView> leader_view_;
+    std::shared_ptr<WrappedMasterService> service_;
+    bool service_available_ = false;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

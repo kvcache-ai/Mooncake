@@ -1,0 +1,94 @@
+name: E2E CI
+
+on:
+  pull_request_target:
+    branches: ["main"]
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number that triggered this'
+        required: false
+        type: string
+      pr_sha:
+        description: 'PR head SHA to checkout'
+        required: false
+        type: string
+      triggered_by:
+        description: 'User who triggered this'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: e2e-ci-${{ github.event.pull_request.number || inputs.pr_number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  ascend-test:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-e2e-ci'
+    uses: ./.github/workflows/ci_ascend.yml
+    with:
+      checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+    secrets: inherit
+
+  integration-test:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-e2e-ci'
+    uses: ./.github/workflows/integration-test.yml
+    with:
+      pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+      pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
+    secrets: inherit
+
+  e2e-gate:
+    name: E2E Gate
+    if: >
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.label.name == 'run-e2e-ci')
+    needs:
+      - ascend-test
+      - integration-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check E2E results
+        run: |
+          echo "PR: #${{ inputs.pr_number || github.event.pull_request.number }}"
+          echo "SHA: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}"
+          failing=$(echo "$NEEDS_JSON" | jq -r '
+            to_entries[] |
+            select(.value.result != "success" and .value.result != "skipped") |
+            "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "::error::The following E2E jobs failed:"
+            echo "$failing"
+            exit 1
+          fi
+          echo "All E2E checks passed."
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+
+  cleanup-label:
+    name: Cleanup E2E Label
+    if: >
+      always() &&
+      github.event_name != 'workflow_dispatch' &&
+      github.event.label.name == 'run-e2e-ci'
+    needs:
+      - e2e-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove run-e2e-ci label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --remove-label "run-e2e-ci" 2>/dev/null || true

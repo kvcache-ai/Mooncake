@@ -448,18 +448,23 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             return std::nullopt;
         }
 
-        TransferStrategy strategy = selectStrategy(handle, slices);
+        if (op_code == TransferRequest::READ) {
+            future = submitMemoryReadOperation(handle, slices, 0);
+        } else {
+            TransferStrategy strategy = selectStrategy(handle, slices);
 
-        switch (strategy) {
-            case TransferStrategy::LOCAL_MEMCPY:
-                future = submitMemcpyOperation(handle, slices, op_code);
-                break;
-            case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
-                break;
-            default:
-                LOG(ERROR) << "Unknown transfer strategy: " << strategy;
-                return std::nullopt;
+            switch (strategy) {
+                case TransferStrategy::LOCAL_MEMCPY:
+                    future = submitMemcpyOperation(handle, slices, op_code);
+                    break;
+                case TransferStrategy::TRANSFER_ENGINE:
+                    future =
+                        submitTransferEngineOperation(handle, slices, op_code);
+                    break;
+                default:
+                    LOG(ERROR) << "Unknown transfer strategy: " << strategy;
+                    return std::nullopt;
+            }
         }
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
@@ -544,14 +549,14 @@ TransferSubmitter::submit_batch_get_offload_object(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t offset = src_offset;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -562,13 +567,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const void* src;
 
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local
-            // buffer)
+            // READ: from handle (remote buffer) to slice (local buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote
-            // buffer)
+            // WRITE: from slice (local buffer) to handle (remote buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
@@ -624,7 +627,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -642,7 +645,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t offset = src_offset;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -659,6 +662,57 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         requests.emplace_back(request);
     }
     return submitTransfer(requests);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    TransferStrategy strategy = selectStrategy(handle, slices);
+
+    if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+        return submitMemcpyOperation(handle, slices, TransferRequest::READ,
+                                     src_offset);
+    }
+    if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+        return submitTransferEngineOperation(handle, slices,
+                                             TransferRequest::READ, src_offset);
+    }
+
+    LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
+               << strategy;
+    return std::nullopt;
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    std::optional<TransferFuture> future;
+
+    if (replica.is_memory_replica()) {
+        auto& mem_desc = replica.get_memory_descriptor();
+        auto& handle = mem_desc.buffer_descriptor;
+
+        size_t slices_size = 0;
+        for (const auto& s : slices) slices_size += s.size;
+        if (src_offset + slices_size > handle.size_) {
+            LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
+                       << " + slices_size=" << slices_size
+                       << " > handle.size_=" << handle.size_;
+            return std::nullopt;
+        }
+
+        future = submitMemoryReadOperation(handle, slices, src_offset);
+    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
+        LOG(ERROR)
+            << "Range read not supported for disk replicas (use full read)";
+        return std::nullopt;
+    }
+
+    if (future.has_value()) {
+        updateTransferMetrics(slices, TransferRequest::READ);
+    }
+
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(

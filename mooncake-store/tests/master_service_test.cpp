@@ -2,8 +2,10 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/struct_json/json_reader.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <random>
 #include <thread>
@@ -51,6 +53,99 @@ class MasterServiceTest : public ::testing::Test {
         auto mount_result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(mount_result.has_value());
         return {.segment_id = segment.id, .client_id = client_id};
+    }
+
+    std::string PutObjectOnSegment(MasterService& service,
+                                   const UUID& client_id,
+                                   const std::string& segment_name,
+                                   size_t slice_length = 1024) const {
+        static std::atomic<uint64_t> counter{0};
+        std::string key =
+            "drain_job_key_" + std::to_string(counter.fetch_add(1));
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = segment_name;
+
+        auto put_start = service.PutStart(client_id, key, slice_length, config);
+        EXPECT_TRUE(put_start.has_value());
+        EXPECT_TRUE(
+            service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        return key;
+    }
+
+    bool ExecutePendingMoveTasks(MasterService& service,
+                                 const UUID& client_id) const {
+        auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
+        EXPECT_TRUE(fetched.has_value());
+        if (!fetched.has_value() || fetched->empty()) {
+            return false;
+        }
+
+        bool processed = false;
+        for (const auto& assignment : *fetched) {
+            if (assignment.type != TaskType::REPLICA_MOVE) {
+                continue;
+            }
+
+            ReplicaMovePayload payload;
+            struct_json::from_json(payload, assignment.payload);
+
+            auto move_start = service.MoveStart(client_id, payload.key,
+                                                payload.source, payload.target);
+            EXPECT_TRUE(move_start.has_value());
+            EXPECT_TRUE(service.MoveEnd(client_id, payload.key).has_value());
+
+            TaskCompleteRequest complete_request;
+            complete_request.id = assignment.id;
+            complete_request.status = TaskStatus::SUCCESS;
+            complete_request.message = "move_done";
+            EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
+                            .has_value());
+            processed = true;
+        }
+        return processed;
+    }
+
+    bool FailPendingMoveTasks(MasterService& service,
+                              const UUID& client_id) const {
+        auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
+        EXPECT_TRUE(fetched.has_value());
+        if (!fetched.has_value() || fetched->empty()) {
+            return false;
+        }
+
+        bool processed = false;
+        for (const auto& assignment : *fetched) {
+            if (assignment.type != TaskType::REPLICA_MOVE) {
+                continue;
+            }
+
+            TaskCompleteRequest complete_request;
+            complete_request.id = assignment.id;
+            complete_request.status = TaskStatus::FAILED;
+            complete_request.message = "move_failed";
+            EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
+                            .has_value());
+            processed = true;
+        }
+        return processed;
+    }
+
+    template <typename Predicate>
+    void WaitUntil(
+        Predicate&& predicate,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(4000),
+        std::chrono::milliseconds interval =
+            std::chrono::milliseconds(50)) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return;
+            }
+            std::this_thread::sleep_for(interval);
+        }
+        EXPECT_TRUE(predicate());
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -1245,6 +1340,12 @@ TEST_F(MasterServiceTest, MoveStart) {
         client_id, key, "non_existent_segment", "segment_1");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, move_start_result.error());
+
+    // Test Case 8.5: Move to a non-existent target segment, should fail.
+    move_start_result = service_->MoveStart(client_id, key, "segment_2",
+                                            "non_existent_segment");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, move_start_result.error());
 
     // Test Case 9: Move to an already existing segment, should succeed but
     // return nullopt.
@@ -4120,7 +4221,203 @@ TEST_F(MasterServiceTest, UpdateTaskNotFound) {
     EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
 }
 
-// Test force Remove - should bypass lease check
+TEST_F(MasterServiceTest,
+       CreateDrainJobMarksSegmentDrainingAndSkipsAllocation) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINING);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    auto put_result = service_->PutStart(
+        ctx0.client_id, "drain_skip_allocation_key", 1024, config);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_EQ(put_result->size(), 1u);
+    EXPECT_EQ(put_result->front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_1");
+    ASSERT_TRUE(service_
+                    ->PutEnd(ctx0.client_id, "drain_skip_allocation_key",
+                             ReplicaType::MEMORY)
+                    .has_value());
+}
+
+TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key =
+        PutObjectOnSegment(*service_, put_client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil(
+        [&] { return ExecutePendingMoveTasks(*service_, ctx0.client_id); });
+
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::SUCCEEDED;
+    });
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->status, JobStatus::SUCCEEDED);
+    EXPECT_EQ(query->active_units, 0u);
+    EXPECT_GE(query->succeeded_units, 1u);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINED);
+
+    auto replicas = service_->GetReplicaList(key);
+    ASSERT_TRUE(replicas.has_value());
+    std::unordered_set<std::string> segment_names;
+    for (const auto& replica : replicas->replicas) {
+        segment_names.insert(replica.get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
+    }
+    EXPECT_TRUE(segment_names.contains("segment_1"));
+    EXPECT_FALSE(segment_names.contains("segment_0"));
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
+    auto service_ = std::make_unique<MasterService>();
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    auto draining_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(draining_status.has_value());
+    EXPECT_EQ(draining_status.value(), SegmentStatus::DRAINING);
+
+    auto cancel_result = service_->CancelDrainJob(job_id.value());
+    ASSERT_TRUE(cancel_result.has_value());
+
+    auto job = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(job.has_value());
+    EXPECT_EQ(job->status, JobStatus::CANCELED);
+
+    auto restored_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(restored_status.has_value());
+    EXPECT_EQ(restored_status.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, CancelDrainJobRejectsActiveMoveTasks) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    WaitUntil([&] {
+        auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+        return fetched.has_value() && !fetched->empty();
+    });
+
+    auto cancel_result = service_->CancelDrainJob(job_id.value());
+    ASSERT_FALSE(cancel_result.has_value());
+    EXPECT_EQ(cancel_result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    PutObjectOnSegment(*service_, put_client_id, "segment_0");
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        WaitUntil(
+            [&] { return FailPendingMoveTasks(*service_, ctx0.client_id); });
+    }
+
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::FAILED;
+    });
+
+    auto query = service_->QueryDrainJob(job_id.value());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->status, JobStatus::FAILED);
+    EXPECT_EQ(query->active_units, 0u);
+    EXPECT_GE(query->failed_units, 3u);
+
+    auto segment_status = service_->QuerySegmentStatus("segment_0");
+    ASSERT_TRUE(segment_status.has_value());
+    EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
+}
+
 TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
     // Set a long lease TTL so objects will have active leases
     const uint64_t kv_lease_ttl = 10000;  // 10 seconds
@@ -4272,6 +4569,432 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
         ASSERT_FALSE(exist_result.value());
     }
 }
+// ===================== Upsert Tests =====================
+
+TEST_F(MasterServiceTest, UpsertNewKey) {
+    // Case A: key does not exist — behaves like PutStart
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_new_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto upsert_result =
+        service_->UpsertStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(upsert_result.has_value());
+    auto replicas = upsert_result.value();
+    EXPECT_EQ(1, replicas.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replicas[0].status);
+
+    // During upsert, GetReplicaList should return not ready
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
+
+    // UpsertEnd completes the operation
+    auto end_result = service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_result.has_value());
+
+    // Verify replica is COMPLETE
+    auto final_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(final_result.has_value());
+    EXPECT_EQ(1, final_result.value().replicas.size());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, UpsertSameSize) {
+    // Case B: key exists with same size — in-place update
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_same_size";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // First: PutStart + PutEnd to create the object
+    auto put_result = service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto original_replicas = put_result.value();
+    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // UpsertStart with same size — should reuse buffers
+    const UUID new_client_id = generate_uuid();
+    auto upsert_result =
+        service_->UpsertStart(new_client_id, key, slice_length, config);
+    ASSERT_TRUE(upsert_result.has_value());
+    auto upsert_replicas = upsert_result.value();
+    EXPECT_EQ(1, upsert_replicas.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, upsert_replicas[0].status);
+
+    // Verify same buffer address (in-place reuse)
+    EXPECT_EQ(original_replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              upsert_replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
+
+    // UpsertEnd with the new client_id
+    auto end_result =
+        service_->UpsertEnd(new_client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_result.has_value());
+
+    // Verify replica is COMPLETE again
+    auto final_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(final_result.has_value());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, UpsertSameSizeRefreshesMetadata) {
+    // Case B: verify client_id and put_start_time are refreshed
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id_a = generate_uuid();
+    const UUID client_id_b = generate_uuid();
+
+    std::string key = "upsert_refresh_metadata";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create object with client_a
+    auto put_result =
+        service_->PutStart(client_id_a, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_id_a, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // UpsertStart with client_b
+    auto upsert_result =
+        service_->UpsertStart(client_id_b, key, slice_length, config);
+    ASSERT_TRUE(upsert_result.has_value());
+
+    // UpsertEnd with client_a should fail (client_id was refreshed to client_b)
+    auto end_fail = service_->UpsertEnd(client_id_a, key, ReplicaType::MEMORY);
+    EXPECT_FALSE(end_fail.has_value());
+    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, end_fail.error());
+
+    // UpsertEnd with client_b should succeed
+    auto end_ok = service_->UpsertEnd(client_id_b, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_ok.has_value());
+}
+
+TEST_F(MasterServiceTest, UpsertDifferentSize) {
+    // Case C: key exists with different size — delete and reallocate
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_diff_size";
+    uint64_t original_size = 1024;
+    uint64_t new_size = 2048;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create object with original_size
+    auto put_result = service_->PutStart(client_id, key, original_size, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto original_replicas = put_result.value();
+    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // UpsertStart with different size
+    auto upsert_result =
+        service_->UpsertStart(client_id, key, new_size, config);
+    ASSERT_TRUE(upsert_result.has_value());
+    auto new_replicas = upsert_result.value();
+    EXPECT_EQ(1, new_replicas.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, new_replicas[0].status);
+
+    // Buffer address should be different (reallocated)
+    EXPECT_NE(original_replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              new_replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
+
+    // UpsertEnd
+    auto end_result = service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_result.has_value());
+
+    // Verify the object is complete
+    auto final_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(final_result.has_value());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
+    // Upsert should fail if Copy is in progress
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    [[maybe_unused]] const auto ctx1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto ctx2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+    UUID client_id = generate_uuid();
+
+    std::string key = "upsert_conflict_copy";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    // Create object
+    auto put_result = service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // Start a Copy
+    auto copy_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_result.has_value());
+
+    // UpsertStart should fail with OBJECT_HAS_REPLICATION_TASK
+    auto upsert_result =
+        service_->UpsertStart(client_id, key, slice_length, config);
+    EXPECT_FALSE(upsert_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, upsert_result.error());
+}
+
+TEST_F(MasterServiceTest, UpsertPreemptsInProgressPut) {
+    // Upsert should preempt an in-progress Put (no discard timeout needed
+    // for preemption via Upsert — Upsert always preempts immediately)
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+
+    std::string key = "upsert_preempt";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Client A starts a Put but doesn't finish
+    auto put_result = service_->PutStart(client_a, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+
+    // Client B upserts the same key — should preempt client A
+    auto upsert_result =
+        service_->UpsertStart(client_b, key, slice_length, config);
+    ASSERT_TRUE(upsert_result.has_value());
+    auto upsert_replicas = upsert_result.value();
+    EXPECT_EQ(1, upsert_replicas.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, upsert_replicas[0].status);
+
+    // Client A's PutEnd should fail
+    auto put_end_a = service_->PutEnd(client_a, key, ReplicaType::MEMORY);
+    EXPECT_FALSE(put_end_a.has_value());
+
+    // Client B's UpsertEnd should succeed
+    auto upsert_end = service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(upsert_end.has_value());
+
+    // Verify final state
+    auto final_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(final_result.has_value());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, UpsertRevoke) {
+    // UpsertRevoke should clean up like PutRevoke
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_revoke";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // UpsertStart (Case A — new key)
+    auto upsert_result =
+        service_->UpsertStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(upsert_result.has_value());
+
+    // UpsertRevoke
+    auto revoke_result =
+        service_->UpsertRevoke(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(revoke_result.has_value());
+
+    // Key should be gone
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    EXPECT_FALSE(exist_result.value());
+}
+
+TEST_F(MasterServiceTest, UpsertInPlaceThenRevoke) {
+    // UpsertRevoke after in-place UpsertStart should clean up
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_inplace_revoke";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create object first
+    auto put_result = service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // UpsertStart in-place (same size)
+    const UUID new_client = generate_uuid();
+    auto upsert_result =
+        service_->UpsertStart(new_client, key, slice_length, config);
+    ASSERT_TRUE(upsert_result.has_value());
+
+    // UpsertRevoke — replicas are PROCESSING, should be erased
+    auto revoke_result =
+        service_->UpsertRevoke(new_client, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(revoke_result.has_value());
+
+    // Key should be gone (no valid replicas left)
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    EXPECT_FALSE(exist_result.value());
+}
+
+TEST_F(MasterServiceTest, BatchUpsertStart) {
+    // Test batch upsert with a mix of new and existing keys
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create key_1 with size 1024
+    auto put_result = service_->PutStart(client_id, "key_1", 1024, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_id, "key_1", ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // BatchUpsertStart: key_1 (same size), key_2 (new)
+    std::vector<std::string> keys = {"key_1", "key_2"};
+    std::vector<uint64_t> slice_lengths = {1024, 2048};
+
+    auto results =
+        service_->BatchUpsertStart(client_id, keys, slice_lengths, config);
+    ASSERT_EQ(2, results.size());
+    EXPECT_TRUE(results[0].has_value());  // key_1: Case B (in-place)
+    EXPECT_TRUE(results[1].has_value());  // key_2: Case A (new)
+
+    // Complete both
+    auto end_results = service_->BatchUpsertEnd(client_id, keys);
+    ASSERT_EQ(2, end_results.size());
+    EXPECT_TRUE(end_results[0].has_value());
+    EXPECT_TRUE(end_results[1].has_value());
+}
+
+TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
+    // Upsert should preempt an in-progress Upsert (Case B in-place).
+    // After preemption, all replicas were PROCESSING (no COMPLETE survives),
+    // so metadata is erased and the new upsert falls through to Case A.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const UUID client_c = generate_uuid();
+
+    std::string key = "upsert_preempt_upsert";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Step 1: Create the object via Put
+    auto put_result = service_->PutStart(client_a, key, slice_length, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_a, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // Step 2: Client B starts in-place upsert (Case B) — marks COMPLETE →
+    // PROCESSING
+    auto upsert_b = service_->UpsertStart(client_b, key, slice_length, config);
+    ASSERT_TRUE(upsert_b.has_value());
+
+    // Key should be unreadable now (all replicas are PROCESSING)
+    auto get_mid = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_mid.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_mid.error());
+
+    // Step 3: Client C upserts the same key — preempts Client B
+    auto upsert_c = service_->UpsertStart(client_c, key, slice_length, config);
+    ASSERT_TRUE(upsert_c.has_value());
+    EXPECT_EQ(1, upsert_c.value().size());
+
+    // Step 4: Client B's UpsertEnd should fail (preempted)
+    auto end_b = service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
+    EXPECT_FALSE(end_b.has_value());
+
+    // Step 5: Client C's UpsertEnd should succeed
+    auto end_c = service_->UpsertEnd(client_c, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(end_c.has_value());
+
+    // Final verification
+    auto final_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(final_result.has_value());
+    EXPECT_EQ(1, final_result.value().replicas.size());
+    EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
+}
+
+TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
+    // Case C (different size) followed by UpsertRevoke.
+    // Old replicas go to discarded_replicas_, new replicas are erased by
+    // revoke. The key should disappear entirely.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    std::string key = "upsert_diff_revoke";
+    uint64_t original_size = 1024;
+    uint64_t new_size = 2048;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create object with original size
+    auto put_result = service_->PutStart(client_id, key, original_size, config);
+    ASSERT_TRUE(put_result.has_value());
+    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    // Verify the key exists
+    auto exist_before = service_->ExistKey(key);
+    ASSERT_TRUE(exist_before.has_value());
+    EXPECT_TRUE(exist_before.value());
+
+    // UpsertStart with different size (Case C) — old replicas discarded,
+    // new replicas allocated
+    auto upsert_result =
+        service_->UpsertStart(client_id, key, new_size, config);
+    ASSERT_TRUE(upsert_result.has_value());
+
+    // Revoke — erase the newly allocated PROCESSING replicas
+    auto revoke_result =
+        service_->UpsertRevoke(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(revoke_result.has_value());
+
+    // Key should be gone (old replicas in discarded, new replicas erased)
+    auto exist_after = service_->ExistKey(key);
+    ASSERT_TRUE(exist_after.has_value());
+    EXPECT_FALSE(exist_after.value());
+}
+
+// ===================== Hard Pin Tests =====================
+
 TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
     // Hard-pinned objects must survive eviction under memory pressure,
     // even after lease expires and all non-pinned objects are gone.

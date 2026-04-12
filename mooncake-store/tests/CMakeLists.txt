@@ -15,7 +15,7 @@ function(add_store_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-function(add_hot_standby_ut_test name)
+function(add_ha_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(
@@ -119,18 +119,32 @@ target_link_libraries(
          gflags
          pthread)
 
-# Hot standby UTs (tests/hot_standby_ut)
-add_hot_standby_ut_test(standby_state_machine_test
-                        hot_standby_ut/standby_state_machine_test.cpp)
-add_hot_standby_ut_test(oplog_applier_test
-                        hot_standby_ut/oplog_applier_test.cpp)
-add_hot_standby_ut_test(oplog_manager_test
-                        hot_standby_ut/oplog_manager_test.cpp)
-add_hot_standby_ut_test(oplog_watcher_test
-                        hot_standby_ut/oplog_watcher_test.cpp)
-add_hot_standby_ut_test(ha_metric_manager_test
-                        hot_standby_ut/ha_metric_manager_test.cpp)
-add_hot_standby_ut_test(hot_standby_service_test
-                        hot_standby_ut/hot_standby_service_test.cpp)
-add_hot_standby_ut_test(etcd_oplog_store_test
-                        hot_standby_ut/etcd_oplog_store_test.cpp)
+# HA tests
+add_ha_test(standby_state_machine_test
+            ha/standby/standby_state_machine_test.cpp)
+add_ha_test(ha_metric_manager_test
+            ha/standby/ha_metric_manager_test.cpp)
+add_ha_test(hot_standby_service_test
+            ha/standby/hot_standby_service_test.cpp)
+add_ha_test(hot_standby_snapshot_bootstrap_test
+            ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
+add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
+add_ha_test(oplog_manager_test ha/oplog/oplog_manager_test.cpp)
+add_ha_test(etcd_oplog_store_test ha/oplog/etcd_oplog_store_test.cpp)
+add_ha_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
+add_ha_test(oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
+add_ha_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
+add_ha_test(ha_recovery_test ha/oplog/ha_recovery_test.cpp)
+add_ha_test(localfs_hot_standby_integration_test
+            ha/oplog/localfs_hot_standby_integration_test.cpp)
+add_ha_test(catalog_backed_snapshot_provider_test
+            ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
+if(STORE_USE_REDIS)
+  foreach(target catalog_backed_snapshot_provider_test
+                 hot_standby_snapshot_bootstrap_test)
+    target_include_directories(${target} PRIVATE
+                               ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+    target_link_libraries(${target}
+                          PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+  endforeach()
+endif()

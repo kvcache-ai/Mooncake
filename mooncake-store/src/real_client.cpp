@@ -13,6 +13,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -52,27 +53,156 @@ bool checkAcl(aclError result, const char *message) {
     return true;
 }
 #endif
+
+struct PreparedRangedReadRequest {
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        results;
+    std::vector<std::vector<std::vector<bool>>> valid_fragments;
+    std::vector<size_t> required_buffer_sizes;
+    bool top_level_valid = true;
+    bool has_any_valid_fragment = false;
+};
+
+PreparedRangedReadRequest prepare_ranged_read_request(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const char *log_prefix) {
+    PreparedRangedReadRequest prepared;
+    prepared.results.resize(buffer_count);
+    prepared.valid_fragments.resize(buffer_count);
+    prepared.required_buffer_sizes.resize(buffer_count, 0);
+
+    if (buffer_count != all_keys.size() ||
+        buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() ||
+        buffer_count != all_sizes.size()) {
+        LOG(ERROR) << log_prefix << ": top-level size mismatch";
+        prepared.results = build_ranged_read_internal_error_results(
+            buffer_count, all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
+        prepared.top_level_valid = false;
+        return prepared;
+    }
+
+    for (size_t i = 0; i < buffer_count; ++i) {
+        const size_t key_count = all_keys[i].size();
+        prepared.results[i].resize(key_count);
+        prepared.valid_fragments[i].resize(key_count);
+
+        if (key_count != all_dst_offsets[i].size() ||
+            key_count != all_src_offsets[i].size() ||
+            key_count != all_sizes[i].size()) {
+            LOG(ERROR) << log_prefix
+                       << ": key-group size mismatch for buffer index " << i;
+            for (size_t j = 0; j < key_count; ++j) {
+                prepared.results[i][j] =
+                    std::vector<tl::expected<int64_t, ErrorCode>>(
+                        1, tl::unexpected(ErrorCode::INVALID_PARAMS));
+                prepared.valid_fragments[i][j] = std::vector<bool>(1, false);
+            }
+            continue;
+        }
+
+        size_t max_required = 0;
+        for (size_t j = 0; j < key_count; ++j) {
+            const size_t fragment_count = all_dst_offsets[i][j].size();
+            prepared.results[i][j] =
+                std::vector<tl::expected<int64_t, ErrorCode>>(
+                    fragment_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
+            prepared.valid_fragments[i][j] =
+                std::vector<bool>(fragment_count, false);
+
+            if (fragment_count != all_src_offsets[i][j].size() ||
+                fragment_count != all_sizes[i][j].size()) {
+                LOG(ERROR) << log_prefix << ": fragment size mismatch, "
+                           << "buffer_index=" << i << " key_index=" << j;
+                continue;
+            }
+
+            for (size_t k = 0; k < fragment_count; ++k) {
+                const size_t dst_offset = all_dst_offsets[i][j][k];
+                const size_t fragment_size = all_sizes[i][j][k];
+                if (dst_offset >
+                    std::numeric_limits<size_t>::max() - fragment_size) {
+                    LOG(ERROR)
+                        << log_prefix
+                        << ": destination range overflow, buffer_index=" << i
+                        << " key_index=" << j << " fragment_index=" << k;
+                    continue;
+                }
+                prepared.valid_fragments[i][j][k] = true;
+                prepared.has_any_valid_fragment = true;
+                max_required =
+                    std::max(max_required, dst_offset + fragment_size);
+            }
+        }
+        prepared.required_buffer_sizes[i] = max_required;
+    }
+
+    return prepared;
+}
+
+void fill_ranged_read_results_with_error(
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        &results,
+    ErrorCode error) {
+    for (auto &key_rows : results) {
+        for (auto &row : key_rows) {
+            for (auto &fragment : row) {
+                fragment = tl::unexpected(error);
+            }
+        }
+    }
+}
 }  // namespace
 
 PyClient::~PyClient() {}
+
+bool RealClient::map_dummy_range_in_shm(const MappedShm &shm,
+                                        uint64_t dummy_addr, size_t offset,
+                                        size_t size, void *&out_real) const {
+    if (dummy_addr < shm.dummy_base_addr) {
+        return false;
+    }
+    const uint64_t base_offset = dummy_addr - shm.dummy_base_addr;
+    if (base_offset > shm.shm_size || offset > shm.shm_size - base_offset) {
+        return false;
+    }
+    const size_t write_offset = static_cast<size_t>(base_offset) + offset;
+    if (write_offset < base_offset || write_offset > shm.shm_size ||
+        size > shm.shm_size - write_offset) {
+        return false;
+    }
+    out_real = reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset +
+                                        static_cast<uint64_t>(offset));
+    return true;
+}
 
 bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                           uint64_t dummy_addr, size_t buf_size,
                                           const MappedShm *&last_hit_shm,
                                           void *&out_real) const {
-    if (last_hit_shm && dummy_addr >= last_hit_shm->dummy_base_addr &&
-        dummy_addr + buf_size <=
-            last_hit_shm->dummy_base_addr + last_hit_shm->shm_size) {
-        out_real = reinterpret_cast<void *>(dummy_addr +
-                                            last_hit_shm->shm_addr_offset);
+    if (last_hit_shm && map_dummy_range_in_shm(*last_hit_shm, dummy_addr, 0,
+                                               buf_size, out_real)) {
         return true;
     }
     for (const auto &shm : shm_ctx.mapped_shms) {
-        if (dummy_addr >= shm.dummy_base_addr &&
-            dummy_addr + buf_size <= shm.dummy_base_addr + shm.shm_size) {
-            out_real =
-                reinterpret_cast<void *>(dummy_addr + shm.shm_addr_offset);
+        if (map_dummy_range_in_shm(shm, dummy_addr, 0, buf_size, out_real)) {
             last_hit_shm = &shm;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RealClient::map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
+                                                uint64_t dummy_addr,
+                                                size_t dst_offset, size_t size,
+                                                void *&out_real) const {
+    for (const auto &shm : shm_ctx.mapped_shms) {
+        if (map_dummy_range_in_shm(shm, dummy_addr, dst_offset, size,
+                                   out_real)) {
             return true;
         }
     }
@@ -1974,8 +2104,16 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false,
-                                        true);
+    auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
+                                               false, true);
+    if (!result) {
+        return result;
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        registered_buffer_sizes_[buffer] = size;
+    }
+    return result;
 }
 
 int RealClient::register_buffer(void *buffer, size_t size) {
@@ -1994,6 +2132,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
     }
+    {
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        registered_buffer_sizes_.erase(buffer);
+    }
     return {};
 }
 
@@ -2001,21 +2143,17 @@ int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
-    const std::string &key, void *buffer, size_t size) {
-    // NOTE: The buffer address must be previously registered with
-    // register_buffer() for zero-copy RDMA operations to work correctly
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::resolve_ranged_read_metadata(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Step 1: Get object info
     auto query_result = client_->Query(key);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            VLOG(1) << "Object not found for key: " << key;
             return tl::unexpected(query_result.error());
         }
         LOG(ERROR) << "Query failed for key: " << key
@@ -2023,10 +2161,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(query_result.error());
     }
 
-    const std::vector<Replica::Descriptor> &replica_list =
-        query_result.value().replicas;
-
-    // Calculate total size from replica list
+    const auto &replica_list = query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Internal error: replica_list is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2038,35 +2173,205 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const auto &replica = res.value();
-    uint64_t total_size = calculate_total_size(replica);
+    auto query_value = std::move(query_result.value());
+    auto replica = res.value();
+    return RangedReadMetadata{.query_result = std::move(query_value),
+                              .replica = std::move(replica),
+                              .total_size = calculate_total_size(replica)};
+}
 
-    // Check if user buffer is large enough
-    if (size < total_size) {
-        LOG(ERROR) << "User buffer too small. Required: " << total_size
-                   << ", provided: " << size;
+tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
+    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
+    size_t size, const RangedReadMetadata &metadata,
+    bool size_is_buffer_capacity) {
+    const auto &query_result = metadata.query_result;
+    const auto &replica = metadata.replica;
+    const uint64_t total_size = metadata.total_size;
+
+    if (size_is_buffer_capacity) {
+        if (size < total_size) {
+            LOG(ERROR) << "User buffer too small. Required: " << total_size
+                       << ", provided: " << size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        size = total_size;
+    } else if (size > total_size || src_offset > total_size - size) {
+        LOG(ERROR) << "Range overflow: src_offset=" << src_offset
+                   << " + size=" << size << " > total=" << total_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Step 2: Split user buffer according to object info and create
-    // slices
-    std::vector<mooncake::Slice> slices;
-    allocateSlices(slices, replica, buffer);
+    if (src_offset == 0 && size == total_size) {
+        std::vector<mooncake::Slice> slices;
+        allocateSlices(slices, replica,
+                       static_cast<char *>(buffer) + dst_offset);
 
-    // Step 3: Read data directly into user buffer
-    auto get_result = client_->Get(key, query_result.value(), slices);
-    if (!get_result) {
-        LOG(ERROR) << "Get failed for key: " << key
-                   << " with error: " << toString(get_result.error());
-        return tl::unexpected(get_result.error());
+        auto get_result = client_->Get(key, query_result, slices);
+        if (!get_result) {
+            LOG(ERROR) << "Get failed for key: " << key
+                       << " with error: " << toString(get_result.error());
+            return tl::unexpected(get_result.error());
+        }
+        return static_cast<int64_t>(total_size);
     }
 
-    return static_cast<int64_t>(total_size);
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "ranged reads only support memory replicas";
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
+
+    auto get_result = client_->Get(key, query_result, slices, src_offset);
+    if (!get_result) {
+        return tl::unexpected(get_result.error());
+    }
+    return static_cast<int64_t>(size);
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
+    const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
+    size_t size, bool size_is_buffer_capacity) {
+    auto metadata_result = resolve_ranged_read_metadata(key);
+    if (!metadata_result) {
+        if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+             metadata_result.error() == ErrorCode::REPLICA_IS_NOT_READY) &&
+            src_offset == 0) {
+            VLOG(1) << "Object not found for key: " << key;
+        }
+        return tl::unexpected(metadata_result.error());
+    }
+
+    return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
+                               metadata_result.value(),
+                               size_is_buffer_capacity);
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
-    return to_py_ret(get_into_internal(key, buffer, size));
+    return to_py_ret(get_into_range_internal(key, buffer, 0, 0, size, true));
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_internal(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::vector<size_t> *buffer_capacities,
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        *prepared_results,
+    const std::vector<std::vector<std::vector<bool>>> *valid_fragments) {
+    const size_t buffer_count = buffers.size();
+    PreparedRangedReadRequest prepared;
+    if (prepared_results != nullptr && valid_fragments != nullptr) {
+        prepared.results = std::move(*prepared_results);
+        prepared.valid_fragments = *valid_fragments;
+        prepared.required_buffer_sizes.resize(buffer_count, 0);
+        prepared.top_level_valid = true;
+    } else {
+        prepared = prepare_ranged_read_request(buffer_count, all_keys,
+                                               all_dst_offsets, all_src_offsets,
+                                               all_sizes, "get_into_ranges");
+    }
+    if (!prepared.top_level_valid) {
+        return std::move(prepared.results);
+    }
+
+    std::vector<size_t> resolved_buffer_capacities;
+    if (buffer_capacities != nullptr) {
+        if (buffer_capacities->size() != buffer_count) {
+            LOG(ERROR) << "get_into_ranges: buffer capacities size mismatch";
+            return build_ranged_read_internal_error_results(
+                buffer_count, all_keys, all_dst_offsets,
+                ErrorCode::INVALID_PARAMS);
+        }
+        resolved_buffer_capacities = *buffer_capacities;
+    } else {
+        resolved_buffer_capacities.resize(buffer_count, 0);
+        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        for (size_t i = 0; i < buffer_count; ++i) {
+            auto it = registered_buffer_sizes_.find(buffers[i]);
+            if (it == registered_buffer_sizes_.end()) {
+                LOG(ERROR)
+                    << "get_into_ranges: buffer is not registered at index "
+                    << i;
+                continue;
+            }
+            resolved_buffer_capacities[i] = it->second;
+        }
+    }
+
+    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
+        metadata_cache;
+
+    for (size_t i = 0; i < buffer_count; ++i) {
+        const size_t key_count = prepared.results[i].size();
+        const size_t buffer_size = resolved_buffer_capacities[i];
+        if (buffer_size == 0 && key_count > 0 && buffer_capacities == nullptr) {
+            continue;
+        }
+
+        for (size_t j = 0; j < key_count; ++j) {
+            auto [metadata_it, inserted] = metadata_cache.try_emplace(
+                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
+            (void)inserted;
+            auto &metadata_result = metadata_it->second;
+
+            for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
+                if (!prepared.valid_fragments[i][j][k]) {
+                    continue;
+                }
+
+                if (all_sizes[i][j][k] > 0 &&
+                    (all_dst_offsets[i][j][k] > buffer_size ||
+                     all_sizes[i][j][k] >
+                         buffer_size - all_dst_offsets[i][j][k])) {
+                    LOG(ERROR)
+                        << "get_into_ranges: destination overflow, "
+                           "buffer_index="
+                        << i << " key_index=" << j << " fragment_index=" << k
+                        << " dst_offset=" << all_dst_offsets[i][j][k]
+                        << " size=" << all_sizes[i][j][k]
+                        << " buffer_size=" << buffer_size;
+                    continue;
+                }
+
+                if (!metadata_result) {
+                    if ((metadata_result.error() ==
+                             ErrorCode::OBJECT_NOT_FOUND ||
+                         metadata_result.error() ==
+                             ErrorCode::REPLICA_IS_NOT_READY) &&
+                        all_src_offsets[i][j][k] == 0) {
+                        VLOG(1)
+                            << "Object not found for key: " << all_keys[i][j];
+                    }
+                    prepared.results[i][j][k] =
+                        tl::unexpected(metadata_result.error());
+                    continue;
+                }
+
+                prepared.results[i][j][k] = execute_ranged_read(
+                    all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
+                    all_src_offsets[i][j][k], all_sizes[i][j][k],
+                    metadata_result.value());
+            }
+        }
+    }
+
+    return prepared.results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes));
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -2221,6 +2526,375 @@ int RealClient::put_from(const std::string &key, void *buffer, size_t size,
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
+// --- Upsert implementations ---
+
+tl::expected<void, ErrorCode> RealClient::upsert_internal(
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
+    if (!alloc_result) {
+        LOG(ERROR) << "Failed to allocate buffer for upsert operation, key: "
+                   << key << ", value size: " << value.size();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &buffer_handle = *alloc_result;
+    memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+
+    std::vector<Slice> slices = split_into_slices(buffer_handle);
+
+    auto result = client_->Upsert(key, slices, config);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+int RealClient::upsert(const std::string &key, std::span<const char> value,
+                       const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_internal(key, value, config, client_buffer_allocator_));
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_dummy_helper(
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+    return upsert_internal(key, value, config, context.client_buffer_allocator);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
+    const std::string &key, void *buffer, size_t size,
+    const ReplicateConfig &config) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (size == 0) {
+        LOG(WARNING) << "Attempting to upsert empty data for key: " << key;
+        return {};
+    }
+
+    std::vector<mooncake::Slice> slices;
+    uint64_t offset = 0;
+    while (offset < size) {
+        auto chunk_size = std::min(size - offset, kMaxSliceSize);
+        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        slices.emplace_back(Slice{chunk_ptr, chunk_size});
+        offset += chunk_size;
+    }
+
+    auto result = client_->Upsert(key, slices, config);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+int RealClient::upsert_from(const std::string &key, void *buffer, size_t size,
+                            const ReplicateConfig &config) {
+    return to_py_ret(upsert_from_internal(key, buffer, size, config));
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
+                                       const std::vector<void *> &buffers,
+                                       const std::vector<size_t> &sizes,
+                                       const ReplicateConfig &config) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (keys.size() != buffers.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<mooncake::Slice> slices;
+        uint64_t offset = 0;
+        while (offset < sizes[i]) {
+            auto chunk_size = std::min(sizes[i] - offset, kMaxSliceSize);
+            void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            offset += chunk_size;
+        }
+        ordered_batched_slices.emplace_back(std::move(slices));
+    }
+
+    return client_->BatchUpsert(keys, ordered_batched_slices, config);
+}
+
+std::vector<int> RealClient::batch_upsert_from(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    auto internal_results =
+        batch_upsert_from_internal(keys, buffers, sizes, config);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto &result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_from_dummy_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t size,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    void *real_buffer = nullptr;
+    const MappedShm *last_hit_shm = nullptr;
+    if (!map_dummy_buffer_to_real(context, dummy_buffer, size, last_hit_shm,
+                                  real_buffer)) {
+        LOG(ERROR) << "Dummy buffer at " << dummy_buffer << " (size " << size
+                   << ") not found in any mapped shared memory for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return upsert_from_internal(key, real_buffer, size, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    std::vector<void *> buffers;
+    buffers.reserve(dummy_buffers.size());
+    const MappedShm *last_hit_shm = nullptr;
+
+    for (size_t i = 0; i < dummy_buffers.size(); ++i) {
+        void *real_ptr = nullptr;
+        if (!map_dummy_buffer_to_real(context, dummy_buffers[i], sizes[i],
+                                      last_hit_shm, real_ptr)) {
+            LOG(ERROR) << "Dummy buffer at " << dummy_buffers[i] << " (size "
+                       << sizes[i]
+                       << ") not found in any mapped shared memory for client "
+                       << client_id;
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        buffers.push_back(real_ptr);
+    }
+    return batch_upsert_from_internal(keys, buffers, sizes, config);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    size_t total_size = 0;
+    for (const auto &value : values) {
+        total_size += value.size_bytes();
+    }
+    if (total_size == 0) {
+        LOG(WARNING) << "Attempting to upsert empty data for key: " << key;
+        return {};
+    }
+
+    auto alloc_result = client_buffer_allocator->allocate(total_size);
+    if (!alloc_result) {
+        LOG(ERROR)
+            << "Failed to allocate buffer for upsert_parts operation, key: "
+            << key << ", total size: " << total_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &buffer_handle = *alloc_result;
+    size_t offset = 0;
+    for (const auto &value : values) {
+        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+               value.size_bytes());
+        offset += value.size_bytes();
+    }
+
+    std::vector<Slice> slices = split_into_slices(buffer_handle);
+
+    auto result = client_->Upsert(key, slices, config);
+    if (!result) {
+        LOG(ERROR) << "Upsert operation failed with error: "
+                   << toString(result.error());
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+int RealClient::upsert_parts(const std::string &key,
+                             std::vector<std::span<const char>> values,
+                             const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_parts_internal(key, values, config, client_buffer_allocator_));
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_parts_dummy_helper(
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+    return upsert_parts_internal(key, values, config,
+                                 context.client_buffer_allocator);
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
+    if (config.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (keys.size() != values.size()) {
+        LOG(ERROR) << "Key and value size mismatch";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<BufferHandle> buffer_handles;
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto &key = keys[i];
+        auto &value = values[i];
+        auto alloc_result =
+            client_buffer_allocator->allocate(value.size_bytes());
+        if (!alloc_result) {
+            LOG(ERROR)
+                << "Failed to allocate buffer for upsert_batch operation, key: "
+                << key << ", value size: " << value.size();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto &buffer_handle = *alloc_result;
+        memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
+        auto slices = split_into_slices(buffer_handle);
+        buffer_handles.emplace_back(std::move(*alloc_result));
+        batched_slices.emplace(key, std::move(slices));
+    }
+
+    // Convert unordered_map to vector format expected by BatchUpsert
+    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
+    ordered_batched_slices.reserve(keys.size());
+    for (const auto &key : keys) {
+        auto it = batched_slices.find(key);
+        if (it != batched_slices.end()) {
+            ordered_batched_slices.emplace_back(it->second);
+        } else {
+            LOG(ERROR) << "Missing slices for key: " << key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto results = client_->BatchUpsert(keys, ordered_batched_slices, config);
+
+    // Check if any operations failed
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            return tl::unexpected(results[i].error());
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::upsert_batch_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    return upsert_batch_internal(keys, values, config,
+                                 context.client_buffer_allocator);
+}
+
+int RealClient::upsert_batch(const std::vector<std::string> &keys,
+                             const std::vector<std::span<const char>> &values,
+                             const ReplicateConfig &config) {
+    return to_py_ret(
+        upsert_batch_internal(keys, values, config, client_buffer_allocator_));
+}
+
+// --- End Upsert implementations ---
+
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
@@ -2337,6 +3011,86 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
     return batch_get_into_multi_buffers_internal(
         keys, real_buffers_result.value(), all_sizes,
         prefer_alloc_in_same_node);
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
+    const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
+    size_t src_offset, size_t size, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    void *real_buffer = nullptr;
+    if (!map_dummy_buffer_range_to_real(context, dummy_buffer, dst_offset, size,
+                                        real_buffer)) {
+        LOG(ERROR) << "Dummy buffer at " << dummy_buffer
+                   << " (dst_offset=" << dst_offset << ", size=" << size
+                   << ") not found in any mapped shared memory for client "
+                   << client_id;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return get_into_range_internal(key, real_buffer, 0, src_offset, size);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_shm_helper(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<
+            std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>(
+            dummy_buffers.size(),
+            std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>(
+                1, std::vector<tl::expected<int64_t, ErrorCode>>(
+                       1, tl::unexpected(ErrorCode::INVALID_PARAMS))));
+    }
+#endif
+
+    const size_t buffer_count = dummy_buffers.size();
+    auto prepared = prepare_ranged_read_request(
+        buffer_count, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        "get_into_ranges_shm_helper");
+    if (!prepared.top_level_valid) {
+        return std::move(prepared.results);
+    }
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        fill_ranged_read_results_with_error(prepared.results,
+                                            ErrorCode::INVALID_PARAMS);
+        return prepared.results;
+    }
+
+    if (!prepared.has_any_valid_fragment) {
+        return prepared.results;
+    }
+
+    auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
+        it->second, dummy_buffers, prepared.required_buffer_sizes, client_id);
+    if (!real_buffers_result) {
+        fill_ranged_read_results_with_error(prepared.results,
+                                            real_buffers_result.error());
+        return prepared.results;
+    }
+
+    return get_into_ranges_internal(
+        real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
+        all_sizes, &prepared.required_buffer_sizes, &prepared.results,
+        &prepared.valid_fragments);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>

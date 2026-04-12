@@ -165,6 +165,10 @@ class Client {
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices,
+                                      uint64_t src_offset);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -197,6 +201,28 @@ class Client {
      * @param config Replication configuration
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
+    /**
+     * @brief Upserts data: inserts if key doesn't exist, updates if it does
+     * @param key Object key
+     * @param slices Vector of data slices to store
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                         std::vector<Slice>& slices,
+                                         const ReplicateConfig& config);
+
+    /**
+     * @brief Batch upsert data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices
+     * @param config Replication configuration
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
@@ -509,10 +535,16 @@ class Client {
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
+    ErrorCode TransferReadInternal(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
+    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                std::vector<Slice>& slices,
+                                uint64_t src_offset);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -590,6 +622,9 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void StartBatchUpsert(std::vector<PutOperation>& ops,
+                          const ReplicateConfig& config);
+    void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 

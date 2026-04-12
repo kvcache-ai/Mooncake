@@ -30,6 +30,7 @@
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
+#include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
@@ -44,6 +45,10 @@ using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 using BufferEntry = Transport::BufferEntry;
+
+#ifdef ENABLE_MULTI_PROTOCOL
+using RegisteredBuffer = TransferEngine::RegisteredBuffer;
+#endif
 
 class TransferEngineImpl {
    public:
@@ -107,19 +112,6 @@ class TransferEngineImpl {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
-                                 const std::string& location);
-
-    int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
-
-    BatchID allocateBatchID(size_t batch_size) {
-        return multi_transports_->allocateBatchID(batch_size);
-    }
-
-    Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
-    }
-
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
         Status s = multi_transports_->submitTransfer(batch_id, entries);
@@ -165,6 +157,79 @@ class TransferEngineImpl {
         return s;
     }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol API
+    // Supports registering memory for multiple protocols (CXL, TCP / RDMA)
+    int mp_registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    int mp_unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    Status mp_submitTransfer(BatchID batch_id,
+                             const std::vector<TransferRequest>& entries,
+                             std::string& proto) {
+        Status s =
+            multi_transports_->mp_submitTransfer(batch_id, entries, proto);
+#ifdef WITH_METRICS
+        if (metrics_enabled_ && s.ok()) {
+            auto& batch = Transport::toBatchDesc(batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
+            }
+        }
+#endif
+        return s;
+    }
+
+    Status mp_submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+        auto target_id = entries[0].target_id;
+        Status s =
+            multi_transports_->mp_submitTransfer(batch_id, entries, proto);
+        if (!s.ok()) {
+            return s;
+        }
+
+#ifdef WITH_METRICS
+        if (metrics_enabled_) {
+            auto& batch = Transport::toBatchDesc(batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
+            }
+        }
+#endif
+
+        // store notify
+        RWSpinlock::WriteGuard guard(send_notifies_lock_);
+        notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+
+        return s;
+    }
+#endif
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                                 const std::string& location);
+
+    int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
+
+    BatchID allocateBatchID(size_t batch_size) {
+        return multi_transports_->allocateBatchID(batch_size);
+    }
+
+    Status freeBatchID(BatchID batch_id) {
+        return multi_transports_->freeBatchID(batch_id);
+    }
+
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     int sendNotifyByID(SegmentID target_id,
@@ -172,6 +237,8 @@ class TransferEngineImpl {
 
     int sendNotifyByName(std::string remote_agent,
                          TransferMetadata::NotifyDesc notify_msg);
+
+    int probePeerAliveByID(SegmentID target_id);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) {
@@ -274,6 +341,17 @@ class TransferEngineImpl {
     std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
     bool checkOverlap(void* addr, uint64_t length);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    struct RegisteredRecord {
+        Transport* transport;
+        void* addr;
+        uint64_t length;
+        std::string location;
+        bool remote_accessible;
+    };
+    void rollbackAllRegistrations(const std::vector<RegisteredRecord>& records);
+#endif
 
     void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 

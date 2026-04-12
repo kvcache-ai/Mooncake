@@ -4,6 +4,23 @@
 #include "utils/zstd_util.h"
 
 namespace mooncake {
+namespace {
+
+bool HasAllocator(const AllocatorManager& allocator_manager,
+                  const std::string& segment_name,
+                  const std::shared_ptr<BufferAllocatorBase>& allocator) {
+    if (!allocator) {
+        return false;
+    }
+    const auto* allocators = allocator_manager.getAllocators(segment_name);
+    if (allocators == nullptr) {
+        return false;
+    }
+    return std::find(allocators->begin(), allocators->end(), allocator) !=
+           allocators->end();
+}
+
+}  // namespace
 
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                                             const UUID& client_id) {
@@ -26,6 +43,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator};
             segment_manager_->client_by_name_[segment.name] = client_id;
+            segment_manager_->segment_id_by_name_[segment.name] = segment.id;
 
             LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
                       << segment.name
@@ -106,6 +124,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
     segment_manager_->client_by_name_[segment.name] = client_id;
+    segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
     return ErrorCode::OK;
@@ -177,11 +196,11 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     std::shared_ptr<BufferAllocatorBase> allocator =
         mounted_segment.buf_allocator;
 
-    // 1. Remove from allocators
-    if (!segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                              allocator)) {
-        LOG(ERROR) << "Allocator " << segment.id << " of segment "
-                   << segment.name << " not found in allocator manager";
+    // 1. Remove from allocators if the segment is still allocatable.
+    if (HasAllocator(segment_manager_->allocator_manager_, segment.name,
+                     allocator)) {
+        segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                             allocator);
     }
 
     // 2. Remove from mounted_segment
@@ -223,6 +242,7 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
         segment_name = segment->second.segment.name;
         // Also remove from segment_name_client_id_map_
         segment_manager_->client_by_name_.erase(segment_name);
+        segment_manager_->segment_id_by_name_.erase(segment_name);
         is_cxl = (segment->second.segment.protocol == "cxl");
     }
     // Remove from mounted_segments_
@@ -269,21 +289,11 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
     all_segments.clear();
 
     for (auto& segment_pair : segment_manager_->mounted_segments_) {
-        // Find the client_id for this segment
-        UUID client_id = UUID{
-            0, 0};  // Default value, indicates no corresponding client found
-
-        // Search for the client corresponding to this segment ID in
-        // client_segments_
-        for (const auto& client_pair : segment_manager_->client_segments_) {
-            const auto& client_id_tmp = client_pair.first;
-            const auto& segment_ids = client_pair.second;
-
-            if (std::find(segment_ids.begin(), segment_ids.end(),
-                          segment_pair.first) != segment_ids.end()) {
-                client_id = client_id_tmp;
-                break;
-            }
+        UUID client_id{0, 0};
+        auto client_it = segment_manager_->client_by_name_.find(
+            segment_pair.second.segment.name);
+        if (client_it != segment_manager_->client_by_name_.end()) {
+            client_id = client_it->second;
         }
 
         all_segments.emplace_back(segment_pair.second.segment, client_id);
@@ -330,28 +340,18 @@ ErrorCode ScopedSegmentAccess::GetUnreadySegments(
 
     for (const auto& pair : segment_manager_->mounted_segments_) {
         const auto& mounted_segment = pair.second;
-        if (mounted_segment.status != SegmentStatus::OK) {
-            // Find the client_id for this segment
-            UUID client_id = UUID{
-                0,
-                0};  // Default value, indicates no corresponding client found
-
-            // Search for the client corresponding to this segment ID in
-            // client_segments_
-            for (const auto& client_pair : segment_manager_->client_segments_) {
-                const auto& client_id_tmp = client_pair.first;
-                const auto& segment_ids = client_pair.second;
-
-                if (std::find(segment_ids.begin(), segment_ids.end(),
-                              mounted_segment.segment.id) !=
-                    segment_ids.end()) {
-                    client_id = client_id_tmp;
-                    break;
-                }
-            }
-
-            unready_segments.emplace_back(mounted_segment.segment, client_id);
+        if (mounted_segment.status == SegmentStatus::OK) {
+            continue;
         }
+
+        UUID client_id{0, 0};
+        auto client_it = segment_manager_->client_by_name_.find(
+            mounted_segment.segment.name);
+        if (client_it != segment_manager_->client_by_name_.end()) {
+            client_id = client_it->second;
+        }
+
+        unready_segments.emplace_back(mounted_segment.segment, client_id);
     }
 
     return ErrorCode::OK;
@@ -783,8 +783,9 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
         }
     }
 
-    // Rebuild client_by_name_ based on client_segments_ and mounted_segments_
+    // Rebuild segment indexes based on client_segments_ and mounted_segments_
     segment_manager_->client_by_name_.clear();
+    segment_manager_->segment_id_by_name_.clear();
     for (const auto& [client_id, segment_ids] :
          segment_manager_->client_segments_) {
         for (const auto& segment_id : segment_ids) {
@@ -792,6 +793,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             if (it != segment_manager_->mounted_segments_.end()) {
                 segment_manager_->client_by_name_[it->second.segment.name] =
                     client_id;
+                segment_manager_->segment_id_by_name_[it->second.segment.name] =
+                    segment_id;
             }
         }
     }
@@ -876,6 +879,7 @@ void SegmentSerializer::Reset() {
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
     segment_manager_->client_by_name_.clear();
+    segment_manager_->segment_id_by_name_.clear();
     segment_manager_->client_local_disk_segment_.clear();
     segment_manager_->allocator_manager_ = AllocatorManager();
 }
@@ -896,6 +900,72 @@ bool ScopedSegmentAccess::ExistsSegmentName(
     const std::string& segment_name) const {
     auto it = segment_manager_->client_by_name_.find(segment_name);
     return it != segment_manager_->client_by_name_.end();
+}
+
+bool ScopedSegmentAccess::IsSegmentAllocatable(
+    const std::string& segment_name) const {
+    auto segment_id_it =
+        segment_manager_->segment_id_by_name_.find(segment_name);
+    if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {
+        return false;
+    }
+    auto mounted_segment_it =
+        segment_manager_->mounted_segments_.find(segment_id_it->second);
+    return mounted_segment_it != segment_manager_->mounted_segments_.end() &&
+           mounted_segment_it->second.status == SegmentStatus::OK;
+}
+
+ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
+    const std::string& segment_name, SegmentStatus& status) const {
+    auto segment_id_it =
+        segment_manager_->segment_id_by_name_.find(segment_name);
+    if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    auto mounted_segment_it =
+        segment_manager_->mounted_segments_.find(segment_id_it->second);
+    if (mounted_segment_it == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = mounted_segment_it->second.status;
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
+    const std::string& segment_name, SegmentStatus status) {
+    auto segment_id_it =
+        segment_manager_->segment_id_by_name_.find(segment_name);
+    if (segment_id_it == segment_manager_->segment_id_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    auto mounted_segment_it =
+        segment_manager_->mounted_segments_.find(segment_id_it->second);
+    if (mounted_segment_it == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
+    auto& mounted_segment = mounted_segment_it->second;
+    if (mounted_segment.status == SegmentStatus::UNMOUNTING) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (mounted_segment.status == status) {
+        return ErrorCode::OK;
+    }
+
+    auto& allocator_manager = segment_manager_->allocator_manager_;
+    const auto& allocator = mounted_segment.buf_allocator;
+    const auto& name = mounted_segment.segment.name;
+    const bool should_be_allocatable = status == SegmentStatus::OK;
+    const bool is_allocatable =
+        HasAllocator(allocator_manager, name, allocator);
+    if (should_be_allocatable && !is_allocatable && allocator) {
+        allocator_manager.addAllocator(name, allocator);
+    } else if (!should_be_allocatable && is_allocatable) {
+        allocator_manager.removeAllocator(name, allocator);
+    }
+
+    mounted_segment.status = status;
+    return ErrorCode::OK;
 }
 
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,

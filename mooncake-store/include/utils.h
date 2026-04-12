@@ -399,6 +399,12 @@ tl::expected<std::string, std::string> GetInterfaceIPv4Address(
 // Network utility: obtain an available TCP port on loopback by binding to 0
 int getFreeTcpPort();
 
+// Obtain multiple unique available TCP ports atomically.
+// All ports are bound simultaneously before any are released, preventing
+// duplicate port assignments that can occur with repeated getFreeTcpPort()
+// calls.
+std::vector<int> getFreeTcpPorts(int count);
+
 int64_t time_gen();
 
 // Helper: Get integer from environment variable, fallback to default

@@ -37,8 +37,12 @@ EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-asio"
 EXT_LDFLAGS+=" -ltransfer_engine -lmooncake_common -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -ljsoncpp"
 
+if [ -d "/usr/local/cuda/lib64/stubs" ]; then
+    EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"
+fi
+
 if [ -d "/usr/local/cuda/lib64" ]; then
-    EXT_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcudart"
+    EXT_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcuda -lcudart"
 fi
 
 if [ -d "/opt/rocm/lib" ]; then

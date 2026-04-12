@@ -65,7 +65,7 @@ const static std::string GPU_PREFIX = "maca:";
 #define cudaMemoryTypeDevice mcMemoryTypeDevice
 #define cudaMemoryTypeHost mcMemoryTypeHost
 #define cudaMemoryTypeUnregistered mcMemoryTypeUnregistered
-#define cudaPointerAttributes mcPointerAttributes
+#define cudaPointerAttributes mcPointerAttribute_t
 #define cudaPointerGetAttributes mcPointerGetAttributes
 #define cudaSetDevice mcSetDevice
 #define cudaStreamCreate mcStreamCreate

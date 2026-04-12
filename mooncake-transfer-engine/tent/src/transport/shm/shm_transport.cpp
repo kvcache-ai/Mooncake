@@ -260,14 +260,17 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
-    SegmentDesc *desc = nullptr;
-    auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
-    if (!status.ok()) return status;
 
-    auto buffer = desc->findBuffer(dest_addr, length);
-    if (!buffer || buffer->shm_path.empty())
-        return Status::InvalidArgument(
-            "Requested address is not in registered buffer" LOC_MARK);
+    BufferDesc *buffer;
+    auto &segment_manager = metadata_->segmentManager();
+    CHECK_STATUS(
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc *segment) {
+            buffer = segment->findBuffer(dest_addr, length);
+            if (!buffer || buffer->shm_path.empty())
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        }));
 
     if (!relocate_map.count(buffer->addr)) {
         void *shm_addr = nullptr;

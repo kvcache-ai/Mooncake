@@ -56,7 +56,7 @@ export MOONCAKE_PROTOCOL="tcp"
 
 ### RDMA (Recommended for Production)
 
-**Description:** Remote Direct Memory Access protocol providing high-performance, low-latency data transfer with minimal CPU overhead. Supports GPUDirect RDMA for zero-copy GPU memory transfers.
+**Description:** Remote Direct Memory Access protocol providing high-performance, low-latency data transfer with minimal CPU overhead. Supports accelerator-aware memory registration, including NVIDIA GPUDirect RDMA for CUDA buffers and Cambricon MLU buffers when built with Neuware.
 
 **Hardware Support:**
 - InfiniBand
@@ -64,6 +64,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - eRDMA (Elastic RDMA)
 - NVIDIA GPUDirect RDMA
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
+- Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -71,6 +72,8 @@ export MOONCAKE_PROTOCOL="tcp"
 - Low latency is critical (e.g., distributed inference, KV cache transfer)
 
 **Note:** If no RDMA HCA (Host Channel Adapter) is detected on the system, the Transfer Engine will automatically fall back to TCP protocol for compatibility.
+
+**MLU Note:** Cambricon MLU support uses the standard `rdma` data path. There is no separate `mlu` protocol string. To enable MLU memory detection, topology discovery, and DMA-BUF based registration, build Transfer Engine with `-DUSE_MLU=ON` and make Neuware available through `NEUWARE_HOME` or `NEUWARE_ROOT`.
 
 **Configuration:**
 ```python
@@ -321,6 +324,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
+| Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 
 ## Troubleshooting

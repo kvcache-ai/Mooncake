@@ -515,26 +515,41 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
                                                          int device_id) {
     SegmentDesc* segment_desc = nullptr;
-    std::string rpc_server_addr;
-    if (target_id == LOCAL_SEGMENT_ID) {
-        segment_desc = metadata_->segmentManager().getLocal().get();
-    } else {
-        metadata_->segmentManager().getRemoteCached(segment_desc, target_id);
-        rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
+    std::string rpc_server_addr, target_seg_name, target_dev_name;
+
+    auto status = metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            segment_desc = segment;
+
+            if (segment->type != SegmentType::Memory) {
+                return Status::NeedsRefreshCache(
+                    "Segment type is not Memory" LOC_MARK);
+            }
+
+            if (target_id != LOCAL_SEGMENT_ID) {
+                rpc_server_addr = segment->rpc_server_addr;
+            }
+
+            auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
+            target_seg_name = segment->name;
+            target_dev_name = topo->getNicName(device_id);
+            if (target_seg_name.empty() || target_dev_name.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty target segment or device name" LOC_MARK);
+            }
+            return Status::OK();
+        });
+
+    if (!status.ok()) {
+        LOG(ERROR) << status.ToString();
+        return nullptr;
     }
-    if (segment_desc->type != SegmentType::Memory) return nullptr;
+
     auto context = context_set_[0].get();
     if (context->status() != RdmaContext::DEVICE_ENABLED) {
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    auto target_seg_name = segment_desc->name;
-    auto topo = &std::get<MemorySegmentDesc>(segment_desc->detail).topology;
-    auto target_dev_name = topo->getNicName(device_id);
-    if (target_seg_name.empty() || target_dev_name.empty()) {
-        LOG(ERROR) << "Empty target segment or device name";
-        return nullptr;
-    }
     std::string peer_name = MakeNicPath(segment_desc->name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {

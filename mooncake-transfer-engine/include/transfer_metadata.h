@@ -46,16 +46,22 @@ class TransferMetadata {
         std::string name;
         uint16_t lid;
         std::string gid;
+        std::string eid;  // for ub
     };
 
     struct BufferDesc {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        std::vector<uint32_t> lkey;  // for rdma
-        std::vector<uint32_t> rkey;  // for rdma
-        std::string shm_name;        // for nvlink and hip
-        uint64_t offset;             // for cxl
+#ifdef ENABLE_MULTI_PROTOCOL
+        std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
+#endif
+        std::vector<uint32_t> lkey;         // for rdma
+        std::vector<uint32_t> rkey;         // for rdma
+        std::string shm_name;               // for nvlink and hip
+        uint64_t offset;                    // for cxl
+        std::vector<std::string> tseg;      // for ub/urma
+        std::vector<uint32_t> l_seg_index;  // for ub/urma
     };
 
     struct NVMeoFBufferDesc {
@@ -82,7 +88,7 @@ class TransferMetadata {
     struct SegmentDesc {
         std::string name;
         std::string protocol;
-        // this is for rdma/shm
+        // this is for rdma/shm/urma
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
@@ -113,6 +119,9 @@ class TransferMetadata {
     struct HandShakeDesc {
         std::string local_nic_path;
         std::string peer_nic_path;
+#ifdef USE_UB
+        std::vector<uint32_t> jetty_num;  // for ub/urma
+#endif
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
@@ -183,6 +192,7 @@ class TransferMetadata {
 
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
+    int sendProbe(const std::string &peer_server_name);
 
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);
@@ -197,6 +207,7 @@ class TransferMetadata {
                             Json::Value &local_json);
     int receivePeerNotify(const Json::Value &peer_json,
                           Json::Value &local_json);
+    int receivePeerProbe(const Json::Value &peer_json, Json::Value &local_json);
     std::string getFullMetadataKey(const std::string &segment_name) const;
 
     bool p2p_handshake_mode_{false};

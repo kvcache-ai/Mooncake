@@ -26,8 +26,12 @@ void loadGlobalConfig(GlobalConfig &config) {
     auto &env = Environ::Get();
 
     int num_cq_per_ctx = env.GetNumCqPerCtx();
-    if (num_cq_per_ctx > 0 && num_cq_per_ctx < 256)
+    if (num_cq_per_ctx > 0 && num_cq_per_ctx < 256) {
         config.num_cq_per_ctx = num_cq_per_ctx;
+        // In URMA, JFC and JFCE are bound one-to-one.
+        config.num_jfc_per_ctx = num_cq_per_ctx;
+        config.num_jfce_per_ctx = num_cq_per_ctx;
+    }
 
     int num_comp_channels_per_ctx = env.GetNumCompChannelsPerCtx();
     if (num_comp_channels_per_ctx > 0 && num_comp_channels_per_ctx < 256)

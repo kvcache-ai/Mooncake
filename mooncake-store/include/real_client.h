@@ -4,8 +4,10 @@
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -107,6 +109,14 @@ class RealClient : public PyClient {
      * register_buffer() for zero-copy operations
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
+        override;
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -218,6 +228,25 @@ class RealClient : public PyClient {
     int put_batch(const std::vector<std::string> &keys,
                   const std::vector<std::span<const char>> &values,
                   const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert(const std::string &key, std::span<const char> value,
+               const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_from(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_parts(const std::string &key,
+                     std::vector<std::span<const char>> values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
 
     [[nodiscard]] std::string get_hostname() const;
 
@@ -342,6 +371,29 @@ class RealClient : public PyClient {
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);
 
+    tl::expected<void, ErrorCode> upsert_dummy_helper(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_parts_dummy_helper(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_from_dummy_helper(
+        const std::string &key, uint64_t dummy_buffer, size_t size,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_batch_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config, const UUID &client_id);
+
     tl::expected<void, ErrorCode> put_batch_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<std::span<const char>> &values,
@@ -377,6 +429,19 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_alloc_in_same_node, int32_t device_id,
         const UUID &client_id);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
+        const std::string &key, uint64_t buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const UUID &client_id);
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_shm_helper(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        int32_t device_id, const UUID &client_id);
 
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
@@ -436,9 +501,36 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
                                                            size_t size);
 
-    tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
-                                                       void *buffer,
-                                                       size_t size);
+    struct RangedReadMetadata {
+        QueryResult query_result;
+        Replica::Descriptor replica;
+        uint64_t total_size;
+    };
+
+    tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
+        const std::string &key);
+
+    tl::expected<int64_t, ErrorCode> execute_ranged_read(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const RangedReadMetadata &metadata,
+        bool size_is_buffer_capacity = false);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_internal(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_internal(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::vector<size_t> *buffer_capacities = nullptr,
+        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+            *prepared_results = nullptr,
+        const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
+            nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -454,6 +546,34 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> upsert_internal(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> upsert_parts_internal(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_batch_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
@@ -605,11 +725,22 @@ class RealClient : public PyClient {
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
+    mutable std::shared_mutex registered_buffer_mutex_;
+    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
+    bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
+                                size_t offset, size_t size,
+                                void *&out_real) const;
+
     bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                   uint64_t dummy_addr, size_t buf_size,
                                   const MappedShm *&last_hit_shm,
                                   void *&out_real) const;
+
+    bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
+                                        uint64_t dummy_addr, size_t dst_offset,
+                                        size_t size, void *&out_real) const;
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,

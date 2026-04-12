@@ -37,7 +37,8 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 #include <cassert>
 
 #ifdef USE_MNNVL
@@ -57,7 +58,8 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 const static int NR_SOCKETS = 4;
 #else
 const static int NR_SOCKETS =
@@ -89,7 +91,8 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
@@ -99,7 +102,8 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
@@ -124,7 +128,8 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
 #ifdef USE_MNNVL
     if (FLAGS_use_vram) {
         freeFabricMemory(addr);
@@ -294,6 +299,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -313,6 +321,9 @@ int initiator() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             xport = engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            xport = engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
@@ -330,7 +341,8 @@ int initiator() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
@@ -412,6 +424,9 @@ int target() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
@@ -426,7 +441,8 @@ int target() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);

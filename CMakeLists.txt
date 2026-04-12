@@ -14,12 +14,14 @@ endif()
 
 option(WITH_TE "build mooncake transfer engine and sample code" ON)
 option(WITH_STORE "build mooncake store library and sample code" ON)
+option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
+option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
-set(PYTHON_EXECUTABLE "python3")
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
@@ -63,6 +65,14 @@ if (WITH_STORE)
   message(STATUS "Mooncake Store will be built")
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
+endif()
+
+if (WITH_STORE_RUST)
+  if (NOT WITH_STORE)
+    message(FATAL_ERROR "WITH_STORE_RUST=ON requires WITH_STORE=ON")
+  endif()
+  message(STATUS "Mooncake Store Rust bindings will be built")
+  add_subdirectory(mooncake-store/rust)
 endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
@@ -112,6 +122,7 @@ if (WITH_EP)
       COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
         "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
+        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
@@ -127,6 +138,7 @@ if (WITH_EP)
       COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
         "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
+        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
@@ -140,6 +152,17 @@ if (WITH_EP)
 endif()
 
 add_subdirectory(mooncake-integration)
+
+if (WITH_STORE_GO AND WITH_STORE)
+  add_custom_target(build_store_go DEPENDS mooncake_store transfer_engine)
+  add_custom_command(
+      TARGET build_store_go
+      COMMAND bash build.sh ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${USE_ETCD} ${USE_REDIS} ${USE_HTTP} ${USE_ETCD_LEGACY}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/mooncake-store/go
+  )
+  set_property(TARGET build_store_go PROPERTY EXCLUDE_FROM_ALL FALSE)
+  message(STATUS "Mooncake Store Go bindings will be built")
+endif()
 
 if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)

@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
 namespace mooncake {
@@ -66,6 +67,7 @@ class ConnectionContext;
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(int cuda_device_index = -1);
+    ~MooncakeWorker();
 
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
@@ -88,7 +90,19 @@ class MooncakeWorker {
 
     void Start();
 
-    void Stop() { running_ = false; }
+    /**
+     * @brief Waits for all active collective tasks for the given backend to
+     * complete.
+     *
+     * Used during graceful shutdown to ensure no pending collective operations
+     * are active before releasing resources. Blocks until all tasks complete
+     * or the timeout expires.
+     *
+     * @param meta The transfer group metadata identifying the backend.
+     * @return True if all tasks completed within the timeout; false if timed
+     * out.
+     */
+    bool drainTasks(const TransferGroupMeta* meta) const;
 
    private:
     void startWorker();
@@ -96,6 +110,7 @@ class MooncakeWorker {
     static constexpr size_t kNumTasks_ = 4;
 
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
+    static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     bool running_ = false;
     std::atomic<bool> started_{false};
@@ -107,6 +122,8 @@ class MooncakeWorker {
 
     int cpuTaskCount = 0;
     int cudaTaskCount = 0;
+
+    std::thread worker_thread_;
 };
 
 class MooncakeWorkerManager {

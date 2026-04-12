@@ -37,12 +37,25 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::upsert_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::upsert_from_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::upsert_parts_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::batch_upsert_from_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::upsert_batch_dummy_helper>(
+        &real_client);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(
         &real_client);
     server.register_handler<
-        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
-    server.register_handler<
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::get_into_range_shm_helper>(
+        &real_client);
+    server.register_handler<&RealClient::get_into_ranges_shm_helper>(
+        &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);

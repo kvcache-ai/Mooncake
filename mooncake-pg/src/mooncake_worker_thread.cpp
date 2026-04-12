@@ -3,6 +3,7 @@
 #include <mooncake_worker.cuh>
 #include <glog/logging.h>
 #include <transfer_engine.h>
+#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -22,9 +23,21 @@ void MooncakeWorker::Start() {
     }
 }
 
+bool MooncakeWorker::drainTasks(const TransferGroupMeta* meta) const {
+    BackoffWaiter waiter;
+    return waiter.wait_for(
+        std::chrono::milliseconds(kDrainTasksTimeoutMs), [this, meta] {
+            for (size_t i = 0; i < kNumTasks_; ++i) {
+                if (tasks_[i].active && tasks_[i].transferGroupMeta == meta)
+                    return false;
+            }
+            return true;
+        });
+}
+
 void MooncakeWorker::startWorker() {
     running_ = true;
-    std::thread([this] {
+    worker_thread_ = std::thread([this] {
         if (cuda_device_index_ >= 0) {
             cudaSetDevice(cuda_device_index_);
         }
@@ -32,7 +45,6 @@ void MooncakeWorker::startWorker() {
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
-        TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -146,8 +158,9 @@ void MooncakeWorker::startWorker() {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (j != group->rank &&
                                      diff.count() > kPingTimeoutMicroseconds_ &&
-                                     group->engine->sendNotifyByID(
-                                         group->segmentIDs[j], msg))) {
+                                     group->engine->probePeerAliveByID(
+                                         group->segmentIDs[j]) !=
+                                         PeerLiveness::Alive)) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
@@ -235,8 +248,9 @@ void MooncakeWorker::startWorker() {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
                                  diff.count() > kPingTimeoutMicroseconds_ &&
-                                 group->engine->sendNotifyByID(
-                                     group->segmentIDs[j], msg))) {
+                                 group->engine->probePeerAliveByID(
+                                     group->segmentIDs[j]) !=
+                                     PeerLiveness::Alive)) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "
@@ -281,7 +295,7 @@ void MooncakeWorker::startWorker() {
                 }
             }
         }
-    }).detach();
+    });
 }
 
 std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetWorker(

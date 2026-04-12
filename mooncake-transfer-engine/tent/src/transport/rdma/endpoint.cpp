@@ -158,8 +158,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
             deconstruct();
             return -1;
         }
-
-        postNotifyRecv(i);
     }
 
     status_ = EP_HANDSHAKING;
@@ -285,7 +283,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             SegmentDescRef segment_desc;
             auto& manager = transport.metadata_->segmentManager();
             CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
-            rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
+            rpc_server_addr = segment_desc->rpc_server_addr;
         }
         if (rpc_server_addr.empty()) {
             return Status::InvalidArgument(
@@ -566,7 +564,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
     if (rc) {
-        PLOG(ERROR) << "ibv_post_send";
+        LOG(ERROR) << "ibv_post_send: " << strerror(abs(rc)) << " [" << rc
+                   << "]";
         while (bad_wr) {
             slice_list[bad_wr - wr_list.data()]->failed = true;
             cancelQuota(qp_index, 1);
@@ -595,7 +594,8 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     int rc = ibv_post_recv(qp_list_[qp_index], &wr, &bad_wr);
     if (rc) {
         cancelQuota(qp_index, 1);
-        PLOG(ERROR) << "ibv_post_recv";
+        LOG(ERROR) << "ibv_post_recv: " << strerror(abs(rc)) << " [" << rc
+                   << "]";
         return -1;
     }
     return 1;
@@ -772,8 +772,10 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     wr.num_sge = 1;
 
     ibv_recv_wr* bad_wr = nullptr;
-    if (ibv_post_recv(notify_qp_, &wr, &bad_wr)) {
-        PLOG(ERROR) << "Failed to post notification recv";
+    int ret = ibv_post_recv(notify_qp_, &wr, &bad_wr);
+    if (ret) {
+        LOG(ERROR) << "Failed to post notification recv: " << strerror(abs(ret))
+                   << " [" << ret << "]";
     }
 }
 
@@ -924,10 +926,11 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
     if (ret) {
-        PLOG(ERROR) << "Failed to post notification send, "
-                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
-                    << ", endpoint: " << peer_nic_name_ << " of "
-                    << peer_server_name_ << ", error code " << ret;
+        LOG(ERROR) << "Failed to post notification send: " << strerror(abs(ret))
+                   << " [" << ret << "], "
+                   << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
+                   << ", endpoint: " << peer_nic_name_ << " of "
+                   << peer_server_name_;
         return false;
     }
 

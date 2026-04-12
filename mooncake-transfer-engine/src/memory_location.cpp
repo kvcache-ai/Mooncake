@@ -35,10 +35,10 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          bool only_first_page) {
     std::vector<MemoryLocationEntry> entries;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU) || defined(USE_MACA)
     cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, start);
+    cudaError_t result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
         LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
                    << " - " << cudaGetErrorString(result) << ")" << std::endl;

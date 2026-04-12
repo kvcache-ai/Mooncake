@@ -126,6 +126,14 @@ class Transport {
                 uint32_t max_retry_cnt;
             } rdma;
             struct {
+                uint64_t dest_addr;
+                volatile int *jetty_depth;
+                uint32_t retry_cnt;
+                uint32_t max_retry_cnt;
+                void *r_seg;
+                void *l_seg;
+            } ub;
+            struct {
                 void *dest_addr;
             } local;
             struct {

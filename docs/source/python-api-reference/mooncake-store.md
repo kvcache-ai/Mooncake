@@ -264,6 +264,151 @@ def get_into(self, key: str, buffer_ptr: int, size: int) -> int
 
 **Returns:** Number of bytes read, or negative on error
 
+#### get_into_ranges()
+Retrieve multiple byte ranges from multiple objects into registered buffers (zero-copy).
+
+```python
+def get_into_ranges(self, buffer_ptrs: List[int], all_keys: List[List[str]], all_dst_offsets: List[List[List[int]]], all_src_offsets: List[List[List[int]]], all_sizes: List[List[List[int]]]) -> List[List[List[int]]]
+```
+
+This API is **buffer-major** and supports **multiple fragments per key**.
+
+Think of the input shape as:
+- `buffer_ptrs[i]`: the `i`-th destination buffer
+- `all_keys[i][j]`: the `j`-th key that writes into buffer `i`
+- `all_dst_offsets[i][j][k]`: destination offset of fragment `k` for key `j` in buffer `i`
+- `all_src_offsets[i][j][k]`: source offset of fragment `k` inside key `j` for buffer `i`
+- `all_sizes[i][j][k]`: byte size of fragment `k`
+
+For each triple `(i, j, k)`, Mooncake reads the source range
+`[all_src_offsets[i][j][k], all_src_offsets[i][j][k] + all_sizes[i][j][k])`
+from object `all_keys[i][j]`, then writes it into destination buffer
+`buffer_ptrs[i]` at offset `all_dst_offsets[i][j][k]`.
+
+This lets one buffer gather interleaved fragments from multiple keys, and lets one key contribute multiple disjoint fragments to the same buffer in a single call.
+
+**Parameters:**
+- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Every buffer must be registered with `register_buffer()` before calling this API.
+- `all_keys`: For each buffer, the ordered list of source object keys to read from.
+- `all_dst_offsets`: For each buffer and key, the destination offsets of that key's fragments.
+- `all_src_offsets`: For each buffer and key, the source offsets of that key's fragments inside the object.
+- `all_sizes`: For each buffer and key, the byte lengths of that key's fragments.
+
+**Shape rules:**
+- `len(buffer_ptrs) == len(all_keys) == len(all_dst_offsets) == len(all_src_offsets) == len(all_sizes)`
+- For each buffer `i`, `len(all_keys[i]) == len(all_dst_offsets[i]) == len(all_src_offsets[i]) == len(all_sizes[i])`
+- For each `(buffer i, key j)`, `len(all_dst_offsets[i][j]) == len(all_src_offsets[i][j]) == len(all_sizes[i][j])`
+
+If a top-level shape or per-key fragment shape does not match, the corresponding result entries are negative error codes.
+
+**Returns:** A nested list of per-buffer, per-key, per-fragment results. `results[i][j][k]` is the number of bytes read for fragment `k`, or a negative value on error.
+
+A successful call can still contain per-fragment failures. For example, if one key is missing but another key in the same buffer is valid, the missing key's fragment result will be negative while the valid fragment can still succeed.
+
+**Typical scenarios:**
+- **Partial read from one object:** You only need a slice of a large value, such as a header, metadata block, or a small subrange of a tensor shard. In this case, use one buffer, one key, and one or more fragments under that key.
+- **Stitch multiple fragments from one object into one buffer:** You need several non-contiguous ranges from the same object and want to pack them into one destination buffer. In this case, keep a single key entry and place multiple fragments under that key.
+- **Stitch data from multiple objects into one buffer:** You want to assemble one logical payload from several keys. In this case, use one destination buffer and list multiple keys under that buffer, with each key contributing one or more fragments.
+- **Fill multiple output buffers in one call:** You have several destination buffers, each with its own read plan. In this case, each top-level entry in `buffer_ptrs` and the parallel nested arrays describes one independent destination buffer.
+
+**How to use it for partial reads:**
+If you only want part of an object, do not call `get_into()` with the full object buffer size. Instead:
+1. Allocate and register a destination buffer sized for the bytes you actually want to materialize.
+2. Put that buffer pointer into `buffer_ptrs`.
+3. Put the source key into `all_keys`.
+4. Set `all_src_offsets` to the start offsets of the object ranges you want.
+5. Set `all_sizes` to the lengths of those ranges.
+6. Set `all_dst_offsets` to where those ranges should land in your destination buffer.
+
+A useful way to think about the arguments is:
+- `buffer_ptrs` answers **where does the data land**
+- `all_keys` answers **which object does it come from**
+- `all_src_offsets` and `all_sizes` answer **which bytes should be read**
+- `all_dst_offsets` answers **where each fragment should be placed in the destination buffer**
+
+If you are extracting a single contiguous slice from one object, the minimal shape is:
+
+```python
+results = store.get_into_ranges(
+    [buffer_ptr],
+    [["my_key"]],
+    [[[0]]],
+    [[[src_offset]]],
+    [[[size]]],
+)
+```
+
+This means:
+- one destination buffer
+- one source key for that buffer
+- one fragment for that key
+- read `size` bytes from `my_key[src_offset:src_offset + size]`
+- write them into `buffer_ptr[0:size]`
+
+If you want to read several disjoint ranges from the same object and pack them together, keep the same key and add more fragments under it. For example:
+
+```python
+results = store.get_into_ranges(
+    [buffer_ptr],
+    [["my_key"]],
+    [[[0, 16, 40]]],
+    [[[128, 4096, 8192]]],
+    [[[8, 12, 4]]],
+)
+```
+
+This reads three fragments from `my_key` and places them into the same destination buffer at offsets `0`, `16`, and `40`. This pattern is useful when you want to assemble only the needed pieces of a large object without reading the whole value.
+
+If you want to assemble one output buffer from multiple objects, keep one top-level buffer entry and add multiple keys under it. Each key can still contribute one or more fragments. For example, you might put a header from `meta_key` at the front of the buffer, then place a payload slice from `data_key` after it.
+
+**Usage example:**
+
+```python
+import ctypes
+
+buffer_size = 32
+buffer0 = (ctypes.c_ubyte * buffer_size)()
+buffer1 = (ctypes.c_ubyte * buffer_size)()
+buffer_ptr0 = ctypes.addressof(buffer0)
+buffer_ptr1 = ctypes.addressof(buffer1)
+
+store.register_buffer(buffer_ptr0, buffer_size)
+store.register_buffer(buffer_ptr1, buffer_size)
+
+# Buffer 0 reads:
+# - from key1: two fragments -> src[1:5] -> dst[0:4], src[30:33] -> dst[20:23]
+# - from key2: one fragment  -> src[2:7] -> dst[8:13]
+# Buffer 1 reads:
+# - from key2: one fragment  -> src[0:6] -> dst[4:10]
+# - from key1: one fragment  -> src[10:14] -> dst[16:20]
+results = store.get_into_ranges(
+    [buffer_ptr0, buffer_ptr1],
+    [["key1", "key2"], ["key2", "key1"]],
+    [[[0, 20], [8]], [[4], [16]]],
+    [[[1, 30], [2]], [[0], [10]]],
+    [[[4, 3], [5]], [[6], [4]]],
+)
+
+# results == [
+#   [[4, 3], [5]],
+#   [[6], [4]],
+# ]
+```
+
+In the example above:
+- `results[0][0][0] == 4`: buffer 0, key 0 (`"key1"`), fragment 0 succeeded with 4 bytes
+- `results[0][0][1] == 3`: buffer 0, key 0 (`"key1"`), fragment 1 succeeded with 3 bytes
+- `results[0][1][0] == 5`: buffer 0, key 1 (`"key2"`), fragment 0 succeeded with 5 bytes
+
+**Common pitfalls:**
+- Do not flatten all fragments for a buffer into one list. Fragments must be grouped under their corresponding key.
+- `all_dst_offsets`, `all_src_offsets`, and `all_sizes` are 3D, but `all_keys` is 2D.
+- Buffer overflow is checked against the registered destination buffer size.
+- Source overflow is checked against the source object's size.
+- Full-object `get_into()` and ranged `get_into_ranges()` are different APIs; use `get_into()` when you want the whole object into one buffer.
+
+**Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
+
 ---
 
 ## ReplicateConfig Configuration
@@ -299,6 +444,16 @@ config.replica_num = 3  # Store 3 copies of the data
 ```python
 config = ReplicateConfig()
 config.with_soft_pin = True  # Keep this object in memory longer
+```
+
+#### with_hard_pin
+**Type:** `bool`
+**Default:** `False`
+**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects.
+
+```python
+config = ReplicateConfig()
+config.with_hard_pin = True  # Keep this object in memory that will not be evicted
 ```
 
 #### preferred_segment
@@ -626,6 +781,120 @@ result = store.put_batch(keys, values)
 ```
 
 </details>
+
+---
+
+#### upsert()
+
+Insert a new object if the key does not exist, or update the existing object in place when possible. They use the same replication configuration model as `put()`.
+
+Upsert binary data in the distributed storage.
+
+```python
+def upsert(self, key: str, value: bytes, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Unique object identifier
+- `value` (bytes): Binary data to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+config = ReplicateConfig()
+config.replica_num = 2
+
+rc = store.upsert("weights", b"new-bytes", config)
+if rc == 0:
+    print("Upsert succeeded")
+```
+
+#### upsert_from()
+
+Upsert object data directly from a pre-allocated buffer (zero-copy).
+
+```python
+def upsert_from(self, key: str, buffer_ptr: int, size: int, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Memory address of the source buffer
+- `size` (int): Number of bytes to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This is the zero-copy counterpart of `upsert()`. As with
+`put_from()`, register the buffer before issuing the request.
+
+#### batch_upsert_from()
+
+Upsert multiple objects directly from pre-allocated buffers.
+
+```python
+def batch_upsert_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int],
+                      config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `buffer_ptrs` (List[int]): List of source buffer addresses
+- `sizes` (List[int]): List of byte lengths for each buffer
+- `config` (ReplicateConfig, optional): Replication configuration shared by all objects
+
+**Returns:**
+- `List[int]`: List of status codes for each upsert
+
+#### upsert_parts()
+
+Upsert data from multiple buffer parts as a single object (insert or update).
+
+```python
+def upsert_parts(self, key: str, *parts, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `*parts`: Variable number of bytes-like objects to concatenate
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+part1 = b"Hello, "
+part2 = b"World!"
+result = store.upsert_parts("greeting", part1, part2)
+```
+
+#### upsert_batch()
+
+Upsert multiple objects in a single batch operation.
+
+```python
+def upsert_batch(self, keys: List[str], values: List[bytes], config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `values` (List[bytes]): List of binary data to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration for all objects
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+keys = ["key1", "key2", "key3"]
+values = [b"value1", b"value2", b"value3"]
+result = store.upsert_batch(keys, values)
+```
 
 ---
 
@@ -1530,6 +1799,133 @@ def batch_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], co
 - `List[int]`: List of status codes for each tensor operation.
 
 **Note:** This function requires `torch` to be installed and available in the environment.
+
+---
+
+#### upsert_tensor()
+
+Insert a tensor if its key is missing, or update the existing tensor if the key already exists. The current tensor upsert helpers use the default `ReplicateConfig` and therefore do not take a `config` parameter.
+
+Upsert a PyTorch tensor into the store.
+
+```python
+def upsert_tensor(self, key: str, tensor: torch.Tensor) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `tensor` (torch.Tensor): The PyTorch tensor to insert or update
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+#### upsert_tensor_from()
+
+Upsert a tensor directly from a pre-allocated buffer. The buffer layout must be
+`[TensorMetadata][tensor data]`, matching the layout used by
+`get_tensor_into()`.
+
+```python
+def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Buffer pointer containing serialized tensor metadata and payload
+- `size` (int): Actual serialized byte length of the tensor buffer
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function is not supported for dummy client.
+
+#### batch_upsert_tensor_from()
+
+Upsert multiple tensors directly from pre-allocated buffers. Each buffer must
+use layout `[TensorMetadata][tensor data]`.
+
+```python
+def batch_upsert_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `buffer_ptrs` (List[int]): List of serialized tensor buffer pointers
+- `sizes` (List[int]): List of actual serialized byte lengths
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor upsert
+
+#### batch_upsert_tensor()
+
+Upsert a batch of PyTorch tensors into the store (insert or update).
+
+```python
+def batch_upsert_tensor(self, keys: List[str], tensors_list: List[torch.Tensor]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `tensors_list` (List[torch.Tensor]): List of tensors to insert or update
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
+
+**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
+#### upsert_pub_tensor()
+
+Upsert a PyTorch tensor with configurable replication settings (insert or update).
+
+```python
+def upsert_pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Unique object identifier
+- `tensor` (torch.Tensor): PyTorch tensor to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+
+**Example:**
+```python
+import torch
+from mooncake.store import ReplicateConfig
+
+tensor = torch.randn(100, 100)
+
+config = ReplicateConfig()
+config.replica_num = 2
+config.with_soft_pin = True
+
+result = store.upsert_pub_tensor("my_tensor", tensor, config)
+if result == 0:
+    print("Tensor upserted successfully")
+```
+
+#### batch_upsert_pub_tensor()
+
+Batch upsert PyTorch tensors with configurable replication settings (insert or update).
+
+```python
+def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `tensors_list` (List[torch.Tensor]): List of tensors to insert or update
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
+
+**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
 
 ---
 

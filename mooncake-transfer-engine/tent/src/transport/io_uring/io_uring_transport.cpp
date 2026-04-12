@@ -139,12 +139,20 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
 }
 
 std::string IOUringTransport::getIOUringFilePath(SegmentID target_id) {
-    SegmentDesc* desc = nullptr;
-    auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
-    if (!status.ok() || desc->type != SegmentType::File) return "";
-    auto& detail = std::get<FileSegmentDesc>(desc->detail);
-    if (detail.buffers.empty()) return "";
-    return detail.buffers[0].path;
+    std::string ret;
+    auto status = metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            if (segment->type != SegmentType::File)
+                return Status::NeedsRefreshCache(
+                    "Segment type is not File" LOC_MARK);
+            auto& detail = std::get<FileSegmentDesc>(segment->detail);
+            if (detail.buffers.empty())
+                return Status::NeedsRefreshCache("No buffers found" LOC_MARK);
+            ret = detail.buffers[0].path;
+            return Status::OK();
+        });
+    if (!status.ok()) return "";
+    return ret;
 }
 
 IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
