@@ -34,9 +34,12 @@ class AsyncMetadataNotifier {
     AsyncMetadataNotifier(const AsyncMetadataNotifier&) = delete;
     AsyncMetadataNotifier& operator=(const AsyncMetadataNotifier&) = delete;
 
-    // Start/Stop can be called alternately. Stop drains + clears queue.
+    // Start/Stop can be called alternately.
+    // drop_pending=false (default): sender drains remaining ops before exiting.
+    // drop_pending=true: queued ops are discarded immediately without invoking
+    // failure_cb.
     void Start();
-    void Stop();
+    void Stop(bool drop_pending = false);
 
     // --- Normal priority ---
     tl::expected<void, ErrorCode> EnqueueAdd(const std::string& key,
@@ -234,6 +237,11 @@ class AsyncMetadataNotifier {
     std::vector<std::unique_ptr<SenderShard>> shards_;
     std::vector<std::vector<PendingOp>> batch_buffers_;
     SyncFailureCallback failure_cb_;
+
+    // Set to true by Stop(drop_pending=true) before waking senders.
+    // Tells CollectBatch to return 0 immediately so senders exit after their
+    // current in-flight SendBatch without processing any further queued ops.
+    std::atomic<bool> drop_on_stop_{false};
 
     // Circuit breaker via consecutive failure count:
     //   >=0 : active, value = consecutive failures so far

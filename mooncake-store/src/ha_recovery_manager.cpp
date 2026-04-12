@@ -22,7 +22,10 @@ HARecoveryManager::~HARecoveryManager() { Stop(); }
 
 void HARecoveryManager::Stop() {
     std::lock_guard<std::mutex> lk(mutex_);
-    if (need_abort_) need_abort_->store(true, std::memory_order_release);
+    if (need_abort_) {
+        need_abort_->store(true, std::memory_order_release);
+        abort_cv_.notify_all();
+    }
     if (recovery_thread_.joinable()) {
         recovery_thread_.join();
     }
@@ -62,6 +65,7 @@ void HARecoveryManager::HandleEvent(HAEvent event) {
     // uses lock-free CAS (no mutex_ needed), so no deadlock.
     if (need_abort_) {
         need_abort_->store(true, std::memory_order_release);
+        abort_cv_.notify_all();
     }
     if (recovery_thread_.joinable()) {
         recovery_thread_.join();
@@ -75,7 +79,7 @@ void HARecoveryManager::HandleEvent(HAEvent event) {
                 current == HAClientState::SYNCING) {
                 TransitionState(HAClientState::DEGRADED,
                                 "heartbeat failure threshold exceeded");
-                if (notifier_) notifier_->Stop();
+                if (notifier_) notifier_->Stop(/*drop_pending=*/true);
             }
             break;
 
@@ -231,7 +235,9 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
         if (sync_result) break;
         LOG(WARNING) << "SetSyncCompleted failed: " << sync_result.error()
                      << ", retrying in 500ms";
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::unique_lock<std::mutex> lk(abort_mutex_);
+        abort_cv_.wait_for(lk, std::chrono::milliseconds(500),
+                           [&] { return aborted(); });
     }
 
     // Transition SYNCING→FULL if not aborted.

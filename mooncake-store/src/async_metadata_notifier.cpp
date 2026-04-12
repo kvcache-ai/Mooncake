@@ -57,10 +57,14 @@ void AsyncMetadataNotifier::Start() {
     }
 }
 
-void AsyncMetadataNotifier::Stop() {
+void AsyncMetadataNotifier::Stop(bool drop_pending) {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false)) {
         return;  // not running
+    }
+
+    if (drop_pending) {
+        drop_on_stop_.store(true, std::memory_order_release);
     }
 
     // Wake all sender threads (both shard CVs and stop CV for retry sleeps)
@@ -82,7 +86,7 @@ void AsyncMetadataNotifier::Stop() {
     for (auto& shard : shards_) {
         ResetShard(*shard);
     }
-    // Reset circuit breaker for next Start cycle
+    drop_on_stop_.store(false, std::memory_order_release);
     consecutive_rpc_failures_.store(0, std::memory_order_release);
 
     LOG(INFO) << "AsyncMetadataNotifier stopped";
@@ -248,12 +252,7 @@ void AsyncMetadataNotifier::SenderLoop(size_t shard_idx) {
         size_t n = CollectBatch(shard, batch);
 
         if (n == 0) {
-            if (!running_.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                if (shard.IsEmpty()) {
-                    break;
-                }
-            }
+            if (!running_.load(std::memory_order_acquire)) break;
             continue;
         }
 
@@ -268,6 +267,11 @@ size_t AsyncMetadataNotifier::CollectBatch(SenderShard& shard,
     shard.sender_cv.wait_for(lock, BatchTimeout, [&] {
         return !shard.IsEmpty() || !running_.load(std::memory_order_relaxed);
     });
+
+    // drop mode: don't collect any more batches — let the sender exit cleanly
+    if (drop_on_stop_.load(std::memory_order_relaxed)) {
+        return 0;
+    }
 
     // Phase 1: collect from normal queue (high priority)
     size_t collected =
@@ -452,9 +456,9 @@ bool AsyncMetadataNotifier::WaitForRecoveryDrain(
             }
 
             auto wait_time = std::min(
-                remaining, std::chrono::duration_cast<
-                               std::chrono::steady_clock::duration>(
-                               std::chrono::milliseconds(100)));
+                remaining,
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::milliseconds(100)));
             shard.recovery_drain_cv.wait_for(lock, wait_time);
         }
     }

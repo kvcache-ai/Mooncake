@@ -82,6 +82,11 @@ class HARecoveryManager {
     std::mutex mutex_;  // protects transitions + recovery thread lifecycle
     std::thread recovery_thread_;
     AbortToken need_abort_;  // signals recovery thread to exit
+
+    // Separate mutex/CV for interruptible sleeps inside the recovery thread.
+    // Must NOT be mutex_ (HandleEvent holds mutex_ while joining the thread).
+    std::mutex abort_mutex_;
+    std::condition_variable abort_cv_;
 };
 
 }  // namespace mooncake
