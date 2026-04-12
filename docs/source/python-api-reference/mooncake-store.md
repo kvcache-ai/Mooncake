@@ -446,6 +446,16 @@ config = ReplicateConfig()
 config.with_soft_pin = True  # Keep this object in memory longer
 ```
 
+#### with_hard_pin
+**Type:** `bool`
+**Default:** `False`
+**Description:** Enables hard pinning for the stored object. Hard pinned objects will not be evicted. This grants user to manually control the life time of stored objects.
+
+```python
+config = ReplicateConfig()
+config.with_hard_pin = True  # Keep this object in memory that will not be evicted
+```
+
 #### preferred_segment
 **Type:** `str`
 **Default:** `""` (empty string)

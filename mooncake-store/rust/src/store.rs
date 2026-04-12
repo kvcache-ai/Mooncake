@@ -42,6 +42,8 @@ pub struct ReplicateConfig {
     pub replica_num: usize,
     /// Prefer a replica on the same NUMA node / host ("soft pin").
     pub with_soft_pin: bool,
+    /// Declare whether the object will never be evicted.
+    pub with_hard_pin: bool,
     /// Whitelist of segment names that should host a replica.
     pub preferred_segments: Vec<String>,
 }
@@ -69,6 +71,7 @@ impl ReplicateConfig {
         let c_config = ffi::mooncake_replicate_config_t {
             replica_num: self.replica_num,
             with_soft_pin: i32::from(self.with_soft_pin),
+            with_hard_pin: i32::from(self.with_hard_pin),
             preferred_segments: if ptrs.is_empty() {
                 std::ptr::null_mut()
             } else {
@@ -465,12 +468,14 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 2,
             with_soft_pin: true,
+            with_hard_pin: false,
             preferred_segments: Vec::new(),
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 2);
         assert_eq!(ffi_cfg.with_soft_pin, 1);
+        assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 0);
         assert!(strings.is_empty());
@@ -482,12 +487,14 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 3,
             with_soft_pin: false,
+            with_hard_pin: false,
             preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 3);
         assert_eq!(ffi_cfg.with_soft_pin, 0);
+        assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(!ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
@@ -504,6 +511,7 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 1,
             with_soft_pin: false,
+            with_hard_pin: false,
             preferred_segments: vec!["bad\0segment".to_string()],
         };
 
@@ -534,6 +542,7 @@ mod tests {
         let cfg_ref = c_cfg.as_ref().expect("expected Some config");
         assert_eq!(cfg_ref.replica_num, 4);
         assert_eq!(cfg_ref.with_soft_pin, 1);
+        assert_eq!(cfg_ref.with_hard_pin, 0);
         assert_eq!(cfg_ref.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
         assert_eq!(ptrs.len(), 2);
