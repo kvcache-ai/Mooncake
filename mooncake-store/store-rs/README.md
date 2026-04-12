@@ -276,6 +276,29 @@ Treat this summary as the primary throughput signal. The per-phase `stress phase
 ./scripts/run-python-compat-e2e.sh
 ```
 
+Run the real-mode black-box read/write validator:
+
+```bash
+python3 ./scripts/real_client_rw.py \
+  --local_host 127.0.0.1:17111 \
+  --metadata_url redis://127.0.0.1:6380/0 \
+  --storage-bytes $((128 * 1024 * 1024)) \
+  --mode idle \
+  --hold-seconds 600
+```
+
+Use the same script to validate routed rw-only clients:
+
+```bash
+python3 ./scripts/real_client_rw.py \
+  --local_host 127.0.0.1:17121 \
+  --metadata_url redis://127.0.0.1:6380/0 \
+  --storage-bytes 0 \
+  --routed-writes \
+  --mode write \
+  --key_prefix smoke
+```
+
 To package the Python module and the standalone client command together:
 
 ```bash
@@ -497,6 +520,8 @@ For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD
 `client_server_address` is not part of the real data path. Real clients create their own TENT runtime inside the calling process and publish `local_hostname + transport_rpc_port` to peers.
 
 For single-host demos, leaving `transport_rpc_port` unset keeps the old random-port behavior. For cross-host or cross-container deployments, set a fixed `transport_rpc_port` and make sure that port is reachable from peer nodes.
+
+The Python compatibility layer also accepts `local_hostname` in `host:port` form. When a port is embedded there, the wrapper normalizes it into `transport_rpc_port` automatically. If both are supplied and disagree, setup fails fast instead of silently publishing a broken real-mode endpoint.
 
 ### Route control modes
 

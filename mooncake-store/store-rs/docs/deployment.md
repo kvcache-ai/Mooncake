@@ -62,6 +62,28 @@ What the script does:
 - creates two Python clients
 - validates single-object, batch, zero-copy, multi-buffer, route, and metrics paths
 
+### Real-mode read/write validation
+
+Run the real-mode black-box validator:
+
+```bash
+python3 ./scripts/real_client_rw.py --help
+```
+
+What the script does:
+
+- validates the current store-rs compatibility path instead of an upstream master-based path
+- accepts `--local_host host:port` and normalizes the embedded port into `transport_rpc_port`
+- can act as a storage process with `--mode idle`
+- can validate routed rw-only write and read flows with `--storage-bytes 0 --routed-writes`
+- supports single-op and batch put/get validation through `--batch_size`
+
+Recommended split-deployment pattern:
+
+- storage node: `--storage-bytes > 0 --mode idle`
+- routed writer: `--storage-bytes 0 --routed-writes --mode write`
+- reader: `--storage-bytes 0 --routed-writes --mode read`
+
 ### Hot-upgrade validation
 
 Native CLI hot-upgrade validation:
@@ -129,6 +151,7 @@ Deployment note:
 - dummy mode needs a reachable `client_server_address`
 - real mode needs a reachable `local_hostname + transport_rpc_port`
 - `client_server_address` does not carry real-mode TENT traffic
+- Python real-mode validation can provide `local_hostname + transport_rpc_port` either explicitly or through `--local_host host:port`
 
 ### Multi-client stress benchmark
 
