@@ -122,8 +122,9 @@ Allocator fallback is intentionally narrow.
 
 The client falls back to metadata-backed allocation only when allocator RPC fails with:
 
-- transport errors
 - unsupported control-plane endpoints
+
+Transport failures quarantine the remote storage owner and let routed placement skip to the next soft candidate instead of reviving the failed owner through metadata allocation.
 
 Allocator failures returned by a live remote storage owner are treated as real capacity errors and are not silently downgraded to metadata allocation.
 

@@ -304,7 +304,7 @@ This is the default mode.
 - steady-state reads use that cached snapshot instead of refreshing membership inline
 - route reads and CAS stay off the metadata hot path in steady state
 - storage owners manage local eviction separately from route ownership
-- read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners, and best-effort prune unreadable replicas after fallback
+- read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners, keep suspect owners quarantined until membership shows a fresh lease/control-plane refresh, and best-effort prune unreadable replicas after fallback
 - metadata remains the fallback when authority RPC is unavailable
 
 Cluster policy is metadata-authoritative:

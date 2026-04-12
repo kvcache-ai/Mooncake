@@ -196,7 +196,7 @@ Allocation is split by storage ownership.
 
 - local allocations use `LocalAllocatorState`
 - remote allocations use control-plane RPC to the owning client
-- metadata allocation remains the fallback only when allocator RPC is unavailable because of transport or unsupported-endpoint failures
+- metadata allocation remains the fallback only when the remote client does not expose allocator RPC; transport failures instead quarantine that owner and let placement move on
 
 Local memory supports two backing strategies:
 

@@ -253,7 +253,8 @@ The client keeps membership refresh out of the steady-state request path.
 - a background worker refreshes that snapshot after startup
 - steady-state reads reuse the cached snapshot instead of issuing inline membership refreshes
 - owners in `Active` and `Draining` state remain readable
-- owners that become offline or hit transport/metadata failures are marked suspect for a short TTL and skipped on later reads
+- owners that become offline or hit transport/metadata failures are marked suspect and skipped on later reads
+- suspect owners observe a minimum quarantine, then recover only after a fresh lease heartbeat or control-plane endpoint change appears in the membership snapshot
 - when fallback to another replica succeeds, the client best-effort prunes unreadable owners from the route with CAS
 
 `MooncakeHostMemAllocator(...)` exposes:

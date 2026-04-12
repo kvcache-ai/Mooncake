@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum StoreError {
     #[error("object not found: {0}")]
     NotFound(String),

@@ -78,19 +78,6 @@ fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
         && left.compatibility.transport_api_version == right.compatibility.transport_api_version
 }
 
-fn clone_store_error(error: &StoreError) -> StoreError {
-    match error {
-        StoreError::NotFound(message) => StoreError::NotFound(message.clone()),
-        StoreError::Conflict(message) => StoreError::Conflict(message.clone()),
-        StoreError::InvalidState(message) => StoreError::InvalidState(message.clone()),
-        StoreError::StaleEpoch(message) => StoreError::StaleEpoch(message.clone()),
-        StoreError::Unsupported(message) => StoreError::Unsupported(message.clone()),
-        StoreError::Allocator(message) => StoreError::Allocator(message.clone()),
-        StoreError::Metadata(message) => StoreError::Metadata(message.clone()),
-        StoreError::Transport(message) => StoreError::Transport(message.clone()),
-    }
-}
-
 fn should_fallback_to_metadata_allocator(error: &StoreError) -> bool {
     matches!(error, StoreError::Unsupported(_))
 }
