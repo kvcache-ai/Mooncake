@@ -15,6 +15,7 @@ tokio-stream = { version = "0.1", features = ["net", "sync"] }
 tonic = { version = "0.12", features = ["transport"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+is-terminal = "0.4.17"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
