@@ -20,6 +20,9 @@ void RegisterP2PRpcService(
     server.register_handler<
         &mooncake::WrappedP2PMasterService::BatchRemoveReplica>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedP2PMasterService::BatchSyncReplica>(
+        &wrapped_master_service);
 }
 
 tl::expected<WriteRouteResponse, ErrorCode>
@@ -83,6 +86,29 @@ WrappedP2PMasterService::BatchRemoveReplica(
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     return results;
+}
+
+BatchSyncReplicaResponse WrappedP2PMasterService::BatchSyncReplica(
+    const BatchSyncReplicaRequest& req) {
+    ScopedVLogTimer timer(1, "BatchSyncReplica");
+    timer.LogRequest("client_id=", req.client_id,
+                     ", adds=", req.add_keys.size(),
+                     ", removes=", req.remove_keys.size());
+
+    auto response = master_service_.BatchSyncReplica(req);
+
+    size_t add_failures = 0;
+    for (auto ec : response.add_results) {
+        if (ec != ErrorCode::OK) add_failures++;
+    }
+    size_t remove_failures = 0;
+    for (auto ec : response.remove_results) {
+        if (ec != ErrorCode::OK) remove_failures++;
+    }
+
+    timer.LogResponse("add_failures=", add_failures,
+                      ", remove_failures=", remove_failures);
+    return response;
 }
 
 }  // namespace mooncake

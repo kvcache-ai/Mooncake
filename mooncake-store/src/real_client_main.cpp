@@ -30,6 +30,14 @@ DEFINE_uint64(lock_shard_count, 1024,
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");
+DEFINE_uint64(async_sender_thread_count, 0,
+              "Async route notifier sender thread count. "
+              "0=disabled (sync RPCs), >0=enable async notifier");
+DEFINE_uint64(async_max_batch_size, 2000,
+              "Max ops per batch in async route notifier.");
+DEFINE_uint64(async_route_queue_size, 0,
+              "Async route notifier queue size when async is enabled "
+              "(min='async_max_batch_size * async_sender_thread_count').");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -90,7 +98,9 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(FLAGS_rpc_thread_num),
                 FLAGS_lock_shard_count,
                 string_to_byte_size(FLAGS_route_cache_max_memory),
-                FLAGS_route_cache_ttl_ms);
+                FLAGS_route_cache_ttl_ms, {},  // labels
+                FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
+                FLAGS_async_route_queue_size);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

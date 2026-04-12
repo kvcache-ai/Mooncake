@@ -5,6 +5,7 @@
 #include <mutex>
 #include <thread>
 
+#include "async_metadata_notifier.h"
 #include "client_service.h"
 #include "data_manager.h"
 #include "client_rpc_service.h"
@@ -282,6 +283,9 @@ class P2PClientService final : public ClientService {
 
     // Route cache for reducing Master query pressure
     std::optional<RouteCache> route_cache_;
+
+    // Async route notifier (nullptr when disabled)
+    std::unique_ptr<AsyncMetadataNotifier> async_route_notifier_;
 };
 
 }  // namespace mooncake

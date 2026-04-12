@@ -36,6 +36,11 @@ void P2PClientService::Stop() {
         client_rpc_server_thread_.join();
     }
 
+    // Stop async notifier before data_manager to drain pending ops
+    if (async_route_notifier_) {
+        async_route_notifier_->Stop();
+    }
+
     // Stop tier scheduler of tierd_backend
     if (data_manager_.has_value()) {
         data_manager_->Stop();
@@ -56,6 +61,7 @@ void P2PClientService::Destroy() {
     }
 
     client_rpc_service_.reset();
+    async_route_notifier_.reset();
     if (data_manager_.has_value()) {
         data_manager_->Destroy();
     }
@@ -113,6 +119,33 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         return err;
     }
 
+    // 4.5. Initialize async route notifier if enabled
+    if (config.async_sender_thread_count > 0) {
+        // When async ADD is rejected by Master, delete the local replica
+        // since Master won't track it.
+        SyncFailureCallback failure_cb = [this](const std::string& key,
+                                                const UUID& segment_id,
+                                                ErrorCode error) {
+            LOG(WARNING) << "Async ADD rejected by Master, deleting local"
+                         << ", key=" << key << ", error=" << error;
+            if (data_manager_.has_value()) {
+                auto r = data_manager_->Delete(key, segment_id);
+                if (!r) {
+                    LOG(ERROR) << "Failed to delete local replica"
+                               << ", key=" << key << ", error=" << r.error();
+                }
+            }
+        };
+        async_route_notifier_ = std::make_unique<AsyncMetadataNotifier>(
+            master_client_, client_id_, config.async_sender_thread_count,
+            config.async_max_batch_size, config.async_route_queue_size,
+            std::move(failure_cb));
+        async_route_notifier_->Start();
+        LOG(INFO) << "Async route notifier enabled, thread_count="
+                  << config.async_sender_thread_count
+                  << ", queue_size=" << config.async_route_queue_size;
+    }
+
     // 5. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_);
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -157,9 +190,27 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
                                 config.lock_shard_count);
     // Set rectify callback on DataManager to remove stale replicas from master
-    data_manager_->SetRectifyCallback(
-        [this](const std::string& key, std::optional<UUID> tier_id) {
-            if (!tier_id) {
+    data_manager_->SetRectifyCallback([this](const std::string& key,
+                                             std::optional<UUID> tier_id) {
+        if (async_route_notifier_) {
+            if (!tier_id.has_value()) {
+                auto tier_views = data_manager_->GetTierViews();
+                for (const auto& tv : tier_views) {
+                    auto r = async_route_notifier_->EnqueueRemove(key, tv.id);
+                    if (!r) {
+                        LOG(WARNING) << "Failed to enqueue rectify remove"
+                                     << ", key=" << key;
+                    }
+                }
+            } else {
+                auto r = async_route_notifier_->EnqueueRemove(key, *tier_id);
+                if (!r) {
+                    LOG(WARNING) << "Failed to enqueue rectify remove"
+                                 << ", key=" << key;
+                }
+            }
+        } else {
+            if (!tier_id.has_value()) {
                 auto tier_views = data_manager_->GetTierViews();
                 std::vector<UUID> segment_ids;
                 segment_ids.reserve(tier_views.size());
@@ -170,7 +221,8 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
             } else {
                 SyncRemoveReplica(key, *tier_id);
             }
-        });
+        }
+    });
 
     // Initialize route cache
     if (config.route_cache_max_memory_bytes > 0 &&
@@ -185,6 +237,9 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
     return [this](const std::string& key, const UUID& tier_id,
                   size_t size) -> tl::expected<void, ErrorCode> {
+        if (async_route_notifier_) {
+            return async_route_notifier_->EnqueueAdd(key, tier_id, size);
+        }
         return SyncAddReplica(key, tier_id, size);
     };
 }
@@ -195,6 +250,9 @@ RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
             const std::string& key, const UUID& tier_id,
             enum REMOVE_CALLBACK_TYPE type) -> tl::expected<void, ErrorCode> {
             if (type == REMOVE_CALLBACK_TYPE::DELETE) {
+                if (async_route_notifier_) {
+                    return async_route_notifier_->EnqueueRemove(key, tier_id);
+                }
                 return SyncRemoveReplica(key, tier_id);
             } else if (type == REMOVE_CALLBACK_TYPE::DELETE_ALL) {
                 // TODO:
@@ -216,10 +274,8 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
     AddReplicaRequest req;
     req.key = key;
     req.size = size;
-    req.replica.client_id = client_id_;
-    req.replica.segment_id = tier_id;
-    req.replica.rpc_port = client_rpc_port_;
-    req.replica.ip_address = local_ip_;
+    req.client_id = client_id_;
+    req.segment_id = tier_id;
     auto result = master_client_.AddReplica(req);
     if (!result) {
         LOG(ERROR) << "Failed to add replica for key: " << key

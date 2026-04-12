@@ -26,6 +26,9 @@ class WrappedP2PMasterService final : public WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
         const BatchRemoveReplicaRequest& req);
 
+    BatchSyncReplicaResponse BatchSyncReplica(
+        const BatchSyncReplicaRequest& req);
+
    private:
     P2PMasterService master_service_;
 };
