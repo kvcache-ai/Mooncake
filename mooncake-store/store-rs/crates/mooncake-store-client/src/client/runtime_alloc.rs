@@ -132,7 +132,11 @@ impl StoreClient {
                                     }
                                 }
                                 Err(error) => {
-                                    resolved[index] = Some(Err(error));
+                                    self.mark_runtime_suspect(
+                                        &storage_runtime,
+                                        "allocator_batch_reserve_any_failed",
+                                    );
+                                    resolved[index] = Some(Err(clone_store_error(&error)));
                                     continue;
                                 }
                             };
@@ -145,7 +149,7 @@ impl StoreClient {
                             )));
                         }
                     }
-                    Err(error) => {
+                    Err(error) if should_fallback_to_metadata_allocator(&error) => {
                         debug!(
                             storage_runtime = %storage_runtime,
                             error = %error,
@@ -171,6 +175,15 @@ impl StoreClient {
                                 },
                                 reservation,
                             )));
+                        }
+                    }
+                    Err(error) => {
+                        self.mark_runtime_suspect(
+                            &storage_runtime,
+                            "allocator_batch_reserve_any_failed",
+                        );
+                        for index in group.any_indices {
+                            resolved[index] = Some(Err(clone_store_error(&error)));
                         }
                     }
                 }
@@ -223,7 +236,11 @@ impl StoreClient {
                                     }
                                 }
                                 Err(error) => {
-                                    resolved[index] = Some(Err(error));
+                                    self.mark_runtime_suspect(
+                                        &storage_runtime,
+                                        "allocator_batch_reserve_specific_failed",
+                                    );
+                                    resolved[index] = Some(Err(clone_store_error(&error)));
                                     continue;
                                 }
                             };
@@ -236,7 +253,7 @@ impl StoreClient {
                             )));
                         }
                     }
-                    Err(error) => {
+                    Err(error) if should_fallback_to_metadata_allocator(&error) => {
                         debug!(
                             storage_runtime = %storage_runtime,
                             error = %error,
@@ -263,6 +280,15 @@ impl StoreClient {
                                 },
                                 reservation,
                             )));
+                        }
+                    }
+                    Err(error) => {
+                        self.mark_runtime_suspect(
+                            &storage_runtime,
+                            "allocator_batch_reserve_specific_failed",
+                        );
+                        for index in group.specific_indices {
+                            resolved[index] = Some(Err(clone_store_error(&error)));
                         }
                     }
                 }
