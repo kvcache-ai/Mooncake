@@ -136,7 +136,7 @@ impl StoreClient {
                                         &storage_runtime,
                                         "allocator_batch_reserve_any_failed",
                                     );
-                                    resolved[index] = Some(Err(clone_store_error(&error)));
+                                    resolved[index] = Some(Err(error.clone()));
                                     continue;
                                 }
                             };
@@ -183,7 +183,7 @@ impl StoreClient {
                             "allocator_batch_reserve_any_failed",
                         );
                         for index in group.any_indices {
-                            resolved[index] = Some(Err(clone_store_error(&error)));
+                            resolved[index] = Some(Err(error.clone()));
                         }
                     }
                 }
@@ -240,7 +240,7 @@ impl StoreClient {
                                         &storage_runtime,
                                         "allocator_batch_reserve_specific_failed",
                                     );
-                                    resolved[index] = Some(Err(clone_store_error(&error)));
+                                    resolved[index] = Some(Err(error.clone()));
                                     continue;
                                 }
                             };
@@ -288,7 +288,7 @@ impl StoreClient {
                             "allocator_batch_reserve_specific_failed",
                         );
                         for index in group.specific_indices {
-                            resolved[index] = Some(Err(clone_store_error(&error)));
+                            resolved[index] = Some(Err(error.clone()));
                         }
                     }
                 }

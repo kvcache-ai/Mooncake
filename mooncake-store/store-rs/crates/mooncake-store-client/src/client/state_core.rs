@@ -21,29 +21,96 @@ impl LiveClientCache {
 
 #[derive(Default)]
 pub(crate) struct SuspectRuntimeCache {
-    suspects: BTreeMap<ClientRuntimeId, Instant>,
+    suspects: BTreeMap<ClientRuntimeId, SuspectRuntimeEntry>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SuspectRuntimeEntry {
+    quarantine_until: Instant,
+    observed_expires_at_ms: Option<u64>,
+    observed_state: Option<ClientLifecycleState>,
+    observed_control_address: Option<String>,
 }
 
 impl SuspectRuntimeCache {
-    pub(crate) fn mark(&mut self, runtime: ClientRuntimeId, deadline: Instant) {
-        self.suspects.insert(runtime, deadline);
+    pub(crate) fn mark(
+        &mut self,
+        runtime: ClientRuntimeId,
+        quarantine_until: Instant,
+        observed: Option<&ClientLease>,
+    ) {
+        self.suspects
+            .entry(runtime)
+            .and_modify(|entry| entry.extend(quarantine_until))
+            .or_insert_with(|| SuspectRuntimeEntry::new(quarantine_until, observed));
     }
 
     pub(crate) fn contains(&mut self, runtime: &ClientRuntimeId) -> bool {
-        self.prune_expired();
+        self.prune_unobserved();
         self.suspects.contains_key(runtime)
     }
 
     pub(crate) fn reconcile_with_leases(&mut self, leases: &[ClientLease]) {
-        self.prune_expired();
-        self.suspects
-            .retain(|runtime, _| leases.iter().any(|lease| lease.runtime == *runtime));
+        let now = Instant::now();
+        self.suspects.retain(|runtime, entry| {
+            let Some(lease) = leases.iter().find(|lease| lease.runtime == *runtime) else {
+                return false;
+            };
+            !entry.is_recovered_by(lease, now)
+        });
     }
 
-    fn prune_expired(&mut self) {
+    fn prune_unobserved(&mut self) {
         let now = Instant::now();
-        self.suspects.retain(|_, deadline| *deadline > now);
+        self.suspects.retain(|_, entry| entry.is_observed() || !entry.quarantine_elapsed(now));
     }
+}
+
+impl SuspectRuntimeEntry {
+    fn new(quarantine_until: Instant, observed: Option<&ClientLease>) -> Self {
+        Self {
+            quarantine_until,
+            observed_expires_at_ms: observed.map(|lease| lease.expires_at_ms),
+            observed_state: observed.map(|lease| lease.state),
+            observed_control_address: observed.and_then(lease_control_address),
+        }
+    }
+
+    fn extend(&mut self, quarantine_until: Instant) {
+        self.quarantine_until = self.quarantine_until.max(quarantine_until);
+    }
+
+    fn is_observed(&self) -> bool {
+        self.observed_expires_at_ms.is_some()
+            || self.observed_state.is_some()
+            || self.observed_control_address.is_some()
+    }
+
+    fn quarantine_elapsed(&self, now: Instant) -> bool {
+        now >= self.quarantine_until
+    }
+
+    fn is_recovered_by(&self, lease: &ClientLease, now: Instant) -> bool {
+        if !self.quarantine_elapsed(now) {
+            return false;
+        }
+        if !self.is_observed() {
+            return true;
+        }
+        self.observed_expires_at_ms
+            .is_some_and(|expires| lease.expires_at_ms > expires)
+            || self
+                .observed_state
+                .is_some_and(|state| lease.state != state && lease.state.allows_new_writes())
+            || self
+                .observed_control_address
+                .as_ref()
+                .is_some_and(|address| lease_control_address(lease).is_some_and(|current| current != *address))
+    }
+}
+
+fn lease_control_address(lease: &ClientLease) -> Option<String> {
+    lease.endpoints.labels.get(control_address_label()).cloned()
 }
 
 pub(crate) fn cached_live_client_snapshot(

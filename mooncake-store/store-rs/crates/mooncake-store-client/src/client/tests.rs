@@ -24,6 +24,7 @@ use super::{
     copy_into_region, flatten_slices, now_ms, record_success_metric, scatter_into_buffers,
     LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
     PendingReclaim, ReplicaWriteTarget, SegmentAllocator, StorageOwnerState, StoreState,
+    SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -4019,6 +4020,43 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         .build(10_000)
         .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
+}
+
+#[test]
+fn suspect_runtime_cache_requires_fresh_lease_before_recovery() {
+    let runtime = ClientRuntimeId::new("suspect-runtime", ClientEpoch(1));
+    let mut endpoints = ClientEndpointSet::default();
+    endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:17001".to_string(),
+    );
+    let lease = ClientLease {
+        runtime: runtime.clone(),
+        state: ClientLifecycleState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        endpoints,
+        expires_at_ms: 10_000,
+    };
+    let elapsed = Instant::now() - Duration::from_millis(1);
+    let mut cache = SuspectRuntimeCache::default();
+    cache.mark(runtime.clone(), elapsed, Some(&lease));
+    cache.reconcile_with_leases(std::slice::from_ref(&lease));
+    assert!(cache.contains(&runtime));
+
+    let mut renewed = lease.clone();
+    renewed.expires_at_ms += 1;
+    cache.reconcile_with_leases(&[renewed]);
+    assert!(!cache.contains(&runtime));
+
+    let mut cache = SuspectRuntimeCache::default();
+    cache.mark(runtime.clone(), elapsed, Some(&lease));
+    let mut moved = lease.clone();
+    moved.endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:17002".to_string(),
+    );
+    cache.reconcile_with_leases(&[moved]);
+    assert!(!cache.contains(&runtime));
 }
 
 #[test]

@@ -344,15 +344,20 @@ impl StoreClient {
             return;
         }
         let deadline = Instant::now() + DEFAULT_SUSPECT_RUNTIME_TTL;
+        let observed = self
+            .live_client_cache
+            .lock()
+            .snapshot()
+            .and_then(|leases| leases.into_iter().find(|lease| lease.runtime == *runtime));
         self.suspect_runtime_cache
             .lock()
-            .mark(runtime.clone(), deadline);
+            .mark(runtime.clone(), deadline, observed.as_ref());
         debug!(
             runtime = %self.lease.runtime,
             suspect_runtime = %runtime,
             context,
-            ttl_ms = DEFAULT_SUSPECT_RUNTIME_TTL.as_millis() as u64,
-            "marked runtime as temporarily suspect after remote failure"
+            quarantine_ms = DEFAULT_SUSPECT_RUNTIME_TTL.as_millis() as u64,
+            "marked runtime as suspect after remote failure"
         );
     }
 

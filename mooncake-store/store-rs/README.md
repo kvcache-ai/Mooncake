@@ -62,6 +62,7 @@ The implementation is easier to understand when grouped by capability instead of
 - metadata fallback when route authorities are unavailable
 - prewarmed membership snapshots with background lease refresh instead of request-path membership refresh
 - read fail-fast on suspect or offline owners while keeping draining owners readable during handoff
+- suspect owners stay quarantined until a fresh lease heartbeat or control-plane endpoint change proves recovery
 - cluster route policy bootstrap in metadata: the first client in a metadata keyspace publishes `route_control + route_topk`, later clients must match or fail startup
 
 ### Placement and Replication
@@ -88,7 +89,7 @@ The implementation is easier to understand when grouped by capability instead of
 - delete reclaim
 - configurable reclaim grace window
 - elastic segment expansion and retirement
-- metadata allocator fallback only for transport or unsupported control-plane failures
+- metadata allocator fallback only for unsupported control-plane endpoints; transport failures quarantine the owner and move to the next soft candidate
 
 ### Lifecycle and Membership
 
@@ -504,7 +505,7 @@ For single-host demos, leaving `transport_rpc_port` unset keeps the old random-p
 | `EmbeddedWrh` | Client-side weighted rendezvous chooses route owners and keeps route lookups off the metadata hot path | Yes |
 | `MetadataOnly` | Object routes are read and written directly from the metadata backend | No |
 
-In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `build(...)` and refreshes it in the background. Normal request paths reuse that shared snapshot instead of performing on-demand metadata refreshes. Read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners after remote failures, and best-effort prune unreadable replicas from stale routes when fallback succeeds.
+In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `build(...)` and refreshes it in the background. Normal request paths reuse that shared snapshot instead of performing on-demand metadata refreshes. Read paths keep `Draining` owners readable for handoff, fail fast on suspect or offline owners after remote failures, and best-effort prune unreadable replicas from stale routes when fallback succeeds. Suspect owners are not trusted again just because a local timer expires; they recover only after the membership snapshot observes a fresh lease heartbeat or a new control-plane endpoint.
 
 ## Observability
 
