@@ -892,4 +892,70 @@ const DataCopier& TieredBackend::GetDataCopier() const {
     return *data_copier_;
 }
 
+void TieredBackend::NotifyBucketEviction(
+    const std::vector<std::string>& evicted_keys, UUID storage_tier_id) {
+    for (const auto& key : evicted_keys) {
+        AllocationHandle handle_to_release;
+        bool found_tier = false;
+        bool need_cleanup = false;
+
+        // Remove the storage-tier replica under the narrowest possible lock
+        // scope (Global Read Lock + per-entry Write Lock), matching the pattern
+        // used by Delete(key, tier_id).
+        {
+            std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
+            auto it = metadata_index_.find(key);
+            if (it == metadata_index_.end()) {
+                // Key was already removed (e.g. logically deleted before the
+                // bucket was evicted).
+                continue;
+            }
+            auto entry = it->second;
+
+            std::unique_lock<std::shared_mutex> entry_write_lock(entry->mutex);
+            for (auto rep_it = entry->replicas.begin();
+                 rep_it != entry->replicas.end(); ++rep_it) {
+                if (rep_it->first == storage_tier_id) {
+                    handle_to_release = std::move(rep_it->second);
+                    entry->replicas.erase(rep_it);
+                    entry->version++;
+                    found_tier = true;
+                    break;
+                }
+            }
+            need_cleanup = found_tier && entry->replicas.empty();
+        }
+
+        // If the entry became empty, upgrade to a global write lock to remove
+        // the zombie entry from the index (same double-check pattern as
+        // Delete).
+        if (need_cleanup) {
+            std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
+            auto it = metadata_index_.find(key);
+            if (it != metadata_index_.end()) {
+                std::unique_lock<std::shared_mutex> entry_lock(
+                    it->second->mutex);
+                if (it->second->replicas.empty()) {
+                    metadata_index_.erase(it);
+                }
+            }
+        }
+
+        if (!found_tier) {
+            // Storage-tier replica not found (already cleaned up elsewhere).
+            continue;
+        }
+
+        // Release the handle outside all locks.
+        // ~AllocationEntry -> StorageTier::Free -> persisted_live_data_bytes_
+        // is decremented correctly per-key. MarkKeyDeleted is a no-op for keys
+        // already removed from object_bucket_map_ by EvictBucket.
+        handle_to_release = nullptr;
+
+        if (scheduler_) {
+            scheduler_->OnDelete(key, storage_tier_id);
+        }
+    }
+}
+
 }  // namespace mooncake
