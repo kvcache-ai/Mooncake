@@ -43,9 +43,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import sys
 import time
 from typing import Iterable
+from urllib.parse import urlsplit
 
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
@@ -61,24 +63,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--local_host",
+        "--local-host",
         required=True,
         help="Local data-plane endpoint, e.g. 192.168.0.158:17111",
     )
     parser.add_argument(
         "--transport_rpc_port",
+        "--transport-rpc-port",
         type=int,
         default=None,
         help="Override the TENT TCP data-plane port; defaults to the port embedded in --local_host",
     )
     parser.add_argument(
         "--metadata_url",
+        "--metadata-url",
         "--metadata_server",
+        "--metadata-server",
         dest="metadata_url",
         required=True,
         help="Metadata endpoint, e.g. redis://host:6379/0 or etcd://host:2379",
     )
     parser.add_argument(
         "--transport_metadata_url",
+        "--transport-metadata-url",
         default=None,
         help="Optional redis:// endpoint used by TENT when store metadata is etcd://",
     )
@@ -99,18 +106,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--storage-bytes",
+        "--storage_bytes",
+        "--global_segment_size",
         type=int,
-        default=0,
-        help="Local storage capacity in bytes; use 0 for rw-only clients (default: 0)",
+        default=None,
+        help=(
+            "Local storage capacity in bytes; use 0 for rw-only clients "
+            "(default: 0; also accepts legacy --global_segment_size)"
+        ),
     )
     parser.add_argument(
         "--scratch-bytes",
+        "--scratch_bytes",
+        "--local_buffer_size",
         type=int,
-        default=16 * 1024 * 1024,
-        help="Local scratch capacity in bytes (default: 16 MiB)",
+        default=None,
+        help=(
+            "Local scratch capacity in bytes (default: 16 MiB; "
+            "also accepts legacy --local_buffer_size)"
+        ),
     )
     parser.add_argument(
         "--stable-id",
+        "--stable_id",
         default=None,
         help="Optional stable client identity",
     )
@@ -132,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--route-control",
+        "--route_control",
         default="embedded_wrh",
         choices=["embedded_wrh", "metadata_only"],
         help="Route control mode (default: embedded_wrh)",
@@ -150,8 +169,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--key_prefix",
-        required=True,
-        help="Key prefix; keys become <prefix>-0, <prefix>-1, ...",
+        default=None,
+        help="Key prefix; keys become <prefix>-0, <prefix>-1, ...; optional in --mode idle",
     )
     parser.add_argument(
         "--mode",
@@ -173,20 +192,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--routed-writes",
+        "--routed_writes",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Enable cluster-routed writes (default: true)",
     )
     parser.add_argument(
         "--prefer-local",
+        "--prefer_local",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Prefer local storage owner during placement when available (default: true)",
     )
     parser.add_argument(
         "--with-soft-pin",
+        "--with_soft_pin",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Enable soft pin placement hints (default: true)",
     )
     parser.add_argument(
@@ -196,11 +218,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--evacuate-owned-replicas",
+        "--evacuate_owned_replicas",
         action="store_true",
         help="Run evacuate_owned_replicas() before exit",
     )
     parser.add_argument(
         "--hold-seconds",
+        "--hold_seconds",
         type=float,
         default=0.0,
         help="Keep the client alive after operations for the specified time",
@@ -212,8 +236,22 @@ def parse_args() -> argparse.Namespace:
         help="Additional client label in key=value form; may be passed multiple times",
     )
     args = parser.parse_args()
+    apply_compat_defaults(args)
     validate_args(args)
     return args
+
+
+def apply_compat_defaults(args: argparse.Namespace) -> None:
+    if args.storage_bytes is None:
+        args.storage_bytes = 0
+    if args.scratch_bytes is None:
+        args.scratch_bytes = 16 * 1024 * 1024
+    if args.routed_writes is None:
+        args.routed_writes = True
+    if args.prefer_local is None:
+        args.prefer_local = True
+    if args.with_soft_pin is None:
+        args.with_soft_pin = True
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -240,6 +278,8 @@ def validate_args(args: argparse.Namespace) -> None:
             "cross-host real-mode validation requires a fixed transport port; "
             "use --local_host host:port or --transport_rpc_port"
         )
+    if (args.mode in ("write", "read", "both") or args.delete) and not args.key_prefix:
+        raise SystemExit("--key_prefix is required unless --mode is idle")
     if args.mode in ("write", "both") and args.storage_bytes == 0 and not args.routed_writes:
         raise SystemExit(
             "rw-only writers require --routed-writes when --storage-bytes is 0"
@@ -326,6 +366,136 @@ def print_throughput(phase: str, item_count: int, value_size: int, elapsed: floa
 # ---------------------------------------------------------------------------
 # store operations
 # ---------------------------------------------------------------------------
+
+
+def apply_replication_config(
+    config: ReplicateConfig,
+    *,
+    replica_num: int,
+    prefer_local: bool,
+    with_soft_pin: bool,
+) -> None:
+    config.replica_num = replica_num
+    if hasattr(config, "prefer_local"):
+        config.prefer_local = prefer_local
+    if hasattr(config, "prefer_alloc_in_same_node"):
+        config.prefer_alloc_in_same_node = prefer_local
+    if hasattr(config, "with_soft_pin"):
+        config.with_soft_pin = with_soft_pin
+
+
+def setup_store(
+    store: MooncakeDistributedStore,
+    *,
+    local_hostname: str,
+    metadata_url: str,
+    storage_bytes: int,
+    scratch_bytes: int,
+    protocol: str,
+    device_names: str,
+    master_addr: str,
+    stable_id: str | None,
+    state: str,
+    tenant: str,
+    labels: dict[str, str],
+    routed_writes: bool,
+    replica_num: int,
+    keyspace: str | None,
+    transport_metadata_url: str | None,
+    transport_rpc_port: int | None,
+    route_control: str,
+) -> int:
+    modern_kwargs = {
+        "stable_id": stable_id,
+        "initial_state": state,
+        "tenant": tenant,
+        "labels": labels,
+        "routed_writes": routed_writes,
+        "replica_count": replica_num,
+        "keyspace": keyspace,
+        "transport_metadata_url": transport_metadata_url,
+        "transport_rpc_port": transport_rpc_port,
+        "route_control": route_control,
+    }
+    try:
+        return int(
+            store.setup(
+                local_hostname,
+                metadata_url,
+                storage_bytes,
+                scratch_bytes,
+                protocol,
+                device_names,
+                "",
+                **modern_kwargs,
+            )
+        )
+    except TypeError as error:
+        message = str(error)
+        if "incompatible function arguments" not in message:
+            raise
+        print("[WARN] setup() does not support store-rs kwargs; falling back to legacy API")
+        legacy_metadata_url = prepare_legacy_metadata_url(metadata_url)
+        legacy_master_addr = master_addr or legacy_metadata_url
+        return int(
+            store.setup(
+                local_hostname,
+                legacy_metadata_url,
+                storage_bytes,
+                scratch_bytes,
+                protocol,
+                device_names,
+                legacy_master_addr,
+            )
+        )
+
+
+def prepare_legacy_metadata_url(metadata_url: str) -> str:
+    if not metadata_url.startswith("redis://"):
+        return metadata_url
+    parts = urlsplit(metadata_url)
+    if parts.hostname is None:
+        return metadata_url
+
+    legacy_netloc = parts.hostname
+    if parts.port is not None:
+        legacy_netloc = f"{legacy_netloc}:{parts.port}"
+
+    if parts.username:
+        existing_user = os.environ.get("MC_REDIS_USERNAME")
+        if not existing_user:
+            os.environ["MC_REDIS_USERNAME"] = parts.username
+        elif existing_user != parts.username:
+            print(
+                "[WARN] MC_REDIS_USERNAME already set; ignoring username embedded in metadata_url"
+            )
+
+    if parts.password:
+        existing_password = os.environ.get("MC_REDIS_PASSWORD")
+        if not existing_password:
+            os.environ["MC_REDIS_PASSWORD"] = parts.password
+        elif existing_password != parts.password:
+            print(
+                "[WARN] MC_REDIS_PASSWORD already set; ignoring password embedded in metadata_url"
+            )
+
+    db_path = parts.path or ""
+    if db_path not in ("", "/"):
+        db_index = db_path[1:] if db_path.startswith("/") else db_path
+        if db_index.isdigit():
+            existing_index = os.environ.get("MC_REDIS_DB_INDEX")
+            if not existing_index:
+                os.environ["MC_REDIS_DB_INDEX"] = db_index
+            elif existing_index != db_index:
+                print(
+                    "[WARN] MC_REDIS_DB_INDEX already set; ignoring db index embedded in metadata_url"
+                )
+        else:
+            print(
+                f"[WARN] legacy Mooncake may not support redis metadata path {db_path!r}"
+            )
+
+    return f"redis://{legacy_netloc}"
 
 
 def write_all(store, keys_vals, batch_size: int, config: ReplicateConfig):
@@ -419,9 +589,12 @@ def main() -> int:
 
     store = MooncakeDistributedStore()
     config = ReplicateConfig()
-    config.replica_num = args.replica_num
-    config.prefer_local = args.prefer_local
-    config.with_soft_pin = args.with_soft_pin
+    apply_replication_config(
+        config,
+        replica_num=args.replica_num,
+        prefer_local=args.prefer_local,
+        with_soft_pin=args.with_soft_pin,
+    )
 
     print("[INFO] Setting up RealClient...")
     print(f"  local_host:          {args.local_host}")
@@ -437,6 +610,7 @@ def main() -> int:
     print(f"  stable_id:           {args.stable_id}")
     print(f"  tenant:              {args.tenant}")
     print(f"  keyspace:            {args.keyspace}")
+    print(f"  key_prefix:          {args.key_prefix or '<unused>'}")
     print(f"  labels:              {labels}")
     print(f"  mode:                {args.mode}")
     print(f"  batch_size:          {args.batch_size}")
@@ -444,20 +618,21 @@ def main() -> int:
     print(f"  prefer_local:        {args.prefer_local}")
     print(f"  with_soft_pin:       {args.with_soft_pin}")
 
-    rc = store.setup(
-        local_hostname,
-        args.metadata_url,
-        args.storage_bytes,
-        args.scratch_bytes,
-        args.protocol,
-        args.device_names,
-        "",
+    rc = setup_store(
+        store,
+        local_hostname=local_hostname,
+        metadata_url=args.metadata_url,
+        storage_bytes=args.storage_bytes,
+        scratch_bytes=args.scratch_bytes,
+        protocol=args.protocol,
+        device_names=args.device_names,
+        master_addr=args.master_addr,
         stable_id=args.stable_id,
-        initial_state=args.state,
+        state=args.state,
         tenant=args.tenant,
         labels=labels,
         routed_writes=args.routed_writes,
-        replica_count=args.replica_num,
+        replica_num=args.replica_num,
         keyspace=args.keyspace,
         transport_metadata_url=args.transport_metadata_url,
         transport_rpc_port=transport_rpc_port,
@@ -466,7 +641,11 @@ def main() -> int:
     if int(rc) != 0:
         raise RuntimeError(f"setup failed status={rc}")
 
-    keys = [f"{args.key_prefix}-{index}" for index in range(args.num_kv)]
+    keys = (
+        [f"{args.key_prefix}-{index}" for index in range(args.num_kv)]
+        if args.key_prefix
+        else []
+    )
 
     try:
         if args.mode in ("write", "both"):
