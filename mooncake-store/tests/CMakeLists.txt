@@ -84,43 +84,28 @@ add_executable(high_availability_test ha/leadership/high_availability_test.cpp)
 target_include_directories(high_availability_test PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR})
 if(STORE_USE_REDIS)
-  target_sources(high_availability_test PRIVATE
-                 ha/leadership/backends/redis/high_availability_redis_test.cpp)
-  target_include_directories(high_availability_test PRIVATE
-                             ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-  target_link_libraries(high_availability_test PRIVATE
-                        ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    target_sources(high_availability_test PRIVATE
+        ha/leadership/backends/redis/high_availability_redis_test.cpp)
+    target_include_directories(high_availability_test PRIVATE
+        ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+    target_link_libraries(high_availability_test PRIVATE
+        ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 
-  add_executable(redis_snapshot_catalog_store_test
-                 ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
-  target_include_directories(redis_snapshot_catalog_store_test PRIVATE
-                             ${CMAKE_CURRENT_SOURCE_DIR}
-                             ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-  target_link_libraries(redis_snapshot_catalog_store_test
-                        PUBLIC mooncake_store
-                               transfer_engine
-                               cachelib_memory_allocator
-                               ${ETCD_WRAPPER_LIB}
-                               glog
-                               gflags
-                               ibverbs
-                               gtest
-                               pthread
-                        PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
-  add_test(NAME redis_snapshot_catalog_store_test
-           COMMAND redis_snapshot_catalog_store_test)
+    add_executable(redis_snapshot_catalog_store_test
+                   ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
+    target_include_directories(redis_snapshot_catalog_store_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+    target_link_libraries(redis_snapshot_catalog_store_test
+        PUBLIC mooncake_store transfer_engine cachelib_memory_allocator
+               ${ETCD_WRAPPER_LIB} glog gflags ibverbs gtest pthread
+        PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    add_test(NAME redis_snapshot_catalog_store_test
+             COMMAND redis_snapshot_catalog_store_test)
 endif()
-target_link_libraries(high_availability_test
-                      PUBLIC mooncake_store
-                             transfer_engine
-                             cachelib_memory_allocator
-                             ${ETCD_WRAPPER_LIB}
-                             glog
-                             gtest
-                             gtest_main
-                             pthread)
-if(STORE_USE_ETCD OR STORE_USE_REDIS)
-  add_test(NAME high_availability_test COMMAND high_availability_test)
+target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
+if (STORE_USE_ETCD OR STORE_USE_REDIS)
+    add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 
 add_executable(stress_workload_test stress_workload_test.cpp)
