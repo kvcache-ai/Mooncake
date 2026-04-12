@@ -2,6 +2,7 @@ mod exporter;
 mod process;
 pub(crate) mod registry;
 
+use is_terminal::IsTerminal;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -119,10 +120,13 @@ pub fn init_tracing(filter: Option<&str>) -> Result<()> {
         None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     };
 
+    let use_ansi = std::io::stdout().is_terminal();
+
     let subscriber = fmt()
         .with_env_filter(env_filter)
         .with_target(true)
         .with_thread_ids(true)
+        .with_ansi(use_ansi)
         .with_span_events(FmtSpan::CLOSE);
 
     match subscriber.try_init() {
