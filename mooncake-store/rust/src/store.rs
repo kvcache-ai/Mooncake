@@ -534,6 +534,7 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 4,
             with_soft_pin: true,
+            with_hard_pin: false,
             preferred_segments: vec!["x".to_string(), "y".to_string()],
         };
 
