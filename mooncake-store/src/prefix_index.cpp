@@ -345,21 +345,6 @@ void PrefixIndex::insert_locked(const std::string& key, uint64_t size,
         return;
     }
 
-    // Entire key was consumed by traversal (key is a prefix of an
-    // existing longer key). Mark current node as terminal.
-    if (current->is_terminal()) {
-        // Duplicate — update leaf_data (same logic as above).
-        uint64_t old_size = current->leaf_data->size;
-        current->leaf_data = TrieLeafData{size, client_id};
-        if (size > old_size) {
-            increment_ancestors(current, 0, size - old_size);
-        } else if (size < old_size) {
-            decrement_ancestors(current, 0, old_size - size);
-        }
-    } else {
-        current->leaf_data = TrieLeafData{size, client_id};
-        increment_ancestors(current, 1, size);
-    }
 }
 
 void PrefixIndex::remove_locked(const std::string& key) {
@@ -399,14 +384,6 @@ void PrefixIndex::remove_locked(const std::string& key) {
         current = child;
     }
 
-    // Key was consumed at current node (e.g. "ab" when "ab" is terminal
-    // and "abcdef" also exists).
-    if (current->is_terminal()) {
-        uint64_t removed_size = current->leaf_data->size;
-        current->leaf_data.reset();
-        decrement_ancestors(current, 1, removed_size);
-        cascade_cleanup(current);
-    }
 }
 
 void PrefixIndex::cascade_cleanup(std::shared_ptr<RadixNode> node) {
