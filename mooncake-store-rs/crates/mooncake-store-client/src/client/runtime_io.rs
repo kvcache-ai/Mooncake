@@ -655,23 +655,22 @@ impl StoreClient {
                         object.key
                     )));
                 }
-                let (replica, readable_for_route) = match self
-                    .select_readable_replica(&route, &readable_runtimes)
-                {
-                    Some(replica) => (replica, readable_runtimes.clone()),
-                    None => {
-                        let refreshed_readable = self.readable_runtime_set(true)?;
-                        let replica = self
-                            .select_readable_replica(&route, &refreshed_readable)
-                            .ok_or_else(|| {
-                                StoreError::NotFound(format!(
-                                    "tenant={tenant} key={} has no readable replica owner",
-                                    object.key
-                                ))
-                            })?;
-                        (replica, refreshed_readable)
-                    }
-                };
+                let (replica, readable_for_route) =
+                    match self.select_readable_replica(&route, &readable_runtimes) {
+                        Some(replica) => (replica, readable_runtimes.clone()),
+                        None => {
+                            let refreshed_readable = self.readable_runtime_set(true)?;
+                            let replica = self
+                                .select_readable_replica(&route, &refreshed_readable)
+                                .ok_or_else(|| {
+                                    StoreError::NotFound(format!(
+                                        "tenant={tenant} key={} has no readable replica owner",
+                                        object.key
+                                    ))
+                                })?;
+                            (replica, refreshed_readable)
+                        }
+                    };
                 if route
                     .replicas
                     .iter()
@@ -695,7 +694,15 @@ impl StoreClient {
                 "resolved object routes"
             );
         }
-        tracker.finish(&result, 0);
+        tracker.finish_with_result(
+            match &result {
+                Ok(_) => "ok",
+                Err(StoreError::NotFound(_)) => "miss",
+                Err(StoreError::Conflict(_)) => "conflict",
+                Err(_) => "error",
+            },
+            0,
+        );
         result
     }
 
@@ -936,7 +943,10 @@ impl StoreClient {
                 continue;
             };
             let routes = routes.into_values().collect::<Vec<_>>();
-            if let Err(error) = self.control_client.batch_track_replica_routes(lease, &routes) {
+            if let Err(error) = self
+                .control_client
+                .batch_track_replica_routes(lease, &routes)
+            {
                 debug!(
                     runtime = %self.lease.runtime,
                     storage_owner = %owner,
@@ -1156,11 +1166,7 @@ impl StoreClient {
             "executed remote direct get fallback"
         );
         if let Err(error) = &result {
-            self.note_remote_read_failure(
-                &[resolved],
-                error,
-                "remote_direct_get_failed",
-            );
+            self.note_remote_read_failure(&[resolved], error, "remote_direct_get_failed");
         }
         tracker.finish(&result, length as u64);
         if result.is_ok() {
