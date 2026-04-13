@@ -818,21 +818,13 @@ auto MasterService::AllocateAndInsertMetadata(
         }
 
         // Select allocation strategy based on preferred_storage_level
-        // - CXL storage level always uses CxlAllocationStrategy
-        // - RAM storage level uses the configured allocation strategy (RANDOM
-        // or FREE_RATIO_FIRST)
-        std::shared_ptr<AllocationStrategy> strategy;
-        if (enable_cxl_) {
-            // When CXL is enabled, choose strategy based on storage level
-            if (config.preferred_storage_level == StorageLevel::CXL) {
-                strategy = cxl_allocation_strategy_;
-            } else if (config.preferred_storage_level == StorageLevel::RAM) {
-                strategy = allocation_strategy_;
-            }
-        } else {
-            // When CXL is not enabled, use the configured RAM allocation
-            // strategy
-            strategy = allocation_strategy_;
+        // - CXL storage level uses CxlAllocationStrategy when CXL is enabled
+        // - RAM storage level uses the configured
+        // allocation strategy (RANDOM or FREE_RATIO_FIRST)
+        std::shared_ptr<AllocationStrategy> strategy = allocation_strategy_;
+        if (enable_cxl_ &&
+            config.preferred_storage_level == StorageLevel::CXL) {
+            strategy = cxl_allocation_strategy_;
         }
 
         auto allocation_result =

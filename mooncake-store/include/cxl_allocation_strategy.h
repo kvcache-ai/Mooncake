@@ -39,8 +39,9 @@ class CxlAllocationStrategy : public AllocationStrategy {
         // CXL is a global shared memory segment, only single replica is
         // supported
         if (replica_num > 1) {
-            LOG(WARNING) << "CXL allocation only supports single replica, "
-                         << "requested " << replica_num << " will be ignored.";
+            LOG(ERROR) << "CXL allocation only supports single replica, "
+                       << "requested " << replica_num;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         if (preferred_segments.empty()) {

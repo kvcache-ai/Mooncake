@@ -2339,8 +2339,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(
                 buffer_map;
             buffer_map[protocol].emplace_back((void*)buffer, size, location,
                                               true, true);
-            int rc = transfer_engine_->mp_registerLocalMemory(
-                buffer_map);  // ← 放这里
+            int rc = transfer_engine_->mp_registerLocalMemory(buffer_map);
             if (rc != 0) {
                 LOG(ERROR) << "register_local_memory_failed base=" << buffer
                            << " size=" << size << ", error=" << rc;
@@ -2350,7 +2349,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 #endif
         {
             int rc = transfer_engine_->registerLocalMemory(
-                (void*)buffer, size, location, true, true);  // ← 放这里
+                (void*)buffer, size, location, true, true);
             if (rc != 0) {
                 LOG(ERROR) << "register_local_memory_failed base=" << buffer
                            << " size=" << size << ", error=" << rc;
