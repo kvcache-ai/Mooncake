@@ -224,6 +224,7 @@ Use these environment variables for SGLang real mode:
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
 - `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_EPOCH`, `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+- `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 
 `MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
 
@@ -446,7 +447,7 @@ Port roles stay the same across backends:
 
 - `transport_rpc_port` is the real data-plane TCP port published to peer real clients
 - `client_server_address` is the dummy compatibility gRPC port
-- `metrics_addr` is the Prometheus `/metrics` listener
+- `metrics_addr` / `MC_STORE_RS_METRICS_ADDR` is the Prometheus `/metrics` listener
 
 ## Routing Modes
 

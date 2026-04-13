@@ -305,7 +305,9 @@ class MooncakeDistributedStore:
             args[0] = local_hostname
             if transport_rpc_port is not None and "transport_rpc_port" not in kwargs:
                 kwargs["transport_rpc_port"] = transport_rpc_port
-        return self._invoke("setup", *args, **kwargs)
+        result = self._invoke("setup", *args, **kwargs)
+        _start_metrics_server_from_env()
+        return result
     def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str):
         return self._invoke("setup_dummy", mem_pool_size, local_buffer_size, server_address)
 
@@ -581,7 +583,7 @@ class MooncakeDistributedStore:
         initial_state = _coerce_optional_str(
             config.get("initial_state", config.get("state"))
         ) or "active"
-        return self._invoke(
+        result = self._invoke(
             "setup",
             local_hostname,
             str(metadata_url),
@@ -610,6 +612,8 @@ class MooncakeDistributedStore:
             hugepage_size=_normalize_hugepage_size(config.get("hugepage_size")),
             route_control=str(config.get("route_control", "embedded_wrh")),
         )
+        _start_metrics_server_from_env()
+        return result
 
 def _replication_kwargs(config) -> dict:
     if config is None:
@@ -778,6 +782,15 @@ def _labels_from_env() -> dict[str, str] | None:
             )
         labels[key.strip()] = label_value.strip()
     return labels or None
+
+def _start_metrics_server_from_env() -> str | None:
+    bind_addr = os.environ.get("MC_STORE_RS_METRICS_ADDR")
+    if not _has_value(bind_addr):
+        return None
+    existing = _native.metrics_server_address()
+    if existing is not None:
+        return existing
+    return _native.start_metrics_server(str(bind_addr).strip())
 
 def _normalize_raw_multi_buffer_args(
     keys: Sequence[str],

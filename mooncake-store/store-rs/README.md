@@ -397,6 +397,7 @@ Use these environment variables for SGLang real mode:
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
 - `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_EPOCH`, `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+- `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 
 `MC_STORE_RS_LABELS` accepts either a JSON object or comma-separated `key=value` pairs, for example `MC_STORE_RS_LABELS='storage=false,pool=rw'`.
 
@@ -675,6 +676,7 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 ### Metrics
 
 - `MC_STORE_RS_METRICS_ADDR=127.0.0.1:9090`
+- Python real clients auto-start the in-process `/metrics` endpoint after `setup(...)` when `MC_STORE_RS_METRICS_ADDR` is set
 - `render_prometheus_metrics()` returns a text snapshot
 - `start_metrics_http_server()` exposes `/metrics` and `/healthz`
 - host-level CPU, disk, and network remain the responsibility of `node_exporter` / `cAdvisor`
