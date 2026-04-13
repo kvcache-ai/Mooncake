@@ -508,7 +508,23 @@ impl StoreClient {
 
     fn sync_route_to_live_authorities(&self, route: &ObjectRoute) -> Result<()> {
         for authority in self.route_scan_authorities()? {
-            self.replace_route_on_authority(&authority, route)?;
+            match self.replace_route_on_authority(&authority, route) {
+                Ok(()) => {}
+                Err(error) if authority.runtime != self.lease.runtime => {
+                    self.mark_runtime_suspect(
+                        &authority.runtime,
+                        "route_sync_authority_replace_failed",
+                    );
+                    warn!(
+                        runtime = %self.lease.runtime,
+                        authority = %authority.runtime,
+                        key = %route.key.0,
+                        error = %error,
+                        "route authority sync failed during migration; continuing with metadata-visible route"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

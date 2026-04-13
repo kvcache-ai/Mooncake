@@ -5320,6 +5320,150 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
 }
 
 #[test]
+fn true_client_shrink_ignores_unreachable_route_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("shrink-dead-auth-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("shrink-dead-auth-b-segment"));
+    let router_transport = Arc::new(store_a_transport.peer("shrink-dead-auth-router-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("shrink-dead-auth-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "shrink-dead-auth-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "shrink-dead-auth-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "shrink-dead-auth-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "shrink-dead-auth-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "shrink-dead-auth-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route_scope", "shrink-dead-auth-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "shrink-dead-auth-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route_scope", "shrink-dead-auth-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+
+    wait_for_membership_convergence(&[&store_a, &store_b, &router, &reader]);
+
+    let mut expected = BTreeMap::new();
+    let mut owned_keys = Vec::new();
+    for index in 0..32 {
+        let key = format!("shrink-dead-auth-key-{index}");
+        let value = format!("value-{index:02}").into_bytes();
+        router
+            .put_with_policy(&key, &value, &ReplicationPolicy::new().prefer_local(false))
+            .expect("seed routed put should succeed");
+        let route = router
+            .query_route(&key)
+            .expect("route query should succeed")
+            .expect("seed route should exist");
+        if route.replicas[0].owner == *store_a.runtime_id() {
+            expected.insert(key.clone(), value);
+            owned_keys.push(key);
+        }
+    }
+    assert!(
+        !owned_keys.is_empty(),
+        "expected at least one object to land on store-a"
+    );
+
+    let mut endpoints = ClientEndpointSet {
+        rpc_address: "127.0.0.1:1".to_string(),
+        segment_name: Some(SegmentName::new("shrink-dead-auth-dead-segment")),
+        labels: BTreeMap::new(),
+    };
+    endpoints
+        .labels
+        .insert("pool".to_string(), "pool-a".to_string());
+    endpoints
+        .labels
+        .insert("storage".to_string(), "false".to_string());
+    endpoints
+        .labels
+        .insert("route".to_string(), "true".to_string());
+    endpoints.labels.insert(
+        "route_scope".to_string(),
+        "shrink-dead-auth-scope".to_string(),
+    );
+    endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:1".to_string(),
+    );
+    metadata
+        .upsert_client_lease(&ClientLease {
+            runtime: ClientRuntimeId::new("shrink-dead-auth-dead", ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: router.lease().compatibility.clone(),
+            endpoints,
+            expires_at_ms: test_future_expiry_ms(),
+        })
+        .expect("dead authority lease should publish");
+
+    let migrated = store_a
+        .evacuate_owned_replicas()
+        .expect("true client shrink should ignore unreachable mirrored authorities");
+    assert_eq!(migrated, owned_keys.len());
+
+    for key in owned_keys {
+        let route = router
+            .query_route(&key)
+            .expect("post-shrink route query should succeed")
+            .expect("post-shrink route should exist");
+        assert!(
+            route
+                .replicas
+                .iter()
+                .all(|replica| replica.owner != *store_a.runtime_id()),
+            "post-shrink route still references evacuated runtime"
+        );
+        assert_eq!(
+            reader.get(&key).expect("reader get should succeed"),
+            expected[&key]
+        );
+    }
+}
+
+#[test]
 fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();

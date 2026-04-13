@@ -14,7 +14,7 @@ use mooncake_store_core::{
 };
 use mooncake_transport::{Opcode, TentEngine, TransferRequest};
 use parking_lot::Mutex;
-use tracing::{debug, info, info_span};
+use tracing::{debug, info, info_span, warn};
 
 use crate::control_plane::{
     control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
