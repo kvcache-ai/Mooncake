@@ -26,6 +26,7 @@ AsyncMetadataNotifier::AsyncMetadataNotifier(P2PMasterClient& master_client,
     for (size_t i = 0; i < sender_thread_count_; ++i) {
         auto shard = std::make_unique<SenderShard>();
         shard->capacity = per_shard;
+        shard->normal_reserved = per_shard / 4;
         shard->slots.resize(per_shard);
         shard->free_stack.reserve(per_shard);
         for (size_t j = 0; j < per_shard; ++j) {
@@ -56,10 +57,14 @@ void AsyncMetadataNotifier::Start() {
     }
 }
 
-void AsyncMetadataNotifier::Stop() {
+void AsyncMetadataNotifier::Stop(bool drop_pending) {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false)) {
         return;  // not running
+    }
+
+    if (drop_pending) {
+        drop_on_stop_.store(true, std::memory_order_release);
     }
 
     // Wake all sender threads (both shard CVs and stop CV for retry sleeps)
@@ -81,7 +86,7 @@ void AsyncMetadataNotifier::Stop() {
     for (auto& shard : shards_) {
         ResetShard(*shard);
     }
-    // Reset circuit breaker for next Start cycle
+    drop_on_stop_.store(false, std::memory_order_release);
     consecutive_rpc_failures_.store(0, std::memory_order_release);
 
     LOG(INFO) << "AsyncMetadataNotifier stopped";
@@ -89,13 +94,16 @@ void AsyncMetadataNotifier::Stop() {
 
 void AsyncMetadataNotifier::ResetShard(SenderShard& shard) {
     std::lock_guard<std::mutex> lock(shard.mutex);
-    if (shard.count > 0) {
-        LOG(WARNING) << "AsyncMetadataNotifier: discarding " << shard.count
-                     << " pending ops on reset";
+    if (!shard.IsEmpty()) {
+        LOG(WARNING) << "AsyncMetadataNotifier: discarding "
+                     << shard.normal_count << " normal + "
+                     << shard.recovery_count << " recovery pending ops";
     }
-    shard.list_head = InvalidIdx;
-    shard.list_tail = InvalidIdx;
-    shard.count = 0;
+    shard.normal_head = shard.normal_tail = InvalidIdx;
+    shard.normal_count = 0;
+    shard.recovery_head = shard.recovery_tail = InvalidIdx;
+    shard.recovery_count = 0;
+    shard.recovery_in_flight = 0;
     shard.free_stack.clear();
     for (size_t i = 0; i < shard.capacity; ++i) {
         shard.slots[i] = Slot{};
@@ -104,6 +112,10 @@ void AsyncMetadataNotifier::ResetShard(SenderShard& shard) {
     shard.coalesce_index.clear();
 }
 
+// ============================================================================
+// Enqueue
+// ============================================================================
+
 tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueAdd(
     const std::string& key, const UUID& segment_id, size_t size) {
     PendingOp op;
@@ -111,7 +123,7 @@ tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueAdd(
     op.key = key;
     op.segment_id = segment_id;
     op.size = size;
-    return DoEnqueue(std::move(op));
+    return DoEnqueue(std::move(op), /*is_recovery=*/false);
 }
 
 tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueRemove(
@@ -120,10 +132,21 @@ tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueRemove(
     op.type = PendingOp::REMOVE;
     op.key = key;
     op.segment_id = segment_id;
-    return DoEnqueue(std::move(op));
+    return DoEnqueue(std::move(op), /*is_recovery=*/false);
 }
 
-tl::expected<void, ErrorCode> AsyncMetadataNotifier::DoEnqueue(PendingOp&& op) {
+tl::expected<void, ErrorCode> AsyncMetadataNotifier::EnqueueRecoveryAdd(
+    const std::string& key, const UUID& segment_id, size_t size) {
+    PendingOp op;
+    op.type = PendingOp::ADD;
+    op.key = key;
+    op.segment_id = segment_id;
+    op.size = size;
+    return DoEnqueue(std::move(op), /*is_recovery=*/true);
+}
+
+tl::expected<void, ErrorCode> AsyncMetadataNotifier::DoEnqueue(
+    PendingOp&& op, bool is_recovery) {
     if (!running_.load(std::memory_order_acquire)) {
         LOG(WARNING)
             << "AsyncMetadataNotifier has stopped, fail to enqueue key="
@@ -137,8 +160,13 @@ tl::expected<void, ErrorCode> AsyncMetadataNotifier::DoEnqueue(PendingOp&& op) {
 
     std::unique_lock<std::mutex> lock(shard.mutex);
 
-    // 1. Wait if pool is full
-    if (shard.IsFull()) {
+    // 1. Handle full pool
+    if (is_recovery ? shard.IsFullForRecovery() : shard.IsFull()) {
+        if (is_recovery) {
+            // Recovery: non-blocking, caller retries with sleep
+            return tl::unexpected(ErrorCode::ASYNC_ENQUEUE_FAILED);
+        }
+        // Normal: block until space available
         bool ok = shard.producer_cv.wait_for(lock, EnqueueTimeout, [&] {
             return !shard.IsFull() || !running_.load(std::memory_order_relaxed);
         });
@@ -165,29 +193,35 @@ tl::expected<void, ErrorCode> AsyncMetadataNotifier::DoEnqueue(PendingOp&& op) {
     // 2b. Opposite-type op pending — cancel it
     if (op.type == PendingOp::ADD && entry.remove_idx != InvalidIdx) {
         // Cancel the pending REMOVE, don't insert this ADD
-        shard.Unlink(entry.remove_idx);
-        shard.FreeSlot(entry.remove_idx);
+        size_t cancel_idx = entry.remove_idx;
+        bool was_recovery = shard.slots[cancel_idx].is_recovery;
+        shard.Unlink(cancel_idx);
+        shard.FreeSlot(cancel_idx);
         entry.remove_idx = InvalidIdx;
         shard.coalesce_index.erase(ci);
         lock.unlock();
         shard.producer_cv.notify_one();
+        if (was_recovery) shard.recovery_drain_cv.notify_all();
         return {};
     }
     if (op.type == PendingOp::REMOVE && entry.add_idx != InvalidIdx) {
         // Cancel the pending ADD, don't insert this REMOVE
-        shard.Unlink(entry.add_idx);
-        shard.FreeSlot(entry.add_idx);
+        size_t cancel_idx = entry.add_idx;
+        bool was_recovery = shard.slots[cancel_idx].is_recovery;
+        shard.Unlink(cancel_idx);
+        shard.FreeSlot(cancel_idx);
         entry.add_idx = InvalidIdx;
         shard.coalesce_index.erase(ci);
         lock.unlock();
         shard.producer_cv.notify_one();
+        if (was_recovery) shard.recovery_drain_cv.notify_all();
         return {};
     }
 
     // 3. No coalescing: alloc slot, write data, link to tail
     size_t idx = shard.AllocSlot();
     shard.slots[idx].op = std::move(op);
-    shard.LinkTail(idx);
+    shard.LinkTail(idx, is_recovery);
 
     if (shard.slots[idx].op.type == PendingOp::ADD) {
         entry.add_idx = idx;
@@ -200,14 +234,15 @@ tl::expected<void, ErrorCode> AsyncMetadataNotifier::DoEnqueue(PendingOp&& op) {
     return {};
 }
 
+// ============================================================================
+// Sender
+// ============================================================================
+
 void AsyncMetadataNotifier::SenderLoop(size_t shard_idx) {
     auto& shard = *shards_[shard_idx];
     auto& batch = batch_buffers_[shard_idx];
 
     while (true) {
-        // Circuit breaker: cool down then fall through to attempt send.
-        // Must NOT continue — at least one thread must attempt SendBatch
-        // so that RecordSuccess() can close the breaker.
         if (running_.load(std::memory_order_acquire) && IsPaused()) {
             std::unique_lock<std::mutex> lock(shard.mutex);
             shard.sender_cv.wait_for(lock, CircuitBreakerCooldown, [&] {
@@ -215,34 +250,73 @@ void AsyncMetadataNotifier::SenderLoop(size_t shard_idx) {
             });
         }
 
-        size_t n = CollectBatch(shard, batch);
+        auto [n, recovery_n] = CollectBatch(shard, batch);
 
         if (n == 0) {
-            if (!running_.load(std::memory_order_acquire)) {
-                // Draining: exit if queue is empty
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                if (shard.IsEmpty()) {
-                    break;
-                }
-            }
+            if (!running_.load(std::memory_order_acquire)) break;
             continue;
         }
 
         SendBatch(batch, n);
+
+        // Decrement recovery_in_flight after the batch is actually sent.
+        // Notify WaitForRecoveryDrain when all recovery ops are drained.
+        if (recovery_n > 0) {
+            std::lock_guard<std::mutex> lk(shard.mutex);
+            shard.recovery_in_flight -= recovery_n;
+            if (shard.recovery_in_flight == 0 && shard.recovery_count == 0) {
+                shard.recovery_drain_cv.notify_all();
+            }
+        }
     }
 }
 
-size_t AsyncMetadataNotifier::CollectBatch(SenderShard& shard,
-                                           std::vector<PendingOp>& batch_out) {
+std::pair<size_t, size_t> AsyncMetadataNotifier::CollectBatch(
+    SenderShard& shard, std::vector<PendingOp>& batch_out) {
     std::unique_lock<std::mutex> lock(shard.mutex);
 
     shard.sender_cv.wait_for(lock, BatchTimeout, [&] {
         return !shard.IsEmpty() || !running_.load(std::memory_order_relaxed);
     });
 
+    // drop mode: don't collect any more batches — let the sender exit cleanly
+    if (drop_on_stop_.load(std::memory_order_relaxed)) {
+        return {0, 0};
+    }
+
+    // Phase 1: collect from normal queue (high priority)
+    size_t collected =
+        CollectFromList(shard, batch_out, 0, max_batch_size_, false);
+    // Phase 2: fill remaining from recovery queue (low priority)
+    size_t remaining = max_batch_size_ - collected;
+    size_t recovery_collected = 0;
+    if (remaining > 0) {
+        recovery_collected =
+            CollectFromList(shard, batch_out, collected, remaining, true);
+        collected += recovery_collected;
+    }
+
+    if (collected > 0) {
+        if (recovery_collected > 0) {
+            shard.recovery_in_flight += recovery_collected;
+        }
+        lock.unlock();
+        shard.producer_cv.notify_all();
+    }
+
+    return {collected, recovery_collected};
+}
+
+size_t AsyncMetadataNotifier::CollectFromList(SenderShard& shard,
+                                              std::vector<PendingOp>& batch_out,
+                                              size_t offset, size_t max_count,
+                                              bool from_recovery) {
+    auto& head = from_recovery ? shard.recovery_head : shard.normal_head;
+    auto& count = from_recovery ? shard.recovery_count : shard.normal_count;
+
     size_t collected = 0;
-    while (!shard.IsEmpty() && collected < max_batch_size_) {
-        size_t idx = shard.list_head;
+    while (count > 0 && collected < max_count) {
+        size_t idx = head;
         auto& slot = shard.slots[idx];
 
         // Remove from coalesce index
@@ -260,16 +334,11 @@ size_t AsyncMetadataNotifier::CollectBatch(SenderShard& shard,
             }
         }
 
-        batch_out[collected++] = std::move(slot.op);
+        batch_out[offset + collected] = std::move(slot.op);
         shard.Unlink(idx);
         shard.FreeSlot(idx);
+        collected++;
     }
-
-    if (collected > 0) {
-        lock.unlock();
-        shard.producer_cv.notify_all();
-    }
-
     return collected;
 }
 
@@ -377,6 +446,34 @@ void AsyncMetadataNotifier::RecordFailure() {
         }
         // old_val updated by CAS, retry
     }
+}
+
+bool AsyncMetadataNotifier::WaitForRecoveryDrain(
+    const std::function<bool()>& abort_fn, std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    // Wait for each shard's recovery queue to drain independently.
+    for (size_t i = 0; i < sender_thread_count_; ++i) {
+        auto& shard = *shards_[i];
+        std::unique_lock<std::mutex> lock(shard.mutex);
+        while (shard.recovery_count > 0 || shard.recovery_in_flight > 0) {
+            if (abort_fn && abort_fn()) return false;
+
+            auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::milliseconds::zero()) {
+                LOG(WARNING) << "WaitForRecoveryDrain timed out, shard=" << i
+                             << ", remaining_count=" << shard.recovery_count;
+                return false;
+            }
+
+            auto wait_time = std::min(
+                remaining,
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::milliseconds(100)));
+            shard.recovery_drain_cv.wait_for(lock, wait_time);
+        }
+    }
+    return true;
 }
 
 }  // namespace mooncake

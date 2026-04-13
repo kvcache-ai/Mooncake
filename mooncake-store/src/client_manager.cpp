@@ -218,6 +218,8 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
         }
     }
 
+    OnClientRegistered(meta);
+
     SharedMutexLocker lock(&clients_mutex_);
     // Write to client_metas_ (overwrites if re-registering after crash)
     client_metas_[client_id] = std::move(meta);

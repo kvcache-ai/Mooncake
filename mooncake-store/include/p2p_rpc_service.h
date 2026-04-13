@@ -29,6 +29,8 @@ class WrappedP2PMasterService final : public WrappedMasterService {
     BatchSyncReplicaResponse BatchSyncReplica(
         const BatchSyncReplicaRequest& req);
 
+    tl::expected<void, ErrorCode> SetSyncCompleted(UUID client_id);
+
    private:
     P2PMasterService master_service_;
 };

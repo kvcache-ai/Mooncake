@@ -46,6 +46,11 @@ class P2PMasterService : public MasterService {
     auto BatchSyncReplica(const BatchSyncReplicaRequest& req)
         -> BatchSyncReplicaResponse;
 
+    /**
+     * @brief Client notifies Master that metadata sync is complete
+     */
+    auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
+
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
         const ObjectMetadata& metadata) override;

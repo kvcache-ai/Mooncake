@@ -391,6 +391,7 @@ class ClientService {
     /**
      * @brief Handles a successful heartbeat response.
      * Triggers async RegisterClient if master reports UNDEFINED status.
+     * Fires MASTER_RECONNECTED if connection_interrupted_ was set.
      * @return true if heartbeat was successfully processed.
      */
     bool HandleHeartbeatResponse(const HeartbeatResponse& response,
@@ -426,6 +427,12 @@ class ClientService {
      */
     virtual tl::expected<RegisterClientResponse, ErrorCode>
     RegisterClient() = 0;
+
+    /**
+     * @brief Single hook for all HA-related events from the heartbeat loop.
+     * Subclasses override to handle state transitions.
+     */
+    virtual void OnHAEvent(HAEvent event) { (void)event; }
 
    protected:
     /**
@@ -527,6 +534,9 @@ class ClientService {
     std::condition_variable heartbeat_cv_;
     std::mutex heartbeat_mtx_;
     ViewVersionId view_version_{0};
+    /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED
+    /// fires. Only accessed from the heartbeat thread — no locking required.
+    bool connection_interrupted_ = false;
 
     // Shutdown protection
     SharedMutex running_rw_mtx_;

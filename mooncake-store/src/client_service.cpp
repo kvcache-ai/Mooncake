@@ -448,7 +448,7 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
 void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                                         std::string current_master_address) {
     // How many failed heartbeats before getting latest master view from etcd
-    const int max_heartbeat_fail_count = 3;
+    const int max_heartbeat_fail_count = 10;
     // How long to wait for next heartbeat after success
     const int success_heartbeat_interval_ms = 1000;
     // How long to wait for next heartbeat after failure
@@ -468,6 +468,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             LOG(INFO) << "Client registered successfully"
                       << ", client_id=" << client_id_
                       << ", view_version=" << res.value().view_version;
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
         }
     };
     // Use another thread to register client to avoid blocking the heartbeat
@@ -497,7 +498,11 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                 // just retry
                 LOG(ERROR) << "Failed to send heartbeat to master";
             } else {
-                // Exceeded failure threshold, attempt reconnect
+                if (!connection_interrupted_) {
+                    OnHAEvent(HAEvent::MASTER_UNREACHABLE);
+                    connection_interrupted_ = true;
+                }
+                // Attempt reconnect
                 if (ReconnectToMaster(is_ha_mode, current_master_address)) {
                     heartbeat_fail_count = 0;
                     // Do NOT sleep here, immediately loop back to send
@@ -537,8 +542,15 @@ bool ClientService::HandleHeartbeatResponse(
     for (auto& task_result : response.task_results) {
         HandleHeartbeatTaskResult(task_result);
     }
-    if (response.status == ClientStatus::UNDEFINED &&
-        !register_client_future.valid()) {
+    if (response.status == ClientStatus::HEALTH) {
+        // Heartbeat recovered after a connection interruption: master still
+        // knows this client. Fire MASTER_RECONNECTED once to trigger re-sync.
+        if (connection_interrupted_) {
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
+            connection_interrupted_ = false;
+        }
+    } else if (response.status == ClientStatus::UNDEFINED &&
+               !register_client_future.valid()) {
         // Ensure at most one register client thread is running
         register_client_future =
             std::async(std::launch::async, register_client);

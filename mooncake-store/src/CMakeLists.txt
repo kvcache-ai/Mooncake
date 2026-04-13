@@ -49,6 +49,7 @@ set(MOONCAKE_STORE_SOURCES
     data_manager.cpp
     route_cache.cpp
     async_metadata_notifier.cpp
+    ha_recovery_manager.cpp
     client_rpc_service.cpp
     peer_client.cpp
     tiered_cache/tiers/dram_tier.cpp

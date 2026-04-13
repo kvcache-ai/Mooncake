@@ -34,16 +34,33 @@ class AsyncMetadataNotifier {
     AsyncMetadataNotifier(const AsyncMetadataNotifier&) = delete;
     AsyncMetadataNotifier& operator=(const AsyncMetadataNotifier&) = delete;
 
-    // Start/Stop can be called alternately. Stop drains + clears queue.
+    // Start/Stop can be called alternately.
+    // drop_pending=false (default): sender drains remaining ops before exiting.
+    // drop_pending=true: queued ops are discarded immediately without invoking
+    // failure_cb.
     void Start();
-    void Stop();
+    void Stop(bool drop_pending = false);
 
+    // --- Normal priority ---
     tl::expected<void, ErrorCode> EnqueueAdd(const std::string& key,
                                              const UUID& segment_id,
                                              size_t size);
 
     tl::expected<void, ErrorCode> EnqueueRemove(const std::string& key,
                                                 const UUID& segment_id);
+
+    // --- Recovery priority (lower send priority) ---
+    tl::expected<void, ErrorCode> EnqueueRecoveryAdd(const std::string& key,
+                                                     const UUID& segment_id,
+                                                     size_t size);
+
+    /**
+     * @brief Wait until all recovery ops have been sent.
+     * Only valid after the caller has finished enqueueing all recovery ops.
+     * @return true if drained, false if aborted or timed out.
+     */
+    bool WaitForRecoveryDrain(const std::function<bool()>& abort_fn,
+                              std::chrono::milliseconds timeout);
 
     bool IsPaused() const {
         return consecutive_rpc_failures_.load(std::memory_order_acquire) < 0;
@@ -90,86 +107,120 @@ class AsyncMetadataNotifier {
         PendingOp op;
         size_t prev = InvalidIdx;
         size_t next = InvalidIdx;
+        bool is_recovery = false;  // which list this slot belongs to
     };
 
     struct SenderShard {
+       public:
         SenderShard() = default;
         SenderShard(const SenderShard&) = delete;
         SenderShard& operator=(const SenderShard&) = delete;
         SenderShard(SenderShard&&) = delete;
         SenderShard& operator=(SenderShard&&) = delete;
 
-        std::mutex mutex;
-        std::condition_variable sender_cv;    // sender waits when empty
-        std::condition_variable producer_cv;  // producer waits when full
-
-        // Pre-allocated slot pool — no dynamic alloc on enqueue/dequeue
-        std::vector<Slot> slots;
-        std::vector<size_t> free_stack;
-
-        // Index-based intrusive doubly-linked list for FIFO ordering
-        size_t list_head = InvalidIdx;
-        size_t list_tail = InvalidIdx;
-        size_t count = 0;
-        size_t capacity = 0;
-
-        std::unordered_map<CoalesceKey, CoalesceEntry, CoalesceKeyHash>
-            coalesce_index;
-
-        std::thread sender_thread;
-
         bool IsFull() const { return free_stack.empty(); }
-        bool IsEmpty() const { return count == 0; }
+        bool IsFullForRecovery() const {
+            return free_stack.size() <= normal_reserved;
+        }
+        bool IsEmpty() const {
+            return normal_count == 0 && recovery_count == 0;
+        }
 
-        // Allocate a slot from the free stack. Caller must check !IsFull().
         size_t AllocSlot() {
             size_t idx = free_stack.back();
             free_stack.pop_back();
             return idx;
         }
 
-        // Return a slot to the free stack.
         void FreeSlot(size_t idx) {
             slots[idx].prev = InvalidIdx;
             slots[idx].next = InvalidIdx;
+            slots[idx].is_recovery = false;
             free_stack.push_back(idx);
         }
 
-        // Append slot idx to the tail of the ordered list.
-        void LinkTail(size_t idx) {
-            slots[idx].prev = list_tail;
+        // Link to the tail of the appropriate list based on is_recovery flag.
+        void LinkTail(size_t idx, bool is_recovery) {
+            auto& head = is_recovery ? recovery_head : normal_head;
+            auto& tail = is_recovery ? recovery_tail : normal_tail;
+            auto& count = is_recovery ? recovery_count : normal_count;
+
+            slots[idx].prev = tail;
             slots[idx].next = InvalidIdx;
-            if (list_tail != InvalidIdx) {
-                slots[list_tail].next = idx;
+            slots[idx].is_recovery = is_recovery;
+            if (tail != InvalidIdx) {
+                slots[tail].next = idx;
             } else {
-                list_head = idx;
+                head = idx;
             }
-            list_tail = idx;
+            tail = idx;
             count++;
         }
 
-        // Remove slot idx from the ordered list.
+        // Unlink from whichever list the slot belongs to.
         void Unlink(size_t idx) {
             auto& slot = slots[idx];
+            auto& head = slot.is_recovery ? recovery_head : normal_head;
+            auto& tail = slot.is_recovery ? recovery_tail : normal_tail;
+            auto& count = slot.is_recovery ? recovery_count : normal_count;
+
             if (slot.prev != InvalidIdx) {
                 slots[slot.prev].next = slot.next;
             } else {
-                list_head = slot.next;
+                head = slot.next;
             }
             if (slot.next != InvalidIdx) {
                 slots[slot.next].prev = slot.prev;
             } else {
-                list_tail = slot.prev;
+                tail = slot.prev;
             }
             count--;
         }
+
+       public:
+        std::mutex mutex;
+        std::condition_variable sender_cv;    // sender waits when both empty
+        std::condition_variable producer_cv;  // normal producer waits when full
+        std::condition_variable recovery_drain_cv;  // WaitForRecoveryDrain
+
+        // Pre-allocated slot pool — shared by both queues
+        std::vector<Slot> slots;
+        std::vector<size_t> free_stack;
+        size_t capacity = 0;
+        size_t normal_reserved = 0;  // slots reserved for normal ops
+
+        // Normal priority linked list
+        size_t normal_head = InvalidIdx;
+        size_t normal_tail = InvalidIdx;
+        size_t normal_count = 0;
+
+        // Recovery (low priority) linked list
+        size_t recovery_head = InvalidIdx;
+        size_t recovery_tail = InvalidIdx;
+        size_t recovery_count = 0;
+
+        // Shared coalesce index (covers both queues)
+        std::unordered_map<CoalesceKey, CoalesceEntry, CoalesceKeyHash>
+            coalesce_index;
+
+        // Recovery ops that have been dequeued by CollectBatch but whose
+        // SendBatch has not yet completed. WaitForRecoveryDrain waits for
+        // both recovery_count and recovery_in_flight to reach zero.
+        size_t recovery_in_flight = 0;
+
+        std::thread sender_thread;
     };
 
    private:
-    tl::expected<void, ErrorCode> DoEnqueue(PendingOp&& op);
+    tl::expected<void, ErrorCode> DoEnqueue(PendingOp&& op, bool is_recovery);
 
     void SenderLoop(size_t shard_idx);
-    size_t CollectBatch(SenderShard& shard, std::vector<PendingOp>& batch_out);
+    // Returns (total_collected, recovery_collected)
+    std::pair<size_t, size_t> CollectBatch(SenderShard& shard,
+                                           std::vector<PendingOp>& batch_out);
+    size_t CollectFromList(SenderShard& shard,
+                           std::vector<PendingOp>& batch_out, size_t offset,
+                           size_t max_count, bool from_recovery);
     void SendBatch(std::vector<PendingOp>& batch, size_t count);
     void RecordSuccess();
     void RecordFailure();
@@ -195,6 +246,11 @@ class AsyncMetadataNotifier {
     std::vector<std::unique_ptr<SenderShard>> shards_;
     std::vector<std::vector<PendingOp>> batch_buffers_;
     SyncFailureCallback failure_cb_;
+
+    // Set to true by Stop(drop_pending=true) before waking senders.
+    // Tells CollectBatch to return 0 immediately so senders exit after their
+    // current in-flight SendBatch without processing any further queued ops.
+    std::atomic<bool> drop_on_stop_{false};
 
     // Circuit breaker via consecutive failure count:
     //   >=0 : active, value = consecutive failures so far
