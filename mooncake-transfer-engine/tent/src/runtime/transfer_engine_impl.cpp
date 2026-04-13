@@ -291,6 +291,7 @@ Status TransferEngineImpl::construct() {
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
+    max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -809,6 +810,29 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
     }
 }
 
+static const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case RDMA:
+            return "RDMA";
+        case MNNVL:
+            return "MNNVL";
+        case SHM:
+            return "SHM";
+        case NVLINK:
+            return "NVLINK";
+        case GDS:
+            return "GDS";
+        case IOURING:
+            return "IOURING";
+        case TCP:
+            return "TCP";
+        case AscendDirect:
+            return "AscendDirect";
+        default:
+            return "UNSPEC";
+    }
+}
+
 std::string printRequest(const Request& request) {
     std::stringstream ss;
     ss << "opcode " << request.opcode << " source " << request.source
@@ -1211,13 +1235,31 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
+    auto prev_type = task.type;
+
+    if (++task.failover_count > max_failover_attempts_) {
+        LOG(WARNING) << "Task failover limit reached ("
+                     << max_failover_attempts_
+                     << "), last transport=" << transportTypeName(prev_type);
+        return Status::InvalidEntry(
+            "Failover limit exceeded, all transports exhausted");
+    }
+
     if (task.staging)
         task.staging = false;
     else
         task.xport_priority++;
     auto type = resolveTransport(task.request, task.xport_priority);
-    if (type == UNSPEC)
+    if (type == UNSPEC) {
+        LOG(WARNING) << "No more transports available after "
+                     << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+
+    LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
+              << " -> " << transportTypeName(type) << " (attempt "
+              << task.failover_count << "/" << max_failover_attempts_ << ")";
+    TENT_RECORD_TRANSPORT_FAILOVER();
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type])
@@ -1295,6 +1337,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     batch->task_list[task_id].status = task_status.s;
 
+    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
+        task_status.s = PENDING;
+        batch->task_list[task_id].status = PENDING;
+    }
+
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
                                 task_status.s);
@@ -1364,6 +1411,13 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         }
         // memorize task result
         task.status = task_status.s;
+
+        if (task_status.s == FAILED &&
+            resubmitTransferTask(batch, task_id).ok()) {
+            task.status = PENDING;
+            task_status.s = PENDING;
+            overall_status.s = PENDING;
+        }
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,

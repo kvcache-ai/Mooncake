@@ -79,6 +79,7 @@ class TentMetrics {
     void recordWriteCompleted(size_t bytes, double latency_seconds = 0.0);
     void recordReadFailed(size_t bytes);
     void recordWriteFailed(size_t bytes);
+    void recordTransportFailover();
 
     // Get metrics for HTTP server
     std::string getPrometheusMetrics();
@@ -127,6 +128,9 @@ class TentMetrics {
                                                 "Total read failures via TENT"};
     ylt::metric::counter_t write_failures_total_{
         "tent_write_failures_total", "Total write failures via TENT"};
+    ylt::metric::counter_t failover_total_{
+        "tent_transport_failover_total",
+        "Total cross-transport failover events"};
 
     // Histograms - stored as pointers for unified management
     std::vector<ylt::metric::histogram_t*> histograms_;
@@ -245,6 +249,14 @@ class ScopedLatencyRecorder {
         }                                                                \
     } while (0)
 
+#define TENT_RECORD_TRANSPORT_FAILOVER()                  \
+    do {                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) { \
+            ::mooncake::tent::TentMetrics::instance()     \
+                .recordTransportFailover();               \
+        }                                                 \
+    } while (0)
+
 // RAII macro for automatic latency measurement
 #define TENT_SCOPED_READ_LATENCY(bytes)                              \
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_( \
@@ -269,6 +281,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_WRITE_COMPLETED(bytes, latency) ((void)0)
 #define TENT_RECORD_READ_FAILED(bytes) ((void)0)
 #define TENT_RECORD_WRITE_FAILED(bytes) ((void)0)
+#define TENT_RECORD_TRANSPORT_FAILOVER() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(bytes) ((void)0)
 
