@@ -732,14 +732,15 @@ impl StoreClient {
 
     fn reserve_replica_targets(
         &self,
-        tenant: &str,
-        key: &str,
+        object: &ObjectRef<'_>,
         length_bytes: usize,
         policy: &ResolvedReplicationPolicy,
     ) -> Result<(
         Vec<ReplicaWriteTarget>,
         Vec<mooncake_store_core::SegmentReservation>,
     )> {
+        let tenant = object.tenant.unwrap_or(self.default_tenant());
+        let key = object.key;
         let mut targets = Vec::with_capacity(policy.replica_count);
         let mut reservations = Vec::with_capacity(policy.replica_count);
         let mut excluded = BTreeSet::new();
@@ -879,7 +880,7 @@ impl StoreClient {
 
         let ranked = self
             .request_placement_planner()
-            .ranked_candidates(self, &ObjectRef::new(key).tenant(tenant))?;
+            .ranked_candidates(self, object)?;
         for owner in ranked {
             if excluded.contains(&owner) {
                 continue;

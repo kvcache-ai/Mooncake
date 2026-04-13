@@ -158,6 +158,15 @@ impl StoreClient {
                 if let Some(tenant) = request.tenant {
                     object = object.tenant(tenant);
                 }
+                if let Some(domain) = request.domain {
+                    object = object.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    object = object.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    object = object.qos_tier(qos_tier);
+                }
                 object
             })
             .collect::<Vec<_>>();
@@ -167,7 +176,11 @@ impl StoreClient {
         let plans = rank_result?;
         for (request, object_ref) in requests.iter().zip(object_refs.iter()) {
             let object_id = LogicalObjectId::new(
-                NamespaceScope::with_defaults(object_ref.tenant, None, None),
+                NamespaceScope::with_defaults(
+                    object_ref.tenant,
+                    object_ref.domain,
+                    object_ref.object_set,
+                ),
                 object_ref.key,
             );
             let current = self

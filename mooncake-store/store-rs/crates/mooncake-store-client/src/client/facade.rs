@@ -664,7 +664,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
-        let result = self.put_scoped_with_policy(tenant, key, value, None);
+        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
         tracker.finish(&result, value.len() as u64);
         result
     }
@@ -694,7 +694,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("put").input_bytes(value.len() as u64);
-        let result = self.put_scoped_with_policy(tenant, key, value, Some(policy));
+        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, Some(policy));
         tracker.finish(&result, value.len() as u64);
         result
     }
@@ -737,7 +737,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             }
         }
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
-        let result = self.put_scoped_with_policy(tenant, key, value, None);
+        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
         tracker.finish(&result, size as u64);
         result
     }
@@ -787,7 +787,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             }
         }
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
-        let result = self.put_scoped_with_policy(tenant, key, value, Some(policy));
+        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, Some(policy));
         tracker.finish(&result, size as u64);
         result
     }
@@ -814,13 +814,20 @@ impl MooncakeCompatibilityFacade for StoreClient {
         }
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
-            let tenant = request.tenant.unwrap_or(self.default_tenant());
-            routes.push(self.put_scoped_with_policy(
-                tenant,
-                request.key,
-                request.value,
-                request.policy.as_ref(),
-            )?);
+            let mut object = ObjectRef::new(request.key);
+            if let Some(tenant) = request.tenant {
+                object = object.tenant(tenant);
+            }
+            if let Some(domain) = request.domain {
+                object = object.domain(domain);
+            }
+            if let Some(object_set) = request.object_set {
+                object = object.object_set(object_set);
+            }
+            if let Some(qos_tier) = request.qos_tier {
+                object = object.qos_tier(qos_tier);
+            }
+            routes.push(self.put_object(&object, request.value, request.policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -842,19 +849,40 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("batch_put_from").input_bytes(bytes_in);
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
-            let tenant = request.tenant.unwrap_or(self.default_tenant());
-            routes.push(
-                self.put_from_in_tenant_with_policy(
-                    tenant,
-                    request.key,
-                    request.buffer,
-                    request.size,
-                    request
-                        .policy
-                        .as_ref()
-                        .unwrap_or(&ReplicationPolicy::default()),
-                )?,
-            );
+            if request.buffer.is_null() {
+                let result = Err(StoreError::Allocator(
+                    "put_from buffer must not be null".to_string(),
+                ));
+                tracker.finish(&result, 0);
+                return result;
+            }
+            {
+                let state = self.state.lock();
+                if !state.buffer_is_registered(request.buffer.cast_mut(), request.size) {
+                    let tenant = request.tenant.unwrap_or(self.default_tenant());
+                    let result = Err(StoreError::Allocator(format!(
+                        "put_from buffer is not registered for tenant={tenant} key={}",
+                        request.key
+                    )));
+                    tracker.finish(&result, 0);
+                    return result;
+                }
+            }
+            let value = unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
+            let mut object = ObjectRef::new(request.key);
+            if let Some(tenant) = request.tenant {
+                object = object.tenant(tenant);
+            }
+            if let Some(domain) = request.domain {
+                object = object.domain(domain);
+            }
+            if let Some(object_set) = request.object_set {
+                object = object.object_set(object_set);
+            }
+            if let Some(qos_tier) = request.qos_tier {
+                object = object.qos_tier(qos_tier);
+            }
+            routes.push(self.put_object(&object, value, request.policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -880,14 +908,21 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("batch_put_from_multi_buffers").input_bytes(bytes_in);
         let mut routes = Vec::with_capacity(requests.len());
         for request in requests {
-            let tenant = request.tenant.unwrap_or(self.default_tenant());
             let payload = flatten_slices(request.buffers);
-            routes.push(self.put_scoped_with_policy(
-                tenant,
-                request.key,
-                &payload,
-                request.policy.as_ref(),
-            )?);
+            let mut object = ObjectRef::new(request.key);
+            if let Some(tenant) = request.tenant {
+                object = object.tenant(tenant);
+            }
+            if let Some(domain) = request.domain {
+                object = object.domain(domain);
+            }
+            if let Some(object_set) = request.object_set {
+                object = object.object_set(object_set);
+            }
+            if let Some(qos_tier) = request.qos_tier {
+                object = object.qos_tier(qos_tier);
+            }
+            routes.push(self.put_object(&object, &payload, request.policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);

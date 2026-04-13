@@ -20,9 +20,6 @@ use mooncake_store_core::{
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
 };
-use mooncake_transport::{
-    Opcode, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
-};
 use parking_lot::Mutex;
 use tracing::{debug, info, info_span, warn};
 

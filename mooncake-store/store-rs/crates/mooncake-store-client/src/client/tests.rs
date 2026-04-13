@@ -1418,6 +1418,78 @@ fn publish_storage_node_with_capacity(
         .expect("storage memory should register");
     let runtime = storage.runtime_id().clone();
     test_storage_nodes().lock().push(storage);
+    publish_labeled_storage_node_with_capacity(
+        metadata,
+        transport,
+        stable_id,
+        segment_name,
+        pool,
+        capacity_bytes,
+        alignment_bytes,
+        None,
+        None,
+        None,
+    )
+}
+
+fn publish_labeled_storage_node_with_capacity(
+    metadata: &InMemoryMetadataBackend,
+    transport: &TestTransport,
+    stable_id: &str,
+    segment_name: &str,
+    pool: &str,
+    capacity_bytes: u64,
+    alignment_bytes: u64,
+    domain: Option<&str>,
+    object_set: Option<&str>,
+    qos_tier: Option<&str>,
+) -> ClientRuntimeId {
+    transport.add_external_segment(segment_name, capacity_bytes as usize);
+    let runtime = ClientRuntimeId::new(stable_id, ClientEpoch(1));
+    let mut endpoints = ClientEndpointSet {
+        rpc_address: "127.0.0.1:0".to_string(),
+        segment_name: Some(SegmentName::new(segment_name)),
+        labels: Default::default(),
+    };
+    endpoints
+        .labels
+        .insert("pool".to_string(), pool.to_string());
+    endpoints
+        .labels
+        .insert("storage".to_string(), "true".to_string());
+    if let Some(domain) = domain {
+        endpoints.labels.insert("domain".to_string(), domain.to_string());
+    }
+    if let Some(object_set) = object_set {
+        endpoints
+            .labels
+            .insert("object_set".to_string(), object_set.to_string());
+    }
+    if let Some(qos_tier) = qos_tier {
+        endpoints
+            .labels
+            .insert("qos_tier".to_string(), qos_tier.to_string());
+    }
+    metadata
+        .upsert_client_lease(&ClientLease {
+            runtime: runtime.clone(),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints,
+            expires_at_ms: test_future_expiry_ms(),
+        })
+        .expect("storage lease should upsert");
+    metadata
+        .publish_segment(&SegmentAnnouncement {
+            owner: runtime.clone(),
+            segment_name: SegmentName::new(segment_name),
+            capacity_bytes,
+            used_bytes: 0,
+            state: SegmentLifecycleState::Active,
+            alignment_bytes,
+            tags: vec!["dram".to_string()],
+        })
+        .expect("storage segment should publish");
     runtime
 }
 
@@ -5026,6 +5098,114 @@ fn batch_get_emits_transport_pacing_hints() {
 }
 
 #[test]
+fn put_paths_accept_namespace_dimensions_beyond_routed_fast_path() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("writer-namespace-placement-segment"));
+    publish_labeled_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-domain-a",
+        "seg-domain-a",
+        "pool-a",
+        1024,
+        1,
+        Some("domain-a"),
+        Some("set-a"),
+        Some("gold"),
+    );
+    publish_labeled_storage_node_with_capacity(
+        metadata.as_ref(),
+        transport.as_ref(),
+        "storage-domain-b",
+        "seg-domain-b",
+        "pool-a",
+        1024,
+        1,
+        Some("domain-b"),
+        Some("set-b"),
+        Some("silver"),
+    );
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(metadata, "writer-namespace-placement")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport.clone())
+        .local_memory(storage_config())
+        .routed_writes(planner, 1)
+        .build(10_000)
+        .expect("writer build should succeed");
+
+    let batch_route = writer
+        .batch_put(&[
+            PutRequest::new("namespace-key", b"payload")
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+        ])
+        .expect("batch put should accept namespace dimensions");
+    assert_eq!(batch_route.len(), 1);
+    assert_eq!(batch_route[0].replicas[0].owner.stable_id.0, "storage-domain-a");
+    assert_eq!(batch_route[0].namespace.as_ref(), Some(&NamespaceScope::with_defaults(
+        Some("tenant-a"),
+        Some("domain-a"),
+        Some("set-a"),
+    )));
+    assert_eq!(batch_route[0].qos_tier.as_deref(), Some("gold"));
+
+    let mut source = [0u8; 16];
+    source[..6].copy_from_slice(b"direct");
+    writer
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("buffer register should succeed");
+
+    let from_route = writer
+        .batch_put_from(&[
+            PutFromRequest::new("namespace-from", source.as_ptr().cast(), 6)
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+        ])
+        .expect("batch put_from should accept namespace dimensions");
+    assert_eq!(from_route.len(), 1);
+    assert_eq!(from_route[0].replicas[0].owner.stable_id.0, "storage-domain-a");
+    assert_eq!(from_route[0].namespace.as_ref(), Some(&NamespaceScope::with_defaults(
+        Some("tenant-a"),
+        Some("domain-a"),
+        Some("set-a"),
+    )));
+    assert_eq!(from_route[0].qos_tier.as_deref(), Some("gold"));
+
+    let slices = [b"multi".as_slice(), b"-gold".as_slice()];
+    let multi_route = writer
+        .batch_put_from_multi_buffers(&[
+            MultiBufferPutRequest::new("namespace-multi", &slices)
+                .tenant("tenant-a")
+                .domain("domain-a")
+                .object_set("set-a")
+                .qos_tier("gold")
+                .replication(ReplicationPolicy::new().replica_count(1).prefer_local(false)),
+        ])
+        .expect("multi-buffer put should accept namespace dimensions");
+    assert_eq!(multi_route.len(), 1);
+    assert_eq!(multi_route[0].replicas[0].owner.stable_id.0, "storage-domain-a");
+    assert_eq!(multi_route[0].namespace.as_ref(), Some(&NamespaceScope::with_defaults(
+        Some("tenant-a"),
+        Some("domain-a"),
+        Some("set-a"),
+    )));
+    assert_eq!(multi_route[0].qos_tier.as_deref(), Some("gold"));
+
+    writer
+        .unregister_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("buffer unregister should succeed");
+}
+
+#[test]
 fn routed_put_emits_transport_pacing_hints() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-put-pacing-segment"));
@@ -5944,8 +6124,14 @@ fn helper_primitives_and_request_builders_cover_contracts() {
 
     let put = PutRequest::new("put-key", b"put-value")
         .tenant("tenant-a")
+        .domain("domain-a")
+        .object_set("set-a")
+        .qos_tier("gold")
         .replication(policy.clone());
     assert_eq!(put.tenant, Some("tenant-a"));
+    assert_eq!(put.domain, Some("domain-a"));
+    assert_eq!(put.object_set, Some("set-a"));
+    assert_eq!(put.qos_tier, Some("gold"));
     assert_eq!(put.key, "put-key");
     assert_eq!(put.value, b"put-value");
     assert_eq!(put.policy, Some(policy.clone()));
@@ -5953,11 +6139,30 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     let source = [1u8, 2, 3, 4];
     let put_from = PutFromRequest::new("from-key", source.as_ptr().cast(), source.len())
         .tenant("tenant-a")
+        .domain("domain-a")
+        .object_set("set-a")
+        .qos_tier("gold")
         .replication(policy.clone());
     assert_eq!(put_from.tenant, Some("tenant-a"));
+    assert_eq!(put_from.domain, Some("domain-a"));
+    assert_eq!(put_from.object_set, Some("set-a"));
+    assert_eq!(put_from.qos_tier, Some("gold"));
     assert_eq!(put_from.key, "from-key");
     assert_eq!(put_from.size, source.len());
     assert_eq!(put_from.policy, Some(policy.clone()));
+
+    let multi_put_buffers = [b"left".as_slice(), b"-right".as_slice()];
+    let multi_put = MultiBufferPutRequest::new("multi-key", &multi_put_buffers)
+        .tenant("tenant-a")
+        .domain("domain-a")
+        .object_set("set-a")
+        .qos_tier("gold")
+        .replication(policy.clone());
+    assert_eq!(multi_put.tenant, Some("tenant-a"));
+    assert_eq!(multi_put.domain, Some("domain-a"));
+    assert_eq!(multi_put.object_set, Some("set-a"));
+    assert_eq!(multi_put.qos_tier, Some("gold"));
+    assert_eq!(multi_put.policy, Some(policy.clone()));
 
     let slices = [b"left".as_slice(), b"-right".as_slice()];
     let multi_put = MultiBufferPutRequest::new("multi-put", &slices)
