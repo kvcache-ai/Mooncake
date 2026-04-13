@@ -200,6 +200,9 @@ impl ReplicationPolicy {
 #[derive(Clone, Debug)]
 pub struct PutRequest<'a> {
     pub tenant: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub object_set: Option<&'a str>,
+    pub qos_tier: Option<&'a str>,
     pub key: &'a str,
     pub value: &'a [u8],
     pub policy: Option<ReplicationPolicy>,
@@ -209,6 +212,9 @@ impl<'a> PutRequest<'a> {
     pub fn new(key: &'a str, value: &'a [u8]) -> Self {
         Self {
             tenant: None,
+            domain: None,
+            object_set: None,
+            qos_tier: None,
             key,
             value,
             policy: None,
@@ -217,6 +223,21 @@ impl<'a> PutRequest<'a> {
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn domain(mut self, domain: &'a str) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    pub fn object_set(mut self, object_set: &'a str) -> Self {
+        self.object_set = Some(object_set);
+        self
+    }
+
+    pub fn qos_tier(mut self, qos_tier: &'a str) -> Self {
+        self.qos_tier = Some(qos_tier);
         self
     }
 
@@ -229,6 +250,9 @@ impl<'a> PutRequest<'a> {
 #[derive(Clone, Debug)]
 pub struct PutFromRequest<'a> {
     pub tenant: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub object_set: Option<&'a str>,
+    pub qos_tier: Option<&'a str>,
     pub key: &'a str,
     pub buffer: *const c_void,
     pub size: usize,
@@ -239,6 +263,9 @@ impl<'a> PutFromRequest<'a> {
     pub fn new(key: &'a str, buffer: *const c_void, size: usize) -> Self {
         Self {
             tenant: None,
+            domain: None,
+            object_set: None,
+            qos_tier: None,
             key,
             buffer,
             size,
@@ -248,6 +275,21 @@ impl<'a> PutFromRequest<'a> {
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn domain(mut self, domain: &'a str) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    pub fn object_set(mut self, object_set: &'a str) -> Self {
+        self.object_set = Some(object_set);
+        self
+    }
+
+    pub fn qos_tier(mut self, qos_tier: &'a str) -> Self {
+        self.qos_tier = Some(qos_tier);
         self
     }
 
@@ -266,6 +308,9 @@ pub struct GetRequest<'a> {
 
 pub struct MultiBufferPutRequest<'a> {
     pub tenant: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub object_set: Option<&'a str>,
+    pub qos_tier: Option<&'a str>,
     pub key: &'a str,
     pub buffers: &'a [&'a [u8]],
     pub policy: Option<ReplicationPolicy>,
@@ -275,6 +320,9 @@ impl<'a> MultiBufferPutRequest<'a> {
     pub fn new(key: &'a str, buffers: &'a [&'a [u8]]) -> Self {
         Self {
             tenant: None,
+            domain: None,
+            object_set: None,
+            qos_tier: None,
             key,
             buffers,
             policy: None,
@@ -283,6 +331,21 @@ impl<'a> MultiBufferPutRequest<'a> {
 
     pub fn tenant(mut self, tenant: &'a str) -> Self {
         self.tenant = Some(tenant);
+        self
+    }
+
+    pub fn domain(mut self, domain: &'a str) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    pub fn object_set(mut self, object_set: &'a str) -> Self {
+        self.object_set = Some(object_set);
+        self
+    }
+
+    pub fn qos_tier(mut self, qos_tier: &'a str) -> Self {
+        self.qos_tier = Some(qos_tier);
         self
     }
 

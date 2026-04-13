@@ -51,10 +51,10 @@ impl StoreClient {
         Ok(())
     }
 
-    fn put_scoped_with_policy_current(
+    fn put_object_with_policy_current(
         &self,
-        tenant: &str,
-        key: &str,
+        object_id: &LogicalObjectId,
+        qos_tier: Option<&str>,
         value: &[u8],
         policy: Option<&ReplicationPolicy>,
         current: Option<&ObjectRoute>,
@@ -62,8 +62,22 @@ impl StoreClient {
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
         self.flush_due_reclaims()?;
-        let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
+        let tenant = object_id.scope.tenant.as_str();
+        let key = object_id.logical_key.as_str();
         let scoped_key = ObjectKey::from_logical_id(&object_id);
+        let mut object_ref = ObjectRef::new(key).tenant(tenant);
+        if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+            object_ref = object_ref.domain(object_id.scope.domain.as_str());
+        }
+        if object_id.scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+            object_ref = object_ref.object_set(object_id.scope.object_set.as_str());
+        }
+        let qos_tier = qos_tier
+            .or_else(|| current.and_then(|route| route.qos_tier.as_deref()))
+            .unwrap_or(mooncake_store_core::DEFAULT_QOS_TIER);
+        if qos_tier != mooncake_store_core::DEFAULT_QOS_TIER {
+            object_ref = object_ref.qos_tier(qos_tier);
+        }
         self.enforce_namespace_quota(&object_id, value.len(), current)?;
         let policy = self.resolve_replication_policy(policy)?;
         let max_write_attempts = if policy.with_soft_pin {
@@ -162,19 +176,29 @@ impl StoreClient {
             cas_tracker.finish(&cas_result, 0);
             let cas = cas_result?;
             if !cas.applied {
+        let reserve_tracker =
+            OperationTracker::new("put_stage_reserve").input_bytes(value.len() as u64);
+        let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
+        reserve_tracker.finish(&reserve_result, 0);
+        let (targets, reservations) = reserve_result?;
+        let write_tracker =
+            OperationTracker::new("put_stage_write").input_bytes(value.len() as u64);
+        let write_result = self.write_reserved_replicas(&targets, &reservations, value);
+        write_tracker.finish(&write_result, value.len() as u64);
+        let offsets = match write_result {
+            Ok(offsets) => offsets,
+            Err(error) => {
                 let _ = self.release_reserved_allocations(&targets, &reservations);
                 return Err(StoreError::Conflict(format!(
                     "route update lost race for tenant={tenant} key={key}"
                 )));
             }
-<<<<<<< HEAD
             self.storage_owner.track_route(&route);
             self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
             if let Some(previous) = current {
                 self.reclaim_route(previous, reclaim_mode)?;
             }
             return Ok(route);
-=======
         };
         let expected_version = current.map(|route| route.version);
         let next_version = current
@@ -208,6 +232,7 @@ impl StoreClient {
                 .collect(),
         };
         mooncake_store_core::apply_route_identity(&mut route, &object_id);
+        route.qos_tier = Some(qos_tier.to_string());
         let cas_tracker = OperationTracker::new("put_stage_route_cas");
         let publish_started = Instant::now();
         let cas_result = self.route_directory.compare_and_swap_object_route(
@@ -236,23 +261,26 @@ impl StoreClient {
         }
     }
 
-    fn put_scoped_with_policy(
+    fn put_object(
         &self,
-        tenant: &str,
-        key: &str,
+        object: &ObjectRef<'_>,
         value: &[u8],
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ObjectRoute> {
-        let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
+        let tenant = object.tenant.unwrap_or(self.default_tenant());
+        let object_id = LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+            object.key,
+        );
         let load_tracker = OperationTracker::new("put_stage_load_route");
         let current_result = self
             .route_directory
             .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
-        self.put_scoped_with_policy_current(
-            tenant,
-            key,
+        self.put_object_with_policy_current(
+            &object_id,
+            object.qos_tier,
             value,
             policy,
             current.as_ref(),
@@ -412,10 +440,10 @@ impl StoreClient {
         route: &ObjectRoute,
     ) -> Result<bool> {
         let object_id = self.route_object_id(route)?;
-        let tenant = object_id.scope.tenant;
-        let key = object_id.logical_key;
+        let tenant = object_id.scope.tenant.clone();
+        let key = object_id.logical_key.clone();
         for _ in 0..4 {
-            let Some(observed) = self.query_route_in_tenant(&tenant, &key)? else {
+            let Some(observed) = self.query_route_by_object_id(&object_id)? else {
                 return Ok(false);
             };
             if observed.state != RouteState::Active {
@@ -429,8 +457,19 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let payload = writer.get_in_tenant(&tenant, &key)?;
-            let Some(confirmed) = self.query_route_in_tenant(&tenant, &key)? else {
+            let mut object = ObjectRef::new(key.as_str()).tenant(tenant.as_str());
+            if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                object = object.domain(object_id.scope.domain.as_str());
+            }
+            if object_id.scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                object = object.object_set(object_id.scope.object_set.as_str());
+            }
+            let payload = writer
+                .batch_get(&[object])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| StoreError::InvalidState("missing batch_get result".to_string()))?;
+            let Some(confirmed) = self.query_route_by_object_id(&object_id)? else {
                 return Ok(false);
             };
             if confirmed.version != observed.version {
@@ -445,9 +484,9 @@ impl StoreClient {
             }
 
             let policy = writer.migration_policy_for_route(&confirmed)?;
-            match writer.put_scoped_with_policy_current(
-                &tenant,
-                &key,
+            match writer.put_object_with_policy_current(
+                &object_id,
+                confirmed.qos_tier.as_deref(),
                 &payload,
                 Some(&policy),
                 Some(&confirmed),
@@ -1430,7 +1469,6 @@ impl StoreClient {
 
         let mut remote_batch_chunks = 0usize;
         let mut remote_direct_fallbacks = 0usize;
-<<<<<<< HEAD
         while cursor < remote_indices.len() {
             match self.plan_remote_get_chunk(&remote_indices, &lengths, cursor)? {
                 Some((next, scratch)) => {
@@ -1456,7 +1494,6 @@ impl StoreClient {
                                     "remote_batch_get_fallback",
                                 )?;
                                 remote_direct_fallbacks += 1;
-=======
         let fairness_slices = self.fairness_slice_remote_indices(resolved, &remote_indices);
         let fairness_rounds = fairness_slices.len();
         let shaping_chunk_limit = self.remote_batch_chunk_limit(
@@ -1495,7 +1532,6 @@ impl StoreClient {
                                     )?;
                                     remote_direct_fallbacks += 1;
                                 }
->>>>>>> 13606eb ([Store-RS] add runtime qos controls)
                             }
                         }
                         cursor += next;
@@ -1512,7 +1548,6 @@ impl StoreClient {
                         remote_direct_fallbacks += 1;
                         cursor += 1;
                     }
-<<<<<<< HEAD
                     cursor = next;
                 }
                 None => {
@@ -1527,8 +1562,6 @@ impl StoreClient {
                     )?;
                     remote_direct_fallbacks += 1;
                     cursor += 1;
-=======
->>>>>>> 13606eb ([Store-RS] add runtime qos controls)
                 }
             }
         }
