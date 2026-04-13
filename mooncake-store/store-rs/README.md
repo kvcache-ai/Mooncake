@@ -329,6 +329,33 @@ These scripts validate:
 - the dummy path through the standalone compatibility service plus shm buffer registration
 - the real path through the native distributed store runtime plus registered-buffer I/O
 
+### Run the true SGLang HiCache e2e
+
+```bash
+./scripts/run-sglang-true-e2e.sh --model-path /models/Qwen3-0.6B
+```
+
+This script performs a full end-to-end run with:
+
+- two standalone storage `mooncake-store-client` processes
+- one routed rw-only `mooncake-store-client` gateway exposed through `client_server_address`
+- two `python -m sglang.launch_server` processes
+- baseline cross-process put/get verification through Mooncake HiCache
+- storage expansion while SGLang continues serving requests
+- forced storage kill validation with retry-based recovery instead of persistent request failure
+- graceful storage shrink validation with request retry and eventual recovery
+
+Useful knobs:
+
+- `--model-path` or `MC_STORE_RS_SGLANG_MODEL_PATH` to point at the local model directory used by `sglang.launch_server`
+- `--auto-download-model --model-id Qwen/Qwen3-0.6B` or `MC_STORE_RS_SGLANG_AUTO_DOWNLOAD_MODEL=1` for opt-in Hugging Face download
+- `MC_STORE_RS_SGLANG_SERVER_A_GPU` and `MC_STORE_RS_SGLANG_SERVER_B_GPU` to pin GPU ids
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to choose the real data-plane backend during validation
+- `MC_STORE_RS_SGLANG_SKIP_WHEEL_BUILD=1` to reuse an existing local wheel build
+- `MC_STORE_RS_SGLANG_SKIP_PIP_INSTALL=1` to reuse an already prepared SGLang venv
+
+The script does not auto-detect cached models. This keeps CI and production validation deterministic: provide an explicit local model path, or opt into download explicitly.
+
 For Python build and API details, read `docs/python.md`.
 
 ## Rust Usage
@@ -397,6 +424,21 @@ fn main() -> Result<()> {
 ```
 
 In Rust, TENT `rpc_server_port` is the real data-plane TCP port. Leaving it at `0` is fine for local demos; for cross-host or cross-container deployments, set a fixed port and make sure peers can reach `rpc_server_hostname:rpc_server_port`.
+
+### Transport backend selection
+
+There are two transport backends in the current tree:
+
+- `TentEngine` + `TentEngineConfig`
+- `ClassicTransferEngine` + `ClassicEngineConfig`
+
+The low-level Rust API keeps transport selection explicit: applications construct the engine they want and wire it into `StoreClientBuilder` themselves.
+
+The runtime transport switch belongs to the compatibility layer:
+
+- `mooncake-store-client --transport-backend tent|classic-te`
+- `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
 
 ### Routed writes
 
@@ -470,6 +512,7 @@ store.setup(
     "",
     stable_id="py-store-a",
     labels={"pool": "pool-a", "storage": "true"},
+    transport_backend="tent",
 )
 
 store.put("hello", b"world")
@@ -513,11 +556,11 @@ For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD
 
 | Knob | Used by | Meaning |
 |------|---------|---------|
-| `transport_rpc_port` / TENT `rpc_server_port` | real mode | TENT TCP data-plane listen port; peer real clients use it for cross-host reads and writes |
+| `transport_rpc_port` / backend `rpc_server_port` | real mode | selected backend TCP data-plane listen port; peer real clients use it for cross-host reads and writes |
 | `client_server_address` | dummy mode | standalone compatibility gRPC endpoint used by `setup_dummy(...)` |
 | `metrics_addr` | all modes | HTTP `/metrics` endpoint |
 
-`client_server_address` is not part of the real data path. Real clients create their own TENT runtime inside the calling process and publish `local_hostname + transport_rpc_port` to peers.
+`client_server_address` is not part of the real data path. Real clients create their own transport runtime inside the calling process and publish `local_hostname + transport_rpc_port` to peers.
 
 For single-host demos, leaving `transport_rpc_port` unset keeps the old random-port behavior. For cross-host or cross-container deployments, set a fixed `transport_rpc_port` and make sure that port is reachable from peer nodes.
 
