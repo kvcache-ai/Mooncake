@@ -237,6 +237,90 @@ name, args, kwargs = store._worker.calls.pop()
 assert args[0] == "node-a"
 assert kwargs["transport_rpc_port"] == 17112
 
+setup_env_vars = [
+    "MC_STORE_RS_STABLE_ID",
+    "MC_STORE_RS_EPOCH",
+    "MC_STORE_RS_INITIAL_STATE",
+    "MC_STORE_RS_TENANT",
+    "MC_STORE_RS_ROUTED_WRITES",
+    "MC_STORE_RS_REPLICA_COUNT",
+    "MC_STORE_RS_ROUTE_TOPK",
+    "MC_STORE_RS_KEYSPACE",
+    "MC_STORE_RS_TRANSPORT_METADATA_URL",
+    "MC_STORE_RS_TRANSPORT_RPC_PORT",
+    "MC_STORE_RS_TRANSPORT_BACKEND",
+    "MC_STORE_RS_LOCAL_SEGMENT_NAME",
+    "MC_STORE_RS_EXPIRES_AT_MS",
+    "MC_STORE_RS_ROUTE_CONTROL",
+    "MC_STORE_RS_LABELS",
+]
+
+def clear_setup_env():
+    for env_name in setup_env_vars:
+        os.environ.pop(env_name, None)
+
+try:
+    clear_setup_env()
+    os.environ.update(
+        {
+            "MC_STORE_RS_STABLE_ID": "env-store",
+            "MC_STORE_RS_EPOCH": "7",
+            "MC_STORE_RS_INITIAL_STATE": "standby",
+            "MC_STORE_RS_TENANT": "tenant-env",
+            "MC_STORE_RS_ROUTED_WRITES": "1",
+            "MC_STORE_RS_REPLICA_COUNT": "3",
+            "MC_STORE_RS_ROUTE_TOPK": "5",
+            "MC_STORE_RS_KEYSPACE": "env/keyspace",
+            "MC_STORE_RS_TRANSPORT_METADATA_URL": "redis://127.0.0.1:6380/1",
+            "MC_STORE_RS_TRANSPORT_RPC_PORT": "17113",
+            "MC_STORE_RS_TRANSPORT_BACKEND": "classic_te",
+            "MC_STORE_RS_LOCAL_SEGMENT_NAME": "env-segment",
+            "MC_STORE_RS_EXPIRES_AT_MS": "12345",
+            "MC_STORE_RS_ROUTE_CONTROL": "embedded_wrh",
+            "MC_STORE_RS_LABELS": "pool=env,storage=false",
+        }
+    )
+    store.setup(
+        "127.0.0.1",
+        "redis://127.0.0.1:6379/0",
+        0,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert kwargs["stable_id"] == "env-store"
+    assert kwargs["epoch"] == 7
+    assert kwargs["initial_state"] == "standby"
+    assert kwargs["tenant"] == "tenant-env"
+    assert kwargs["routed_writes"] is True
+    assert kwargs["replica_count"] == 3
+    assert kwargs["route_topk"] == 5
+    assert kwargs["keyspace"] == "env/keyspace"
+    assert kwargs["transport_metadata_url"] == "redis://127.0.0.1:6380/1"
+    assert kwargs["transport_rpc_port"] == 17113
+    assert kwargs["transport_backend"] == "classic_te"
+    assert kwargs["local_segment_name"] == "env-segment"
+    assert kwargs["expires_at_ms"] == 12345
+    assert kwargs["route_control"] == "embedded_wrh"
+    assert kwargs["labels"] == {"pool": "env", "storage": "false"}
+
+    os.environ["MC_STORE_RS_LABELS"] = '{"pool": "json", "storage": "true"}'
+    store.setup(
+        {
+            "local_hostname": "127.0.0.1",
+            "metadata_server": "redis://127.0.0.1:6379/0",
+            "state": "offline",
+            "rpc_server_port": 17114,
+            "labels": {"pool": "explicit"},
+        }
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert kwargs["initial_state"] == "offline"
+    assert kwargs["transport_rpc_port"] == 17114
+    assert kwargs["labels"] == {"pool": "explicit"}
+    assert kwargs["route_topk"] == 5
+finally:
+    clear_setup_env()
+
 try:
     store.setup(
         "127.0.0.1:17111",

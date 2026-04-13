@@ -430,6 +430,19 @@ Selection order:
 
 The standalone client follows the same rule, except the explicit override is `--transport-backend`.
 
+## SGLang Environment Fallbacks
+
+Current upstream SGLang only forwards legacy Mooncake setup fields. When SGLang cannot pass Store-RS setup extensions, the Python wrapper reads these environment variables as fallbacks:
+
+- `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
+- `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
+- `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
+- `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
+- `MC_STORE_RS_TRANSPORT_METADATA_URL`, `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_EPOCH`, `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
+
+Explicit `setup(...)` arguments still take precedence. `MC_STORE_RS_LABELS` accepts either JSON (`{"storage":"false","pool":"rw"}`) or comma-separated pairs (`storage=false,pool=rw`).
+
 ## Replication Policy
 
 `ReplicateConfig` currently supports:

@@ -6,7 +6,9 @@ import ctypes
 import gc
 import importlib.machinery
 import importlib.util
+import json
 import mmap
+import os
 import pathlib
 import queue
 import sys
@@ -292,6 +294,7 @@ class MooncakeDistributedStore:
         kwargs.pop("engine", None)
         if "state" in kwargs and "initial_state" not in kwargs:
             kwargs["initial_state"] = kwargs.pop("state")
+        kwargs = _apply_setup_env_defaults(kwargs)
         if "hugepage_size" in kwargs:
             kwargs["hugepage_size"] = _normalize_hugepage_size(kwargs["hugepage_size"])
         if args:
@@ -562,6 +565,7 @@ class MooncakeDistributedStore:
                 grouped.setdefault(tenant, []).append(key)
         return grouped
     def _setup_from_config_dict(self, config: Mapping[str, object]):
+        config = _apply_setup_env_defaults(dict(config))
         if "local_hostname" not in config:
             raise TypeError("setup config requires `local_hostname`")
         metadata_url = config.get("metadata_server", config.get("metadata_url"))
@@ -593,6 +597,7 @@ class MooncakeDistributedStore:
             labels=_coerce_mapping(config.get("labels")),
             routed_writes=_coerce_bool(config.get("routed_writes"), False),
             replica_count=_coerce_int(config.get("replica_count"), 1),
+            route_topk=_coerce_int(config.get("route_topk"), 2),
             keyspace=_coerce_optional_str(config.get("keyspace")),
             transport_metadata_url=_coerce_optional_str(
                 config.get("transport_metadata_url")
@@ -706,6 +711,73 @@ def _coerce_mapping(value) -> dict[str, str] | None:
     if not isinstance(value, Mapping):
         raise TypeError("labels must be a mapping")
     return {str(key): str(item) for key, item in value.items()}
+
+_SETUP_ENV_DEFAULTS = {
+    "stable_id": ("MC_STORE_RS_STABLE_ID", _coerce_optional_str),
+    "epoch": ("MC_STORE_RS_EPOCH", lambda value: _coerce_int(value, 1)),
+    "initial_state": ("MC_STORE_RS_INITIAL_STATE", _coerce_optional_str),
+    "tenant": ("MC_STORE_RS_TENANT", str),
+    "routed_writes": (
+        "MC_STORE_RS_ROUTED_WRITES",
+        lambda value: _coerce_bool(value, False),
+    ),
+    "replica_count": ("MC_STORE_RS_REPLICA_COUNT", lambda value: _coerce_int(value, 1)),
+    "route_topk": ("MC_STORE_RS_ROUTE_TOPK", lambda value: _coerce_int(value, 2)),
+    "keyspace": ("MC_STORE_RS_KEYSPACE", _coerce_optional_str),
+    "transport_metadata_url": ("MC_STORE_RS_TRANSPORT_METADATA_URL", _coerce_optional_str),
+    "transport_rpc_port": ("MC_STORE_RS_TRANSPORT_RPC_PORT", _coerce_optional_int),
+    "transport_backend": ("MC_STORE_RS_TRANSPORT_BACKEND", _coerce_optional_str),
+    "local_segment_name": ("MC_STORE_RS_LOCAL_SEGMENT_NAME", _coerce_optional_str),
+    "expires_at_ms": ("MC_STORE_RS_EXPIRES_AT_MS", _coerce_optional_int),
+    "route_control": ("MC_STORE_RS_ROUTE_CONTROL", _coerce_optional_str),
+}
+
+def _apply_setup_env_defaults(config: Mapping[str, object]) -> dict:
+    merged = dict(config)
+    for key, (env_name, coerce) in _SETUP_ENV_DEFAULTS.items():
+        if _has_value(merged.get(key)):
+            continue
+        if key == "initial_state" and _has_value(merged.get("state")):
+            continue
+        if key == "transport_rpc_port" and _has_value(merged.get("rpc_server_port")):
+            continue
+        env_value = os.environ.get(env_name)
+        if not _has_value(env_value):
+            continue
+        merged[key] = coerce(env_value)
+
+    if not _has_value(merged.get("labels")):
+        labels = _labels_from_env()
+        if labels:
+            merged["labels"] = labels
+    return merged
+
+def _has_value(value) -> bool:
+    return value not in (None, "")
+
+def _labels_from_env() -> dict[str, str] | None:
+    value = os.environ.get("MC_STORE_RS_LABELS")
+    if not _has_value(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        decoded = json.loads(text)
+        return _coerce_mapping(decoded)
+
+    labels = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, separator, label_value = item.partition("=")
+        if not separator or not key.strip():
+            raise ValueError(
+                "MC_STORE_RS_LABELS must be a JSON object or comma-separated key=value pairs"
+            )
+        labels[key.strip()] = label_value.strip()
+    return labels or None
 
 def _normalize_raw_multi_buffer_args(
     keys: Sequence[str],
