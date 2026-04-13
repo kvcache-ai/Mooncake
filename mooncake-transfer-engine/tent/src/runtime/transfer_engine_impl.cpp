@@ -805,11 +805,14 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
     } else {
         auto entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return UNSPEC;
-        auto* local_desc = metadata_->segmentManager().getLocal().get();
-        bool same_machine =
-            request.target_id == LOCAL_SEGMENT_ID ||
-            (!desc->machine_id.empty() && !local_desc->machine_id.empty() &&
-             desc->machine_id == local_desc->machine_id);
+        bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
+        if (!same_machine) {
+            auto local_desc = metadata_->segmentManager().getLocal();
+            same_machine =
+                local_desc && !desc->machine_id.empty() &&
+                !local_desc->machine_id.empty() &&
+                desc->machine_id == local_desc->machine_id;
+        }
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
