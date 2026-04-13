@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::tent as ffi;
 
+use crate::env::EnvOverrideGuard;
 use crate::{Opcode, TransferProgress, TransferRequest, TransferStatus};
 
 #[derive(Clone, Default)]
@@ -282,42 +283,16 @@ fn tent_engine_create_lock() -> &'static Mutex<()> {
 }
 
 struct TentRedisEnvGuard {
-    username: Option<String>,
-    password: Option<String>,
-    db_index: Option<String>,
+    _env: EnvOverrideGuard,
 }
 
 impl TentRedisEnvGuard {
     fn apply(config: &TentEngineConfig) -> Self {
-        Self {
-            username: set_env_override("MC_REDIS_USERNAME", config.redis_username.as_deref()),
-            password: set_env_override("MC_REDIS_PASSWORD", config.redis_password.as_deref()),
-            db_index: set_env_override("MC_REDIS_DB_INDEX", config.redis_db_index.as_deref()),
-        }
-    }
-}
-
-impl Drop for TentRedisEnvGuard {
-    fn drop(&mut self) {
-        restore_env_override("MC_REDIS_USERNAME", self.username.as_deref());
-        restore_env_override("MC_REDIS_PASSWORD", self.password.as_deref());
-        restore_env_override("MC_REDIS_DB_INDEX", self.db_index.as_deref());
-    }
-}
-
-fn set_env_override(key: &str, value: Option<&str>) -> Option<String> {
-    let previous = std::env::var(key).ok();
-    match value {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
-    }
-    previous
-}
-
-fn restore_env_override(key: &str, previous: Option<&str>) {
-    match previous {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        let mut env = EnvOverrideGuard::new();
+        env.set_optional("MC_REDIS_USERNAME", config.redis_username.as_deref());
+        env.set_optional("MC_REDIS_PASSWORD", config.redis_password.as_deref());
+        env.set_optional("MC_REDIS_DB_INDEX", config.redis_db_index.as_deref());
+        Self { _env: env }
     }
 }
 
