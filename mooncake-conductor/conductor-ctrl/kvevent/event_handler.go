@@ -30,6 +30,7 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 		return fmt.Errorf("manager stopped")
 	}
 	h.manager.mu.RUnlock()
+	slog.Info("Handling KV event", "instance_id", h.instanceID, "dpRank", dpRank)
 
 	// Create context for processing
 	ctx, cancel := context.WithTimeout(h.manager.ctx, 10*time.Second)
@@ -43,6 +44,7 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 			"dpRank", dpRank,
 			"blocks", len(e.BlockHashes),
 		)
+		slog.Info("Received BlockStoredEvent", "medium", e.Medium)
 		return h.handleBlockStored(ctx, e, dpRank)
 	case *zmq.BlockRemovedEvent:
 		slog.Debug("BlockRemoved",
@@ -50,6 +52,7 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent, dpRank int64) error {
 			"dpRank", dpRank,
 			"blocks", len(e.BlockHashes),
 		)
+		slog.Info("Received BlockRemovedEvent", "medium", e.Medium)
 		return h.handleBlockRemoved(ctx, e, dpRank)
 
 	default:
