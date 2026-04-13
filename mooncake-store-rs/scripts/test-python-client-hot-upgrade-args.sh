@@ -132,9 +132,14 @@ native.MooncakeDistributedStore = lambda: object()
 native.MooncakeHostMemAllocator = lambda *args, **kwargs: None
 native.init_tracing = lambda *args, **kwargs: 0
 native.metrics_text = lambda: ""
-native.start_metrics_server = lambda bind_addr="127.0.0.1:0": bind_addr
+metrics_state = {"address": None, "starts": []}
+def start_metrics_server(bind_addr="127.0.0.1:0"):
+    metrics_state["starts"].append(bind_addr)
+    metrics_state["address"] = bind_addr
+    return bind_addr
+native.start_metrics_server = start_metrics_server
 native.stop_metrics_server = lambda: None
-native.metrics_server_address = lambda: None
+native.metrics_server_address = lambda: metrics_state["address"]
 sys.modules["mooncake._store_rs"] = native
 
 spec = importlib.util.spec_from_file_location("mooncake.store", package_dir / "store.py")
@@ -320,6 +325,30 @@ try:
     assert kwargs["route_topk"] == 5
 finally:
     clear_setup_env()
+
+os.environ["MC_STORE_RS_METRICS_ADDR"] = "127.0.0.1:19090"
+try:
+    store.setup(
+        "127.0.0.1",
+        "redis://127.0.0.1:6379/0",
+        1024,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert metrics_state["starts"] == ["127.0.0.1:19090"]
+
+    store.setup(
+        {
+            "local_hostname": "127.0.0.1",
+            "metadata_server": "redis://127.0.0.1:6379/0",
+        }
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert metrics_state["starts"] == ["127.0.0.1:19090"]
+finally:
+    os.environ.pop("MC_STORE_RS_METRICS_ADDR", None)
+    metrics_state["address"] = None
+    metrics_state["starts"].clear()
 
 try:
     store.setup(
