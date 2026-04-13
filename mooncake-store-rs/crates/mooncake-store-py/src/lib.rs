@@ -1559,6 +1559,7 @@ mod tests {
     use std::net::TcpListener;
     use std::ptr;
     use std::slice;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread::sleep;
     use std::time::Duration;
@@ -1584,10 +1585,11 @@ mod tests {
     use super::{
         _store_rs, init_tracing, metrics_server_address, metrics_text, parse_client_epoch_arg,
         parse_initial_state_arg, pointer_from_usize, replication_policy, route_to_py,
-        segment_to_py, start_metrics_server, stop_metrics_server, store_error_to_py,
+        segment_to_py, start_metrics_server, stop_metrics_server, store_error_to_py, DummySession,
         PyMooncakeDistributedStore, PyMooncakeHostMemAllocator, StoreBackend,
     };
     use crate::dispatcher::StoreDispatcher;
+    use crate::dummy_service::pb;
     use crate::dummy_service::{start_dummy_store_server, DummyStoreServerHandle};
 
     struct TestTransport {
@@ -1933,6 +1935,181 @@ mod tests {
             sleep(Duration::from_millis(25));
         }
         (store, server)
+    }
+
+    #[derive(Clone)]
+    struct BlockingDummyStoreService {
+        release: Arc<AtomicBool>,
+    }
+
+    impl BlockingDummyStoreService {
+        async fn wait(&self) {
+            while !self.release.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl pb::dummy_store_service_server::DummyStoreService for BlockingDummyStoreService {
+        async fn health(
+            &self,
+            _request: tonic::Request<pb::HealthRequest>,
+        ) -> std::result::Result<tonic::Response<pb::HealthReply>, tonic::Status> {
+            Ok(tonic::Response::new(pb::HealthReply { status: 0 }))
+        }
+
+        async fn put(
+            &self,
+            _request: tonic::Request<pb::PutRequest>,
+        ) -> std::result::Result<tonic::Response<pb::StatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::StatusReply { status: 0 }))
+        }
+
+        async fn get(
+            &self,
+            _request: tonic::Request<pb::GetRequest>,
+        ) -> std::result::Result<tonic::Response<pb::GetReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::GetReply {
+                status: 0,
+                value: b"released".to_vec(),
+            }))
+        }
+
+        async fn batch_is_exist(
+            &self,
+            _request: tonic::Request<pb::BatchIsExistRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchIsExistReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchIsExistReply {
+                statuses: vec![],
+            }))
+        }
+
+        async fn batch_put_from(
+            &self,
+            _request: tonic::Request<pb::BatchPutFromRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchStatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchStatusReply {
+                statuses: vec![],
+            }))
+        }
+
+        async fn batch_put_from_multi_buffers(
+            &self,
+            _request: tonic::Request<pb::BatchPutFromMultiBuffersRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchStatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchStatusReply {
+                statuses: vec![],
+            }))
+        }
+
+        async fn batch_get_into(
+            &self,
+            _request: tonic::Request<pb::BatchGetIntoRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchGetIntoReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchGetIntoReply {
+                lengths: vec![],
+            }))
+        }
+
+        async fn batch_get_into_multi_buffers(
+            &self,
+            _request: tonic::Request<pb::BatchGetIntoMultiBuffersRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchGetIntoReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchGetIntoReply {
+                lengths: vec![],
+            }))
+        }
+
+        async fn remove_all(
+            &self,
+            _request: tonic::Request<pb::RemoveAllRequest>,
+        ) -> std::result::Result<tonic::Response<pb::RemoveAllReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::RemoveAllReply {
+                status: 0,
+                removed: 0,
+            }))
+        }
+
+        async fn unregister_region(
+            &self,
+            _request: tonic::Request<pb::UnregisterRegionRequest>,
+        ) -> std::result::Result<tonic::Response<pb::StatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::StatusReply { status: 0 }))
+        }
+    }
+
+    struct BlockingDummyServerHandle {
+        address: String,
+        release: Arc<AtomicBool>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl BlockingDummyServerHandle {
+        fn address(&self) -> &str {
+            &self.address
+        }
+
+        fn release(&self) {
+            self.release.store(true, Ordering::SeqCst);
+        }
+
+        fn shutdown(mut self) {
+            self.release();
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn start_blocking_dummy_server() -> BlockingDummyServerHandle {
+        let address = bind_addr();
+        let socket_addr = address
+            .parse()
+            .expect("blocking dummy server address should parse");
+        let release = Arc::new(AtomicBool::new(false));
+        let service = BlockingDummyStoreService {
+            release: release.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("blocking-dummy-server".to_string())
+            .spawn(move || {
+                let runtime =
+                    tokio::runtime::Runtime::new().expect("blocking dummy runtime should build");
+                runtime.block_on(async move {
+                    tonic::transport::Server::builder()
+                        .add_service(
+                            pb::dummy_store_service_server::DummyStoreServiceServer::new(service),
+                        )
+                        .serve_with_shutdown(socket_addr, async move {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .expect("blocking dummy server should run");
+                });
+            })
+            .expect("blocking dummy server thread should spawn");
+        DummySession::connect(&address).expect("blocking dummy server should accept connections");
+        BlockingDummyServerHandle {
+            address,
+            release,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        }
     }
 
     fn sample_segment() -> SegmentAnnouncement {
@@ -2626,5 +2803,61 @@ mod tests {
             .free(read_ptr)
             .expect("dummy read buffer should free");
         server.shutdown().expect("dummy server should stop");
+    }
+
+    #[test]
+    fn dummy_rpc_returns_timeout_instead_of_hanging() {
+        let server = start_blocking_dummy_server();
+        let session = DummySession::connect(server.address())
+            .expect("dummy client should connect to blocking server");
+        let started = std::time::Instant::now();
+        let error = session
+            .get("blocked", None)
+            .expect_err("blocked dummy rpc should time out");
+        assert!(
+            matches!(error, StoreError::Transport(ref message) if message.contains("timed out")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "dummy rpc timeout should fail fast"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn dispatcher_async_wait_returns_timeout_instead_of_hanging() {
+        let dispatcher = StoreDispatcher::spawn(
+            build_client("dispatcher-timeout"),
+            "dispatcher-timeout".to_string(),
+        )
+        .expect("dispatcher should spawn");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let error = tokio::runtime::Runtime::new()
+            .expect("test runtime should build")
+            .block_on(async {
+                dispatcher
+                    .run_async_with_state(move |_client, _state| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                    .await
+            })
+            .expect_err("blocked dispatcher request should time out");
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dispatcher task should enter");
+        assert!(
+            matches!(error, StoreError::Transport(ref message) if message.contains("timed out")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "dispatcher timeout should fail fast"
+        );
+        let _ = release_tx.send(());
     }
 }

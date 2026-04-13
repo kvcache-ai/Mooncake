@@ -3,6 +3,7 @@ use std::ffi::c_void;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use mooncake_store_client::{
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
@@ -13,7 +14,6 @@ use mooncake_store_core::{
     StoreError,
 };
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
 
 use crate::dummy_service::pb;
 use crate::shm::{DummyClientId, OwnedMappedRegion};
@@ -22,6 +22,7 @@ type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
 type Task = Box<dyn FnOnce(&mut StoreClient, &mut DispatcherState) + Send + 'static>;
+const DISPATCHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct DispatcherState {
     tracked_keys: BTreeSet<TrackedKey>,
@@ -159,11 +160,15 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&mut StoreClient, &mut DispatcherState) -> Result<T, StoreError> + Send + 'static,
     {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.send(Box::new(move |client, state| {
             let _ = reply_tx.send(f(client, state));
         }))?;
-        reply_rx.blocking_recv().map_err(|_| dispatcher_stopped())?
+        match reply_rx.recv_timeout(DISPATCHER_REQUEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(dispatcher_timeout()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(dispatcher_stopped()),
+        }
     }
 
     pub(crate) async fn run_async_with_state<T, F>(&self, f: F) -> Result<T, StoreError>
@@ -171,11 +176,20 @@ impl StoreDispatcher {
         T: Send + 'static,
         F: FnOnce(&mut StoreClient, &mut DispatcherState) -> Result<T, StoreError> + Send + 'static,
     {
-        let (reply_tx, reply_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.send(Box::new(move |client, state| {
             let _ = reply_tx.send(f(client, state));
         }))?;
-        reply_rx.await.map_err(|_| dispatcher_stopped())?
+        match tokio::task::spawn_blocking(move || reply_rx.recv_timeout(DISPATCHER_REQUEST_TIMEOUT))
+            .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => Err(dispatcher_timeout()),
+            Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => Err(dispatcher_stopped()),
+            Err(error) => Err(StoreError::Transport(format!(
+                "store dispatcher wait worker failed: {error}"
+            ))),
+        }
     }
 
     pub(crate) fn install_region(
@@ -572,6 +586,13 @@ fn region_key(client_id: DummyClientId, region_id: u64) -> RegionKey {
 
 fn dispatcher_stopped() -> StoreError {
     StoreError::Transport("store dispatcher stopped".to_string())
+}
+
+fn dispatcher_timeout() -> StoreError {
+    StoreError::Transport(format!(
+        "store dispatcher request timed out after {}ms",
+        DISPATCHER_REQUEST_TIMEOUT.as_millis()
+    ))
 }
 
 fn normalized_tenant(client: &StoreClient, tenant: &str) -> String {
