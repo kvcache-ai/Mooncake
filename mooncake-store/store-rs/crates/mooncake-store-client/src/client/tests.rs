@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, MetadataBackend, NamespaceScope,
-    ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy, RoutePolicyDomain,
-    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
+    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
+    RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+    StoreError,
 };
 use mooncake_transport::{
     Opcode, SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
@@ -1546,6 +1547,10 @@ fn query_route_uses_default_tenant_scope() {
     assert!(client
         .query_route_in_tenant("tenant-a", "same-key")
         .expect("tenant query should succeed")
+        .is_none());
+    assert!(client
+        .query_route_in_scope(&NamespaceScope::with_defaults(Some("tenant-a"), None, None), "same-key")
+        .expect("scope query should succeed")
         .is_none());
 }
 
@@ -6261,6 +6266,28 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
     assert_eq!(queried_tenant.canonical_key, tenant_plain.canonical_key);
     assert_eq!(queried_tenant.sharing_scope, tenant_plain.sharing_scope);
     assert_eq!(queried_tenant.qos_tier, tenant_plain.qos_tier);
+
+    let queried_scope = client
+        .query_route_in_scope(
+            &NamespaceScope::with_defaults(Some("tenant-b"), None, None),
+            "plain",
+        )
+        .expect("scope query should succeed")
+        .expect("scope route should exist");
+    assert_eq!(queried_scope.key, queried_tenant.key);
+    let queried_object = client
+        .query_route_by_object_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some("tenant-b"), None, None),
+            "plain",
+        ))
+        .expect("object query should succeed")
+        .expect("object route should exist");
+    assert_eq!(queried_object.key, queried_tenant.key);
+    let scoped_routes = client
+        .list_routes_in_scope(&NamespaceScope::with_defaults(Some("tenant-b"), None, None))
+        .expect("scope listing should succeed");
+    assert!(scoped_routes.iter().any(|route| route.key == queried_tenant.key));
+    assert!(scoped_routes.iter().all(|route| route.namespace.as_ref() == Some(&NamespaceScope::with_defaults(Some("tenant-b"), None, None))));
 
     let mut direct_insert = queried.clone();
     direct_insert.key = client.scoped_key("tenant-a", "cas-direct");

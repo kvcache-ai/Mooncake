@@ -500,7 +500,7 @@ impl StoreClient {
     }
 
     fn scoped_key(&self, tenant: &str, key: &str) -> ObjectKey {
-        ObjectKey::new(format!("{tenant}::{key}"))
+        mooncake_store_core::scoped_object_key(tenant, key)
     }
 
     fn publish_local_segment(&self, segment: &StorageExtentInfo, used_bytes: u64) -> Result<()> {

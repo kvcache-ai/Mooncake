@@ -186,8 +186,8 @@ mod tests {
     };
     use crate::NamespaceScope;
     use crate::{
-        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        CompatibilityDescriptor,
+        scoped_logical_object_id, scoped_object_key, ClientEndpointSet, ClientEpoch, ClientLease,
+        ClientLifecycleState, ClientRuntimeId, CompatibilityDescriptor,
     };
 
     #[test]
@@ -200,6 +200,10 @@ mod tests {
     fn object_key_can_be_derived_from_namespace_scope() {
         let scope = NamespaceScope::new("tenant-a", "domain-a", "set-a");
         assert_eq!(ObjectKey::from_scope(&scope, "logical-a").0, "tenant-a::logical-a");
+        assert_eq!(
+            ObjectKey::from_logical_id(&scoped_logical_object_id("tenant-a", "logical-a")),
+            scoped_object_key("tenant-a", "logical-a")
+        );
     }
 
     #[test]

@@ -23,6 +23,13 @@ pub trait MooncakeCompatibilityFacade {
     }
     fn query_route(&self, key: &str) -> Result<Option<ObjectRoute>>;
     fn query_route_in_tenant(&self, tenant: &str, key: &str) -> Result<Option<ObjectRoute>>;
+    fn query_route_in_scope(
+        &self,
+        scope: &NamespaceScope,
+        logical_key: &str,
+    ) -> Result<Option<ObjectRoute>>;
+    fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>>;
+    fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>>;
     fn cas_route(
         &self,
         key: &str,
@@ -445,8 +452,29 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_in_tenant(&self, tenant: &str, key: &str) -> Result<Option<ObjectRoute>> {
+        self.query_route_in_scope(&NamespaceScope::with_defaults(Some(tenant), None, None), key)
+    }
+
+    fn query_route_in_scope(
+        &self,
+        scope: &NamespaceScope,
+        logical_key: &str,
+    ) -> Result<Option<ObjectRoute>> {
+        self.query_route_by_object_id(&LogicalObjectId::new(scope.clone(), logical_key))
+    }
+
+    fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
         self.route_directory
-            .get_object_route(&self.lease, &self.scoped_key(tenant, key))
+            .get_object_route(&self.lease, &ObjectKey::from_logical_id(object_id))
+    }
+
+    fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
+        Ok(self
+            .metadata
+            .list_object_routes()?
+            .into_iter()
+            .filter(|route| route.namespace.as_ref() == Some(scope))
+            .collect())
     }
 
     fn cas_route(
@@ -465,9 +493,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult> {
+        let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
+        let object_key = ObjectKey::from_logical_id(&object_id);
         self.route_directory.compare_and_swap_object_route(
             &self.lease,
-            &self.scoped_key(tenant, key),
+            &object_key,
             expected,
             next,
         )
@@ -575,10 +605,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
         let tracker = OperationTracker::new("remove");
         let _ = force;
-        let scoped_key = self.scoped_key(tenant, key);
+        let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
+        let object_key = ObjectKey::from_logical_id(&object_id);
         let Some(route) = self
             .route_directory
-            .get_object_route(&self.lease, &scoped_key)?
+            .get_object_route(&self.lease, &object_key)?
         else {
             let result = Err(StoreError::NotFound(format!("tenant={tenant} key={key}")));
             tracker.finish(&result, 0);
@@ -586,7 +617,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         };
         let cas = self.route_directory.compare_and_swap_object_route(
             &self.lease,
-            &scoped_key,
+            &object_key,
             Some(route.version),
             None,
         )?;

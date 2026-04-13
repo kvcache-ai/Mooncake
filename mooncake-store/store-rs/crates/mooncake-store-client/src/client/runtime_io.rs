@@ -9,7 +9,9 @@ impl StoreClient {
         reclaim_mode: ReclaimMode,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
-        let scoped_key = self.scoped_key(tenant, key);
+        self.flush_due_reclaims()?;
+        let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
+        let scoped_key = ObjectKey::from_logical_id(&object_id);
         let policy = self.resolve_replication_policy(policy)?;
         let max_write_attempts = if policy.with_soft_pin {
             DEFAULT_PUT_WRITE_RETRY_LIMIT
@@ -60,12 +62,11 @@ impl StoreClient {
                 .map(|route| route.version.next())
                 .unwrap_or(RouteVersion(1));
             let checksum = payload_checksum(value);
-            let namespace = mooncake_store_core::NamespaceScope::with_defaults(Some(tenant), None, None);
-            let route = ObjectRoute {
+            let mut route = ObjectRoute {
                 key: scoped_key.clone(),
-                namespace: Some(namespace.clone()),
+                namespace: Some(mooncake_store_core::NamespaceScope::with_defaults(Some(tenant), None, None)),
                 logical_key: Some(key.to_string()),
-                canonical_key: Some(format!("{}/{}", namespace.canonical_prefix(), key)),
+                canonical_key: None,
                 sharing_scope: Some(tenant.to_string()),
                 qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
                 version: next_version,
@@ -87,6 +88,7 @@ impl StoreClient {
                     })
                     .collect(),
             };
+            mooncake_store_core::apply_route_identity(&mut route, &object_id);
             let cas_tracker = OperationTracker::new("put_stage_route_cas");
             let publish_started = Instant::now();
             let cas_result = self.route_directory.compare_and_swap_object_route(
@@ -112,12 +114,72 @@ impl StoreClient {
                     "route update lost race for tenant={tenant} key={key}"
                 )));
             }
+<<<<<<< HEAD
             self.storage_owner.track_route(&route);
             self.track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
             if let Some(previous) = current {
                 self.reclaim_route(previous, reclaim_mode)?;
             }
             return Ok(route);
+=======
+        };
+        let expected_version = current.map(|route| route.version);
+        let next_version = current
+            .map(|route| route.version.next())
+            .unwrap_or(RouteVersion(1));
+        let checksum = payload_checksum(value);
+        let mut route = ObjectRoute {
+            key: scoped_key,
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: next_version,
+            state: RouteState::Active,
+            compatibility: self.lease.compatibility.clone(),
+            replicas: targets
+                .iter()
+                .zip(offsets.iter())
+                .enumerate()
+                .map(|(priority, (target, offset))| ReplicaRoute {
+                    owner: target.storage_runtime.clone(),
+                    segment_name: target.segment_name.clone(),
+                    offset: *offset,
+                    segment_offset: reservations[priority].offset_bytes,
+                    length: value.len() as u64,
+                    checksum: Some(checksum),
+                    tier: ReplicaTier::Dram,
+                    priority: priority as u16,
+                })
+                .collect(),
+        };
+        mooncake_store_core::apply_route_identity(&mut route, &object_id);
+        let cas_tracker = OperationTracker::new("put_stage_route_cas");
+        let publish_started = Instant::now();
+        let cas_result = self.route_directory.compare_and_swap_object_route(
+            &self.lease,
+            &route.key,
+            expected_version,
+            Some(&route),
+        );
+        registry::record_replication_publish(
+            match &cas_result {
+                Ok(cas) if cas.applied => "ok",
+                Ok(_) => "conflict",
+                Err(StoreError::Conflict(_)) => "conflict",
+                Err(_) => "error",
+            },
+            publish_started.elapsed(),
+        );
+        cas_tracker.finish(&cas_result, 0);
+        let cas = cas_result?;
+        if !cas.applied {
+            let _ = self.release_reserved_allocations(&targets, &reservations);
+            return Err(StoreError::Conflict(format!(
+                "route update lost race for tenant={tenant} key={key}"
+            )));
+>>>>>>> 215c90f ([Store-RS] centralize namespace identity routing)
         }
     }
 
@@ -128,10 +190,11 @@ impl StoreClient {
         value: &[u8],
         policy: Option<&ReplicationPolicy>,
     ) -> Result<ObjectRoute> {
+        let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let load_tracker = OperationTracker::new("put_stage_load_route");
         let current_result = self
             .route_directory
-            .get_object_route(&self.lease, &self.scoped_key(tenant, key));
+            .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
         self.put_scoped_with_policy_current(
@@ -212,15 +275,25 @@ impl StoreClient {
             .collect())
     }
 
+    fn insert_latest_route(routes: &mut BTreeMap<LogicalObjectId, ObjectRoute>, route: ObjectRoute) {
+        let Ok(object_id) = mooncake_store_core::route_logical_object_id(&route) else {
+            return;
+        };
+        match routes.get(&object_id) {
+            Some(current) if current.version >= route.version => {}
+            _ => {
+                routes.insert(object_id, route);
+            }
+        }
+    }
+
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
         self.route_directory
             .list_routes_by_replica_owner(&self.lease, owner)
     }
 
-    fn split_scoped_route_key<'a>(&self, route: &'a ObjectRoute) -> Result<(&'a str, &'a str)> {
-        route.key.0.split_once("::").ok_or_else(|| {
-            StoreError::InvalidState(format!("route key {} is missing tenant scope", route.key.0))
-        })
+    fn route_object_id(&self, route: &ObjectRoute) -> Result<LogicalObjectId> {
+        mooncake_store_core::route_logical_object_id(route)
     }
 
     fn migration_policy_for_route(&self, route: &ObjectRoute) -> Result<ReplicationPolicy> {
@@ -285,9 +358,11 @@ impl StoreClient {
         writer: &StoreClient,
         route: &ObjectRoute,
     ) -> Result<bool> {
-        let (tenant, key) = self.split_scoped_route_key(route)?;
+        let object_id = self.route_object_id(route)?;
+        let tenant = object_id.scope.tenant;
+        let key = object_id.logical_key;
         for _ in 0..4 {
-            let Some(observed) = self.query_route_in_tenant(tenant, key)? else {
+            let Some(observed) = self.query_route_in_tenant(&tenant, &key)? else {
                 return Ok(false);
             };
             if observed.state != RouteState::Active {
@@ -301,8 +376,8 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let payload = writer.get_in_tenant(tenant, key)?;
-            let Some(confirmed) = self.query_route_in_tenant(tenant, key)? else {
+            let payload = writer.get_in_tenant(&tenant, &key)?;
+            let Some(confirmed) = self.query_route_in_tenant(&tenant, &key)? else {
                 return Ok(false);
             };
             if confirmed.version != observed.version {
@@ -318,8 +393,8 @@ impl StoreClient {
 
             let policy = writer.migration_policy_for_route(&confirmed)?;
             match writer.put_scoped_with_policy_current(
-                tenant,
-                key,
+                &tenant,
+                &key,
                 &payload,
                 Some(&policy),
                 Some(&confirmed),
@@ -450,8 +525,10 @@ impl StoreClient {
     fn current_owned_allocations(&self) -> Result<BTreeSet<AllocationSpan>> {
         let mut allocations = BTreeSet::new();
         for route in self.collect_routes_by_replica_owner(&self.lease.runtime)? {
-            let (tenant, key) = self.split_scoped_route_key(&route)?;
-            let Some(current) = self.query_route_in_tenant(tenant, key)? else {
+            let object_id = self.route_object_id(&route)?;
+            let tenant = object_id.scope.tenant;
+            let key = object_id.logical_key;
+            let Some(current) = self.query_route_in_tenant(&tenant, &key)? else {
                 continue;
             };
             if current.state != RouteState::Active {
@@ -1002,7 +1079,8 @@ impl StoreClient {
                 .iter()
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    (tenant.to_string(), self.scoped_key(tenant, object.key))
+                    let object_id = mooncake_store_core::scoped_logical_object_id(tenant, object.key);
+                    (tenant.to_string(), ObjectKey::from_logical_id(&object_id))
                 })
                 .collect::<Vec<_>>();
             let routes = self.route_directory.get_object_routes(
