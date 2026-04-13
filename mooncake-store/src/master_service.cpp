@@ -3598,6 +3598,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto it = shard->metadata.begin();
                 while (it != shard->metadata.end() && target_evict_num > 0) {
                     if (!it->second.IsHardPinned() &&
+                        it->second.IsLeaseExpired(now) &&
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
