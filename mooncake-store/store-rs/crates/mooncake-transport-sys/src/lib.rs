@@ -13,6 +13,7 @@ pub mod classic {
     pub type TransferEngineHandle = *mut c_void;
     pub type SegmentId = i32;
     pub type BatchId = u64;
+    pub type TransportHandle = *mut c_void;
 
     pub const OPCODE_READ: c_int = 0;
     pub const OPCODE_WRITE: c_int = 1;
@@ -50,6 +51,16 @@ pub mod classic {
             rpc_port: u64,
             auto_discover: c_int,
         ) -> TransferEngineHandle;
+        pub fn getLocalIpAndPort(
+            engine: TransferEngineHandle,
+            buf_out: *mut c_char,
+            buf_len: usize,
+        ) -> c_int;
+        pub fn installTransport(
+            engine: TransferEngineHandle,
+            proto: *const c_char,
+            args: *mut *mut c_void,
+        ) -> TransportHandle;
         pub fn destroyTransferEngine(engine: TransferEngineHandle);
         pub fn registerLocalMemory(
             engine: TransferEngineHandle,
@@ -60,6 +71,10 @@ pub mod classic {
         ) -> c_int;
         pub fn unregisterLocalMemory(engine: TransferEngineHandle, addr: *mut c_void) -> c_int;
         pub fn openSegment(engine: TransferEngineHandle, segment_name: *const c_char) -> SegmentId;
+        pub fn openSegmentNoCache(
+            engine: TransferEngineHandle,
+            segment_name: *const c_char,
+        ) -> SegmentId;
         pub fn closeSegment(engine: TransferEngineHandle, segment_id: SegmentId) -> c_int;
         pub fn allocateBatchID(engine: TransferEngineHandle, batch_size: usize) -> BatchId;
         pub fn submitTransfer(
@@ -76,6 +91,17 @@ pub mod classic {
         ) -> c_int;
         pub fn freeBatchID(engine: TransferEngineHandle, batch_id: BatchId) -> c_int;
         pub fn syncSegmentCache(engine: TransferEngineHandle) -> c_int;
+        pub fn mooncake_classic_get_batch_transfer_status(
+            engine: TransferEngineHandle,
+            batch_id: BatchId,
+            status: *mut TransferStatus,
+        ) -> c_int;
+        pub fn mooncake_classic_get_segment_first_buffer(
+            engine: TransferEngineHandle,
+            segment_id: SegmentId,
+            addr_out: *mut u64,
+            length_out: *mut u64,
+        ) -> c_int;
     }
 }
 

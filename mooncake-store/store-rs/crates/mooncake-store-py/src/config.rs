@@ -7,14 +7,27 @@ use mooncake_metadata::{
     RedisMetadataConfig,
 };
 use mooncake_store_core::{MetadataBackend, Result, StoreError};
-use mooncake_transport::TentEngineConfig;
+use mooncake_transport::{ClassicEngineConfig, ClassicTransportProtocol, TentEngineConfig};
 use url::Url;
 
 const DEFAULT_COMPAT_LEASE_TTL_MS: u64 = 30_000;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TransportBackend {
+    Tent,
+    ClassicTe,
+}
+
+#[derive(Clone, Debug)]
+pub enum CompatTransportConfig {
+    Tent(TentEngineConfig),
+    ClassicTe(ClassicEngineConfig),
+}
+
 pub struct CompatBuildPlan {
     pub metadata: Arc<dyn MetadataBackend>,
-    pub tent_config: TentEngineConfig,
+    pub transport_backend: TransportBackend,
+    pub transport_config: CompatTransportConfig,
     pub stable_id: String,
     pub tenant: String,
     pub labels: BTreeMap<String, String>,
@@ -38,6 +51,7 @@ pub struct CompatSetupArgs {
     pub protocol: String,
     pub _rdma_devices: String,
     pub transport_rpc_port: Option<u16>,
+    pub transport_backend: Option<String>,
     pub stable_id: Option<String>,
     pub tenant: String,
     pub labels: BTreeMap<String, String>,
@@ -56,9 +70,11 @@ impl CompatSetupArgs {
         let stable_id = self
             .stable_id
             .unwrap_or_else(|| format!("py-store-{}", now_ms()));
+        let transport_backend = resolve_transport_backend(self.transport_backend.as_deref())?;
         let (metadata, transport_redis_url) =
             build_metadata_backend(&self.metadata_url, self.transport_metadata_url, keyspace)?;
-        let tent_config = build_tent_config(
+        let transport_config = build_transport_config(
+            transport_backend,
             &self.local_hostname,
             &transport_redis_url,
             &self.protocol,
@@ -86,7 +102,8 @@ impl CompatSetupArgs {
         }
         Ok(CompatBuildPlan {
             metadata,
-            tent_config,
+            transport_backend,
+            transport_config,
             stable_id,
             tenant: self.tenant,
             labels,
@@ -101,6 +118,45 @@ impl CompatSetupArgs {
             use_hugepage: self.use_hugepage,
             hugepage_size_bytes: self.hugepage_size_bytes,
         })
+    }
+}
+
+fn resolve_transport_backend(explicit: Option<&str>) -> Result<TransportBackend> {
+    let value = explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("MC_STORE_RS_TRANSPORT_BACKEND").ok())
+        .unwrap_or_else(|| "tent".to_string());
+    match value.to_ascii_lowercase().as_str() {
+        "tent" => Ok(TransportBackend::Tent),
+        "classic" | "classic_te" | "classic-te" | "te" => Ok(TransportBackend::ClassicTe),
+        other => Err(StoreError::Unsupported(format!(
+            "unsupported transport backend: {other}"
+        ))),
+    }
+}
+
+fn build_transport_config(
+    backend: TransportBackend,
+    local_hostname: &str,
+    transport_redis_url: &str,
+    protocol: &str,
+    transport_rpc_port: Option<u16>,
+) -> Result<CompatTransportConfig> {
+    match backend {
+        TransportBackend::Tent => Ok(CompatTransportConfig::Tent(build_tent_config(
+            local_hostname,
+            transport_redis_url,
+            protocol,
+            transport_rpc_port,
+        )?)),
+        TransportBackend::ClassicTe => Ok(CompatTransportConfig::ClassicTe(build_classic_config(
+            local_hostname,
+            transport_redis_url,
+            protocol,
+            transport_rpc_port,
+        )?)),
     }
 }
 
@@ -209,6 +265,50 @@ fn build_tent_config(
     Ok(config)
 }
 
+fn build_classic_config(
+    local_hostname: &str,
+    transport_redis_url: &str,
+    protocol: &str,
+    transport_rpc_port: Option<u16>,
+) -> Result<ClassicEngineConfig> {
+    let (rpc_bind_host, rpc_port) =
+        normalize_transport_listen_endpoint(local_hostname, transport_rpc_port)?;
+    let redis = Url::parse(transport_redis_url)
+        .map_err(|error| StoreError::Metadata(format!("invalid redis url: {error}")))?;
+    let host = redis
+        .host_str()
+        .ok_or_else(|| StoreError::Metadata("redis url is missing host".to_string()))?;
+    let port = redis.port().unwrap_or(6379);
+    let db_index = redis
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("0");
+    let auth = resolve_transport_redis_auth(&redis);
+    let protocol = match protocol.to_ascii_lowercase().as_str() {
+        "tcp" | "" | "auto" => ClassicTransportProtocol::Tcp,
+        "rdma" => ClassicTransportProtocol::Rdma,
+        other => {
+            return Err(StoreError::Unsupported(format!(
+                "unsupported transport protocol: {other}"
+            )))
+        }
+    };
+    let metadata_uri = format!("redis://{}:{port}", format_redis_host(host));
+    let mut config = ClassicEngineConfig::new(metadata_uri, rpc_bind_host).protocol(protocol);
+    if let Some(rpc_port) = rpc_port {
+        config = config.rpc_port(rpc_port);
+    }
+    config = config.redis_db_index(db_index);
+    if let Some(username) = auth.username {
+        config = config.redis_username(username);
+    }
+    if let Some(password) = auth.password {
+        config = config.redis_password(password);
+    }
+    Ok(config)
+}
+
 fn normalize_transport_listen_endpoint(
     local_hostname: &str,
     transport_rpc_port: Option<u16>,
@@ -292,6 +392,14 @@ fn normalize_etcd_endpoint(endpoint: &str) -> String {
     }
 }
 
+fn format_redis_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -331,6 +439,51 @@ mod tests {
         assert!(debug.contains("cache.local:6381"));
         assert!(debug.contains("3"));
         assert!(debug.contains("17111"));
+    }
+
+    #[test]
+    fn build_classic_config_normalizes_metadata_uri_and_auth() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        let config = build_classic_config(
+            "node-a:17112",
+            "redis://user:pass@cache.local:6381/4",
+            "tcp",
+            None,
+        )
+        .expect("classic config should build");
+        assert_eq!(config.metadata_uri(), "redis://cache.local:6381");
+        assert_eq!(config.rpc_bind_host(), "node-a");
+        assert_eq!(config.rpc_port_value(), Some(17112));
+        assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Tcp);
+        assert_eq!(config.redis_username_value(), Some("user"));
+        assert_eq!(config.redis_password_value(), Some("pass"));
+        assert_eq!(config.redis_db_index_value(), Some("4"));
+    }
+
+    #[test]
+    fn resolve_transport_backend_prefers_explicit_value() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        std::env::set_var("MC_STORE_RS_TRANSPORT_BACKEND", "tent");
+        let backend =
+            resolve_transport_backend(Some("classic_te")).expect("explicit backend should parse");
+        assert_eq!(backend, TransportBackend::ClassicTe);
+        std::env::remove_var("MC_STORE_RS_TRANSPORT_BACKEND");
+    }
+
+    #[test]
+    fn resolve_transport_backend_reads_env_when_unspecified() {
+        let _guard = env_test_lock().lock().expect("test lock poisoned");
+        std::env::set_var("MC_STORE_RS_TRANSPORT_BACKEND", "te");
+        let backend = resolve_transport_backend(None).expect("env backend should parse");
+        assert_eq!(backend, TransportBackend::ClassicTe);
+        std::env::remove_var("MC_STORE_RS_TRANSPORT_BACKEND");
+    }
+
+    #[test]
+    fn resolve_transport_backend_rejects_unknown_values() {
+        let error =
+            resolve_transport_backend(Some("mystery")).expect_err("unknown backend should fail");
+        assert!(matches!(error, StoreError::Unsupported(_)));
     }
 
     #[test]
@@ -385,6 +538,7 @@ mod tests {
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
+            transport_backend: None,
             stable_id: Some("sample".to_string()),
             tenant: "default".to_string(),
             labels: BTreeMap::new(),
@@ -402,6 +556,7 @@ mod tests {
             plan.labels.get("storage").map(String::as_str),
             Some("false")
         );
+        assert_eq!(plan.transport_backend, TransportBackend::Tent);
     }
 
     #[test]
@@ -415,6 +570,7 @@ mod tests {
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
+            transport_backend: None,
             stable_id: Some("sample".to_string()),
             tenant: "default".to_string(),
             labels: BTreeMap::from([("storage".to_string(), "true".to_string())]),
@@ -445,6 +601,7 @@ mod tests {
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
+            transport_backend: None,
             stable_id: Some("sample".to_string()),
             tenant: "default".to_string(),
             labels: BTreeMap::new(),
@@ -475,6 +632,7 @@ mod tests {
             protocol: "rdma".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: Some(17112),
+            transport_backend: None,
             stable_id: None,
             tenant: "tenant-a".to_string(),
             labels: BTreeMap::from([("pool".to_string(), "pool-a".to_string())]),
@@ -501,11 +659,54 @@ mod tests {
         assert_eq!(plan.labels.get("storage").map(String::as_str), Some("true"));
         assert!(plan.expires_at_ms > 0);
 
-        let debug = format!("{:?}", plan.tent_config);
-        assert!(debug.contains("cache.local:6381"));
-        assert!(debug.contains("4"));
-        assert!(debug.contains("17112"));
-        assert!(debug.contains("transports/rdma/enable"));
+        match plan.transport_config {
+            CompatTransportConfig::Tent(config) => {
+                let debug = format!("{config:?}");
+                assert!(debug.contains("cache.local:6381"));
+                assert!(debug.contains("4"));
+                assert!(debug.contains("17112"));
+                assert!(debug.contains("transports/rdma/enable"));
+            }
+            CompatTransportConfig::ClassicTe(_) => {
+                panic!("default backend should remain tent")
+            }
+        }
+    }
+
+    #[test]
+    fn compat_setup_can_build_classic_te_plan() {
+        let plan = CompatSetupArgs {
+            local_hostname: "node-a:17112".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            transport_metadata_url: None,
+            global_segment_size: 4096,
+            local_buffer_size: 1024,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            transport_rpc_port: None,
+            transport_backend: Some("classic_te".to_string()),
+            stable_id: Some("classic".to_string()),
+            tenant: "tenant-a".to_string(),
+            labels: BTreeMap::new(),
+            routed_writes: false,
+            replica_count: 1,
+            route_topk: 2,
+            keyspace: None,
+            expires_at_ms: Some(10_000),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+        }
+        .build()
+        .expect("classic plan should build");
+
+        assert_eq!(plan.transport_backend, TransportBackend::ClassicTe);
+        match plan.transport_config {
+            CompatTransportConfig::ClassicTe(config) => {
+                assert_eq!(config.rpc_bind_host(), "node-a");
+                assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Tcp);
+            }
+            CompatTransportConfig::Tent(_) => panic!("classic backend should build classic config"),
+        }
     }
 
     #[test]
@@ -519,6 +720,7 @@ mod tests {
             protocol: "tcp".to_string(),
             _rdma_devices: String::new(),
             transport_rpc_port: None,
+            transport_backend: None,
             stable_id: Some("rw-only".to_string()),
             tenant: "tenant-a".to_string(),
             labels: BTreeMap::new(),

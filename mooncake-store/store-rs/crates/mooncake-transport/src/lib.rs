@@ -3,7 +3,7 @@ mod tent;
 
 use std::ffi::c_void;
 
-pub use classic::ClassicTransferEngine;
+pub use classic::{ClassicEngineConfig, ClassicTransferEngine, ClassicTransportProtocol};
 pub use tent::{SegmentBuffer, SegmentInfo, SegmentKind, TentEngine, TentEngineConfig};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

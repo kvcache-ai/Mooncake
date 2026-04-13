@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    LocalMemoryConfig, PlacementPlanner, RouteControlMode, StoreClient, StoreClientBuilder,
-    TentTransportFactory,
+    ClassicTeTransportFactory, LocalMemoryConfig, PlacementPlanner, RouteControlMode, StoreClient,
+    StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
-use mooncake_transport::TentEngine;
 
-pub use crate::config::CompatSetupArgs;
+pub use crate::config::{CompatSetupArgs, CompatTransportConfig};
 
 pub struct CompatRuntime {
     pub client: StoreClient,
@@ -37,13 +36,14 @@ impl CompatRuntimeArgs {
         let segment_name = self
             .local_segment_name
             .unwrap_or_else(|| default_segment_name(&stable_id));
-        let engine = Arc::new(TentEngine::new(
-            &plan
-                .tent_config
-                .clone()
-                .set("local_segment_name", &segment_name),
-        )?);
-        let factory = Arc::new(TentTransportFactory::new(plan.tent_config));
+        let transport_config = plan.transport_config.clone();
+        let factory: Arc<dyn StoreTransportFactory> = match transport_config {
+            CompatTransportConfig::Tent(config) => Arc::new(TentTransportFactory::new(config)),
+            CompatTransportConfig::ClassicTe(config) => {
+                Arc::new(ClassicTeTransportFactory::new(config))
+            }
+        };
+        let transport = factory.create(&segment_name)?;
         let mut local_memory = LocalMemoryConfig::new()
             .storage_bytes(plan.storage_bytes)
             .scratch_bytes(plan.scratch_bytes)
@@ -61,7 +61,7 @@ impl CompatRuntimeArgs {
             .compatibility(CompatibilityDescriptor::default())
             .tenant(plan.tenant)
             .local_memory(local_memory)
-            .with_tent(engine)
+            .transport(transport)
             .transport_factory(factory)
             .route_control(self.route_control)
             .route_topk(plan.route_topk);
@@ -191,6 +191,7 @@ mod tests {
                 protocol: protocol.to_string(),
                 _rdma_devices: String::new(),
                 transport_rpc_port: None,
+                transport_backend: None,
                 stable_id: Some("py-runtime".to_string()),
                 tenant: "default".to_string(),
                 labels: BTreeMap::new(),

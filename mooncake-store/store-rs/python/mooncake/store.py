@@ -598,6 +598,7 @@ class MooncakeDistributedStore:
                 config.get("transport_metadata_url")
             ),
             transport_rpc_port=transport_rpc_port,
+            transport_backend=_coerce_optional_str(config.get("transport_backend")),
             local_segment_name=_coerce_optional_str(config.get("local_segment_name")),
             expires_at_ms=_coerce_optional_int(config.get("expires_at_ms")),
             use_hugepage=_coerce_optional_bool(config.get("use_hugepage")),

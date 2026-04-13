@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::thread;
@@ -5,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport::{
-    SegmentInfo, TentEngine, TentEngineConfig, TransferProgress, TransferRequest, TransferStatus,
+    ClassicEngineConfig, ClassicTransferEngine, SegmentBuffer, SegmentInfo, SegmentKind,
+    TentEngine, TentEngineConfig, TransferProgress, TransferRequest, TransferStatus,
 };
+use parking_lot::Mutex;
 
 pub trait StoreTransport: Send + Sync {
     fn segment_name(&self) -> Result<String>;
@@ -47,6 +50,26 @@ impl StoreTransportFactory for TentTransportFactory {
     fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
         Ok(Arc::new(TentEngine::new(
             &self.config.clone().set("local_segment_name", segment_name),
+        )?))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassicTeTransportFactory {
+    config: ClassicEngineConfig,
+}
+
+impl ClassicTeTransportFactory {
+    pub fn new(config: ClassicEngineConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl StoreTransportFactory for ClassicTeTransportFactory {
+    fn create(&self, segment_name: &str) -> Result<Arc<dyn StoreTransport>> {
+        Ok(Arc::new(ClassicTeTransport::new(
+            self.config.clone(),
+            segment_name,
         )?))
     }
 }
@@ -109,6 +132,176 @@ impl StoreTransport for TentEngine {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ClassicAllocationRecord {
+    location: String,
+    owned: bool,
+}
+
+pub struct ClassicTeTransport {
+    engine: ClassicTransferEngine,
+    segment_name: String,
+    allocations: Mutex<BTreeMap<usize, ClassicAllocationRecord>>,
+}
+
+impl ClassicTeTransport {
+    fn new(config: ClassicEngineConfig, segment_name: &str) -> Result<Self> {
+        Ok(Self {
+            engine: ClassicTransferEngine::new(&config, segment_name)?,
+            segment_name: segment_name.to_string(),
+            allocations: Mutex::new(BTreeMap::new()),
+        })
+    }
+}
+
+impl StoreTransport for ClassicTeTransport {
+    fn segment_name(&self) -> Result<String> {
+        Ok(self.segment_name.clone())
+    }
+
+    fn rpc_server_address(&self) -> Result<(String, u16)> {
+        parse_rpc_server_address(&self.engine.rpc_server_address_text()?)
+    }
+
+    fn open_segment(&self, segment_name: &str) -> Result<u64> {
+        Ok(self.engine.open_segment(segment_name)? as u64)
+    }
+
+    fn close_segment(&self, handle: u64) -> Result<()> {
+        let handle = i32::try_from(handle).map_err(|_| {
+            StoreError::Transport(format!("classic segment handle {handle} does not fit i32"))
+        })?;
+        self.engine.close_segment(handle)
+    }
+
+    fn get_segment_info(&self, handle: u64) -> Result<SegmentInfo> {
+        let handle = i32::try_from(handle).map_err(|_| {
+            StoreError::Transport(format!("classic segment handle {handle} does not fit i32"))
+        })?;
+        let (base, length) = self.engine.first_buffer(handle)?;
+        Ok(SegmentInfo {
+            kind: SegmentKind::Memory,
+            buffers: vec![SegmentBuffer {
+                base,
+                length,
+                location: "cpu:0".to_string(),
+            }],
+        })
+    }
+
+    fn adopt_local_memory(&self, addr: *mut c_void, _size: usize, location: &str) -> Result<()> {
+        self.allocations
+            .lock()
+            .entry(addr as usize)
+            .or_insert_with(|| ClassicAllocationRecord {
+                location: location.to_string(),
+                owned: false,
+            });
+        Ok(())
+    }
+
+    fn allocate_memory(&self, size: usize, location: &str) -> Result<*mut c_void> {
+        let alignment = default_classic_alignment();
+        let mut addr = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut addr, alignment, size.max(1)) };
+        if rc != 0 {
+            return Err(StoreError::Allocator(format!(
+                "classic posix_memalign failed with rc={rc} size={size} alignment={alignment}"
+            )));
+        }
+        self.allocations.lock().insert(
+            addr as usize,
+            ClassicAllocationRecord {
+                location: location.to_string(),
+                owned: true,
+            },
+        );
+        Ok(addr)
+    }
+
+    fn free_memory(&self, addr: *mut c_void) -> Result<()> {
+        let record = self
+            .allocations
+            .lock()
+            .remove(&(addr as usize))
+            .ok_or_else(|| {
+                StoreError::Allocator(format!(
+                    "classic transport does not own allocation {:p}",
+                    addr
+                ))
+            })?;
+        if record.owned {
+            unsafe { libc::free(addr) };
+        }
+        Ok(())
+    }
+
+    fn register_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {
+        let location = self
+            .allocations
+            .lock()
+            .get(&(addr as usize))
+            .map(|record| record.location.clone())
+            .unwrap_or_else(|| "cpu:0".to_string());
+        self.engine
+            .register_local_memory(addr, size, &location, true)
+    }
+
+    fn unregister_memory(&self, addr: *mut c_void, _size: usize) -> Result<()> {
+        self.engine.unregister_local_memory(addr)
+    }
+
+    fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
+        self.engine.allocate_batch(batch_size)
+    }
+
+    fn free_batch(&self, batch_id: u64) -> Result<()> {
+        self.engine.free_batch(batch_id)
+    }
+
+    fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
+        self.engine.submit(batch_id, requests)
+    }
+
+    fn task_status(&self, batch_id: u64, task_id: usize) -> Result<TransferProgress> {
+        self.engine.task_status(batch_id, task_id)
+    }
+
+    fn overall_status(&self, batch_id: u64) -> Result<TransferProgress> {
+        self.engine.batch_status(batch_id)
+    }
+}
+
+fn default_classic_alignment() -> usize {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        4096
+    } else {
+        usize::try_from(page).unwrap_or(4096).max(64)
+    }
+}
+
+fn parse_rpc_server_address(text: &str) -> Result<(String, u16)> {
+    let trimmed = text.trim();
+    if let Some(inner) = trimmed.strip_prefix('[') {
+        if let Some((host, suffix)) = inner.split_once(']') {
+            let port = suffix
+                .strip_prefix(':')
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or_default();
+            return Ok((host.to_string(), port));
+        }
+    }
+    if trimmed.matches(':').count() == 1 {
+        if let Some((host, port)) = trimmed.rsplit_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                return Ok((host.to_string(), port));
+            }
+        }
+    }
+    Ok((trimmed.to_string(), 0))
+}
+
 pub fn wait_for_batch_completion(
     transport: &dyn StoreTransport,
     batch_id: u64,
@@ -151,7 +344,7 @@ mod tests {
     use mooncake_transport::{SegmentInfo, TransferProgress, TransferRequest, TransferStatus};
     use parking_lot::Mutex;
 
-    use super::{wait_for_batch_completion, StoreTransport};
+    use super::{parse_rpc_server_address, wait_for_batch_completion, StoreTransport};
 
     struct ScriptedTransport {
         statuses: Arc<Mutex<VecDeque<TransferStatus>>>,
@@ -316,5 +509,21 @@ mod tests {
         transport
             .free_batch(batch_id)
             .expect("free batch is a no-op");
+    }
+
+    #[test]
+    fn rpc_server_address_parser_handles_ipv4_ipv6_and_bare_hosts() {
+        assert_eq!(
+            parse_rpc_server_address("127.0.0.1:17111").expect("ipv4 should parse"),
+            ("127.0.0.1".to_string(), 17111)
+        );
+        assert_eq!(
+            parse_rpc_server_address("[::1]:17112").expect("ipv6 should parse"),
+            ("::1".to_string(), 17112)
+        );
+        assert_eq!(
+            parse_rpc_server_address("runtime-a").expect("bare host should parse"),
+            ("runtime-a".to_string(), 0)
+        );
     }
 }

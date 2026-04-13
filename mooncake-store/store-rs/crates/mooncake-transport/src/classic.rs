@@ -1,32 +1,118 @@
 use std::ffi::{c_void, CString};
+use std::sync::{Mutex, OnceLock};
 
 use mooncake_store_core::{Result, StoreError};
 use mooncake_transport_sys::classic as ffi;
 
 use crate::{Opcode, TransferProgress, TransferRequest, TransferStatus};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClassicEngineConfig {
+    metadata_uri: String,
+    rpc_bind_host: String,
+    rpc_port: Option<u16>,
+    protocol: ClassicTransportProtocol,
+    redis_username: Option<String>,
+    redis_password: Option<String>,
+    redis_db_index: Option<String>,
+}
+
+impl ClassicEngineConfig {
+    pub fn new(metadata_uri: impl Into<String>, rpc_bind_host: impl Into<String>) -> Self {
+        Self {
+            metadata_uri: metadata_uri.into(),
+            rpc_bind_host: rpc_bind_host.into(),
+            rpc_port: None,
+            protocol: ClassicTransportProtocol::Tcp,
+            redis_username: None,
+            redis_password: None,
+            redis_db_index: None,
+        }
+    }
+
+    pub fn protocol(mut self, protocol: ClassicTransportProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    pub fn rpc_port(mut self, rpc_port: u16) -> Self {
+        self.rpc_port = Some(rpc_port);
+        self
+    }
+
+    pub fn redis_username(mut self, redis_username: impl Into<String>) -> Self {
+        self.redis_username = Some(redis_username.into());
+        self
+    }
+
+    pub fn redis_password(mut self, redis_password: impl Into<String>) -> Self {
+        self.redis_password = Some(redis_password.into());
+        self
+    }
+
+    pub fn redis_db_index(mut self, redis_db_index: impl Into<String>) -> Self {
+        self.redis_db_index = Some(redis_db_index.into());
+        self
+    }
+
+    pub fn metadata_uri(&self) -> &str {
+        &self.metadata_uri
+    }
+
+    pub fn rpc_bind_host(&self) -> &str {
+        &self.rpc_bind_host
+    }
+
+    pub fn rpc_port_value(&self) -> Option<u16> {
+        self.rpc_port
+    }
+
+    pub fn transport_protocol(&self) -> ClassicTransportProtocol {
+        self.protocol
+    }
+
+    pub fn redis_username_value(&self) -> Option<&str> {
+        self.redis_username.as_deref()
+    }
+
+    pub fn redis_password_value(&self) -> Option<&str> {
+        self.redis_password.as_deref()
+    }
+
+    pub fn redis_db_index_value(&self) -> Option<&str> {
+        self.redis_db_index.as_deref()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClassicTransportProtocol {
+    Tcp,
+    Rdma,
+}
+
 pub struct ClassicTransferEngine {
     raw: ffi::TransferEngineHandle,
 }
 
 impl ClassicTransferEngine {
-    pub fn new(
-        metadata_uri: &str,
-        local_server_name: &str,
-        ip_or_host_name: &str,
-        rpc_port: u64,
-    ) -> Result<Self> {
-        let metadata_uri = to_cstring("metadata_uri", metadata_uri)?;
+    pub fn new(config: &ClassicEngineConfig, local_server_name: &str) -> Result<Self> {
+        let _lock = classic_engine_create_lock()
+            .lock()
+            .expect("classic engine create lock poisoned");
+        let _env = ClassicCreateEnvGuard::apply(config);
+
+        let metadata_uri = to_cstring("metadata_uri", config.metadata_uri())?;
         let local_server_name = to_cstring("local_server_name", local_server_name)?;
-        let ip_or_host_name = to_cstring("ip_or_host_name", ip_or_host_name)?;
+        let ip_or_host_name = to_cstring("ip_or_host_name", config.rpc_bind_host())?;
+        let auto_discover = matches!(config.transport_protocol(), ClassicTransportProtocol::Rdma);
 
         let raw = unsafe {
             ffi::createTransferEngine(
                 metadata_uri.as_ptr(),
                 local_server_name.as_ptr(),
                 ip_or_host_name.as_ptr(),
-                rpc_port,
-                0,
+                u64::from(config.rpc_port_value().unwrap_or_default()),
+                auto_discover as i32,
             )
         };
         if raw.is_null() {
@@ -34,7 +120,19 @@ impl ClassicTransferEngine {
                 "createTransferEngine returned a null pointer".to_string(),
             ));
         }
-        Ok(Self { raw })
+
+        let engine = Self { raw };
+        if matches!(config.transport_protocol(), ClassicTransportProtocol::Tcp) {
+            engine.install_transport("tcp")?;
+        }
+        Ok(engine)
+    }
+
+    pub fn rpc_server_address_text(&self) -> Result<String> {
+        let mut buffer = vec![0i8; 256];
+        let rc = unsafe { ffi::getLocalIpAndPort(self.raw, buffer.as_mut_ptr(), buffer.len()) };
+        check_zero(rc, "getLocalIpAndPort")?;
+        Ok(read_c_buffer(&buffer))
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -67,17 +165,37 @@ impl ClassicTransferEngine {
     pub fn open_segment(&self, segment_name: &str) -> Result<i32> {
         let segment_name = to_cstring("segment_name", segment_name)?;
         let handle = unsafe { ffi::openSegment(self.raw, segment_name.as_ptr()) };
-        if handle < 0 {
+        if handle >= 0 {
+            return Ok(handle);
+        }
+        let refreshed = unsafe { ffi::openSegmentNoCache(self.raw, segment_name.as_ptr()) };
+        if refreshed < 0 {
             return Err(StoreError::Transport(format!(
-                "openSegment failed for {segment_name:?}"
+                "openSegment failed for {:?}",
+                segment_name
             )));
         }
-        Ok(handle)
+        Ok(refreshed)
     }
 
     pub fn close_segment(&self, segment_id: i32) -> Result<()> {
         let rc = unsafe { ffi::closeSegment(self.raw, segment_id) };
         check_zero(rc, "closeSegment")
+    }
+
+    pub fn first_buffer(&self, segment_id: i32) -> Result<(u64, u64)> {
+        let mut addr = 0u64;
+        let mut length = 0u64;
+        let rc = unsafe {
+            ffi::mooncake_classic_get_segment_first_buffer(
+                self.raw,
+                segment_id,
+                &mut addr,
+                &mut length,
+            )
+        };
+        check_zero(rc, "mooncake_classic_get_segment_first_buffer")?;
+        Ok((addr, length))
     }
 
     pub fn allocate_batch(&self, batch_size: usize) -> Result<u64> {
@@ -92,7 +210,6 @@ impl ClassicTransferEngine {
 
     pub fn submit(&self, batch_id: u64, requests: &[TransferRequest]) -> Result<()> {
         let mut native_requests = encode_requests(requests)?;
-
         let rc = unsafe {
             ffi::submitTransfer(
                 self.raw,
@@ -114,6 +231,18 @@ impl ClassicTransferEngine {
         })
     }
 
+    pub fn batch_status(&self, batch_id: u64) -> Result<TransferProgress> {
+        let mut status = ffi::TransferStatus::default();
+        let rc = unsafe {
+            ffi::mooncake_classic_get_batch_transfer_status(self.raw, batch_id, &mut status)
+        };
+        check_zero(rc, "mooncake_classic_get_batch_transfer_status")?;
+        Ok(TransferProgress {
+            status: decode_status(status.status),
+            transferred_bytes: status.transferred_bytes,
+        })
+    }
+
     pub fn free_batch(&self, batch_id: u64) -> Result<()> {
         let rc = unsafe { ffi::freeBatchID(self.raw, batch_id) };
         check_zero(rc, "freeBatchID")
@@ -123,6 +252,19 @@ impl ClassicTransferEngine {
         let rc = unsafe { ffi::syncSegmentCache(self.raw) };
         check_zero(rc, "syncSegmentCache")
     }
+
+    fn install_transport(&self, protocol: &str) -> Result<()> {
+        let protocol = to_cstring("protocol", protocol)?;
+        let transport =
+            unsafe { ffi::installTransport(self.raw, protocol.as_ptr(), std::ptr::null_mut()) };
+        if transport.is_null() {
+            return Err(StoreError::Transport(format!(
+                "installTransport failed for {}",
+                protocol.to_string_lossy()
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ClassicTransferEngine {
@@ -131,9 +273,89 @@ impl Drop for ClassicTransferEngine {
     }
 }
 
+unsafe impl Send for ClassicTransferEngine {}
+unsafe impl Sync for ClassicTransferEngine {}
+
+fn classic_engine_create_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct ClassicCreateEnvGuard {
+    saved_use_tent: Option<String>,
+    saved_use_tev1: Option<String>,
+    saved_tcp_bind_address: Option<String>,
+    saved_redis_username: Option<String>,
+    saved_redis_password: Option<String>,
+    saved_redis_db_index: Option<String>,
+}
+
+impl ClassicCreateEnvGuard {
+    fn apply(config: &ClassicEngineConfig) -> Self {
+        let saved_use_tent = set_env_override("MC_USE_TENT", None);
+        let saved_use_tev1 = set_env_override("MC_USE_TEV1", None);
+        let saved_tcp_bind_address = set_env_override(
+            "MC_TCP_BIND_ADDRESS",
+            (!config.rpc_bind_host().is_empty()).then_some(config.rpc_bind_host()),
+        );
+        let saved_redis_username =
+            set_env_override("MC_REDIS_USERNAME", config.redis_username_value());
+        let saved_redis_password =
+            set_env_override("MC_REDIS_PASSWORD", config.redis_password_value());
+        let saved_redis_db_index =
+            set_env_override("MC_REDIS_DB_INDEX", config.redis_db_index_value());
+
+        Self {
+            saved_use_tent,
+            saved_use_tev1,
+            saved_tcp_bind_address,
+            saved_redis_username,
+            saved_redis_password,
+            saved_redis_db_index,
+        }
+    }
+}
+
+impl Drop for ClassicCreateEnvGuard {
+    fn drop(&mut self) {
+        restore_env("MC_USE_TENT", self.saved_use_tent.take());
+        restore_env("MC_USE_TEV1", self.saved_use_tev1.take());
+        restore_env("MC_TCP_BIND_ADDRESS", self.saved_tcp_bind_address.take());
+        restore_env("MC_REDIS_USERNAME", self.saved_redis_username.take());
+        restore_env("MC_REDIS_PASSWORD", self.saved_redis_password.take());
+        restore_env("MC_REDIS_DB_INDEX", self.saved_redis_db_index.take());
+    }
+}
+
+fn set_env_override(key: &str, value: Option<&str>) -> Option<String> {
+    let previous = std::env::var(key).ok();
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    previous
+}
+
+fn restore_env(key: &str, value: Option<String>) {
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
 fn to_cstring(field: &str, value: &str) -> Result<CString> {
     CString::new(value)
         .map_err(|_| StoreError::Transport(format!("{field} contains an embedded NUL byte")))
+}
+
+fn read_c_buffer(buffer: &[i8]) -> String {
+    let bytes = buffer
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .map(|byte| byte as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn check_zero(rc: i32, operation: &str) -> Result<()> {
@@ -193,8 +415,9 @@ mod tests {
     use mooncake_transport_sys::classic as ffi;
 
     use super::{
-        check_zero, decode_status, encode_opcode, encode_request, encode_requests, to_cstring,
-        ClassicTransferEngine,
+        check_zero, decode_status, encode_opcode, encode_request, encode_requests, read_c_buffer,
+        restore_env, to_cstring, ClassicCreateEnvGuard, ClassicEngineConfig, ClassicTransferEngine,
+        ClassicTransportProtocol,
     };
     use crate::{Opcode, TransferRequest, TransferStatus};
 
@@ -202,6 +425,12 @@ mod tests {
     fn cstring_conversion_rejects_embedded_nul() {
         assert!(to_cstring("field", "hello").is_ok());
         assert!(to_cstring("field", "bad\0value").is_err());
+    }
+
+    #[test]
+    fn read_c_buffer_stops_at_first_nul() {
+        let buffer = vec![b'a' as i8, b'b' as i8, 0, b'c' as i8];
+        assert_eq!(read_c_buffer(&buffer), "ab");
     }
 
     #[test]
@@ -232,10 +461,84 @@ mod tests {
     }
 
     #[test]
+    fn classic_engine_config_tracks_protocol_and_hosts() {
+        let config = ClassicEngineConfig::new("redis://127.0.0.1:6379/0", "127.0.0.1")
+            .protocol(ClassicTransportProtocol::Rdma)
+            .rpc_port(17111)
+            .redis_username("user")
+            .redis_password("pass")
+            .redis_db_index("4");
+        assert_eq!(config.metadata_uri(), "redis://127.0.0.1:6379/0");
+        assert_eq!(config.rpc_bind_host(), "127.0.0.1");
+        assert_eq!(config.rpc_port_value(), Some(17111));
+        assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Rdma);
+        assert_eq!(config.redis_username_value(), Some("user"));
+        assert_eq!(config.redis_password_value(), Some("pass"));
+        assert_eq!(config.redis_db_index_value(), Some("4"));
+    }
+
+    #[test]
+    fn create_guard_temporarily_clears_tent_envs() {
+        let _lock = super::classic_engine_create_lock()
+            .lock()
+            .expect("classic env test lock poisoned");
+        restore_env("MC_USE_TENT", Some("1".to_string()));
+        restore_env("MC_USE_TEV1", Some("1".to_string()));
+        restore_env("MC_TCP_BIND_ADDRESS", Some("old".to_string()));
+        restore_env("MC_REDIS_USERNAME", Some("old-user".to_string()));
+        restore_env("MC_REDIS_PASSWORD", Some("old-pass".to_string()));
+        restore_env("MC_REDIS_DB_INDEX", Some("9".to_string()));
+        let config = ClassicEngineConfig::new("redis://127.0.0.1:6379", "127.0.0.1")
+            .redis_username("new-user")
+            .redis_password("new-pass")
+            .redis_db_index("4");
+        {
+            let _guard = ClassicCreateEnvGuard::apply(&config);
+            assert!(std::env::var("MC_USE_TENT").is_err());
+            assert!(std::env::var("MC_USE_TEV1").is_err());
+            assert_eq!(
+                std::env::var("MC_TCP_BIND_ADDRESS").as_deref(),
+                Ok("127.0.0.1")
+            );
+            assert_eq!(
+                std::env::var("MC_REDIS_USERNAME").as_deref(),
+                Ok("new-user")
+            );
+            assert_eq!(
+                std::env::var("MC_REDIS_PASSWORD").as_deref(),
+                Ok("new-pass")
+            );
+            assert_eq!(std::env::var("MC_REDIS_DB_INDEX").as_deref(), Ok("4"));
+        }
+        assert_eq!(std::env::var("MC_USE_TENT").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("MC_USE_TEV1").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("MC_TCP_BIND_ADDRESS").as_deref(), Ok("old"));
+        assert_eq!(
+            std::env::var("MC_REDIS_USERNAME").as_deref(),
+            Ok("old-user")
+        );
+        assert_eq!(
+            std::env::var("MC_REDIS_PASSWORD").as_deref(),
+            Ok("old-pass")
+        );
+        assert_eq!(std::env::var("MC_REDIS_DB_INDEX").as_deref(), Ok("9"));
+        restore_env("MC_USE_TENT", None);
+        restore_env("MC_USE_TEV1", None);
+        restore_env("MC_TCP_BIND_ADDRESS", None);
+        restore_env("MC_REDIS_USERNAME", None);
+        restore_env("MC_REDIS_PASSWORD", None);
+        restore_env("MC_REDIS_DB_INDEX", None);
+    }
+
+    #[test]
     fn classic_constructor_rejects_embedded_nul_before_touching_ffi() {
-        assert!(ClassicTransferEngine::new("bad\0uri", "local", "127.0.0.1", 1).is_err());
-        assert!(ClassicTransferEngine::new("redis://ok", "lo\0cal", "127.0.0.1", 1).is_err());
-        assert!(ClassicTransferEngine::new("redis://ok", "local", "127.0.0.1\0", 1).is_err());
+        let config = ClassicEngineConfig::new("redis://ok", "127.0.0.1");
+        assert!(ClassicTransferEngine::new(
+            &ClassicEngineConfig::new("bad\0uri", "127.0.0.1"),
+            "local"
+        )
+        .is_err());
+        assert!(ClassicTransferEngine::new(&config, "lo\0cal").is_err());
     }
 
     #[test]
