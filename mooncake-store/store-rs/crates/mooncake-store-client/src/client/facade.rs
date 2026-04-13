@@ -585,7 +585,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let mut results = Vec::with_capacity(objects.len());
         for object in objects {
             let tenant = object.tenant.unwrap_or(self.default_tenant());
-            results.push(self.is_exist_in_tenant(tenant, object.key)?);
+            let object_id = LogicalObjectId::new(
+                NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+                object.key,
+            );
+            results.push(self.query_route_by_object_id(&object_id)?.is_some());
         }
         Ok(results)
     }
@@ -643,7 +647,35 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("batch_remove");
         for object in objects {
             let tenant = object.tenant.unwrap_or(self.default_tenant());
-            self.remove_in_tenant(tenant, object.key, force)?;
+            let object_id = LogicalObjectId::new(
+                NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+                object.key,
+            );
+            let object_key = ObjectKey::from_logical_id(&object_id);
+            let Some(route) = self
+                .route_directory
+                .get_object_route(&self.lease, &object_key)?
+            else {
+                let result = Err(StoreError::NotFound(format!("tenant={tenant} key={}", object.key)));
+                tracker.finish(&result, 0);
+                return result;
+            };
+            let cas = self.route_directory.compare_and_swap_object_route(
+                &self.lease,
+                &object_key,
+                Some(route.version),
+                None,
+            )?;
+            if cas.applied {
+                self.schedule_route_reclaim(&route)?;
+            } else {
+                let result = Err(StoreError::Conflict(format!(
+                    "route delete lost race for tenant={tenant} key={}",
+                    object.key
+                )));
+                tracker.finish(&result, 0);
+                return result;
+            }
         }
         let result = Ok(());
         tracker.finish(&result, 0);
