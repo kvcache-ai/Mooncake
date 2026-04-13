@@ -308,6 +308,20 @@ The current repository uses these environment variables.
 | Variable | Used By | Meaning |
 |----------|---------|---------|
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
+| `MC_STORE_RS_KEYSPACE` | Python wrapper setup fallback | metadata keyspace used when SGLang cannot pass `keyspace` |
+| `MC_STORE_RS_STABLE_ID` | Python wrapper setup fallback | stable client id used when SGLang cannot pass `stable_id` |
+| `MC_STORE_RS_EPOCH` | Python wrapper setup fallback | client epoch used when SGLang cannot pass `epoch` |
+| `MC_STORE_RS_INITIAL_STATE` | Python wrapper setup fallback | initial lifecycle state, for example `active`, `standby`, `draining`, or `offline` |
+| `MC_STORE_RS_TENANT` | Python wrapper setup fallback | default tenant used when SGLang cannot pass `tenant` |
+| `MC_STORE_RS_LABELS` | Python wrapper setup fallback | labels as JSON object or comma-separated `key=value` pairs |
+| `MC_STORE_RS_ROUTED_WRITES` | Python wrapper setup fallback | enable routed writer mode when set to `1`, `true`, `yes`, or `on` |
+| `MC_STORE_RS_REPLICA_COUNT` | Python wrapper setup fallback | default routed-writer replica count |
+| `MC_STORE_RS_ROUTE_TOPK` | Python wrapper setup fallback | WRH route-authority fanout; must be `>= 2` |
+| `MC_STORE_RS_ROUTE_CONTROL` | Python wrapper setup fallback | route control mode, usually `embedded_wrh` |
+| `MC_STORE_RS_TRANSPORT_METADATA_URL` | Python wrapper setup fallback | transport Redis URL when store metadata uses etcd |
+| `MC_STORE_RS_TRANSPORT_RPC_PORT` | Python wrapper setup fallback | fixed real data-plane transport port |
+| `MC_STORE_RS_LOCAL_SEGMENT_NAME` | Python wrapper setup fallback | explicit local segment name |
+| `MC_STORE_RS_EXPIRES_AT_MS` | Python wrapper setup fallback | absolute lease expiry timestamp in milliseconds |
 | `MC_STORE_RS_TRACE` | e2e and applications | enable tracing initialization from env |
 | `MC_STORE_RS_TRACE_FILTER` | e2e and applications | `tracing_subscriber` filter string |
 | `MC_STORE_RS_METRICS_ADDR` | e2e and applications | bind address for the in-process metrics server |
