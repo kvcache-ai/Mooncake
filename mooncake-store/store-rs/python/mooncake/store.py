@@ -305,6 +305,7 @@ class MooncakeDistributedStore:
             args[0] = local_hostname
             if transport_rpc_port is not None and "transport_rpc_port" not in kwargs:
                 kwargs["transport_rpc_port"] = transport_rpc_port
+        _init_tracing_from_env()
         result = self._invoke("setup", *args, **kwargs)
         _start_metrics_server_from_env()
         return result
@@ -583,6 +584,7 @@ class MooncakeDistributedStore:
         initial_state = _coerce_optional_str(
             config.get("initial_state", config.get("state"))
         ) or "active"
+        _init_tracing_from_env()
         result = self._invoke(
             "setup",
             local_hostname,
@@ -791,6 +793,18 @@ def _start_metrics_server_from_env() -> str | None:
     if existing is not None:
         return existing
     return _native.start_metrics_server(str(bind_addr).strip())
+
+def _init_tracing_from_env() -> bool:
+    if not _env_truthy(os.environ.get("MC_STORE_RS_TRACE")):
+        return False
+    trace_filter = _coerce_optional_str(os.environ.get("MC_STORE_RS_TRACE_FILTER"))
+    _native.init_tracing(trace_filter)
+    return True
+
+def _env_truthy(value) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 def _normalize_raw_multi_buffer_args(
     keys: Sequence[str],
