@@ -11,10 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend, ObjectKey,
-    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteControlMode,
-    RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, StoreError,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
+    MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result,
+    RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain,
+    RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+    StoreError,
 };
 use mooncake_transport::{Opcode, SegmentInfo, TentEngine, TransferRequest};
 use parking_lot::Mutex;

@@ -2,6 +2,7 @@ pub mod compat;
 pub mod error;
 pub mod hugepage;
 pub mod identity;
+pub mod identity_codec;
 pub mod lifecycle;
 pub mod route;
 pub mod traits;
@@ -13,6 +14,10 @@ pub use identity::{
     ClientEndpointSet, ClientEpoch, ClientRuntimeId, ClientStableId, LogicalObjectId,
     NamespaceScope, ReuseIdentity, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET, DEFAULT_QOS_TIER,
     DEFAULT_TENANT,
+};
+pub use identity_codec::{
+    apply_route_identity, parse_legacy_scoped_key, route_logical_object_id,
+    scoped_logical_object_id, scoped_object_key,
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
