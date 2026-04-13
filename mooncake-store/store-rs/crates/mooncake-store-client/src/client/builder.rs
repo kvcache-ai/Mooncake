@@ -167,8 +167,9 @@ impl StoreClientBuilder {
         };
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
-        let live_client_cache = Arc::new(Mutex::new(LiveClientCache::default()));
-        let suspect_runtime_cache = Arc::new(Mutex::new(SuspectRuntimeCache::default()));
+        let route_namespace = self.metadata.route_namespace();
+        let live_client_cache = shared_live_client_cache(&route_namespace);
+        let suspect_runtime_cache = shared_suspect_runtime_cache(&route_namespace);
         let control_client = Arc::new(ControlPlaneClient::new()?);
         let provisional_lease = ClientLease {
             runtime: runtime.clone(),
@@ -190,6 +191,7 @@ impl StoreClientBuilder {
             &provisional_lease,
             control_client.clone(),
             live_client_cache.clone(),
+            suspect_runtime_cache.clone(),
         );
         let storage_owner = Arc::new(StorageOwnerState::new(
             runtime.clone(),
@@ -232,8 +234,12 @@ impl StoreClientBuilder {
             live_client_cache.clone(),
             self.live_client_sync_interval,
         )?;
-        let async_eviction =
-            AsyncEvictionHandle::spawn(&runtime, &lease, &self.local_memory, storage_owner.clone())?;
+        let async_eviction = AsyncEvictionHandle::spawn(
+            &runtime,
+            &lease,
+            &self.local_memory,
+            storage_owner.clone(),
+        )?;
         Ok(StoreClient {
             metadata: self.metadata,
             route_directory,
@@ -282,8 +288,7 @@ fn bootstrap_route_policy(
             }
             let Some(existing) = metadata.get_route_policy(&domain)? else {
                 return Err(StoreError::InvalidState(
-                    "route policy bootstrap raced but no policy was readable afterward"
-                        .to_string(),
+                    "route policy bootstrap raced but no policy was readable afterward".to_string(),
                 ));
             };
             validate_route_policy(&local, &existing)

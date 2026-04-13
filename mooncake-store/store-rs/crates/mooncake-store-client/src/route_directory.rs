@@ -7,9 +7,10 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::warn;
 
-use crate::client::SharedLiveClientCache;
+use crate::client::{SharedLiveClientCache, SharedSuspectRuntimeCache};
 use crate::{
     control_plane::ControlPlaneClient,
     observability::{registry, OperationTracker},
@@ -19,6 +20,7 @@ const ROUTE_SCOPE_LABEL: &str = "route_scope";
 const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
 const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
 const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
+const SUSPECT_AUTHORITY_TTL: Duration = Duration::from_secs(5);
 
 pub(crate) fn build_route_directory(
     mode: RouteControlMode,
@@ -27,6 +29,7 @@ pub(crate) fn build_route_directory(
     lease: &ClientLease,
     control_plane: Arc<ControlPlaneClient>,
     live_client_cache: SharedLiveClientCache,
+    suspect_runtime_cache: SharedSuspectRuntimeCache,
 ) -> Arc<dyn RouteDirectory> {
     match mode {
         RouteControlMode::MetadataOnly => Arc::new(MetadataRouteDirectory { metadata }),
@@ -36,6 +39,7 @@ pub(crate) fn build_route_directory(
             lease,
             control_plane,
             live_client_cache,
+            suspect_runtime_cache,
         )),
     }
 }
@@ -77,6 +81,7 @@ struct EmbeddedWrhRouteDirectory {
     local_stable_id: ClientStableId,
     control_plane: Arc<ControlPlaneClient>,
     live_client_cache: SharedLiveClientCache,
+    suspect_runtime_cache: SharedSuspectRuntimeCache,
 }
 
 #[derive(Clone)]
@@ -101,6 +106,7 @@ impl EmbeddedWrhRouteDirectory {
         lease: &ClientLease,
         control_plane: Arc<ControlPlaneClient>,
         live_client_cache: SharedLiveClientCache,
+        suspect_runtime_cache: SharedSuspectRuntimeCache,
     ) -> Self {
         let namespace = metadata.route_namespace();
         route_mesh(&namespace)
@@ -113,6 +119,7 @@ impl EmbeddedWrhRouteDirectory {
             local_stable_id: lease.runtime.stable_id.clone(),
             control_plane,
             live_client_cache,
+            suspect_runtime_cache,
         }
     }
 
@@ -126,10 +133,43 @@ impl EmbeddedWrhRouteDirectory {
         } else {
             crate::client::cached_live_client_snapshot(&self.live_client_cache)?
         };
+        let mut suspect_cache = self.suspect_runtime_cache.lock();
+        suspect_cache.reconcile_with_leases(&leases);
         Ok(leases
             .into_iter()
             .filter(|lease| lease.state == ClientLifecycleState::Active && route_capable(lease))
+            .filter(|lease| !suspect_cache.contains(&lease.runtime))
             .collect())
+    }
+
+    fn maybe_mark_authority_suspect(
+        &self,
+        authority: &ClientLease,
+        error: &StoreError,
+        context: &'static str,
+    ) {
+        if self.authority_is_local(authority)
+            || !matches!(
+                error,
+                StoreError::Transport(_)
+                    | StoreError::NotFound(_)
+                    | StoreError::InvalidState(_)
+                    | StoreError::Unsupported(_)
+            )
+        {
+            return;
+        }
+        self.suspect_runtime_cache.lock().mark(
+            authority.runtime.clone(),
+            Instant::now() + SUSPECT_AUTHORITY_TTL,
+            Some(authority),
+        );
+        warn!(
+            runtime = %authority.runtime,
+            context,
+            quarantine_ms = SUSPECT_AUTHORITY_TTL.as_millis() as u64,
+            "marked route authority as suspect after request failure"
+        );
     }
 
     fn authority_candidates_once(
@@ -281,6 +321,11 @@ impl EmbeddedWrhRouteDirectory {
             Ok(results) => {
                 for (request, result) in requests.iter().zip(results.into_iter()) {
                     if let Err(error) = result {
+                        self.maybe_mark_authority_suspect(
+                            secondary,
+                            &error,
+                            "route_secondary_mirror_failed",
+                        );
                         warn!(
                             authority = %secondary.runtime,
                             key = %request.key.0,
@@ -291,6 +336,11 @@ impl EmbeddedWrhRouteDirectory {
                 }
             }
             Err(error) => {
+                self.maybe_mark_authority_suspect(
+                    secondary,
+                    &error,
+                    "route_secondary_mirror_batch_failed",
+                );
                 warn!(
                     authority = %secondary.runtime,
                     error = %error,
@@ -369,16 +419,28 @@ impl EmbeddedWrhRouteDirectory {
                                     );
                                 }
                             }
-                            Err(error) => warn!(
-                                runtime = %authority.runtime,
-                                key = %key.0,
-                                error = %error,
-                                "{failure_message}"
-                            ),
+                            Err(error) => {
+                                self.maybe_mark_authority_suspect(
+                                    &authority,
+                                    &error,
+                                    "route_batch_read_failed",
+                                );
+                                warn!(
+                                    runtime = %authority.runtime,
+                                    key = %key.0,
+                                    error = %error,
+                                    "{failure_message}"
+                                );
+                            }
                         }
                     }
                 }
                 Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_batch_read_transport_failed",
+                    );
                     warn!(
                         runtime = %authority.runtime,
                         error = %error,
@@ -513,6 +575,11 @@ impl EmbeddedWrhRouteDirectory {
                 Ok(results) => {
                     for (request, result) in requests.iter().zip(results.into_iter()) {
                         if let Err(error) = result {
+                            self.maybe_mark_authority_suspect(
+                                &authority,
+                                &error,
+                                "route_backfill_failed",
+                            );
                             warn!(
                                 authority = %authority.runtime,
                                 key = %request.key.0,
@@ -523,6 +590,11 @@ impl EmbeddedWrhRouteDirectory {
                     }
                 }
                 Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_backfill_batch_failed",
+                    );
                     warn!(
                         authority = %authority.runtime,
                         error = %error,
@@ -669,6 +741,11 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                         }
                     }
                     Err(error) => {
+                        self.maybe_mark_authority_suspect(
+                            &authority,
+                            &error,
+                            "route_batch_cas_local_failed",
+                        );
                         warn!(
                             runtime = %authority.runtime,
                             error = %error,
@@ -694,16 +771,28 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     {
                         match result {
                             Ok(result) => resolved[index] = Some(Ok(result)),
-                            Err(error) => warn!(
-                                runtime = %authority.runtime,
-                                key = %request.key.0,
-                                error = %error,
-                                "authority route cas failed; falling back to metadata"
-                            ),
+                            Err(error) => {
+                                self.maybe_mark_authority_suspect(
+                                    &authority,
+                                    &error,
+                                    "route_batch_cas_failed",
+                                );
+                                warn!(
+                                    runtime = %authority.runtime,
+                                    key = %request.key.0,
+                                    error = %error,
+                                    "authority route cas failed; falling back to metadata"
+                                );
+                            }
                         }
                     }
                 }
                 Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_batch_cas_transport_failed",
+                    );
                     warn!(
                         runtime = %authority.runtime,
                         error = %error,
@@ -1147,6 +1236,7 @@ fn stable_hash(parts: &[&str]) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
@@ -1163,6 +1253,14 @@ mod tests {
         route_capable, route_mesh, route_weight, stable_hash, weighted_rendezvous_score,
         ClusterRouteMesh, ControlPlaneClient, EmbeddedWrhRouteDirectory, RouteControlMode,
     };
+
+    fn test_future_expiry_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should advance")
+            .as_millis() as u64
+            + 60_000
+    }
 
     fn lease(stable_id: &str, epoch: u64, route: bool, route_scope: Option<&str>) -> ClientLease {
         let mut labels = BTreeMap::new();
@@ -1182,7 +1280,7 @@ mod tests {
                 segment_name: Some(SegmentName::new(format!("{stable_id}-segment"))),
                 labels,
             },
-            expires_at_ms: 60_000,
+            expires_at_ms: test_future_expiry_ms(),
         }
     }
 
@@ -1272,6 +1370,9 @@ mod tests {
             control,
             Arc::new(parking_lot::Mutex::new(
                 crate::client::LiveClientCache::default(),
+            )),
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
             )),
         );
         let key = ObjectKey::new("tenant-a::alpha");
@@ -1454,6 +1555,9 @@ mod tests {
             &observer,
             control,
             live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
         );
         let namespace = metadata.route_namespace();
         route_mesh(&namespace)
@@ -1528,6 +1632,100 @@ mod tests {
     }
 
     #[test]
+    fn embedded_directory_quarantines_dead_authority_without_globally_demoting_it() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-suspect", 1, false, Some("scope-a"));
+        let mut dead_authority = lease("authority-dead", 9, true, Some("scope-a"));
+        dead_authority.endpoints.labels.insert(
+            crate::control_plane::control_address_label().to_string(),
+            "127.0.0.1:1".to_string(),
+        );
+        let live_authority = lease("authority-live", 1, true, Some("scope-a"));
+        for lease in [
+            observer.clone(),
+            dead_authority.clone(),
+            live_authority.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        let suspect_runtime_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::SuspectRuntimeCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_suspect_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache,
+            suspect_runtime_cache,
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&live_authority.runtime.stable_id);
+
+        let candidates = vec![dead_authority.clone(), live_authority.clone()];
+        let key = (0..4096u32)
+            .map(|index| ObjectKey::new(format!("tenant-a::suspect-key-{index}")))
+            .find(|candidate_key| {
+                directory
+                    .ranked_authorities_from_candidates(&candidates, candidate_key)
+                    .first()
+                    .is_some_and(|lease| lease.runtime == dead_authority.runtime)
+            })
+            .expect("test key should rank dead authority first");
+        let request = RouteCasRequest {
+            key: key.clone(),
+            expected: None,
+            next: Some(route_for(&key.0, &live_authority.runtime)),
+        };
+        let results = directory
+            .compare_and_swap_object_routes(&observer, std::slice::from_ref(&request))
+            .expect("first cas should succeed via fallback after quarantining dead authority");
+        assert!(
+            results[0]
+                .as_ref()
+                .expect("cas reply should decode")
+                .applied
+        );
+
+        let filtered = directory
+            .authority_candidates(&observer)
+            .expect("suspect authority should be filtered from future selections");
+        assert!(filtered
+            .iter()
+            .all(|lease| lease.runtime != dead_authority.runtime));
+        assert!(filtered
+            .iter()
+            .any(|lease| lease.runtime == live_authority.runtime));
+
+        let state = metadata
+            .list_live_clients()
+            .expect("list clients should succeed")
+            .into_iter()
+            .find(|lease| lease.runtime == dead_authority.runtime)
+            .map(|lease| lease.state);
+        assert_eq!(state, Some(ClientLifecycleState::Active));
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&live_authority.runtime.stable_id);
+    }
+
+    #[test]
     fn embedded_directory_honors_route_topk_for_authority_mirrors() {
         let metadata = Arc::new(InMemoryMetadataBackend::new());
         let observer = lease("observer-topk", 1, false, Some("scope-a"));
@@ -1561,6 +1759,9 @@ mod tests {
             &observer,
             control,
             live_client_cache,
+            Arc::new(parking_lot::Mutex::new(
+                crate::client::SuspectRuntimeCache::default(),
+            )),
         );
         let namespace = metadata.route_namespace();
         for authority in [

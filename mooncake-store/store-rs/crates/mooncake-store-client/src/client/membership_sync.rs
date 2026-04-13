@@ -36,9 +36,7 @@ impl MembershipSyncHandle {
                 }
             })
             .map_err(|error| {
-                StoreError::Transport(format!(
-                    "failed to spawn membership sync worker: {error}"
-                ))
+                StoreError::Transport(format!("failed to spawn membership sync worker: {error}"))
             })?;
         Ok(Self {
             shutdown: Some(shutdown_tx),
@@ -108,9 +106,7 @@ impl AsyncEvictionHandle {
                 }
             })
             .map_err(|error| {
-                StoreError::Transport(format!(
-                    "failed to spawn async eviction worker: {error}"
-                ))
+                StoreError::Transport(format!("failed to spawn async eviction worker: {error}"))
             })?;
         Ok(Self {
             shutdown: Some(shutdown_tx),
@@ -148,8 +144,10 @@ pub(crate) fn refresh_live_client_cache(
         started.elapsed(),
     );
     if let Ok(leases) = &result {
-        registry::record_runtime_leases(leases);
-        live_client_cache.lock().store(leases.clone());
+        let live_leases = filter_live_client_leases(leases);
+        registry::record_runtime_leases(&live_leases);
+        live_client_cache.lock().store(live_leases.clone());
+        return Ok(live_leases);
     }
     result
 }

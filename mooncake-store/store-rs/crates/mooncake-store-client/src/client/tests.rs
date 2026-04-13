@@ -20,11 +20,11 @@ use mooncake_transport::{
 use parking_lot::Mutex;
 
 use super::{
-    align_up_u64, bootstrap_route_policy, compatibility_matches, control_bind_host,
-    copy_into_region, flatten_slices, now_ms, record_success_metric, scatter_into_buffers,
-    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
-    PendingReclaim, ReplicaWriteTarget, SegmentAllocator, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
+    control_bind_host, copy_into_region, flatten_slices, now_ms, record_success_metric,
+    scatter_into_buffers, LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState,
+    LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, SegmentAllocator, StorageOwnerState,
+    StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -697,6 +697,10 @@ fn fast_live_client_sync_interval() -> Duration {
     Duration::from_millis(25)
 }
 
+fn test_future_expiry_ms() -> u64 {
+    now_ms().saturating_add(30_000)
+}
+
 fn test_storage_owner_state(
     runtime: &ClientRuntimeId,
     allocator: Arc<Mutex<LocalAllocatorState>>,
@@ -709,7 +713,7 @@ fn test_storage_owner_state(
         state: ClientLifecycleState::Active,
         compatibility: CompatibilityDescriptor::default(),
         endpoints: ClientEndpointSet::default(),
-        expires_at_ms: 10_000,
+        expires_at_ms: test_future_expiry_ms(),
     };
     let route_directory = build_route_directory(
         RouteControlMode::MetadataOnly,
@@ -718,6 +722,7 @@ fn test_storage_owner_state(
         &lease,
         control_client.clone(),
         live_client_cache.clone(),
+        Arc::new(Mutex::new(SuspectRuntimeCache::default())),
     );
     Arc::new(StorageOwnerState::new(
         runtime.clone(),
@@ -766,7 +771,7 @@ fn publish_storage_node_with_capacity(
             state: ClientLifecycleState::Active,
             compatibility: CompatibilityDescriptor::default(),
             endpoints,
-            expires_at_ms: 10_000,
+            expires_at_ms: test_future_expiry_ms(),
         })
         .expect("storage lease should upsert");
     metadata
@@ -820,7 +825,7 @@ fn hot_upgrade_handoff_is_published_after_draining() {
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7001")
         .segment_name("client-a-segment")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     client.enter_draining().expect("draining should succeed");
@@ -851,21 +856,21 @@ fn hot_upgrade_successor_discovery_uses_same_stable_higher_epoch() {
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7101")
         .segment_name("upgrade-find-old")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("predecessor build should succeed");
     let successor = StoreClientBuilder::new(metadata.clone(), "upgrade-find")
         .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Standby)
         .rpc_address("127.0.0.1:7102")
         .segment_name("upgrade-find-new")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("successor build should succeed");
     let _other_stable = StoreClientBuilder::new(metadata, "upgrade-other")
         .epoch(ClientEpoch(9))
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7103")
         .segment_name("upgrade-other")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("other stable build should succeed");
 
     let found = predecessor
@@ -883,14 +888,14 @@ fn targeted_hot_upgrade_handoff_promotes_standby_successor() {
         .state(ClientLifecycleState::Active)
         .rpc_address("127.0.0.1:7111")
         .segment_name("upgrade-promote-old")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("predecessor build should succeed");
     let mut successor = StoreClientBuilder::new(metadata, "upgrade-promote")
         .epoch(ClientEpoch(2))
         .state(ClientLifecycleState::Standby)
         .rpc_address("127.0.0.1:7112")
         .segment_name("upgrade-promote-new")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("successor build should succeed");
 
     predecessor
@@ -928,7 +933,7 @@ fn query_route_uses_default_tenant_scope() {
         .tenant("tenant-a")
         .rpc_address("127.0.0.1:7001")
         .segment_name("client-a-segment")
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     assert!(client
@@ -953,7 +958,7 @@ fn routed_batch_put_rejects_duplicate_scoped_keys() {
         .transport(transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let error = client
@@ -977,7 +982,7 @@ fn batch_get_into_multi_buffers_rejects_insufficient_capacity() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     client.put("blob", b"abcdefgh").expect("put should succeed");
@@ -1006,7 +1011,7 @@ fn observability_metrics_render_after_put_and_get() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     client
@@ -1046,7 +1051,7 @@ fn observability_metrics_render_remote_datapaths() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata, "client-metrics-reader")
         .state(ClientLifecycleState::Active)
@@ -1055,7 +1060,7 @@ fn observability_metrics_render_remote_datapaths() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config_with_layout(4096, 4, 1))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     wait_for_membership_convergence(&[&writer, &reader]);
@@ -1140,7 +1145,7 @@ fn observability_metrics_render_fast_batch_put_stages() {
             PlacementPlanner::new(metadata).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
 
     writer
@@ -1181,7 +1186,7 @@ fn observability_metrics_render_fast_batch_put_stages_for_shared_policy() {
             PlacementPlanner::new(metadata).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
 
     let policy = ReplicationPolicy::new()
@@ -1220,7 +1225,7 @@ fn rw_only_client_registers_without_segments_and_routes_to_remote_storage() {
         .label("storage", "true")
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -1236,7 +1241,7 @@ fn rw_only_client_registers_without_segments_and_routes_to_remote_storage() {
             PlacementPlanner::new(metadata).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("rw-only writer should build");
     writer
         .register_local_memory()
@@ -1290,7 +1295,7 @@ fn builder_rejects_storage_true_without_storage_bytes() {
         .label("storage", "true")
         .transport(transport)
         .local_memory(rw_only_config())
-        .build(10_000);
+        .build(test_future_expiry_ms());
     let error = match result {
         Ok(_) => panic!("builder should reject storage=true without storage bytes"),
         Err(error) => error,
@@ -1306,7 +1311,7 @@ fn builder_defaults_storage_label_to_false_when_storage_bytes_is_zero() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(rw_only_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("builder should succeed");
     assert_eq!(
         client
@@ -1334,7 +1339,7 @@ fn lookup_runtime_lease_reuses_live_client_snapshot() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     let client = StoreClientBuilder::new(metadata.clone(), "client-cache")
         .state(ClientLifecycleState::Active)
@@ -1342,7 +1347,7 @@ fn lookup_runtime_lease_reuses_live_client_snapshot() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(client_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let runtime = storage.runtime_id().clone();
@@ -1369,7 +1374,7 @@ fn rw_only_client_can_expand_into_primary_segment() {
         .transport(transport.clone())
         .transport_factory(transport.factory())
         .local_memory(rw_only_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("rw-only client should build");
 
     client
@@ -1418,7 +1423,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -1435,7 +1440,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     writer
         .register_local_memory()
@@ -1449,7 +1454,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
     reader
         .register_local_memory()
@@ -1499,7 +1504,7 @@ fn routed_put_reuses_live_client_snapshot_for_placement() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -1516,7 +1521,7 @@ fn routed_put_reuses_live_client_snapshot_for_placement() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     writer
         .register_local_memory()
@@ -1554,7 +1559,7 @@ fn build_prewarms_live_client_snapshot_for_first_routed_put() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -1571,7 +1576,7 @@ fn build_prewarms_live_client_snapshot_for_first_routed_put() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     writer
         .register_local_memory()
@@ -1609,7 +1614,7 @@ fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
         .live_client_sync_interval(Duration::from_secs(60))
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -1626,7 +1631,7 @@ fn routed_batch_put_reuses_live_client_snapshot_for_placement() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     writer
         .register_local_memory()
@@ -1668,7 +1673,7 @@ fn background_live_client_sync_refreshes_snapshot_without_request_refresh() {
         .live_client_sync_interval(Duration::from_millis(25))
         .transport(writer_transport.clone())
         .local_memory(rw_only_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     writer
         .register_local_memory()
@@ -1712,7 +1717,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -1729,7 +1734,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("router build should succeed");
     router
         .register_local_memory()
@@ -1743,7 +1748,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
     reader
         .register_local_memory()
@@ -1799,7 +1804,7 @@ fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
         .transport(transport.clone())
         .local_memory(storage_config())
         .routed_writes(planner, 2)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let payload = b"routed-payload";
@@ -1872,7 +1877,7 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(writer_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "reader")
         .state(ClientLifecycleState::Active)
@@ -1880,7 +1885,7 @@ fn embedded_wrh_route_directory_serves_peer_clients_without_metadata_routes() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     wait_for_membership_convergence(&[&writer, &reader]);
@@ -1929,7 +1934,7 @@ fn routed_read_skips_inactive_primary_replica_and_prunes_stale_route() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let store_b = StoreClientBuilder::new(metadata.clone(), "inactive-primary-store-b")
         .state(ClientLifecycleState::Active)
@@ -1939,7 +1944,7 @@ fn routed_read_skips_inactive_primary_replica_and_prunes_stale_route() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "inactive-primary-writer")
         .state(ClientLifecycleState::Active)
@@ -1951,7 +1956,7 @@ fn routed_read_skips_inactive_primary_replica_and_prunes_stale_route() {
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 2)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "inactive-primary-reader")
         .state(ClientLifecycleState::Active)
@@ -1962,7 +1967,7 @@ fn routed_read_skips_inactive_primary_replica_and_prunes_stale_route() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -2043,7 +2048,7 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let store_b = StoreClientBuilder::new(metadata.clone(), "transport-failed-store-b")
         .state(ClientLifecycleState::Active)
@@ -2053,7 +2058,7 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "transport-failed-writer")
         .state(ClientLifecycleState::Active)
@@ -2065,7 +2070,7 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 2)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "transport-failed-reader")
         .state(ClientLifecycleState::Active)
@@ -2076,7 +2081,7 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -2154,6 +2159,130 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
 }
 
 #[test]
+fn suspect_authority_quarantine_is_shared_across_clients() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("shared-suspect-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("shared-suspect-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("shared-suspect-writer-segment"));
+    let reader_a_transport = Arc::new(store_a_transport.peer("shared-suspect-reader-a-segment"));
+    let reader_b_transport = Arc::new(store_a_transport.peer("shared-suspect-reader-b-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "shared-suspect-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "shared-suspect-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "shared-suspect-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "shared-suspect-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "shared-suspect-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "shared-suspect-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader_a = StoreClientBuilder::new(metadata.clone(), "shared-suspect-reader-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "shared-suspect-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader-a build should succeed");
+    let reader_b = StoreClientBuilder::new(metadata.clone(), "shared-suspect-reader-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "shared-suspect-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader-b build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader_a
+        .register_local_memory()
+        .expect("reader-a memory should register");
+    reader_b
+        .register_local_memory()
+        .expect("reader-b memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader_a, &reader_b]);
+
+    writer
+        .put_with_policy(
+            "shared-suspect-key",
+            b"shared-suspect-payload",
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated put should succeed");
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("shared-suspect-a-segment")
+            .expect("primary segment handle should exist");
+        state.segments_by_handle.remove(&handle);
+    }
+
+    let first = reader_a.get("shared-suspect-key");
+    assert!(
+        matches!(
+            first,
+            Err(StoreError::NotFound(_))
+                | Err(StoreError::Transport(_))
+                | Err(StoreError::InvalidState(_))
+        ),
+        "first reader should discover the dead authority and quarantine it"
+    );
+
+    assert_eq!(
+        reader_b
+            .get("shared-suspect-key")
+            .expect("second reader should reuse the shared quarantine and avoid a fresh dead-authority failure"),
+        b"shared-suspect-payload"
+    );
+}
+
+#[test]
 fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("put-failed-a-segment"));
@@ -2169,7 +2298,7 @@ fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let store_b = StoreClientBuilder::new(metadata.clone(), "put-failed-store-b")
         .state(ClientLifecycleState::Active)
@@ -2179,7 +2308,7 @@ fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "put-failed-writer")
         .state(ClientLifecycleState::Active)
@@ -2191,7 +2320,7 @@ fn routed_put_skips_transport_failed_storage_owner_and_uses_live_peer() {
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
 
     store_a
@@ -2260,7 +2389,7 @@ fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "repair-old-writer")
         .state(ClientLifecycleState::Active)
@@ -2272,7 +2401,7 @@ fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner.clone(), 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "repair-old-reader")
         .state(ClientLifecycleState::Active)
@@ -2283,7 +2412,7 @@ fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -2337,7 +2466,7 @@ fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let store_c = StoreClientBuilder::new(metadata.clone(), "repair-old-store-c")
         .state(ClientLifecycleState::Active)
@@ -2348,7 +2477,7 @@ fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_c_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-c build should succeed");
 
     store_b
@@ -2424,7 +2553,7 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "repair-meta-writer")
         .state(ClientLifecycleState::Active)
@@ -2436,7 +2565,7 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "repair-meta-reader")
         .state(ClientLifecycleState::Active)
@@ -2447,7 +2576,7 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -2502,7 +2631,7 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let store_c = StoreClientBuilder::new(metadata.clone(), "repair-meta-store-c")
         .state(ClientLifecycleState::Active)
@@ -2513,7 +2642,7 @@ fn embedded_wrh_query_route_repairs_from_metadata_after_authority_miss() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_c_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-c build should succeed");
 
     store_b
@@ -2576,7 +2705,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-writer")
         .state(ClientLifecycleState::Active)
@@ -2588,7 +2717,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner.clone(), 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-reader")
         .state(ClientLifecycleState::Active)
@@ -2599,7 +2728,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -2656,7 +2785,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let store_c = StoreClientBuilder::new(metadata.clone(), "repair-stale-old-store-c")
         .state(ClientLifecycleState::Active)
@@ -2667,7 +2796,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_c_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-c build should succeed");
 
     store_b
@@ -2755,7 +2884,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let writer = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-writer")
         .state(ClientLifecycleState::Active)
@@ -2767,7 +2896,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
         .transport(writer_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-reader")
         .state(ClientLifecycleState::Active)
@@ -2778,7 +2907,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -2839,7 +2968,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let store_c = StoreClientBuilder::new(metadata.clone(), "repair-stale-meta-store-c")
         .state(ClientLifecycleState::Active)
@@ -2850,7 +2979,7 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_metadata() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_c_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-c build should succeed");
 
     store_b
@@ -2927,7 +3056,7 @@ fn embedded_wrh_route_directory_ignores_pool_boundaries_by_default() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "reader-cross-pool")
         .state(ClientLifecycleState::Active)
@@ -2935,7 +3064,7 @@ fn embedded_wrh_route_directory_ignores_pool_boundaries_by_default() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     wait_for_membership_convergence(&[&writer, &reader]);
@@ -2975,7 +3104,7 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -2992,7 +3121,7 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("router build should succeed");
     router
         .register_local_memory()
@@ -3005,7 +3134,7 @@ fn routed_io_works_when_metadata_hot_paths_are_disabled() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
     reader
         .register_local_memory()
@@ -3046,7 +3175,7 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -3063,7 +3192,7 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("router build should succeed");
     router
         .register_local_memory()
@@ -3076,7 +3205,7 @@ fn routed_batch_io_works_when_metadata_hot_paths_are_disabled() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
     reader
         .register_local_memory()
@@ -3175,7 +3304,7 @@ fn batch_get_chunks_remote_reads_when_scratch_window_is_small() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata, "reader-batch-chunk")
         .state(ClientLifecycleState::Active)
@@ -3184,7 +3313,7 @@ fn batch_get_chunks_remote_reads_when_scratch_window_is_small() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config_with_layout(4096, 8, 1))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     wait_for_membership_convergence(&[&writer, &reader]);
@@ -3233,7 +3362,7 @@ fn batch_get_into_falls_back_to_direct_when_value_exceeds_scratch() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata, "reader-batch-direct")
         .state(ClientLifecycleState::Active)
@@ -3242,7 +3371,7 @@ fn batch_get_into_falls_back_to_direct_when_value_exceeds_scratch() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config_with_layout(4096, 4, 1))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     wait_for_membership_convergence(&[&writer, &reader]);
@@ -3275,7 +3404,7 @@ fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport.clone())
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("writer build should succeed");
     let reader = StoreClientBuilder::new(metadata, "reader-subrange")
         .state(ClientLifecycleState::Active)
@@ -3283,7 +3412,7 @@ fn registered_buffer_subranges_support_put_from_and_batch_get_into() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     wait_for_membership_convergence(&[&writer, &reader]);
@@ -3336,7 +3465,7 @@ fn remove_reclaims_segment_space_immediately_when_grace_zero() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let first = client
@@ -3367,7 +3496,7 @@ fn remove_defers_reclaim_until_grace_deadline() {
                 .scratch_bytes(4096)
                 .reclaim_grace_ms(30),
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let first = client
@@ -3413,7 +3542,7 @@ fn replication_policy_prefers_local_before_remote_replica() {
         .label("storage", "false")
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let route = client
@@ -3458,7 +3587,7 @@ fn default_put_spills_to_remote_after_local_capacity_is_exhausted() {
         .label("storage", "false")
         .transport(transport)
         .local_memory(storage_config_with_bytes(8))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let first = client
@@ -3489,7 +3618,7 @@ fn storage_owner_clock_evicts_cold_local_replicas_before_hot_ones() {
         .label("storage", "true")
         .transport(transport)
         .local_memory(storage_config_with_bytes(32))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
     client
         .register_local_memory()
@@ -3557,7 +3686,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(storage_transport)
         .local_memory(storage_config_with_bytes(32))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("storage build should succeed");
     storage
         .register_local_memory()
@@ -3574,7 +3703,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
             PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
             1,
         )
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("router build should succeed");
     router
         .register_local_memory()
@@ -3646,7 +3775,7 @@ fn background_watermark_eviction_reclaims_without_front_path_pressure() {
         .label("storage", "true")
         .transport(transport)
         .local_memory(storage_config_with_background_eviction(100, 60, 20))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
     client
         .register_local_memory()
@@ -3723,7 +3852,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         .label("storage", "false")
         .transport(transport)
         .local_memory(storage_config_with_bytes(16))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let policy = ReplicationPolicy::new()
@@ -3773,7 +3902,7 @@ fn routed_batch_put_prefers_local_before_spilling_remote() {
         .transport(transport)
         .local_memory(storage_config_with_bytes(8))
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let routes = client
@@ -3821,7 +3950,7 @@ fn routed_batch_put_ignores_local_segments_when_storage_role_is_disabled() {
         .transport(transport)
         .local_memory(storage_config_with_bytes(8))
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let routes = client
@@ -3865,7 +3994,7 @@ fn request_replication_policy_honors_preferred_segment() {
         .label("storage", "false")
         .transport(transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     let route = client
@@ -4003,7 +4132,7 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     assert!(matches!(
         StoreClientBuilder::new(metadata, "builder-tenant-empty")
             .tenant("")
-            .build(10_000),
+            .build(test_future_expiry_ms()),
         Err(StoreError::InvalidState(_))
     ));
 
@@ -4017,7 +4146,7 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         .route_control(RouteControlMode::MetadataOnly)
         .state(ClientLifecycleState::Active)
         .transport(builder_transport)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("builder with compatibility and route_control should succeed");
     assert_eq!(built.lease().compatibility, custom_compat);
 }
@@ -4035,7 +4164,7 @@ fn suspect_runtime_cache_requires_fresh_lease_before_recovery() {
         state: ClientLifecycleState::Active,
         compatibility: CompatibilityDescriptor::default(),
         endpoints,
-        expires_at_ms: 10_000,
+        expires_at_ms: test_future_expiry_ms(),
     };
     let elapsed = Instant::now() - Duration::from_millis(1);
     let mut cache = SuspectRuntimeCache::default();
@@ -4060,10 +4189,39 @@ fn suspect_runtime_cache_requires_fresh_lease_before_recovery() {
 }
 
 #[test]
+fn cached_live_client_snapshot_filters_expired_runtimes_without_refresh() {
+    let runtime_live = ClientRuntimeId::new("live-runtime", ClientEpoch(1));
+    let runtime_dead = ClientRuntimeId::new("dead-runtime", ClientEpoch(1));
+    let cache = Arc::new(Mutex::new(LiveClientCache::default()));
+    cache.lock().store(vec![
+        ClientLease {
+            runtime: runtime_live.clone(),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: test_future_expiry_ms(),
+        },
+        ClientLease {
+            runtime: runtime_dead,
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: now_ms().saturating_sub(1),
+        },
+    ]);
+
+    let snapshot =
+        cached_live_client_snapshot(&cache).expect("cached live-client snapshot should exist");
+
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].runtime, runtime_live);
+}
+
+#[test]
 fn builder_rejects_route_topk_below_two_before_runtime_start() {
     let result = StoreClientBuilder::new(Arc::new(InMemoryMetadataBackend::new()), "builder-topk")
         .route_topk(1)
-        .build(10_000);
+        .build(test_future_expiry_ms());
     assert!(matches!(result, Err(StoreError::InvalidState(_))));
 }
 
@@ -4075,7 +4233,7 @@ fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
         state: ClientLifecycleState::Active,
         compatibility: CompatibilityDescriptor::default(),
         endpoints: ClientEndpointSet::default(),
-        expires_at_ms: 10_000,
+        expires_at_ms: test_future_expiry_ms(),
     };
     bootstrap_route_policy(metadata.as_ref(), &writer, RouteControlMode::EmbeddedWrh, 3)
         .expect("initial route policy bootstrap should succeed");
@@ -4091,7 +4249,7 @@ fn bootstrap_route_policy_bootstraps_once_and_rejects_mismatch() {
         state: ClientLifecycleState::Active,
         compatibility: CompatibilityDescriptor::default(),
         endpoints: ClientEndpointSet::default(),
-        expires_at_ms: 10_000,
+        expires_at_ms: test_future_expiry_ms(),
     };
     bootstrap_route_policy(
         metadata.as_ref(),
@@ -4121,7 +4279,7 @@ fn compatibility_facade_surface_covers_aliases_and_buffers() {
         .transport(transport.clone())
         .transport_factory(transport.factory())
         .local_memory(storage_config_with_bytes(512))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     client
@@ -4424,7 +4582,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         .state(ClientLifecycleState::Active)
         .transport(transport)
         .local_memory(storage_config_with_bytes(256))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     client
@@ -4723,7 +4881,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
         .transport(transport.clone())
         .transport_factory(transport.factory())
         .local_memory(storage_config_with_bytes(256))
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
     client
@@ -4810,7 +4968,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let store_b = StoreClientBuilder::new(metadata.clone(), "shrink-store-b")
         .state(ClientLifecycleState::Active)
@@ -4819,7 +4977,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let router = StoreClientBuilder::new(metadata.clone(), "shrink-router")
         .state(ClientLifecycleState::Active)
@@ -4829,7 +4987,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("router build should succeed");
     let reader = StoreClientBuilder::new(metadata, "shrink-reader")
         .state(ClientLifecycleState::Active)
@@ -4838,7 +4996,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -4928,7 +5086,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_a_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let store_b = StoreClientBuilder::new(metadata.clone(), "writer-via-store-b")
         .state(ClientLifecycleState::Active)
@@ -4937,7 +5095,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(store_b_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let router = StoreClientBuilder::new(metadata.clone(), "writer-via-router")
         .state(ClientLifecycleState::Active)
@@ -4947,7 +5105,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("router build should succeed");
     let reader = StoreClientBuilder::new(metadata, "writer-via-reader")
         .state(ClientLifecycleState::Active)
@@ -4956,7 +5114,7 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
         .live_client_sync_interval(fast_live_client_sync_interval())
         .transport(reader_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     store_a
@@ -5061,7 +5219,7 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .transport(predecessor_transport)
         .transport_factory(predecessor_factory)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("predecessor build should succeed");
     let mut successor = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-store")
         .epoch(ClientEpoch(2))
@@ -5070,7 +5228,7 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .label("storage", "true")
         .transport(successor_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("successor build should succeed");
     let spare = StoreClientBuilder::new(metadata.clone(), "pin-upgrade-spare")
         .state(ClientLifecycleState::Active)
@@ -5078,7 +5236,7 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .label("storage", "true")
         .transport(spare_transport)
         .local_memory(storage_config())
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("spare build should succeed");
     let reader = StoreClientBuilder::new(metadata, "pin-upgrade-reader")
         .state(ClientLifecycleState::Active)
@@ -5087,7 +5245,7 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .transport(reader_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 1)
-        .build(10_000)
+        .build(test_future_expiry_ms())
         .expect("reader build should succeed");
 
     predecessor

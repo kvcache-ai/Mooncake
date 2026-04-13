@@ -348,6 +348,10 @@ fn result_label<T>(result: &Result<T>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+        CompatibilityDescriptor,
+    };
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -533,6 +537,43 @@ mod tests {
             .expect("http handler worker should exit cleanly");
     }
 
+    #[test]
+    fn runtime_lease_metrics_reconcile_to_latest_live_snapshot() {
+        let _guard = metrics_test_lock().lock().expect("test lock poisoned");
+        reset_metrics();
+
+        registry::record_runtime_leases(&[
+            sample_runtime_lease("runtime-a"),
+            sample_runtime_lease("runtime-b"),
+        ]);
+        registry::record_runtime_leases(&[sample_runtime_lease("runtime-a")]);
+
+        let metrics = snapshot_metrics();
+        let runtime_statuses = metrics
+            .runtime_status
+            .into_iter()
+            .map(|sample| sample.key.runtime)
+            .collect::<std::collections::BTreeSet<_>>();
+        let runtime_leases = metrics
+            .runtime_lease_expires_at_ms
+            .into_iter()
+            .map(|sample| sample.key.runtime)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            runtime_statuses,
+            std::collections::BTreeSet::from([
+                ClientRuntimeId::new("runtime-a", ClientEpoch(1)).to_string()
+            ]),
+        );
+        assert_eq!(
+            runtime_leases,
+            std::collections::BTreeSet::from([
+                ClientRuntimeId::new("runtime-a", ClientEpoch(1)).to_string()
+            ]),
+        );
+    }
+
     fn http_get(address: &str, path: &str) -> String {
         let request =
             format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
@@ -563,5 +604,15 @@ mod tests {
             None => std::env::remove_var(key),
         }
         result
+    }
+
+    fn sample_runtime_lease(stable_id: &str) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms: 4_102_444_800_000,
+        }
     }
 }

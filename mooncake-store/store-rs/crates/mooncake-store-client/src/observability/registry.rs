@@ -600,16 +600,19 @@ pub(crate) fn record_membership_refresh(result: &'static str, duration: Duration
 
 pub(crate) fn record_runtime_leases(leases: &[ClientLease]) {
     let mut registry = metrics_registry().lock().expect("metrics lock poisoned");
-    for lease in leases {
-        registry.runtime_leases.insert(
-            lease.runtime.to_string(),
-            RuntimeLeaseMetric {
-                runtime: lease.runtime.to_string(),
-                state: client_state_label(lease.state),
-                expires_at_ms: lease.expires_at_ms,
-            },
-        );
-    }
+    registry.runtime_leases = leases
+        .iter()
+        .map(|lease| {
+            (
+                lease.runtime.to_string(),
+                RuntimeLeaseMetric {
+                    runtime: lease.runtime.to_string(),
+                    state: client_state_label(lease.state),
+                    expires_at_ms: lease.expires_at_ms,
+                },
+            )
+        })
+        .collect();
 }
 
 pub(crate) fn record_segment(announcement: &SegmentAnnouncement) {
