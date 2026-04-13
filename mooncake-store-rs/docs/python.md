@@ -544,6 +544,7 @@ python -m sglang.launch_server \
   --hicache-storage-backend-extra-config '{
     "local_hostname": "10.0.0.21:17121",
     "metadata_server": "redis://10.0.0.10:6379/0",
+    "master_server_address": "ignored-by-store-rs",
     "global_segment_size": 0,
     "local_buffer_size": 16777216,
     "protocol": "tcp",
@@ -559,6 +560,7 @@ python -m sglang.launch_server \
 ```
 
   Use this when SGLang should build the real store runtime directly inside the serving process. The `global_segment_size: 0` setting keeps the process rw-only while still allowing routed writes to remote storage peers.
+  SGLang's current Mooncake backend parser still requires `master_server_address` in real mode for upstream schema compatibility. Store-RS accepts the field but ignores it; the actual control plane comes from `metadata_server=redis://...` or `etcd://...`. If `metadata_server` is omitted, SGLang falls back to `P2PHANDSHAKE`, which Store-RS intentionally rejects.
 
 - dummy-mode SGLang through a standalone routed gateway
 
