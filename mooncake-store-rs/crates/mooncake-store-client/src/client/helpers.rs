@@ -75,9 +75,7 @@ fn scatter_into_buffers(payload: &[u8], buffers: &mut [&mut [u8]]) {
 }
 
 fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
-    left.compatibility.store_api_version == right.compatibility.store_api_version
-        && left.compatibility.metadata_schema_version == right.compatibility.metadata_schema_version
-        && left.compatibility.transport_api_version == right.compatibility.transport_api_version
+    left.compatibility.is_compatible_with(&right.compatibility)
 }
 
 fn should_fallback_to_metadata_allocator(error: &StoreError) -> bool {

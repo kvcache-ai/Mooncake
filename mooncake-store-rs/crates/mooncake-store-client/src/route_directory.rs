@@ -1117,9 +1117,7 @@ fn route_mesh(namespace: &str) -> Arc<Mutex<ClusterRouteMesh>> {
 }
 
 fn compatibility_matches(left: &ClientLease, right: &ClientLease) -> bool {
-    left.compatibility.store_api_version == right.compatibility.store_api_version
-        && left.compatibility.metadata_schema_version == right.compatibility.metadata_schema_version
-        && left.compatibility.transport_api_version == right.compatibility.transport_api_version
+    left.compatibility.is_compatible_with(&right.compatibility)
 }
 
 fn route_capable(lease: &ClientLease) -> bool {
@@ -1171,11 +1169,12 @@ fn canonical_route_key(route: &ObjectRoute) -> String {
     let mut key = String::new();
     let _ = write!(
         key,
-        "{}|{}|{}|{}|{}|{}|",
+        "{}|{}|{}|{}|{}|{}|{}|",
         route.key.0,
         route.version.0,
         route_state_rank(route.state),
         route.compatibility.store_api_version,
+        route.compatibility.store_api_minor_version,
         route.compatibility.metadata_schema_version,
         route.compatibility.transport_api_version,
     );
@@ -1545,6 +1544,12 @@ mod tests {
         let mut incompatible = capable.clone();
         incompatible.compatibility.store_api_version += 1;
         assert!(!compatibility_matches(&capable, &incompatible));
+
+        // minor version difference should still be compatible
+        let mut minor_diff = capable.clone();
+        minor_diff.compatibility.store_api_minor_version += 2;
+        assert!(compatibility_matches(&capable, &minor_diff));
+        assert!(compatibility_matches(&minor_diff, &capable));
 
         route_mesh(namespace).lock().unregister_local(&authority);
         assert!(authority_get(namespace, &authority, &route_b.key).is_err());
