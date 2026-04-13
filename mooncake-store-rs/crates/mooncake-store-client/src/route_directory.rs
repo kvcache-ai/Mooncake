@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::client::{SharedLiveClientCache, SharedSuspectRuntimeCache};
 use crate::{
@@ -396,6 +396,16 @@ impl EmbeddedWrhRouteDirectory {
                     {
                         match result {
                             Ok(Some(route)) => {
+                                debug!(
+                                    namespace = %self.namespace,
+                                    key = %key.0,
+                                    authority = %authority.runtime,
+                                    rank,
+                                    source = route_read_source(rank, self.route_topk),
+                                    route_version = route.version.0,
+                                    replica_count = route.replicas.len(),
+                                    "route authority returned object route"
+                                );
                                 if let Some(states) = repairs.as_mut() {
                                     Self::set_repair_observation(
                                         &mut states[index],
@@ -488,6 +498,14 @@ impl EmbeddedWrhRouteDirectory {
         for (index, key) in keys.iter().enumerate() {
             match self.metadata.get_object_route(key) {
                 Ok(Some(route)) => {
+                    debug!(
+                        namespace = %self.namespace,
+                        key = %key.0,
+                        source = "metadata",
+                        route_version = route.version.0,
+                        replica_count = route.replicas.len(),
+                        "metadata returned object route"
+                    );
                     Self::merge_fresher_route(&mut resolved[index], route, "metadata", key);
                 }
                 Ok(None) => {}
@@ -1120,6 +1138,16 @@ fn route_weight(lease: &ClientLease) -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|weight| *weight > 0.0)
         .unwrap_or(1.0)
+}
+
+fn route_read_source(rank: usize, route_topk: usize) -> &'static str {
+    if rank == 0 {
+        "primary"
+    } else if rank < route_topk {
+        "mirror"
+    } else {
+        "fallback"
+    }
 }
 
 fn route_state_rank(state: RouteState) -> u8 {

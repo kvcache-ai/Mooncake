@@ -66,7 +66,7 @@ KEY='YOUR_KEY'
 TENANT='default'
 
 grep -E \
-  "key=\"${KEY}\"|key=${KEY}|${TENANT}::${KEY}|resolved object routes|writing reserved replicas|batch get completed|remote direct|get fallback|route .*failed|marked route authority" \
+  "key=\"${KEY}\"|key=${KEY}|${TENANT}::${KEY}|route authority returned object route|metadata returned object route|resolved object routes|writing reserved replicas|batch get completed|remote direct|get fallback|route .*failed|marked route authority" \
   sglang.log
 ```
 
@@ -265,10 +265,28 @@ mirrored authority route batch read failed; trying other authorities or metadata
 These logs tell you which route authority was tried and why the request fell
 back to another authority.
 
-Successful route lookups currently log the resolved route stage, but they do
-not print a full per-key line containing `key`, `rank`, `authority`, `source`,
-`version`, and `replica_count`. If a test requires that exact successful
-authority path, add a `debug` log in the route directory success path.
+Successful route lookups also emit a per-key `debug` line:
+
+```text
+route authority returned object route namespace=... key=default::YOUR_KEY authority=storage-node-a:1 rank=0 source=primary route_version=1 replica_count=1
+```
+
+Important fields:
+
+- `authority` is the route authority that returned this route.
+- `rank` is this authority's WRH rank for the key.
+- `source=primary` means rank `0`.
+- `source=mirror` means a configured mirrored authority inside route top-K.
+- `source=fallback` means a lower-ranked fallback authority was used after the
+  primary/mirror path.
+- `route_version` and `replica_count` describe the route returned by that
+  authority.
+
+If metadata repair or fallback returns the route, you may also see:
+
+```text
+metadata returned object route namespace=... key=default::YOUR_KEY source=metadata route_version=1 replica_count=1
+```
 
 ## Metrics for Correlation
 
@@ -313,18 +331,9 @@ full path by themselves.
 
 ## Current Limitation
 
-The system can already show the request span, local/remote data path, failures,
-and final storage placement. The missing piece is a concise success log for
-route-authority hits.
+The system can show the request span, route-authority hit, local/remote data
+path, failures, and final storage placement. The only remaining split is that
+logs and route inspection answer different questions:
 
-If that becomes a test requirement, add a `debug` line in the route directory
-success path with:
-
-- `key`
-- `rank`
-- `authority`
-- `source`
-- `route_version`
-- `replica_count`
-
-Keep it at `debug` level so production logs stay quiet by default.
+- Logs show the request path and route-authority lookup path.
+- `query_route()` shows the final storage placement for the object replicas.
