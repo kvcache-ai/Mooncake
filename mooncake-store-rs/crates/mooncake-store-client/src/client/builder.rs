@@ -120,6 +120,8 @@ pub struct StoreClientBuilder {
     startup_prewarm_max_delay: Duration,
     activate_on_local_memory_registration: bool,
     namespace_quota: Option<NamespaceQuota>,
+    execution_fairness: Option<ExecutionFairness>,
+    bandwidth_shaping: Option<BandwidthShaping>,
 }
 
 impl StoreClientBuilder {
@@ -144,6 +146,8 @@ impl StoreClientBuilder {
             startup_prewarm_max_delay: startup_prewarm_max_delay_from_env(),
             activate_on_local_memory_registration: false,
             namespace_quota: None,
+            execution_fairness: None,
+            bandwidth_shaping: None,
         }
     }
 
@@ -247,6 +251,16 @@ impl StoreClientBuilder {
 
     pub fn namespace_quota(mut self, namespace_quota: NamespaceQuota) -> Self {
         self.namespace_quota = Some(namespace_quota);
+        self
+    }
+
+    pub fn execution_fairness(mut self, execution_fairness: ExecutionFairness) -> Self {
+        self.execution_fairness = Some(execution_fairness);
+        self
+    }
+
+    pub fn bandwidth_shaping(mut self, bandwidth_shaping: BandwidthShaping) -> Self {
+        self.bandwidth_shaping = Some(bandwidth_shaping);
         self
     }
 
@@ -420,6 +434,8 @@ impl StoreClientBuilder {
             startup_activation_pending: AtomicBool::new(startup_activation_pending),
             heartbeat_repair_pending: AtomicUsize::new(0),
             namespace_quota: self.namespace_quota,
+            execution_fairness: self.execution_fairness,
+            bandwidth_shaping: self.bandwidth_shaping,
             state,
         })
     }

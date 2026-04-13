@@ -45,6 +45,59 @@ pub struct NamespaceQuota {
     pub max_objects: Option<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionFairness {
+    pub max_remote_batch_items_per_tenant: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BandwidthShaping {
+    pub max_remote_batch_bytes: Option<usize>,
+    pub max_remote_batch_burst_items: Option<usize>,
+    pub max_inflight_bytes_per_batch: Option<u64>,
+}
+
+impl BandwidthShaping {
+    pub fn new() -> Self {
+        Self {
+            max_remote_batch_bytes: None,
+            max_remote_batch_burst_items: None,
+            max_inflight_bytes_per_batch: None,
+        }
+    }
+
+    pub fn max_remote_batch_bytes(mut self, max_remote_batch_bytes: usize) -> Self {
+        self.max_remote_batch_bytes = Some(max_remote_batch_bytes.max(1));
+        self
+    }
+
+    pub fn max_remote_batch_burst_items(mut self, max_remote_batch_burst_items: usize) -> Self {
+        self.max_remote_batch_burst_items = Some(max_remote_batch_burst_items.max(1));
+        self
+    }
+
+    pub fn max_inflight_bytes_per_batch(mut self, max_inflight_bytes_per_batch: u64) -> Self {
+        self.max_inflight_bytes_per_batch = Some(max_inflight_bytes_per_batch.max(1));
+        self
+    }
+}
+
+impl ExecutionFairness {
+    pub fn new() -> Self {
+        Self {
+            max_remote_batch_items_per_tenant: None,
+        }
+    }
+
+    pub fn max_remote_batch_items_per_tenant(
+        mut self,
+        max_remote_batch_items_per_tenant: usize,
+    ) -> Self {
+        self.max_remote_batch_items_per_tenant = Some(max_remote_batch_items_per_tenant.max(1));
+        self
+    }
+}
+
 impl NamespaceQuota {
     pub fn new() -> Self {
         Self {

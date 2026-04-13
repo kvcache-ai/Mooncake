@@ -503,9 +503,11 @@ impl StoreClient {
         successor: &ClientRuntimeId,
         route: &ObjectRoute,
     ) -> Result<bool> {
-        let (tenant, key) = self.split_scoped_route_key(route)?;
+        let object_id = self.route_object_id(route)?;
+        let tenant = object_id.scope.tenant;
+        let key = object_id.logical_key;
         for _ in 0..4 {
-            let Some(observed) = self.query_route_in_tenant(tenant, key)? else {
+            let Some(observed) = self.query_route_in_tenant(&tenant, &key)? else {
                 return Ok(false);
             };
             if observed.state != RouteState::Active {
@@ -519,8 +521,8 @@ impl StoreClient {
                 return Ok(false);
             }
 
-            let payload = writer.get_in_tenant(tenant, key)?;
-            let Some(confirmed) = self.query_route_in_tenant(tenant, key)? else {
+            let payload = writer.get_in_tenant(&tenant, &key)?;
+            let Some(confirmed) = self.query_route_in_tenant(&tenant, &key)? else {
                 return Ok(false);
             };
             if confirmed.version != observed.version {
@@ -536,8 +538,8 @@ impl StoreClient {
 
             let policy = writer.migration_policy_for_successor_route(&confirmed, successor)?;
             match writer.put_scoped_with_policy_current(
-                tenant,
-                key,
+                &tenant,
+                &key,
                 &payload,
                 Some(&policy),
                 Some(&confirmed),
@@ -1132,8 +1134,7 @@ impl StoreClient {
                 .iter()
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    let object_id = mooncake_store_core::scoped_logical_object_id(tenant, object.key);
-                    (tenant.to_string(), ObjectKey::from_logical_id(&object_id))
+                    (tenant.to_string(), self.scoped_key(tenant, object.key))
                 })
                 .collect::<Vec<_>>();
             let routes = self.route_directory.get_object_routes(
@@ -1212,6 +1213,117 @@ impl StoreClient {
             0,
         );
         result
+    }
+
+    fn shaping_max_remote_batch_burst_items(&self) -> Option<usize> {
+        self.bandwidth_shaping
+            .as_ref()
+            .and_then(|shaping| shaping.max_remote_batch_bytes)
+            .map(|bytes| bytes as usize)
+    }
+
+    fn shaping_max_remote_batch_bytes(&self) -> Option<u64> {
+        self.bandwidth_shaping
+            .as_ref()
+            .and_then(|shaping| shaping.max_remote_batch_bytes)
+    }
+
+    fn fairness_max_remote_batch_items_per_tenant(&self) -> Option<usize> {
+        self.execution_fairness
+            .as_ref()
+            .and_then(|fairness| fairness.max_remote_batch_items_per_tenant)
+    }
+
+    fn shaping_max_inflight_bytes_per_batch(&self) -> Option<u64> {
+        self.bandwidth_shaping
+            .as_ref()
+            .and_then(|shaping| shaping.max_inflight_bytes_per_batch)
+    }
+
+    fn remote_batch_chunk_limit(&self, bytes_per_item: usize, fallback_items: usize) -> usize {
+        let burst_items = self
+            .shaping_max_remote_batch_burst_items()
+            .unwrap_or(fallback_items)
+            .max(1);
+        let byte_items = self
+            .shaping_max_remote_batch_bytes()
+            .map(|max_bytes| (max_bytes / bytes_per_item.max(1)).max(1))
+            .unwrap_or(fallback_items)
+            .max(1);
+        burst_items.min(byte_items).min(fallback_items).max(1)
+    }
+
+    fn remote_write_chunk_limit(&self, bytes_per_item: usize, fallback_items: usize) -> usize {
+        self.fairness_max_remote_batch_items_per_tenant()
+            .unwrap_or(fallback_items)
+            .max(1)
+            .min(self.remote_batch_chunk_limit(bytes_per_item, fallback_items))
+    }
+
+    fn remote_batch_hints(
+        &self,
+        tenant: &str,
+        _bytes: u64,
+        mode: TransferPacingMode,
+    ) -> TransferBatchHints {
+        TransferBatchHints {
+            pacing_group: Some(format!("tenant:{tenant}")),
+            mode,
+            max_inflight_bytes: self.shaping_max_inflight_bytes_per_batch(),
+        }
+    }
+
+    fn fairness_slice_by_tenant<T, F>(&self, items: &[T], tenant_of: F) -> Vec<Vec<usize>>
+    where
+        F: Fn(&T) -> &str,
+    {
+        let Some(limit) = self.fairness_max_remote_batch_items_per_tenant() else {
+            return vec![(0..items.len()).collect()];
+        };
+        let mut per_tenant = BTreeMap::<String, VecDeque<usize>>::new();
+        for (index, item) in items.iter().enumerate() {
+            per_tenant
+                .entry(tenant_of(item).to_string())
+                .or_default()
+                .push_back(index);
+        }
+        let mut slices = Vec::new();
+        while per_tenant.values().any(|queue| !queue.is_empty()) {
+            let mut chunk = Vec::new();
+            for queue in per_tenant.values_mut() {
+                for _ in 0..limit {
+                    let Some(index) = queue.pop_front() else {
+                        break;
+                    };
+                    chunk.push(index);
+                }
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            slices.push(chunk);
+        }
+        slices
+    }
+
+    fn fairness_slice_remote_indices(
+        &self,
+        resolved: &[ResolvedObject],
+        remote_indices: &[usize],
+    ) -> Vec<Vec<usize>> {
+        let indexed = remote_indices
+            .iter()
+            .map(|index| resolved[*index].clone())
+            .collect::<Vec<_>>();
+        self.fairness_slice_by_tenant(&indexed, |entry| entry.tenant.as_str())
+            .into_iter()
+            .map(|slice| {
+                slice
+                    .into_iter()
+                    .map(|position| remote_indices[position])
+                    .collect()
+            })
+            .collect()
     }
 
     fn execute_batch_get_into(
@@ -1316,9 +1428,9 @@ impl StoreClient {
             return Ok(lengths);
         }
 
-        let mut cursor = 0usize;
         let mut remote_batch_chunks = 0usize;
         let mut remote_direct_fallbacks = 0usize;
+<<<<<<< HEAD
         while cursor < remote_indices.len() {
             match self.plan_remote_get_chunk(&remote_indices, &lengths, cursor)? {
                 Some((next, scratch)) => {
@@ -1344,9 +1456,63 @@ impl StoreClient {
                                     "remote_batch_get_fallback",
                                 )?;
                                 remote_direct_fallbacks += 1;
+=======
+        let fairness_slices = self.fairness_slice_remote_indices(resolved, &remote_indices);
+        let fairness_rounds = fairness_slices.len();
+        let shaping_chunk_limit = self.remote_batch_chunk_limit(
+            remote_indices
+                .iter()
+                .map(|index| lengths[*index])
+                .max()
+                .unwrap_or(1),
+            remote_indices.len(),
+        );
+        for fairness_slice in fairness_slices {
+            let mut cursor = 0usize;
+            while cursor < fairness_slice.len() {
+                let capped_end = fairness_slice.len().min(cursor + shaping_chunk_limit);
+                let planning_window = &fairness_slice[cursor..capped_end];
+                match self.plan_remote_get_chunk(planning_window, &lengths, 0)? {
+                    Some((next, scratch)) => {
+                        match self.execute_remote_batch_get_chunk(
+                            transport,
+                            resolved,
+                            buffers,
+                            &planning_window[..next],
+                            &scratch,
+                        ) {
+                            Ok(()) => {
+                                remote_batch_chunks += 1;
+                            }
+                            Err(_) => {
+                                for index in &planning_window[..next] {
+                                    let buffer = &mut *buffers[*index];
+                                    self.read_single_object_with_failover(
+                                        transport,
+                                        &mut resolved[*index],
+                                        buffer,
+                                        "remote_batch_get_fallback",
+                                    )?;
+                                    remote_direct_fallbacks += 1;
+                                }
+>>>>>>> 13606eb ([Store-RS] add runtime qos controls)
                             }
                         }
+                        cursor += next;
                     }
+                    None => {
+                        let index = fairness_slice[cursor];
+                        let buffer = &mut *buffers[index];
+                        self.read_single_object_with_failover(
+                            transport,
+                            &mut resolved[index],
+                            buffer,
+                            "remote_direct_get_fallback",
+                        )?;
+                        remote_direct_fallbacks += 1;
+                        cursor += 1;
+                    }
+<<<<<<< HEAD
                     cursor = next;
                 }
                 None => {
@@ -1361,6 +1527,8 @@ impl StoreClient {
                     )?;
                     remote_direct_fallbacks += 1;
                     cursor += 1;
+=======
+>>>>>>> 13606eb ([Store-RS] add runtime qos controls)
                 }
             }
         }
@@ -1372,6 +1540,7 @@ impl StoreClient {
             local_bytes,
             remote_items = remote_indices.len(),
             remote_bytes,
+            fairness_rounds,
             remote_batch_chunks,
             remote_direct_fallbacks,
             "batch get completed across local and remote paths"
@@ -1710,7 +1879,13 @@ impl StoreClient {
                     Self::remote_read_failure_marks_runtime_suspect(&error),
                 )
             })?;
-            let submit_result = transport.submit(batch_id, &requests);
+            let mode = if remote_indices.len() == 1 {
+                TransferPacingMode::LatencySensitive
+            } else {
+                TransferPacingMode::ThroughputOptimized
+            };
+            let hints = self.remote_batch_hints(&resolved[remote_indices[0]].tenant, bytes_out, mode);
+            let submit_result = transport.submit_with_hints(batch_id, &requests, &hints);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
                 return Err((
@@ -1834,7 +2009,12 @@ impl StoreClient {
                     Self::remote_read_failure_marks_runtime_suspect(&error),
                 )
             })?;
-            let submit_result = transport.submit(batch_id, &[request]);
+            let hints = self.remote_batch_hints(
+                &resolved.tenant,
+                resolved.replica.length,
+                TransferPacingMode::LatencySensitive,
+            );
+            let submit_result = transport.submit_with_hints(batch_id, &[request], &hints);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
                 if registered_here {
