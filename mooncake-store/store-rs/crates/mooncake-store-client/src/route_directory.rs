@@ -1236,7 +1236,7 @@ fn stable_hash(parts: &[&str]) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use mooncake_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
@@ -1260,6 +1260,13 @@ mod tests {
             .expect("time should advance")
             .as_millis() as u64
             + 60_000
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should advance")
+            .as_millis() as u64
     }
 
     fn lease(stable_id: &str, epoch: u64, route: bool, route_scope: Option<&str>) -> ClientLease {
@@ -1719,6 +1726,121 @@ mod tests {
             .find(|lease| lease.runtime == dead_authority.runtime)
             .map(|lease| lease.state);
         assert_eq!(state, Some(ClientLifecycleState::Active));
+
+        route_mesh(&namespace)
+            .lock()
+            .unregister_local(&live_authority.runtime.stable_id);
+    }
+
+    #[test]
+    fn embedded_directory_reads_from_live_authority_after_dead_primary_and_snapshot_refresh() {
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let observer = lease("observer-read-suspect", 1, false, Some("scope-a"));
+        let mut dead_authority = lease("authority-read-dead", 9, true, Some("scope-a"));
+        let mut live_authority = lease("authority-read-live", 1, true, Some("scope-a"));
+        let short_expiry = now_ms().saturating_add(500);
+        dead_authority.expires_at_ms = short_expiry;
+        live_authority.expires_at_ms = short_expiry;
+        dead_authority.endpoints.labels.insert(
+            crate::control_plane::control_address_label().to_string(),
+            "127.0.0.1:1".to_string(),
+        );
+        for lease in [
+            observer.clone(),
+            dead_authority.clone(),
+            live_authority.clone(),
+        ] {
+            metadata
+                .upsert_client_lease(&lease)
+                .expect("lease upsert should succeed");
+        }
+
+        let control = Arc::new(ControlPlaneClient::new().expect("control client should build"));
+        let live_client_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::LiveClientCache::default(),
+        ));
+        let suspect_runtime_cache = Arc::new(parking_lot::Mutex::new(
+            crate::client::SuspectRuntimeCache::default(),
+        ));
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_read_suspect_test_prewarm",
+        )
+        .expect("route directory test should prewarm membership");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            metadata.clone(),
+            &observer,
+            control,
+            live_client_cache.clone(),
+            suspect_runtime_cache,
+        );
+        let namespace = metadata.route_namespace();
+        route_mesh(&namespace)
+            .lock()
+            .register_local(&live_authority.runtime.stable_id);
+
+        let candidates = vec![dead_authority.clone(), live_authority.clone()];
+        let key = (0..4096u32)
+            .map(|index| ObjectKey::new(format!("tenant-a::read-suspect-key-{index}")))
+            .find(|candidate_key| {
+                directory
+                    .ranked_authorities_from_candidates(&candidates, candidate_key)
+                    .first()
+                    .is_some_and(|lease| lease.runtime == dead_authority.runtime)
+            })
+            .expect("test key should rank dead authority first");
+        let route = route_for(&key.0, &live_authority.runtime);
+        authority_replace(
+            &namespace,
+            &live_authority.runtime.stable_id,
+            &key,
+            Some(&route),
+        )
+        .expect("live authority route should seed");
+
+        let first = directory
+            .get_object_routes(&observer, std::slice::from_ref(&key))
+            .expect("route read should succeed via live fallback");
+        assert_eq!(first, vec![Some(route.clone())]);
+
+        let filtered = directory
+            .authority_candidates(&observer)
+            .expect("dead authority should be quarantined after the first failure");
+        assert!(filtered
+            .iter()
+            .all(|lease| lease.runtime != dead_authority.runtime));
+        assert!(filtered
+            .iter()
+            .any(|lease| lease.runtime == live_authority.runtime));
+
+        std::thread::sleep(Duration::from_millis(700));
+        live_authority.expires_at_ms = now_ms().saturating_add(30_000);
+        metadata
+            .upsert_client_lease(&live_authority)
+            .expect("live authority lease refresh should succeed");
+        crate::client::refresh_live_client_cache(
+            metadata.as_ref(),
+            &live_client_cache,
+            "route_directory_read_suspect_refresh",
+        )
+        .expect("live client cache refresh should succeed");
+
+        let refreshed = directory
+            .authority_candidates_once(&observer, false)
+            .expect("refreshed authority candidates should succeed");
+        assert!(refreshed
+            .iter()
+            .all(|lease| lease.runtime != dead_authority.runtime));
+        assert!(refreshed
+            .iter()
+            .any(|lease| lease.runtime == live_authority.runtime));
+
+        let second = directory
+            .get_object_routes(&observer, std::slice::from_ref(&key))
+            .expect("route read should remain healthy after snapshot refresh");
+        assert_eq!(second, vec![Some(route)]);
 
         route_mesh(&namespace)
             .lock()
