@@ -2159,6 +2159,151 @@ fn routed_read_marks_transport_failed_primary_suspect_and_fails_over_on_retry() 
 }
 
 #[test]
+fn route_lookup_many_stays_ok_when_live_replica_survives_and_snapshot_converges() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("route-lookup-live-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("route-lookup-live-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("route-lookup-live-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("route-lookup-live-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let short_expiry_ms = now_ms().saturating_add(1_000);
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "route-lookup-live-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "route-lookup-live-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(short_expiry_ms)
+        .expect("store-a build should succeed");
+    let mut store_b = StoreClientBuilder::new(metadata.clone(), "route-lookup-live-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "route-lookup-live-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(short_expiry_ms)
+        .expect("store-b build should succeed");
+    let mut writer = StoreClientBuilder::new(metadata.clone(), "route-lookup-live-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "route-lookup-live-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(short_expiry_ms)
+        .expect("writer build should succeed");
+    let mut reader = StoreClientBuilder::new(metadata.clone(), "route-lookup-live-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "route-lookup-live-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(short_expiry_ms)
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    writer
+        .put_with_policy(
+            "route-lookup-live-key",
+            b"route-lookup-live-payload",
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated put should succeed");
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("route-lookup-live-a-segment")
+            .expect("primary segment handle should exist");
+        state.segments_by_handle.remove(&handle);
+    }
+
+    let first = reader.get("route-lookup-live-key");
+    assert!(matches!(
+        first,
+        Err(StoreError::NotFound(_))
+            | Err(StoreError::Transport(_))
+            | Err(StoreError::InvalidState(_))
+    ));
+
+    for _ in 0..3 {
+        assert_eq!(
+            reader
+                .get("route-lookup-live-key")
+                .expect("subsequent reads should use the surviving replica"),
+            b"route-lookup-live-payload"
+        );
+    }
+
+    sleep(Duration::from_millis(1_100));
+    let refreshed_expiry = now_ms().saturating_add(30_000);
+    store_b
+        .heartbeat(refreshed_expiry)
+        .expect("store-b heartbeat should extend its lease");
+    writer
+        .heartbeat(refreshed_expiry)
+        .expect("writer heartbeat should extend its lease");
+    reader
+        .heartbeat(refreshed_expiry)
+        .expect("reader heartbeat should extend its lease");
+    sleep(fast_live_client_sync_interval() * 3);
+
+    assert_eq!(
+        reader
+            .get("route-lookup-live-key")
+            .expect("read should still succeed after live snapshot drops the dead lease"),
+        b"route-lookup-live-payload"
+    );
+
+    let metrics = snapshot_metrics();
+    let ok = metrics
+        .iter()
+        .find(|snapshot| snapshot.operation == "route_lookup_many" && snapshot.status == "ok")
+        .expect("route lookup should stay healthy with a surviving replica");
+    assert!(ok.calls_total >= 4);
+    assert!(
+        metrics
+            .iter()
+            .all(|snapshot| !(snapshot.operation == "route_lookup_many"
+                && snapshot.status == "error")),
+        "route lookup should not report persistent errors when a live replica still exists"
+    );
+}
+
+#[test]
 fn route_lookup_many_records_miss_after_killed_single_replica_is_quarantined() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();
