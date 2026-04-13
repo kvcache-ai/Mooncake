@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use mooncake_store_client::{
@@ -13,7 +13,8 @@ use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
     StoreError,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use tokio::runtime::Runtime;
 
 use crate::dummy_service::pb;
 use crate::shm::{DummyClientId, OwnedMappedRegion};
@@ -21,38 +22,30 @@ use crate::shm::{DummyClientId, OwnedMappedRegion};
 type RegionKey = (u64, u64, u64);
 type RegionMap = BTreeMap<RegionKey, OwnedMappedRegion>;
 type TrackedKey = (String, String);
-type Task = Box<dyn FnOnce(&mut StoreClient, &mut DispatcherState) + Send + 'static>;
 const DISPATCHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+static DISPATCHER_RUNTIME: LazyLock<Runtime> =
+    LazyLock::new(|| Runtime::new().expect("dispatcher runtime should initialize"));
 
 pub(crate) struct DispatcherState {
     tracked_keys: BTreeSet<TrackedKey>,
 }
 
-enum Message {
-    Task(Task),
-    Shutdown,
-}
-
 pub struct StoreDispatcher {
+    client: Arc<RwLock<StoreClient>>,
     regions: Arc<Mutex<RegionMap>>,
-    sender: Mutex<Option<mpsc::Sender<Message>>>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    state: Arc<Mutex<DispatcherState>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl StoreDispatcher {
-    pub fn spawn(client: StoreClient, thread_name: impl Into<String>) -> Result<Self, StoreError> {
-        let regions = Arc::new(Mutex::new(BTreeMap::new()));
-        let (sender, receiver) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name(thread_name.into())
-            .spawn(move || worker_loop(client, receiver))
-            .map_err(|error| {
-                StoreError::Transport(format!("failed to spawn store dispatcher: {error}"))
-            })?;
+    pub fn spawn(client: StoreClient, _thread_name: impl Into<String>) -> Result<Self, StoreError> {
         Ok(Self {
-            regions,
-            sender: Mutex::new(Some(sender)),
-            thread: Mutex::new(Some(thread)),
+            client: Arc::new(RwLock::new(client)),
+            regions: Arc::new(Mutex::new(BTreeMap::new())),
+            state: Arc::new(Mutex::new(DispatcherState {
+                tracked_keys: BTreeSet::new(),
+            })),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -61,19 +54,19 @@ impl StoreDispatcher {
     }
 
     pub fn heartbeat(&self, expires_at_ms: u64) -> Result<(), StoreError> {
-        self.run(move |client| client.heartbeat(expires_at_ms))
+        self.run_mut(move |client| client.heartbeat(expires_at_ms))
     }
 
     pub fn activate(&self) -> Result<(), StoreError> {
-        self.run(|client| client.activate())
+        self.run_mut(|client| client.activate())
     }
 
     pub fn enter_standby(&self) -> Result<(), StoreError> {
-        self.run(|client| client.enter_standby())
+        self.run_mut(|client| client.enter_standby())
     }
 
     pub fn enter_draining(&self) -> Result<(), StoreError> {
-        self.run(|client| client.enter_draining())
+        self.run_mut(|client| client.enter_draining())
     }
 
     pub fn plan_handoff(
@@ -84,7 +77,7 @@ impl StoreDispatcher {
         created_at_ms: u64,
         deadline_ms: Option<u64>,
     ) -> Result<HandoffPlan, StoreError> {
-        self.run(move |client| {
+        self.run_mut(move |client| {
             client.plan_handoff(
                 successor_epoch,
                 kind,
@@ -96,7 +89,7 @@ impl StoreDispatcher {
     }
 
     pub fn activate_if_targeted_handoff(&self) -> Result<Option<HandoffPlan>, StoreError> {
-        self.run(|client| client.activate_if_targeted_handoff())
+        self.run_mut(|client| client.activate_if_targeted_handoff())
     }
 
     pub fn find_hot_upgrade_successor(&self) -> Result<Option<ClientLease>, StoreError> {
@@ -111,14 +104,14 @@ impl StoreDispatcher {
     }
 
     pub fn evacuate_owned_replicas(&self) -> Result<usize, StoreError> {
-        self.run(|client| client.evacuate_owned_replicas())
+        self.run_mut(|client| client.evacuate_owned_replicas())
     }
 
     pub fn evacuate_owned_replicas_to_runtime(
         &self,
         runtime: ClientRuntimeId,
     ) -> Result<usize, StoreError> {
-        self.run(move |client| client.evacuate_owned_replicas_to_runtime(&runtime))
+        self.run_mut(move |client| client.evacuate_owned_replicas_to_runtime(&runtime))
     }
 
     pub fn register_buffer(&self, base_ptr: usize, len: usize) -> Result<(), StoreError> {
@@ -141,55 +134,57 @@ impl StoreDispatcher {
     pub(crate) fn run<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
+        F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
+    {
+        DISPATCHER_RUNTIME.block_on(self.run_async(f))
+    }
+
+    pub(crate) fn run_mut<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
         F: FnOnce(&mut StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
-        self.run_with_state(move |client, _state| f(client))
+        DISPATCHER_RUNTIME.block_on(self.run_async_mut(f))
     }
 
     pub(crate) async fn run_async<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
+        F: FnOnce(&StoreClient) -> Result<T, StoreError> + Send + 'static,
+    {
+        self.ensure_open()?;
+        let closed = self.closed.clone();
+        let client = self.client.clone();
+        self.await_blocking(move || {
+            if closed.load(Ordering::SeqCst) {
+                return Err(dispatcher_stopped());
+            }
+            let Some(client) = client.try_read_for(DISPATCHER_REQUEST_TIMEOUT) else {
+                return Err(dispatcher_timeout("read lock"));
+            };
+            f(&client)
+        })
+        .await
+    }
+
+    pub(crate) async fn run_async_mut<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
         F: FnOnce(&mut StoreClient) -> Result<T, StoreError> + Send + 'static,
     {
-        self.run_async_with_state(move |client, _state| f(client))
-            .await
-    }
-
-    pub(crate) fn run_with_state<T, F>(&self, f: F) -> Result<T, StoreError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut StoreClient, &mut DispatcherState) -> Result<T, StoreError> + Send + 'static,
-    {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        self.send(Box::new(move |client, state| {
-            let _ = reply_tx.send(f(client, state));
-        }))?;
-        match reply_rx.recv_timeout(DISPATCHER_REQUEST_TIMEOUT) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(dispatcher_timeout()),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(dispatcher_stopped()),
-        }
-    }
-
-    pub(crate) async fn run_async_with_state<T, F>(&self, f: F) -> Result<T, StoreError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut StoreClient, &mut DispatcherState) -> Result<T, StoreError> + Send + 'static,
-    {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        self.send(Box::new(move |client, state| {
-            let _ = reply_tx.send(f(client, state));
-        }))?;
-        match tokio::task::spawn_blocking(move || reply_rx.recv_timeout(DISPATCHER_REQUEST_TIMEOUT))
-            .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => Err(dispatcher_timeout()),
-            Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => Err(dispatcher_stopped()),
-            Err(error) => Err(StoreError::Transport(format!(
-                "store dispatcher wait worker failed: {error}"
-            ))),
-        }
+        self.ensure_open()?;
+        let closed = self.closed.clone();
+        let client = self.client.clone();
+        self.await_blocking(move || {
+            if closed.load(Ordering::SeqCst) {
+                return Err(dispatcher_stopped());
+            }
+            let Some(mut client) = client.try_write_for(DISPATCHER_REQUEST_TIMEOUT) else {
+                return Err(dispatcher_timeout("write lock"));
+            };
+            f(&mut client)
+        })
+        .await
     }
 
     pub(crate) fn install_region(
@@ -214,7 +209,8 @@ impl StoreDispatcher {
     }
 
     pub async fn put(&self, request: pb::PutRequest) -> Result<i32, StoreError> {
-        self.run_async_with_state(move |client, state| Ok(execute_put(client, state, request)))
+        let state = self.state.clone();
+        self.run_async(move |client| Ok(execute_put(client, &state, request)))
             .await
     }
 
@@ -236,10 +232,9 @@ impl StoreDispatcher {
         request: pb::BatchPutFromRequest,
     ) -> Result<Vec<i32>, StoreError> {
         let regions = self.regions.clone();
-        self.run_async_with_state(move |client, state| {
-            Ok(execute_batch_put_from(client, &regions, state, request))
-        })
-        .await
+        let state = self.state.clone();
+        self.run_async(move |client| Ok(execute_batch_put_from(client, &regions, &state, request)))
+            .await
     }
 
     pub async fn batch_put_from_multi_buffers(
@@ -247,9 +242,10 @@ impl StoreDispatcher {
         request: pb::BatchPutFromMultiBuffersRequest,
     ) -> Result<Vec<i32>, StoreError> {
         let regions = self.regions.clone();
-        self.run_async_with_state(move |client, state| {
+        let state = self.state.clone();
+        self.run_async(move |client| {
             Ok(execute_batch_put_from_multi_buffers(
-                client, &regions, state, request,
+                client, &regions, &state, request,
             ))
         })
         .await
@@ -278,28 +274,35 @@ impl StoreDispatcher {
     }
 
     pub async fn remove_all(&self, force: bool) -> Result<(i32, i64), StoreError> {
-        self.run_async_with_state(move |client, state| Ok(execute_remove_all(client, state, force)))
+        let state = self.state.clone();
+        self.run_async(move |client| Ok(execute_remove_all(client, &state, force)))
             .await
     }
 
     pub fn shutdown(&self) {
-        let sender = self.sender.lock().take();
-        if let Some(sender) = sender {
-            let _ = sender.send(Message::Shutdown);
-        }
-        if let Some(thread) = self.thread.lock().take() {
-            let _ = thread.join();
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    async fn await_blocking<T, F>(&self, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    {
+        match tokio::time::timeout(DISPATCHER_REQUEST_TIMEOUT, tokio::task::spawn_blocking(f)).await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(StoreError::Transport(format!(
+                "store dispatcher worker failed: {error}"
+            ))),
+            Err(_) => Err(dispatcher_timeout("request execution")),
         }
     }
 
-    fn send(&self, task: Task) -> Result<(), StoreError> {
-        let sender = self.sender.lock();
-        let Some(sender) = sender.as_ref() else {
+    fn ensure_open(&self) -> Result<(), StoreError> {
+        if self.closed.load(Ordering::SeqCst) {
             return Err(dispatcher_stopped());
-        };
-        sender
-            .send(Message::Task(task))
-            .map_err(|_| dispatcher_stopped())
+        }
+        Ok(())
     }
 }
 
@@ -309,19 +312,11 @@ impl Drop for StoreDispatcher {
     }
 }
 
-fn worker_loop(mut client: StoreClient, receiver: mpsc::Receiver<Message>) {
-    let mut state = DispatcherState {
-        tracked_keys: BTreeSet::new(),
-    };
-    while let Ok(message) = receiver.recv() {
-        match message {
-            Message::Task(task) => task(&mut client, &mut state),
-            Message::Shutdown => break,
-        }
-    }
-}
-
-fn execute_put(client: &StoreClient, state: &mut DispatcherState, request: pb::PutRequest) -> i32 {
+fn execute_put(
+    client: &StoreClient,
+    state: &Arc<Mutex<DispatcherState>>,
+    request: pb::PutRequest,
+) -> i32 {
     let tenant = normalized_tenant(client, &request.tenant);
     let policy = proto_policy(&request.replication);
     let result = match policy.as_ref() {
@@ -331,7 +326,7 @@ fn execute_put(client: &StoreClient, state: &mut DispatcherState, request: pb::P
         None => client.put_in_tenant(&tenant, &request.key, &request.value),
     };
     if result.is_ok() {
-        state.tracked_keys.insert((tenant, request.key));
+        track_key(state, tenant, request.key);
         0
     } else {
         -1
@@ -370,7 +365,7 @@ fn execute_batch_is_exist(client: &StoreClient, request: pb::BatchIsExistRequest
 fn execute_batch_put_from(
     client: &StoreClient,
     regions: &Arc<Mutex<RegionMap>>,
-    state: &mut DispatcherState,
+    state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchPutFromRequest,
 ) -> Vec<i32> {
     let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
@@ -400,9 +395,7 @@ fn execute_batch_put_from(
             None => -1,
         };
         if status == 0 {
-            state
-                .tracked_keys
-                .insert((tenant.clone(), item.key.clone()));
+            track_key(state, tenant.clone(), item.key.clone());
         }
         statuses.push(status);
     }
@@ -412,7 +405,7 @@ fn execute_batch_put_from(
 fn execute_batch_put_from_multi_buffers(
     client: &StoreClient,
     regions: &Arc<Mutex<RegionMap>>,
-    state: &mut DispatcherState,
+    state: &Arc<Mutex<DispatcherState>>,
     request: pb::BatchPutFromMultiBuffersRequest,
 ) -> Vec<i32> {
     let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
@@ -452,9 +445,7 @@ fn execute_batch_put_from_multi_buffers(
             None => -1,
         };
         if status == 0 {
-            state
-                .tracked_keys
-                .insert((tenant.clone(), item.key.clone()));
+            track_key(state, tenant.clone(), item.key.clone());
         }
         statuses.push(status);
     }
@@ -532,14 +523,14 @@ fn execute_batch_get_into_multi_buffers(
 
 fn execute_remove_all(
     client: &StoreClient,
-    state: &mut DispatcherState,
+    state: &Arc<Mutex<DispatcherState>>,
     force: bool,
 ) -> (i32, i64) {
-    let keys = state.tracked_keys.iter().cloned().collect::<Vec<_>>();
+    let keys = tracked_keys_snapshot(state);
     let mut removed = 0i64;
     for (tenant, key) in keys {
         if client.remove_in_tenant(&tenant, &key, force).is_ok() {
-            state.tracked_keys.remove(&(tenant, key));
+            untrack_key(state, &tenant, &key);
             removed += 1;
         }
     }
@@ -588,11 +579,26 @@ fn dispatcher_stopped() -> StoreError {
     StoreError::Transport("store dispatcher stopped".to_string())
 }
 
-fn dispatcher_timeout() -> StoreError {
+fn dispatcher_timeout(context: &'static str) -> StoreError {
     StoreError::Transport(format!(
-        "store dispatcher request timed out after {}ms",
-        DISPATCHER_REQUEST_TIMEOUT.as_millis()
+        "store dispatcher {context} timed out after {}ms",
+        DISPATCHER_REQUEST_TIMEOUT.as_millis(),
     ))
+}
+
+fn track_key(state: &Arc<Mutex<DispatcherState>>, tenant: String, key: String) {
+    state.lock().tracked_keys.insert((tenant, key));
+}
+
+fn tracked_keys_snapshot(state: &Arc<Mutex<DispatcherState>>) -> Vec<TrackedKey> {
+    state.lock().tracked_keys.iter().cloned().collect()
+}
+
+fn untrack_key(state: &Arc<Mutex<DispatcherState>>, tenant: &str, key: &str) {
+    state
+        .lock()
+        .tracked_keys
+        .remove(&(tenant.to_string(), key.to_string()));
 }
 
 fn normalized_tenant(client: &StoreClient, tenant: &str) -> String {
@@ -633,7 +639,7 @@ mod tests {
 
     #[test]
     fn store_client_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<StoreClient>();
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StoreClient>();
     }
 }
