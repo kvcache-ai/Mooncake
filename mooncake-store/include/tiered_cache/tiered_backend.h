@@ -219,7 +219,6 @@ class TieredBackend {
      * @brief Iterate all keys in batches.
      * Iterates per-shard to minimize lock hold time.
      * @param callback Receives each batch; return false to stop iteration.
-     * @param batch_size Max entries per batch before releasing lock.
      */
     void ForEachKeyBatch(
         const std::function<bool(std::vector<ReplicaLocation>&&)>& callback)

@@ -68,9 +68,16 @@ class HARecoveryManager {
     void StartRecoveryThread();
     void RecoveryPipelineMain(AbortToken need_abort);
 
-    /** @brief TryEnqueue with back-off, yielding priority to normal writes. */
-    bool RecoveryEnqueueAdd(const std::string& key, const UUID& tier_id,
-                            size_t size, const AbortToken& need_abort);
+    /**
+     * @brief Retry enqueue until success or abort is signalled.
+     *        Hot keys use the normal (high-priority) queue; recovery keys use
+     *        the recovery queue. Sleeps 10 ms between attempts so normal
+     *        writes keep priority.
+     * @return true on success, false if aborted.
+     */
+    bool EnqueueWithRetry(const std::string& key, const UUID& tier_id,
+                          size_t size, bool is_hot,
+                          const AbortToken& need_abort);
 
     const UUID& client_id_;
     P2PMasterClient& master_client_;

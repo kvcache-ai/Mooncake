@@ -137,7 +137,10 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
                               : 0;
             if (notifier_ && size > 0) {
                 // Hot keys go through normal (high-priority) queue
-                notifier_->EnqueueAdd(entry.key, tier_id, size);
+                if (!EnqueueWithRetry(entry.key, tier_id, size,
+                                      /*is_hot=*/true, need_abort)) {
+                    return;  // aborted
+                }
                 hot_count++;
             }
         }
@@ -168,14 +171,14 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
                 return false;
             }
 
-            std::vector<ReplicaLocation> storage_batch;
-            for (auto& e : batch) {
+            // Pass 1: DRAM entries first for fastest recovery
+            for (const auto& e : batch) {
                 if (synced_keys.count(e.key)) continue;
                 if (dram_tiers.count(e.tier_id)) {
                     if (e.size == 0) continue;
                     if (notifier_) {
-                        if (!RecoveryEnqueueAdd(e.key, e.tier_id, e.size,
-                                                need_abort)) {
+                        if (!EnqueueWithRetry(e.key, e.tier_id, e.size,
+                                              /*is_hot=*/false, need_abort)) {
                             was_aborted = true;
                             LOG(WARNING)
                                 << "fail to enqueue route recovery list";
@@ -183,15 +186,16 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
                         }
                         dram_count++;
                     }
-                } else {
-                    storage_batch.push_back(std::move(e));
                 }
             }
-            for (auto& e : storage_batch) {
+            // Pass 2: Storage entries
+            for (const auto& e : batch) {
+                if (synced_keys.count(e.key)) continue;
+                if (dram_tiers.count(e.tier_id)) continue;
                 if (e.size == 0) continue;
                 if (notifier_) {
-                    if (!RecoveryEnqueueAdd(e.key, e.tier_id, e.size,
-                                            need_abort)) {
+                    if (!EnqueueWithRetry(e.key, e.tier_id, e.size,
+                                          /*is_hot=*/false, need_abort)) {
                         was_aborted = true;
                         LOG(WARNING) << "fail to enqueue route recovery list";
                         return false;
@@ -253,12 +257,14 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
 }
 
 // return false when abort
-bool HARecoveryManager::RecoveryEnqueueAdd(const std::string& key,
-                                           const UUID& tier_id, size_t size,
-                                           const AbortToken& need_abort) {
+bool HARecoveryManager::EnqueueWithRetry(const std::string& key,
+                                         const UUID& tier_id, size_t size,
+                                         bool is_hot,
+                                         const AbortToken& need_abort) {
     while (true) {
         if (need_abort->load(std::memory_order_acquire)) return false;
-        auto r = notifier_->EnqueueRecoveryAdd(key, tier_id, size);
+        auto r = is_hot ? notifier_->EnqueueAdd(key, tier_id, size)
+                        : notifier_->EnqueueRecoveryAdd(key, tier_id, size);
         if (r) return true;
         // Queue full — yield to normal writes then retry
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
