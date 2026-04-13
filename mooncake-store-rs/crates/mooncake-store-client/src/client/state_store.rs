@@ -171,6 +171,13 @@ impl StoreState {
                 ready.push(entry);
             }
         }
+        ready.sort_by(|left, right| {
+            left.policy_rank
+                .cmp(&right.policy_rank)
+                .then_with(|| left.due_at_ms.cmp(&right.due_at_ms))
+                .then_with(|| left.tenant.cmp(&right.tenant))
+                .then_with(|| left.qos_tier.cmp(&right.qos_tier))
+        });
         ready
     }
 }

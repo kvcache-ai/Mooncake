@@ -152,6 +152,16 @@ impl StoreClient {
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
+        for (request, object_ref) in requests.iter().zip(object_refs.iter()) {
+            let object_id = LogicalObjectId::new(
+                NamespaceScope::with_defaults(object_ref.tenant, None, None),
+                object_ref.key,
+            );
+            let current = self
+                .route_directory
+                .get_object_route(&self.lease, &ObjectKey::from_logical_id(&object_id))?;
+            self.enforce_namespace_quota(&object_id, request.value.len(), current.as_ref())?;
+        }
 
         struct PendingBatchReservation<'a> {
             scoped_key: ObjectKey,

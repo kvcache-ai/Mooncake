@@ -1,5 +1,7 @@
 use crate::error::{Result, StoreError};
-use crate::identity::{LogicalObjectId, NamespaceScope, DEFAULT_QOS_TIER};
+use crate::identity::{
+    LogicalObjectId, NamespaceScope, ReuseIdentity, DEFAULT_QOS_TIER,
+};
 use crate::route::{ObjectKey, ObjectRoute};
 
 pub fn scoped_logical_object_id(tenant: &str, logical_key: &str) -> LogicalObjectId {
@@ -38,6 +40,26 @@ pub fn apply_route_identity(route: &mut ObjectRoute, id: &LogicalObjectId) {
     route.qos_tier = Some(DEFAULT_QOS_TIER.to_string());
 }
 
+pub fn route_reuse_identity(route: &ObjectRoute) -> Result<ReuseIdentity> {
+    let object_id = route_logical_object_id(route)?;
+    let tenant = object_id.scope.tenant.clone();
+    let domain = object_id.scope.domain.clone();
+    let object_set = object_id.scope.object_set.clone();
+    let canonical_key = object_id.canonical_key();
+    Ok(ReuseIdentity::new(
+        tenant,
+        domain,
+        route
+            .sharing_scope
+            .clone()
+            .unwrap_or(object_set),
+        route
+            .canonical_key
+            .clone()
+            .unwrap_or(canonical_key),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -45,7 +67,10 @@ mod tests {
         RouteVersion, StoreError,
     };
 
-    use super::{apply_route_identity, parse_legacy_scoped_key, route_logical_object_id, scoped_logical_object_id, scoped_object_key};
+    use super::{
+        apply_route_identity, parse_legacy_scoped_key, route_logical_object_id,
+        route_reuse_identity, scoped_logical_object_id, scoped_object_key,
+    };
 
     #[test]
     fn scoped_helpers_build_default_namespace_identity() {
@@ -112,5 +137,29 @@ mod tests {
     fn parse_legacy_scoped_key_rejects_unscoped_values() {
         let error = parse_legacy_scoped_key(&ObjectKey::new("plain-key")).expect_err("key should fail");
         assert!(matches!(error, StoreError::InvalidState(_)));
+    }
+
+    #[test]
+    fn route_reuse_identity_uses_route_metadata_boundary() {
+        let mut route = ObjectRoute {
+            key: scoped_object_key("tenant-a", "old"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: Vec::<ReplicaRoute>::new(),
+        };
+        apply_route_identity(&mut route, &scoped_logical_object_id("tenant-b", "key-b"));
+        route.sharing_scope = Some("domain-a".to_string());
+
+        let reuse = route_reuse_identity(&route).expect("reuse identity should build");
+        assert_eq!(reuse.tenant, "tenant-b");
+        assert_eq!(reuse.domain, "default");
+        assert_eq!(reuse.sharing_scope, "domain-a");
+        assert_eq!(reuse.canonical_key, "tenant-b/default/default/key-b");
     }
 }

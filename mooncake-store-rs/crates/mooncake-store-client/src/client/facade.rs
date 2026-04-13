@@ -30,6 +30,7 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<Option<ObjectRoute>>;
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>>;
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>>;
+    fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>>;
     fn cas_route(
         &self,
         key: &str,
@@ -469,12 +470,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
-        Ok(self
-            .metadata
-            .list_object_routes()?
-            .into_iter()
-            .filter(|route| route.namespace.as_ref() == Some(scope))
-            .collect())
+        self.metadata.list_object_routes_in_scope(scope)
+    }
+
+    fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>> {
+        self.metadata.list_reuse_candidates(reuse)
     }
 
     fn cas_route(
