@@ -2835,21 +2835,23 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let started = std::time::Instant::now();
-        let error = tokio::runtime::Runtime::new()
-            .expect("test runtime should build")
-            .block_on(async {
-                dispatcher
-                    .run_async_with_state(move |_client, _state| {
-                        let _ = entered_tx.send(());
-                        let _ = release_rx.recv();
-                        Ok::<_, StoreError>(())
-                    })
-                    .await
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-timeout-test".to_string())
+            .spawn(move || {
+                dispatcher.run(move |_client| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok::<_, StoreError>(())
+                })
             })
-            .expect_err("blocked dispatcher request should time out");
+            .expect("dispatcher timeout worker should spawn");
         entered_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("dispatcher task should enter");
+        let error = worker
+            .join()
+            .expect("dispatcher timeout worker should join")
+            .expect_err("blocked dispatcher request should time out");
         assert!(
             matches!(error, StoreError::Transport(ref message) if message.contains("timed out")),
             "unexpected error: {error}"
@@ -2859,5 +2861,49 @@ mod tests {
             "dispatcher timeout should fail fast"
         );
         let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn dispatcher_shared_requests_do_not_head_of_line_block() {
+        let dispatcher = Arc::new(
+            StoreDispatcher::spawn(
+                build_client("dispatcher-shared"),
+                "dispatcher-shared".to_string(),
+            )
+            .expect("dispatcher should spawn"),
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("dispatcher-shared-read-holder".to_string())
+            .spawn({
+                let dispatcher = dispatcher.clone();
+                move || {
+                    dispatcher.run(move |_client| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        Ok::<_, StoreError>(())
+                    })
+                }
+            })
+            .expect("dispatcher shared test worker should spawn");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first shared request should enter");
+        let started = std::time::Instant::now();
+        let second = dispatcher
+            .run(|_client| Ok::<_, StoreError>(7usize))
+            .expect("second shared request should not block behind first");
+        assert_eq!(second, 7);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "second shared request should complete quickly"
+        );
+        let _ = release_tx.send(());
+        worker
+            .join()
+            .expect("dispatcher shared worker should join")
+            .expect("first shared request should finish after release");
     }
 }
