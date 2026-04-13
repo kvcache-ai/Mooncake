@@ -60,8 +60,14 @@ impl StoreClient {
                 .map(|route| route.version.next())
                 .unwrap_or(RouteVersion(1));
             let checksum = payload_checksum(value);
+            let namespace = mooncake_store_core::NamespaceScope::with_defaults(Some(tenant), None, None);
             let route = ObjectRoute {
                 key: scoped_key.clone(),
+                namespace: Some(namespace.clone()),
+                logical_key: Some(key.to_string()),
+                canonical_key: Some(format!("{}/{}", namespace.canonical_prefix(), key)),
+                sharing_scope: Some(tenant.to_string()),
+                qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
                 version: next_version,
                 state: RouteState::Active,
                 compatibility: self.lease.compatibility.clone(),

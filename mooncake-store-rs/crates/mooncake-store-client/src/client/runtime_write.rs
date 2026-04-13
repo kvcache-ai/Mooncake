@@ -537,12 +537,24 @@ impl StoreClient {
                     .as_ref()
                     .map(|route| route.version.next())
                     .unwrap_or(RouteVersion(1));
+                let (tenant, logical_key) = entry.scoped_key.0.split_once("::").ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "route key {} is missing tenant scope",
+                        entry.scoped_key.0
+                    ))
+                })?;
+                let namespace = mooncake_store_core::NamespaceScope::with_defaults(Some(tenant), None, None);
                 routes.push(PendingRoutePublish {
                     key: entry.scoped_key.clone(),
                     expected_version,
                     previous: current,
                     route: ObjectRoute {
                         key: entry.scoped_key.clone(),
+                        namespace: Some(namespace.clone()),
+                        logical_key: Some(logical_key.to_string()),
+                        canonical_key: Some(format!("{}/{}", namespace.canonical_prefix(), logical_key)),
+                        sharing_scope: Some(tenant.to_string()),
+                        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
                         version: next_version,
                         state: RouteState::Active,
                         compatibility: self.lease.compatibility.clone(),

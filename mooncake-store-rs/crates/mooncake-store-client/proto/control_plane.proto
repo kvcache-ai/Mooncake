@@ -83,6 +83,13 @@ message ObjectRoute {
   RouteState state = 3;
   CompatibilityDescriptor compatibility = 4;
   repeated ReplicaRoute replicas = 5;
+  string tenant = 6;
+  string domain = 7;
+  string object_set = 8;
+  string logical_key = 9;
+  string canonical_key = 10;
+  string sharing_scope = 11;
+  string qos_tier = 12;
 }
 
 message CasResult {

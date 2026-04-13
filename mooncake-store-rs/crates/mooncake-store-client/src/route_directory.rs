@@ -1636,6 +1636,11 @@ mod tests {
     fn route_for(key: &str, owner: &ClientRuntimeId) -> ObjectRoute {
         ObjectRoute {
             key: ObjectKey::new(key),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
             version: RouteVersion(1),
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
@@ -1800,6 +1805,11 @@ mod tests {
 
         let route_a = ObjectRoute {
             key: ObjectKey::new("tenant-a::key-a"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
             version: RouteVersion(1),
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
@@ -1816,6 +1826,11 @@ mod tests {
         };
         let route_b = ObjectRoute {
             key: ObjectKey::new("tenant-a::key-b"),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
             version: RouteVersion(1),
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),

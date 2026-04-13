@@ -24,8 +24,9 @@ use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
-    RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
+    ClientStableId, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute,
+    ReplicaRoute, ReplicaTier, RouteCasRequest, RouteState, RouteVersion, SegmentName,
+    SegmentReservation, StoreError,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -626,6 +627,11 @@ fn sample_owner() -> ClientRuntimeId {
 fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute {
     ObjectRoute {
         key: ObjectKey::new(key),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
         version: RouteVersion(version),
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
@@ -1053,6 +1059,37 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
 }
 
 #[test]
+fn object_route_round_trip_preserves_namespace_fields() {
+    let owner = sample_owner();
+    let route = ObjectRoute {
+        key: ObjectKey::new("tenant-a::key-a"),
+        namespace: Some(NamespaceScope::with_defaults(Some("tenant-a"), None, None)),
+        logical_key: Some("key-a".to_string()),
+        canonical_key: Some("tenant-a/default/default/key-a".to_string()),
+        sharing_scope: Some("tenant-a".to_string()),
+        qos_tier: Some("default".to_string()),
+        version: RouteVersion(3),
+        state: RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner,
+            segment_name: SegmentName::new("segment-a"),
+            offset: 128,
+            segment_offset: 64,
+            length: 16,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+
+    assert_eq!(
+        try_object_route(pb_object_route(&route)).expect("route should round-trip"),
+        route
+    );
+}
+
+#[test]
 fn fail_stream_session_marks_session_closed_and_drains_waiters() {
     let (sender, _receiver) = mpsc::channel(1);
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1143,6 +1180,13 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             state: pb_route_state(RouteState::Active),
             compatibility: None,
             replicas: vec![],
+            tenant: String::new(),
+            domain: String::new(),
+            object_set: String::new(),
+            logical_key: String::new(),
+            canonical_key: String::new(),
+            sharing_scope: String::new(),
+            qos_tier: String::new(),
         };
 
         let cas_reply = service
