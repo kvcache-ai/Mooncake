@@ -53,6 +53,21 @@ impl From<InitialStateArg> for ClientLifecycleState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TransportBackendArg {
+    Tent,
+    ClassicTe,
+}
+
+impl TransportBackendArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tent => "tent",
+            Self::ClassicTe => "classic_te",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-client")]
 #[command(about = "Start a standalone Mooncake store-rs client runtime")]
@@ -73,6 +88,8 @@ struct Args {
     rdma_devices: String,
     #[arg(long, alias = "rpc-server-port")]
     transport_rpc_port: Option<u16>,
+    #[arg(long, value_enum)]
+    transport_backend: Option<TransportBackendArg>,
     #[arg(long)]
     stable_id: Option<String>,
     #[arg(long, default_value_t = 1)]
@@ -306,6 +323,9 @@ fn build_runtime_args(args: &Args) -> CompatRuntimeArgs {
             protocol: args.protocol.clone(),
             _rdma_devices: args.rdma_devices.clone(),
             transport_rpc_port: args.transport_rpc_port,
+            transport_backend: args
+                .transport_backend
+                .map(|backend| backend.as_str().to_string()),
             stable_id: args.stable_id.clone(),
             tenant: args.tenant.clone(),
             labels: args.labels.iter().cloned().collect::<BTreeMap<_, _>>(),
@@ -485,6 +505,7 @@ mod tests {
             protocol: "tcp".to_string(),
             rdma_devices: String::new(),
             transport_rpc_port: None,
+            transport_backend: None,
             stable_id: Some("sample".to_string()),
             epoch: 1,
             initial_state: InitialStateArg::Active,
