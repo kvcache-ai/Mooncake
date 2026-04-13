@@ -465,82 +465,92 @@ Status RdmaTransport::submitTransferTask(
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
+    const auto cleanup_posted_slices = [&]() {
+        for (auto &entry : slices_to_post) {
+            for (auto *slice : entry.second) {
+                getSliceCache().deallocate(slice);
+            }
+        }
+    };
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
         nr_slices = 0;
-        assert(task.request);
-        auto &request = *task.request;
-
-        auto request_buffer_id = -1, request_device_id = -1;
-        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id,
-                         request_device_id)) {
-            request_buffer_id = -1;
-            request_device_id = -1;
-        }
-
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
-            Slice *slice = getSliceCache().allocate();
-            assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
+        const auto submit_request = [&](const TransferRequest &request,
+                                        uint64_t &local_nr_slices) -> Status {
+            auto request_buffer_id = -1, request_device_id = -1;
+            if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
+                             request.length, request_buffer_id,
+                             request_device_id)) {
+                request_buffer_id = -1;
+                request_device_id = -1;
             }
 
-            bool merge_final_slice =
-                request.length - offset <= kBlockSize + kFragmentSize;
+            for (uint64_t offset = 0; offset < request.length;
+                 offset += kBlockSize) {
+                Slice *slice = getSliceCache().allocate();
+                assert(slice);
+                if (!slice->from_cache) {
+                    local_nr_slices++;
+                }
 
-            slice->source_addr = (char *)request.source + offset;
-            slice->length =
-                merge_final_slice ? request.length - offset : kBlockSize;
-            slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset + offset;
-            slice->rdma.retry_cnt = request.advise_retry_cnt;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->status = Slice::PENDING;
-            slice->ts = 0;
-            task.slice_list.push_back(slice);
+                bool merge_final_slice =
+                    request.length - offset <= kBlockSize + kFragmentSize;
 
-            int buffer_id = -1, device_id = -1,
-                retry_cnt = request.advise_retry_cnt;
-            bool found_device = false;
-            if (request_buffer_id >= 0 && request_device_id >= 0) {
-                found_device = true;
-                buffer_id = request_buffer_id;
-                device_id = request_device_id;
-            }
-            while (retry_cnt < kMaxRetryCount && !found_device) {
-                if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
-                    continue;
-                assert(device_id >= 0 &&
-                       static_cast<size_t>(device_id) < context_list_.size());
-                auto &context = context_list_[device_id];
-                assert(context.get());
-                if (!context->active()) continue;
-                assert(buffer_id >= 0 &&
-                       static_cast<size_t>(buffer_id) <
-                           local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
-                       context_list_.size());
-                found_device = true;
-                break;
-            }
-            if (!found_device) {
-                auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
-                LOG(ERROR)
-                    << "Memory region not registered by any active device(s): "
-                    << source_addr;
-                return Status::AddressNotRegistered(
-                    "Memory region not registered by any active device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
-            } else {
+                slice->source_addr = (char *)request.source + offset;
+                slice->length =
+                    merge_final_slice ? request.length - offset : kBlockSize;
+                slice->opcode = request.opcode;
+                slice->rdma.dest_addr = request.target_offset + offset;
+                slice->rdma.retry_cnt = request.advise_retry_cnt;
+                slice->rdma.max_retry_cnt = kMaxRetryCount;
+                slice->task = &task;
+                slice->target_id = request.target_id;
+                slice->status = Slice::PENDING;
+                slice->ts = 0;
+                task.slice_list.push_back(slice);
+
+                int buffer_id = -1, device_id = -1,
+                    retry_cnt = request.advise_retry_cnt;
+                bool found_device = false;
+                if (request_buffer_id >= 0 && request_device_id >= 0) {
+                    found_device = true;
+                    buffer_id = request_buffer_id;
+                    device_id = request_device_id;
+                }
+                while (retry_cnt < kMaxRetryCount && !found_device) {
+                    if (selectDevice(local_segment_desc.get(),
+                                     (uint64_t)slice->source_addr,
+                                     slice->length, buffer_id, device_id,
+                                     retry_cnt++)) {
+                        continue;
+                    }
+                    assert(device_id >= 0 && static_cast<size_t>(device_id) <
+                                                 context_list_.size());
+                    auto &context = context_list_[device_id];
+                    assert(context.get());
+                    if (!context->active()) continue;
+                    assert(buffer_id >= 0 &&
+                           static_cast<size_t>(buffer_id) <
+                               local_segment_desc->buffers.size());
+                    assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
+                           context_list_.size());
+                    found_device = true;
+                    break;
+                }
+                if (!found_device) {
+                    auto source_addr = slice->source_addr;
+                    cleanup_posted_slices();
+                    LOG(ERROR) << "Memory region not registered by any active "
+                                  "device(s): "
+                               << source_addr;
+                    return Status::AddressNotRegistered(
+                        "Memory region not registered by any active "
+                        "device(s): " +
+                        std::to_string(
+                            reinterpret_cast<uintptr_t>(source_addr)));
+                }
+
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
                     LOG(ERROR) << "Device " << device_id << " is not active";
@@ -553,17 +563,34 @@ Status RdmaTransport::submitTransferTask(
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
-            }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
+                if (local_nr_slices >= kSubmitWatermark) {
+                    for (auto &entry : slices_to_post) {
+                        entry.first->submitPostSend(entry.second);
+                    }
+                    slices_to_post.clear();
+                    local_nr_slices = 0;
+                }
 
-            if (merge_final_slice) {
-                break;
+                if (merge_final_slice) {
+                    break;
+                }
+            }
+            return Status::OK();
+        };
+
+        if (!task.request_group.empty()) {
+            for (const auto &request : task.request_group) {
+                auto status = submit_request(request, nr_slices);
+                if (!status.ok()) {
+                    return status;
+                }
+            }
+        } else {
+            assert(task.request);
+            auto status = submit_request(*task.request, nr_slices);
+            if (!status.ok()) {
+                return status;
             }
         }
     }

@@ -110,6 +110,10 @@ add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
+add_executable(multi_transport_grouping_test ${WORKSPACE}/multi_transport_grouping_test.cpp)
+target_link_libraries(multi_transport_grouping_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME multi_transport_grouping_test COMMAND multi_transport_grouping_test)
+
 if (USE_ASCEND_DIRECT)
     # AscendDirectTransport unit test with mock implementations
     # Mock implementations are included in the test file via anonymous namespace

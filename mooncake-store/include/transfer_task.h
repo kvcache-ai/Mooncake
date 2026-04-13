@@ -408,6 +408,22 @@ class TransferSubmitter {
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, Slice>& batched_slices);
 
+    /**
+     * @brief Submit batch read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return TransferFuture or nullopt on failure
+     */
+    std::optional<TransferFuture> submitBatchReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges,
+        bool enable_task_grouping = false);
+
    private:
     TransferEngine& engine_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
@@ -464,7 +480,7 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests, size_t batch_task_count = 0);
 };
 
 }  // namespace mooncake

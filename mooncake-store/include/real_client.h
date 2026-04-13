@@ -147,6 +147,12 @@ class RealClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes);
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys

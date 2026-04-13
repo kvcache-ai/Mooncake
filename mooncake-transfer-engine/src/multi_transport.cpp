@@ -86,55 +86,208 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
-    for (size_t task_id = 0; task_id < task_count; task_id++) {
-        if (!batch_desc.task_list[task_id].is_finished) {
+    {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        if (!batch_desc.sealed.load(std::memory_order_acquire)) {
             return Status::BatchBusy(
-                "BatchID cannot be freed until all tasks are done");
+                "BatchID cannot be freed until the batch is sealed");
+        }
+
+        const size_t submitted_task_count = static_cast<size_t>(
+            batch_desc.submitted_task_count.load(std::memory_order_acquire));
+        const size_t finished_task_count = static_cast<size_t>(
+            batch_desc.finished_task_count.load(std::memory_order_acquire));
+        if (finished_task_count < submitted_task_count) {
+            return Status::BatchBusy(
+                "BatchID cannot be freed until all submitted tasks are done");
+        }
+
+        for (size_t task_id = 0; task_id < submitted_task_count; task_id++) {
+            if (!batch_desc.task_list[task_id].is_finished) {
+                return Status::BatchBusy(
+                    "BatchID cannot be freed until all submitted tasks are "
+                    "done");
+            }
         }
     }
-    delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
-    RWSpinlock::WriteGuard guard(batch_desc_lock_);
-    batch_desc_set_.erase(batch_id);
+    bool present = false;
+    {
+        RWSpinlock::ReadGuard guard(batch_desc_lock_);
+        present = batch_desc_set_.find(batch_id) != batch_desc_set_.end();
+    }
+    if (present) {
+        RWSpinlock::WriteGuard guard(batch_desc_lock_);
+        batch_desc_set_.erase(batch_id);
+    }
 #endif
+    delete &batch_desc;
     return Status::OK();
 }
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        return Status::TooManyRequests(
-            "Exceed the limitation of batch capacity");
-    }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
+    struct ResolvedEntry {
+        size_t request_idx;
+        Transport* transport;
+    };
+    std::vector<ResolvedEntry> resolved;
+    resolved.reserve(entries.size());
 
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
-        submit_tasks;
-    for (auto& request : entries) {
+    bool all_standalone = true;
+    for (size_t i = 0; i < entries.size(); ++i) {
         Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
+        auto status = selectTransport(entries[i], transport);
         if (!status.ok()) return status;
         assert(transport);
+        resolved.push_back({i, transport});
+        all_standalone &=
+            entries[i].task_group_id == TransferRequest::kNoTaskGroup;
+    }
+
+    if (all_standalone) {
+        const size_t num_logical = entries.size();
+        size_t task_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            if (batch_desc.sealed.load(std::memory_order_acquire)) {
+                return Status::InvalidArgument(
+                    "Cannot append transfers to a sealed batch");
+            }
+            const size_t submitted_task_count =
+                static_cast<size_t>(batch_desc.submitted_task_count.load(
+                    std::memory_order_acquire));
+            if (submitted_task_count + num_logical > batch_desc.batch_size) {
+                return Status::TooManyRequests(
+                    "Exceed the limitation of batch capacity");
+            }
+
+            task_id = submitted_task_count;
+            batch_desc.task_list.resize(task_id + num_logical);
+            const size_t new_submitted_task_count = task_id + num_logical;
+            batch_desc.submitted_task_count.store(new_submitted_task_count,
+                                                  std::memory_order_release);
+            if (new_submitted_task_count == batch_desc.batch_size) {
+                batch_desc.sealed.store(true, std::memory_order_release);
+            }
+            batch_desc.is_finished.store(false, std::memory_order_release);
+            batch_desc.publish_completion_if_ready_locked();
+        }
+
+        std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
+            submit_tasks;
+        submit_tasks.reserve(resolved.size());
+
+        for (const auto& entry : resolved) {
+            auto& task = batch_desc.task_list[task_id++];
+            task.batch_id = batch_id;
+            const auto& request = entries[entry.request_idx];
+#ifdef USE_ASCEND_HETEROGENEOUS
+            task.request = const_cast<Transport::TransferRequest *>(&request);
+#else
+            task.request = &request;
+#endif
+            submit_tasks[entry.transport].push_back(&task);
+        }
+
+        Status overall_status = Status::OK();
+        for (auto& entry : submit_tasks) {
+            auto status = entry.first->submitTransferTask(entry.second);
+            if (!status.ok()) {
+                overall_status = status;
+            }
+        }
+        return overall_status;
+    }
+
+    // Phase 2: Compute logical tasks by coalescing adjacent requests that
+    // share the same non-default task_group_id and the same transport.
+    // Each run of grouped requests becomes one logical task; ungrouped
+    // requests are each their own logical task.
+    struct LogicalTask {
+        size_t start;  // first index in resolved[]
+        size_t count;  // number of entries in this logical task
+        Transport* transport;
+    };
+    std::vector<LogicalTask> logical_tasks;
+    logical_tasks.reserve(entries.size());
+    {
+        size_t i = 0;
+        while (i < resolved.size()) {
+            const auto& req = entries[resolved[i].request_idx];
+            Transport* tp = resolved[i].transport;
+            if (req.task_group_id != TransferRequest::kNoTaskGroup) {
+                size_t group_start = i;
+                uint64_t gid = req.task_group_id;
+                while (i < resolved.size() &&
+                       entries[resolved[i].request_idx].task_group_id == gid &&
+                       resolved[i].transport == tp) {
+                    ++i;
+                }
+                logical_tasks.push_back({group_start, i - group_start, tp});
+            } else {
+                logical_tasks.push_back({i, 1, tp});
+                ++i;
+            }
+        }
+    }
+
+    size_t num_logical = logical_tasks.size();
+    size_t task_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+        if (batch_desc.sealed.load(std::memory_order_acquire)) {
+            return Status::InvalidArgument(
+                "Cannot append transfers to a sealed batch");
+        }
+        const size_t submitted_task_count = static_cast<size_t>(
+            batch_desc.submitted_task_count.load(std::memory_order_acquire));
+        if (submitted_task_count + num_logical > batch_desc.batch_size) {
+            return Status::TooManyRequests(
+                "Exceed the limitation of batch capacity");
+        }
+
+        task_id = submitted_task_count;
+        batch_desc.task_list.resize(task_id + num_logical);
+        const size_t new_submitted_task_count = task_id + num_logical;
+        batch_desc.submitted_task_count.store(new_submitted_task_count,
+                                              std::memory_order_release);
+        if (new_submitted_task_count == batch_desc.batch_size) {
+            batch_desc.sealed.store(true, std::memory_order_release);
+        }
+        batch_desc.is_finished.store(false, std::memory_order_release);
+        batch_desc.publish_completion_if_ready_locked();
+    }
+
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
+        submit_tasks;
+    for (size_t lt = 0; lt < num_logical; ++lt) {
+        auto& ltask = logical_tasks[lt];
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        const auto& first_req = entries[resolved[ltask.start].request_idx];
 #ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
+        task.request = const_cast<Transport::TransferRequest *>(&first_req);
 #else
-        task.request = &request;
+        task.request = &first_req;
 #endif
+        if (ltask.count > 1) {
+            task.request_group.reserve(ltask.count);
+            for (size_t offset = 0; offset < ltask.count; ++offset) {
+                task.request_group.push_back(
+                    entries[resolved[ltask.start + offset].request_idx]);
+            }
+        }
         ++task_id;
-        submit_tasks[transport].push_back(&task);
+        submit_tasks[ltask.transport].push_back(&task);
     }
+
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
-            // LOG(ERROR) << "Failed to submit transfer task to "
-            //            << entry.first->getName();
             overall_status = status;
         }
     }
@@ -154,7 +307,7 @@ Status MultiTransport::mp_submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*>>
         submit_tasks;
     for (auto& request : entries) {
         Transport* transport = nullptr;
@@ -187,7 +340,8 @@ Status MultiTransport::mp_submitTransfer(
 Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
                                          TransferStatus& status) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
+    const size_t task_count = static_cast<size_t>(
+        batch_desc.submitted_task_count.load(std::memory_order_acquire));
     if (task_id >= task_count) {
         return Status::InvalidArgument("Task ID out of range");
     }
@@ -226,11 +380,12 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    const size_t task_count = batch_desc.task_list.size();
+    const size_t task_count = static_cast<size_t>(
+        batch_desc.submitted_task_count.load(std::memory_order_acquire));
+    const bool sealed = batch_desc.sealed.load(std::memory_order_acquire);
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
-        task_count == 0) {
+    if (batch_desc.is_finished.load(std::memory_order_acquire) && sealed) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
             batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
@@ -250,21 +405,31 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
-        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
+                   task_status.s == Transport::TransferStatusEnum::CANCELED ||
+                   task_status.s == Transport::TransferStatusEnum::INVALID ||
+                   task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
             status.s = Transport::TransferStatusEnum::FAILED;
+            batch_desc.has_failure.store(true, std::memory_order_release);
             return Status::OK();
         }
+    }
+
+    if (!sealed) {
+        status.s = Transport::TransferStatusEnum::WAITING;
+        return Status::OK();
     }
 
     status.s = (success_count == task_count)
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.is_finished.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(batch_desc.lifecycle_mutex);
+            batch_desc.publish_completion_if_ready_locked();
+        }
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
                                                  std::memory_order_release);
-    } else if (status.s == Transport::TransferStatusEnum::FAILED) {
-        batch_desc.has_failure.store(true, std::memory_order_release);
     }
     return Status::OK();
 }

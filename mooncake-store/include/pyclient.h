@@ -249,6 +249,12 @@ class PyClient {
         const std::vector<void *> &buffers,
         const std::vector<size_t> &sizes) = 0;
 
+    virtual std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) = 0;
+
     virtual std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
