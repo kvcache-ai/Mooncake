@@ -4485,6 +4485,17 @@ fn helper_primitives_and_request_builders_cover_contracts() {
     lease_b.compatibility.transport_api_version += 1;
     assert!(!compatibility_matches(&lease_a, &lease_b));
 
+    // minor version difference should still be compatible
+    let mut lease_c = lease_a.clone();
+    lease_c.compatibility.store_api_minor_version += 3;
+    assert!(compatibility_matches(&lease_a, &lease_c));
+    assert!(compatibility_matches(&lease_c, &lease_a));
+
+    // major version difference should be incompatible
+    let mut lease_d = lease_a.clone();
+    lease_d.compatibility.store_api_version += 1;
+    assert!(!compatibility_matches(&lease_a, &lease_d));
+
     assert_eq!(control_bind_host(""), "127.0.0.1");
     assert_eq!(control_bind_host("0.0.0.0:7001"), "127.0.0.1");
     assert_eq!(control_bind_host("10.0.0.9:7001"), "10.0.0.9");

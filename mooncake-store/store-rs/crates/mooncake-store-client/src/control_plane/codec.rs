@@ -93,6 +93,7 @@ pub(super) fn pb_compatibility(
 ) -> pb::CompatibilityDescriptor {
     pb::CompatibilityDescriptor {
         store_api_version: descriptor.store_api_version,
+        store_api_minor_version: descriptor.store_api_minor_version,
         metadata_schema_version: descriptor.metadata_schema_version,
         transport_api_version: descriptor.transport_api_version,
         capabilities: descriptor.capabilities.iter().cloned().collect(),
@@ -104,6 +105,7 @@ pub(super) fn try_compatibility(
 ) -> CompatibilityDescriptor {
     CompatibilityDescriptor {
         store_api_version: descriptor.store_api_version,
+        store_api_minor_version: descriptor.store_api_minor_version,
         metadata_schema_version: descriptor.metadata_schema_version,
         transport_api_version: descriptor.transport_api_version,
         capabilities: descriptor.capabilities.iter().cloned().collect(),

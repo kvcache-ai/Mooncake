@@ -234,9 +234,7 @@ impl PlacementPlanner {
 }
 
 fn is_compatible(left: &ClientLease, right: &ClientLease) -> bool {
-    left.compatibility.store_api_version == right.compatibility.store_api_version
-        && left.compatibility.metadata_schema_version == right.compatibility.metadata_schema_version
-        && left.compatibility.transport_api_version == right.compatibility.transport_api_version
+    left.compatibility.is_compatible_with(&right.compatibility)
 }
 
 fn rendezvous_score(tenant: &str, key: &str, runtime: &ClientRuntimeId) -> u64 {

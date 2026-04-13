@@ -48,6 +48,7 @@ message CompatibilityDescriptor {
   uint32 metadata_schema_version = 2;
   uint32 transport_api_version = 3;
   repeated string capabilities = 4;
+  uint32 store_api_minor_version = 5;
 }
 
 enum RouteState {
