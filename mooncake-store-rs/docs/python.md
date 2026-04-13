@@ -387,6 +387,8 @@ The real backend keeps batch read behavior compatible with upstream Mooncake whi
 - `stop_metrics_server()`
 - `metrics_server_address()`
 
+Python real clients also auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`; use `MC_STORE_RS_TRACE_FILTER` to pass a `tracing_subscriber` filter.
+
 ## Metadata URLs
 
 The compatibility layer accepts these metadata URL forms:

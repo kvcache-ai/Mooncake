@@ -130,7 +130,11 @@ sys.modules["mooncake._runtime"] = runtime
 native = types.ModuleType("mooncake._store_rs")
 native.MooncakeDistributedStore = lambda: object()
 native.MooncakeHostMemAllocator = lambda *args, **kwargs: None
-native.init_tracing = lambda *args, **kwargs: 0
+trace_state = {"filters": []}
+def init_tracing(trace_filter=None):
+    trace_state["filters"].append(trace_filter)
+    return 0
+native.init_tracing = init_tracing
 native.metrics_text = lambda: ""
 metrics_state = {"address": None, "starts": []}
 def start_metrics_server(bind_addr="127.0.0.1:0"):
@@ -349,6 +353,22 @@ finally:
     os.environ.pop("MC_STORE_RS_METRICS_ADDR", None)
     metrics_state["address"] = None
     metrics_state["starts"].clear()
+
+os.environ["MC_STORE_RS_TRACE"] = "1"
+os.environ["MC_STORE_RS_TRACE_FILTER"] = "info,mooncake_store_client::client=debug"
+try:
+    store.setup(
+        "127.0.0.1",
+        "redis://127.0.0.1:6379/0",
+        1024,
+        512,
+    )
+    name, args, kwargs = store._worker.calls.pop()
+    assert trace_state["filters"] == ["info,mooncake_store_client::client=debug"]
+finally:
+    os.environ.pop("MC_STORE_RS_TRACE", None)
+    os.environ.pop("MC_STORE_RS_TRACE_FILTER", None)
+    trace_state["filters"].clear()
 
 try:
     store.setup(

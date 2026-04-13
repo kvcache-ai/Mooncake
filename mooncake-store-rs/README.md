@@ -672,6 +672,7 @@ In `EmbeddedWrh`, the client prewarms a live-client membership snapshot during `
 
 - `MC_STORE_RS_TRACE=1`
 - `MC_STORE_RS_TRACE_FILTER=info` or any `tracing_subscriber` filter string
+- Python real clients auto-initialize Rust tracing before `setup(...)` when `MC_STORE_RS_TRACE=1`
 
 ### Metrics
 
